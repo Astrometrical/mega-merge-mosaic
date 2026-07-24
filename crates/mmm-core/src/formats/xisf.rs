@@ -147,10 +147,11 @@ fn parse_header(path: &Path, mmap: &Mmap) -> Result<XisfHeader> {
                 if name == b"Image" && header.is_none() {
                     header = Some(parse_image_element(path, &e)?);
                     in_image = true;
-                } else if name == b"FITSKeyword" && in_image {
-                    if let Some(h) = header.as_mut() {
-                        h.fits_keywords.push(parse_fits_keyword(path, &e)?);
-                    }
+                } else if name == b"FITSKeyword"
+                    && in_image
+                    && let Some(h) = header.as_mut()
+                {
+                    h.fits_keywords.push(parse_fits_keyword(path, &e)?);
                 }
             }
             Ok(Event::End(e)) => {

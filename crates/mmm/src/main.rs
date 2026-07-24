@@ -61,7 +61,41 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Analyze { panels, session } => {
             tracing::info!(?session, n_panels = panels.len(), "analyze requested");
-            anyhow::bail!("analyze: not yet implemented");
+            let t0 = std::time::Instant::now();
+            let s = mmm_core::analyze::analyze(&panels, &session)?;
+            let (w, h, ch) = s.canvas;
+            println!("canvas: {w}x{h} x{ch}ch   session: {}", s.dir.display());
+            println!(
+                "{:>3}  {:<28} {:>26} {:>8}  per-channel mean",
+                "id", "file", "bbox [x0,x1)x[y0,y1)", "nonzero"
+            );
+            for p in &s.panels {
+                let name = p
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.path.display().to_string());
+                let bbox = format!(
+                    "[{},{})x[{},{})",
+                    p.bbox[0], p.bbox[2], p.bbox[1], p.bbox[3]
+                );
+                let means = p
+                    .ch_mean
+                    .iter()
+                    .map(|m| format!("{m:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "{:>3}  {:<28} {:>26} {:>7.1}%  {}",
+                    p.id,
+                    name,
+                    bbox,
+                    100.0 * p.nonzero_frac,
+                    means
+                );
+            }
+            println!("analyze: {:.2}s", t0.elapsed().as_secs_f64());
+            Ok(())
         }
     }
 }
