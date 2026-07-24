@@ -1,0 +1,17 @@
+//! Mega Merge Mosaic core library.
+//!
+//! Merges/blends pre-aligned astrophotography mosaic panels (as produced by
+//! PixInsight's MosaicByCoordinates) into a seamless mosaic. Panels are
+//! full-canvas frames on a common projection, with hard zeros outside each
+//! panel's coverage — all processing exploits that sparsity: work happens in
+//! overlap bands, never globally.
+//!
+//! Pipeline stages (each independently cacheable in a session directory):
+//!   ingest → coverage/overlap graph → photometric solve → seam → blend → output
+//!
+//! This crate is UI-agnostic: the `mmm` CLI and any future GUI are thin
+//! frontends over [`session`].
+
+pub mod error;
+
+pub use error::{Error, Result};

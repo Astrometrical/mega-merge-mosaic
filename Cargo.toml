@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/mmm-core", "crates/mmm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/dpaull/MergeMosaic"
+
+[workspace.dependencies]
+mmm-core = { path = "crates/mmm-core" }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+rayon = "1.10"
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Blend math is hot-path; always optimize dependencies even in dev builds
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

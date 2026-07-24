@@ -1,0 +1,16 @@
+# Rust
+/target
+
+# Test data — multi-GB astro panels, never committed
+/test_data/
+
+# MMM session caches (tiled panel cache, analysis artifacts)
+*.mmm-session/
+/sessions/
+
+# WSL / Windows artifacts
+*Zone.Identifier
+
+# Editor
+.vscode/
+.idea/
