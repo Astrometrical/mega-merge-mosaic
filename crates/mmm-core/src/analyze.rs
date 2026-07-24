@@ -1,6 +1,7 @@
 //! Analyze stage: one streaming pass per panel producing the L8 summary,
 //! content bbox, and per-channel statistics, persisted into a session dir,
-//! followed by the overlap-graph build over the collected summaries.
+//! followed by the overlap-graph build over the collected summaries and the
+//! photometric solve (per-edge fits + global per-panel corrections).
 //!
 //! Panels are scanned in parallel (rayon; the work is I/O-bound). Each scan is
 //! a single sequential pass over the mmap'd planes: per image row the channel
@@ -25,8 +26,8 @@ struct PanelScan {
 }
 
 /// Analyze `paths` into a session at `session_dir`: writes `session.json`,
-/// `panels/<id>/summary.bin`, and `analysis/overlap_graph.json`, returns the
-/// populated [`Session`].
+/// `panels/<id>/summary.bin`, `analysis/overlap_graph.json`, and
+/// `analysis/photometry.json`, returns the populated [`Session`].
 pub fn analyze(paths: &[PathBuf], session_dir: &Path) -> Result<Session> {
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
@@ -75,6 +76,9 @@ pub fn analyze(paths: &[PathBuf], session_dir: &Path) -> Result<Session> {
     let parent = graph_path.parent().expect("graph path has a parent");
     std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     graph.save(&graph_path)?;
+
+    let phot = crate::photometry::solve(&summaries, &graph)?;
+    phot.save(&session.photometry_path())?;
 
     session.save()?;
     Ok(session)

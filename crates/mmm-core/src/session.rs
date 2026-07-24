@@ -79,6 +79,11 @@ impl Session {
     pub fn overlap_graph_path(&self) -> PathBuf {
         self.dir.join("analysis").join("overlap_graph.json")
     }
+
+    /// Path of the photometric solve results: `analysis/photometry.json`.
+    pub fn photometry_path(&self) -> PathBuf {
+        self.dir.join("analysis").join("photometry.json")
+    }
 }
 
 #[cfg(test)]

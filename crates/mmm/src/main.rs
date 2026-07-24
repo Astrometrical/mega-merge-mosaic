@@ -157,7 +157,65 @@ fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {
         let ids = comp.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(" ");
         println!("  #{i}: {ids}");
     }
+
+    match mmm_core::photometry::Photometry::load(&session.photometry_path()) {
+        Ok(phot) => report_photometry(&phot, &name),
+        Err(_) => println!("\nno photometry results (re-run `mmm analyze`)"),
+    }
     Ok(())
+}
+
+fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usize) -> String) {
+    let channels = phot.gains.len();
+
+    // Per-channel median rms for the suspect-edge flag.
+    let median_rms: Vec<f64> = (0..channels)
+        .map(|c| {
+            let mut r: Vec<f64> = phot
+                .edge_fits
+                .iter()
+                .filter(|f| f.channel as usize == c)
+                .map(|f| f.rms)
+                .collect();
+            r.sort_by(f64::total_cmp);
+            if r.is_empty() {
+                0.0
+            } else if r.len() % 2 == 1 {
+                r[r.len() / 2]
+            } else {
+                0.5 * (r[r.len() / 2 - 1] + r[r.len() / 2])
+            }
+        })
+        .collect();
+
+    println!("\nphotometric edge fits (I_b ≈ gain·I_a + offset; ⚠ = rms > 3× channel median):");
+    println!(
+        "{:>3}-{:<3} {:>2} {:>9} {:>10} {:>10} {:>7}",
+        "a", "b", "ch", "gain", "offset", "rms", "n"
+    );
+    for f in &phot.edge_fits {
+        let med = median_rms.get(f.channel as usize).copied().unwrap_or(0.0);
+        let flag = if med > 0.0 && f.rms > 3.0 * med { "  ⚠ suspect" } else { "" };
+        println!(
+            "{:>3}-{:<3} {:>2} {:>9.4} {:>10.6} {:>10.3e} {:>7}{}",
+            f.a, f.b, f.channel, f.gain, f.offset, f.rms, f.n, flag
+        );
+    }
+
+    let n_panels = phot.gains.first().map(|g| g.len()).unwrap_or(0);
+    println!("\nper-panel corrections (I' = g·I + o), per channel:");
+    let mut header = format!("{:>3} ", "id");
+    for c in 0..channels {
+        header.push_str(&format!(" {:>8}{c} {:>10}{c}", "g", "o"));
+    }
+    println!("{header}  file");
+    for p in 0..n_panels {
+        let mut row = format!("{p:>3} ");
+        for c in 0..channels {
+            row.push_str(&format!(" {:>9.4} {:>+11.6}", phot.gains[c][p], phot.offsets[c][p]));
+        }
+        println!("{row}  {}", name(p));
+    }
 }
 
 fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
