@@ -402,6 +402,7 @@ mod tests {
             panel_gain_range: (1.0, 1.0),
             panel_offset_range: (0.0, 0.0),
             panel_gradient_range: (-0.01, 0.01),
+            panel_shift: vec![],
             seed: 7,
         }
     }

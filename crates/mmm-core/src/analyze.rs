@@ -123,9 +123,12 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
 
     let mut summary = L8Summary::zeroed(w8 as u32, h8 as u32, ch as u32);
 
-    // One L8 cell-row accumulator, flushed every BLOCK image rows.
+    // One L8 cell-row accumulator, flushed every BLOCK image rows. Σv and Σv²
+    // together yield mean and detail RMS once the cell completes (the cell
+    // mean is unknown until then): RMS² = Σv²/n − mean².
     let mut cell_cnt = vec![0u32; w8];
     let mut cell_sum = vec![0f64; nch * w8];
+    let mut cell_sum2 = vec![0f64; nch * w8];
 
     // Global per-panel stats.
     let (mut x0, mut y0, mut x1, mut y1) = (u64::MAX, u64::MAX, 0u64, 0u64);
@@ -168,6 +171,7 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
                 let v64 = v as f64;
                 ch_sum[c] += v64;
                 cell_sum[c * w8 + x8] += v64;
+                cell_sum2[c * w8 + x8] += v64 * v64;
             }
         }
         if row_covered {
@@ -187,13 +191,16 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
                 summary.coverage[y8 * w8 + x8] = cnt as f32 / n_pix;
                 if cnt > 0 {
                     for c in 0..nch {
-                        summary.mean[(c * h8 + y8) * w8 + x8] =
-                            (cell_sum[c * w8 + x8] / cnt as f64) as f32;
+                        let mean = cell_sum[c * w8 + x8] / cnt as f64;
+                        summary.mean[(c * h8 + y8) * w8 + x8] = mean as f32;
+                        let var = cell_sum2[c * w8 + x8] / cnt as f64 - mean * mean;
+                        summary.detail[(c * h8 + y8) * w8 + x8] = var.max(0.0).sqrt() as f32;
                     }
                 }
             }
             cell_cnt.fill(0);
             cell_sum.fill(0.0);
+            cell_sum2.fill(0.0);
         }
     }
 

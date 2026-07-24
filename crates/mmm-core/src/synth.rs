@@ -33,6 +33,10 @@ pub struct SynthSpec {
     /// applied inside the window on top of gain/offset. `(0.0, 0.0)` is a
     /// strict no-op (phase-1 behavior).
     pub panel_gradient_range: (f32, f32),
+    /// Per-panel sub-pixel shift `(dx, dy)` of the *star positions only* —
+    /// background and noise stay put. Simulates residual misregistration.
+    /// Empty = no shift; otherwise must have one entry per panel.
+    pub panel_shift: Vec<(f32, f32)>,
     pub seed: u64,
 }
 
@@ -149,26 +153,43 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
 
     // Stars: positions and sigma from the RNG, amplitudes log-spaced from the
     // brightest (~1.0) down to a faint floor, shared across channels.
-    let mut star_plane = vec![0.0f32; plane];
-    for i in 0..spec.n_stars {
-        let sx = rng.range_f64(0.0, w as f64);
-        let sy = rng.range_f64(0.0, h as f64);
-        let sigma = rng.range_f64(1.0, 3.0);
-        let t = if spec.n_stars > 1 { i as f64 / (spec.n_stars - 1) as f64 } else { 0.0 };
-        let amp = 1.0 * (0.02f64 / 1.0).powf(t); // log-spaced 1.0 .. 0.02
+    let stars: Vec<(f64, f64, f64, f64)> = (0..spec.n_stars)
+        .map(|i| {
+            let sx = rng.range_f64(0.0, w as f64);
+            let sy = rng.range_f64(0.0, h as f64);
+            let sigma = rng.range_f64(1.0, 3.0);
+            let t = if spec.n_stars > 1 { i as f64 / (spec.n_stars - 1) as f64 } else { 0.0 };
+            let amp = 1.0 * (0.02f64 / 1.0).powf(t); // log-spaced 1.0 .. 0.02
+            (sx, sy, sigma, amp)
+        })
+        .collect();
 
-        let r = (4.0 * sigma).ceil() as i64;
-        let (cxp, cyp) = (sx.round() as i64, sy.round() as i64);
-        let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
-        for y in (cyp - r).max(0)..=(cyp + r).min(h as i64 - 1) {
-            for x in (cxp - r).max(0)..=(cxp + r).min(w as i64 - 1) {
-                let dx = x as f64 - sx;
-                let dy = y as f64 - sy;
-                let v = amp * (-(dx * dx + dy * dy) * inv_2s2).exp();
-                star_plane[(y as u64 * w + x as u64) as usize] += v as f32;
+    /// Render the stars into a canvas-sized plane, centers shifted by `(dx, dy)`.
+    fn render_stars(
+        stars: &[(f64, f64, f64, f64)],
+        w: u64,
+        h: u64,
+        dx: f64,
+        dy: f64,
+    ) -> Vec<f32> {
+        let mut plane = vec![0.0f32; (w * h) as usize];
+        for &(sx0, sy0, sigma, amp) in stars {
+            let (sx, sy) = (sx0 + dx, sy0 + dy);
+            let r = (4.0 * sigma).ceil() as i64;
+            let (cxp, cyp) = (sx.round() as i64, sy.round() as i64);
+            let inv_2s2 = 1.0 / (2.0 * sigma * sigma);
+            for y in (cyp - r).max(0)..=(cyp + r).min(h as i64 - 1) {
+                for x in (cxp - r).max(0)..=(cxp + r).min(w as i64 - 1) {
+                    let ddx = x as f64 - sx;
+                    let ddy = y as f64 - sy;
+                    let v = amp * (-(ddx * ddx + ddy * ddy) * inv_2s2).exp();
+                    plane[(y as u64 * w + x as u64) as usize] += v as f32;
+                }
             }
         }
+        plane
     }
+    let star_plane = render_stars(&stars, w, h, 0.0, 0.0);
 
     // Truth = background + stars + Gaussian noise, floored positive.
     let mut truth = vec![0.0f32; ch * plane];
@@ -190,6 +211,15 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
     // `n_stars`/noise draws — tests compare star vs star-free generations of
     // the same seed and need identical perturbations.
     let n_panels = (spec.grid.0 * spec.grid.1) as usize;
+    if !spec.panel_shift.is_empty() && spec.panel_shift.len() != n_panels {
+        return Err(Error::format(
+            dir,
+            format!(
+                "panel_shift has {} entries but the grid has {n_panels} panels",
+                spec.panel_shift.len()
+            ),
+        ));
+    }
     let mut prng = Rng::new(spec.seed ^ 0xC0FF_EE00_D15E_A5E5);
     let mut panel_paths = Vec::with_capacity(n_panels);
     let mut applied = Vec::with_capacity(n_panels);
@@ -213,6 +243,18 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
             let gc = prng.range_f64(glo, ghi) as f32;
             let [x0, y0, x1, y1] = panel_window(spec, cx, cy);
 
+            // Star-only misregistration: replace the truth's star field with a
+            // shifted rendering (background and noise are untouched).
+            let shift = spec.panel_shift.get(id).copied().unwrap_or((0.0, 0.0));
+            let star_delta: Option<Vec<f32>> = if shift == (0.0, 0.0) {
+                None
+            } else {
+                let shifted = render_stars(&stars, w, h, shift.0 as f64, shift.1 as f64);
+                Some(
+                    shifted.iter().zip(&star_plane).map(|(&s, &u)| s - u).collect(),
+                )
+            };
+
             frame.fill(0.0);
             for c in 0..ch {
                 let src = &truth[c * plane..(c + 1) * plane];
@@ -222,7 +264,8 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                     for x in x0..x1 {
                         let i = (y * w + x) as usize;
                         let grad = grad_y + gb * (x as f32 / w as f32);
-                        let mut v = src[i] * gain + offset + grad;
+                        let star = star_delta.as_ref().map_or(0.0, |d| d[i]);
+                        let mut v = (src[i] + star) * gain + offset + grad;
                         if v == 0.0 {
                             // Covered pixels must never be exactly 0 (no-data
                             // sentinel); nudge by a value below test tolerance.
@@ -304,6 +347,7 @@ mod tests {
             panel_gain_range: (0.7, 1.4),
             panel_offset_range: (-0.01, 0.02),
             panel_gradient_range: (0.0, 0.0),
+            panel_shift: vec![],
             seed: 42,
         }
     }

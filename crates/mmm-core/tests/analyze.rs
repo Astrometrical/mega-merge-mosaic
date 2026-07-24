@@ -150,6 +150,36 @@ fn analyze_builds_and_saves_overlap_graph() {
 }
 
 #[test]
+fn detail_plane_is_in_cell_rms() {
+    // Channel 0: pixels alternate 0.2/0.6 along x → cell mean 0.4, RMS 0.2.
+    // Channel 1: constant 0.5 → RMS 0.
+    let dir = tempdir("detail");
+    let (w, h) = (16u64, 16u64);
+    let mut planes = vec![0.0f32; (w * h * 2) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            planes[(y * w + x) as usize] = if x % 2 == 0 { 0.2 } else { 0.6 };
+            planes[(w * h + y * w + x) as usize] = 0.5;
+        }
+    }
+    let p = dir.join("p.xisf");
+    write_xisf_owned(&p, w, h, 2, planes);
+
+    let session = analyze(&[p], &dir.join("s.mmm-session")).unwrap();
+    let s = L8Summary::read(&session.summary_path(0)).unwrap();
+    assert_eq!((s.w8, s.h8, s.channels), (2, 2, 2));
+    for y8 in 0..2 {
+        for x8 in 0..2u32 {
+            assert!((s.cell(0, x8, y8) - 0.4).abs() < 1e-6);
+            assert!((s.det(0, x8, y8) - 0.2).abs() < 1e-6, "ch0 RMS at ({x8},{y8})");
+            assert!(s.det(1, x8, y8).abs() < 1e-6, "constant channel must have zero detail");
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn pixel_with_one_zero_channel_is_uncovered() {
     let dir = tempdir("zero-ch");
     let (w, h, ch) = (64u64, 48u64, 3u64);

@@ -47,7 +47,7 @@ enum Command {
         session: std::path::PathBuf,
     },
 
-    /// Feather-blend the analyzed panels into a mosaic FITS (and optional PNG preview)
+    /// Blend the analyzed panels into a mosaic FITS (and optional PNG preview)
     Blend {
         /// Session directory produced by `mmm analyze`
         #[arg(short, long, default_value = "mosaic.mmm-session")]
@@ -64,6 +64,10 @@ enum Command {
         /// Feather ramp length in canvas pixels
         #[arg(long, default_value_t = 256.0)]
         feather: f32,
+
+        /// Blend mode: twoband (star-safe seams, default) or feather (phase-1)
+        #[arg(long, default_value = "twoband")]
+        mode: String,
 
         /// Also write an autostretched 8-bit PNG preview (downsampled runs only)
         #[arg(long)]
@@ -139,8 +143,13 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Report { session } => report(&session),
-        Command::Blend { session, output, downsample, feather, png } => {
-            blend_cmd(&session, &output, downsample, feather, png.as_deref())
+        Command::Blend { session, output, downsample, feather, mode, png } => {
+            let mode = match mode.as_str() {
+                "feather" => mmm_core::blend::BlendMode::Feather,
+                "twoband" => mmm_core::blend::BlendMode::TwoBand,
+                other => anyhow::bail!("--mode must be feather or twoband (got {other})"),
+            };
+            blend_cmd(&session, &output, downsample, feather, mode, png.as_deref())
         }
     }
 }
@@ -150,6 +159,7 @@ fn blend_cmd(
     output: &std::path::Path,
     downsample: u32,
     feather: f32,
+    mode: mmm_core::blend::BlendMode,
     png: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     use mmm_core::blend::{BlendParams, blend, union_bbox};
@@ -194,7 +204,7 @@ fn blend_cmd(
         None => println!("surfaces: none (analyze ran with --surface off)"),
     }
 
-    let params = BlendParams { feather_px: feather, downsample, ..Default::default() };
+    let params = BlendParams { feather_px: feather, downsample, mode, ..Default::default() };
     let t1 = std::time::Instant::now();
     let mut fits = FitsSink::create(output, keywords)?;
     match png {
@@ -211,7 +221,7 @@ fn blend_cmd(
     let out_w = bbox[2].div_ceil(ds) - bbox[0] / ds;
     let out_h = bbox[3].div_ceil(ds) - bbox[1] / ds;
     println!(
-        "output: {} ({}x{} x{}ch, downsample {downsample}, feather {feather} px)",
+        "output: {} ({}x{} x{}ch, downsample {downsample}, feather {feather} px, {mode:?})",
         output.display(),
         out_w,
         out_h,
