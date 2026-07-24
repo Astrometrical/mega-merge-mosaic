@@ -76,6 +76,11 @@ enum Command {
         /// Region of interest in full-res canvas pixels: x,y,w,h
         #[arg(long)]
         roi: Option<String>,
+
+        /// Cross-panel defect veto in overlaps (twoband mode): suppresses
+        /// cosmic-ray residue and satellite trails that survive in one panel
+        #[arg(long, default_value = "on")]
+        defect_veto: String,
     },
 }
 
@@ -156,18 +161,24 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Report { session } => report(&session),
-        Command::Blend { session, output, downsample, feather, mode, png, roi } => {
+        Command::Blend { session, output, downsample, feather, mode, png, roi, defect_veto } => {
             let mode = match mode.as_str() {
                 "feather" => mmm_core::blend::BlendMode::Feather,
                 "twoband" => mmm_core::blend::BlendMode::TwoBand,
                 other => anyhow::bail!("--mode must be feather or twoband (got {other})"),
             };
+            let defect_veto = match defect_veto.as_str() {
+                "on" => true,
+                "off" => false,
+                other => anyhow::bail!("--defect-veto must be on or off (got {other})"),
+            };
             let roi = roi.as_deref().map(parse_roi).transpose()?;
-            blend_cmd(&session, &output, downsample, feather, mode, png.as_deref(), roi)
+            blend_cmd(&session, &output, downsample, feather, mode, png.as_deref(), roi, defect_veto)
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn blend_cmd(
     session_dir: &std::path::Path,
     output: &std::path::Path,
@@ -176,6 +187,7 @@ fn blend_cmd(
     mode: mmm_core::blend::BlendMode,
     png: Option<&std::path::Path>,
     roi: Option<[u64; 4]>,
+    defect_veto: bool,
 ) -> anyhow::Result<()> {
     use mmm_core::astrometry::{wcs_cards, wcs_from_properties};
     use mmm_core::blend::{BlendParams, blend, output_bbox};
@@ -189,7 +201,7 @@ fn blend_cmd(
     let graph = mmm_core::overlap::OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = mmm_core::photometry::Photometry::load(&session.photometry_path())?;
     let params_for_bbox =
-        BlendParams { feather_px: feather, downsample, mode, roi, ..Default::default() };
+        BlendParams { feather_px: feather, downsample, mode, roi, defect_veto, ..Default::default() };
     let bbox = output_bbox(&session, &params_for_bbox)?;
     let ds = downsample.max(1) as u64;
     // Crop origin in output pixel units (best-effort for downsampled previews:

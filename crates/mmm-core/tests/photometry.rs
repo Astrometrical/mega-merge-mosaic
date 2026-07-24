@@ -31,6 +31,7 @@ fn analyze_recovers_applied_panel_transforms() {
         panel_gradient_range: (0.0, 0.0),
         panel_shift: vec![],
         panel_spike_angle: vec![],
+        panel_defects: vec![],
         seed: 7,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();

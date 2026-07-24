@@ -43,6 +43,12 @@ pub struct SynthSpec {
     /// otherwise one entry per panel. The truth carries spikes at angle 0;
     /// differing per-panel offsets simulate per-session camera rotation.
     pub panel_spike_angle: Vec<f32>,
+    /// Single-panel defects `(panel, x, y, length_px, amplitude)`: a bright
+    /// 1-px-wide *horizontal* line segment starting at `(x, y)` (length 1 =
+    /// cosmic ray, longer = a satellite-trail piece), added to all channels
+    /// *after* gain/offset/gradient, clipped to the panel's window. Simulates
+    /// transients that survive stacking in exactly one panel.
+    pub panel_defects: Vec<(usize, u64, u64, u32, f32)>,
     pub seed: u64,
 }
 
@@ -306,6 +312,17 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
             ),
         ));
     }
+    for &(dp, _, _, len, _) in &spec.panel_defects {
+        if dp >= n_panels {
+            return Err(Error::format(
+                dir,
+                format!("panel_defects names panel {dp} but the grid has {n_panels} panels"),
+            ));
+        }
+        if len == 0 {
+            return Err(Error::format(dir, "panel_defects length must be ≥ 1"));
+        }
+    }
     let mut prng = Rng::new(spec.seed ^ 0xC0FF_EE00_D15E_A5E5);
     let mut panel_paths = Vec::with_capacity(n_panels);
     let mut applied = Vec::with_capacity(n_panels);
@@ -367,6 +384,24 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                             v = 1e-6;
                         }
                         dst[i] = v;
+                    }
+                }
+            }
+
+            // Single-panel defects: additive on top of gain/offset/gradient
+            // (a transient in the light frames survives the stack's scaling),
+            // clipped to the window so no-data pixels stay exactly 0.
+            for &(dp, defx, defy, len, amp) in &spec.panel_defects {
+                if dp != id || defy < y0 || defy >= y1 {
+                    continue;
+                }
+                for x in defx..defx.saturating_add(len as u64) {
+                    if x < x0 || x >= x1 {
+                        continue;
+                    }
+                    let i = (defy * w + x) as usize;
+                    for c in 0..ch {
+                        frame[c * plane + i] += amp;
                     }
                 }
             }
@@ -444,6 +479,7 @@ mod tests {
             panel_gradient_range: (0.0, 0.0),
             panel_shift: vec![],
             panel_spike_angle: vec![],
+            panel_defects: vec![],
             seed: 42,
         }
     }
@@ -608,6 +644,62 @@ mod tests {
         std::fs::remove_dir_all(&dir2).unwrap();
     }
 
+    /// Defects are injected after gain/offset (additive, all channels),
+    /// clipped to the panel's window, and only into the named panel.
+    #[test]
+    fn panel_defects_inject_line_segments() {
+        let dir_clean = tmpdir("defects-clean");
+        let spec_clean = test_spec();
+        let clean = generate(&spec_clean, &dir_clean).unwrap();
+
+        let mut spec = test_spec();
+        let [x0, y0, x1, _y1] = clean.windows[1];
+        // A 5-px trail inside panel 1's window, a cosmic ray (len 1), and a
+        // segment overhanging the window's right edge (must be clipped).
+        let trail = (1usize, x0 + 4, y0 + 6, 5u32, 0.5f32);
+        let ray = (1usize, x0 + 10, y0 + 12, 1u32, 0.25f32);
+        let overhang = (1usize, x1 - 2, y0 + 3, 6u32, 0.125f32);
+        spec.panel_defects = vec![trail, ray, overhang];
+        let dir = tmpdir("defects");
+        let res = generate(&spec, &dir).unwrap();
+
+        let (w, _) = spec.canvas;
+        let plane = (spec.canvas.0 * spec.canvas.1) as usize;
+        // Same seed → identical truth/perturbations; the panel-1 frames must
+        // differ by exactly the defect amplitudes, on every channel.
+        for p in 0..res.panel_paths.len() {
+            let a = XisfPanel::open(&res.panel_paths[p]).unwrap();
+            let b = XisfPanel::open(&clean.panel_paths[p]).unwrap();
+            for c in 0..spec.channels as u64 {
+                let (da, db) = (a.channel(c), b.channel(c));
+                for i in 0..plane {
+                    let (x, y) = (i as u64 % w, i as u64 / w);
+                    let mut expect = 0.0f32;
+                    if p == 1 {
+                        for &(_, dx, dy, len, amp) in &spec.panel_defects {
+                            if y == dy && x >= dx && x < dx + len as u64 && x < x1 {
+                                expect += amp;
+                            }
+                        }
+                    }
+                    let diff = da[i] - db[i];
+                    assert!(
+                        (diff - expect).abs() < 1e-6,
+                        "panel {p} ch {c} ({x},{y}): diff {diff} vs expected {expect}"
+                    );
+                }
+            }
+        }
+
+        // Out-of-range panel index errors.
+        let mut bad = test_spec();
+        bad.panel_defects = vec![(9, 0, 0, 1, 0.1)];
+        assert!(generate(&bad, &tmpdir("defects-bad")).is_err());
+
+        std::fs::remove_dir_all(&dir_clean).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn spike_angle_len_mismatch_errors() {
         let dir = tmpdir("spikelen");
@@ -635,6 +727,7 @@ mod tests {
             panel_gradient_range: (0.0, 0.0),
             panel_shift: vec![],
             panel_spike_angle: vec![],
+            panel_defects: vec![],
             seed: 42,
         };
         let dir_plain = tmpdir("spikes-plain");

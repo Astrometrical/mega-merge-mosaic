@@ -404,6 +404,7 @@ mod tests {
             panel_gradient_range: (-0.01, 0.01),
             panel_shift: vec![],
             panel_spike_angle: vec![],
+            panel_defects: vec![],
             seed: 7,
         }
     }

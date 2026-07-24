@@ -21,6 +21,16 @@
 //! transition snaps hard so a star (or a diffraction-spike arm attached to
 //! one) crossing the seam is taken whole from one panel.
 //!
+//! In TwoBand mode a cross-panel **defect veto** (default on) restores the
+//! defect suppression that averaging used to provide: where ≥2 panels cover a
+//! pixel and the cell is star-mask-clear in both compared panels, a detail
+//! difference above [`DEFECT_VETO_FACTOR`] × the smaller of the two panels'
+//! cell detail RMS marks a single-panel transient (cosmic-ray residue,
+//! satellite trail), and the smaller-|d| detail is used instead of the
+//! owner's. Trade-off (by design): a *genuine* transient present in only one
+//! panel is suppressed too — exactly what we want for trails and cosmics.
+//! Feather mode is untouched (averaging already dilutes defects).
+//!
 //! Bands are computed rayon-parallel (over rows within a band) but delivered
 //! to the sink strictly in order. `downsample == 8` blends from the L8 summary
 //! means over fully-covered cells instead of touching the full-res mmaps —
@@ -63,6 +73,15 @@ pub const STAR_LOCK_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 /// them would leave cell-scale coloured blobs around stars and their spikes.
 pub const BASE_STAR_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 
+/// Defect-veto trigger: in the TwoBand detail stage, |owner detail − other
+/// detail| beyond this factor × the cell's detail RMS scale marks a
+/// single-panel defect. The scale is the *minimum* of the two compared
+/// panels' gain-corrected cell detail RMS: the defect itself inflates the
+/// carrying panel's cell RMS (a cell-crossing trail contributes ~0.33× its
+/// amplitude), so the owner's own RMS could never flag the very defect it
+/// carries — the cleaner panel's RMS is the defect-free noise scale.
+pub const DEFECT_VETO_FACTOR: f32 = 6.0;
+
 /// How the detail band is combined across panels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendMode {
@@ -87,11 +106,21 @@ pub struct BlendParams {
     /// Optional region of interest in full-res canvas coords `[x0,y0,x1,y1]`
     /// (exclusive); the output is the intersection with the union bbox.
     pub roi: Option<[u64; 4]>,
+    /// Cross-panel defect veto in the TwoBand detail stage (see the module
+    /// docs and [`DEFECT_VETO_FACTOR`]). No effect in Feather mode.
+    pub defect_veto: bool,
 }
 
 impl Default for BlendParams {
     fn default() -> Self {
-        Self { feather_px: 256.0, downsample: 1, band_rows: 256, mode: BlendMode::TwoBand, roi: None }
+        Self {
+            feather_px: 256.0,
+            downsample: 1,
+            band_rows: 256,
+            mode: BlendMode::TwoBand,
+            roi: None,
+            defect_veto: true,
+        }
     }
 }
 
@@ -151,6 +180,9 @@ struct PanelPrep {
     /// `channels × cells` — the source of the two-band base via bilinear
     /// upsampling.
     corr8: Vec<f32>,
+    /// Gain-corrected channel-max detail RMS per cell — the defect veto's
+    /// noise scale (kept even after `summary.detail` is dropped).
+    vdet: Vec<f32>,
 }
 
 impl PanelPrep {
@@ -253,7 +285,15 @@ fn prep_from_summaries(
 
             suppress_stars_in_base(&mut corr8, &summary, ch, mask);
 
-            PanelPrep { bbox: p.bbox, gains, offsets, surf, summary, dist, corr8 }
+            let vdet: Vec<f32> = (0..cells)
+                .map(|i| {
+                    (0..ch)
+                        .map(|c| summary.detail[c * cells + i] * gains[c])
+                        .fold(0.0f32, f32::max)
+                })
+                .collect();
+
+            PanelPrep { bbox: p.bbox, gains, offsets, surf, summary, dist, corr8, vdet }
         })
         .collect()
 }
@@ -723,6 +763,7 @@ fn blend_twoband_impl(
     let inv_block = 1.0 / BLOCK as f32;
     let inv_cw = 1.0f32 / session.canvas.0 as f32;
     let inv_ch = 1.0f64 / session.canvas.1 as f64;
+    let defect_veto = params.defect_veto;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
 
     for y0 in (0..out_h).step_by(band_rows) {
@@ -850,6 +891,41 @@ fn blend_twoband_impl(
                             let k = fallback();
                             for (c, d) in det.iter_mut().enumerate() {
                                 *d = full(k, c) - bases[k * nch + c];
+                            }
+                        }
+                    }
+
+                    // Cross-panel defect veto: a cosmic-ray residue or
+                    // satellite trail survives stacking in exactly one panel,
+                    // so where a second panel covers the pixel and the cell
+                    // is star-mask-clear in both, a detail difference far
+                    // above the cell's noise scale marks a single-panel
+                    // transient — take the smaller-|d| detail. (A genuine
+                    // one-panel transient is suppressed too; for trails and
+                    // cosmics that is the desired behaviour.)
+                    if defect_veto && cov.len() >= 2 {
+                        let ko = cov
+                            .iter()
+                            .find(|&&(k, _)| prow[k].pi as u16 == cell_owner)
+                            .map(|&(k, _)| k);
+                        let kp = ko.and_then(|ko| {
+                            cov.iter()
+                                .filter(|&&(k, _)| k != ko)
+                                .max_by(|a, b| a.1.total_cmp(&b.1))
+                                .map(|&(k, _)| k)
+                        });
+                        if let (Some(ko), Some(kp)) = (ko, kp) {
+                            let (po, pp) = (prow[ko].pi, prow[kp].pi);
+                            if !masks[po][cell] && !masks[pp][cell] {
+                                let thresh = DEFECT_VETO_FACTOR
+                                    * preps[po].vdet[cell].min(preps[pp].vdet[cell]);
+                                for (c, d) in det.iter_mut().enumerate() {
+                                    let d_o = full(ko, c) - bases[ko * nch + c];
+                                    let d_p = full(kp, c) - bases[kp * nch + c];
+                                    if (d_o - d_p).abs() > thresh {
+                                        *d = if d_o.abs() <= d_p.abs() { d_o } else { d_p };
+                                    }
+                                }
                             }
                         }
                     }
@@ -1084,7 +1160,7 @@ mod tests {
         let dir = tmpdir("feather");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1123,7 +1199,7 @@ mod tests {
         let dir = tmpdir("roi");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let full = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None };
+        let full = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
         let mut full_sink = MemSink::new();
         blend(&session, &phot, None, &graph, &full, &mut full_sink).unwrap();
 
@@ -1157,7 +1233,7 @@ mod tests {
             gains: vec![vec![2.0, 1.0]],
             offsets: vec![vec![0.01, 0.0]],
         };
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1191,7 +1267,7 @@ mod tests {
             0.05 + 0.1 * xn - 0.02 * yn + 0.2 * xn * xn
         };
 
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
         let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
@@ -1210,7 +1286,7 @@ mod tests {
         );
 
         // Same corrections must hold on the L8 preview path (cell centers).
-        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4, mode: BlendMode::Feather, roi: None };
+        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4, mode: BlendMode::Feather, roi: None, defect_veto: true };
         let mut sink8 = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params8, &mut sink8).unwrap();
         // Canvas cell (3,4) is A-only; center pixel (28, 36).
@@ -1226,7 +1302,7 @@ mod tests {
         let dir = tmpdir("l8");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3, mode: BlendMode::Feather, roi: None };
+        let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3, mode: BlendMode::Feather, roi: None, defect_veto: true };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1267,6 +1343,7 @@ mod tests {
             panel_gradient_range: (0.0, 0.0),
             panel_shift: vec![(0.0, 0.0), (0.8, 0.0)],
             panel_spike_angle: vec![0.0, 0.02],
+            panel_defects: vec![],
             // Seed chosen (deterministically) so a bright spiked star lands on
             // the band's midline, where the mask-disabled seam runs within
             // ramp reach of its arms — the kink scenario observed on real
@@ -1284,6 +1361,11 @@ mod tests {
             band_rows: 64,
             mode: BlendMode::TwoBand,
             roi: None,
+            // This test isolates the star mask's protection: in the run(false)
+            // teeth check every arm cell is unmasked and thus veto-eligible,
+            // and the veto could partially repair the arm mismatch the check
+            // must detect. The veto has its own tests.
+            defect_veto: false,
         };
 
         let run = |use_mask: bool| -> MemSink {
@@ -1400,12 +1482,209 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Mandatory phase-3F test 1: a satellite-trail piece and a cosmic ray in
+    /// ONE panel's overlap region are vetoed — the merged pixels match the
+    /// clean panel within noise — while `defect_veto: false` leaves them at
+    /// full strength (proving both directions).
+    #[test]
+    fn twoband_defect_veto_suppresses_overlap_defects() {
+        use crate::analyze::analyze_opts;
+        use crate::seam::compute_owner_map;
+        use crate::synth::{SynthSpec, generate};
+
+        let dir = tmpdir("veto");
+        // 2×1 grid on 768×480: windows [0,432) and [336,768), overlap band
+        // x∈[336,432). The band is 12×60 cells — under seam::DP_MIN_LONG on
+        // both axes — so ownership keeps the deterministic Voronoi midline at
+        // x≈384 and the defects (x ≥ 414) are owned by panel 1, the panel
+        // that carries them: without the veto they show at full strength.
+        let noise = 0.0025f32;
+        // Amplitudes thread the veto's needle deliberately: |Δdetail| ≈ 0.97
+        // amp must exceed 6× the clean panel's cell RMS (≈ noise), while the
+        // defect cell's own RMS (0.17×/0.12× amp for 2 px/1 px per cell) must
+        // stay under the star mask's 3×-median seed threshold — like the
+        // real defects that matter, bright but not star-bright. The trail
+        // starts at x=414 (cell phase 6) so its 4 px straddle two cells.
+        let trail = (1usize, 414u64, 268u64, 4u32, 0.032f32);
+        let ray = (1usize, 421u64, 156u64, 1u32, 0.040f32);
+        let spec = SynthSpec {
+            canvas: (768, 480),
+            channels: 1,
+            grid: (2, 1),
+            overlap_frac: 0.25,
+            n_stars: 30,
+            noise_sigma: noise,
+            panel_gain_range: (0.95, 1.1),
+            panel_offset_range: (-0.003, 0.005),
+            panel_gradient_range: (0.0, 0.0),
+            panel_shift: vec![],
+            panel_spike_angle: vec![],
+            panel_defects: vec![trail, ray],
+            seed: 11,
+        };
+        let res = generate(&spec, &dir.join("panels")).unwrap();
+        let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), None).unwrap();
+        let phot = Photometry::load(&session.photometry_path()).unwrap();
+        let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+
+        // Preconditions (defects must sit where the veto is allowed to act):
+        // their cells star-mask-clear in both panels and owned by panel 1.
+        let summaries: Vec<L8Summary> = session
+            .panels
+            .iter()
+            .map(|p| L8Summary::read(&session.summary_path(p.id)).unwrap())
+            .collect();
+        let masks: Vec<Vec<bool>> = summaries.iter().map(crate::seam::star_mask).collect();
+        let owner =
+            compute_owner_map(&summaries, &graph, &phot, None, session.canvas, 24.0);
+        for &(_, dx, dy, len, _) in &spec.panel_defects {
+            for x in dx..dx + len as u64 {
+                let cell =
+                    (dy / BLOCK as u64) as usize * owner.w8 as usize + (x / BLOCK as u64) as usize;
+                assert!(
+                    !masks[0][cell] && !masks[1][cell],
+                    "defect cell at ({x},{dy}) must be star-mask-clear (move it or reseed)"
+                );
+                assert_eq!(
+                    owner.owner[cell], 1,
+                    "defect cell at ({x},{dy}) must be owned by the defect panel"
+                );
+            }
+        }
+
+        let run = |veto: bool| -> MemSink {
+            let params = BlendParams {
+                feather_px: 24.0,
+                downsample: 1,
+                band_rows: 64,
+                mode: BlendMode::TwoBand,
+                roi: None,
+                defect_veto: veto,
+            };
+            let mut sink = MemSink::new();
+            blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+            sink
+        };
+        let on = run(true);
+        let off = run(false);
+
+        // Clean panel (0), corrected into the blend's photometric frame.
+        let w = spec.canvas.0 as usize;
+        let clean = crate::formats::xisf::XisfPanel::open(&res.panel_paths[0]).unwrap();
+        let (g0, o0) = (phot.gains[0][0] as f32, phot.offsets[0][0] as f32);
+        let corrected0: Vec<f32> = clean.channel(0).iter().map(|&v| v * g0 + o0).collect();
+        let bbox = union_bbox(&session).unwrap();
+
+        // Max |merged − clean panel| over the defect pixels ±1.
+        let defect_dist = |sink: &MemSink, d: (usize, u64, u64, u32, f32)| -> f32 {
+            let (_, dx, dy, len, _) = d;
+            let mut worst = 0.0f32;
+            for y in dy - 1..=dy + 1 {
+                for x in dx - 1..dx + len as u64 + 1 {
+                    let merged =
+                        sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
+                    worst = worst.max((merged - corrected0[y as usize * w + x as usize]).abs());
+                }
+            }
+            worst
+        };
+
+        let thresh = 6.0 * noise;
+        for (name, d) in [("trail", trail), ("ray", ray)] {
+            let d_on = defect_dist(&on, d);
+            let d_off = defect_dist(&off, d);
+            eprintln!("{name}: veto on {d_on:.4}, veto off {d_off:.4} (thresh {thresh:.4})");
+            assert!(
+                d_on < thresh,
+                "{name}: veto ON must match the clean panel within noise, got {d_on}"
+            );
+            assert!(
+                d_off > thresh,
+                "{name}: veto OFF must show the defect (teeth), got {d_off}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Mandatory phase-3F test 3: a defect *outside* any overlap has nothing
+    /// to be compared against — the owner's value stands untouched, veto ON.
+    #[test]
+    fn defect_outside_overlap_is_untouched() {
+        use crate::analyze::analyze_opts;
+        use crate::synth::{SynthSpec, generate};
+
+        let dir = tmpdir("veto-single");
+        // Windows [0,288) and [224,512): x=400 is covered by panel 1 alone.
+        let defect = (1usize, 400u64, 190u64, 4u32, 0.03f32);
+        let spec = SynthSpec {
+            canvas: (512, 384),
+            channels: 1,
+            grid: (2, 1),
+            overlap_frac: 0.25,
+            n_stars: 20,
+            noise_sigma: 0.0025,
+            panel_gain_range: (0.95, 1.1),
+            panel_offset_range: (-0.003, 0.005),
+            panel_gradient_range: (0.0, 0.0),
+            panel_shift: vec![],
+            panel_spike_angle: vec![],
+            panel_defects: vec![defect],
+            seed: 5,
+        };
+        let res = generate(&spec, &dir.join("panels")).unwrap();
+        let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), None).unwrap();
+        let phot = Photometry::load(&session.photometry_path()).unwrap();
+        let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample: 1,
+            band_rows: 64,
+            mode: BlendMode::TwoBand,
+            roi: None,
+            defect_veto: true,
+        };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+
+        let w = spec.canvas.0 as usize;
+        let panel = crate::formats::xisf::XisfPanel::open(&res.panel_paths[1]).unwrap();
+        let (g1, o1) = (phot.gains[0][1] as f32, phot.offsets[0][1] as f32);
+        let corrected1: Vec<f32> = panel.channel(0).iter().map(|&v| v * g1 + o1).collect();
+        let bbox = union_bbox(&session).unwrap();
+        let (_, dx, dy, len, amp) = defect;
+
+        // Single coverage: base + (full − base) reconstructs the corrected
+        // input exactly — including the defect, at full strength.
+        let mut worst = 0.0f32;
+        for y in dy - 2..=dy + 2 {
+            for x in dx - 2..dx + len as u64 + 2 {
+                let merged = sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
+                worst = worst.max((merged - corrected1[y as usize * w + x as usize]).abs());
+            }
+        }
+        eprintln!("outside-overlap defect: max |merged − corrected input| = {worst:.2e}");
+        assert!(worst < 1e-4, "owner value must stand untouched, max diff {worst}");
+
+        // And the defect really is present in the output (not vetoed away):
+        // the defect pixel towers over the row 4 px below by ~the amplitude.
+        let at = |x: u64, y: u64| sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
+        let step = at(dx + 1, dy) - at(dx + 1, dy + 4);
+        assert!(
+            step > 0.5 * amp * g1,
+            "defect must survive in single coverage: step {step} vs amp {amp}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn rejects_unsupported_downsample() {
         let dir = tmpdir("badds");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16, mode: BlendMode::Feather, roi: None };
+        let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
         let mut sink = MemSink::new();
         assert!(blend(&session, &phot, None, &graph, &params, &mut sink).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
