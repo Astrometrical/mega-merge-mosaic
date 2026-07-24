@@ -13,6 +13,7 @@
 //! frontends over [`session`].
 
 pub mod analyze;
+pub mod astrometry;
 pub mod blend;
 pub mod error;
 pub mod formats;
