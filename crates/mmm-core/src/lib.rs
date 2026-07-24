@@ -17,6 +17,7 @@ pub mod astrometry;
 pub mod blend;
 pub mod diag;
 pub mod error;
+pub mod flatten;
 pub mod formats;
 pub mod linalg;
 pub mod output;

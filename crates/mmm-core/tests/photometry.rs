@@ -29,6 +29,7 @@ fn analyze_recovers_applied_panel_transforms() {
         panel_gain_range: (0.7, 1.4),
         panel_offset_range: (-0.01, 0.02),
         panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],

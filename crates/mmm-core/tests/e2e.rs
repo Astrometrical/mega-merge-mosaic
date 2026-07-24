@@ -114,6 +114,7 @@ fn full_pipeline_recovers_ground_truth() {
         panel_gain_range: (0.7, 1.4),
         panel_offset_range: (-0.01, 0.02),
         panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
@@ -130,7 +131,7 @@ fn full_pipeline_recovers_ground_truth() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -292,6 +293,7 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
         panel_gain_range: (0.7, 1.4),
         panel_offset_range: (-0.01, 0.02),
         panel_gradient_range: (-0.006, 0.006),
+        global_gradient: (0.0, 0.0, 0.0),
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
@@ -305,7 +307,7 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
     assert_eq!(surf.order, 2);
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -420,6 +422,7 @@ fn surface_off_bypasses_cleanly() {
         panel_gain_range: (0.9, 1.1),
         panel_offset_range: (-0.005, 0.005),
         panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
@@ -438,7 +441,7 @@ fn surface_off_bypasses_cleanly() {
 
     let phot = Photometry::load(&session.photometry_path()).unwrap();
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -463,6 +466,7 @@ fn full_pipeline_twoband_recovers_ground_truth() {
         panel_gain_range: (0.7, 1.4),
         panel_offset_range: (-0.01, 0.02),
         panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
@@ -474,7 +478,7 @@ fn full_pipeline_twoband_recovers_ground_truth() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::TwoBand, roi: None, defect_veto: true };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::TwoBand, roi: None, defect_veto: true, flatten: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -542,6 +546,7 @@ fn twoband_single_panel_reconstructs_input() {
         panel_gain_range: (1.0, 1.0),
         panel_offset_range: (0.0, 0.0),
         panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
@@ -552,7 +557,7 @@ fn twoband_single_panel_reconstructs_input() {
     let phot = Photometry::load(&session.photometry_path()).unwrap();
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 32, mode: BlendMode::TwoBand, roi: None, defect_veto: true };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 32, mode: BlendMode::TwoBand, roi: None, defect_veto: true, flatten: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -644,6 +649,7 @@ fn twoband_never_averages_misregistered_stars() {
         panel_gain_range: (0.9, 1.2),
         panel_offset_range: (-0.005, 0.01),
         panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
         // Panel 1 is misregistered by 0.6 px in x — stars only.
         panel_shift: vec![(0.0, 0.0), (0.6, 0.0), (0.0, 0.0), (0.0, 0.0)],
         panel_spike_angle: vec![],
@@ -656,7 +662,7 @@ fn twoband_never_averages_misregistered_stars() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
 
     let run = |mode: BlendMode| -> MemSink {
-        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode, roi: None, defect_veto: true };
+        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode, roi: None, defect_veto: true, flatten: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
         sink
@@ -733,6 +739,225 @@ fn twoband_never_averages_misregistered_stars() {
         feather_fails > 0,
         "Feather mode passed the one-panel check for all {} stars — the test has no teeth",
         peaks.len()
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Synthetic case for the global-flatten tests: unit gains, zero offsets and
+/// a large common sky gradient added to every panel (invisible to photometry
+/// and per-panel surfaces — identical in overlaps).
+fn global_gradient_spec() -> SynthSpec {
+    SynthSpec {
+        canvas: (512, 384),
+        channels: 1,
+        grid: (2, 2),
+        overlap_frac: 0.25,
+        n_stars: 30,
+        noise_sigma: 0.002,
+        panel_gain_range: (1.0, 1.0),
+        panel_offset_range: (0.0, 0.0),
+        panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.3, 0.25),
+        panel_shift: vec![],
+        panel_spike_angle: vec![],
+        panel_defects: vec![],
+        seed: 21,
+    }
+}
+
+/// Fit a plane `c0 + c1·xn + c2·yn` to `(xn, yn, v)` samples and return the
+/// amplitude of its varying part about the canvas center:
+/// `max |c1·(xn−0.5) + c2·(yn−0.5)|` over the samples.
+fn plane_amp_about_center(samples: &[(f64, f64, f64)]) -> f64 {
+    let mut a = [0.0f64; 9];
+    let mut b = [0.0f64; 3];
+    for &(x, y, v) in samples {
+        let phi = [1.0, x, y];
+        for i in 0..3 {
+            for j in 0..3 {
+                a[i * 3 + j] += phi[i] * phi[j];
+            }
+            b[i] += phi[i] * v;
+        }
+    }
+    let c = solve_dense(&mut a, &mut b, 3).unwrap();
+    samples
+        .iter()
+        .map(|&(x, y, _)| (c[1] * (x - 0.5) + c[2] * (y - 0.5)).abs())
+        .fold(0.0f64, f64::max)
+}
+
+/// Background residual samples `(xn, yn, merged − truth_in_ref_frame)` over
+/// interior background pixels (16 px inside the window union, star pixels
+/// excluded by a truth threshold).
+fn background_residual_samples(
+    sink: &MemSink,
+    res: &mmm_core::synth::SynthResult,
+    spec: &SynthSpec,
+    bbox: [u64; 4],
+    ref_gain: f32,
+    ref_offset: f32,
+) -> Vec<(f64, f64, f64)> {
+    let (w, h) = (spec.canvas.0 as usize, spec.canvas.1 as usize);
+    let mut mask = vec![false; w * h];
+    for &[x0, y0, x1, y1] in &res.windows {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                mask[y as usize * w + x as usize] = true;
+            }
+        }
+    }
+    let interior = erode(&mask, w, h, 16);
+    let (cx0, cy0) = (bbox[0] as usize, bbox[1] as usize);
+    let mut samples = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let truth = res.truth[y * w + x];
+            if !interior[y * w + x] || truth >= 0.12 {
+                continue; // star cores/wings must not steer the plane fit
+            }
+            let merged = sink.at(0, x - cx0, y - cy0);
+            let r = merged - (truth * ref_gain + ref_offset);
+            samples.push((x as f64 / w as f64, y as f64 / h as f64, r as f64));
+        }
+    }
+    assert!(samples.len() > 10_000, "background sample unexpectedly small");
+    samples
+}
+
+/// Mandatory phase-3H test 1: a sky gradient common to ALL panels survives
+/// photometry (it cancels in every overlap) but `flatten: Some(1)` removes
+/// it — the post-flatten background residual's plane-fit amplitude is < 10%
+/// of the injected amplitude, measured against the truth mapped through the
+/// reference panel like the other e2e tests. The downsampled preview path
+/// must subtract the same field.
+#[test]
+fn flatten_removes_common_sky_gradient() {
+    let dir = tempdir("flatten-on");
+    let spec = global_gradient_spec();
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+    let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), None).unwrap();
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+    let bbox = union_bbox(&session).unwrap();
+
+    let run = |flatten: Option<u32>, downsample: u32| -> MemSink {
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample,
+            band_rows: 64,
+            mode: BlendMode::TwoBand,
+            roi: None,
+            defect_veto: true,
+            flatten,
+        };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+        sink
+    };
+    let flat = run(Some(1), 1);
+    assert!(flat.data.iter().all(|v| v.is_finite()), "no NaN/Inf in flattened output");
+
+    let n_panels = res.applied.len();
+    let reference = (0..n_panels)
+        .find(|&p| phot.gains[0][p] == 1.0 && phot.offsets[0][p] == 0.0)
+        .expect("one panel must carry the gauge (g=1, o=0)");
+    let (ref_gain, ref_offset) = res.applied[reference];
+
+    let samples = background_residual_samples(&flat, &res, &spec, bbox, ref_gain, ref_offset);
+    let amp_flat = plane_amp_about_center(&samples);
+
+    // Injected amplitude over the same pixels.
+    let (_, gb, gc) = spec.global_gradient;
+    let injected: Vec<(f64, f64, f64)> = samples
+        .iter()
+        .map(|&(x, y, _)| (x, y, gb as f64 * x + gc as f64 * y))
+        .collect();
+    let amp_inj = plane_amp_about_center(&injected);
+    assert!(amp_inj > 0.2, "injected gradient amplitude sanity: {amp_inj:.3}");
+
+    eprintln!("flatten on: residual plane amp {amp_flat:.4} vs injected {amp_inj:.4}");
+    assert!(
+        amp_flat < 0.1 * amp_inj,
+        "post-flatten background plane amplitude {amp_flat:.4} >= 10% of injected {amp_inj:.4}"
+    );
+
+    // Downsample path: the L8 preview subtracts the same global field — the
+    // (off − on) preview difference is that field, a plane whose amplitude
+    // matches the injected gradient (the fit also absorbs the truth's own
+    // mild background trend, hence the generous band).
+    let l8_on = run(Some(1), 8);
+    let l8_off = run(None, 8);
+    assert_eq!((l8_on.w, l8_on.h), (l8_off.w, l8_off.h));
+    let (w, h) = (spec.canvas.0 as f64, spec.canvas.1 as f64);
+    let (gx0, gy0) = (bbox[0] / 8, bbox[1] / 8);
+    let mut diffs = Vec::new();
+    for cy in 0..l8_on.h {
+        for cx in 0..l8_on.w {
+            let (von, voff) = (l8_on.at(0, cx, cy), l8_off.at(0, cx, cy));
+            if von == 0.0 || voff == 0.0 {
+                continue; // uncovered cell
+            }
+            let xn = (gx0 as f64 + cx as f64 + 0.5) * 8.0 / w;
+            let yn = (gy0 as f64 + cy as f64 + 0.5) * 8.0 / h;
+            diffs.push((xn, yn, (voff - von) as f64));
+        }
+    }
+    assert!(diffs.len() > 500, "too few covered preview cells: {}", diffs.len());
+    let amp_l8 = plane_amp_about_center(&diffs);
+    eprintln!("L8 preview subtracted-field amp {amp_l8:.4} vs injected {amp_inj:.4}");
+    assert!(
+        amp_l8 > 0.7 * amp_inj && amp_l8 < 1.3 * amp_inj,
+        "L8 preview must subtract the same field: amp {amp_l8:.4} vs injected {amp_inj:.4}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Mandatory phase-3H test 2: with flatten off (the default), the common sky
+/// gradient passes through intact.
+#[test]
+fn flatten_off_keeps_common_sky_gradient() {
+    let dir = tempdir("flatten-off");
+    let spec = global_gradient_spec();
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+    let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), None).unwrap();
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+    let bbox = union_bbox(&session).unwrap();
+
+    let params = BlendParams {
+        feather_px: 24.0,
+        downsample: 1,
+        band_rows: 64,
+        mode: BlendMode::TwoBand,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+    };
+    let mut sink = MemSink::new();
+    blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+
+    let n_panels = res.applied.len();
+    let reference = (0..n_panels)
+        .find(|&p| phot.gains[0][p] == 1.0 && phot.offsets[0][p] == 0.0)
+        .expect("one panel must carry the gauge (g=1, o=0)");
+    let (ref_gain, ref_offset) = res.applied[reference];
+
+    let samples = background_residual_samples(&sink, &res, &spec, bbox, ref_gain, ref_offset);
+    let amp_off = plane_amp_about_center(&samples);
+    let (_, gb, gc) = spec.global_gradient;
+    let injected: Vec<(f64, f64, f64)> = samples
+        .iter()
+        .map(|&(x, y, _)| (x, y, gb as f64 * x + gc as f64 * y))
+        .collect();
+    let amp_inj = plane_amp_about_center(&injected);
+
+    eprintln!("flatten off: residual plane amp {amp_off:.4} vs injected {amp_inj:.4}");
+    assert!(
+        amp_off > 0.6 * amp_inj,
+        "with flatten off the gradient must survive: amp {amp_off:.4} vs injected {amp_inj:.4}"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();

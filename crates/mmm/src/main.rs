@@ -86,6 +86,13 @@ enum Command {
         /// cosmic-ray residue and satellite trails that survive in one panel
         #[arg(long, default_value = "on")]
         defect_veto: String,
+
+        /// Opt-in global background flatten: off (default), 1 (plane) or
+        /// 2 (quadratic). Fits the merged mosaic's background and subtracts
+        /// its varying part, preserving the central level; refuses on
+        /// signal-dominated (nebula-heavy) mosaics
+        #[arg(long, default_value = "off")]
+        flatten: String,
     },
 }
 
@@ -166,7 +173,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Report { session, seam_png } => report(&session, seam_png.as_deref()),
-        Command::Blend { session, output, downsample, feather, mode, png, roi, defect_veto } => {
+        Command::Blend { session, output, downsample, feather, mode, png, roi, defect_veto, flatten } => {
             let mode = match mode.as_str() {
                 "feather" => mmm_core::blend::BlendMode::Feather,
                 "twoband" => mmm_core::blend::BlendMode::TwoBand,
@@ -177,8 +184,24 @@ fn main() -> anyhow::Result<()> {
                 "off" => false,
                 other => anyhow::bail!("--defect-veto must be on or off (got {other})"),
             };
+            let flatten = match flatten.as_str() {
+                "off" => None,
+                "1" => Some(1),
+                "2" => Some(2),
+                other => anyhow::bail!("--flatten must be off, 1 or 2 (got {other})"),
+            };
             let roi = roi.as_deref().map(parse_roi).transpose()?;
-            blend_cmd(&session, &output, downsample, feather, mode, png.as_deref(), roi, defect_veto)
+            blend_cmd(
+                &session,
+                &output,
+                downsample,
+                feather,
+                mode,
+                png.as_deref(),
+                roi,
+                defect_veto,
+                flatten,
+            )
         }
     }
 }
@@ -193,6 +216,7 @@ fn blend_cmd(
     png: Option<&std::path::Path>,
     roi: Option<[u64; 4]>,
     defect_veto: bool,
+    flatten: Option<u32>,
 ) -> anyhow::Result<()> {
     use mmm_core::astrometry::{wcs_cards, wcs_from_properties};
     use mmm_core::blend::{BlendParams, blend, output_bbox};
@@ -205,8 +229,15 @@ fn blend_cmd(
     let session = mmm_core::session::Session::open(session_dir)?;
     let graph = mmm_core::overlap::OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = mmm_core::photometry::Photometry::load(&session.photometry_path())?;
-    let params_for_bbox =
-        BlendParams { feather_px: feather, downsample, mode, roi, defect_veto, ..Default::default() };
+    let params_for_bbox = BlendParams {
+        feather_px: feather,
+        downsample,
+        mode,
+        roi,
+        defect_veto,
+        flatten,
+        ..Default::default()
+    };
     let bbox = output_bbox(&session, &params_for_bbox)?;
     let ds = downsample.max(1) as u64;
     // Crop origin in output pixel units (best-effort for downsampled previews:
@@ -247,6 +278,10 @@ fn blend_cmd(
     match &surfaces {
         Some(s) => println!("surfaces: applying residual corrections (order {})", s.order),
         None => println!("surfaces: none (analyze ran with --surface off)"),
+    }
+    match flatten {
+        Some(o) => println!("flatten: order {o} global background flatten (opt-in)"),
+        None => println!("flatten: off"),
     }
 
     let params = params_for_bbox;

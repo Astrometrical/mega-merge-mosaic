@@ -31,6 +31,14 @@
 //! panel is suppressed too — exactly what we want for trails and cosmics.
 //! Feather mode is untouched (averaging already dilutes defects).
 //!
+//! An opt-in **global flatten** ([`BlendParams::flatten`], default off) fits
+//! an order-1/2 polynomial per channel to the merged L8 background
+//! ([`crate::flatten`]) and subtracts `f(x, y) − f(canvas center)` during
+//! output on every path (full-res feather, two-band, and the L8 preview) —
+//! implemented by folding the negated delta into each panel's surface terms,
+//! which is exactly equivalent and leaves all cross-panel differences (seams,
+//! detail ownership, defect veto) untouched.
+//!
 //! Bands are computed rayon-parallel (over rows within a band) but delivered
 //! to the sink strictly in order. `downsample == 8` blends from the L8 summary
 //! means over fully-covered cells instead of touching the full-res mmaps —
@@ -40,6 +48,7 @@
 
 use rayon::prelude::*;
 
+use crate::flatten::Flatten;
 use crate::formats::xisf::XisfPanel;
 use crate::overlap::{OverlapGraph, distance_map};
 use crate::photometry::Photometry;
@@ -109,6 +118,13 @@ pub struct BlendParams {
     /// Cross-panel defect veto in the TwoBand detail stage (see the module
     /// docs and [`DEFECT_VETO_FACTOR`]). No effect in Feather mode.
     pub defect_veto: bool,
+    /// Opt-in global background flatten: fit an order-1/2 polynomial per
+    /// channel to the *merged* L8 background ([`crate::flatten`]) and
+    /// subtract `f(x, y) − f(canvas center)` during output — removes a sky
+    /// gradient common to all panels (which per-panel corrections cannot
+    /// see) while preserving the central level. `None` = off (default).
+    /// Errors when the mosaic is signal-dominated (< 20% background cells).
+    pub flatten: Option<u32>,
 }
 
 impl Default for BlendParams {
@@ -120,6 +136,7 @@ impl Default for BlendParams {
             mode: BlendMode::TwoBand,
             roi: None,
             defect_veto: true,
+            flatten: None,
         }
     }
 }
@@ -206,23 +223,56 @@ pub(crate) fn load_summaries(session: &Session) -> Result<Vec<L8Summary>> {
     session.panels.par_iter().map(|p| L8Summary::read(&session.summary_path(p.id))).collect()
 }
 
-/// Load summaries, compute distance maps, and resolve per-panel corrections.
+/// Load summaries, compute distance maps, and resolve per-panel corrections
+/// (fitting the optional global flatten first — it needs the star masks).
 fn prep_panels(
     session: &Session,
     phot: &Photometry,
     surfaces: Option<&Surfaces>,
+    flatten_order: Option<u32>,
 ) -> Result<Vec<PanelPrep>> {
     let summaries = load_summaries(session)?;
     let masks: Vec<Vec<bool>> = summaries.par_iter().map(star_mask).collect();
-    Ok(prep_from_summaries(session, phot, surfaces, summaries, &masks))
+    let flat = fit_flatten_opt(&summaries, &masks, phot, surfaces, session, flatten_order)?;
+    Ok(prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks))
+}
+
+/// Fit the global flatten when requested ([`BlendParams::flatten`]).
+fn fit_flatten_opt(
+    summaries: &[L8Summary],
+    masks: &[Vec<bool>],
+    phot: &Photometry,
+    surfaces: Option<&Surfaces>,
+    session: &Session,
+    order: Option<u32>,
+) -> Result<Option<Flatten>> {
+    order
+        .map(|o| {
+            crate::flatten::fit_flatten(
+                summaries,
+                masks,
+                phot,
+                surfaces,
+                session.canvas,
+                o,
+                &session.dir,
+            )
+        })
+        .transpose()
 }
 
 /// Build the per-panel blend contexts from already-loaded summaries; `masks`
-/// are the panels' connected star masks (base-band exclusion).
+/// are the panels' connected star masks (base-band exclusion). When `flat`
+/// is set, its delta `f(x,y) − f(center)` is folded (negated) into every
+/// panel's surface terms — subtracting the same global field from every
+/// panel's correction subtracts it from the blended output on every path
+/// (feather, two-band, L8 preview), while cross-panel differences (seams,
+/// detail bands) are untouched.
 fn prep_from_summaries(
     session: &Session,
     phot: &Photometry,
     surfaces: Option<&Surfaces>,
+    flat: Option<&Flatten>,
     summaries: Vec<L8Summary>,
     masks: &[Vec<bool>],
 ) -> Vec<PanelPrep> {
@@ -241,7 +291,10 @@ fn prep_from_summaries(
                     *d = 1e30;
                 }
             }
-            let (gains, offsets, surf) = panel_correction_terms(phot, surfaces, p.id, ch);
+            let (gains, offsets, mut surf) = panel_correction_terms(phot, surfaces, p.id, ch);
+            if let Some(f) = flat {
+                f.apply_to_surf(&mut surf);
+            }
 
             // Corrected cell means at cell centers: the two-band base plane.
             let mut corr8 =
@@ -523,7 +576,7 @@ fn blend_full(
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
-    let preps = prep_panels(session, phot, surfaces)?;
+    let preps = prep_panels(session, phot, surfaces, params.flatten)?;
     let panels: Vec<XisfPanel> = session
         .panels
         .par_iter()
@@ -748,7 +801,9 @@ fn blend_twoband_impl(
         &masks,
     );
     let (ramps, hard) = detail_transition_maps(&owner, &masks);
-    let mut preps = prep_from_summaries(session, phot, surfaces, summaries, &masks);
+    let flat = fit_flatten_opt(&summaries, &masks, phot, surfaces, session, params.flatten)?;
+    let mut preps =
+        prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks);
     for p in &mut preps {
         p.summary.detail = Vec::new(); // only needed for the maps above
     }
@@ -985,7 +1040,7 @@ fn blend_l8(
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
-    let preps = prep_panels(session, phot, surfaces)?;
+    let preps = prep_panels(session, phot, surfaces, params.flatten)?;
     let bbox = output_bbox(session, params)?;
     let (w8, h8) = (preps[0].summary.w8, preps[0].summary.h8);
     let b = BLOCK as u64;
@@ -1186,7 +1241,7 @@ mod tests {
         let dir = tmpdir("feather");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1225,7 +1280,7 @@ mod tests {
         let dir = tmpdir("roi");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let full = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
+        let full = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
         let mut full_sink = MemSink::new();
         blend(&session, &phot, None, &graph, &full, &mut full_sink).unwrap();
 
@@ -1259,7 +1314,7 @@ mod tests {
             gains: vec![vec![2.0, 1.0]],
             offsets: vec![vec![0.01, 0.0]],
         };
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1293,7 +1348,7 @@ mod tests {
             0.05 + 0.1 * xn - 0.02 * yn + 0.2 * xn * xn
         };
 
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
         let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
@@ -1312,7 +1367,7 @@ mod tests {
         );
 
         // Same corrections must hold on the L8 preview path (cell centers).
-        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4, mode: BlendMode::Feather, roi: None, defect_veto: true };
+        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
         let mut sink8 = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params8, &mut sink8).unwrap();
         // Canvas cell (3,4) is A-only; center pixel (28, 36).
@@ -1328,7 +1383,7 @@ mod tests {
         let dir = tmpdir("l8");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3, mode: BlendMode::Feather, roi: None, defect_veto: true };
+        let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1367,6 +1422,7 @@ mod tests {
             panel_gain_range: (0.95, 1.1),
             panel_offset_range: (-0.003, 0.005),
             panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
             panel_shift: vec![(0.0, 0.0), (0.8, 0.0)],
             panel_spike_angle: vec![0.0, 0.02],
             panel_defects: vec![],
@@ -1392,6 +1448,7 @@ mod tests {
             // and the veto could partially repair the arm mismatch the check
             // must detect. The veto has its own tests.
             defect_veto: false,
+            flatten: None,
         };
 
         let run = |use_mask: bool| -> MemSink {
@@ -1543,6 +1600,7 @@ mod tests {
             panel_gain_range: (0.95, 1.1),
             panel_offset_range: (-0.003, 0.005),
             panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![trail, ray],
@@ -1586,6 +1644,7 @@ mod tests {
                 mode: BlendMode::TwoBand,
                 roi: None,
                 defect_veto: veto,
+                flatten: None,
             };
             let mut sink = MemSink::new();
             blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -1653,6 +1712,7 @@ mod tests {
             panel_gain_range: (0.95, 1.1),
             panel_offset_range: (-0.003, 0.005),
             panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![defect],
@@ -1670,6 +1730,7 @@ mod tests {
             mode: BlendMode::TwoBand,
             roi: None,
             defect_veto: true,
+            flatten: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -1710,7 +1771,7 @@ mod tests {
         let dir = tmpdir("badds");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true };
+        let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
         let mut sink = MemSink::new();
         assert!(blend(&session, &phot, None, &graph, &params, &mut sink).is_err());
         std::fs::remove_dir_all(&dir).unwrap();

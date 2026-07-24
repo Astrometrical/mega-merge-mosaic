@@ -33,6 +33,13 @@ pub struct SynthSpec {
     /// applied inside the window on top of gain/offset. `(0.0, 0.0)` is a
     /// strict no-op (phase-1 behavior).
     pub panel_gradient_range: (f32, f32),
+    /// Common additive gradient plane `a + b·x/w + c·y/h` (normalized canvas
+    /// coords) added to *every* panel inside its window, after gain/offset —
+    /// a sky gradient shared by all panels (identical in overlaps, so the
+    /// photometric solve and per-panel surfaces cannot see it; only the
+    /// global flatten can remove it). NOT included in the returned `truth`.
+    /// `(0.0, 0.0, 0.0)` is a strict no-op.
+    pub global_gradient: (f32, f32, f32),
     /// Per-panel sub-pixel shift `(dx, dy)` of the *star positions only* —
     /// background and noise stay put. Simulates residual misregistration.
     /// Empty = no shift; otherwise must have one entry per panel.
@@ -367,15 +374,16 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                 Some(d)
             };
 
+            let (gga, ggb, ggc) = spec.global_gradient;
             frame.fill(0.0);
             for c in 0..ch {
                 let src = &truth[c * plane..(c + 1) * plane];
                 let dst = &mut frame[c * plane..(c + 1) * plane];
                 for y in y0..y1 {
-                    let grad_y = ga + gc * (y as f32 / h as f32);
+                    let grad_y = ga + gga + (gc + ggc) * (y as f32 / h as f32);
                     for x in x0..x1 {
                         let i = (y * w + x) as usize;
-                        let grad = grad_y + gb * (x as f32 / w as f32);
+                        let grad = grad_y + (gb + ggb) * (x as f32 / w as f32);
                         let star = star_delta.as_ref().map_or(0.0, |d| d[i]);
                         let mut v = (src[i] + star) * gain + offset + grad;
                         if v == 0.0 {
@@ -477,6 +485,7 @@ mod tests {
             panel_gain_range: (0.7, 1.4),
             panel_offset_range: (-0.01, 0.02),
             panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![],
@@ -644,6 +653,47 @@ mod tests {
         std::fs::remove_dir_all(&dir2).unwrap();
     }
 
+    /// The common global gradient is added to every panel's window (after
+    /// gain/offset, identically across panels) and is NOT in the truth.
+    #[test]
+    fn generate_applies_common_global_gradient() {
+        let dir_clean = tmpdir("gg-clean");
+        let clean = generate(&test_spec(), &dir_clean).unwrap();
+
+        let mut spec = test_spec();
+        spec.global_gradient = (0.01, 0.05, -0.03);
+        let dir = tmpdir("gg");
+        let res = generate(&spec, &dir).unwrap();
+
+        // Same seed → identical truth (the gradient lives in the panels only).
+        assert_eq!(res.truth, clean.truth);
+
+        let (w, h) = spec.canvas;
+        let (ga, gb, gc) = spec.global_gradient;
+        for (p, path) in res.panel_paths.iter().enumerate() {
+            let a = XisfPanel::open(path).unwrap();
+            let b = XisfPanel::open(&clean.panel_paths[p]).unwrap();
+            let [x0, y0, x1, y1] = res.windows[p];
+            for c in 0..spec.channels as u64 {
+                let (da, db) = (a.channel(c), b.channel(c));
+                for y in (y0..y1).step_by(3) {
+                    for x in (x0..x1).step_by(3) {
+                        let i = (y * w + x) as usize;
+                        let expect = ga + gb * (x as f32 / w as f32) + gc * (y as f32 / h as f32);
+                        let diff = da[i] - db[i];
+                        assert!(
+                            (diff - expect).abs() < 1e-5,
+                            "panel {p} ch {c} ({x},{y}): diff {diff} vs global gradient {expect}"
+                        );
+                    }
+                }
+            }
+        }
+
+        std::fs::remove_dir_all(&dir_clean).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Defects are injected after gain/offset (additive, all channels),
     /// clipped to the panel's window, and only into the named panel.
     #[test]
@@ -725,6 +775,7 @@ mod tests {
             panel_gain_range: (1.0, 1.0),
             panel_offset_range: (0.0, 0.0),
             panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![],
