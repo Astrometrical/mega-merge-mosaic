@@ -52,8 +52,15 @@ mmm blend   --session orion.mmm-session -o crop.fits --roi 5000,3500,2000,2000
 mmm blend   --session orion.mmm-session -o prev.fits --downsample 8 --png prev.png
 ```
 
-Phase 3 candidates: FITS/compressed-XISF input, optional global gradient
-flatten, full Laplacian pyramid, wgpu GPU path, GUI.
+Phase 3 (quality) added: connected star masks so seams can never kink a
+diffraction spike, a cross-panel defect veto (cosmic residue and satellite
+trails in overlaps are suppressed, not shown at full strength), seam-map
+diagnostics (`mmm report --seam-png map.png` + per-edge seam Δ), and an
+opt-in `--flatten 1|2` global background flatten that provably cannot dig
+holes in nebulosity. 97 tests.
+
+Phase 4 candidates: FITS/compressed-XISF input, full Laplacian pyramid,
+wgpu GPU path, GUI.
 
 ## Build
 

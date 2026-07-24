@@ -208,6 +208,35 @@ All four phase-2 tasks landed (75 tests, clippy clean). Real-data numbers,
   linear Gnomonic → exact TAN cards, center error 0.0″, crop-shift invariant.
   Downsampled previews get no WCS (CD would need rescaling — refusing to lie).
 
+## Phase 3 results (2026-07-25)
+
+Quality-only phase (user directive: no GPU). 97 tests, clippy clean.
+
+- **Connected star masks** (spike-kink fix): flood-fill masks (seed 3×,
+  grow 1.5× median detail) follow diffraction-spike arms out from cores;
+  used by seam DP cost (+100× median on masked cells), star-lock, and base
+  exclusion. Spike-integrity test: merged arms match ONE panel under 0.8 px
+  shift + 0.02 rad spike rotation (fails with masks off). Real-data diff vs
+  phase 2: background identical; seam-adjacent stars now owned whole.
+- **Defect veto**: in overlaps, detail outliers vs the partner panel
+  (>6× the cleaner panel's cell RMS, star-mask-clear both sides) take the
+  smaller detail — cosmic residue/satellite trails are suppressed instead of
+  shown at full strength. Plan's owner-RMS threshold was self-defeating (a
+  trail inflates its own cell RMS); min-of-two used instead. Real data:
+  ~1.9k sub-visible single-pixel fixes, star cores byte-identical.
+- **Diagnostics**: `mmm report --seam-png` renders the owner map (tinted
+  regions, boundaries, panel ids) over the preview; per-edge `seam Δ` (mean
+  |corrected_a−corrected_b| over boundary cells, ⚠ >3× median). Orion: all
+  seams ≤7e-5 linear; the only ⚠ edge borders PANEL-8's bright background;
+  seams visibly detour around stars and thread the M42/Running Man corridor.
+- **Opt-in `--flatten 1|2`**: global background poly fitted to the merged
+  L8 background (star-mask + median+3×MAD excluded), folded equally into all
+  panels' corrections — cross-panel math (seams, veto) provably unaffected,
+  so nebula hole-digging is structurally impossible (verified). Halves the
+  varying colour cast; remaining cast is genuine IFN. Not a GraXpert
+  replacement; refuses when <20% background. Caveat: the background
+  thresholds are relative, so a >80%-structure mosaic can evade the refusal.
+
 ## Performance notes
 
 - Full-plane scan measured at ~0.9 GB/s single-threaded; analyze is I/O-bound
