@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use mmm_core::analyze::analyze;
+use mmm_core::overlap::OverlapGraph;
 use mmm_core::session::Session;
 use mmm_core::summary::L8Summary;
 
@@ -118,6 +119,32 @@ fn analyze_two_overlapping_panels() {
     assert_eq!(reopened.panels[1].bbox, [24, 0, 64, 48]);
     assert!(reopened.summary_path(0).is_file());
     assert!(reopened.summary_path(1).is_file());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn analyze_builds_and_saves_overlap_graph() {
+    let dir = tempdir("graph");
+    let (w, h) = (128u64, 128u64);
+    let a = dir.join("a.xisf");
+    let b = dir.join("b.xisf");
+    // Overlap x ∈ [48,80) → L8 cells x8 ∈ [6,10), all 16 cell rows = 64 cells.
+    make_panel(&a, w, h, &[0.5], 0, 80);
+    make_panel(&b, w, h, &[0.25], 48, 128);
+
+    let session = analyze(&[a, b], &dir.join("s.mmm-session")).unwrap();
+    let graph_path = session.overlap_graph_path();
+    assert_eq!(graph_path, session.dir.join("analysis").join("overlap_graph.json"));
+    assert!(graph_path.is_file(), "analyze must persist analysis/overlap_graph.json");
+
+    let graph = OverlapGraph::load(&graph_path).unwrap();
+    assert_eq!(graph.edges.len(), 1);
+    let e = &graph.edges[0];
+    assert_eq!((e.a, e.b), (0, 1));
+    assert_eq!(e.n_cells, 64);
+    assert_eq!(e.bbox8, [6, 0, 10, 16]);
+    assert_eq!(graph.components(2), vec![vec![0, 1]]);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

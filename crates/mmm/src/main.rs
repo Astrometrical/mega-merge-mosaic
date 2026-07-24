@@ -35,6 +35,13 @@ enum Command {
         #[arg(short, long, default_value = "mosaic.mmm-session")]
         session: std::path::PathBuf,
     },
+
+    /// Report analysis results: the overlap-graph edge table
+    Report {
+        /// Session directory produced by `mmm analyze`
+        #[arg(short, long, default_value = "mosaic.mmm-session")]
+        session: std::path::PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -97,7 +104,60 @@ fn main() -> anyhow::Result<()> {
             println!("analyze: {:.2}s", t0.elapsed().as_secs_f64());
             Ok(())
         }
+        Command::Report { session } => report(&session),
     }
+}
+
+fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {
+    use mmm_core::overlap::OverlapGraph;
+    use mmm_core::session::Session;
+
+    let session = Session::open(session_dir)?;
+    let graph = OverlapGraph::load(&session.overlap_graph_path())?;
+    let (w, h, ch) = session.canvas;
+    println!(
+        "canvas: {w}x{h} x{ch}ch   panels: {}   session: {}",
+        session.panels.len(),
+        session.dir.display()
+    );
+
+    let name = |id: usize| -> String {
+        session
+            .panels
+            .get(id)
+            .and_then(|p| p.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("panel {id}"))
+    };
+    println!("\noverlap edges ({}):", graph.edges.len());
+    println!(
+        "{:>3}-{:<3} {:>8} {:>12}  {:<24} files",
+        "a", "b", "cells", "~px", "bbox8 [x0,x1)x[y0,y1)"
+    );
+    for e in &graph.edges {
+        let bbox = format!(
+            "[{},{})x[{},{})",
+            e.bbox8[0], e.bbox8[2], e.bbox8[1], e.bbox8[3]
+        );
+        println!(
+            "{:>3}-{:<3} {:>8} {:>12}  {:<24} {} | {}",
+            e.a,
+            e.b,
+            e.n_cells,
+            e.n_cells * 64,
+            bbox,
+            name(e.a),
+            name(e.b)
+        );
+    }
+
+    let comps = graph.components(session.panels.len());
+    println!("\nconnected components: {}", comps.len());
+    for (i, comp) in comps.iter().enumerate() {
+        let ids = comp.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(" ");
+        println!("  #{i}: {ids}");
+    }
+    Ok(())
 }
 
 fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {

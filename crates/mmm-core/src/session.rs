@@ -74,6 +74,11 @@ impl Session {
     pub fn summary_path(&self, id: usize) -> PathBuf {
         self.dir.join("panels").join(id.to_string()).join("summary.bin")
     }
+
+    /// Path of the overlap graph: `analysis/overlap_graph.json`.
+    pub fn overlap_graph_path(&self) -> PathBuf {
+        self.dir.join("analysis").join("overlap_graph.json")
+    }
 }
 
 #[cfg(test)]

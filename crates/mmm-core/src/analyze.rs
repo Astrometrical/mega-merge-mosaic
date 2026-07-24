@@ -1,5 +1,6 @@
 //! Analyze stage: one streaming pass per panel producing the L8 summary,
-//! content bbox, and per-channel statistics, persisted into a session dir.
+//! content bbox, and per-channel statistics, persisted into a session dir,
+//! followed by the overlap-graph build over the collected summaries.
 //!
 //! Panels are scanned in parallel (rayon; the work is I/O-bound). Each scan is
 //! a single sequential pass over the mmap'd planes: per image row the channel
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::formats::xisf::XisfPanel;
+use crate::overlap::OverlapGraph;
 use crate::session::{PanelMeta, Session};
 use crate::summary::{BLOCK, L8Summary};
 use crate::{Error, Result};
@@ -22,8 +24,9 @@ struct PanelScan {
     canvas: (u64, u64, u64),
 }
 
-/// Analyze `paths` into a session at `session_dir`: writes `session.json` and
-/// `panels/<id>/summary.bin`, returns the populated [`Session`].
+/// Analyze `paths` into a session at `session_dir`: writes `session.json`,
+/// `panels/<id>/summary.bin`, and `analysis/overlap_graph.json`, returns the
+/// populated [`Session`].
 pub fn analyze(paths: &[PathBuf], session_dir: &Path) -> Result<Session> {
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
@@ -63,7 +66,16 @@ pub fn analyze(paths: &[PathBuf], session_dir: &Path) -> Result<Session> {
         scan.summary.write(&path)
     })?;
 
-    session.panels = scans.into_iter().map(|scan| scan.meta).collect();
+    let (metas, summaries): (Vec<_>, Vec<_>) =
+        scans.into_iter().map(|scan| (scan.meta, scan.summary)).unzip();
+    session.panels = metas;
+
+    let graph = OverlapGraph::build(&summaries);
+    let graph_path = session.overlap_graph_path();
+    let parent = graph_path.parent().expect("graph path has a parent");
+    std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    graph.save(&graph_path)?;
+
     session.save()?;
     Ok(session)
 }
