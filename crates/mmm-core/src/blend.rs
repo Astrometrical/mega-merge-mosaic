@@ -202,7 +202,7 @@ impl PanelPrep {
 }
 
 /// Load the panels' L8 summaries in parallel.
-fn load_summaries(session: &Session) -> Result<Vec<L8Summary>> {
+pub(crate) fn load_summaries(session: &Session) -> Result<Vec<L8Summary>> {
     session.panels.par_iter().map(|p| L8Summary::read(&session.summary_path(p.id))).collect()
 }
 
@@ -241,50 +241,15 @@ fn prep_from_summaries(
                     *d = 1e30;
                 }
             }
-            let correction = |table: &Vec<Vec<f64>>, default: f64| -> Vec<f32> {
-                (0..ch)
-                    .map(|c| {
-                        table.get(c).and_then(|t| t.get(p.id)).copied().unwrap_or(default) as f32
-                    })
-                    .collect()
-            };
-            let surf: Vec<[f64; 6]> = (0..ch)
-                .map(|c| {
-                    let mut padded = [0.0f64; 6];
-                    if let Some(coeffs) =
-                        surfaces.and_then(|s| s.coeffs.get(c)).and_then(|t| t.get(p.id))
-                    {
-                        padded[..coeffs.len()].copy_from_slice(coeffs);
-                    }
-                    padded
-                })
-                .collect();
-            let gains = correction(&phot.gains, 1.0);
-            let offsets = correction(&phot.offsets, 0.0);
+            let (gains, offsets, surf) = panel_correction_terms(phot, surfaces, p.id, ch);
 
             // Corrected cell means at cell centers: the two-band base plane.
-            let (w8, h8) = (summary.w8 as usize, summary.h8 as usize);
-            let cells = w8 * h8;
-            let (cw, chh) = (session.canvas.0 as f64, session.canvas.1 as f64);
-            let mut corr8 = vec![0.0f32; ch * cells];
-            for c in 0..ch {
-                let t = &surf[c];
-                for y8 in 0..h8 {
-                    let yn = (y8 as f64 + 0.5) * BLOCK as f64 / chh;
-                    let sa = t[0] + (t[2] + t[5] * yn) * yn;
-                    let sb = t[1] + t[4] * yn;
-                    for x8 in 0..w8 {
-                        let xn = (x8 as f64 + 0.5) * BLOCK as f64 / cw;
-                        let s = sa + xn * (sb + xn * t[3]);
-                        let i = y8 * w8 + x8;
-                        corr8[c * cells + i] =
-                            summary.mean[c * cells + i] * gains[c] + offsets[c] + s as f32;
-                    }
-                }
-            }
+            let mut corr8 =
+                corrected_cell_means(&summary, &gains, &offsets, &surf, session.canvas);
 
             suppress_stars_in_base(&mut corr8, &summary, ch, mask);
 
+            let cells = summary.w8 as usize * summary.h8 as usize;
             let vdet: Vec<f32> = (0..cells)
                 .map(|i| {
                     (0..ch)
@@ -296,6 +261,67 @@ fn prep_from_summaries(
             PanelPrep { bbox: p.bbox, gains, offsets, surf, summary, dist, corr8, vdet }
         })
         .collect()
+}
+
+/// Per-panel correction terms resolved from the photometry/surfaces tables:
+/// per-channel gains, offsets, and residual-surface coefficients padded to
+/// the 6 terms `1, x, y, x², xy, y²` (normalized canvas coords). Identity /
+/// all-zero when a table has no entry for the panel. Shared by the blender's
+/// prep and the seam diagnostics ([`crate::diag`]).
+pub(crate) fn panel_correction_terms(
+    phot: &Photometry,
+    surfaces: Option<&Surfaces>,
+    id: usize,
+    ch: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<[f64; 6]>) {
+    let correction = |table: &Vec<Vec<f64>>, default: f64| -> Vec<f32> {
+        (0..ch)
+            .map(|c| table.get(c).and_then(|t| t.get(id)).copied().unwrap_or(default) as f32)
+            .collect()
+    };
+    let surf: Vec<[f64; 6]> = (0..ch)
+        .map(|c| {
+            let mut padded = [0.0f64; 6];
+            if let Some(coeffs) = surfaces.and_then(|s| s.coeffs.get(c)).and_then(|t| t.get(id)) {
+                padded[..coeffs.len()].copy_from_slice(coeffs);
+            }
+            padded
+        })
+        .collect();
+    (correction(&phot.gains, 1.0), correction(&phot.offsets, 0.0), surf)
+}
+
+/// Corrected L8 cell means `g·mean + o + s(cell center)`, planar
+/// `channels × cells` — the raw corrected cell plane (no star suppression),
+/// shared by the blender's prep and the seam diagnostics ([`crate::diag`]).
+pub(crate) fn corrected_cell_means(
+    summary: &L8Summary,
+    gains: &[f32],
+    offsets: &[f32],
+    surf: &[[f64; 6]],
+    canvas: (u64, u64, u64),
+) -> Vec<f32> {
+    let ch = gains.len();
+    let (w8, h8) = (summary.w8 as usize, summary.h8 as usize);
+    let cells = w8 * h8;
+    let (cw, chh) = (canvas.0 as f64, canvas.1 as f64);
+    let mut corr8 = vec![0.0f32; ch * cells];
+    for c in 0..ch {
+        let t = &surf[c];
+        for y8 in 0..h8 {
+            let yn = (y8 as f64 + 0.5) * BLOCK as f64 / chh;
+            let sa = t[0] + (t[2] + t[5] * yn) * yn;
+            let sb = t[1] + t[4] * yn;
+            for x8 in 0..w8 {
+                let xn = (x8 as f64 + 0.5) * BLOCK as f64 / cw;
+                let s = sa + xn * (sb + xn * t[3]);
+                let i = y8 * w8 + x8;
+                corr8[c * cells + i] =
+                    summary.mean[c * cells + i] * gains[c] + offsets[c] + s as f32;
+            }
+        }
+    }
+    corr8
 }
 
 /// Make the base band star-free and rim-safe: a cell's raw mean is trusted

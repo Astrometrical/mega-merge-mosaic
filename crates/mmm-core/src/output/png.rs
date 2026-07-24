@@ -131,8 +131,9 @@ impl RowSink for PngSink {
 
 /// Shadow clip `c` and MTF midtones balance `m'` for one channel's covered
 /// values (consumed as scratch). `m'` is chosen so the clipped-normalized
-/// median lands at [`MIDTONE_TARGET`].
-fn stretch_params(vals: &mut [f32]) -> (f32, f32) {
+/// median lands at [`MIDTONE_TARGET`]. Shared with the seam-map diagnostics
+/// ([`crate::diag`]), which stretch a luminance plane the same way.
+pub(crate) fn stretch_params(vals: &mut [f32]) -> (f32, f32) {
     if vals.is_empty() {
         return (0.0, 0.5);
     }
@@ -160,7 +161,7 @@ fn stretch_params(vals: &mut [f32]) -> (f32, f32) {
 
 /// Midtones transfer function; `m` is the midtones balance.
 #[inline]
-fn mtf(m: f32, x: f32) -> f32 {
+pub(crate) fn mtf(m: f32, x: f32) -> f32 {
     if x <= 0.0 {
         0.0
     } else if x >= 1.0 {

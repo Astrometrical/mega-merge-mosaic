@@ -45,6 +45,11 @@ enum Command {
         /// Session directory produced by `mmm analyze`
         #[arg(short, long, default_value = "mosaic.mmm-session")]
         session: std::path::PathBuf,
+
+        /// Write a seam/ownership map PNG: autostretched blended preview
+        /// with owner regions tinted, seams drawn dark, panel ids labelled
+        #[arg(long)]
+        seam_png: Option<std::path::PathBuf>,
     },
 
     /// Blend the analyzed panels into a mosaic FITS (and optional PNG preview)
@@ -160,7 +165,7 @@ fn main() -> anyhow::Result<()> {
             println!("analyze: {:.2}s", t0.elapsed().as_secs_f64());
             Ok(())
         }
-        Command::Report { session } => report(&session),
+        Command::Report { session, seam_png } => report(&session, seam_png.as_deref()),
         Command::Blend { session, output, downsample, feather, mode, png, roi, defect_veto } => {
             let mode = match mode.as_str() {
                 "feather" => mmm_core::blend::BlendMode::Feather,
@@ -271,7 +276,7 @@ fn blend_cmd(
     Ok(())
 }
 
-fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {
+fn report(session_dir: &std::path::Path, seam_png: Option<&std::path::Path>) -> anyhow::Result<()> {
     use mmm_core::overlap::OverlapGraph;
     use mmm_core::session::Session;
 
@@ -284,6 +289,47 @@ fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {
         session.dir.display()
     );
 
+    let phot = mmm_core::photometry::Photometry::load(&session.photometry_path()).ok();
+    let surfaces = mmm_core::surfaces::Surfaces::load(&session.surfaces_path()).ok();
+
+    // Seam diagnostics need the summaries + owner map (same feather as the
+    // blend's default); skipped when photometry is missing.
+    let feather = mmm_core::blend::BlendParams::default().feather_px;
+    let mut deltas = None;
+    if let Some(phot) = &phot {
+        let (summaries, owner) =
+            mmm_core::diag::load_owner_map(&session, &graph, phot, surfaces.as_ref(), feather)?;
+        deltas = Some(mmm_core::diag::seam_deltas(
+            &summaries,
+            &owner,
+            phot,
+            surfaces.as_ref(),
+            session.canvas,
+        ));
+        drop(summaries);
+        if let Some(png) = seam_png {
+            mmm_core::diag::write_seam_map(
+                &session,
+                &graph,
+                phot,
+                surfaces.as_ref(),
+                &owner,
+                feather,
+                png,
+            )?;
+            println!("seam map: {}", png.display());
+        }
+    } else if seam_png.is_some() {
+        anyhow::bail!("--seam-png needs photometry results (re-run `mmm analyze`)");
+    }
+
+    // Median seam Δ for the ⚠ flag.
+    let seam_median = deltas.as_ref().map_or(0.0, |m| {
+        let mut v: Vec<f64> = m.values().filter(|d| d.n > 0).map(|d| d.delta).collect();
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() { 0.0 } else { v[v.len() / 2] }
+    });
+
     let name = |id: usize| -> String {
         session
             .panels
@@ -292,25 +338,41 @@ fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("panel {id}"))
     };
-    println!("\noverlap edges ({}):", graph.edges.len());
     println!(
-        "{:>3}-{:<3} {:>8} {:>12}  {:<24} files",
-        "a", "b", "cells", "~px", "bbox8 [x0,x1)x[y0,y1)"
+        "\noverlap edges ({}; seam Δ = mean |corrected step| across owner boundary, ⚠ > 3× median):",
+        graph.edges.len()
+    );
+    println!(
+        "{:>3}-{:<3} {:>8} {:>12} {:>10}  {:<24} files",
+        "a", "b", "cells", "~px", "seam Δ", "bbox8 [x0,x1)x[y0,y1)"
     );
     for e in &graph.edges {
         let bbox = format!(
             "[{},{})x[{},{})",
             e.bbox8[0], e.bbox8[2], e.bbox8[1], e.bbox8[3]
         );
+        let sd = deltas
+            .as_ref()
+            .and_then(|m| m.get(&(e.a.min(e.b), e.a.max(e.b))))
+            .filter(|d| d.n > 0);
+        let (delta, flag) = match sd {
+            Some(d) => (
+                format!("{:.3e}", d.delta),
+                if seam_median > 0.0 && d.delta > 3.0 * seam_median { "  ⚠ seam" } else { "" },
+            ),
+            None => ("-".to_string(), ""),
+        };
         println!(
-            "{:>3}-{:<3} {:>8} {:>12}  {:<24} {} | {}",
+            "{:>3}-{:<3} {:>8} {:>12} {:>10}  {:<24} {} | {}{}",
             e.a,
             e.b,
             e.n_cells,
             e.n_cells * 64,
+            delta,
             bbox,
             name(e.a),
-            name(e.b)
+            name(e.b),
+            flag
         );
     }
 
@@ -321,14 +383,14 @@ fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {
         println!("  #{i}: {ids}");
     }
 
-    match mmm_core::photometry::Photometry::load(&session.photometry_path()) {
-        Ok(phot) => report_photometry(&phot, &name),
-        Err(_) => println!("\nno photometry results (re-run `mmm analyze`)"),
+    match &phot {
+        Some(phot) => report_photometry(phot, &name),
+        None => println!("\nno photometry results (re-run `mmm analyze`)"),
     }
 
-    match mmm_core::surfaces::Surfaces::load(&session.surfaces_path()) {
-        Ok(surf) => report_surfaces(&surf, &name),
-        Err(_) => println!("\nno residual surfaces (analyze ran with --surface off)"),
+    match &surfaces {
+        Some(surf) => report_surfaces(surf, &name),
+        None => println!("\nno residual surfaces (analyze ran with --surface off)"),
     }
     Ok(())
 }
