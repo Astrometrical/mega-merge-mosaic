@@ -16,9 +16,10 @@
 //! exactly one panel per pixel via the seam [`crate::seam::OwnerMap`], so
 //! stars are never averaged and sub-pixel misregistration cannot pinch or
 //! double them. Detail transitions ramp linearly over ±[`RAMP_PX`] px of the
-//! owner boundary, except where a boundary cell's detail energy exceeds
-//! [`STAR_LOCK_FACTOR`]× the panel's median detail — there the transition
-//! snaps hard so a star crossing the seam is taken whole from one panel.
+//! owner boundary, except where a boundary cell is covered by the connected
+//! star mask ([`crate::seam::star_mask`]) in either panel — there the
+//! transition snaps hard so a star (or a diffraction-spike arm attached to
+//! one) crossing the seam is taken whole from one panel.
 //!
 //! Bands are computed rayon-parallel (over rows within a band) but delivered
 //! to the sink strictly in order. `downsample == 8` blends from the L8 summary
@@ -32,7 +33,7 @@ use rayon::prelude::*;
 use crate::formats::xisf::XisfPanel;
 use crate::overlap::{OverlapGraph, distance_map};
 use crate::photometry::Photometry;
-use crate::seam::{OwnerMap, compute_owner_map};
+use crate::seam::{OwnerMap, compute_owner_map_masked, star_mask};
 use crate::session::Session;
 use crate::summary::{BLOCK, L8Summary};
 use crate::surfaces::Surfaces;
@@ -46,16 +47,21 @@ pub const MIN_WEIGHT: f32 = 1e-4;
 /// pixels (the transition spans ±RAMP_PX).
 pub const RAMP_PX: f32 = 16.0;
 
-/// Star-lock: snap the detail transition hard where a boundary cell's detail
-/// energy exceeds this factor × the owning panel's median detail.
-pub const STAR_LOCK_FACTOR: f32 = 3.0;
+/// Star-lock parameter, retained under its historical name: this is the
+/// *seed* factor of the connected star mask ([`crate::seam::star_mask`],
+/// grown onto cells > [`crate::seam::MASK_GROW_FACTOR`] × median detail).
+/// The detail transition snaps hard wherever an owner-boundary cell is
+/// masked in either panel — covering spike arms attached to star cores, not
+/// just cells that individually exceed the raw threshold.
+pub const STAR_LOCK_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 
-/// Cells whose detail energy exceeds this factor × the panel's median detail
-/// are excluded from the base band (their base value is filled from the
+/// Base-band exclusion parameter, retained under its historical name: also
+/// the connected star mask's seed factor. Cells covered by the mask are
+/// excluded from the base band (their base value is filled from the
 /// surrounding background instead). The base must be star-free: raw cell
 /// means near bright stars differ between misregistered panels, and blending
-/// them would leave cell-scale coloured blobs around stars.
-pub const BASE_STAR_FACTOR: f32 = 3.0;
+/// them would leave cell-scale coloured blobs around stars and their spikes.
+pub const BASE_STAR_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 
 /// How the detail band is combined across panels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -175,22 +181,26 @@ fn prep_panels(
     surfaces: Option<&Surfaces>,
 ) -> Result<Vec<PanelPrep>> {
     let summaries = load_summaries(session)?;
-    Ok(prep_from_summaries(session, phot, surfaces, summaries))
+    let masks: Vec<Vec<bool>> = summaries.par_iter().map(star_mask).collect();
+    Ok(prep_from_summaries(session, phot, surfaces, summaries, &masks))
 }
 
-/// Build the per-panel blend contexts from already-loaded summaries.
+/// Build the per-panel blend contexts from already-loaded summaries; `masks`
+/// are the panels' connected star masks (base-band exclusion).
 fn prep_from_summaries(
     session: &Session,
     phot: &Photometry,
     surfaces: Option<&Surfaces>,
     summaries: Vec<L8Summary>,
+    masks: &[Vec<bool>],
 ) -> Vec<PanelPrep> {
     let ch = session.canvas.2 as usize;
     session
         .panels
         .par_iter()
         .zip(summaries)
-        .map(|(p, summary)| {
+        .zip(masks.par_iter())
+        .map(|((p, summary), mask)| {
             let mut dist = distance_map(&summary.coverage, summary.w8, summary.h8);
             // A panel with no uncovered cell at all yields INFINITY; make it a
             // large finite value so bilinear interpolation cannot produce NaN.
@@ -241,7 +251,7 @@ fn prep_from_summaries(
                 }
             }
 
-            suppress_stars_in_base(&mut corr8, &summary, ch);
+            suppress_stars_in_base(&mut corr8, &summary, ch, mask);
 
             PanelPrep { bbox: p.bbox, gains, offsets, surf, summary, dist, corr8 }
         })
@@ -249,35 +259,27 @@ fn prep_from_summaries(
 }
 
 /// Make the base band star-free and rim-safe: a cell's raw mean is trusted
-/// only when the cell is *fully covered* and its detail energy (channel max)
-/// is at most [`BASE_STAR_FACTOR`] × the panel's median detail. Everything
-/// else the bilinear base taps can reach — starry cells, partially covered
-/// rim cells (registration-interpolation garbage on real data), and the one
-/// ring of uncovered cells beyond the rim — is replaced by an onion-peel
-/// fill from the trusted background cells. The per-panel identity
-/// `out = base + (full − base)` is unaffected by what the base contains —
-/// but the *cross-panel* base difference near bright stars and panel rims
-/// (which a feathered base blend would imprint as cell-scale blobs and rim
-/// streaks under misregistration) collapses to the background mismatch.
-fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize) {
+/// only when the cell is *fully covered* and outside the panel's connected
+/// star mask ([`crate::seam::star_mask`] — star cores plus attached spike
+/// arms and structure). Everything else the bilinear base taps can reach —
+/// masked cells, partially covered rim cells (registration-interpolation
+/// garbage on real data), and the one ring of uncovered cells beyond the rim
+/// — is replaced by an onion-peel fill from the trusted background cells.
+/// The per-panel identity `out = base + (full − base)` is unaffected by what
+/// the base contains — but the *cross-panel* base difference near bright
+/// stars and panel rims (which a feathered base blend would imprint as
+/// cell-scale blobs and rim streaks under misregistration) collapses to the
+/// background mismatch.
+fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize, mask: &[bool]) {
     let (w, h) = (summary.w8 as usize, summary.h8 as usize);
     let cells = w * h;
+    debug_assert_eq!(mask.len(), cells);
 
-    // Channel-max detail per cell and its median over fully covered cells.
-    let chdet = |i: usize| -> f32 {
-        (0..nch).map(|c| summary.detail[c * cells + i]).fold(0.0f32, f32::max)
-    };
-    let mut det_cov: Vec<f32> =
-        (0..cells).filter(|&i| summary.coverage[i] >= 1.0).map(chdet).collect();
-    if det_cov.is_empty() {
-        return;
+    let source: Vec<bool> =
+        (0..cells).map(|i| summary.coverage[i] >= 1.0 && !mask[i]).collect();
+    if !source.iter().any(|&s| s) {
+        return; // nothing trustworthy to fill from: keep raw values
     }
-    let mid = det_cov.len() / 2;
-    let median = *det_cov.select_nth_unstable_by(mid, f32::total_cmp).1;
-
-    let source: Vec<bool> = (0..cells)
-        .map(|i| summary.coverage[i] >= 1.0 && chdet(i) <= BASE_STAR_FACTOR * median)
-        .collect();
 
     // Cells the base sampling can reach: covered cells dilated by 2 (the
     // bilinear taps of a covered pixel stay within 1 cell of its own cell).
@@ -568,11 +570,12 @@ fn blend_full(
 /// Detail-transition planes for the two-band blend, from the owner map:
 /// per owning panel a ramp plane `r ∈ [0,1]` rising linearly from 0 outside
 /// the panel's owned region to 1 inside over ±[`RAMP_PX`], plus a per-cell
-/// star-lock flag marking ramp-wide zones around owner boundaries whose cells
-/// carry star-level detail energy (transition must snap, not ramp, there).
+/// star-lock flag marking ramp-wide zones around owner boundaries that touch
+/// star-masked cells (transition must snap, not ramp, there — a star or a
+/// spike arm crossing the seam is taken whole from one panel).
 fn detail_transition_maps(
-    summaries: &[L8Summary],
     owner: &OwnerMap,
+    masks: &[Vec<bool>],
 ) -> (Vec<Option<Vec<f32>>>, Vec<bool>) {
     let (w8, h8) = (owner.w8, owner.h8);
     let (w, h) = (w8 as usize, h8 as usize);
@@ -580,7 +583,7 @@ fn detail_transition_maps(
 
     // Ramp per panel that owns at least one cell: signed chamfer distance to
     // the ownership boundary, mapped linearly onto [0,1] over ±ramp_cells.
-    let ramps: Vec<Option<Vec<f32>>> = (0..summaries.len())
+    let ramps: Vec<Option<Vec<f32>>> = (0..masks.len())
         .into_par_iter()
         .map(|p| {
             let ind: Vec<f32> =
@@ -599,33 +602,6 @@ fn detail_transition_maps(
             )
         })
         .collect();
-
-    // Star-lock: per panel, the median channel-max detail energy over its
-    // fully covered cells is the "background detail" scale.
-    let medians: Vec<f32> = summaries
-        .par_iter()
-        .map(|s| {
-            let cells = w * h;
-            let mut v: Vec<f32> = (0..cells)
-                .filter(|&i| s.coverage[i] >= 1.0)
-                .map(|i| {
-                    (0..s.channels as usize)
-                        .map(|c| s.detail[c * cells + i])
-                        .fold(0.0f32, f32::max)
-                })
-                .collect();
-            if v.is_empty() {
-                return f32::INFINITY; // no covered cells: never star-locks
-            }
-            let mid = v.len() / 2;
-            *v.select_nth_unstable_by(mid, f32::total_cmp).1
-        })
-        .collect();
-    let cell_detail = |p: usize, i: usize| -> f32 {
-        let s = &summaries[p];
-        let cells = w * h;
-        (0..s.channels as usize).map(|c| s.detail[c * cells + i]).fold(0.0f32, f32::max)
-    };
 
     let mut hard = vec![false; w * h];
     let r = ramp_cells.ceil() as i64;
@@ -652,9 +628,7 @@ fn detail_transition_maps(
                 if n == u16::MAX || n == o {
                     continue;
                 }
-                let starry = cell_detail(o as usize, i)
-                    > STAR_LOCK_FACTOR * medians[o as usize]
-                    || cell_detail(n as usize, j) > STAR_LOCK_FACTOR * medians[n as usize];
+                let starry = masks[o as usize][i] || masks[n as usize][j];
                 if starry {
                     mark(x, y);
                     mark(nx, ny);
@@ -674,13 +648,41 @@ fn blend_twoband(
     params: &BlendParams,
     sink: &mut dyn RowSink,
 ) -> Result<()> {
+    blend_twoband_impl(session, phot, surfaces, graph, params, sink, true)
+}
+
+/// [`blend_twoband`] with the connected star masks optionally disabled
+/// (all-false masks: no seam penalty, no star-lock, no base exclusion) —
+/// test-only escape hatch proving the mask's protection bites.
+#[allow(clippy::too_many_arguments)]
+fn blend_twoband_impl(
+    session: &Session,
+    phot: &Photometry,
+    surfaces: Option<&Surfaces>,
+    graph: &OverlapGraph,
+    params: &BlendParams,
+    sink: &mut dyn RowSink,
+    use_star_mask: bool,
+) -> Result<()> {
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
     let summaries = load_summaries(session)?;
-    let owner =
-        compute_owner_map(&summaries, graph, phot, surfaces, session.canvas, params.feather_px);
-    let (ramps, hard) = detail_transition_maps(&summaries, &owner);
-    let mut preps = prep_from_summaries(session, phot, surfaces, summaries);
+    let masks: Vec<Vec<bool>> = if use_star_mask {
+        summaries.par_iter().map(star_mask).collect()
+    } else {
+        summaries.iter().map(|s| vec![false; s.w8 as usize * s.h8 as usize]).collect()
+    };
+    let owner = compute_owner_map_masked(
+        &summaries,
+        graph,
+        phot,
+        surfaces,
+        session.canvas,
+        params.feather_px,
+        &masks,
+    );
+    let (ramps, hard) = detail_transition_maps(&owner, &masks);
+    let mut preps = prep_from_summaries(session, phot, surfaces, summaries, &masks);
     for p in &mut preps {
         p.summary.detail = Vec::new(); // only needed for the maps above
     }
@@ -1237,6 +1239,163 @@ mod tests {
         assert!((at(3, 4) - 0.2).abs() < 1e-6, "A-only cell: {}", at(3, 4));
         assert!((at(8, 4) - 0.3).abs() < 1e-6, "overlap cell: {}", at(8, 4));
         assert_eq!(at(13, 1), 0.0, "cell covered by neither panel");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Mandatory phase-3E test 3 (spike integrity, end-to-end): two panels
+    /// share bright spiked stars in their overlap; panel 1 is misregistered
+    /// by 0.6 px and its spikes are rotated 0.02 rad (per-session camera
+    /// rotation). Every pixel along each merged arm must match ONE panel's
+    /// corrected pixels — and the same check must FAIL with the star masks
+    /// disabled, proving the mask (not luck) protects the arms.
+    #[test]
+    fn twoband_spike_arms_match_one_panel() {
+        use crate::analyze::analyze_opts;
+        use crate::synth::{SynthSpec, generate};
+
+        let dir = tmpdir("spikes");
+        let spec = SynthSpec {
+            canvas: (768, 640),
+            channels: 1,
+            grid: (2, 1),
+            overlap_frac: 0.25,
+            n_stars: 90,
+            noise_sigma: 0.002,
+            panel_gain_range: (0.95, 1.1),
+            panel_offset_range: (-0.003, 0.005),
+            panel_gradient_range: (0.0, 0.0),
+            panel_shift: vec![(0.0, 0.0), (0.8, 0.0)],
+            panel_spike_angle: vec![0.0, 0.02],
+            // Seed chosen (deterministically) so a bright spiked star lands on
+            // the band's midline, where the mask-disabled seam runs within
+            // ramp reach of its arms — the kink scenario observed on real
+            // data. Verified: mask on ≤ 0.0004 on all arms; mask off 0.0203
+            // on one arm (thresh 0.0120).
+            seed: 9,
+        };
+        let res = generate(&spec, &dir.join("panels")).unwrap();
+        let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), None).unwrap();
+        let phot = Photometry::load(&session.photometry_path()).unwrap();
+        let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample: 1,
+            band_rows: 64,
+            mode: BlendMode::TwoBand,
+            roi: None,
+        };
+
+        let run = |use_mask: bool| -> MemSink {
+            let mut sink = MemSink::new();
+            blend_twoband_impl(&session, &phot, None, &graph, &params, &mut sink, use_mask)
+                .unwrap();
+            sink
+        };
+        let with_mask = run(true);
+        let no_mask = run(false);
+
+        // Corrected panel pixels in the blend's photometric frame.
+        let w = spec.canvas.0 as usize;
+        let corrected: Vec<Vec<f32>> = res
+            .panel_paths
+            .iter()
+            .enumerate()
+            .map(|(p, path)| {
+                let panel = crate::formats::xisf::XisfPanel::open(path).unwrap();
+                let (g, o) = (phot.gains[0][p] as f32, phot.offsets[0][p] as f32);
+                panel.channel(0).iter().map(|&v| v * g + o).collect()
+            })
+            .collect();
+        let bbox = union_bbox(&session).unwrap();
+
+        // Spiked stars whose full spike footprint (arm length + margin) lies
+        // inside BOTH panel windows — arms crossing the overlap band.
+        let overlap_stars: Vec<(f64, f64, f64)> = res
+            .spiked
+            .iter()
+            .copied()
+            .filter(|&(sx, sy, len)| {
+                res.windows.iter().all(|&[x0, y0, x1, y1]| {
+                    sx - len >= x0 as f64 + 4.0
+                        && sx + len < x1 as f64 - 4.0
+                        && sy - len >= y0 as f64 + 4.0
+                        && sy + len < y1 as f64 - 4.0
+                })
+            })
+            .collect();
+        assert!(
+            !overlap_stars.is_empty(),
+            "seed must place at least one spiked star fully inside the overlap"
+        );
+
+        // Pixels of one arm: 3×3 neighbourhoods along the arm at BOTH panels'
+        // spike angles (the merged arm may come from either panel), skipping
+        // the core where the panels nearly agree anyway.
+        let arm_pixels = |sx: f64, sy: f64, len: f64, arm: usize| -> Vec<(usize, usize)> {
+            let mut px = Vec::new();
+            for &a0 in &spec.panel_spike_angle {
+                let th = a0 as f64 + arm as f64 * std::f64::consts::FRAC_PI_2;
+                let (s, c) = th.sin_cos();
+                let mut t = 3.0;
+                while t <= len {
+                    let (x, y) = ((sx + t * c).round() as i64, (sy + t * s).round() as i64);
+                    for yy in y - 1..=y + 1 {
+                        for xx in x - 1..=x + 1 {
+                            px.push((xx as usize, yy as usize));
+                        }
+                    }
+                    t += 1.0;
+                }
+            }
+            px
+        };
+        // Distance of the merged arm to the closest single corrected panel.
+        let one_panel_dist = |sink: &MemSink, pixels: &[(usize, usize)]| -> f32 {
+            (0..2)
+                .map(|p| {
+                    pixels
+                        .iter()
+                        .map(|&(x, y)| {
+                            let merged = sink.at(
+                                0,
+                                x - bbox[0] as usize,
+                                y - bbox[1] as usize,
+                            );
+                            (merged - corrected[p][y * w + x]).abs()
+                        })
+                        .fold(0.0f32, f32::max)
+                })
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let thresh = 6.0 * spec.noise_sigma;
+        let mut no_mask_fails = 0;
+        let mut arms = 0;
+        for &(sx, sy, len) in &overlap_stars {
+            for arm in 0..4 {
+                let pixels = arm_pixels(sx, sy, len, arm);
+                let d_mask = one_panel_dist(&with_mask, &pixels);
+                let d_none = one_panel_dist(&no_mask, &pixels);
+                eprintln!(
+                    "spiked star ({sx:6.1},{sy:6.1}) arm {arm}: \
+                     masked {d_mask:.4}, unmasked {d_none:.4} (thresh {thresh:.4})"
+                );
+                assert!(
+                    d_mask < thresh,
+                    "arm {arm} of star at ({sx},{sy}) matches no single panel: {d_mask}"
+                );
+                if d_none >= thresh {
+                    no_mask_fails += 1;
+                }
+                arms += 1;
+            }
+        }
+        assert!(
+            no_mask_fails > 0,
+            "mask-disabled blend passed the one-panel check on all {arms} arms — \
+             the mask is not biting"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

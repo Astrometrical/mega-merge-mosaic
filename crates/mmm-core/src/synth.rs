@@ -37,6 +37,12 @@ pub struct SynthSpec {
     /// background and noise stay put. Simulates residual misregistration.
     /// Empty = no shift; otherwise must have one entry per panel.
     pub panel_shift: Vec<(f32, f32)>,
+    /// Per-panel rotation offset (radians) of 4-armed diffraction spikes
+    /// drawn on the brightest stars (amplitude ≥ [`SPIKE_MIN_AMP`]; arm
+    /// length ∝ amplitude, ~1 px wide, additive). Empty = no spikes anywhere;
+    /// otherwise one entry per panel. The truth carries spikes at angle 0;
+    /// differing per-panel offsets simulate per-session camera rotation.
+    pub panel_spike_angle: Vec<f32>,
     pub seed: u64,
 }
 
@@ -54,12 +60,29 @@ pub struct SynthResult {
     pub applied_grad: Vec<(f32, f32, f32)>,
     /// Per-panel content window on the canvas: [x0, y0, x1, y1], exclusive.
     pub windows: Vec<[u64; 4]>,
+    /// Stars that received diffraction spikes (when `panel_spike_angle` is
+    /// non-empty): `(x, y, arm_length_px)` in unshifted canvas coordinates.
+    pub spiked: Vec<(f64, f64, f64)>,
 }
 
 /// Positive floor applied to truth (and to any covered panel pixel that would
 /// otherwise land on exactly 0.0): zero is the no-data sentinel and must never
 /// occur inside a panel's window.
 const VALUE_FLOOR: f32 = 1e-4;
+
+/// Stars at least this bright (peak amplitude) receive diffraction spikes
+/// when `panel_spike_angle` is set.
+pub const SPIKE_MIN_AMP: f64 = 0.25;
+
+/// Spike arm length in pixels per unit of star amplitude.
+pub const SPIKE_LEN_PER_AMP: f64 = 48.0;
+
+/// Peak spike brightness relative to the star's amplitude; brightness falls
+/// linearly to zero at the arm tip.
+const SPIKE_REL_AMP: f64 = 0.35;
+
+/// Gaussian half-width of a spike arm across its axis, in pixels (~1 px wide).
+const SPIKE_SIGMA: f64 = 0.6;
 
 /// xorshift64* PRNG with a Box-Muller Gaussian tap. Deterministic for a seed;
 /// no external dependency.
@@ -191,6 +214,59 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
     }
     let star_plane = render_stars(&stars, w, h, 0.0, 0.0);
 
+    /// Render 4-armed diffraction spikes for the brightest stars: arms at
+    /// `angle + k·π/2`, length [`SPIKE_LEN_PER_AMP`] × amplitude, Gaussian
+    /// cross-section of width [`SPIKE_SIGMA`], brightness falling linearly to
+    /// zero at the tip; star centers shifted by `(dx, dy)`. Additive.
+    fn render_spikes(
+        stars: &[(f64, f64, f64, f64)],
+        w: u64,
+        h: u64,
+        dx: f64,
+        dy: f64,
+        angle: f64,
+    ) -> Vec<f32> {
+        let mut plane = vec![0.0f32; (w * h) as usize];
+        let inv_2s2 = 1.0 / (2.0 * SPIKE_SIGMA * SPIKE_SIGMA);
+        for &(sx0, sy0, _, amp) in stars {
+            if amp < SPIKE_MIN_AMP {
+                continue;
+            }
+            let (sx, sy) = (sx0 + dx, sy0 + dy);
+            let len = SPIKE_LEN_PER_AMP * amp;
+            let r = (len + 3.0).ceil() as i64;
+            let (cxp, cyp) = (sx.round() as i64, sy.round() as i64);
+            for y in (cyp - r).max(0)..=(cyp + r).min(h as i64 - 1) {
+                for x in (cxp - r).max(0)..=(cxp + r).min(w as i64 - 1) {
+                    let (px, py) = (x as f64 - sx, y as f64 - sy);
+                    let mut v = 0.0f64;
+                    for k in 0..4 {
+                        let (s, c) = (angle + k as f64 * std::f64::consts::FRAC_PI_2).sin_cos();
+                        let t = px * c + py * s; // along the arm
+                        let d = py * c - px * s; // across the arm
+                        if t < 0.0 || t > len {
+                            continue;
+                        }
+                        v += amp * SPIKE_REL_AMP * (1.0 - t / len) * (-d * d * inv_2s2).exp();
+                    }
+                    plane[(y as u64 * w + x as u64) as usize] += v as f32;
+                }
+            }
+        }
+        plane
+    }
+    let has_spikes = !spec.panel_spike_angle.is_empty();
+    let truth_spikes = has_spikes.then(|| render_spikes(&stars, w, h, 0.0, 0.0, 0.0));
+    let spiked: Vec<(f64, f64, f64)> = if has_spikes {
+        stars
+            .iter()
+            .filter(|s| s.3 >= SPIKE_MIN_AMP)
+            .map(|s| (s.0, s.1, s.3 * SPIKE_LEN_PER_AMP))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Truth = background + stars + Gaussian noise, floored positive.
     let mut truth = vec![0.0f32; ch * plane];
     for c in 0..spec.channels {
@@ -199,7 +275,8 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
             for x in 0..w {
                 let i = (y * w + x) as usize;
                 let noise = spec.noise_sigma * rng.next_gaussian() as f32;
-                let v = background(x, y, c, w, h) + star_plane[i] + noise;
+                let sp = truth_spikes.as_ref().map_or(0.0, |p| p[i]);
+                let v = background(x, y, c, w, h) + star_plane[i] + sp + noise;
                 out[i] = v.max(VALUE_FLOOR);
             }
         }
@@ -217,6 +294,15 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
             format!(
                 "panel_shift has {} entries but the grid has {n_panels} panels",
                 spec.panel_shift.len()
+            ),
+        ));
+    }
+    if has_spikes && spec.panel_spike_angle.len() != n_panels {
+        return Err(Error::format(
+            dir,
+            format!(
+                "panel_spike_angle has {} entries but the grid has {n_panels} panels",
+                spec.panel_spike_angle.len()
             ),
         ));
     }
@@ -243,16 +329,25 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
             let gc = prng.range_f64(glo, ghi) as f32;
             let [x0, y0, x1, y1] = panel_window(spec, cx, cy);
 
-            // Star-only misregistration: replace the truth's star field with a
-            // shifted rendering (background and noise are untouched).
+            // Star-only misregistration and per-panel spike rotation: replace
+            // the truth's star (+spike) field with this panel's rendering
+            // (background and noise are untouched).
             let shift = spec.panel_shift.get(id).copied().unwrap_or((0.0, 0.0));
-            let star_delta: Option<Vec<f32>> = if shift == (0.0, 0.0) {
+            let angle = spec.panel_spike_angle.get(id).copied().unwrap_or(0.0);
+            let star_delta: Option<Vec<f32>> = if shift == (0.0, 0.0) && angle == 0.0 {
                 None
             } else {
                 let shifted = render_stars(&stars, w, h, shift.0 as f64, shift.1 as f64);
-                Some(
-                    shifted.iter().zip(&star_plane).map(|(&s, &u)| s - u).collect(),
-                )
+                let mut d: Vec<f32> =
+                    shifted.iter().zip(&star_plane).map(|(&s, &u)| s - u).collect();
+                if let Some(tsp) = &truth_spikes {
+                    let psp =
+                        render_spikes(&stars, w, h, shift.0 as f64, shift.1 as f64, angle as f64);
+                    for ((dv, &p), &t) in d.iter_mut().zip(&psp).zip(tsp) {
+                        *dv += p - t;
+                    }
+                }
+                Some(d)
             };
 
             frame.fill(0.0);
@@ -285,7 +380,7 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         }
     }
 
-    Ok(SynthResult { truth, panel_paths, applied, applied_grad, windows })
+    Ok(SynthResult { truth, panel_paths, applied, applied_grad, windows, spiked })
 }
 
 /// Minimal monolithic XISF writer (Float32, planar, little-endian,
@@ -348,6 +443,7 @@ mod tests {
             panel_offset_range: (-0.01, 0.02),
             panel_gradient_range: (0.0, 0.0),
             panel_shift: vec![],
+            panel_spike_angle: vec![],
             seed: 42,
         }
     }
@@ -510,6 +606,116 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn spike_angle_len_mismatch_errors() {
+        let dir = tmpdir("spikelen");
+        let mut spec = test_spec(); // 2×2 grid = 4 panels
+        spec.panel_spike_angle = vec![0.0, 0.1];
+        assert!(generate(&spec, &dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Spikes are rendered on the brightest stars at angle 0 in the truth,
+    /// rotated per panel by the given offset: a π/2 offset maps the 4-armed
+    /// cross onto itself (panel identical to no-offset), while a π/4 offset
+    /// must visibly move spike flux inside the panel window.
+    #[test]
+    fn spikes_add_arms_and_rotate_per_panel() {
+        let base = SynthSpec {
+            canvas: (256, 192),
+            channels: 1,
+            grid: (2, 1),
+            overlap_frac: 0.25,
+            n_stars: 12,
+            noise_sigma: 0.001,
+            panel_gain_range: (1.0, 1.0),
+            panel_offset_range: (0.0, 0.0),
+            panel_gradient_range: (0.0, 0.0),
+            panel_shift: vec![],
+            panel_spike_angle: vec![],
+            seed: 42,
+        };
+        let dir_plain = tmpdir("spikes-plain");
+        let plain = generate(&base, &dir_plain).unwrap();
+        assert!(plain.spiked.is_empty(), "no spikes requested → none reported");
+
+        let mut spec = base.clone();
+        spec.panel_spike_angle = vec![0.0, std::f64::consts::FRAC_PI_2 as f32];
+        let dir_sp = tmpdir("spikes-on");
+        let sp = generate(&spec, &dir_sp).unwrap();
+        assert!(!sp.spiked.is_empty(), "the amp-1.0 star must be spiked");
+
+        // Truth difference = exactly the spike plane (same seed → same stars
+        // and noise): zero far from spiked stars, elevated along the +x arm.
+        let (w, h) = (base.canvas.0 as usize, base.canvas.1 as usize);
+        let diff: Vec<f32> =
+            sp.truth[..w * h].iter().zip(&plain.truth[..w * h]).map(|(a, b)| a - b).collect();
+        let &(sx, sy, len) = sp.spiked.iter().max_by(|a, b| a.2.total_cmp(&b.2)).unwrap();
+        for &(_, _, l) in &sp.spiked {
+            assert!(l >= SPIKE_MIN_AMP * SPIKE_LEN_PER_AMP, "arm length ∝ amplitude");
+        }
+        let mut max_far = 0.0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let near = sp.spiked.iter().any(|&(cx, cy, l)| {
+                    (x as f64 - cx).abs().max((y as f64 - cy).abs()) <= l + 3.0
+                });
+                if !near {
+                    max_far = max_far.max(diff[y * w + x].abs());
+                }
+            }
+        }
+        assert!(max_far < 1e-6, "spike flux only near spiked stars, saw {max_far}");
+        // Sample the +x arm of the brightest spiked star (angle 0 in truth).
+        let t = (len * 0.25).round();
+        let (ax, ay) = ((sx + t).round() as usize, sy.round() as usize);
+        if ax < w && ay < h {
+            assert!(
+                diff[ay * w + ax] > 0.02,
+                "+x arm sample at ({ax},{ay}) too faint: {}",
+                diff[ay * w + ax]
+            );
+        }
+
+        // Panel 1's π/2 rotation is a symmetry of the cross: its frame must
+        // equal gain·truth + offset (gain 1, offset 0 here) inside its window.
+        let panel = XisfPanel::open(&sp.panel_paths[1]).unwrap();
+        let data = panel.channel(0);
+        let [x0, y0, x1, y1] = sp.windows[1];
+        let mut max_dev = 0.0f32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * base.canvas.0 + x) as usize;
+                max_dev = max_dev.max((data[i] - sp.truth[i]).abs());
+            }
+        }
+        assert!(max_dev < 1e-5, "π/2-rotated spikes must be identical, max dev {max_dev}");
+
+        // A π/4 rotation is not: flux moves off the truth's arms.
+        let mut spec4 = base.clone();
+        spec4.panel_spike_angle = vec![0.0, std::f64::consts::FRAC_PI_4 as f32];
+        let dir4 = tmpdir("spikes-rot");
+        let r4 = generate(&spec4, &dir4).unwrap();
+        let panel4 = XisfPanel::open(&r4.panel_paths[1]).unwrap();
+        let data4 = panel4.channel(0);
+        let [x0, y0, x1, y1] = r4.windows[1];
+        let mut max_dev4 = 0.0f32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * base.canvas.0 + x) as usize;
+                max_dev4 = max_dev4.max((data4[i] - r4.truth[i]).abs());
+            }
+        }
+        assert!(
+            max_dev4 > 0.02,
+            "π/4-rotated spikes must differ from the truth's, max dev {max_dev4}"
+        );
+
+        std::fs::remove_dir_all(&dir_plain).unwrap();
+        std::fs::remove_dir_all(&dir_sp).unwrap();
+        std::fs::remove_dir_all(&dir4).unwrap();
     }
 
     #[test]

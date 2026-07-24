@@ -115,6 +115,7 @@ fn full_pipeline_recovers_ground_truth() {
         panel_offset_range: (-0.01, 0.02),
         panel_gradient_range: (0.0, 0.0),
         panel_shift: vec![],
+        panel_spike_angle: vec![],
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -291,6 +292,7 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
         panel_offset_range: (-0.01, 0.02),
         panel_gradient_range: (-0.006, 0.006),
         panel_shift: vec![],
+        panel_spike_angle: vec![],
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -417,6 +419,7 @@ fn surface_off_bypasses_cleanly() {
         panel_offset_range: (-0.005, 0.005),
         panel_gradient_range: (0.0, 0.0),
         panel_shift: vec![],
+        panel_spike_angle: vec![],
         seed: 3,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -458,6 +461,7 @@ fn full_pipeline_twoband_recovers_ground_truth() {
         panel_offset_range: (-0.01, 0.02),
         panel_gradient_range: (0.0, 0.0),
         panel_shift: vec![],
+        panel_spike_angle: vec![],
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -535,6 +539,7 @@ fn twoband_single_panel_reconstructs_input() {
         panel_offset_range: (0.0, 0.0),
         panel_gradient_range: (0.0, 0.0),
         panel_shift: vec![],
+        panel_spike_angle: vec![],
         seed: 7,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -636,6 +641,7 @@ fn twoband_never_averages_misregistered_stars() {
         panel_gradient_range: (0.0, 0.0),
         // Panel 1 is misregistered by 0.6 px in x — stars only.
         panel_shift: vec![(0.0, 0.0), (0.6, 0.0), (0.0, 0.0), (0.0, 0.0)],
+        panel_spike_angle: vec![],
         seed: 1234,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();

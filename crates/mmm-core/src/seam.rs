@@ -4,9 +4,11 @@
 //! from the chamfer distance maps), then refine each overlap edge with a DP
 //! min-cost seam over the L8 band: the seam runs along the band's long axis,
 //! one boundary position per row/column moving at most ±1 per step, with a
-//! cost that penalizes cutting through photometric disagreement and through
-//! high-detail (star/structure) cells. The owner map is shared by all
-//! channels so seams cannot introduce colour fringing.
+//! cost that penalizes cutting through photometric disagreement, through
+//! high-detail (star/structure) cells, and — hard — through cells covered by
+//! the connected [`star_mask`], which protects diffraction-spike arms whose
+//! individual cells fall below any per-cell threshold. The owner map is
+//! shared by all channels so seams cannot introduce colour fringing.
 
 use rayon::prelude::*;
 
@@ -19,6 +21,21 @@ use crate::surfaces::Surfaces;
 /// Star-avoidance weight: cost of cutting next to a cell, per unit of
 /// corrected detail energy (β in the design).
 pub const DETAIL_BETA: f32 = 4.0;
+
+/// Star-mask seed factor: cells whose channel-max detail exceeds this × the
+/// panel's median detail seed the connected star mask ([`star_mask`]).
+pub const MASK_SEED_FACTOR: f32 = 3.0;
+
+/// Star-mask growth factor: the mask flood-fills (8-connected) from seeds
+/// onto cells whose channel-max detail exceeds this × the median — covering
+/// diffraction-spike arms attached to star cores, whose cells individually
+/// fall below the seed threshold.
+pub const MASK_GROW_FACTOR: f32 = 1.5;
+
+/// DP seam penalty for star-masked cells: this factor × the band's median
+/// cell cost, added per cell masked in either panel — large but finite, so a
+/// band that is entirely structure still yields a least-bad seam.
+pub const MASK_COST_FACTOR: f32 = 100.0;
 
 /// Edges whose overlap bbox is smaller than this along *both* axes keep their
 /// Voronoi labels (diagonal corner overlaps have no meaningful seam axis).
@@ -84,8 +101,53 @@ impl CellCorr<'_> {
     }
 }
 
+/// Per-panel L8 star/structure mask: seeds = cells with channel-max detail
+/// above [`MASK_SEED_FACTOR`] × the panel's median detail (over fully
+/// covered cells); grown by 8-connectivity flood fill onto cells with detail
+/// above [`MASK_GROW_FACTOR`] × median. Covers diffraction-spike arms
+/// connected to star cores — elongated detail a per-cell threshold alone
+/// misses, which is how a seam once kinked a spike. Returns `w8*h8` flags.
+pub fn star_mask(summary: &L8Summary) -> Vec<bool> {
+    let (w, h) = (summary.w8 as usize, summary.h8 as usize);
+    let cells = w * h;
+    let nch = summary.channels as usize;
+    let chdet =
+        |i: usize| -> f32 { (0..nch).map(|c| summary.detail[c * cells + i]).fold(0.0, f32::max) };
+
+    let mut det_cov: Vec<f32> =
+        (0..cells).filter(|&i| summary.coverage[i] >= 1.0).map(chdet).collect();
+    if det_cov.is_empty() {
+        return vec![false; cells];
+    }
+    let mid = det_cov.len() / 2;
+    let median = *det_cov.select_nth_unstable_by(mid, f32::total_cmp).1;
+
+    let mut mask = vec![false; cells];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, m) in mask.iter_mut().enumerate() {
+        if summary.coverage[i] > 0.0 && chdet(i) > MASK_SEED_FACTOR * median {
+            *m = true;
+            stack.push(i);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        let (x, y) = (i % w, i / w);
+        for yy in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+            for xx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                let j = yy * w + xx;
+                if !mask[j] && summary.coverage[j] > 0.0 && chdet(j) > MASK_GROW_FACTOR * median {
+                    mask[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    mask
+}
+
 /// Compute the shared owner map: Voronoi labels from feather weights, then a
-/// per-edge DP seam refinement that avoids stars and photometric mismatch.
+/// per-edge DP seam refinement that avoids photometric mismatch and — via
+/// [`star_mask`] — connected star/spike structure.
 pub fn compute_owner_map(
     summaries: &[L8Summary],
     graph: &OverlapGraph,
@@ -93,6 +155,24 @@ pub fn compute_owner_map(
     surfaces: Option<&Surfaces>,
     canvas: (u64, u64, u64),
     feather_px: f32,
+) -> OwnerMap {
+    let masks: Vec<Vec<bool>> = summaries.par_iter().map(star_mask).collect();
+    compute_owner_map_masked(summaries, graph, phot, surfaces, canvas, feather_px, &masks)
+}
+
+/// As [`compute_owner_map`], with the per-panel star masks supplied by the
+/// caller — the blender computes them once and shares them with the
+/// star-lock and base-exclusion stages; tests pass all-false masks to prove
+/// the mask's protection bites.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_owner_map_masked(
+    summaries: &[L8Summary],
+    graph: &OverlapGraph,
+    phot: &Photometry,
+    surfaces: Option<&Surfaces>,
+    canvas: (u64, u64, u64),
+    feather_px: f32,
+    masks: &[Vec<bool>],
 ) -> OwnerMap {
     assert!(!summaries.is_empty(), "owner map needs at least one panel");
     let (w8, h8) = (summaries[0].w8, summaries[0].h8);
@@ -164,7 +244,7 @@ pub fn compute_owner_map(
     let relabels: Vec<Vec<(usize, u16)>> = graph
         .edges
         .par_iter()
-        .map(|e| edge_seam(e, &corrs, &dists, w8))
+        .map(|e| edge_seam(e, &corrs, &dists, masks, w8))
         .collect();
     for ops in relabels {
         for (i, p) in ops {
@@ -181,6 +261,7 @@ fn edge_seam(
     e: &crate::overlap::OverlapEdge,
     corrs: &[CellCorr],
     dists: &[Vec<f32>],
+    masks: &[Vec<bool>],
     w8: u32,
 ) -> Vec<(usize, u16)> {
     let [x0, y0, x1, y1] = e.bbox8;
@@ -197,19 +278,43 @@ fn edge_seam(
 
     let (ca, cb) = (&corrs[e.a], &corrs[e.b]);
     let nch = ca.summary.channels as usize;
-    // Cost of a *cell*: photometric disagreement + β·detail (star avoidance);
-    // cells outside the shared full-coverage band are effectively uncuttable.
-    let cell_cost = |t: usize, s: usize| -> f32 {
-        let (x, y) = cell_at(t, s);
-        if ca.summary.cov(x, y) < 1.0 || cb.summary.cov(x, y) < 1.0 {
-            return UNSHARED_COST;
+    // Cost of a *cell*: photometric disagreement + β·detail, plus a large
+    // finite penalty ([`MASK_COST_FACTOR`] × the band's median cost) on cells
+    // star-masked in either panel — the seam crosses connected star/spike
+    // structure only when the whole band is structure, and then takes the
+    // least-bad line. Cells outside the shared full-coverage band are
+    // effectively uncuttable.
+    let mut cost = vec![0.0f32; t_len * s_len];
+    let mut masked = vec![false; t_len * s_len];
+    for t in 0..t_len {
+        for s in 0..s_len {
+            let (x, y) = cell_at(t, s);
+            let k = t * s_len + s;
+            if ca.summary.cov(x, y) < 1.0 || cb.summary.cov(x, y) < 1.0 {
+                cost[k] = UNSHARED_COST;
+                continue;
+            }
+            let diff = (0..nch)
+                .map(|c| (ca.corrected(c, x, y) - cb.corrected(c, x, y)).abs())
+                .fold(0.0f32, f32::max);
+            let det = ca.detail(x, y).max(cb.detail(x, y));
+            cost[k] = diff + DETAIL_BETA * det;
+            let i = y as usize * w8 as usize + x as usize;
+            masked[k] = masks[e.a][i] || masks[e.b][i];
         }
-        let diff = (0..nch)
-            .map(|c| (ca.corrected(c, x, y) - cb.corrected(c, x, y)).abs())
-            .fold(0.0f32, f32::max);
-        let det = ca.detail(x, y).max(cb.detail(x, y));
-        diff + DETAIL_BETA * det
-    };
+    }
+    let mut shared: Vec<f32> = cost.iter().copied().filter(|&c| c < UNSHARED_COST).collect();
+    if !shared.is_empty() {
+        let mid = shared.len() / 2;
+        let median = *shared.select_nth_unstable_by(mid, f32::total_cmp).1;
+        let penalty = MASK_COST_FACTOR * median;
+        for (c, &m) in cost.iter_mut().zip(&masked) {
+            if m && *c < UNSHARED_COST {
+                *c += penalty;
+            }
+        }
+    }
+    let cell_cost = |t: usize, s: usize| -> f32 { cost[t * s_len + s] };
 
     // Boundary states s ∈ 0..=s_len: the seam runs between cells s−1 and s
     // (s = 0 or s_len give the whole band to one side). Cutting is charged
@@ -362,6 +467,143 @@ mod tests {
         // Mid-band boundary: equidistant at x ≈ 15.5.
         assert_eq!(map.at(14, 40), 0);
         assert_eq!(map.at(17, 40), 1);
+    }
+
+    /// Mandatory phase-3E test 1 (mask connectivity): a star core (seed) with
+    /// four spike arms — one diagonal, to exercise 8-connectivity — whose
+    /// cells sit between the grow and seed thresholds. The connected mask
+    /// must cover core and full arms (≥ 2× the extent of a seed-only mask);
+    /// background cells stay unmasked.
+    #[test]
+    fn star_mask_grows_over_connected_spike_arms() {
+        let (w8, h8) = (48u32, 48u32);
+        let mut s = L8Summary::zeroed(w8, h8, 1);
+        for i in 0..(48 * 48) {
+            s.coverage[i] = 1.0;
+            s.detail[i] = 0.01; // background detail; median = 0.01
+        }
+        let idx = |x: i64, y: i64| (y * 48 + x) as usize;
+        let (cx, cy) = (24i64, 24i64);
+        s.detail[idx(cx, cy)] = 0.2; // core: 20× median → seed
+        let arm = 8i64;
+        for t in 1..=arm {
+            // 2× median: below the 3× seed threshold, above the 1.5× grow one.
+            s.detail[idx(cx + t, cy)] = 0.02; // +x arm
+            s.detail[idx(cx - t, cy)] = 0.02; // −x arm
+            s.detail[idx(cx, cy + t)] = 0.02; // +y arm
+            s.detail[idx(cx + t, cy - t)] = 0.02; // diagonal arm (8-conn only)
+        }
+
+        let mask = star_mask(&s);
+        // Seed-only mask (what the raw 3× threshold would protect): core only.
+        let seed_only: Vec<bool> =
+            s.detail.iter().map(|&d| d > MASK_SEED_FACTOR * 0.01).collect();
+        assert_eq!(seed_only.iter().filter(|&&m| m).count(), 1, "only the core seeds");
+
+        // The connected mask covers core and every arm cell — and nothing else.
+        assert!(mask[idx(cx, cy)], "core must be masked");
+        for t in 1..=arm {
+            for (x, y) in
+                [(cx + t, cy), (cx - t, cy), (cx, cy + t), (cx + t, cy - t)]
+            {
+                assert!(mask[idx(x, y)], "arm cell ({x},{y}) must be masked");
+            }
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            1 + 4 * arm as usize,
+            "background cells must stay unmasked"
+        );
+
+        // Extent along the +x arm: 1 + arm cells vs the seed-only single cell.
+        let extent = |m: &[bool]| (0..=arm).take_while(|&t| m[idx(cx + t, cy)]).count();
+        assert!(
+            extent(&mask) >= 2 * extent(&seed_only),
+            "mask arm extent {} must be ≥ 2× seed-only extent {}",
+            extent(&mask),
+            extent(&seed_only)
+        );
+    }
+
+    /// Two panels as in [`band_summaries`], plus a spike: a seed core at
+    /// (12, 40) with an arm along +x to (17, 40) whose detail (2× median)
+    /// is below the seed threshold but inside the mask's growth range, and a
+    /// mildly mismatched background corridor at x ∈ {18, 19} (photometric
+    /// diff 0.005) — cheap enough that only the mask penalty pushes the seam
+    /// into it.
+    fn spike_summaries() -> Vec<L8Summary> {
+        let mut ss = band_summaries(None);
+        for s in &mut ss {
+            s.detail[(40 * 32 + 12) as usize] = 0.5; // core seed
+            for x in 13..18u32 {
+                s.detail[(40 * 32 + x) as usize] = 0.002; // arm: grow range
+            }
+        }
+        for y in 0..80u32 {
+            for x in 18..20u32 {
+                ss[1].mean[(y * 32 + x) as usize] = 0.105; // corridor diff
+            }
+        }
+        ss
+    }
+
+    /// Mandatory phase-3E test 2: the owner boundary never crosses masked
+    /// cells when a clear background corridor exists — and, teeth: with the
+    /// masks disabled the mildly cheaper straight seam does cross the arm.
+    #[test]
+    fn seam_avoids_masked_spike_arm_via_background_corridor() {
+        let summaries = spike_summaries();
+        let graph = OverlapGraph::build(&summaries);
+        assert_eq!(graph.edges.len(), 1);
+        let masks: Vec<Vec<bool>> = summaries.iter().map(star_mask).collect();
+        // Sanity: core + arm are masked in both panels, corridor is not.
+        for x in 12..18usize {
+            assert!(masks[0][40 * 32 + x] && masks[1][40 * 32 + x], "arm cell x={x}");
+        }
+        for x in 18..20usize {
+            assert!(!masks[0][40 * 32 + x] && !masks[1][40 * 32 + x], "corridor x={x}");
+        }
+
+        let map = compute_owner_map(
+            &summaries,
+            &graph,
+            &identity_phot(2),
+            None,
+            (256, 640, 1),
+            256.0,
+        );
+        for ((x, y), (x2, y2)) in boundary_pairs(&map) {
+            for (bx, by) in [(x, y), (x2, y2)] {
+                let i = by as usize * 32 + bx as usize;
+                assert!(
+                    !masks[0][i] && !masks[1][i],
+                    "owner boundary crosses masked cell ({bx},{by})"
+                );
+            }
+        }
+
+        // Teeth: all-false masks (mask disabled) → the seam cuts the arm.
+        let no_masks: Vec<Vec<bool>> =
+            summaries.iter().map(|s| vec![false; (s.w8 * s.h8) as usize]).collect();
+        let unmasked = compute_owner_map_masked(
+            &summaries,
+            &graph,
+            &identity_phot(2),
+            None,
+            (256, 640, 1),
+            256.0,
+            &no_masks,
+        );
+        let crossed = boundary_pairs(&unmasked).iter().any(|&((x, y), (x2, y2))| {
+            [(x, y), (x2, y2)]
+                .iter()
+                .any(|&(bx, by)| masks[0][by as usize * 32 + bx as usize])
+        });
+        assert!(
+            crossed,
+            "without the mask the cheap straight seam must cross the arm — \
+             otherwise this test has no teeth"
+        );
     }
 
     /// Mandatory test 1: with a bright star mid-band, the seam must route
