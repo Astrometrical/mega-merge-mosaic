@@ -42,6 +42,29 @@ enum Command {
         #[arg(short, long, default_value = "mosaic.mmm-session")]
         session: std::path::PathBuf,
     },
+
+    /// Feather-blend the analyzed panels into a mosaic FITS (and optional PNG preview)
+    Blend {
+        /// Session directory produced by `mmm analyze`
+        #[arg(short, long, default_value = "mosaic.mmm-session")]
+        session: std::path::PathBuf,
+
+        /// Output FITS file (BITPIX=-32, planar channels)
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+
+        /// Downsample factor: 1 = full resolution, 8 = fast preview from L8 summaries
+        #[arg(long, default_value_t = 1)]
+        downsample: u32,
+
+        /// Feather ramp length in canvas pixels
+        #[arg(long, default_value_t = 256.0)]
+        feather: f32,
+
+        /// Also write an autostretched 8-bit PNG preview (downsampled runs only)
+        #[arg(long)]
+        png: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -105,7 +128,76 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Report { session } => report(&session),
+        Command::Blend { session, output, downsample, feather, png } => {
+            blend_cmd(&session, &output, downsample, feather, png.as_deref())
+        }
     }
+}
+
+fn blend_cmd(
+    session_dir: &std::path::Path,
+    output: &std::path::Path,
+    downsample: u32,
+    feather: f32,
+    png: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use mmm_core::blend::{BlendParams, blend, union_bbox};
+    use mmm_core::formats::xisf::XisfPanel;
+    use mmm_core::output::Tee;
+    use mmm_core::output::fits::{FitsSink, keywords_for_output};
+    use mmm_core::output::png::PngSink;
+
+    let t0 = std::time::Instant::now();
+    let session = mmm_core::session::Session::open(session_dir)?;
+    let graph = mmm_core::overlap::OverlapGraph::load(&session.overlap_graph_path())?;
+    let phot = mmm_core::photometry::Photometry::load(&session.photometry_path())?;
+    let bbox = union_bbox(&session)?;
+    let ds = downsample.max(1) as u64;
+    // Crop origin in output pixel units (best-effort for downsampled previews:
+    // the WCS scale itself is not rewritten).
+    let crop = (bbox[0] / ds, bbox[1] / ds);
+    let keywords = keywords_for_output(
+        &XisfPanel::open(&session.panels[0].path)?.header().fits_keywords,
+        crop,
+    );
+    println!(
+        "session: {} panels, canvas {}x{}x{}ch, output bbox [{},{})x[{},{})  ({:.2}s)",
+        session.panels.len(),
+        session.canvas.0,
+        session.canvas.1,
+        session.canvas.2,
+        bbox[0],
+        bbox[2],
+        bbox[1],
+        bbox[3],
+        t0.elapsed().as_secs_f64()
+    );
+
+    let params = BlendParams { feather_px: feather, downsample, ..Default::default() };
+    let t1 = std::time::Instant::now();
+    let mut fits = FitsSink::create(output, keywords)?;
+    match png {
+        Some(png_path) => {
+            let mut png_sink = PngSink::create(png_path);
+            let mut tee = Tee::new(&mut fits, &mut png_sink);
+            blend(&session, &phot, &graph, &params, &mut tee)?;
+            println!("png preview: {}", png_path.display());
+        }
+        None => blend(&session, &phot, &graph, &params, &mut fits)?,
+    }
+    println!("blend + write: {:.2}s", t1.elapsed().as_secs_f64());
+
+    let out_w = bbox[2].div_ceil(ds) - bbox[0] / ds;
+    let out_h = bbox[3].div_ceil(ds) - bbox[1] / ds;
+    println!(
+        "output: {} ({}x{} x{}ch, downsample {downsample}, feather {feather} px)",
+        output.display(),
+        out_w,
+        out_h,
+        session.canvas.2
+    );
+    println!("total: {:.2}s", t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {

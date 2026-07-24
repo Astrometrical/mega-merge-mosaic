@@ -10,6 +10,7 @@ repository.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
 bytemuck.workspace = true
+png.workspace = true
 rayon.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
