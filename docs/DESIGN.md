@@ -84,12 +84,43 @@ automatically (distance ≈ 0 ⇒ tiny weight).
 optional PNG output with an autostretch (median/MAD midtone transfer) for
 quick visual checks.
 
-### Phase 2 (not in POC)
+### Phase 2 (in progress)
 
-Star-avoiding seam paths (DP/graph-cut on overlap bands, star penalty), shared
-across channels; multiband blend confined to seam bands; residual low-order
-surface correction after the gain fit. Never average stars — each star comes
-from exactly one panel.
+**A. Residual surface correction.** After the global gain solve, per-panel
+low-order 2-D polynomial corrections `s_i(x,y)` (order ≤ 2 over normalized
+canvas coords) fitted per channel to the remaining overlap differences on L8,
+solved globally (6N×6N normal equations) so corrections agree around loops.
+Guard rails (see user validation above): fit uses **background cells only**
+(exclude cells brighter than panel median + k·MAD — signal regions must not
+steer the fit), sigma-clipped, small ridge toward zero correction, reference
+panel's constant term gauged to 0, and reported max |s| per panel so runaway
+corrections are visible in `mmm report`. Applied during blend as
+`v' = g·v + o + s_i(x,y)`.
+
+**B. Two-band blend with star-avoiding seams.** Split each corrected panel
+into base (bilinear-upsampled L8 mean — smooth, star-free) + detail
+(full-res minus base). Base blends with the existing wide feather (hides any
+residual low-frequency mismatch); detail comes from exactly **one** panel per
+pixel via an owner/label map — stars are never averaged, so sub-pixel
+misregistration cannot pinch or double them. Owner map computed on the L8
+grid: start from argmax feather weight (Voronoi-like mid-overlap boundary),
+then per-edge seam optimization (DP path over the overlap band) with a cost
+of |corrected difference| + penalty on high-detail cells (star/structure
+avoidance, using an L8 detail-energy plane added to the analyze scan). Detail
+transitions ramp over ~16 px in background but snap hard near stars. Seam is
+shared across channels (single owner map) to avoid colour fringing.
+
+**C. WCS passthrough.** PixInsight stores plate solutions as XISF
+`<Property>` elements (not FITS keywords). Parse properties, extract the
+linear part of the astrometric solution, emit standard WCS cards
+(CTYPE/CRVAL/CRPIX/CD) shifted by the crop origin. Spline solutions are
+approximated by their linear part (documented limitation).
+
+**D. ROI blending.** `--roi x,y,w,h` restricts the output canvas (fast
+problem-area iteration at full res).
+
+Deferred to phase 3: FITS *input*, compressed XISF ingest, full Laplacian
+pyramid (if two-band proves insufficient), wgpu GPU path, GUI.
 
 ## Session directory
 
@@ -136,6 +167,15 @@ Threadripper 64T under WSL2, page cache warm:
   colour-tint gradients that global gain+offset cannot remove (residual
   surface correction); cosmetic staircase where rotated panel rims meet the
   canvas edge.
+- **User validation (PixInsight, unlinked screen stretch): "best mosaic merge
+  I've seen on that mosaic."** No star issues in seams, no bad gradients, no
+  odd colours. Notably: other tools "dig holes" in the region between M42 and
+  the Running Man (fighting gradient mismatches in signal-dominated overlap);
+  mmm does not — because it fits levels globally and never lets the blender
+  reconcile signal. **Design guard rail derived from this:** the phase-2
+  residual surface correction must be prevented from absorbing signal
+  differences (fit background cells only, robust clipping, low order, capped
+  magnitude) or we will reintroduce exactly this failure mode.
 - ⚠ finding: PixInsight stores plate solutions as XISF `<Property>` elements,
   NOT FITS keywords — the registered panels carry no CRPIX/CRVAL/CTYPE
   keywords. WCS passthrough requires parsing `<Property>` elements (todo,
