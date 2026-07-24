@@ -33,18 +33,27 @@ CPU-parallel (rayon) first; GPU acceleration (wgpu) planned. Core is a library
 
 ## Status
 
-**Phase 1 POC working.** On a 12-panel mosaic (9255×18310×3 canvas, 24 GB of
-panels): analyze 3.5 s, full-res blend to FITS 6.1 s, downsampled preview
-0.6 s (64-thread Threadripper, warm cache). Photometric matching + feather
-blend produce seam-free results on real data, validated against a synthetic
-ground truth. Phase 2 (star-avoiding seams, multiband, residual gradient
-surfaces, WCS from XISF properties) is next.
+**Phase 2 complete.** On a 12-panel mosaic (9255×18310×3 canvas, 24 GB of
+panels, 64-thread Threadripper): analyze 5 s, full-res blend 6 s, ROI crop
+1.3 s, preview under a second. The pipeline is photometric matching (global
+gain/offset solve) → residual surface correction (background-only, signal-
+protected) → star-avoiding seams with two-band blending (stars always come
+from exactly one panel — misregistration cannot pinch or double them) →
+streamed FITS with real WCS from the XISF astrometric solution. Validated
+against synthetic ground truth (75 tests) and user-validated in PixInsight
+against GradientMergeMosaic/PhotometricMosaic on real data ("best merge
+I've seen on that mosaic").
 
 ```
 mmm analyze test_data/orion_mosaic/*.xisf --session orion.mmm-session
 mmm report  --session orion.mmm-session
-mmm blend   --session orion.mmm-session -o mosaic.fits [--downsample 8 --png prev.png]
+mmm blend   --session orion.mmm-session -o mosaic.fits
+mmm blend   --session orion.mmm-session -o crop.fits --roi 5000,3500,2000,2000
+mmm blend   --session orion.mmm-session -o prev.fits --downsample 8 --png prev.png
 ```
+
+Phase 3 candidates: FITS/compressed-XISF input, optional global gradient
+flatten, full Laplacian pyramid, wgpu GPU path, GUI.
 
 ## Build
 

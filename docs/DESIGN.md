@@ -182,6 +182,32 @@ Threadripper 64T under WSL2, page cache warm:
   phase 2); `keywords_for_output`'s CRPIX shifting is implemented and tested
   but currently has nothing to shift on real data.
 
+## Phase 2 results (2026-07-24)
+
+All four phase-2 tasks landed (75 tests, clippy clean). Real-data numbers,
+12-panel Orion set, warm cache:
+
+- analyze (now incl. detail planes, surfaces): **5.2 s**; full-res TwoBand
+  blend + WCS: **6.1 s**; ROI 2000×2000: **1.3 s**.
+- **Surfaces**: inter-panel overlap residual RMS improved 1.9× globally
+  (3.3× on worst edges); max|s| ~1e-4–3e-4, all under the 5×MAD guard.
+  Honest finding: much of the visible large-scale colour cast is *common to
+  all panels* (real sky gradient/IFN) — out of scope by design; the guard
+  rail worked (star regions moved the fit ≤1.3% in tests).
+- **Two-band + seams**: anti-pinching e2e proves merged stars match ONE
+  panel (≤0.0006 vs noise threshold 0.024) under 0.6 px synthetic
+  misregistration, while feather mode fails the same check (0.08–0.13).
+  Implementation deviation (kept within design intent): the base band
+  excludes starry + rim cells (onion-peel background fill) — raw cell means
+  near stars otherwise imprint colour blobs; rim cells leak garbage.
+  Trade-off to watch: single-panel defects (cosmic rays, satellite trails)
+  in overlaps are no longer averaged down — the owner shows them at full
+  strength.
+- **WCS**: PixInsight 1.9.4 stores the solution in `PCL:AstrometricSolution:*`
+  properties (inline base64 f64 vectors/matrices, not attachments); pure
+  linear Gnomonic → exact TAN cards, center error 0.0″, crop-shift invariant.
+  Downsampled previews get no WCS (CD would need rescaling — refusing to lie).
+
 ## Performance notes
 
 - Full-plane scan measured at ~0.9 GB/s single-threaded; analyze is I/O-bound
