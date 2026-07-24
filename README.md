@@ -33,8 +33,18 @@ CPU-parallel (rayon) first; GPU acceleration (wgpu) planned. Core is a library
 
 ## Status
 
-Early development. Phase 1 (ingest, overlap graph, photometric solve, feather
-blend) in progress.
+**Phase 1 POC working.** On a 12-panel mosaic (9255×18310×3 canvas, 24 GB of
+panels): analyze 3.5 s, full-res blend to FITS 6.1 s, downsampled preview
+0.6 s (64-thread Threadripper, warm cache). Photometric matching + feather
+blend produce seam-free results on real data, validated against a synthetic
+ground truth. Phase 2 (star-avoiding seams, multiband, residual gradient
+surfaces, WCS from XISF properties) is next.
+
+```
+mmm analyze test_data/orion_mosaic/*.xisf --session orion.mmm-session
+mmm report  --session orion.mmm-session
+mmm blend   --session orion.mmm-session -o mosaic.fits [--downsample 8 --png prev.png]
+```
 
 ## Build
 

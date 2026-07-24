@@ -119,6 +119,29 @@ mmm blend --session S -o out.fits [--downsample N] [--feather PX] [--png P]
   assert recovered gains and RMSE of (merged − truth) in interior regions.
 - Real-data smoke: `test_data/orion_mosaic/` (12 panels; 3,4,7,8 cover M42).
 
+## POC results (2026-07-24, Phase 1 complete)
+
+Real data: 12-panel Orion mosaic, canvas 9255×18310×3 Float32 (24 GB input),
+Threadripper 64T under WSL2, page cache warm:
+
+- `analyze` (L8 summaries + overlap graph + photometric solve): **3.5 s**
+- `blend` full-res → 1.94 GB FITS: **6.1 s**; `--downsample 8` + PNG: **0.6 s**
+- Overlap graph: 29 edges (17 grid-neighbour + 12 diagonal corner), one
+  connected component. Global gains 0.85–1.23; PANEL-8's 2.3× brighter
+  background correctly absorbed into offsets.
+- Visual: no visible seams or brightness steps at 1/8 or at full res,
+  including the seam bands crossing M42/Running Man (signal-dominated
+  overlap). Stars round through all seams — no pinching/doubling.
+- Remaining artifacts (expected, phase 2 targets): large-scale per-panel
+  colour-tint gradients that global gain+offset cannot remove (residual
+  surface correction); cosmetic staircase where rotated panel rims meet the
+  canvas edge.
+- ⚠ finding: PixInsight stores plate solutions as XISF `<Property>` elements,
+  NOT FITS keywords — the registered panels carry no CRPIX/CRVAL/CTYPE
+  keywords. WCS passthrough requires parsing `<Property>` elements (todo,
+  phase 2); `keywords_for_output`'s CRPIX shifting is implemented and tested
+  but currently has nothing to shift on real data.
+
 ## Performance notes
 
 - Full-plane scan measured at ~0.9 GB/s single-threaded; analyze is I/O-bound
