@@ -12,7 +12,16 @@
 //! This crate is UI-agnostic: the `mmm` CLI and any future GUI are thin
 //! frontends over [`session`].
 
+pub mod analyze;
+pub mod blend;
 pub mod error;
 pub mod formats;
+pub mod linalg;
+pub mod output;
+pub mod overlap;
+pub mod photometry;
+pub mod session;
+pub mod summary;
+pub mod synth;
 
 pub use error::{Error, Result};
