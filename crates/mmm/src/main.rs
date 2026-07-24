@@ -34,6 +34,10 @@ enum Command {
         /// Session directory for cached analysis (created if missing)
         #[arg(short, long, default_value = "mosaic.mmm-session")]
         session: std::path::PathBuf,
+
+        /// Residual surface correction: off, 0 (constant), 1 (plane), 2 (quadratic)
+        #[arg(long, default_value = "2")]
+        surface: String,
     },
 
     /// Report analysis results: the overlap-graph edge table
@@ -89,10 +93,17 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Analyze { panels, session } => {
+        Command::Analyze { panels, session, surface } => {
             tracing::info!(?session, n_panels = panels.len(), "analyze requested");
+            let surface_order = match surface.as_str() {
+                "off" => None,
+                "0" => Some(0),
+                "1" => Some(1),
+                "2" => Some(2),
+                other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
+            };
             let t0 = std::time::Instant::now();
-            let s = mmm_core::analyze::analyze(&panels, &session)?;
+            let s = mmm_core::analyze::analyze_opts(&panels, &session, surface_order)?;
             let (w, h, ch) = s.canvas;
             println!("canvas: {w}x{h} x{ch}ch   session: {}", s.dir.display());
             println!(
@@ -173,6 +184,16 @@ fn blend_cmd(
         t0.elapsed().as_secs_f64()
     );
 
+    let surfaces = if session.surfaces_path().exists() {
+        Some(mmm_core::surfaces::Surfaces::load(&session.surfaces_path())?)
+    } else {
+        None
+    };
+    match &surfaces {
+        Some(s) => println!("surfaces: applying residual corrections (order {})", s.order),
+        None => println!("surfaces: none (analyze ran with --surface off)"),
+    }
+
     let params = BlendParams { feather_px: feather, downsample, ..Default::default() };
     let t1 = std::time::Instant::now();
     let mut fits = FitsSink::create(output, keywords)?;
@@ -180,10 +201,10 @@ fn blend_cmd(
         Some(png_path) => {
             let mut png_sink = PngSink::create(png_path);
             let mut tee = Tee::new(&mut fits, &mut png_sink);
-            blend(&session, &phot, &graph, &params, &mut tee)?;
+            blend(&session, &phot, surfaces.as_ref(), &graph, &params, &mut tee)?;
             println!("png preview: {}", png_path.display());
         }
-        None => blend(&session, &phot, &graph, &params, &mut fits)?,
+        None => blend(&session, &phot, surfaces.as_ref(), &graph, &params, &mut fits)?,
     }
     println!("blend + write: {:.2}s", t1.elapsed().as_secs_f64());
 
@@ -254,7 +275,40 @@ fn report(session_dir: &std::path::Path) -> anyhow::Result<()> {
         Ok(phot) => report_photometry(&phot, &name),
         Err(_) => println!("\nno photometry results (re-run `mmm analyze`)"),
     }
+
+    match mmm_core::surfaces::Surfaces::load(&session.surfaces_path()) {
+        Ok(surf) => report_surfaces(&surf, &name),
+        Err(_) => println!("\nno residual surfaces (analyze ran with --surface off)"),
+    }
     Ok(())
+}
+
+fn report_surfaces(surf: &mmm_core::surfaces::Surfaces, name: &dyn Fn(usize) -> String) {
+    use mmm_core::surfaces::WARN_MAD_FACTOR;
+
+    let channels = surf.coeffs.len();
+    let n_panels = surf.coeffs.first().map(|c| c.len()).unwrap_or(0);
+    println!(
+        "\nresidual surfaces (order {}; ⚠ = max|s| > {WARN_MAD_FACTOR}× background MAD):",
+        surf.order
+    );
+    let mut header = format!("{:>3} ", "id");
+    for c in 0..channels {
+        header.push_str(&format!(" {:>10}{c} {:>10}{c}", "max|s|", "bgMAD"));
+    }
+    println!("{header}  file");
+    for p in 0..n_panels {
+        let mut row = format!("{p:>3} ");
+        let mut warn = false;
+        for c in 0..channels {
+            let s = surf.max_abs_s.get(c).and_then(|v| v.get(p)).copied().unwrap_or(0.0);
+            let mad = surf.bg_mad.get(c).and_then(|v| v.get(p)).copied().unwrap_or(0.0);
+            warn |= mad > 0.0 && s > WARN_MAD_FACTOR * mad;
+            row.push_str(&format!(" {s:>11.3e} {mad:>11.3e}"));
+        }
+        let flag = if warn { "  ⚠ runaway correction" } else { "" };
+        println!("{row}  {}{flag}", name(p));
+    }
 }
 
 fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usize) -> String) {

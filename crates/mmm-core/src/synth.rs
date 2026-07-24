@@ -28,6 +28,11 @@ pub struct SynthSpec {
     pub panel_gain_range: (f32, f32),
     /// Per-panel offset drawn uniformly from this range, e.g. (-0.01, 0.02).
     pub panel_offset_range: (f32, f32),
+    /// Per-panel additive gradient plane `a + b·x/w + c·y/h` (normalized
+    /// canvas coords) with `a`, `b`, `c` each drawn uniformly from this range;
+    /// applied inside the window on top of gain/offset. `(0.0, 0.0)` is a
+    /// strict no-op (phase-1 behavior).
+    pub panel_gradient_range: (f32, f32),
     pub seed: u64,
 }
 
@@ -40,6 +45,9 @@ pub struct SynthResult {
     pub panel_paths: Vec<PathBuf>,
     /// Per-panel (gain, offset) actually applied.
     pub applied: Vec<(f32, f32)>,
+    /// Per-panel gradient plane coefficients `(a, b, c)` actually applied:
+    /// `a + b·x/w + c·y/h` over normalized canvas coords.
+    pub applied_grad: Vec<(f32, f32, f32)>,
     /// Per-panel content window on the canvas: [x0, y0, x1, y1], exclusive.
     pub windows: Vec<[u64; 4]>,
 }
@@ -176,11 +184,16 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         }
     }
 
-    // Panels: full-canvas frames, truth·gain+offset inside the window, hard
-    // zeros elsewhere.
+    // Panels: full-canvas frames, truth·gain + offset + gradient plane inside
+    // the window, hard zeros elsewhere. Perturbations come from a *separate*
+    // RNG stream so the drawn gain/offset/gradient values are invariant to
+    // `n_stars`/noise draws — tests compare star vs star-free generations of
+    // the same seed and need identical perturbations.
     let n_panels = (spec.grid.0 * spec.grid.1) as usize;
+    let mut prng = Rng::new(spec.seed ^ 0xC0FF_EE00_D15E_A5E5);
     let mut panel_paths = Vec::with_capacity(n_panels);
     let mut applied = Vec::with_capacity(n_panels);
+    let mut applied_grad = Vec::with_capacity(n_panels);
     let mut windows = Vec::with_capacity(n_panels);
     let mut frame = vec![0.0f32; ch * plane];
 
@@ -188,11 +201,16 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         for cx in 0..spec.grid.0 {
             let id = (cy * spec.grid.0 + cx) as usize;
             let gain =
-                rng.range_f64(spec.panel_gain_range.0 as f64, spec.panel_gain_range.1 as f64)
+                prng.range_f64(spec.panel_gain_range.0 as f64, spec.panel_gain_range.1 as f64)
                     as f32;
             let offset =
-                rng.range_f64(spec.panel_offset_range.0 as f64, spec.panel_offset_range.1 as f64)
+                prng.range_f64(spec.panel_offset_range.0 as f64, spec.panel_offset_range.1 as f64)
                     as f32;
+            let (glo, ghi) =
+                (spec.panel_gradient_range.0 as f64, spec.panel_gradient_range.1 as f64);
+            let ga = prng.range_f64(glo, ghi) as f32;
+            let gb = prng.range_f64(glo, ghi) as f32;
+            let gc = prng.range_f64(glo, ghi) as f32;
             let [x0, y0, x1, y1] = panel_window(spec, cx, cy);
 
             frame.fill(0.0);
@@ -200,9 +218,11 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                 let src = &truth[c * plane..(c + 1) * plane];
                 let dst = &mut frame[c * plane..(c + 1) * plane];
                 for y in y0..y1 {
+                    let grad_y = ga + gc * (y as f32 / h as f32);
                     for x in x0..x1 {
                         let i = (y * w + x) as usize;
-                        let mut v = src[i] * gain + offset;
+                        let grad = grad_y + gb * (x as f32 / w as f32);
+                        let mut v = src[i] * gain + offset + grad;
                         if v == 0.0 {
                             // Covered pixels must never be exactly 0 (no-data
                             // sentinel); nudge by a value below test tolerance.
@@ -217,11 +237,12 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
             write_xisf(&path, w, h, spec.channels as u64, &frame)?;
             panel_paths.push(path);
             applied.push((gain, offset));
+            applied_grad.push((ga, gb, gc));
             windows.push([x0, y0, x1, y1]);
         }
     }
 
-    Ok(SynthResult { truth, panel_paths, applied, windows })
+    Ok(SynthResult { truth, panel_paths, applied, applied_grad, windows })
 }
 
 /// Minimal monolithic XISF writer (Float32, planar, little-endian,
@@ -282,6 +303,7 @@ mod tests {
             noise_sigma: 0.002,
             panel_gain_range: (0.7, 1.4),
             panel_offset_range: (-0.01, 0.02),
+            panel_gradient_range: (0.0, 0.0),
             seed: 42,
         }
     }
@@ -387,7 +409,63 @@ mod tests {
         let [bx0, _, bx1, _] = res.windows[1];
         assert!(bx0 < ax1 && ax0 < bx1, "horizontally adjacent panels must overlap");
 
+        // Default gradient range (0,0) is a strict no-op.
+        for &(a, b, c) in &res.applied_grad {
+            assert_eq!((a, b, c), (0.0, 0.0, 0.0), "gradient range (0,0) must draw zeros");
+        }
+
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn generate_applies_per_panel_gradient_planes() {
+        let dir = tmpdir("grad");
+        let mut spec = test_spec();
+        spec.panel_gradient_range = (-0.01, 0.02);
+        let res = generate(&spec, &dir).unwrap();
+
+        let (w, h) = spec.canvas;
+        let plane = (w * h) as usize;
+        for (p, path) in res.panel_paths.iter().enumerate() {
+            let (gain, offset) = res.applied[p];
+            let (ga, gb, gc) = res.applied_grad[p];
+            assert!((-0.01..=0.02).contains(&ga));
+            assert!((-0.01..=0.02).contains(&gb));
+            assert!((-0.01..=0.02).contains(&gc));
+
+            let panel = XisfPanel::open(path).unwrap();
+            let [x0, y0, x1, y1] = res.windows[p];
+            for c in 0..spec.channels as u64 {
+                let data = panel.channel(c);
+                let truth_plane = &res.truth[c as usize * plane..(c as usize + 1) * plane];
+                for y in (y0..y1).step_by(3) {
+                    for x in (x0..x1).step_by(3) {
+                        let i = (y * w + x) as usize;
+                        let grad =
+                            ga + gb * (x as f32 / w as f32) + gc * (y as f32 / h as f32);
+                        let expected = truth_plane[i] * gain + offset + grad;
+                        let got = data[i];
+                        let tol = 1e-5 + expected.abs() * 1e-5;
+                        assert!(
+                            (got - expected).abs() <= tol,
+                            "panel {p} ch {c} ({x},{y}): got {got}, expected {expected}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The same seed with stars added must draw identical perturbations
+        // (perturbation RNG is independent of star/noise draws).
+        let mut spec_stars = spec.clone();
+        spec_stars.n_stars = 30;
+        let dir2 = tmpdir("grad-stars");
+        let res2 = generate(&spec_stars, &dir2).unwrap();
+        assert_eq!(res.applied, res2.applied);
+        assert_eq!(res.applied_grad, res2.applied_grad);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir2).unwrap();
     }
 
     #[test]

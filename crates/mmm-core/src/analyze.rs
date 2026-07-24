@@ -25,10 +25,24 @@ struct PanelScan {
     canvas: (u64, u64, u64),
 }
 
-/// Analyze `paths` into a session at `session_dir`: writes `session.json`,
-/// `panels/<id>/summary.bin`, `analysis/overlap_graph.json`, and
-/// `analysis/photometry.json`, returns the populated [`Session`].
+/// Analyze `paths` into a session at `session_dir` with the default residual
+/// surface order (quadratic). See [`analyze_opts`].
 pub fn analyze(paths: &[PathBuf], session_dir: &Path) -> Result<Session> {
+    analyze_opts(paths, session_dir, Some(2))
+}
+
+/// Analyze `paths` into a session at `session_dir`: writes `session.json`,
+/// `panels/<id>/summary.bin`, `analysis/overlap_graph.json`,
+/// `analysis/photometry.json`, and (unless `surface_order` is `None`)
+/// `analysis/surfaces.json`, returns the populated [`Session`].
+///
+/// `surface_order = None` disables the residual surface fit entirely and
+/// removes any stale `surfaces.json` so a later blend won't apply it.
+pub fn analyze_opts(
+    paths: &[PathBuf],
+    session_dir: &Path,
+    surface_order: Option<u32>,
+) -> Result<Session> {
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
     }
@@ -79,6 +93,19 @@ pub fn analyze(paths: &[PathBuf], session_dir: &Path) -> Result<Session> {
 
     let phot = crate::photometry::solve(&summaries, &graph)?;
     phot.save(&session.photometry_path())?;
+
+    match surface_order {
+        Some(order) => {
+            let surfaces =
+                crate::surfaces::fit_surfaces(&summaries, &graph, &phot, canvas, order)?;
+            surfaces.save(&session.surfaces_path())?;
+        }
+        None => {
+            // Stale surfaces from a previous run must not survive an
+            // explicit `--surface off` re-analyze.
+            let _ = std::fs::remove_file(session.surfaces_path());
+        }
+    }
 
     session.save()?;
     Ok(session)

@@ -28,6 +28,7 @@ fn analyze_recovers_applied_panel_transforms() {
         noise_sigma: 0.002,
         panel_gain_range: (0.7, 1.4),
         panel_offset_range: (-0.01, 0.02),
+        panel_gradient_range: (0.0, 0.0),
         seed: 7,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();

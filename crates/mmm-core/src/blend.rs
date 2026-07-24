@@ -22,6 +22,7 @@ use crate::overlap::{OverlapGraph, distance_map};
 use crate::photometry::Photometry;
 use crate::session::Session;
 use crate::summary::{BLOCK, L8Summary};
+use crate::surfaces::Surfaces;
 use crate::{Error, Result};
 
 /// Weight floor for covered pixels: rim pixels survive normalization when
@@ -78,13 +79,37 @@ struct PanelPrep {
     /// Per-channel photometric gain/offset (identity when absent).
     gains: Vec<f32>,
     offsets: Vec<f32>,
+    /// Per-channel residual surface coefficients, padded to the 6 terms
+    /// `1, x, y, x², xy, y²` (normalized canvas coords); all-zero when the
+    /// session has no surfaces.
+    surf: Vec<[f64; 6]>,
     summary: L8Summary,
     /// Chamfer distance to the nearest not-fully-covered L8 cell, in cells.
     dist: Vec<f32>,
 }
 
+impl PanelPrep {
+    /// Row constants for the surface at normalized row coordinate `yn`:
+    /// `s(xn) = a + xn·(b + xn·c)` per channel (Horner in `xn`).
+    #[inline]
+    fn surf_row(&self, yn: f64) -> Vec<(f32, f32, f32)> {
+        self.surf
+            .iter()
+            .map(|t| {
+                let a = t[0] + (t[2] + t[5] * yn) * yn;
+                let b = t[1] + t[4] * yn;
+                (a as f32, b as f32, t[3] as f32)
+            })
+            .collect()
+    }
+}
+
 /// Load summaries, compute distance maps, and resolve per-panel corrections.
-fn prep_panels(session: &Session, phot: &Photometry) -> Result<Vec<PanelPrep>> {
+fn prep_panels(
+    session: &Session,
+    phot: &Photometry,
+    surfaces: Option<&Surfaces>,
+) -> Result<Vec<PanelPrep>> {
     let ch = session.canvas.2 as usize;
     session
         .panels
@@ -106,10 +131,22 @@ fn prep_panels(session: &Session, phot: &Photometry) -> Result<Vec<PanelPrep>> {
                     })
                     .collect()
             };
+            let surf: Vec<[f64; 6]> = (0..ch)
+                .map(|c| {
+                    let mut padded = [0.0f64; 6];
+                    if let Some(coeffs) =
+                        surfaces.and_then(|s| s.coeffs.get(c)).and_then(|t| t.get(p.id))
+                    {
+                        padded[..coeffs.len()].copy_from_slice(coeffs);
+                    }
+                    padded
+                })
+                .collect();
             Ok(PanelPrep {
                 bbox: p.bbox,
                 gains: correction(&phot.gains, 1.0),
                 offsets: correction(&phot.offsets, 0.0),
+                surf,
                 summary,
                 dist,
             })
@@ -140,10 +177,12 @@ fn weight(d_px: f32, inv_feather: f32) -> f32 {
     (d_px * inv_feather).clamp(0.0, 1.0).max(MIN_WEIGHT)
 }
 
-/// Feather-blend the session's panels into `sink`.
+/// Feather-blend the session's panels into `sink`, applying the photometric
+/// corrections and (when given) the residual surfaces: `v' = g·v + o + s(x,y)`.
 pub fn blend(
     session: &Session,
     phot: &Photometry,
+    surfaces: Option<&Surfaces>,
     _graph: &OverlapGraph,
     params: &BlendParams,
     sink: &mut dyn RowSink,
@@ -158,8 +197,8 @@ pub fn blend(
         ));
     }
     match params.downsample {
-        1 => blend_full(session, phot, params, sink),
-        8 => blend_l8(session, phot, params, sink),
+        1 => blend_full(session, phot, surfaces, params, sink),
+        8 => blend_l8(session, phot, surfaces, params, sink),
         d => Err(Error::format(
             &session.dir,
             format!("unsupported downsample {d} (only 1 or 8)"),
@@ -171,12 +210,13 @@ pub fn blend(
 fn blend_full(
     session: &Session,
     phot: &Photometry,
+    surfaces: Option<&Surfaces>,
     params: &BlendParams,
     sink: &mut dyn RowSink,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
-    let preps = prep_panels(session, phot)?;
+    let preps = prep_panels(session, phot, surfaces)?;
     let panels: Vec<XisfPanel> = session
         .panels
         .par_iter()
@@ -211,6 +251,8 @@ fn blend_full(
     let band_rows = params.band_rows.max(1);
     let inv_feather = 1.0 / params.feather_px;
     let inv_block = 1.0 / BLOCK as f32;
+    let inv_cw = 1.0f32 / session.canvas.0 as f32;
+    let inv_ch = 1.0f64 / session.canvas.1 as f64;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
 
     for y0 in (0..out_h).step_by(band_rows) {
@@ -243,6 +285,9 @@ fn blend_full(
                     for c in 0..nch as u64 {
                         rows.push(panels[pi].row(c, cy));
                     }
+                    // Residual surface, reduced to per-row constants:
+                    // s(xn) = a + xn·(b + xn·c) per channel (Horner).
+                    let srow = p.surf_row(cy as f64 * inv_ch);
                     let xs = p.bbox[0].max(cx0);
                     let xe = p.bbox[2].min(bbox[2]);
                     for x in xs..xe {
@@ -256,8 +301,14 @@ fn blend_full(
                         let wgt = weight(d_px, inv_feather);
                         let o = (x - cx0) as usize;
                         wsum[o] += wgt;
+                        let xn = x as f32 * inv_cw;
                         for (c, row) in rows.iter().enumerate() {
-                            acc[c * out_w + o] += wgt * (row[xi] * p.gains[c] + p.offsets[c]);
+                            let (sa, sb, sc) = srow[c];
+                            acc[c * out_w + o] += wgt
+                                * (row[xi] * p.gains[c]
+                                    + p.offsets[c]
+                                    + sa
+                                    + xn * (sb + xn * sc));
                         }
                     }
                 }
@@ -280,12 +331,13 @@ fn blend_full(
 fn blend_l8(
     session: &Session,
     phot: &Photometry,
+    surfaces: Option<&Surfaces>,
     params: &BlendParams,
     sink: &mut dyn RowSink,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
-    let preps = prep_panels(session, phot)?;
+    let preps = prep_panels(session, phot, surfaces)?;
     let bbox = union_bbox(session)?;
     let (w8, h8) = (preps[0].summary.w8, preps[0].summary.h8);
     let b = BLOCK as u64;
@@ -300,6 +352,8 @@ fn blend_l8(
     sink.begin(out_w as u64, out_h as u64, nch as u64)?;
     let band_rows = params.band_rows.max(1);
     let inv_feather = 1.0 / params.feather_px;
+    let inv_cw = 1.0f64 / session.canvas.0 as f64;
+    let inv_ch = 1.0f64 / session.canvas.1 as f64;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
 
     for y0 in (0..out_h).step_by(band_rows) {
@@ -310,11 +364,14 @@ fn blend_l8(
                 let y8 = gy0 + (y0 + r) as u32;
                 let mut acc = vec![0.0f32; nch * out_w];
                 let mut wsum = vec![0.0f32; out_w];
+                // Surfaces are evaluated at cell centers, matching the fit.
+                let yn = (y8 as f64 + 0.5) * b as f64 * inv_ch;
                 for p in &preps {
                     if y8 as u64 * b >= p.bbox[3] || (y8 as u64 + 1) * b <= p.bbox[1] {
                         continue;
                     }
                     let s = &p.summary;
+                    let srow = p.surf_row(yn);
                     for x8 in gx0..gx1 {
                         if s.cov(x8, y8) < 1.0 {
                             continue; // only fully covered cells blend
@@ -324,9 +381,14 @@ fn blend_l8(
                         let wgt = weight(d_px, inv_feather);
                         let o = (x8 - gx0) as usize;
                         wsum[o] += wgt;
+                        let xn = ((x8 as f64 + 0.5) * b as f64 * inv_cw) as f32;
                         for c in 0..nch {
-                            acc[c * out_w + o] +=
-                                wgt * (s.cell(c as u32, x8, y8) * p.gains[c] + p.offsets[c]);
+                            let (sa, sb, sc) = srow[c];
+                            acc[c * out_w + o] += wgt
+                                * (s.cell(c as u32, x8, y8) * p.gains[c]
+                                    + p.offsets[c]
+                                    + sa
+                                    + xn * (sb + xn * sc));
                         }
                     }
                 }
@@ -478,7 +540,7 @@ mod tests {
         let phot = identity_phot(2, 1);
         let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16 };
         let mut sink = MemSink::new();
-        blend(&session, &phot, &graph, &params, &mut sink).unwrap();
+        blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
         // Output is the cropped union bbox, and every pixel was written.
         assert_eq!((sink.w, sink.h, sink.ch), (112, 56, 1));
@@ -521,7 +583,7 @@ mod tests {
         };
         let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64 };
         let mut sink = MemSink::new();
-        blend(&session, &phot, &graph, &params, &mut sink).unwrap();
+        blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
         let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
         // A interior: 0.2·2 + 0.01 = 0.41; B untouched; overlap = mean of both.
@@ -533,13 +595,64 @@ mod tests {
     }
 
     #[test]
+    fn surfaces_are_applied_during_accumulation() {
+        let dir = tmpdir("surf");
+        let (session, graph) = make_panels(&dir);
+        let phot = identity_phot(2, 1);
+        // Panel A gets s(x,y) = 0.05 + 0.1·x − 0.02·y + 0.2·x² (normalized
+        // canvas coords, canvas 128×64); panel B gets zero.
+        let surf = crate::surfaces::Surfaces {
+            order: 2,
+            coeffs: vec![vec![
+                vec![0.05, 0.1, -0.02, 0.2, 0.0, 0.0],
+                vec![0.0; 6],
+            ]],
+            max_abs_s: vec![],
+            bg_mad: vec![],
+        };
+        let s_at = |x: f64, y: f64| {
+            let (xn, yn) = (x / 128.0, y / 64.0);
+            0.05 + 0.1 * xn - 0.02 * yn + 0.2 * xn * xn
+        };
+
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16 };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
+        let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
+
+        // A interior: 0.2 + s(x,y); B interior unchanged; overlap midpoint
+        // (both full weight): mean of corrected values.
+        let (ax, ay) = (24u64, 32u64);
+        let expect_a = 0.2 + s_at(ax as f64, ay as f64) as f32;
+        assert!((at(ax, ay) - expect_a).abs() < 1e-5, "A interior {} vs {expect_a}", at(ax, ay));
+        assert!((at(104, 40) - 0.4).abs() < 1e-6, "B interior must stay uncorrected");
+        let expect_mid = 0.5 * ((0.2 + s_at(64.0, 36.0) as f32) + 0.4);
+        assert!(
+            (at(64, 36) - expect_mid).abs() < 1e-5,
+            "overlap midpoint {} vs {expect_mid}",
+            at(64, 36)
+        );
+
+        // Same corrections must hold on the L8 preview path (cell centers).
+        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4 };
+        let mut sink8 = MemSink::new();
+        blend(&session, &phot, Some(&surf), &graph, &params8, &mut sink8).unwrap();
+        // Canvas cell (3,4) is A-only; center pixel (28, 36).
+        let got = sink8.at(0, 3 - 1, 4 - 1);
+        let expect_cell = 0.2 + s_at(28.0, 36.0) as f32;
+        assert!((got - expect_cell).abs() < 1e-5, "L8 A-only cell {got} vs {expect_cell}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn downsample_blends_from_l8_summaries() {
         let dir = tmpdir("l8");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
         let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3 };
         let mut sink = MemSink::new();
-        blend(&session, &phot, &graph, &params, &mut sink).unwrap();
+        blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
         // L8 grid cropped to union bbox / 8: x8∈[1,15), y8∈[1,8) → 14×7.
         assert_eq!((sink.w, sink.h, sink.ch), (14, 7, 1));
@@ -561,7 +674,7 @@ mod tests {
         let phot = identity_phot(2, 1);
         let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16 };
         let mut sink = MemSink::new();
-        assert!(blend(&session, &phot, &graph, &params, &mut sink).is_err());
+        assert!(blend(&session, &phot, None, &graph, &params, &mut sink).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

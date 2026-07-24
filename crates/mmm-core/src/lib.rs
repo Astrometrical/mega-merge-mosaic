@@ -23,6 +23,7 @@ pub mod overlap;
 pub mod photometry;
 pub mod session;
 pub mod summary;
+pub mod surfaces;
 pub mod synth;
 
 pub use error::{Error, Result};

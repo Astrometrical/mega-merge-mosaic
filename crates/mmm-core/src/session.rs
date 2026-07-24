@@ -84,6 +84,12 @@ impl Session {
     pub fn photometry_path(&self) -> PathBuf {
         self.dir.join("analysis").join("photometry.json")
     }
+
+    /// Path of the residual surface corrections: `analysis/surfaces.json`.
+    /// Absent when analyze ran with surfaces disabled.
+    pub fn surfaces_path(&self) -> PathBuf {
+        self.dir.join("analysis").join("surfaces.json")
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +125,10 @@ mod tests {
         assert_eq!(
             reopened.summary_path(0),
             dir.join("panels").join("0").join("summary.bin")
+        );
+        assert_eq!(
+            reopened.surfaces_path(),
+            dir.join("analysis").join("surfaces.json")
         );
 
         // Later stages depend on these exact JSON field names.
