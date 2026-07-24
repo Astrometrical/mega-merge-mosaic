@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 memmap2.workspace = true
+bytemuck.workspace = true
 rayon.workspace = true
 quick-xml.workspace = true
 serde.workspace = true

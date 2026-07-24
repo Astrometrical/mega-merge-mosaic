@@ -13,5 +13,6 @@
 //! frontends over [`session`].
 
 pub mod error;
+pub mod formats;
 
 pub use error::{Error, Result};
