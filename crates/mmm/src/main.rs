@@ -72,7 +72,20 @@ enum Command {
         /// Also write an autostretched 8-bit PNG preview (downsampled runs only)
         #[arg(long)]
         png: Option<std::path::PathBuf>,
+
+        /// Region of interest in full-res canvas pixels: x,y,w,h
+        #[arg(long)]
+        roi: Option<String>,
     },
+}
+
+fn parse_roi(s: &str) -> anyhow::Result<[u64; 4]> {
+    let v: Vec<u64> = s.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>()?;
+    let [x, y, w, h] = v.as_slice() else {
+        anyhow::bail!("--roi must be x,y,w,h (got '{s}')");
+    };
+    anyhow::ensure!(*w > 0 && *h > 0, "--roi width/height must be > 0");
+    Ok([*x, *y, x + w, y + h])
 }
 
 fn main() -> anyhow::Result<()> {
@@ -143,13 +156,14 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Report { session } => report(&session),
-        Command::Blend { session, output, downsample, feather, mode, png } => {
+        Command::Blend { session, output, downsample, feather, mode, png, roi } => {
             let mode = match mode.as_str() {
                 "feather" => mmm_core::blend::BlendMode::Feather,
                 "twoband" => mmm_core::blend::BlendMode::TwoBand,
                 other => anyhow::bail!("--mode must be feather or twoband (got {other})"),
             };
-            blend_cmd(&session, &output, downsample, feather, mode, png.as_deref())
+            let roi = roi.as_deref().map(parse_roi).transpose()?;
+            blend_cmd(&session, &output, downsample, feather, mode, png.as_deref(), roi)
         }
     }
 }
@@ -161,8 +175,10 @@ fn blend_cmd(
     feather: f32,
     mode: mmm_core::blend::BlendMode,
     png: Option<&std::path::Path>,
+    roi: Option<[u64; 4]>,
 ) -> anyhow::Result<()> {
-    use mmm_core::blend::{BlendParams, blend, union_bbox};
+    use mmm_core::astrometry::{wcs_cards, wcs_from_properties};
+    use mmm_core::blend::{BlendParams, blend, output_bbox};
     use mmm_core::formats::xisf::XisfPanel;
     use mmm_core::output::Tee;
     use mmm_core::output::fits::{FitsSink, keywords_for_output};
@@ -172,15 +188,27 @@ fn blend_cmd(
     let session = mmm_core::session::Session::open(session_dir)?;
     let graph = mmm_core::overlap::OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = mmm_core::photometry::Photometry::load(&session.photometry_path())?;
-    let bbox = union_bbox(&session)?;
+    let params_for_bbox =
+        BlendParams { feather_px: feather, downsample, mode, roi, ..Default::default() };
+    let bbox = output_bbox(&session, &params_for_bbox)?;
     let ds = downsample.max(1) as u64;
     // Crop origin in output pixel units (best-effort for downsampled previews:
     // the WCS scale itself is not rewritten).
     let crop = (bbox[0] / ds, bbox[1] / ds);
-    let keywords = keywords_for_output(
-        &XisfPanel::open(&session.panels[0].path)?.header().fits_keywords,
-        crop,
-    );
+    let ref_panel = XisfPanel::open(&session.panels[0].path)?;
+    let mut keywords = keywords_for_output(&ref_panel.header().fits_keywords, crop);
+    // Astrometric solution lives in XISF properties, not FITS keywords; attach
+    // real WCS cards at full resolution (downsampled previews would need a
+    // rescaled CD matrix — not worth lying about; skip them there).
+    if ds == 1 {
+        match wcs_from_properties(&ref_panel.header().properties) {
+            Some(wcs) => {
+                keywords.extend(wcs_cards(&wcs, (bbox[0], bbox[1])));
+                println!("wcs: attached from XISF astrometric solution");
+            }
+            None => println!("wcs: no astrometric solution found in panel 0"),
+        }
+    }
     println!(
         "session: {} panels, canvas {}x{}x{}ch, output bbox [{},{})x[{},{})  ({:.2}s)",
         session.panels.len(),
@@ -204,7 +232,7 @@ fn blend_cmd(
         None => println!("surfaces: none (analyze ran with --surface off)"),
     }
 
-    let params = BlendParams { feather_px: feather, downsample, mode, ..Default::default() };
+    let params = params_for_bbox;
     let t1 = std::time::Instant::now();
     let mut fits = FitsSink::create(output, keywords)?;
     match png {

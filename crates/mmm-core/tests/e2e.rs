@@ -128,7 +128,7 @@ fn full_pipeline_recovers_ground_truth() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -301,7 +301,7 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
     assert_eq!(surf.order, 2);
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -432,7 +432,7 @@ fn surface_off_bypasses_cleanly() {
 
     let phot = Photometry::load(&session.photometry_path()).unwrap();
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -466,7 +466,7 @@ fn full_pipeline_twoband_recovers_ground_truth() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::TwoBand };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::TwoBand, roi: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -542,7 +542,7 @@ fn twoband_single_panel_reconstructs_input() {
     let phot = Photometry::load(&session.photometry_path()).unwrap();
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 32, mode: BlendMode::TwoBand };
+    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 32, mode: BlendMode::TwoBand, roi: None };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -644,7 +644,7 @@ fn twoband_never_averages_misregistered_stars() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
 
     let run = |mode: BlendMode| -> MemSink {
-        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode };
+        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode, roi: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
         sink

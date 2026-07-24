@@ -8,6 +8,11 @@
 *.mmm-session/
 /sessions/
 
+# Blend outputs in the repo root (runs during development)
+/*.fits
+/*.tiff
+/*.png
+
 # WSL / Windows artifacts
 *Zone.Identifier
 

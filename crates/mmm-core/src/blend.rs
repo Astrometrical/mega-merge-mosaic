@@ -78,12 +78,27 @@ pub struct BlendParams {
     pub band_rows: usize,
     /// Feather (phase-1) or two-band with star-avoiding seams (default).
     pub mode: BlendMode,
+    /// Optional region of interest in full-res canvas coords `[x0,y0,x1,y1]`
+    /// (exclusive); the output is the intersection with the union bbox.
+    pub roi: Option<[u64; 4]>,
 }
 
 impl Default for BlendParams {
     fn default() -> Self {
-        Self { feather_px: 256.0, downsample: 1, band_rows: 256, mode: BlendMode::TwoBand }
+        Self { feather_px: 256.0, downsample: 1, band_rows: 256, mode: BlendMode::TwoBand, roi: None }
     }
+}
+
+/// The blend's output bbox: union of panel bboxes, intersected with the ROI
+/// when one is set. Errors if the intersection is empty.
+pub fn output_bbox(session: &Session, params: &BlendParams) -> Result<[u64; 4]> {
+    let u = union_bbox(session)?;
+    let Some(r) = params.roi else { return Ok(u) };
+    let b = [u[0].max(r[0]), u[1].max(r[1]), u[2].min(r[2]), u[3].min(r[3])];
+    if b[0] >= b[2] || b[1] >= b[3] {
+        return Err(Error::format(&session.dir, "ROI does not intersect the mosaic content"));
+    }
+    Ok(b)
 }
 
 /// Streaming consumer of blended rows (planar per band).
@@ -465,7 +480,7 @@ fn blend_full(
         })
         .collect::<Result<_>>()?;
 
-    let bbox = union_bbox(session)?;
+    let bbox = output_bbox(session, params)?;
     let (cx0, cy0) = (bbox[0], bbox[1]);
     let out_w = (bbox[2] - bbox[0]) as usize;
     let out_h = (bbox[3] - bbox[1]) as usize;
@@ -693,7 +708,7 @@ fn blend_twoband(
         })
         .collect::<Result<_>>()?;
 
-    let bbox = union_bbox(session)?;
+    let bbox = output_bbox(session, params)?;
     let (cx0, cy0) = (bbox[0], bbox[1]);
     let out_w = (bbox[2] - bbox[0]) as usize;
     let out_h = (bbox[3] - bbox[1]) as usize;
@@ -867,7 +882,7 @@ fn blend_l8(
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
     let preps = prep_panels(session, phot, surfaces)?;
-    let bbox = union_bbox(session)?;
+    let bbox = output_bbox(session, params)?;
     let (w8, h8) = (preps[0].summary.w8, preps[0].summary.h8);
     let b = BLOCK as u64;
     let gx0 = (bbox[0] / b) as u32;
@@ -1067,7 +1082,7 @@ mod tests {
         let dir = tmpdir("feather");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1102,6 +1117,36 @@ mod tests {
     }
 
     #[test]
+    fn roi_matches_full_blend_subregion() {
+        let dir = tmpdir("roi");
+        let (session, graph) = make_panels(&dir);
+        let phot = identity_phot(2, 1);
+        let full = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None };
+        let mut full_sink = MemSink::new();
+        blend(&session, &phot, None, &graph, &full, &mut full_sink).unwrap();
+
+        // ROI spanning the overlap: canvas [40,100)x[20,60), clipped to union y<64.
+        let roi = BlendParams { roi: Some([40, 20, 100, 60]), ..full.clone() };
+        let mut roi_sink = MemSink::new();
+        blend(&session, &phot, None, &graph, &roi, &mut roi_sink).unwrap();
+
+        assert_eq!((roi_sink.w, roi_sink.h), (60, 40));
+        for y in 0..roi_sink.h {
+            for x in 0..roi_sink.w {
+                // ROI output (x,y) = canvas (40+x, 20+y) = full output (32+x, 12+y).
+                let (a, b) = (roi_sink.at(0, x, y), full_sink.at(0, x + 32, y + 12));
+                assert!((a - b).abs() < 1e-6, "mismatch at roi ({x},{y}): {a} vs {b}");
+            }
+        }
+
+        // Disjoint ROI errors.
+        let miss = BlendParams { roi: Some([0, 0, 4, 4]), ..full.clone() };
+        assert!(blend(&session, &phot, None, &graph, &miss, &mut MemSink::new()).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn photometric_corrections_are_applied() {
         let dir = tmpdir("phot");
         let (session, graph) = make_panels(&dir);
@@ -1110,7 +1155,7 @@ mod tests {
             gains: vec![vec![2.0, 1.0]],
             offsets: vec![vec![0.01, 0.0]],
         };
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1144,7 +1189,7 @@ mod tests {
             0.05 + 0.1 * xn - 0.02 * yn + 0.2 * xn * xn
         };
 
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather };
+        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
         let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
@@ -1163,7 +1208,7 @@ mod tests {
         );
 
         // Same corrections must hold on the L8 preview path (cell centers).
-        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4, mode: BlendMode::Feather };
+        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4, mode: BlendMode::Feather, roi: None };
         let mut sink8 = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params8, &mut sink8).unwrap();
         // Canvas cell (3,4) is A-only; center pixel (28, 36).
@@ -1179,7 +1224,7 @@ mod tests {
         let dir = tmpdir("l8");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3, mode: BlendMode::Feather };
+        let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3, mode: BlendMode::Feather, roi: None };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1201,7 +1246,7 @@ mod tests {
         let dir = tmpdir("badds");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16, mode: BlendMode::Feather };
+        let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16, mode: BlendMode::Feather, roi: None };
         let mut sink = MemSink::new();
         assert!(blend(&session, &phot, None, &graph, &params, &mut sink).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
