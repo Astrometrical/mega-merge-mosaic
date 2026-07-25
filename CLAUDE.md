@@ -34,4 +34,8 @@ Rust via rustup (`source ~/.cargo/env` if PATH lacks cargo).
 - Per-channel math for OSC; seams (phase 2) shared across channels.
 - Session dirs (`*.mmm-session/`) hold all cached analysis; stages re-runnable.
 - Tests must not depend on `test_data/` (synthesize inputs); real-data runs
-  are manual smoke tests.
+  are manual smoke tests. `blend.rs`'s unit tests live in the sibling
+  `blend_tests.rs` (a `#[path]` child module).
+- Every public item in `mmm-core` needs a doc comment (`missing_docs` is
+  warned); keep `cargo fmt`, `cargo clippy --all-targets`, and `cargo doc`
+  warning-free. `lib.rs` documents the intended public API surface.
