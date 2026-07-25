@@ -3,9 +3,11 @@
 //! Output: single HDU, `BITPIX = -32`, `NAXIS = 3` (planar: NAXIS1 = width,
 //! NAXIS2 = height, NAXIS3 = channels), big-endian samples, 2880-byte header
 //! blocks and data padding. Rows are written top-down and declared with
-//! `ROWORDER= 'TOP-DOWN'` (the astro-camera convention the inputs use, so the
-//! WCS carried through from panel 0 stays valid). Bands may arrive in any
-//! order — each channel slice is written at its absolute file offset.
+//! `ROWORDER= 'TOP-DOWN'` (the astro-camera convention the inputs use). WCS
+//! cards must nonetheless reference the standard bottom-up frame — see
+//! `astrometry::wcs_cards`, which reflects the y axis accordingly. Bands may
+//! arrive in any order — each channel slice is written at its absolute file
+//! offset.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};

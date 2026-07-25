@@ -251,7 +251,8 @@ fn blend_cmd(
     if ds == 1 {
         match wcs_from_properties(&ref_panel.header().properties) {
             Some(wcs) => {
-                keywords.extend(wcs_cards(&wcs, (bbox[0], bbox[1])));
+                // Output height fixes the bottom-up y reflection of the cards.
+                keywords.extend(wcs_cards(&wcs, (bbox[0], bbox[1]), bbox[3] - bbox[1]));
                 println!("wcs: attached from XISF astrometric solution");
             }
             None => println!("wcs: no astrometric solution found in panel 0"),

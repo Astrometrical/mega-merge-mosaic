@@ -256,6 +256,25 @@ Quality-only phase (user directive: no GPU). 97 tests, clippy clean.
   replacement; refuses when <20% background. Caveat: the background
   thresholds are relative, so a >80%-structure mosaic can evade the refusal.
 
+### WCS fix: north–south mirror (2026-07-25)
+
+User report: the blended FITS's astrometric solution appeared mirrored N–S in
+PixInsight. Root cause: PI's XISF solution lives in top-down image
+coordinates, and we emitted the cards verbatim (valid for our stored top-down
+rows read naively) — but FITS WCS consumers, PI included (PCL maps
+`y_topdown = H + 0.5 − y_fits` when converting keywords, regardless of
+`ROWORDER`), interpret the WCS in the standard bottom-up frame. Verified on
+catalog stars (Alnitak, Alnilam, Mintaka, Trapezium): under the bottom-up
+reading, predicted positions were empty sky and the stars sat at the mirrored
+row `2·CRPIX2 − y`. Fix (`wcs_cards`, now takes the output height): reflect
+the solution into the bottom-up frame — `CRPIX2 → H_out + 1 − CRPIX2`, negate
+the dy-dependent CD *column* (`CD1_2`, `CD2_2`; PI negates the same terms when
+it writes solved FITS). Data layout and `ROWORDER='TOP-DOWN'` are unchanged.
+After: all four stars within 0.1–4 px (Trapezium cluster centroid 15 px), on
+both the full frame and a `--roi` crop. No flip property exists in the XISF —
+`ReferenceNativeCoordinates`/`CelestialPoleNativeCoordinates` are the standard
+zenithal values; orientation is entirely in the matrix.
+
 ## Performance notes
 
 - Full-plane scan measured at ~0.9 GB/s single-threaded; analyze is I/O-bound

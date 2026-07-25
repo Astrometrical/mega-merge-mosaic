@@ -17,17 +17,28 @@
 //! frame, implied by the CTYPE projection code; `Observation:Center:RA/Dec`
 //! duplicate the reference celestial coordinates.)
 //!
-//! Mapping to FITS WCS cards — valid for top-down row order, which our FITS
-//! writer declares via `ROWORDER = 'TOP-DOWN'`:
+//! Extraction to [`LinearWcs`] keeps PixInsight's top-down y axis (matching
+//! both the XISF input and our stored row order):
 //!
 //! - `CRVAL1/2` = ReferenceCelestialCoordinates,
 //! - `CRPIX1/2` = ReferenceImageCoordinates + 0.5 on both axes (PixInsight
 //!   pixel centers sit at k + 0.5 in 0-based coords; FITS pixel centers sit at
-//!   integer 1-based coords, so FITS = PI + 0.5; no y flip since rows stay
-//!   top-down),
+//!   integer 1-based coords, so FITS = PI + 0.5),
 //! - `CD1_1..CD2_2` = LinearTransformationMatrix exactly as stored (row 0 →
 //!   axis 1 / ξ, row 1 → axis 2 / η),
 //! - `CTYPE1/2` = `RA---`/`DEC--` + projection code (Gnomonic → `TAN`).
+//!
+//! **Card emission flips the y axis.** FITS WCS consumers — PixInsight
+//! included, when it converts FITS keywords back to an astrometric solution —
+//! interpret the WCS in the standard bottom-up frame (y = 1 at the bottom row
+//! of the sky image; PCL maps `y_image_topdown = H + 0.5 − y_fits`),
+//! regardless of `ROWORDER`. Our writer stores rows top-down, so
+//! [`wcs_cards`] emits the solution reflected into that frame:
+//! `CRPIX2 → H + 1 − CRPIX2` and the CD second *column* (`CD1_2`, `CD2_2` —
+//! the dy-dependent terms) negated. Emitting the top-down solution verbatim
+//! produced a north–south mirrored solution in PixInsight (verified against
+//! catalog stars on the real Orion mosaic: stars landed at `2·CRPIX2 − y`,
+//! empty sky at the predicted spots).
 //!
 //! The axis conventions were verified empirically on the real 12-panel Orion
 //! mosaic: the stored matrix is diagonal `[[−s, 0], [0, +s]]` with
@@ -149,28 +160,41 @@ fn projection_code(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Produce FITS WCS cards, with CRPIX shifted by minus the crop origin (0-based
-/// canvas pixels) so the canvas solution stays valid on a cropped output.
-pub fn wcs_cards(w: &LinearWcs, crop_origin: (u64, u64)) -> Vec<FitsKeyword> {
+/// Produce FITS WCS cards for an output crop of height `out_height` starting
+/// at `crop_origin` (0-based canvas pixels).
+///
+/// `w` is the canvas solution in top-down stored-row coordinates. The cards
+/// are emitted in the standard FITS frame — y = 1 at the *bottom* of the sky
+/// image, the convention every WCS consumer (PixInsight, astropy, ds9)
+/// assumes — while our writer stores rows top-down. The reflection
+/// `y_fits = H + 1 − y_topdown` (H = `out_height`) turns CRPIX2 into
+/// `H + 1 − (crpix2 − crop_y)` and negates the dy-dependent CD terms
+/// (`CD1_2`, `CD2_2`). CRPIX1 only gets the crop translation.
+pub fn wcs_cards(w: &LinearWcs, crop_origin: (u64, u64), out_height: u64) -> Vec<FitsKeyword> {
     let kw = |name: &str, value: String, comment: &str| FitsKeyword {
         name: name.to_string(),
         value,
         comment: comment.to_string(),
     };
     let q = |s: &str| format!("'{s}'");
+    // Crop translation in the top-down frame (CRPIX is 1-based but the shift
+    // is a pure translation, so the base cancels), then the y reflection into
+    // the bottom-up FITS frame.
+    let crpix1 = w.crpix[0] - crop_origin.0 as f64;
+    let crpix2 = out_height as f64 + 1.0 - (w.crpix[1] - crop_origin.1 as f64);
+    // Avoid "-0" card text when a matrix element is exactly zero.
+    let neg = |v: f64| if v == 0.0 { 0.0 } else { -v };
     vec![
         kw("CTYPE1", q(&w.ctype[0]), "projection"),
         kw("CTYPE2", q(&w.ctype[1]), "projection"),
         kw("CRVAL1", w.crval[0].to_string(), "[deg] RA at reference point"),
         kw("CRVAL2", w.crval[1].to_string(), "[deg] Dec at reference point"),
-        // CRPIX is 1-based but the shift is a pure translation, so the base
-        // cancels: new = old - crop_origin.
-        kw("CRPIX1", (w.crpix[0] - crop_origin.0 as f64).to_string(), "reference pixel x"),
-        kw("CRPIX2", (w.crpix[1] - crop_origin.1 as f64).to_string(), "reference pixel y"),
+        kw("CRPIX1", crpix1.to_string(), "reference pixel x"),
+        kw("CRPIX2", crpix2.to_string(), "reference pixel y (bottom-up)"),
         kw("CD1_1", w.cd[0][0].to_string(), "[deg/px] transformation matrix"),
-        kw("CD1_2", w.cd[0][1].to_string(), "[deg/px] transformation matrix"),
+        kw("CD1_2", neg(w.cd[0][1]).to_string(), "[deg/px] transformation matrix"),
         kw("CD2_1", w.cd[1][0].to_string(), "[deg/px] transformation matrix"),
-        kw("CD2_2", w.cd[1][1].to_string(), "[deg/px] transformation matrix"),
+        kw("CD2_2", neg(w.cd[1][1]).to_string(), "[deg/px] transformation matrix"),
         kw("CUNIT1", q("deg"), "axis unit"),
         kw("CUNIT2", q("deg"), "axis unit"),
         kw("RADESYS", q(&w.radesys), "celestial reference system"),
@@ -294,28 +318,84 @@ mod tests {
         }
     }
 
+    /// Real Orion canvas height (top-down rows the solution refers to).
+    const ORION_H: u64 = 18310;
+
     #[test]
     fn cards_carry_full_wcs_and_quote_strings() {
         let w = wcs_from_properties(&orion_props()).unwrap();
-        let cards = wcs_cards(&w, (0, 0));
+        let cards = wcs_cards(&w, (0, 0), ORION_H);
         let get = |n: &str| &cards.iter().find(|k| k.name == n).unwrap().value;
         assert_eq!(get("CTYPE1"), "'RA---TAN'");
         assert_eq!(get("CTYPE2"), "'DEC--TAN'");
         assert_eq!(get("CUNIT1"), "'deg'");
         assert_eq!(get("RADESYS"), "'ICRS'");
-        assert_eq!(wcs_from_cards(&cards), w, "values round-trip through card text exactly");
+        // No "-0" text for the zero off-diagonal elements.
+        assert_eq!(get("CD1_2"), "0");
+
+        // Cards are the same solution reflected into the bottom-up FITS
+        // frame: card pixel (x, H+1-y) ≡ top-down pixel (x, y).
+        let c = wcs_from_cards(&cards);
+        assert_eq!(c.crval, w.crval);
+        assert_eq!(c.crpix[0], w.crpix[0]);
+        assert_eq!(c.crpix[1], ORION_H as f64 + 1.0 - w.crpix[1]);
+        for &(x, y) in &[(1.0, 1.0), (9255.0, 18310.0), (100.5, 17000.25), (4628.0, 9155.5)] {
+            let (ra1, dec1) = w.pixel_to_sky(x, y);
+            let (ra2, dec2) = c.pixel_to_sky(x, ORION_H as f64 + 1.0 - y);
+            assert!((ra1 - ra2).abs() < 1e-9 && (dec1 - dec2).abs() < 1e-9, "({x},{y})");
+        }
+    }
+
+    /// The emitted cards must place a sky object at the mirrored row of the
+    /// bottom-up frame — the fix for the north–south mirror PixInsight showed
+    /// when the top-down solution was emitted verbatim. Uses a non-diagonal
+    /// matrix so a wrong choice of negated elements (row vs column) fails.
+    #[test]
+    fn cards_flip_y_into_bottom_up_frame() {
+        const H: u64 = 4000;
+        let w = LinearWcs {
+            crval: [84.0, -3.0],
+            crpix: [1500.0, 1200.0],
+            // Rotated ~30°, with the E-W mirror astro images have.
+            cd: [[-3.8e-4, 2.2e-4], [2.2e-4, 3.8e-4]],
+            ctype: ["RA---TAN".into(), "DEC--TAN".into()],
+            radesys: "ICRS".into(),
+        };
+        let c = wcs_from_cards(&wcs_cards(&w, (0, 0), H));
+
+        // dy-dependent terms (second column) negate; dx terms don't.
+        assert_eq!(c.cd[0][0], w.cd[0][0]);
+        assert_eq!(c.cd[1][0], w.cd[1][0]);
+        assert_eq!(c.cd[0][1], -w.cd[0][1]);
+        assert_eq!(c.cd[1][1], -w.cd[1][1]);
+        assert_eq!(c.crpix[1], H as f64 + 1.0 - w.crpix[1]);
+
+        // Round trip: an object at top-down pixel (x, y) projects through the
+        // cards to (x, H+1-y) — the same stored row, addressed bottom-up.
+        for &(x, y) in &[(100.0, 250.0), (3000.0, 3900.0), (1500.0, 1200.0)] {
+            let (ra, dec) = w.pixel_to_sky(x, y);
+            let (cx, cy) = c.sky_to_pixel(ra, dec);
+            assert!((cx - x).abs() < 1e-6, "x: {cx} vs {x}");
+            assert!((cy - (H as f64 + 1.0 - y)).abs() < 1e-6, "y: {cy} vs {}", H as f64 + 1.0 - y);
+        }
     }
 
     #[test]
     fn crop_shift_keeps_sky_of_a_fixed_pixel_invariant() {
         let w = wcs_from_properties(&orion_props()).unwrap();
-        let full = wcs_from_cards(&wcs_cards(&w, (0, 0)));
-        let cropped = wcs_from_cards(&wcs_cards(&w, (1000, 2500)));
+        let full = wcs_from_cards(&wcs_cards(&w, (0, 0), ORION_H));
+        // Crop [1000, 2500) origin: output height shrinks by the y origin.
+        let (oy, crop_h) = (2500u64, ORION_H - 2500);
+        let cropped = wcs_from_cards(&wcs_cards(&w, (1000, oy), crop_h));
         assert_eq!(cropped.crpix[0], full.crpix[0] - 1000.0);
-        assert_eq!(cropped.crpix[1], full.crpix[1] - 2500.0);
-        // A fixed canvas pixel keeps its sky coordinates after cropping.
-        let (ra1, dec1) = full.pixel_to_sky(6100.0, 12000.0);
-        let (ra2, dec2) = cropped.pixel_to_sky(6100.0 - 1000.0, 12000.0 - 2500.0);
+        // Bottom-up CRPIX2 is measured from the crop's bottom edge, which the
+        // top crop does not move: it stays put.
+        assert_eq!(cropped.crpix[1], crop_h as f64 + 1.0 - (w.crpix[1] - oy as f64));
+        // A fixed canvas pixel keeps its sky coordinates after cropping
+        // (top-down canvas pixel (6100, 12000), addressed bottom-up in both).
+        let (ra1, dec1) = full.pixel_to_sky(6100.0, ORION_H as f64 + 1.0 - 12000.0);
+        let (ra2, dec2) =
+            cropped.pixel_to_sky(6100.0 - 1000.0, crop_h as f64 + 1.0 - (12000.0 - oy as f64));
         assert!((ra1 - ra2).abs() < 1e-9 && (dec1 - dec2).abs() < 1e-9);
     }
 
