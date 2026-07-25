@@ -3,7 +3,6 @@ name = "mmm"
 description = "Mega Merge Mosaic — fast astrophotography mosaic merging/blending CLI"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 repository.workspace = true
 
 [[bin]]
