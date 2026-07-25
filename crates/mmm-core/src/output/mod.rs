@@ -14,6 +14,7 @@ pub struct Tee<'a> {
 }
 
 impl<'a> Tee<'a> {
+    /// Pair two sinks; every `begin`/`band`/`finish` call reaches both.
     pub fn new(first: &'a mut dyn RowSink, second: &'a mut dyn RowSink) -> Self {
         Self { first, second }
     }

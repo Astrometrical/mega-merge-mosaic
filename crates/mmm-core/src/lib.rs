@@ -12,6 +12,8 @@
 //! This crate is UI-agnostic: the `mmm` CLI and any future GUI are thin
 //! frontends over [`session`].
 
+#![warn(missing_docs)]
+
 pub mod align;
 pub mod analyze;
 pub mod astrometry;

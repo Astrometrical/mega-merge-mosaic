@@ -22,7 +22,9 @@ pub const MIN_EDGE_CELLS: u64 = 16;
 /// One overlapping panel pair (`a < b`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlapEdge {
+    /// Lower panel id of the pair.
     pub a: usize,
+    /// Higher panel id of the pair.
     pub b: usize,
     /// L8-grid bbox of the shared full-coverage cells: `[x0, y0, x1, y1]`, exclusive.
     pub bbox8: [u32; 4],
@@ -33,6 +35,7 @@ pub struct OverlapEdge {
 /// Which panels overlap which, from the analyze stage's L8 summaries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OverlapGraph {
+    /// All overlapping pairs, ordered `(a, b)` with `a < b`.
     pub edges: Vec<OverlapEdge>,
 }
 
@@ -96,6 +99,7 @@ impl OverlapGraph {
         std::fs::write(p, json).map_err(|e| Error::io(p, e))
     }
 
+    /// Load a graph previously written by [`OverlapGraph::save`].
     pub fn load(p: &Path) -> Result<OverlapGraph> {
         let json = std::fs::read_to_string(p).map_err(|e| Error::io(p, e))?;
         serde_json::from_str(&json).map_err(|e| Error::format(p, format!("bad overlap graph: {e}")))

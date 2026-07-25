@@ -5,7 +5,7 @@
 //! uncompressed attachment data block. Anything else errors clearly; compressed
 //! blocks will be handled later by decompressing into the tile cache.
 //!
-//! Spec: https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html
+//! Spec: <https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html>
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -21,14 +21,19 @@ const SIGNATURE: &[u8; 8] = b"XISF0100";
 /// Parsed metadata for the image block of an XISF file.
 #[derive(Debug, Clone)]
 pub struct XisfHeader {
+    /// Image width in pixels.
     pub width: u64,
+    /// Image height in pixels.
     pub height: u64,
+    /// Number of channels (planar planes).
     pub channels: u64,
+    /// Per-sample data type; only [`SampleFormat::Float32`] is readable.
     pub sample_format: SampleFormat,
     /// Byte offset of the attached data block within the file.
     pub data_offset: u64,
     /// Byte size of the attached data block.
     pub data_size: u64,
+    /// All `<FITSKeyword>` cards of the image element, in header order.
     pub fits_keywords: Vec<FitsKeyword>,
     /// All `<Property>` elements in the header (image-level and file-level).
     /// Attachment-located f64 vectors/matrices are resolved by [`XisfPanel::open`].
@@ -43,6 +48,11 @@ pub struct XisfPanel {
 }
 
 impl XisfPanel {
+    /// Open and validate a monolithic XISF file, resolving attachment-located
+    /// f64 vector/matrix properties (e.g. astrometric solution data) so
+    /// downstream code sees decoded values. Errors on anything outside the
+    /// supported subset (module docs): non-Float32 samples, compressed or
+    /// non-planar storage, malformed headers.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::io(path, e))?;
         // SAFETY: read-only map; we accept that truncation by another process
@@ -100,22 +110,27 @@ impl XisfPanel {
         })
     }
 
+    /// The file this panel was opened from.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Parsed header metadata (geometry, FITS keywords, properties).
     pub fn header(&self) -> &XisfHeader {
         &self.header
     }
 
+    /// Image width in pixels.
     pub fn width(&self) -> u64 {
         self.header.width
     }
 
+    /// Image height in pixels.
     pub fn height(&self) -> u64 {
         self.header.height
     }
 
+    /// Number of channels (planar planes).
     pub fn channels(&self) -> u64 {
         self.header.channels
     }

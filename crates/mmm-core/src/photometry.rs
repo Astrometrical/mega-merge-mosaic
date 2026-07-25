@@ -32,10 +32,15 @@ const CLIP_FLOOR: f64 = 1e-7;
 /// Robust linear fit for one overlap edge and channel: `I_b ≈ gain·I_a + offset`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeFit {
+    /// Lower panel id of the pair (the fit's `x` side).
     pub a: usize,
+    /// Higher panel id of the pair (the fit's `y` side).
     pub b: usize,
+    /// Channel index the fit applies to.
     pub channel: u32,
+    /// Fitted gain of `I_b ≈ gain·I_a + offset`.
     pub gain: f64,
+    /// Fitted offset of `I_b ≈ gain·I_a + offset`.
     pub offset: f64,
     /// L8 cell pairs surviving the residual clip.
     pub n: u64,
@@ -49,6 +54,8 @@ pub struct EdgeFit {
 /// Full photometric solution: per-edge fits plus per-panel global corrections.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Photometry {
+    /// Per-edge, per-channel robust fits (diagnostics; the global solve's
+    /// inputs are their sufficient statistics).
     pub edge_fits: Vec<EdgeFit>,
     /// Per-panel gain corrections, indexed `[channel][panel]`.
     pub gains: Vec<Vec<f64>>,
@@ -64,6 +71,7 @@ impl Photometry {
         std::fs::write(p, json).map_err(|e| Error::io(p, e))
     }
 
+    /// Load a solution previously written by [`Photometry::save`].
     pub fn load(p: &Path) -> Result<Photometry> {
         let json = std::fs::read_to_string(p).map_err(|e| Error::io(p, e))?;
         serde_json::from_str(&json).map_err(|e| Error::format(p, format!("bad photometry: {e}")))

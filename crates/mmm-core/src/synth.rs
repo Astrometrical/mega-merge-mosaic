@@ -16,13 +16,17 @@ use crate::{Error, Result};
 /// Specification of the synthetic mosaic to generate.
 #[derive(Debug, Clone)]
 pub struct SynthSpec {
+    /// Canvas dimensions `(width, height)` in pixels.
     pub canvas: (u64, u64),
+    /// Number of channels (1 = mono, 3 = RGB-like).
     pub channels: u32,
     /// Panels across x down.
     pub grid: (u32, u32),
     /// Fraction of a grid cell added as overlap between neighbours (e.g. 0.25).
     pub overlap_frac: f64,
+    /// Number of stars, amplitudes log-spaced from ~1.0 down to 0.02.
     pub n_stars: usize,
+    /// Per-pixel Gaussian noise sigma (0.0 = noiseless).
     pub noise_sigma: f32,
     /// Per-panel gain drawn uniformly from this range, e.g. (0.7, 1.4).
     pub panel_gain_range: (f32, f32),
@@ -67,6 +71,7 @@ pub struct SynthSpec {
     /// *after* gain/offset/gradient, clipped to the panel's window. Simulates
     /// transients that survive stacking in exactly one panel.
     pub panel_defects: Vec<(usize, u64, u64, u32, f32)>,
+    /// RNG seed; every output is deterministic in the spec including this.
     pub seed: u64,
 }
 
@@ -76,6 +81,7 @@ pub struct SynthSpec {
 pub struct SynthResult {
     /// Planar channel planes, canvas-sized (keep the canvas small: <= 1024^2).
     pub truth: Vec<f32>,
+    /// The written panel files, in panel-id order.
     pub panel_paths: Vec<PathBuf>,
     /// Per-panel (gain, offset) actually applied.
     pub applied: Vec<(f32, f32)>,

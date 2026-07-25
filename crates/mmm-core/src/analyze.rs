@@ -17,8 +17,8 @@
 //!   output) sharing one geometry — the historical path, unchanged.
 //! - **Solved**: unaligned panels each carrying a PixInsight astrometric
 //!   solution. The align stage loads every panel's [`WcsModel`], chooses a
-//!   fresh [`MosaicFrame`](crate::align::MosaicFrame) via
-//!   [`choose_frame`](crate::align::choose_frame), reprojects each panel into
+//!   fresh [`crate::align::MosaicFrame`] via
+//!   [`choose_frame`], reprojects each panel into
 //!   the session cache (`panels/<id>/aligned.bin`, rayon-parallel rows —
 //!   see [`crate::align::reproject_panel`]), and the per-panel scan then
 //!   proceeds over [`PanelReader`] exactly as for aligned input.

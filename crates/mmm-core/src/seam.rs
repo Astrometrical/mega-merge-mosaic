@@ -70,8 +70,11 @@ const UNSHARED_COST: f32 = 1e12;
 
 /// Panel index per L8 cell; `u16::MAX` = no panel covers the cell.
 pub struct OwnerMap {
+    /// Grid width in L8 cells.
     pub w8: u32,
+    /// Grid height in L8 cells.
     pub h8: u32,
+    /// Owning panel per cell, row-major; `u16::MAX` = no coverage.
     pub owner: Vec<u16>,
 }
 

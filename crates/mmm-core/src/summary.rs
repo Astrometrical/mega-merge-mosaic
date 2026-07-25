@@ -26,8 +26,11 @@ const MAGIC_V1: &[u8; 4] = b"MMM8";
 /// One panel's 1/8-resolution summary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct L8Summary {
+    /// Grid width in cells: `ceil(canvas_width / 8)`.
     pub w8: u32,
+    /// Grid height in cells: `ceil(canvas_height / 8)`.
     pub h8: u32,
+    /// Number of channels (matches the panel).
     pub channels: u32,
     /// len `w8*h8`; fraction of covered pixels in each cell, 0..1.
     pub coverage: Vec<f32>,
@@ -75,6 +78,7 @@ impl L8Summary {
         self.coverage[y8 as usize * self.w8 as usize + x8 as usize]
     }
 
+    /// Write the summary to `path` in the on-disk v2 format (module docs).
     pub fn write(&self, path: &Path) -> Result<()> {
         let cells = self.w8 as usize * self.h8 as usize;
         assert_eq!(self.coverage.len(), cells, "coverage plane size mismatch");
@@ -108,6 +112,8 @@ impl L8Summary {
         std::fs::write(path, bytes).map_err(|e| Error::io(path, e))
     }
 
+    /// Read a summary written by [`L8Summary::write`], validating magic and
+    /// size; v1 (`MMM8`) files are rejected with a re-run-analyze hint.
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
         if bytes.len() >= 4 && &bytes[0..4] == MAGIC_V1 {

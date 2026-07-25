@@ -32,7 +32,10 @@ pub enum PanelStorage {
     /// the bbox's dimensions. `bbox` is the cache's placement on the canvas,
     /// `[x0, y0, x1, y1]` exclusive. The panel's [`PanelMeta::path`] points
     /// at the cache file itself.
-    CroppedCache { bbox: [u64; 4] },
+    CroppedCache {
+        /// Canvas placement of the cache, `[x0, y0, x1, y1]` exclusive.
+        bbox: [u64; 4],
+    },
 }
 
 enum Backing {

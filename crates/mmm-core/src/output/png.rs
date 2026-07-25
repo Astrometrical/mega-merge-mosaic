@@ -31,6 +31,7 @@ pub struct PngSink {
 }
 
 impl PngSink {
+    /// New sink targeting `path`; nothing is written until `finish`.
     pub fn create(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),

@@ -202,7 +202,9 @@ pub struct Grid2D {
     pub rect: [f64; 4],
     /// Node spacing in input units.
     pub delta: f64,
+    /// Node rows (input y steps).
     pub rows: u32,
+    /// Node columns (input x steps).
     pub cols: u32,
     /// Output x at each node, row-major `rows × cols`.
     pub gx: Vec<f64>,

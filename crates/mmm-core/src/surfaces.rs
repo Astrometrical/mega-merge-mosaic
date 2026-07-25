@@ -102,6 +102,7 @@ impl Surfaces {
         std::fs::write(p, json).map_err(|e| Error::io(p, e))
     }
 
+    /// Load surfaces previously written by [`Surfaces::save`].
     pub fn load(p: &Path) -> Result<Surfaces> {
         let json = std::fs::read_to_string(p).map_err(|e| Error::io(p, e))?;
         serde_json::from_str(&json).map_err(|e| Error::format(p, format!("bad surfaces: {e}")))

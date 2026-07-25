@@ -93,7 +93,7 @@ pub const RAMP_PX: f32 = 16.0;
 /// ([`crate::seam::split_mask_components`]) in either panel: inside bright
 /// structure the residual inter-panel disagreement is at its largest, so the
 /// transition gets twice the normal room to hide it. Compact mask components
-/// (stars + spike arms) still snap ([`detail_transition_maps`]).
+/// (stars + spike arms) still snap (`detail_transition_maps`).
 pub const WIDE_RAMP_PX: f32 = 32.0;
 
 /// Star-lock parameter, retained under its historical name: this is the
@@ -213,10 +213,12 @@ pub fn output_bbox(session: &Session, params: &BlendParams) -> Result<[u64; 4]> 
 
 /// Streaming consumer of blended rows (planar per band).
 pub trait RowSink {
+    /// Announce the output geometry before any band is delivered.
     fn begin(&mut self, w: u64, h: u64, ch: u64) -> Result<()>;
     /// One band starting at output row `y0`; `rows` is planar:
     /// `ch` planes × `band_rows` × `w`, row-major.
     fn band(&mut self, y0: u64, rows: &[f32]) -> Result<()>;
+    /// All bands delivered; flush and validate completeness.
     fn finish(&mut self) -> Result<()>;
 }
 

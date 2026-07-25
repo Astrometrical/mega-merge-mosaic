@@ -34,6 +34,7 @@ pub enum InputKind {
 /// Per-panel metadata recorded by the analyze stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelMeta {
+    /// Panel index within the session (0-based, stable across stages).
     pub id: usize,
     /// File the panel's pixel data is read from: the source XISF for
     /// full-canvas input, the `aligned.bin` reprojection cache otherwise
@@ -69,6 +70,7 @@ pub struct Session {
     pub dir: PathBuf,
     /// Canvas geometry `(width, height, channels)`, identical across panels.
     pub canvas: (u64, u64, u64),
+    /// Analyzed panels, indexed by [`PanelMeta::id`].
     pub panels: Vec<PanelMeta>,
     /// How the input panels were provided (default: aligned).
     #[serde(default)]

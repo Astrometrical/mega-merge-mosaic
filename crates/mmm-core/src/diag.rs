@@ -232,7 +232,7 @@ impl RowSink for BufSink {
 }
 
 /// Write the seam/ownership map PNG: autostretched L8 luminance of the
-/// blended preview, owner regions tinted with the 12-hue [`PALETTE`]
+/// blended preview, owner regions tinted with a 12-hue palette
 /// (subtle), owner boundaries drawn dark, and panel ids drawn at region
 /// centroids as 3×5 bitmap digits. `owner` must come from the same session
 /// (see [`load_owner_map`]); `feather_px` should match the blend's.

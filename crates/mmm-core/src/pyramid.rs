@@ -39,8 +39,11 @@ const MASK_SUPPORT_MIN: f32 = 1e-3;
 /// by the Gaussian residual as the last level. [`mask_pyramid`] reuses the
 /// container for Gaussian (non-Laplacian) mask levels of the same shape.
 pub struct CellPyramid {
+    /// Level planes, finest first; the last is the Gaussian residual.
     pub levels: Vec<Vec<f32>>,
+    /// Level-0 grid width in cells.
     pub w8: u32,
+    /// Level-0 grid height in cells.
     pub h8: u32,
 }
 
@@ -190,7 +193,7 @@ pub fn build_masked(plane: &[f32], valid: &[f32], w8: u32, h8: u32, n_levels: u3
 /// `valid` is the same validity plane the panel's [`build_masked`] uses
 /// (1 = trusted cell). Both the mask chain and every stored level are
 /// clamped to zero where the identically-downsampled validity falls below
-/// [`MASK_SUPPORT_MIN`]: without the clamp, the per-level smoothing walks
+/// `MASK_SUPPORT_MIN`: without the clamp, the per-level smoothing walks
 /// the mask support outward without limit — by the coarse levels a panel
 /// held blend weight hundreds of px past its geometric coverage, exactly
 /// where its data pyramid is the 0.0 sentinel or a baseless extrapolation
