@@ -122,6 +122,25 @@ problem-area iteration at full res).
 Deferred to phase 3: FITS *input*, compressed XISF ingest, full Laplacian
 pyramid (if two-band proves insufficient), wgpu GPU path, GUI.
 
+### Phase 4 (in progress): pyramid base
+
+Generalize the two-band blend to a full multiband scheme **without touching
+the star guarantees**. The split: detail (<8 px + all star flux, since the
+base is star-free by construction) keeps the phase-3 treatment verbatim —
+hard per-pixel ownership, ±16 px ramp, star-lock, defect veto. The star-free
+*base* replaces its single wide feather with a **Laplacian pyramid on the L8
+cell grid**: levels at 8, 16, 32, … px scale (up to the feather scale), each
+level blended with an ownership-mask pyramid whose transition width is
+proportional to the level's scale. Mid-frequency structure (8 px–feather)
+thus gets seam-switched over distances matched to its wavelength instead of
+being averaged across the whole feather — the classic Burt–Adelson result —
+while everything runs on the small L8 grid (e.g. 1157×2289 for the Orion
+set), so cost is negligible and out-of-core pyramid plumbing is avoided
+entirely. `BlendMode::Pyramid` becomes the default; TwoBand and Feather stay
+for comparison. The benefit case: panels with differing PSF (seeing/focus)
+or few-pixel misregistration, where the feathered base would soften or
+double mid-scale structure.
+
 ## Session directory
 
 ```
