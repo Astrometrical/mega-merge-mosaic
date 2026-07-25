@@ -14,13 +14,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::panel_reader::PanelStorage;
 use crate::{Error, Result};
 
 /// Per-panel metadata recorded by the analyze stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelMeta {
     pub id: usize,
-    /// Source file the panel was analyzed from.
+    /// File the panel's pixel data is read from: the source XISF for
+    /// full-canvas input, the `aligned.bin` reprojection cache otherwise
+    /// (see [`PanelStorage`]).
     pub path: PathBuf,
     /// Content bounding box of covered pixels: `[x0, y0, x1, y1]`, exclusive.
     pub bbox: [u64; 4],
@@ -32,6 +35,11 @@ pub struct PanelMeta {
     pub ch_max: Vec<f32>,
     /// Per-channel mean over covered pixels (0 if none).
     pub ch_mean: Vec<f64>,
+    /// How the pixel data at `path` is stored. Defaults to
+    /// [`PanelStorage::FullCanvasXisf`] so pre-phase-5 `session.json` files
+    /// (which lack the field) keep reading unchanged.
+    #[serde(default)]
+    pub storage: PanelStorage,
 }
 
 /// A mosaic session: canvas geometry plus the analyzed panel set.
@@ -75,6 +83,12 @@ impl Session {
         self.dir.join("panels").join(id.to_string()).join("summary.bin")
     }
 
+    /// Path of panel `id`'s reprojection cache: `panels/<id>/aligned.bin`.
+    /// Only exists for solved (reprojected) input panels.
+    pub fn aligned_path(&self, id: usize) -> PathBuf {
+        self.dir.join("panels").join(id.to_string()).join("aligned.bin")
+    }
+
     /// Path of the overlap graph: `analysis/overlap_graph.json`.
     pub fn overlap_graph_path(&self) -> PathBuf {
         self.dir.join("analysis").join("overlap_graph.json")
@@ -111,6 +125,7 @@ mod tests {
             ch_min: vec![0.001, 0.002, 0.003],
             ch_max: vec![0.9, 0.8, 0.7],
             ch_mean: vec![0.01, 0.02, 0.03],
+            storage: PanelStorage::CroppedCache { bbox: [10, 20, 300, 400] },
         });
         session.save().unwrap();
 
@@ -122,9 +137,14 @@ mod tests {
         assert_eq!(p.id, 0);
         assert_eq!(p.bbox, [10, 20, 300, 400]);
         assert_eq!(p.ch_max, vec![0.9, 0.8, 0.7]);
+        assert_eq!(p.storage, PanelStorage::CroppedCache { bbox: [10, 20, 300, 400] });
         assert_eq!(
             reopened.summary_path(0),
             dir.join("panels").join("0").join("summary.bin")
+        );
+        assert_eq!(
+            reopened.aligned_path(0),
+            dir.join("panels").join("0").join("aligned.bin")
         );
         assert_eq!(
             reopened.surfaces_path(),
@@ -139,6 +159,29 @@ mod tests {
         // The directory itself must not be baked into the JSON.
         assert!(!json.contains("\"dir\""));
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Pre-phase-5 `session.json` files carry no `storage` field: they must
+    /// keep deserializing, defaulting to full-canvas XISF storage.
+    #[test]
+    fn session_without_storage_field_defaults_to_full_canvas() {
+        let dir = std::env::temp_dir().join(format!("mmm-session-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{
+              "canvas": [640, 480, 3],
+              "panels": [{
+                "id": 0, "path": "/data/panel0.xisf", "bbox": [10, 20, 300, 400],
+                "nonzero_frac": 0.25, "ch_min": [0.001], "ch_max": [0.9], "ch_mean": [0.01]
+              }]
+            }"#,
+        )
+        .unwrap();
+        let session = Session::open(&dir).unwrap();
+        assert_eq!(session.panels[0].storage, PanelStorage::FullCanvasXisf);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

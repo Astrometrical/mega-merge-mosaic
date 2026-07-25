@@ -61,8 +61,8 @@
 use rayon::prelude::*;
 
 use crate::flatten::Flatten;
-use crate::formats::xisf::XisfPanel;
 use crate::overlap::{OverlapGraph, distance_map};
+use crate::panel_reader::PanelReader;
 use crate::photometry::Photometry;
 use crate::seam::{OwnerMap, compute_owner_map_masked, star_mask};
 use crate::session::Session;
@@ -244,6 +244,20 @@ impl PanelPrep {
 /// Load the panels' L8 summaries in parallel.
 pub(crate) fn load_summaries(session: &Session) -> Result<Vec<L8Summary>> {
     session.panels.par_iter().map(|p| L8Summary::read(&session.summary_path(p.id))).collect()
+}
+
+/// Open every panel's pixel data for streaming reads ([`PanelReader`]
+/// validates each panel's storage against the session canvas).
+fn open_readers(session: &Session) -> Result<Vec<PanelReader>> {
+    session
+        .panels
+        .par_iter()
+        .map(|p| {
+            let r = PanelReader::open(p, session.canvas)?;
+            r.advise_sequential();
+            Ok(r)
+        })
+        .collect()
 }
 
 /// Load summaries, compute distance maps, and resolve per-panel corrections
@@ -610,29 +624,7 @@ fn blend_full(
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
     let preps = prep_panels(session, phot, surfaces, params.flatten)?;
-    let panels: Vec<XisfPanel> = session
-        .panels
-        .par_iter()
-        .map(|p| {
-            let x = XisfPanel::open(&p.path)?;
-            if (x.width(), x.height(), x.channels()) != session.canvas {
-                return Err(Error::format(
-                    &p.path,
-                    format!(
-                        "panel geometry {}x{}x{} does not match session canvas {}x{}x{}",
-                        x.width(),
-                        x.height(),
-                        x.channels(),
-                        session.canvas.0,
-                        session.canvas.1,
-                        session.canvas.2
-                    ),
-                ));
-            }
-            x.advise_sequential();
-            Ok(x)
-        })
-        .collect::<Result<_>>()?;
+    let panels = open_readers(session)?;
 
     let bbox = output_bbox(session, params)?;
     let (cx0, cy0) = (bbox[0], bbox[1]);
@@ -668,7 +660,8 @@ fn blend_full(
                 let mut acc = vec![0.0f32; nch * out_w];
                 let mut wsum = vec![0.0f32; out_w];
                 let gy = cy as f32 * inv_block;
-                let mut rows: Vec<&[f32]> = Vec::with_capacity(nch);
+                // Per panel: (storage x0, clipped channel row) per channel.
+                let mut rows: Vec<(usize, &[f32])> = Vec::with_capacity(nch);
                 for &pi in &active {
                     let p = &preps[pi];
                     if cy < p.bbox[1] || cy >= p.bbox[3] {
@@ -676,7 +669,10 @@ fn blend_full(
                     }
                     rows.clear();
                     for c in 0..nch as u64 {
-                        rows.push(panels[pi].row(c, cy));
+                        // Content bbox ⊆ storage bbox, so the row exists.
+                        let (rx0, row) =
+                            panels[pi].row(c, cy).expect("content row within storage bbox");
+                        rows.push((rx0 as usize, row));
                     }
                     // Residual surface, reduced to per-row constants:
                     // s(xn) = a + xn·(b + xn·c) per channel (Horner).
@@ -685,7 +681,7 @@ fn blend_full(
                     let xe = p.bbox[2].min(bbox[2]);
                     for x in xs..xe {
                         let xi = x as usize;
-                        if rows.iter().any(|row| row[xi] == 0.0) {
+                        if rows.iter().any(|&(rx0, row)| row[xi - rx0] == 0.0) {
                             continue; // uncovered: any channel zero
                         }
                         let gx = x as f32 * inv_block;
@@ -695,10 +691,10 @@ fn blend_full(
                         let o = (x - cx0) as usize;
                         wsum[o] += wgt;
                         let xn = x as f32 * inv_cw;
-                        for (c, row) in rows.iter().enumerate() {
+                        for (c, &(rx0, row)) in rows.iter().enumerate() {
                             let (sa, sb, sc) = srow[c];
                             acc[c * out_w + o] += wgt
-                                * (row[xi] * p.gains[c]
+                                * (row[xi - rx0] * p.gains[c]
                                     + p.offsets[c]
                                     + sa
                                     + xn * (sb + xn * sc));
@@ -912,29 +908,7 @@ fn blend_twoband_impl(
     // fallback). Everything else below is byte-for-byte the TwoBand path.
     let pyr_base = (params.mode == BlendMode::Pyramid)
         .then(|| pyramid_base_planes(&preps, &owner, nch, params.feather_px));
-    let panels: Vec<XisfPanel> = session
-        .panels
-        .par_iter()
-        .map(|p| {
-            let x = XisfPanel::open(&p.path)?;
-            if (x.width(), x.height(), x.channels()) != session.canvas {
-                return Err(Error::format(
-                    &p.path,
-                    format!(
-                        "panel geometry {}x{}x{} does not match session canvas {}x{}x{}",
-                        x.width(),
-                        x.height(),
-                        x.channels(),
-                        session.canvas.0,
-                        session.canvas.1,
-                        session.canvas.2
-                    ),
-                ));
-            }
-            x.advise_sequential();
-            Ok(x)
-        })
-        .collect::<Result<_>>()?;
+    let panels = open_readers(session)?;
 
     let bbox = output_bbox(session, params)?;
     let (cx0, cy0) = (bbox[0], bbox[1]);
@@ -968,10 +942,11 @@ fn blend_twoband_impl(
             .map(|r| {
                 let cy = band_cy0 + r as u64;
                 let mut out = vec![0.0f32; nch * out_w];
-                // Panels covering this row: index, mmap rows, surface row terms.
+                // Panels covering this row: index, clipped mmap rows (storage
+                // x0 + slice, canvas coords), surface row terms.
                 struct PRow<'a> {
                     pi: usize,
-                    rows: Vec<&'a [f32]>,
+                    rows: Vec<(usize, &'a [f32])>,
                     srow: Vec<(f32, f32, f32)>,
                 }
                 let prow: Vec<PRow> = active
@@ -979,7 +954,15 @@ fn blend_twoband_impl(
                     .filter(|&&pi| cy >= preps[pi].bbox[1] && cy < preps[pi].bbox[3])
                     .map(|&pi| PRow {
                         pi,
-                        rows: (0..nch as u64).map(|c| panels[pi].row(c, cy)).collect(),
+                        rows: (0..nch as u64)
+                            .map(|c| {
+                                // Content bbox ⊆ storage bbox: the row exists.
+                                let (rx0, row) = panels[pi]
+                                    .row(c, cy)
+                                    .expect("content row within storage bbox");
+                                (rx0 as usize, row)
+                            })
+                            .collect(),
                         srow: preps[pi].surf_row(cy as f64 * inv_ch),
                     })
                     .collect();
@@ -1013,7 +996,7 @@ fn blend_twoband_impl(
                         if x < p.bbox[0] || x >= p.bbox[2] {
                             continue;
                         }
-                        if pr.rows.iter().any(|row| row[xi] == 0.0) {
+                        if pr.rows.iter().any(|&(rx0, row)| row[xi - rx0] == 0.0) {
                             continue; // uncovered: any channel zero
                         }
                         let bld = bl_d.get_or_insert_with(|| BiLin::at(w8, h8, gx_d, gy_d));
@@ -1040,7 +1023,8 @@ fn blend_twoband_impl(
                         let pr = &prow[k];
                         let p = &preps[pr.pi];
                         let (sa, sb, sc) = pr.srow[c];
-                        pr.rows[c][xi] * p.gains[c] + p.offsets[c] + sa + xn * (sb + xn * sc)
+                        let (rx0, row) = pr.rows[c];
+                        row[xi - rx0] * p.gains[c] + p.offsets[c] + sa + xn * (sb + xn * sc)
                     };
                     let fallback = || -> usize {
                         cov.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0

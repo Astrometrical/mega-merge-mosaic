@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::formats::xisf::XisfPanel;
 use crate::overlap::OverlapGraph;
+use crate::panel_reader::{PanelReader, PanelStorage};
 use crate::session::{PanelMeta, Session};
 use crate::summary::{BLOCK, L8Summary};
 use crate::{Error, Result};
@@ -113,9 +113,9 @@ pub fn analyze_opts(
 
 /// Single streaming pass over one panel.
 fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
-    let panel = XisfPanel::open(path)?;
+    let panel = PanelReader::open_xisf(path)?;
     panel.advise_sequential();
-    let (w, h, ch) = (panel.width(), panel.height(), panel.channels());
+    let (w, h, ch) = panel.canvas();
     let block = BLOCK as u64;
     let w8 = w.div_ceil(block) as usize;
     let h8 = h.div_ceil(block) as usize;
@@ -139,16 +139,27 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
 
     let mut rows: Vec<&[f32]> = Vec::with_capacity(nch);
     for y in 0..h {
+        // Rows come back clipped to the panel's x extent (canvas x = rx0 + i);
+        // rows outside the storage bbox are absent — fully uncovered. All
+        // channels share one storage bbox, so the first channel decides.
         rows.clear();
+        let mut rx0 = 0usize;
         for c in 0..ch {
-            rows.push(panel.row(c, y));
+            match panel.row(c, y) {
+                Some((x0c, r)) => {
+                    rx0 = x0c as usize;
+                    rows.push(r);
+                }
+                None => break,
+            }
         }
         let mut row_covered = false;
-        for x in 0..w as usize {
-            let covered = rows.iter().all(|r| r[x] != 0.0);
+        for i in 0..rows.first().map_or(0, |r| r.len()) {
+            let covered = rows.iter().all(|r| r[i] != 0.0);
             if !covered {
                 continue;
             }
+            let x = rx0 + i;
             covered_total += 1;
             row_covered = true;
             let xu = x as u64;
@@ -161,7 +172,7 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
             let x8 = x / BLOCK as usize;
             cell_cnt[x8] += 1;
             for (c, r) in rows.iter().enumerate() {
-                let v = r[x];
+                let v = r[i];
                 if v < ch_min[c] {
                     ch_min[c] = v;
                 }
@@ -216,6 +227,7 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
             .into_iter()
             .map(|s| if covered_total > 0 { s / covered_total as f64 } else { 0.0 })
             .collect(),
+        storage: PanelStorage::FullCanvasXisf,
     };
     Ok(PanelScan { meta, summary, canvas: (w, h, ch) })
 }

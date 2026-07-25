@@ -12,6 +12,7 @@
 //! This crate is UI-agnostic: the `mmm` CLI and any future GUI are thin
 //! frontends over [`session`].
 
+pub mod align;
 pub mod analyze;
 pub mod astrometry;
 pub mod blend;
@@ -22,6 +23,7 @@ pub mod formats;
 pub mod linalg;
 pub mod output;
 pub mod overlap;
+pub mod panel_reader;
 pub mod photometry;
 pub mod pyramid;
 pub mod seam;
