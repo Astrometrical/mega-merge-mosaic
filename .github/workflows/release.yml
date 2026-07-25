@@ -1,0 +1,108 @@
+# Release automation: pushing a tag like `v0.1.0` builds the `mmm` binary for
+# four targets on native runners, packages each with README/LICENSE, and
+# publishes a GitHub Release with SHA256 checksums and auto-generated notes.
+# See docs/RELEASING.md for the full release procedure.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Required so the release job may create the GitHub Release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runner per target — no cross-compilation toolchains needed.
+          # `label` is the human-readable suffix used in archive filenames.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            label: x86_64-linux
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            label: x86_64-windows
+          # macos-*-intel are GitHub's Intel runners (macos-13 was retired).
+          # If Intel runners disappear entirely, switch this entry to
+          # `runner: macos-latest` and keep the target — Apple toolchains
+          # build x86_64 from arm64 out of the box.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            label: x86_64-macos
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            label: aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --package mmm --target ${{ matrix.target }}
+
+      # GITHUB_REF_NAME is the tag, e.g. "v0.1.0", so archives are named like
+      # mmm-v0.1.0-x86_64-linux.tar.gz / mmm-v0.1.0-x86_64-windows.zip.
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="mmm-${GITHUB_REF_NAME}-${{ matrix.label }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/mmm" "$name/"
+          cp README.md "$name/"
+          if [ -f LICENSE ]; then cp LICENSE "$name/"; fi
+          tar czf "$name.tar.gz" "$name"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "mmm-$env:GITHUB_REF_NAME-${{ matrix.label }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mmm.exe" $name/
+          Copy-Item README.md $name/
+          if (Test-Path LICENSE) { Copy-Item LICENSE $name/ }
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.label }}
+          path: |
+            mmm-*.tar.gz
+            mmm-*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: packages
+        run: sha256sum -- * > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: packages/*
