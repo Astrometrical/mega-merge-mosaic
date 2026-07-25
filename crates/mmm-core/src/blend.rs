@@ -21,7 +21,19 @@
 //! transition snaps hard so a star (or a diffraction-spike arm attached to
 //! one) crossing the seam is taken whole from one panel.
 //!
-//! In TwoBand mode a cross-panel **defect veto** (default on) restores the
+//! [`BlendMode::Pyramid`] (the default) keeps the whole TwoBand detail stage
+//! byte-for-byte but replaces the *base's* single wide feather with an
+//! L8-grid Laplacian-pyramid blend ([`crate::pyramid`]): per channel, each
+//! panel's star-free corrected base plane is decomposed into levels at 8, 16,
+//! 32, … px scale (up to the feather scale) and blended per level with a
+//! Gaussian pyramid of its hard ownership indicator, so each frequency band
+//! transitions over a distance proportional to its wavelength instead of
+//! being averaged across the whole feather. Masks renormalize per level over
+//! the panels actually reaching a cell (validity = the base's sampling reach,
+//! so nothing bleeds in from beyond a panel's coverage); where the mask sum
+//! is numerically ~0 the cell falls back to the feather-weighted base.
+//!
+//! In TwoBand/Pyramid mode a cross-panel **defect veto** (default on) restores the
 //! defect suppression that averaging used to provide: where ≥2 panels cover a
 //! pixel and the cell is star-mask-clear in both compared panels, a detail
 //! difference above [`DEFECT_VETO_FACTOR`] × the smaller of the two panels'
@@ -97,8 +109,18 @@ pub enum BlendMode {
     /// Phase-1 weighted average of full-res corrected pixels.
     Feather,
     /// Feathered base + seam-owned detail (star-safe under misregistration).
-    #[default]
     TwoBand,
+    /// TwoBand with the star-free base blended as an L8-grid Laplacian
+    /// pyramid ([`crate::pyramid`]): levels at 8, 16, 32, … px up to the
+    /// feather scale, each blended with Gaussian ownership-mask pyramids
+    /// whose transition width is proportional to the level's scale. Mid-scale
+    /// structure (8 px–feather) is seam-switched over distances matched to
+    /// its wavelength instead of averaged across the whole feather (the
+    /// Burt–Adelson result), which keeps differing-PSF or slightly
+    /// misregistered panels from softening/doubling it. The detail stage
+    /// (ownership, ramp, star-lock, defect veto) is exactly the TwoBand path.
+    #[default]
+    Pyramid,
 }
 
 /// Parameters of the blend.
@@ -110,7 +132,8 @@ pub struct BlendParams {
     pub downsample: u32,
     /// Output rows per band delivered to the sink.
     pub band_rows: usize,
-    /// Feather (phase-1) or two-band with star-avoiding seams (default).
+    /// Feather (phase-1), two-band with star-avoiding seams, or two-band
+    /// with the pyramid base (default).
     pub mode: BlendMode,
     /// Optional region of interest in full-res canvas coords `[x0,y0,x1,y1]`
     /// (exclusive); the output is the intersection with the union bbox.
@@ -133,7 +156,7 @@ impl Default for BlendParams {
             feather_px: 256.0,
             downsample: 1,
             band_rows: 256,
-            mode: BlendMode::TwoBand,
+            mode: BlendMode::Pyramid,
             roi: None,
             defect_veto: true,
             flatten: None,
@@ -404,24 +427,7 @@ fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize, ma
     // bilinear taps of a covered pixel stay within 1 cell of its own cell).
     // Only non-source cells in this zone need filling; the rest of the (96%
     // empty) canvas grid is never sampled and keeps its raw value.
-    let covered: Vec<bool> = summary.coverage.iter().map(|&c| c > 0.0).collect();
-    let mut reach = covered.clone();
-    for _ in 0..2 {
-        let prev = reach.clone();
-        for y in 0..h {
-            for x in 0..w {
-                if prev[y * w + x] {
-                    continue;
-                }
-                let near = (y.saturating_sub(1)..=(y + 1).min(h - 1)).any(|yy| {
-                    (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|xx| prev[yy * w + xx])
-                });
-                if near {
-                    reach[y * w + x] = true;
-                }
-            }
-        }
-    }
+    let reach = base_reach(&summary.coverage, w, h);
 
     // Onion-peel: each pass fills cells that touch already-available cells
     // with the mean of those neighbours, per channel. Star blobs and rim
@@ -472,6 +478,31 @@ fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize, ma
     }
 }
 
+/// Cells the bilinear base sampling can reach for a panel: covered cells
+/// (coverage > 0) dilated by 2 — the base's validity zone. Shared by the
+/// star-suppression fill (which fills exactly this zone) and the pyramid
+/// base's per-panel validity plane.
+fn base_reach(coverage: &[f32], w: usize, h: usize) -> Vec<bool> {
+    let mut reach: Vec<bool> = coverage.iter().map(|&c| c > 0.0).collect();
+    for _ in 0..2 {
+        let prev = reach.clone();
+        for y in 0..h {
+            for x in 0..w {
+                if prev[y * w + x] {
+                    continue;
+                }
+                let near = (y.saturating_sub(1)..=(y + 1).min(h - 1)).any(|yy| {
+                    (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|xx| prev[yy * w + xx])
+                });
+                if near {
+                    reach[y * w + x] = true;
+                }
+            }
+        }
+    }
+    reach
+}
+
 /// Bilinear sample of an L8-grid plane at fractional cell coordinates.
 #[inline]
 fn bilinear(d: &[f32], w8: u32, h8: u32, gx: f32, gy: f32) -> f32 {
@@ -516,9 +547,11 @@ pub fn blend(
     }
     match (params.downsample, params.mode) {
         (1, BlendMode::Feather) => blend_full(session, phot, surfaces, params, sink),
-        (1, BlendMode::TwoBand) => blend_twoband(session, phot, surfaces, graph, params, sink),
+        (1, BlendMode::TwoBand | BlendMode::Pyramid) => {
+            blend_twoband(session, phot, surfaces, graph, params, sink)
+        }
         // At 1/8 the base band is the whole signal: previews feather-blend
-        // the L8 means in both modes.
+        // the L8 means in all modes.
         (8, _) => blend_l8(session, phot, surfaces, params, sink),
         (d, _) => Err(Error::format(
             &session.dir,
@@ -758,6 +791,73 @@ fn detail_transition_maps(
     (ramps, hard)
 }
 
+/// Merged star-free base planes for [`BlendMode::Pyramid`], on the L8 grid:
+/// per channel, the collapse of the panels' masked Laplacian pyramids of the
+/// corrected star-free base planes (`corr8`), blended per level with Gaussian
+/// pyramids of each panel's hard ownership indicator (`owner == panel`).
+/// Validity for the normalized-convolution build is [`base_reach`] — beyond
+/// it a panel contributes nothing at any level, so a sparse panel's zeros
+/// never bleed into the blend. Returns the per-channel planes plus a per-cell
+/// definedness flag: `false` where the mask sum vanished at some level
+/// (numerical guard) — those pixels fall back to the feather-weighted base.
+fn pyramid_base_planes(
+    preps: &[PanelPrep],
+    owner: &OwnerMap,
+    nch: usize,
+    feather_px: f32,
+) -> (Vec<Vec<f32>>, Vec<bool>) {
+    use crate::pyramid::{CellPyramid, blend_pyramids_guarded, build_masked, mask_pyramid};
+
+    let (w8, h8) = (owner.w8, owner.h8);
+    let (w, h) = (w8 as usize, h8 as usize);
+    let cells = w * h;
+    let n_levels = crate::pyramid::n_levels_for_feather(feather_px);
+
+    // Panels owning no cell have zero mask weight at every level: skip them.
+    let contributors: Vec<usize> = (0..preps.len())
+        .filter(|&p| owner.owner.contains(&(p as u16)))
+        .collect();
+    if contributors.is_empty() {
+        return (vec![vec![0.0; cells]; nch], vec![false; cells]);
+    }
+
+    struct PanelPyr {
+        data: Vec<CellPyramid>,
+        mask: CellPyramid,
+    }
+    let pyrs: Vec<PanelPyr> = contributors
+        .par_iter()
+        .map(|&pi| {
+            let p = &preps[pi];
+            let valid: Vec<f32> = base_reach(&p.summary.coverage, w, h)
+                .into_iter()
+                .map(|r| if r { 1.0 } else { 0.0 })
+                .collect();
+            let mask: Vec<f32> =
+                owner.owner.iter().map(|&o| if o == pi as u16 { 1.0 } else { 0.0 }).collect();
+            let data = (0..nch)
+                .map(|c| {
+                    build_masked(&p.corr8[c * cells..(c + 1) * cells], &valid, w8, h8, n_levels)
+                })
+                .collect();
+            PanelPyr { data, mask: mask_pyramid(&mask, w8, h8, n_levels) }
+        })
+        .collect();
+
+    let masks: Vec<&CellPyramid> = pyrs.iter().map(|p| &p.mask).collect();
+    let mut planes = Vec::with_capacity(nch);
+    let mut defined = Vec::new();
+    for c in 0..nch {
+        let datas: Vec<&CellPyramid> = pyrs.iter().map(|p| &p.data[c]).collect();
+        let (plane, def) = blend_pyramids_guarded(&datas, &masks);
+        if c == 0 {
+            defined = def; // masks/validity are channel-independent
+        }
+        planes.push(plane);
+    }
+    (planes, defined)
+}
+
 /// Two-band full-resolution blend: feathered base + seam-owned detail.
 fn blend_twoband(
     session: &Session,
@@ -807,6 +907,11 @@ fn blend_twoband_impl(
     for p in &mut preps {
         p.summary.detail = Vec::new(); // only needed for the maps above
     }
+    // Pyramid mode: the merged star-free base, replacing the per-pixel
+    // feather-weighted base accumulation (which stays as the numerical-guard
+    // fallback). Everything else below is byte-for-byte the TwoBand path.
+    let pyr_base = (params.mode == BlendMode::Pyramid)
+        .then(|| pyramid_base_planes(&preps, &owner, nch, params.feather_px));
     let panels: Vec<XisfPanel> = session
         .panels
         .par_iter()
@@ -1011,9 +1116,21 @@ fn blend_twoband_impl(
                         }
                     }
 
-                    let inv_sw = 1.0 / sum_w;
-                    for c in 0..nch {
-                        out[c * out_w + o] = base_acc[c] * inv_sw + det[c];
+                    match &pyr_base {
+                        // Pyramid base: one bilinear sample of the merged
+                        // plane; the detail term is untouched.
+                        Some((planes, defined)) if defined[cell] => {
+                            let blc = bl_c.as_ref().expect("set for any covered pixel");
+                            for (c, plane) in planes.iter().enumerate() {
+                                out[c * out_w + o] = blc.sample(plane) + det[c];
+                            }
+                        }
+                        _ => {
+                            let inv_sw = 1.0 / sum_w;
+                            for c in 0..nch {
+                                out[c * out_w + o] = base_acc[c] * inv_sw + det[c];
+                            }
+                        }
                     }
                 }
                 out
@@ -1431,6 +1548,8 @@ mod tests {
             // ramp reach of its arms — the kink scenario observed on real
             // data. Verified: mask on ≤ 0.0004 on all arms; mask off 0.0203
             // on one arm (thresh 0.0120).
+            mid_blobs: 0,
+            shift_blobs: false,
             seed: 9,
         };
         let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -1451,14 +1570,16 @@ mod tests {
             flatten: None,
         };
 
-        let run = |use_mask: bool| -> MemSink {
+        let run = |use_mask: bool, mode: BlendMode| -> MemSink {
+            let params = BlendParams { mode, ..params.clone() };
             let mut sink = MemSink::new();
             blend_twoband_impl(&session, &phot, None, &graph, &params, &mut sink, use_mask)
                 .unwrap();
             sink
         };
-        let with_mask = run(true);
-        let no_mask = run(false);
+        let with_mask = run(true, BlendMode::TwoBand);
+        let with_mask_pyr = run(true, BlendMode::Pyramid);
+        let no_mask = run(false, BlendMode::TwoBand);
 
         // Corrected panel pixels in the blend's photometric frame.
         let w = spec.canvas.0 as usize;
@@ -1541,14 +1662,20 @@ mod tests {
             for arm in 0..4 {
                 let pixels = arm_pixels(sx, sy, len, arm);
                 let d_mask = one_panel_dist(&with_mask, &pixels);
+                let d_pyr = one_panel_dist(&with_mask_pyr, &pixels);
                 let d_none = one_panel_dist(&no_mask, &pixels);
                 eprintln!(
                     "spiked star ({sx:6.1},{sy:6.1}) arm {arm}: \
-                     masked {d_mask:.4}, unmasked {d_none:.4} (thresh {thresh:.4})"
+                     masked {d_mask:.4}, pyramid {d_pyr:.4}, unmasked {d_none:.4} \
+                     (thresh {thresh:.4})"
                 );
                 assert!(
                     d_mask < thresh,
                     "arm {arm} of star at ({sx},{sy}) matches no single panel: {d_mask}"
+                );
+                assert!(
+                    d_pyr < thresh,
+                    "Pyramid: arm {arm} of star at ({sx},{sy}) matches no single panel: {d_pyr}"
                 );
                 if d_none >= thresh {
                     no_mask_fails += 1;
@@ -1604,6 +1731,8 @@ mod tests {
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![trail, ray],
+            mid_blobs: 0,
+            shift_blobs: false,
             seed: 11,
         };
         let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -1636,12 +1765,12 @@ mod tests {
             }
         }
 
-        let run = |veto: bool| -> MemSink {
+        let run = |veto: bool, mode: BlendMode| -> MemSink {
             let params = BlendParams {
                 feather_px: 24.0,
                 downsample: 1,
                 band_rows: 64,
-                mode: BlendMode::TwoBand,
+                mode,
                 roi: None,
                 defect_veto: veto,
                 flatten: None,
@@ -1650,8 +1779,10 @@ mod tests {
             blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
             sink
         };
-        let on = run(true);
-        let off = run(false);
+        let on = run(true, BlendMode::TwoBand);
+        let off = run(false, BlendMode::TwoBand);
+        let on_pyr = run(true, BlendMode::Pyramid);
+        let off_pyr = run(false, BlendMode::Pyramid);
 
         // Clean panel (0), corrected into the blend's photometric frame.
         let w = spec.canvas.0 as usize;
@@ -1675,18 +1806,24 @@ mod tests {
         };
 
         let thresh = 6.0 * noise;
-        for (name, d) in [("trail", trail), ("ray", ray)] {
-            let d_on = defect_dist(&on, d);
-            let d_off = defect_dist(&off, d);
-            eprintln!("{name}: veto on {d_on:.4}, veto off {d_off:.4} (thresh {thresh:.4})");
-            assert!(
-                d_on < thresh,
-                "{name}: veto ON must match the clean panel within noise, got {d_on}"
-            );
-            assert!(
-                d_off > thresh,
-                "{name}: veto OFF must show the defect (teeth), got {d_off}"
-            );
+        for (mode, on, off) in
+            [(BlendMode::TwoBand, &on, &off), (BlendMode::Pyramid, &on_pyr, &off_pyr)]
+        {
+            for (name, d) in [("trail", trail), ("ray", ray)] {
+                let d_on = defect_dist(on, d);
+                let d_off = defect_dist(off, d);
+                eprintln!(
+                    "{mode:?} {name}: veto on {d_on:.4}, veto off {d_off:.4} (thresh {thresh:.4})"
+                );
+                assert!(
+                    d_on < thresh,
+                    "{mode:?} {name}: veto ON must match the clean panel within noise, got {d_on}"
+                );
+                assert!(
+                    d_off > thresh,
+                    "{mode:?} {name}: veto OFF must show the defect (teeth), got {d_off}"
+                );
+            }
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1716,6 +1853,8 @@ mod tests {
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![defect],
+            mid_blobs: 0,
+            shift_blobs: false,
             seed: 5,
         };
         let res = generate(&spec, &dir.join("panels")).unwrap();

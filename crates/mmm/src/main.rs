@@ -70,8 +70,9 @@ enum Command {
         #[arg(long, default_value_t = 256.0)]
         feather: f32,
 
-        /// Blend mode: twoband (star-safe seams, default) or feather (phase-1)
-        #[arg(long, default_value = "twoband")]
+        /// Blend mode: pyramid (multiband base + star-safe seams, default),
+        /// twoband (feathered base + star-safe seams) or feather (phase-1)
+        #[arg(long, default_value = "pyramid")]
         mode: String,
 
         /// Also write an autostretched 8-bit PNG preview (downsampled runs only)
@@ -177,7 +178,8 @@ fn main() -> anyhow::Result<()> {
             let mode = match mode.as_str() {
                 "feather" => mmm_core::blend::BlendMode::Feather,
                 "twoband" => mmm_core::blend::BlendMode::TwoBand,
-                other => anyhow::bail!("--mode must be feather or twoband (got {other})"),
+                "pyramid" => mmm_core::blend::BlendMode::Pyramid,
+                other => anyhow::bail!("--mode must be pyramid, twoband or feather (got {other})"),
             };
             let defect_veto = match defect_veto.as_str() {
                 "on" => true,

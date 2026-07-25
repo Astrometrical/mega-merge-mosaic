@@ -406,6 +406,8 @@ mod tests {
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![],
+            mid_blobs: 0,
+            shift_blobs: false,
             seed: 7,
         }
     }

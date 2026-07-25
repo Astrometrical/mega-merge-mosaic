@@ -50,6 +50,17 @@ pub struct SynthSpec {
     /// otherwise one entry per panel. The truth carries spikes at angle 0;
     /// differing per-panel offsets simulate per-session camera rotation.
     pub panel_spike_angle: Vec<f32>,
+    /// Number of mid-frequency Gaussian blobs (σ = [`BLOB_SIGMA_PX`] px ≈ 3
+    /// L8 cells) added to the truth sky — extended structure between the
+    /// detail band and the feather scale, faint enough to stay below the star
+    /// mask, for the pyramid blend's ghost-reduction tests. Positions and
+    /// amplitudes ([`BLOB_AMP_RANGE`]) come from an RNG stream independent of
+    /// the star/noise/perturbation draws, so `0` is byte-identical to a spec
+    /// without blobs.
+    pub mid_blobs: usize,
+    /// Apply `panel_shift` to the blob centers too (not only stars) —
+    /// simulates misregistration of extended mid-scale structure.
+    pub shift_blobs: bool,
     /// Single-panel defects `(panel, x, y, length_px, amplitude)`: a bright
     /// 1-px-wide *horizontal* line segment starting at `(x, y)` (length 1 =
     /// cosmic ray, longer = a satellite-trail piece), added to all channels
@@ -76,6 +87,9 @@ pub struct SynthResult {
     /// Stars that received diffraction spikes (when `panel_spike_angle` is
     /// non-empty): `(x, y, arm_length_px)` in unshifted canvas coordinates.
     pub spiked: Vec<(f64, f64, f64)>,
+    /// Mid-frequency blobs `(x, y, amplitude)` in unshifted canvas
+    /// coordinates (σ is always [`BLOB_SIGMA_PX`]).
+    pub blobs: Vec<(f64, f64, f64)>,
 }
 
 /// Positive floor applied to truth (and to any covered panel pixel that would
@@ -96,6 +110,15 @@ const SPIKE_REL_AMP: f64 = 0.35;
 
 /// Gaussian half-width of a spike arm across its axis, in pixels (~1 px wide).
 const SPIKE_SIGMA: f64 = 0.6;
+
+/// Mid-frequency blob width: σ = 3 L8 cells — structure between the detail
+/// band (< 8 px) and typical feather scales.
+pub const BLOB_SIGMA_PX: f64 = 24.0;
+
+/// Mid-frequency blob peak amplitudes are drawn uniformly from this range:
+/// bright against the sky, but with cell-scale detail energy near the noise
+/// median so the star mask leaves blobs in the base band.
+pub const BLOB_AMP_RANGE: (f64, f64) = (0.06, 0.12);
 
 /// xorshift64* PRNG with a Box-Muller Gaussian tap. Deterministic for a seed;
 /// no external dependency.
@@ -268,6 +291,24 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         }
         plane
     }
+    // Mid-frequency blobs: rendered exactly like (wide, faint) stars, from a
+    // dedicated RNG stream so enabling them never perturbs the star, noise or
+    // panel-perturbation draws (mid_blobs == 0 is byte-identical output).
+    let mut brng = Rng::new(spec.seed ^ 0xB10B_B10B_B10B_B10B);
+    let blobs: Vec<(f64, f64, f64)> = (0..spec.mid_blobs)
+        .map(|_| {
+            let bx = brng.range_f64(0.0, w as f64);
+            let by = brng.range_f64(0.0, h as f64);
+            let amp = brng.range_f64(BLOB_AMP_RANGE.0, BLOB_AMP_RANGE.1);
+            (bx, by, amp)
+        })
+        .collect();
+    let blob_stars = |dx: f64, dy: f64| -> Vec<(f64, f64, f64, f64)> {
+        blobs.iter().map(|&(bx, by, amp)| (bx + dx, by + dy, BLOB_SIGMA_PX, amp)).collect()
+    };
+    let blob_plane =
+        (!blobs.is_empty()).then(|| render_stars(&blob_stars(0.0, 0.0), w, h, 0.0, 0.0));
+
     let has_spikes = !spec.panel_spike_angle.is_empty();
     let truth_spikes = has_spikes.then(|| render_spikes(&stars, w, h, 0.0, 0.0, 0.0));
     let spiked: Vec<(f64, f64, f64)> = if has_spikes {
@@ -289,7 +330,8 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                 let i = (y * w + x) as usize;
                 let noise = spec.noise_sigma * rng.next_gaussian() as f32;
                 let sp = truth_spikes.as_ref().map_or(0.0, |p| p[i]);
-                let v = background(x, y, c, w, h) + star_plane[i] + sp + noise;
+                let bl = blob_plane.as_ref().map_or(0.0, |p| p[i]);
+                let v = background(x, y, c, w, h) + star_plane[i] + sp + bl + noise;
                 out[i] = v.max(VALUE_FLOOR);
             }
         }
@@ -371,6 +413,16 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                         *dv += p - t;
                     }
                 }
+                if spec.shift_blobs
+                    && shift != (0.0, 0.0)
+                    && let Some(tbl) = &blob_plane
+                {
+                    let pbl =
+                        render_stars(&blob_stars(shift.0 as f64, shift.1 as f64), w, h, 0.0, 0.0);
+                    for ((dv, &p), &t) in d.iter_mut().zip(&pbl).zip(tbl) {
+                        *dv += p - t;
+                    }
+                }
                 Some(d)
             };
 
@@ -423,7 +475,7 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         }
     }
 
-    Ok(SynthResult { truth, panel_paths, applied, applied_grad, windows, spiked })
+    Ok(SynthResult { truth, panel_paths, applied, applied_grad, windows, spiked, blobs })
 }
 
 /// Minimal monolithic XISF writer (Float32, planar, little-endian,
@@ -489,6 +541,8 @@ mod tests {
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![],
+            mid_blobs: 0,
+            shift_blobs: false,
             seed: 42,
         }
     }
@@ -779,6 +833,8 @@ mod tests {
             panel_shift: vec![],
             panel_spike_angle: vec![],
             panel_defects: vec![],
+            mid_blobs: 0,
+            shift_blobs: false,
             seed: 42,
         };
         let dir_plain = tmpdir("spikes-plain");
@@ -860,6 +916,118 @@ mod tests {
         std::fs::remove_dir_all(&dir_plain).unwrap();
         std::fs::remove_dir_all(&dir_sp).unwrap();
         std::fs::remove_dir_all(&dir4).unwrap();
+    }
+
+    /// Mid-frequency blobs land in the truth near their centers only, follow
+    /// `panel_shift` when `shift_blobs` is set, and stay put otherwise. Same
+    /// seed without blobs draws identical stars/noise/perturbations (the blob
+    /// RNG stream is independent).
+    #[test]
+    fn mid_blobs_add_shifted_midscale_structure() {
+        let base = SynthSpec {
+            canvas: (256, 192),
+            channels: 1,
+            grid: (2, 1),
+            overlap_frac: 0.25,
+            n_stars: 0, // isolate the blobs: panel_shift then only moves them
+            noise_sigma: 0.001,
+            panel_gain_range: (1.0, 1.0),
+            panel_offset_range: (0.0, 0.0),
+            panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
+            panel_shift: vec![(0.0, 0.0), (3.0, 0.0)],
+            panel_spike_angle: vec![],
+            mid_blobs: 0,
+            shift_blobs: false,
+            panel_defects: vec![],
+            seed: 42,
+        };
+        let dir_clean = tmpdir("blobs-clean");
+        let clean = generate(&base, &dir_clean).unwrap();
+        assert!(clean.blobs.is_empty());
+
+        let mut spec = base.clone();
+        spec.mid_blobs = 4;
+        spec.shift_blobs = true;
+        let dir = tmpdir("blobs");
+        let res = generate(&spec, &dir).unwrap();
+        assert_eq!(res.blobs.len(), 4);
+        for &(_, _, amp) in &res.blobs {
+            assert!((BLOB_AMP_RANGE.0..BLOB_AMP_RANGE.1).contains(&amp));
+        }
+        // Independent blob stream: perturbation draws are unchanged.
+        assert_eq!(res.applied, clean.applied);
+
+        // Truth diff = exactly the blob plane: zero far from every blob,
+        // ≈ amp at each blob center (up to neighbouring blob tails).
+        let (w, h) = (base.canvas.0 as usize, base.canvas.1 as usize);
+        let diff: Vec<f32> =
+            res.truth[..w * h].iter().zip(&clean.truth[..w * h]).map(|(a, b)| a - b).collect();
+        let r = 4.0 * BLOB_SIGMA_PX;
+        let mut max_far = 0.0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let near = res.blobs.iter().any(|&(bx, by, _)| {
+                    (x as f64 - bx).abs().max((y as f64 - by).abs()) <= r + 1.0
+                });
+                if !near {
+                    max_far = max_far.max(diff[y * w + x].abs());
+                }
+            }
+        }
+        assert!(max_far < 1e-6, "blob flux only near blob centers, saw {max_far}");
+        for &(bx, by, amp) in &res.blobs {
+            let (cx, cy) = (bx.round() as usize, by.round() as usize);
+            if cx < w && cy < h {
+                assert!(
+                    diff[cy * w + cx] >= 0.9 * amp as f32,
+                    "blob at ({bx:.0},{by:.0}) too faint in truth: {}",
+                    diff[cy * w + cx]
+                );
+            }
+        }
+
+        // shift_blobs: panel 1's frame differs from the truth inside its
+        // window by the blob displacement (no stars → nothing else moves)…
+        let [x0, y0, x1, y1] = res.windows[1];
+        let panel = XisfPanel::open(&res.panel_paths[1]).unwrap();
+        let data = panel.channel(0);
+        let mut max_dev = 0.0f32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * base.canvas.0 + x) as usize;
+                max_dev = max_dev.max((data[i] - res.truth[i]).abs());
+            }
+        }
+        // Only meaningful when a blob actually reaches panel 1's window.
+        let blob_in_window = res.blobs.iter().any(|&(bx, by, _)| {
+            bx + r >= x0 as f64 && bx - r < x1 as f64 && by + r >= y0 as f64 && by - r < y1 as f64
+        });
+        assert!(blob_in_window, "seed must place a blob touching panel 1's window");
+        assert!(max_dev > 5e-3, "shifted blobs must move flux in panel 1, max dev {max_dev}");
+
+        // …and with shift_blobs = false the same panel matches the truth.
+        let mut spec_ns = spec.clone();
+        spec_ns.shift_blobs = false;
+        let dir_ns = tmpdir("blobs-noshift");
+        let res_ns = generate(&spec_ns, &dir_ns).unwrap();
+        let panel_ns = XisfPanel::open(&res_ns.panel_paths[1]).unwrap();
+        let data_ns = panel_ns.channel(0);
+        let mut max_dev_ns = 0.0f32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * base.canvas.0 + x) as usize;
+                max_dev_ns = max_dev_ns.max((data_ns[i] - res_ns.truth[i]).abs());
+            }
+        }
+        assert!(
+            max_dev_ns < 1e-6,
+            "unshifted blobs must leave the panel equal to the truth, max dev {max_dev_ns}"
+        );
+
+        std::fs::remove_dir_all(&dir_clean).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir_ns).unwrap();
     }
 
     #[test]

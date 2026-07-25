@@ -118,6 +118,8 @@ fn full_pipeline_recovers_ground_truth() {
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -297,6 +299,8 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -426,6 +430,8 @@ fn surface_off_bypasses_cleanly() {
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
         seed: 3,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -450,9 +456,9 @@ fn surface_off_bypasses_cleanly() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Mandatory phase-2B test 4: the full pipeline (analyze → photometry →
-/// surfaces → TwoBand blend) still recovers ground truth within the phase-1
-/// RMSE bound.
+/// Mandatory phase-2B test 4 (+ phase-4 test 3): the full pipeline (analyze
+/// → photometry → surfaces → blend) still recovers ground truth within the
+/// phase-1 RMSE bound, in TwoBand *and* Pyramid mode.
 #[test]
 fn full_pipeline_twoband_recovers_ground_truth() {
     let dir = tempdir("twoband");
@@ -470,6 +476,8 @@ fn full_pipeline_twoband_recovers_ground_truth() {
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -478,17 +486,8 @@ fn full_pipeline_twoband_recovers_ground_truth() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::TwoBand, roi: None, defect_veto: true, flatten: None };
-    let mut sink = MemSink::new();
-    blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
-    assert!(sink.finished);
-    assert!(sink.data.iter().all(|v| v.is_finite()), "output must contain no NaN/Inf");
-
     let n_panels = res.applied.len();
     let nch = spec.channels as usize;
-    let reference = (0..n_panels)
-        .find(|&p| phot.gains[0][p] == 1.0 && phot.offsets[0][p] == 0.0)
-        .expect("one panel must carry the gauge (g=1, o=0)");
 
     let (w, h) = (spec.canvas.0 as usize, spec.canvas.1 as usize);
     let bbox = union_bbox(&session).unwrap();
@@ -503,36 +502,50 @@ fn full_pipeline_twoband_recovers_ground_truth() {
     }
     let interior = erode(&mask, w, h, 16);
 
+    let reference = (0..n_panels)
+        .find(|&p| phot.gains[0][p] == 1.0 && phot.offsets[0][p] == 0.0)
+        .expect("one panel must carry the gauge (g=1, o=0)");
     let (ref_gain, ref_offset) = res.applied[reference];
     let plane = w * h;
-    for c in 0..nch {
-        let truth = &res.truth[c * plane..(c + 1) * plane];
-        let mut sum_sq = 0.0f64;
-        let mut n = 0u64;
-        for y in 0..h {
-            for x in 0..w {
-                if !interior[y * w + x] {
-                    continue;
+
+    for mode in [BlendMode::TwoBand, BlendMode::Pyramid] {
+        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode, roi: None, defect_veto: true, flatten: None };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
+        assert!(sink.finished);
+        assert!(sink.data.iter().all(|v| v.is_finite()), "output must contain no NaN/Inf");
+
+        for c in 0..nch {
+            let truth = &res.truth[c * plane..(c + 1) * plane];
+            let mut sum_sq = 0.0f64;
+            let mut n = 0u64;
+            for y in 0..h {
+                for x in 0..w {
+                    if !interior[y * w + x] {
+                        continue;
+                    }
+                    let merged = sink.at(c, x - cx0, y - cy0);
+                    let expected = truth[y * w + x] * ref_gain + ref_offset;
+                    sum_sq += f64::from(merged - expected).powi(2);
+                    n += 1;
                 }
-                let merged = sink.at(c, x - cx0, y - cy0);
-                let expected = truth[y * w + x] * ref_gain + ref_offset;
-                sum_sq += f64::from(merged - expected).powi(2);
-                n += 1;
             }
+            assert!(n > 10_000, "interior region unexpectedly small: {n} px");
+            let rmse = (sum_sq / n as f64).sqrt();
+            let bound = 2.0 * spec.noise_sigma as f64;
+            eprintln!("{mode:?} ch {c}: RMSE {rmse:.3e} vs bound {bound:.3e} over {n} interior px");
+            assert!(rmse < bound, "{mode:?} ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}");
         }
-        assert!(n > 10_000, "interior region unexpectedly small: {n} px");
-        let rmse = (sum_sq / n as f64).sqrt();
-        let bound = 2.0 * spec.noise_sigma as f64;
-        eprintln!("twoband ch {c}: RMSE {rmse:.3e} vs bound {bound:.3e} over {n} interior px");
-        assert!(rmse < bound, "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}");
     }
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Mandatory phase-2B test 3: base + detail must reconstruct exactly. A
-/// single panel blended in TwoBand mode equals the corrected input away from
-/// the coverage boundary (base cancels out of `base + (full − base)`).
+/// Mandatory phase-2B test 3 (+ phase-4 test 3): base + detail must
+/// reconstruct exactly. A single panel blended in TwoBand or Pyramid mode
+/// equals the corrected input away from the coverage boundary (in Pyramid
+/// mode the single-contributor pyramid collapses back to the panel's own
+/// base plane, so the cancellation still holds).
 #[test]
 fn twoband_single_panel_reconstructs_input() {
     let dir = tempdir("recon");
@@ -550,6 +563,8 @@ fn twoband_single_panel_reconstructs_input() {
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
         seed: 7,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -557,28 +572,33 @@ fn twoband_single_panel_reconstructs_input() {
     let phot = Photometry::load(&session.photometry_path()).unwrap();
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 32, mode: BlendMode::TwoBand, roi: None, defect_veto: true, flatten: None };
-    let mut sink = MemSink::new();
-    blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
-
     // The single panel is its own reference (g=1, o=0): output == input.
     let panel = XisfPanel::open(&res.panel_paths[0]).unwrap();
     let bbox = union_bbox(&session).unwrap();
     let [x0, y0, x1, y1] = res.windows[0];
-    let mut max_diff = 0.0f32;
-    for c in 0..spec.channels as u64 {
-        let data = panel.channel(c);
-        for y in y0 + 16..y1 - 16 {
-            for x in x0 + 16..x1 - 16 {
-                let merged =
-                    sink.at(c as usize, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
-                let input = data[(y * spec.canvas.0 + x) as usize];
-                max_diff = max_diff.max((merged - input).abs());
+    for mode in [BlendMode::TwoBand, BlendMode::Pyramid] {
+        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 32, mode, roi: None, defect_veto: true, flatten: None };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+
+        let mut max_diff = 0.0f32;
+        for c in 0..spec.channels as u64 {
+            let data = panel.channel(c);
+            for y in y0 + 16..y1 - 16 {
+                for x in x0 + 16..x1 - 16 {
+                    let merged =
+                        sink.at(c as usize, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
+                    let input = data[(y * spec.canvas.0 + x) as usize];
+                    max_diff = max_diff.max((merged - input).abs());
+                }
             }
         }
+        eprintln!("{mode:?} reconstruction max |merged − input| = {max_diff:.2e}");
+        assert!(
+            max_diff < 1e-5,
+            "{mode:?}: base+detail must reconstruct the input, max diff {max_diff}"
+        );
     }
-    eprintln!("twoband reconstruction max |merged − input| = {max_diff:.2e}");
-    assert!(max_diff < 1e-5, "base+detail must reconstruct the input, max diff {max_diff}");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -627,11 +647,11 @@ fn bright_overlap_peaks(
     peaks
 }
 
-/// Mandatory phase-2B test 2 (anti-pinching): with a 0.6 px star-only shift
-/// on one panel, every bright overlap star's merged neighbourhood must match
-/// ONE panel's corrected pixels in TwoBand mode — and the same check must
-/// FAIL in Feather mode (which averages the two star positions), proving the
-/// test can detect pinching.
+/// Mandatory phase-2B test 2 (anti-pinching, + phase-4 test 3): with a
+/// 0.6 px star-only shift on one panel, every bright overlap star's merged
+/// neighbourhood must match ONE panel's corrected pixels in TwoBand *and*
+/// Pyramid mode — and the same check must FAIL in Feather mode (which
+/// averages the two star positions), proving the test can detect pinching.
 #[test]
 fn twoband_never_averages_misregistered_stars() {
     let dir = tempdir("pinch");
@@ -654,6 +674,8 @@ fn twoband_never_averages_misregistered_stars() {
         panel_shift: vec![(0.0, 0.0), (0.6, 0.0), (0.0, 0.0), (0.0, 0.0)],
         panel_spike_angle: vec![],
         panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
         seed: 1234,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -668,6 +690,7 @@ fn twoband_never_averages_misregistered_stars() {
         sink
     };
     let two = run(BlendMode::TwoBand);
+    let pyr = run(BlendMode::Pyramid);
     let fea = run(BlendMode::Feather);
 
     // Corrected panel pixels: g·v + o with the recovered corrections — the
@@ -711,25 +734,32 @@ fn twoband_never_averages_misregistered_stars() {
             .fold(f32::INFINITY, f32::min)
     };
 
-    // TwoBand within ~noise of one panel; Feather's average is far from every
-    // panel for at least one bright misregistered star.
+    // TwoBand and Pyramid within ~noise of one panel; Feather's average is
+    // far from every panel for at least one bright misregistered star.
     let thresh = 6.0 * spec.noise_sigma;
     let mut feather_fails = 0;
     for &(px, py, ref covering) in &peaks {
         let d_two = one_panel_dist(&two, px, py, covering);
+        let d_pyr = one_panel_dist(&pyr, px, py, covering);
         let d_fea = one_panel_dist(&fea, px, py, covering);
         eprintln!(
-            "star at ({:4},{:4}) panels {:?}: twoband {:.4}, feather {:.4} (thresh {:.4})",
+            "star at ({:4},{:4}) panels {:?}: twoband {:.4}, pyramid {:.4}, feather {:.4} \
+             (thresh {:.4})",
             px + cx0,
             py + cy0,
             covering,
             d_two,
+            d_pyr,
             d_fea,
             thresh
         );
         assert!(
             d_two < thresh,
             "TwoBand: star at ({px},{py}) matches no single panel (min max-diff {d_two})"
+        );
+        assert!(
+            d_pyr < thresh,
+            "Pyramid: star at ({px},{py}) matches no single panel (min max-diff {d_pyr})"
         );
         if d_fea >= thresh {
             feather_fails += 1;
@@ -739,6 +769,303 @@ fn twoband_never_averages_misregistered_stars() {
         feather_fails > 0,
         "Feather mode passed the one-panel check for all {} stars — the test has no teeth",
         peaks.len()
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Mandatory phase-4 test 2 (mid-frequency ghost reduction): two panels share
+/// Gaussian blobs (σ ≈ 24 px — structure between the detail band and the
+/// feather scale) displaced 3 px between the panels. TwoBand's feathered base
+/// averages the two displaced copies over the whole overlap, so the merged
+/// blob matches neither panel; the pyramid base seam-switches each frequency
+/// band over a distance matched to its scale, so blobs away from the seam
+/// come from one panel. Metric per blob: RMS of (merged − closest single
+/// corrected panel) over the blob region; Pyramid must beat TwoBand by ≥30%.
+/// Additionally the Pyramid profile across the seam shows no step: where the
+/// panels disagree near the boundary, the blend fraction moves monotonically
+/// (within noise) from one panel to the other, without overshooting either.
+#[test]
+fn pyramid_reduces_midfrequency_ghosting() {
+    let dir = tempdir("ghost");
+    let spec = SynthSpec {
+        canvas: (768, 512),
+        channels: 1,
+        grid: (2, 1),
+        overlap_frac: 0.6, // wide band: windows [0,500) and [268,768)
+        n_stars: 20,
+        noise_sigma: 0.002,
+        panel_gain_range: (0.95, 1.05),
+        panel_offset_range: (-0.003, 0.003),
+        panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
+        // Stars AND blobs shift 3 px in panel 1 (shift_blobs) — mid-scale
+        // misregistration the detail band cannot own (blobs live in the base).
+        panel_shift: vec![(0.0, 0.0), (3.0, 0.0)],
+        panel_spike_angle: vec![],
+        mid_blobs: 20,
+        shift_blobs: true,
+        panel_defects: vec![],
+        seed: 37,
+    };
+    let feather = 64.0f32;
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+    let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), None).unwrap();
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+
+    let run = |mode: BlendMode| -> MemSink {
+        let params = BlendParams {
+            feather_px: feather,
+            downsample: 1,
+            band_rows: 64,
+            mode,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+        sink
+    };
+    let two = run(BlendMode::TwoBand);
+    let pyr = run(BlendMode::Pyramid);
+
+    // Corrected panels (the frame the blend output lives in) and the owner
+    // map / star masks the blend used (same feather).
+    let w = spec.canvas.0 as usize;
+    let corrected: Vec<Vec<f32>> = res
+        .panel_paths
+        .iter()
+        .enumerate()
+        .map(|(p, path)| {
+            let panel = XisfPanel::open(path).unwrap();
+            let (g, o) = (phot.gains[0][p] as f32, phot.offsets[0][p] as f32);
+            panel.channel(0).iter().map(|&v| v * g + o).collect()
+        })
+        .collect();
+    let (summaries, owner) =
+        mmm_core::diag::load_owner_map(&session, &graph, &phot, None, feather).unwrap();
+    let masks: Vec<Vec<bool>> =
+        summaries.iter().map(mmm_core::seam::star_mask).collect();
+    let bbox = union_bbox(&session).unwrap();
+    let (cx0, cy0) = (bbox[0] as usize, bbox[1] as usize);
+
+    // Seam x at a row: first cell of the band owned by panel 1 whose left
+    // neighbour is owned by panel 0 (in px).
+    let seam_x = |y: u64| -> Option<f64> {
+        let y8 = (y / 8) as u32;
+        (1..owner.w8).find_map(|x8| {
+            (owner.at(x8 - 1, y8) == 0 && owner.at(x8, y8) == 1)
+                .then_some((x8 as f64) * 8.0)
+        })
+    };
+
+    // Blobs whose metric region (±R px) is fully inside BOTH windows, is
+    // ≥ 48 px clear of the seam (so hard switching could in principle match
+    // one panel), and whose cells the star mask left in the base band.
+    const R: i64 = 32;
+    let [w0, w1] = [res.windows[0], res.windows[1]];
+    let inside = |win: [u64; 4], bx: f64, by: f64| {
+        bx - R as f64 >= win[0] as f64
+            && bx + R as f64 <= win[2] as f64 - 1.0
+            && by - R as f64 >= win[1] as f64
+            && by + R as f64 <= win[3] as f64 - 1.0
+    };
+    let unmasked = |bx: f64, by: f64| {
+        let (x8, y8) = ((bx / 8.0) as u32, (by / 8.0) as u32);
+        let i = y8 as usize * owner.w8 as usize + x8 as usize;
+        !masks[0][i] && !masks[1][i]
+    };
+    let rms_vs_closest = |sink: &MemSink, bx: f64, by: f64| -> f32 {
+        (0..2)
+            .map(|p| {
+                let (mut ss, mut n) = (0.0f64, 0u64);
+                for y in (by as i64 - R)..=(by as i64 + R) {
+                    for x in (bx as i64 - R)..=(bx as i64 + R) {
+                        let (x, y) = (x as usize, y as usize);
+                        let m = sink.at(0, x - cx0, y - cy0);
+                        ss += f64::from(m - corrected[p][y * w + x]).powi(2);
+                        n += 1;
+                    }
+                }
+                (ss / n as f64).sqrt() as f32
+            })
+            .fold(f32::INFINITY, f32::min)
+    };
+
+    let mut n_metric = 0;
+    let (mut sum_two, mut sum_pyr) = (0.0f64, 0.0f64);
+    for &(bx, by, amp) in &res.blobs {
+        if !inside(w0, bx, by) || !inside(w1, bx, by) || !unmasked(bx, by) {
+            continue;
+        }
+        // No seam on the row, or too close to it: the profile check's job.
+        let near_seam = seam_x(by as u64).is_none_or(|sx| (bx - sx).abs() < 48.0);
+        let sx = seam_x(by as u64).unwrap_or(f64::NAN);
+        if near_seam {
+            continue;
+        }
+        let d_two = rms_vs_closest(&two, bx, by);
+        let d_pyr = rms_vs_closest(&pyr, bx, by);
+        eprintln!(
+            "blob at ({bx:5.1},{by:5.1}) amp {amp:.3}, seam at {sx:5.1}: \
+             twoband RMS {d_two:.5}, pyramid RMS {d_pyr:.5}"
+        );
+        sum_two += d_two as f64;
+        sum_pyr += d_pyr as f64;
+        n_metric += 1;
+    }
+    assert!(n_metric >= 2, "need ≥ 2 clear overlap blobs, got {n_metric} (reseed)");
+    let ratio = sum_pyr / sum_two;
+    eprintln!(
+        "ghost metric over {n_metric} blobs: twoband {:.5}, pyramid {:.5}, ratio {ratio:.3}",
+        sum_two / n_metric as f64,
+        sum_pyr / n_metric as f64
+    );
+    assert!(
+        ratio <= 0.7,
+        "pyramid must reduce mid-frequency ghosting by ≥ 30%, got ratio {ratio:.3}"
+    );
+
+    // No step at the seam: around the blob nearest the seam, the row-averaged
+    // Pyramid blend fraction α(x) = (merged − c0)/(c1 − c0) rises monotonely
+    // (within noise) from the panel-0 side to the panel-1 side wherever the
+    // panels disagree enough to measure, and merged never overshoots the
+    // envelope of the two panels.
+    let near = res
+        .blobs
+        .iter()
+        .filter(|&&(bx, by, _)| inside(w0, bx, by) && inside(w1, bx, by) && unmasked(bx, by))
+        .min_by(|a, b| {
+            let d = |&(bx, by, _): &(f64, f64, f64)| {
+                seam_x(by as u64).map_or(f64::INFINITY, |sx| (bx - sx).abs())
+            };
+            d(a).total_cmp(&d(b))
+        })
+        .copied()
+        .expect("at least one clear overlap blob");
+    let (bx, by, _) = near;
+    let sx = seam_x(by as u64).unwrap();
+    eprintln!("profile blob at ({bx:.1},{by:.1}), seam at {sx:.1} (dist {:.1})", (bx - sx).abs());
+    let rows: Vec<usize> = ((by as i64 - 16)..=(by as i64 + 16)).map(|y| y as usize).collect();
+    // Clamp the profile to the shared-coverage band (16 px margin): outside
+    // it one of the "panels" is uncovered and its corrected value means
+    // nothing, and panel-rim cells are the feather's job, not the seam's.
+    let x_lo = ((sx.min(bx) - 40.0) as usize).max(w1[0] as usize + 16);
+    let x_hi = ((sx.max(bx) + 40.0) as usize).min(w0[2] as usize - 17);
+    let row_mean = |img: &dyn Fn(usize, usize) -> f32, x: usize| -> f64 {
+        rows.iter().map(|&y| img(x, y) as f64).sum::<f64>() / rows.len() as f64
+    };
+    let merged = |x: usize, y: usize| pyr.at(0, x - cx0, y - cy0);
+    let c0 = |x: usize, y: usize| corrected[0][y * w + x];
+    let c1 = |x: usize, y: usize| corrected[1][y * w + x];
+    let sigma_row = spec.noise_sigma as f64 / (rows.len() as f64).sqrt();
+    let mut alphas: Vec<(usize, f64)> = Vec::new();
+    for x in x_lo..=x_hi {
+        let m = row_mean(&merged, x);
+        let a = row_mean(&c0, x);
+        let b = row_mean(&c1, x);
+        // Envelope: merged stays between the two source panels (within noise).
+        let (lo, hi) = (a.min(b), a.max(b));
+        assert!(
+            m >= lo - 6.0 * sigma_row && m <= hi + 6.0 * sigma_row,
+            "merged overshoots the source envelope at x={x}: {m} vs [{lo}, {hi}]"
+        );
+        if (b - a).abs() > 10.0 * sigma_row {
+            alphas.push((x, (m - a) / (b - a)));
+        }
+    }
+    eprintln!(
+        "profile: {} measurable columns; α = {:?}",
+        alphas.len(),
+        alphas.iter().map(|&(_, a)| (a * 100.0).round() / 100.0).collect::<Vec<_>>()
+    );
+    for pair in alphas.windows(2) {
+        let (&(x0, a0), &(x1, a1)) = (&pair[0], &pair[1]);
+        assert!(
+            a1 >= a0 - 0.2,
+            "blend fraction steps backwards across the seam: α({x0})={a0:.2} → α({x1})={a1:.2}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// FNV-1a hash of a sink's geometry + f32 output bits — a bit-exactness
+/// fingerprint for the regression guard below.
+fn output_hash(sink: &MemSink) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut upd = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for d in [sink.w as u64, sink.h as u64, sink.ch as u64] {
+        d.to_le_bytes().into_iter().for_each(&mut upd);
+    }
+    for v in &sink.data {
+        v.to_le_bytes().into_iter().for_each(&mut upd);
+    }
+    h
+}
+
+/// Mandatory phase-4 test 4 (regression guard): Feather and TwoBand outputs
+/// on a fixed-seed synthetic mosaic (exercising shifts, spikes, defects and
+/// surfaces) are bit-identical to their pre-pyramid baselines. The literals
+/// were captured from the phase-3 code immediately before the pyramid work;
+/// the pipeline is deterministic (fixed-order accumulation, rayon only across
+/// independent rows), so any change to these paths trips the hashes.
+#[test]
+fn feather_and_twoband_outputs_are_bit_stable() {
+    let dir = tempdir("bitstable");
+    let spec = SynthSpec {
+        canvas: (512, 384),
+        channels: 3,
+        grid: (2, 2),
+        overlap_frac: 0.25,
+        n_stars: 40,
+        noise_sigma: 0.002,
+        panel_gain_range: (0.7, 1.4),
+        panel_offset_range: (-0.01, 0.02),
+        panel_gradient_range: (-0.004, 0.004),
+        global_gradient: (0.0, 0.0, 0.0),
+        panel_shift: vec![(0.0, 0.0), (0.6, 0.0), (0.0, 0.3), (0.0, 0.0)],
+        panel_spike_angle: vec![0.0, 0.02, 0.0, 0.01],
+        panel_defects: vec![(1, 300, 150, 4, 0.03)],
+        mid_blobs: 0,
+        shift_blobs: false,
+        seed: 77,
+    };
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+    let session = analyze(&res.panel_paths, &dir.join("s.mmm-session")).unwrap();
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+    let surf = Surfaces::load(&session.surfaces_path()).unwrap();
+
+    let run = |mode: BlendMode| -> u64 {
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample: 1,
+            band_rows: 64,
+            mode,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
+        output_hash(&sink)
+    };
+    let feather = run(BlendMode::Feather);
+    let twoband = run(BlendMode::TwoBand);
+    eprintln!("feather hash {feather:#018x}, twoband hash {twoband:#018x}");
+    assert_eq!(
+        feather, 0x4e5d_7ebe_25f4_b6e9,
+        "Feather output changed — must stay bit-identical"
+    );
+    assert_eq!(
+        twoband, 0x536f_0323_8796_27da,
+        "TwoBand output changed — must stay bit-identical"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -762,6 +1089,8 @@ fn global_gradient_spec() -> SynthSpec {
         panel_shift: vec![],
         panel_spike_angle: vec![],
         panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
         seed: 21,
     }
 }

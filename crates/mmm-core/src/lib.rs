@@ -23,6 +23,7 @@ pub mod linalg;
 pub mod output;
 pub mod overlap;
 pub mod photometry;
+pub mod pyramid;
 pub mod seam;
 pub mod session;
 pub mod summary;
