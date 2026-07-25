@@ -71,9 +71,16 @@ impl Photometry {
         std::fs::write(p, json).map_err(|e| Error::io(p, e))
     }
 
-    /// Load a solution previously written by [`Photometry::save`].
+    /// Load a solution previously written by [`Photometry::save`]. A missing
+    /// file gets a hint: the analyze stage writes it.
     pub fn load(p: &Path) -> Result<Photometry> {
-        let json = std::fs::read_to_string(p).map_err(|e| Error::io(p, e))?;
+        let json = std::fs::read_to_string(p).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::format(p, "photometry results missing — re-run `mmm analyze`")
+            } else {
+                Error::io(p, e)
+            }
+        })?;
         serde_json::from_str(&json).map_err(|e| Error::format(p, format!("bad photometry: {e}")))
     }
 }

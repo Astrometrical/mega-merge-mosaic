@@ -99,9 +99,16 @@ impl OverlapGraph {
         std::fs::write(p, json).map_err(|e| Error::io(p, e))
     }
 
-    /// Load a graph previously written by [`OverlapGraph::save`].
+    /// Load a graph previously written by [`OverlapGraph::save`]. A missing
+    /// file gets a hint: the analyze stage writes it.
     pub fn load(p: &Path) -> Result<OverlapGraph> {
-        let json = std::fs::read_to_string(p).map_err(|e| Error::io(p, e))?;
+        let json = std::fs::read_to_string(p).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::format(p, "overlap graph missing — re-run `mmm analyze`")
+            } else {
+                Error::io(p, e)
+            }
+        })?;
         serde_json::from_str(&json).map_err(|e| Error::format(p, format!("bad overlap graph: {e}")))
     }
 

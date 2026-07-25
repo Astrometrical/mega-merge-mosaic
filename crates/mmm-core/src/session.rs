@@ -101,10 +101,21 @@ impl Session {
         })
     }
 
-    /// Open an existing session by reading its `session.json`.
+    /// Open an existing session by reading its `session.json`. A missing
+    /// file gets an actionable hint: sessions are created by the analyze
+    /// stage, so the fix is to run it (CLI: `mmm analyze`).
     pub fn open(dir: &Path) -> Result<Self> {
         let path = dir.join("session.json");
-        let json = std::fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
+        let json = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::format(
+                    dir,
+                    "not a session directory (no session.json) — run `mmm analyze` first",
+                )
+            } else {
+                Error::io(&path, e)
+            }
+        })?;
         let mut session: Session = serde_json::from_str(&json)
             .map_err(|e| Error::format(&path, format!("bad session.json: {e}")))?;
         session.dir = dir.to_path_buf();
@@ -269,9 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn open_missing_session_errors() {
+    fn open_missing_session_errors_with_analyze_hint() {
         let dir = std::env::temp_dir().join(format!("mmm-session-miss-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(Session::open(&dir).is_err());
+        let err = Session::open(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("mmm analyze"),
+            "missing-session error must point at the analyze stage: {err}"
+        );
     }
 }
