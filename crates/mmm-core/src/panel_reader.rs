@@ -183,6 +183,7 @@ mod tests {
         PanelMeta {
             id: 0,
             path,
+            source: None,
             bbox: [0, 0, 0, 0],
             nonzero_frac: 0.0,
             ch_min: vec![],

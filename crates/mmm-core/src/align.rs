@@ -71,7 +71,8 @@ const BBOX_PAD: i64 = 3;
 /// The mosaic reference frame: TAN, north-up, `CD = diag(-scale, +scale)` in
 /// the internal top-down convention (standard-frame semantics after the
 /// writer's bottom-up reflection), reference point at the canvas center.
-#[derive(Debug, Clone, PartialEq)]
+/// Serializable so solved-input sessions persist it in `session.json`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MosaicFrame {
     /// Reference sky coordinates [RA, Dec] at the canvas center, degrees.
     pub crval: [f64; 2],
@@ -491,6 +492,7 @@ mod tests {
         let meta = PanelMeta {
             id: 0,
             path: ap.path.clone(),
+            source: None,
             bbox: ap.bbox,
             nonzero_frac: 0.0,
             ch_min: vec![],

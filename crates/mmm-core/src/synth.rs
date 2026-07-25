@@ -478,10 +478,91 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
     Ok(SynthResult { truth, panel_paths, applied, applied_grad, windows, spiked, blobs })
 }
 
+/// Linear astrometric solution attached to a synthetic *solved* panel, in
+/// exactly the PixInsight property form [`crate::astrometry`] parses.
+#[derive(Debug, Clone)]
+pub struct SynthWcs {
+    /// Reference sky coordinates `[RA, Dec]`, degrees.
+    pub crval: [f64; 2],
+    /// Reference point in PixInsight image coordinates (0-based, top-down,
+    /// pixel k spanning `[k, k+1]`).
+    pub refimg: [f64; 2],
+    /// 2×2 linear transformation, deg/px, applied to top-down image offsets
+    /// from the reference point (row 0 → ξ, row 1 → η).
+    pub cd: [[f64; 2]; 2],
+}
+
+/// Standard-alphabet base64 with padding (the encoding PixInsight uses for
+/// `location="inline:base64"` property payloads).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                s.push(ALPHA[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                s.push('=');
+            }
+        }
+    }
+    s
+}
+
+/// f64 slice → little-endian bytes → base64 (XISF inline payload form).
+fn b64_f64s(vals: &[f64]) -> String {
+    let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    base64_encode(&bytes)
+}
+
+/// `<Property>` elements for a linear Gnomonic astrometric solution — the
+/// exact ids/types/encodings `astrometry::wcs_from_properties` requires.
+fn wcs_property_xml(wcs: &SynthWcs) -> String {
+    let cd = [wcs.cd[0][0], wcs.cd[0][1], wcs.cd[1][0], wcs.cd[1][1]];
+    format!(
+        concat!(
+            r#"<Property id="PCL:AstrometricSolution:ReferenceCelestialCoordinates" type="F64Vector" length="2" location="inline:base64">{crval}</Property>"#,
+            r#"<Property id="PCL:AstrometricSolution:ReferenceImageCoordinates" type="F64Vector" length="2" location="inline:base64">{refimg}</Property>"#,
+            r#"<Property id="PCL:AstrometricSolution:LinearTransformationMatrix" type="F64Matrix" rows="2" columns="2" location="inline:base64">{cd}</Property>"#,
+            r#"<Property id="PCL:AstrometricSolution:ProjectionSystem" type="String">Gnomonic</Property>"#,
+        ),
+        crval = b64_f64s(&wcs.crval),
+        refimg = b64_f64s(&wcs.refimg),
+        cd = b64_f64s(&cd),
+    )
+}
+
 /// Minimal monolithic XISF writer (Float32, planar, little-endian,
 /// uncompressed attachment at offset 4096). Round-trips through
 /// [`crate::formats::xisf::XisfPanel`].
 pub fn write_xisf(path: &Path, w: u64, h: u64, ch: u64, planes: &[f32]) -> Result<()> {
+    write_xisf_impl(path, w, h, ch, planes, "")
+}
+
+/// [`write_xisf`] plus a linear astrometric solution as inline-base64 XISF
+/// `<Property>` elements — a synthetic stand-in for a plate-solved raw panel
+/// (`analyze --input solved` consumes these).
+pub fn write_xisf_solved(
+    path: &Path,
+    w: u64,
+    h: u64,
+    ch: u64,
+    planes: &[f32],
+    wcs: &SynthWcs,
+) -> Result<()> {
+    write_xisf_impl(path, w, h, ch, planes, &wcs_property_xml(wcs))
+}
+
+fn write_xisf_impl(
+    path: &Path,
+    w: u64,
+    h: u64,
+    ch: u64,
+    planes: &[f32],
+    extra_xml: &str,
+) -> Result<()> {
     let n = w
         .checked_mul(h)
         .and_then(|p| p.checked_mul(ch))
@@ -497,7 +578,7 @@ pub fn write_xisf(path: &Path, w: u64, h: u64, ch: u64, planes: &[f32]) -> Resul
     let data_size = n as u64 * 4;
     let color_space = if ch == 1 { "Gray" } else { "RGB" };
     let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0" xmlns="http://www.pixinsight.com/xisf"><Image geometry="{w}:{h}:{ch}" sampleFormat="Float32" colorSpace="{color_space}" pixelStorage="Planar" byteOrder="little" location="attachment:{DATA_OFFSET}:{data_size}"><FITSKeyword name="CREATOR" value="'mmm-synth'" comment="synthetic ground-truth frame"/></Image></xisf>"#
+        r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0" xmlns="http://www.pixinsight.com/xisf"><Image geometry="{w}:{h}:{ch}" sampleFormat="Float32" colorSpace="{color_space}" pixelStorage="Planar" byteOrder="little" location="attachment:{DATA_OFFSET}:{data_size}"><FITSKeyword name="CREATOR" value="'mmm-synth'" comment="synthetic ground-truth frame"/>{extra_xml}</Image></xisf>"#
     );
     if 16 + xml.len() > DATA_OFFSET {
         return Err(Error::format(path, "XISF header does not fit before the 4096-byte attachment"));
@@ -568,6 +649,45 @@ mod tests {
         for c in 0..ch {
             assert_eq!(panel.channel(c), &planes[c as usize * plane..(c as usize + 1) * plane]);
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The solved writer's properties must round-trip through the XISF reader
+    /// and the astrometry extractor into exactly the written solution — the
+    /// contract the solved-input e2e tests build on.
+    #[test]
+    fn write_xisf_solved_round_trips_wcs_properties() {
+        let dir = tmpdir("solved");
+        let (w, h, ch) = (24u64, 16u64, 2u64);
+        let planes: Vec<f32> = (0..(w * h * ch)).map(|i| i as f32 * 0.25 + 0.5).collect();
+        // Non-diagonal matrix (rotation) so element ordering is pinned.
+        let wcs = SynthWcs {
+            crval: [84.25, -3.5],
+            refimg: [12.25, 8.75],
+            cd: [[-4.0e-4, 0.5e-4], [0.5e-4, 4.0e-4]],
+        };
+        let path = dir.join("solved.xisf");
+        write_xisf_solved(&path, w, h, ch, &planes, &wcs).unwrap();
+
+        let panel = XisfPanel::open(&path).unwrap();
+        assert_eq!((panel.width(), panel.height(), panel.channels()), (w, h, ch));
+        let plane = (w * h) as usize;
+        assert_eq!(panel.channel(1), &planes[plane..2 * plane], "pixel data intact");
+
+        let hdr = panel.header();
+        let model = crate::astrometry::WcsModel::from_properties(&hdr.properties, w, h)
+            .expect("written properties must form a valid solution");
+        assert!(!model.is_spline(), "linear-only solution");
+        assert_eq!(model.linear.crval, wcs.crval);
+        // FITS = PixInsight image coords + 0.5 on both axes.
+        assert_eq!(model.linear.crpix, [wcs.refimg[0] + 0.5, wcs.refimg[1] + 0.5]);
+        assert_eq!(model.linear.cd, wcs.cd);
+        assert_eq!(model.linear.ctype[0], "RA---TAN");
+
+        // The reference image coordinate maps to the reference sky position.
+        let (ra, dec) = model.pixel_to_sky(wcs.refimg[0], wcs.refimg[1]);
+        assert!((ra - wcs.crval[0]).abs() < 1e-9 && (dec - wcs.crval[1]).abs() < 1e-9);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

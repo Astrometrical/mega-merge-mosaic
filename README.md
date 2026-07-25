@@ -1,10 +1,11 @@
 # Mega Merge Mosaic (mmm)
 
-Fast, standalone merging/blending of pre-aligned astrophotography mosaic panels.
+Fast, standalone merging/blending of astrophotography mosaic panels.
 
 Takes the aligned, zero-padded panel frames produced by PixInsight's
-**MosaicByCoordinates** (FITS/XISF, linear data) and produces a seamless merged
-mosaic (FITS/TIFF) — automatically, quickly, and without pinched stars.
+**MosaicByCoordinates** — or raw plate-solved panels directly (phase 5) —
+(FITS/XISF, linear data) and produces a seamless merged mosaic (FITS/TIFF) —
+automatically, quickly, and without pinched stars.
 
 ## Why
 
@@ -64,6 +65,16 @@ as a Laplacian pyramid with seam transitions proportional to each scale
 (default mode; `--mode twoband|feather` retained), closing the last gap —
 mid-frequency structure under differing seeing or slight misregistration.
 Output WCS verified against catalog star positions. 107 tests.
+
+Phase 5 removed the MosaicByCoordinates prerequisite: `mmm analyze` accepts
+unaligned plate-solved panels directly (`--input auto|aligned|solved`,
+default auto-detect). Each panel's PixInsight astrometric solution —
+including spline distortion grids — places it on a fresh mosaic frame via
+Lanczos-3 reprojection into the session cache; the rest of the pipeline is
+unchanged, and the output carries the fresh frame's WCS. On the real
+12-panel set the raw-input mosaic matches the registered-input one to
+0.030 px (median over 25 stars matched by sky position) with sub-noise value
+differences; align stage ~8 s warm. 132 tests.
 
 Next: tidy-up for external testers (PixInsight/XISF workflows, CLI), then
 FITS/compressed-XISF input, wgpu GPU path, GUI.

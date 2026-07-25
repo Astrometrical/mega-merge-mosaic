@@ -146,7 +146,9 @@ double mid-scale structure.
 ```
 <name>.mmm-session/
   session.json        # canvas geometry, panel list+paths, stage stamps, params
+                      # + input kind and the mosaic frame for solved input
   panels/<id>/summary.bin   # L8 planes: mean[ch] + coverage, f32
+  panels/<id>/aligned.bin   # solved input only: reprojection cache (planar f32)
   analysis/overlap_graph.json
   analysis/photometry.json  # per-edge fits + global gains/offsets per channel
 ```
@@ -155,7 +157,7 @@ double mid-scale structure.
 
 ```
 mmm info <files…> [--stats]
-mmm analyze <panels…> --session S
+mmm analyze <panels…> --session S [--input auto|aligned|solved]
 mmm report --session S            # graph + fit table, warnings on poor fits
 mmm blend --session S -o out.fits [--downsample N] [--feather PX] [--png P]
 ```
@@ -302,6 +304,52 @@ star path untouched. 107 tests, clippy clean.
   in the same standard frame. Data and WCS now share one frame, so readers
   cannot disagree regardless of their ROWORDER handling; catalog stars
   (Alnitak/Alnilam/Mintaka/Trapezium) verified at predicted data indices.
+
+## Phase 5 results (2026-07-25): unaligned solved-panel input
+
+The MosaicByCoordinates prerequisite is gone: `analyze` accepts raw panels
+carrying PixInsight astrometric solutions (`--input auto|aligned|solved`,
+default auto). 132 tests, clippy clean.
+
+- **Full WCS model** (`astrometry::WcsModel`): PI's precomputed
+  `PointGridInterpolation` spline grids (both directions) are interpolated
+  bicubically — no thin-plate-spline evaluation. Cross-frame star chain on
+  real data validated the whole model at 0.034 px median (all verified layout
+  facts live in the module docs).
+- **Frame + reprojection** (`align.rs`): fresh north-up TAN frame (spherical
+  mean center, median scale, union footprint + 16 px margin); Lanczos-3
+  reprojection with a hard full-support-or-zero rim into mmap-able session
+  caches; `PanelReader` gives the scan and blender storage-agnostic row
+  access. Aligned-input artifacts and blends stayed byte-identical through
+  the refactor (hash regression guard).
+- **Auto-detect** (binding rule): same geometry AND ≥ 2 panels AND every
+  panel's covered fraction < 50% → aligned; otherwise solved, where every
+  input must yield a model (per-file error naming the missing properties).
+  Geometry is checked from headers before any scan; the coverage rule is
+  applied after the aligned scan and re-dispatches to solved when violated.
+  `--input` overrides in both directions (needed for the rare undetectable
+  case of same-geometry raw panels with < 50% coverage, and for ≥ 50%-overlap
+  2-panel aligned mosaics).
+- **Output metadata**: solved sessions persist the fresh frame + input kind
+  in `session.json`; `blend` emits the frame's WCS cards and filters the
+  panel-0 geometry/pointing cards (RA/DEC/CRVAL…/CD…) from FITS-keyword
+  passthrough — non-geometric metadata (EXPTIME, INSTRUME, …) still passes.
+- **Synthetic e2e**: analytic sky cut into four offset-geometry panels with
+  linear solutions including 0–3° rotations → solved pipeline → RMSE
+  1.7–1.8e-3 vs the noiseless truth (phase-1 bound 2σ = 4e-3).
+- **Real acceptance** (12 RAW Orion panels vs the registered-input phase-4
+  output): auto-detected solved; chosen frame 9286×18341 @ 1.5974″/px
+  (registered canvas: 9255×18310 @ 1.597″/px, center 0.7″ apart). 25 bright
+  stars detected in both outputs by local centroid and matched through the
+  two WCS solutions: **median residual 0.030 px, max 0.224 px** (bound 1 px).
+  Value difference over 17.6k sky-mapped samples: median 9.0e-6, p90 2.6e-5,
+  p99 1.7e-4 vs a ≥ 1e-3 data floor — sub-noise everywhere; mean
+  raw/registered ratio 0.9997 (the two sessions share the same gauge panel).
+  Timings, warm cache: align (12 reprojections) 8.1 s, analyze total 10.6 s,
+  full-res blend 6.9 s. Cold not directly measurable in this environment
+  (no root to drop caches); first partially-cold run measured align 11.0 s,
+  and the 24 GB of source reads bound a fully cold align well under the 60 s
+  target at the measured ≥ 0.9 GB/s scan rate.
 
 ## Performance notes
 

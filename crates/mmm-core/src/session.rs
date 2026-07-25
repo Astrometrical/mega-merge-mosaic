@@ -14,8 +14,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::align::MosaicFrame;
 use crate::panel_reader::PanelStorage;
 use crate::{Error, Result};
+
+/// How a session's input panels were provided (phase 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum InputKind {
+    /// Pre-aligned full-canvas frames (MosaicByCoordinates output). The
+    /// default, and what pre-phase-5 `session.json` files (which lack the
+    /// field) deserialize to.
+    #[default]
+    Aligned,
+    /// Unaligned solved panels: each carried its own astrometric solution and
+    /// was reprojected onto the session's fresh [`MosaicFrame`].
+    Solved,
+}
 
 /// Per-panel metadata recorded by the analyze stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +39,11 @@ pub struct PanelMeta {
     /// full-canvas input, the `aligned.bin` reprojection cache otherwise
     /// (see [`PanelStorage`]).
     pub path: PathBuf,
+    /// The original input file for reprojected panels (`path` then points at
+    /// the session cache): used for display and FITS-keyword passthrough.
+    /// `None` for aligned input, where `path` is the source itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
     /// Content bounding box of covered pixels: `[x0, y0, x1, y1]`, exclusive.
     pub bbox: [u64; 4],
     /// Fraction of canvas pixels covered (all channels nonzero).
@@ -51,13 +70,33 @@ pub struct Session {
     /// Canvas geometry `(width, height, channels)`, identical across panels.
     pub canvas: (u64, u64, u64),
     pub panels: Vec<PanelMeta>,
+    /// How the input panels were provided (default: aligned).
+    #[serde(default)]
+    pub input: InputKind,
+    /// The fresh mosaic reference frame chosen for solved input; its
+    /// [`MosaicFrame::linear_wcs`] is the canvas solution the blender must
+    /// emit. `None` for aligned sessions, whose canvas carries the input
+    /// frames' own (passthrough) solution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<MosaicFrame>,
+    /// Wall-clock seconds of the align (reprojection) stage of the analyze
+    /// run that produced this value; not persisted.
+    #[serde(skip)]
+    pub align_secs: Option<f64>,
 }
 
 impl Session {
     /// Create the session directory (and parents) with an empty panel set.
     pub fn create(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-        Ok(Self { dir: dir.to_path_buf(), canvas: (0, 0, 0), panels: Vec::new() })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            canvas: (0, 0, 0),
+            panels: Vec::new(),
+            input: InputKind::Aligned,
+            frame: None,
+            align_secs: None,
+        })
     }
 
     /// Open an existing session by reading its `session.json`.
@@ -120,6 +159,7 @@ mod tests {
         session.panels.push(PanelMeta {
             id: 0,
             path: PathBuf::from("/data/panel0.xisf"),
+            source: Some(PathBuf::from("/data/raw0.xisf")),
             bbox: [10, 20, 300, 400],
             nonzero_frac: 0.25,
             ch_min: vec![0.001, 0.002, 0.003],
@@ -127,6 +167,14 @@ mod tests {
             ch_mean: vec![0.01, 0.02, 0.03],
             storage: PanelStorage::CroppedCache { bbox: [10, 20, 300, 400] },
         });
+        session.input = InputKind::Solved;
+        session.frame = Some(MosaicFrame {
+            crval: [84.2, -3.24],
+            scale_deg: 4.4e-4,
+            width: 640,
+            height: 480,
+        });
+        session.align_secs = Some(1.5);
         session.save().unwrap();
 
         let reopened = Session::open(&dir).unwrap();
@@ -135,9 +183,13 @@ mod tests {
         assert_eq!(reopened.panels.len(), 1);
         let p = &reopened.panels[0];
         assert_eq!(p.id, 0);
+        assert_eq!(p.source, Some(PathBuf::from("/data/raw0.xisf")));
         assert_eq!(p.bbox, [10, 20, 300, 400]);
         assert_eq!(p.ch_max, vec![0.9, 0.8, 0.7]);
         assert_eq!(p.storage, PanelStorage::CroppedCache { bbox: [10, 20, 300, 400] });
+        assert_eq!(reopened.input, InputKind::Solved);
+        assert_eq!(reopened.frame, session.frame);
+        assert_eq!(reopened.align_secs, None, "align timing must not persist");
         assert_eq!(
             reopened.summary_path(0),
             dir.join("panels").join("0").join("summary.bin")
@@ -182,6 +234,9 @@ mod tests {
         .unwrap();
         let session = Session::open(&dir).unwrap();
         assert_eq!(session.panels[0].storage, PanelStorage::FullCanvasXisf);
+        assert_eq!(session.panels[0].source, None);
+        assert_eq!(session.input, InputKind::Aligned);
+        assert_eq!(session.frame, None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

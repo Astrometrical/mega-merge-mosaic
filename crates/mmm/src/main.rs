@@ -27,7 +27,8 @@ enum Command {
 
     /// Analyze panels: build tiled cache, coverage masks, and the overlap graph
     Analyze {
-        /// Input panel files (FITS/XISF), all pre-aligned on a common canvas
+        /// Input panel files (XISF): pre-aligned full-canvas frames, or
+        /// unaligned plate-solved panels (reprojected automatically)
         #[arg(required = true)]
         panels: Vec<std::path::PathBuf>,
 
@@ -38,6 +39,11 @@ enum Command {
         /// Residual surface correction: off, 0 (constant), 1 (plane), 2 (quadratic)
         #[arg(long, default_value = "2")]
         surface: String,
+
+        /// Input kind: auto (detect), aligned (registered full-canvas
+        /// frames), solved (unaligned panels with astrometric solutions)
+        #[arg(long, default_value = "auto")]
+        input: String,
     },
 
     /// Report analysis results: the overlap-graph edge table
@@ -128,7 +134,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Analyze { panels, session, surface } => {
+        Command::Analyze { panels, session, surface, input } => {
             tracing::info!(?session, n_panels = panels.len(), "analyze requested");
             let surface_order = match surface.as_str() {
                 "off" => None,
@@ -137,8 +143,28 @@ fn main() -> anyhow::Result<()> {
                 "2" => Some(2),
                 other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
             };
+            let input = match input.as_str() {
+                "auto" => mmm_core::analyze::InputSelect::Auto,
+                "aligned" => mmm_core::analyze::InputSelect::Aligned,
+                "solved" => mmm_core::analyze::InputSelect::Solved,
+                other => anyhow::bail!("--input must be auto, aligned or solved (got {other})"),
+            };
             let t0 = std::time::Instant::now();
-            let s = mmm_core::analyze::analyze_opts(&panels, &session, surface_order)?;
+            let s = mmm_core::analyze::analyze_input(&panels, &session, surface_order, input)?;
+            match (&s.frame, s.align_secs) {
+                (Some(f), align_secs) => println!(
+                    "input: solved panels — {} reprojected onto a fresh {}x{} frame \
+                     ({:.3}\"/px, center RA {:.4} Dec {:+.4}) in {:.2}s",
+                    s.panels.len(),
+                    f.width,
+                    f.height,
+                    f.scale_deg * 3600.0,
+                    f.crval[0],
+                    f.crval[1],
+                    align_secs.unwrap_or(0.0),
+                ),
+                _ => println!("input: aligned full-canvas frames"),
+            }
             let (w, h, ch) = s.canvas;
             println!("canvas: {w}x{h} x{ch}ch   session: {}", s.dir.display());
             println!(
@@ -146,11 +172,7 @@ fn main() -> anyhow::Result<()> {
                 "id", "file", "bbox [x0,x1)x[y0,y1)", "nonzero"
             );
             for p in &s.panels {
-                let name = p
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| p.path.display().to_string());
+                let name = panel_name(p);
                 let bbox = format!(
                     "[{},{})x[{},{})",
                     p.bbox[0], p.bbox[2], p.bbox[1], p.bbox[3]
@@ -208,6 +230,37 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Display name for a panel: the original input file for reprojected panels
+/// (whose `path` points at the session cache), else the panel file itself.
+fn panel_name(p: &mmm_core::session::PanelMeta) -> String {
+    let path = p.source.as_ref().unwrap_or(&p.path);
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// FITS cards describing the *input panel's* geometry or pointing. These
+/// must not pass through to a solved-session output: its canvas is a fresh
+/// [`mmm_core::align::MosaicFrame`], and the correct cards are emitted from
+/// that frame instead. Non-geometric metadata (EXPTIME, INSTRUME, …) still
+/// passes through from panel 0.
+fn geometry_card(name: &str) -> bool {
+    let n = name.trim().to_ascii_uppercase();
+    matches!(
+        n.as_str(),
+        "RA" | "DEC"
+            | "OBJCTRA"
+            | "OBJCTDEC"
+            | "RADESYS"
+            | "EQUINOX"
+            | "EPOCH"
+            | "LONPOLE"
+            | "LATPOLE"
+    ) || ["CRVAL", "CRPIX", "CDELT", "CROTA", "CTYPE", "CUNIT", "CD1_", "CD2_", "PC1_", "PC2_", "PV1_", "PV2_"]
+        .iter()
+        .any(|p| n.starts_with(p))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn blend_cmd(
     session_dir: &std::path::Path,
@@ -245,17 +298,33 @@ fn blend_cmd(
     // Crop origin in output pixel units (best-effort for downsampled previews:
     // the WCS scale itself is not rewritten).
     let crop = (bbox[0] / ds, bbox[1] / ds);
-    let ref_panel = XisfPanel::open(&session.panels[0].path)?;
+    // Panel-0 file for FITS keyword passthrough: for solved sessions the
+    // panel path is the reprojection cache, so the original input is used.
+    let p0 = &session.panels[0];
+    let ref_panel = XisfPanel::open(p0.source.as_ref().unwrap_or(&p0.path))?;
     let mut keywords = keywords_for_output(&ref_panel.header().fits_keywords, crop);
+    if session.frame.is_some() {
+        // Solved session: the output canvas is a fresh frame — panel-0
+        // geometry/pointing cards would lie about it and are dropped.
+        keywords.retain(|kw| !geometry_card(&kw.name));
+    }
     // Astrometric solution lives in XISF properties, not FITS keywords; attach
     // real WCS cards at full resolution (downsampled previews would need a
-    // rescaled CD matrix — not worth lying about; skip them there).
+    // rescaled CD matrix — not worth lying about; skip them there). Solved
+    // sessions use the session's own mosaic frame, never panel-0 passthrough.
     if ds == 1 {
-        match wcs_from_properties(&ref_panel.header().properties) {
+        let wcs = match &session.frame {
+            Some(frame) => {
+                println!("wcs: session mosaic frame (solved input)");
+                Some(frame.linear_wcs())
+            }
+            None => wcs_from_properties(&ref_panel.header().properties),
+        };
+        match wcs {
             Some(wcs) => {
                 // Output height fixes the bottom-up y reflection of the cards.
                 keywords.extend(wcs_cards(&wcs, (bbox[0], bbox[1]), bbox[3] - bbox[1]));
-                println!("wcs: attached from XISF astrometric solution");
+                println!("wcs: cards attached");
             }
             None => println!("wcs: no astrometric solution found in panel 0"),
         }
@@ -369,12 +438,7 @@ fn report(session_dir: &std::path::Path, seam_png: Option<&std::path::Path>) -> 
     });
 
     let name = |id: usize| -> String {
-        session
-            .panels
-            .get(id)
-            .and_then(|p| p.path.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("panel {id}"))
+        session.panels.get(id).map(panel_name).unwrap_or_else(|| format!("panel {id}"))
     };
     println!(
         "\noverlap edges ({}; seam Δ = mean |corrected step| across owner boundary, ⚠ > 3× median):",
