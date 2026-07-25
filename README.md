@@ -59,8 +59,14 @@ diagnostics (`mmm report --seam-png map.png` + per-edge seam Δ), and an
 opt-in `--flatten 1|2` global background flatten that provably cannot dig
 holes in nebulosity. 97 tests.
 
-Phase 4 candidates: FITS/compressed-XISF input, full Laplacian pyramid,
-wgpu GPU path, GUI.
+Phase 4 added the full multiband blend: the star-free base is now blended
+as a Laplacian pyramid with seam transitions proportional to each scale
+(default mode; `--mode twoband|feather` retained), closing the last gap —
+mid-frequency structure under differing seeing or slight misregistration.
+Output WCS verified against catalog star positions. 107 tests.
+
+Next: tidy-up for external testers (PixInsight/XISF workflows, CLI), then
+FITS/compressed-XISF input, wgpu GPU path, GUI.
 
 ## Build
 

@@ -275,6 +275,28 @@ both the full frame and a `--roi` crop. No flip property exists in the XISF —
 `ReferenceNativeCoordinates`/`CelestialPoleNativeCoordinates` are the standard
 zenithal values; orientation is entirely in the matrix.
 
+## Phase 4 results (2026-07-25)
+
+`BlendMode::Pyramid` (new default) landed: star-free base blended as an
+L8-grid Laplacian pyramid with scale-proportional seam transitions; detail/
+star path untouched. 107 tests, clippy clean.
+
+- Mid-frequency ghost metric (24 px blobs displaced 3 px between panels):
+  **82% RMS reduction** vs the feathered TwoBand base (bound was 30%);
+  ratios 0.02–0.18 across seeds. All phase-3 guarantees re-proven in
+  Pyramid mode; Feather/TwoBand outputs hash-identical to before.
+- Real data: full-res blend 8.2 s; diff vs TwoBand sub-noise everywhere
+  (RMS 1.8e-5, p99 < 1e-4 vs data floor 1e-3+), concentrated in seam
+  transition zones; seam map byte-identical (ownership unchanged). On this
+  well-registered set the pyramid is insurance, not a visible improvement —
+  its benefit case is differing PSF or few-px misregistration between panels.
+- WCS N–S mirror fixed (user-reported): PI's solution is top-down; FITS
+  consumers interpret WCS bottom-up. `wcs_cards` now reflects CRPIX2 and
+  negates the CD second column; verified empirically (Alnitak/Alnilam/
+  Mintaka/Trapezium land within px; before the fix stars sat at exactly the
+  mirrored row). No flip property exists in the XISF — orientation is
+  carried entirely by the matrix convention.
+
 ## Performance notes
 
 - Full-plane scan measured at ~0.9 GB/s single-threaded; analyze is I/O-bound
