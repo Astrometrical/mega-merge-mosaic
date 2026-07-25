@@ -306,10 +306,15 @@ star path untouched. 107 tests, clippy clean.
   panel mismatch is largest. Masks are now split by component morphology —
   compact components (stars + spike arms; area ≤ 40 cells, bbox dim ≤ 12, or
   thin cross shapes) keep the snap; extended structure ramps with a widened
-  32 px half-width. Base exclusion also compact-only (structure cell means
-  blend fine; the pyramid base regains scale-matched blending under M42).
-  Verified: staircase gone on real data, stars pixel-identical, all
-  anti-pinching/spike/veto guarantees green.
+  32 px half-width. Base exclusion stays FULL-mask (compact ∪ structure) —
+  a compact-only attempt caused a dark-moat regression around haloed bright
+  stars (reflection halos flood components past compactness → halo entered
+  the pyramid base → asymmetric Laplacian mixing near boundaries dug a wide
+  dark annulus; user-reported, reproduced synthetically red/green). Ramped
+  detail contributions also fade over each panel's last 32 px of coverage
+  (rim fade) so transitions forced onto coverage rims complete inside
+  coverage. Verified: staircase gone (metric 0.0015 vs 0.028 pre-fix),
+  moats gone, stars pixel-identical, all guarantees green.
 
 ## Phase 5 results (2026-07-25): unaligned solved-panel input
 
