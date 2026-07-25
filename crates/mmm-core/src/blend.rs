@@ -196,9 +196,17 @@ impl Default for BlendParams {
 pub fn output_bbox(session: &Session, params: &BlendParams) -> Result<[u64; 4]> {
     let u = union_bbox(session)?;
     let Some(r) = params.roi else { return Ok(u) };
-    let b = [u[0].max(r[0]), u[1].max(r[1]), u[2].min(r[2]), u[3].min(r[3])];
+    let b = [
+        u[0].max(r[0]),
+        u[1].max(r[1]),
+        u[2].min(r[2]),
+        u[3].min(r[3]),
+    ];
     if b[0] >= b[2] || b[1] >= b[3] {
-        return Err(Error::format(&session.dir, "ROI does not intersect the mosaic content"));
+        return Err(Error::format(
+            &session.dir,
+            "ROI does not intersect the mosaic content",
+        ));
     }
     Ok(b)
 }
@@ -215,7 +223,10 @@ pub trait RowSink {
 /// Union of the panel content bboxes: `[x0, y0, x1, y1]`, exclusive.
 /// Errors if the session has no panel with content.
 pub fn union_bbox(session: &Session) -> Result<[u64; 4]> {
-    let mut it = session.panels.iter().filter(|p| p.bbox[2] > p.bbox[0] && p.bbox[3] > p.bbox[1]);
+    let mut it = session
+        .panels
+        .iter()
+        .filter(|p| p.bbox[2] > p.bbox[0] && p.bbox[3] > p.bbox[1]);
     let first = it
         .next()
         .ok_or_else(|| Error::format(&session.dir, "session has no panels with content"))?;
@@ -270,7 +281,11 @@ impl PanelPrep {
 
 /// Load the panels' L8 summaries in parallel.
 pub(crate) fn load_summaries(session: &Session) -> Result<Vec<L8Summary>> {
-    session.panels.par_iter().map(|p| L8Summary::read(&session.summary_path(p.id))).collect()
+    session
+        .panels
+        .par_iter()
+        .map(|p| L8Summary::read(&session.summary_path(p.id)))
+        .collect()
 }
 
 /// Open every panel's pixel data for streaming reads ([`PanelReader`]
@@ -298,7 +313,14 @@ fn prep_panels(
     let summaries = load_summaries(session)?;
     let masks: Vec<Vec<bool>> = summaries.par_iter().map(star_mask).collect();
     let flat = fit_flatten_opt(&summaries, &masks, phot, surfaces, session, flatten_order)?;
-    Ok(prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks))
+    Ok(prep_from_summaries(
+        session,
+        phot,
+        surfaces,
+        flat.as_ref(),
+        summaries,
+        &masks,
+    ))
 }
 
 /// Fit the global flatten when requested ([`BlendParams::flatten`]).
@@ -364,8 +386,7 @@ fn prep_from_summaries(
             }
 
             // Corrected cell means at cell centers: the two-band base plane.
-            let mut corr8 =
-                corrected_cell_means(&summary, &gains, &offsets, &surf, session.canvas);
+            let mut corr8 = corrected_cell_means(&summary, &gains, &offsets, &surf, session.canvas);
 
             suppress_stars_in_base(&mut corr8, &summary, ch, mask);
 
@@ -378,7 +399,16 @@ fn prep_from_summaries(
                 })
                 .collect();
 
-            PanelPrep { bbox: p.bbox, gains, offsets, surf, summary, dist, corr8, vdet }
+            PanelPrep {
+                bbox: p.bbox,
+                gains,
+                offsets,
+                surf,
+                summary,
+                dist,
+                corr8,
+                vdet,
+            }
         })
         .collect()
 }
@@ -396,19 +426,32 @@ pub(crate) fn panel_correction_terms(
 ) -> (Vec<f32>, Vec<f32>, Vec<[f64; 6]>) {
     let correction = |table: &Vec<Vec<f64>>, default: f64| -> Vec<f32> {
         (0..ch)
-            .map(|c| table.get(c).and_then(|t| t.get(id)).copied().unwrap_or(default) as f32)
+            .map(|c| {
+                table
+                    .get(c)
+                    .and_then(|t| t.get(id))
+                    .copied()
+                    .unwrap_or(default) as f32
+            })
             .collect()
     };
     let surf: Vec<[f64; 6]> = (0..ch)
         .map(|c| {
             let mut padded = [0.0f64; 6];
-            if let Some(coeffs) = surfaces.and_then(|s| s.coeffs.get(c)).and_then(|t| t.get(id)) {
+            if let Some(coeffs) = surfaces
+                .and_then(|s| s.coeffs.get(c))
+                .and_then(|t| t.get(id))
+            {
                 padded[..coeffs.len()].copy_from_slice(coeffs);
             }
             padded
         })
         .collect();
-    (correction(&phot.gains, 1.0), correction(&phot.offsets, 0.0), surf)
+    (
+        correction(&phot.gains, 1.0),
+        correction(&phot.offsets, 0.0),
+        surf,
+    )
 }
 
 /// Corrected L8 cell means `g·mean + o + s(cell center)`, planar
@@ -471,8 +514,9 @@ fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize, ma
     let cells = w * h;
     debug_assert_eq!(mask.len(), cells);
 
-    let source: Vec<bool> =
-        (0..cells).map(|i| summary.coverage[i] >= 1.0 && !mask[i]).collect();
+    let source: Vec<bool> = (0..cells)
+        .map(|i| summary.coverage[i] >= 1.0 && !mask[i])
+        .collect();
     if !source.iter().any(|&s| s) {
         return; // nothing trustworthy to fill from: keep raw values
     }
@@ -669,7 +713,13 @@ fn blend_full(
     let (cx0, cy0) = (bbox[0], bbox[1]);
     let out_w = (bbox[2] - bbox[0]) as usize;
     let out_h = (bbox[3] - bbox[1]) as usize;
-    tracing::info!(out_w, out_h, nch, prep_s = t0.elapsed().as_secs_f64(), "blend full-res");
+    tracing::info!(
+        out_w,
+        out_h,
+        nch,
+        prep_s = t0.elapsed().as_secs_f64(),
+        "blend full-res"
+    );
 
     sink.begin(out_w as u64, out_h as u64, nch as u64)?;
     let band_rows = params.band_rows.max(1);
@@ -709,8 +759,9 @@ fn blend_full(
                     rows.clear();
                     for c in 0..nch as u64 {
                         // Content bbox ⊆ storage bbox, so the row exists.
-                        let (rx0, row) =
-                            panels[pi].row(c, cy).expect("content row within storage bbox");
+                        let (rx0, row) = panels[pi]
+                            .row(c, cy)
+                            .expect("content row within storage bbox");
                         rows.push((rx0 as usize, row));
                     }
                     // Residual surface, reduced to per-row constants:
@@ -724,8 +775,8 @@ fn blend_full(
                             continue; // uncovered: any channel zero
                         }
                         let gx = x as f32 * inv_block;
-                        let d_px = BLOCK as f32
-                            * bilinear(&p.dist, p.summary.w8, p.summary.h8, gx, gy);
+                        let d_px =
+                            BLOCK as f32 * bilinear(&p.dist, p.summary.w8, p.summary.h8, gx, gy);
                         let wgt = weight(d_px, inv_feather);
                         let o = (x - cx0) as usize;
                         wsum[o] += wgt;
@@ -830,8 +881,11 @@ fn detail_transition_maps(
     let ramps: Vec<Option<Vec<f32>>> = (0..compact.len())
         .into_par_iter()
         .map(|p| {
-            let ind: Vec<f32> =
-                owner.owner.iter().map(|&o| if o == p as u16 { 1.0 } else { 0.0 }).collect();
+            let ind: Vec<f32> = owner
+                .owner
+                .iter()
+                .map(|&o| if o == p as u16 { 1.0 } else { 0.0 })
+                .collect();
             if ind.iter().all(|&v| v == 0.0) {
                 return None;
             }
@@ -896,17 +950,29 @@ fn pyramid_base_planes(
                 .into_iter()
                 .map(|r| if r { 1.0 } else { 0.0 })
                 .collect();
-            let mask: Vec<f32> =
-                owner.owner.iter().map(|&o| if o == pi as u16 { 1.0 } else { 0.0 }).collect();
+            let mask: Vec<f32> = owner
+                .owner
+                .iter()
+                .map(|&o| if o == pi as u16 { 1.0 } else { 0.0 })
+                .collect();
             let data = (0..nch)
                 .map(|c| {
-                    build_masked(&p.corr8[c * cells..(c + 1) * cells], &valid, w8, h8, n_levels)
+                    build_masked(
+                        &p.corr8[c * cells..(c + 1) * cells],
+                        &valid,
+                        w8,
+                        h8,
+                        n_levels,
+                    )
                 })
                 .collect();
             // The mask pyramid is clamped to the same validity plane the
             // data build uses, so this panel carries no blend weight where
             // its base pyramid would be sentinel/extrapolated garbage.
-            PanelPyr { data, mask: mask_pyramid(&mask, &valid, w8, h8, n_levels) }
+            PanelPyr {
+                data,
+                mask: mask_pyramid(&mask, &valid, w8, h8, n_levels),
+            }
         })
         .collect();
 
@@ -955,7 +1021,10 @@ fn blend_twoband_impl(
     let masks: Vec<Vec<bool>> = if use_star_mask {
         summaries.par_iter().map(star_mask).collect()
     } else {
-        summaries.iter().map(|s| vec![false; s.w8 as usize * s.h8 as usize]).collect()
+        summaries
+            .iter()
+            .map(|s| vec![false; s.w8 as usize * s.h8 as usize])
+            .collect()
     };
     // Compact components (stars + spike arms) vs extended structure (nebular
     // cores the mask flooded across): the star-lock snap acts on the compact
@@ -964,8 +1033,10 @@ fn blend_twoband_impl(
     // `seam::split_mask_components` — a reflection halo flooded into a
     // structure component must not enter the base band).
     let (w8s, h8s) = (summaries[0].w8, summaries[0].h8);
-    let splits: Vec<(Vec<bool>, Vec<bool>)> =
-        masks.par_iter().map(|m| crate::seam::split_mask_components(m, w8s, h8s)).collect();
+    let splits: Vec<(Vec<bool>, Vec<bool>)> = masks
+        .par_iter()
+        .map(|m| crate::seam::split_mask_components(m, w8s, h8s))
+        .collect();
     let compact: Vec<Vec<bool>> = splits.iter().map(|(c, _)| c.clone()).collect();
     let structure: Vec<Vec<bool>> = splits.into_iter().map(|(_, s)| s).collect();
     let owner = compute_owner_map_masked(
@@ -979,8 +1050,7 @@ fn blend_twoband_impl(
     );
     let (ramps, hard) = detail_transition_maps(&owner, &compact, &structure);
     let flat = fit_flatten_opt(&summaries, &masks, phot, surfaces, session, params.flatten)?;
-    let mut preps =
-        prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks);
+    let mut preps = prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks);
     for p in &mut preps {
         p.summary.detail = Vec::new(); // only needed for the maps above
     }
@@ -996,7 +1066,13 @@ fn blend_twoband_impl(
     let out_w = (bbox[2] - bbox[0]) as usize;
     let out_h = (bbox[3] - bbox[1]) as usize;
     let (w8, h8) = (owner.w8, owner.h8);
-    tracing::info!(out_w, out_h, nch, prep_s = t0.elapsed().as_secs_f64(), "blend two-band");
+    tracing::info!(
+        out_w,
+        out_h,
+        nch,
+        prep_s = t0.elapsed().as_secs_f64(),
+        "blend two-band"
+    );
 
     sink.begin(out_w as u64, out_h as u64, nch as u64)?;
     let band_rows = params.band_rows.max(1);
@@ -1108,9 +1184,8 @@ fn blend_twoband_impl(
                         let (rx0, row) = pr.rows[c];
                         row[xi - rx0] * p.gains[c] + p.offsets[c] + sa + xn * (sb + xn * sc)
                     };
-                    let fallback = || -> usize {
-                        cov.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0
-                    };
+                    let fallback =
+                        || -> usize { cov.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0 };
                     det.iter_mut().for_each(|v| *v = 0.0);
                     if hard[cell] {
                         // Star-lock: snap to the owner (or the best-weighted
@@ -1127,7 +1202,9 @@ fn blend_twoband_impl(
                         let blc = bl_c.as_ref().expect("set for any covered pixel");
                         let mut rsum = 0.0f32;
                         for &(k, _, d_px) in &cov {
-                            let Some(ramp) = &ramps[prow[k].pi] else { continue };
+                            let Some(ramp) = &ramps[prow[k].pi] else {
+                                continue;
+                            };
                             // Rim fade: a panel's detail contribution falls
                             // to 0 over its last ±WIDE_RAMP_PX of coverage.
                             // Where the DP seam (or coverage itself) puts the
@@ -1138,8 +1215,7 @@ fn blend_twoband_impl(
                             // (~half the cross-panel structure mismatch, the
                             // residual staircase). Interior seams have both
                             // panels deep in coverage (fade = 1): unchanged.
-                            let rv =
-                                blc.sample(ramp) * (d_px / WIDE_RAMP_PX).clamp(0.0, 1.0);
+                            let rv = blc.sample(ramp) * (d_px / WIDE_RAMP_PX).clamp(0.0, 1.0);
                             if rv <= 1e-6 {
                                 continue;
                             }
@@ -1244,7 +1320,13 @@ fn blend_l8(
     let gy1 = (bbox[3].div_ceil(b) as u32).min(h8);
     let out_w = (gx1 - gx0) as usize;
     let out_h = (gy1 - gy0) as usize;
-    tracing::info!(out_w, out_h, nch, prep_s = t0.elapsed().as_secs_f64(), "blend from L8");
+    tracing::info!(
+        out_w,
+        out_h,
+        nch,
+        prep_s = t0.elapsed().as_secs_f64(),
+        "blend from L8"
+    );
 
     sink.begin(out_w as u64, out_h as u64, nch as u64)?;
     let band_rows = params.band_rows.max(1);
@@ -1273,8 +1355,7 @@ fn blend_l8(
                         if s.cov(x8, y8) < 1.0 {
                             continue; // only fully covered cells blend
                         }
-                        let d_px =
-                            BLOCK as f32 * p.dist[y8 as usize * s.w8 as usize + x8 as usize];
+                        let d_px = BLOCK as f32 * p.dist[y8 as usize * s.w8 as usize + x8 as usize];
                         let wgt = weight(d_px, inv_feather);
                         let o = (x8 - gx0) as usize;
                         wsum[o] += wgt;
@@ -1344,7 +1425,13 @@ mod tests {
 
     impl MemSink {
         fn new() -> Self {
-            Self { w: 0, h: 0, ch: 0, data: Vec::new(), finished: false }
+            Self {
+                w: 0,
+                h: 0,
+                ch: 0,
+                data: Vec::new(),
+                finished: false,
+            }
         }
 
         fn at(&self, c: usize, x: usize, y: usize) -> f32 {
@@ -1435,14 +1522,25 @@ mod tests {
         let dir = tmpdir("feather");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 16.0,
+            downsample: 1,
+            band_rows: 16,
+            mode: BlendMode::Feather,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
         // Output is the cropped union bbox, and every pixel was written.
         assert_eq!((sink.w, sink.h, sink.ch), (112, 56, 1));
         assert!(sink.finished);
-        assert!(sink.data.iter().all(|v| v.is_finite()), "no NaN/Inf anywhere");
+        assert!(
+            sink.data.iter().all(|v| v.is_finite()),
+            "no NaN/Inf anywhere"
+        );
 
         // Canvas (x, y) → output (x−8, y−8).
         let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
@@ -1451,11 +1549,23 @@ mod tests {
         assert_eq!(at(100, 10), 0.0);
 
         // Single-coverage interiors: weights normalize out exactly.
-        assert!((at(24, 32) - 0.2).abs() < 1e-6, "A interior: {}", at(24, 32));
-        assert!((at(104, 40) - 0.4).abs() < 1e-6, "B interior: {}", at(104, 40));
+        assert!(
+            (at(24, 32) - 0.2).abs() < 1e-6,
+            "A interior: {}",
+            at(24, 32)
+        );
+        assert!(
+            (at(104, 40) - 0.4).abs() < 1e-6,
+            "B interior: {}",
+            at(104, 40)
+        );
 
         // Overlap midpoint: both panels at full weight → exact average.
-        assert!((at(64, 36) - 0.3).abs() < 1e-6, "overlap midpoint: {}", at(64, 36));
+        assert!(
+            (at(64, 36) - 0.3).abs() < 1e-6,
+            "overlap midpoint: {}",
+            at(64, 36)
+        );
 
         // Monotone ramp from A's value to B's value across the overlap.
         let mut prev = f32::NEG_INFINITY;
@@ -1464,7 +1574,10 @@ mod tests {
             assert!(v >= prev - 1e-5, "ramp not monotone at x={x}: {v} < {prev}");
             prev = v;
         }
-        assert!(at(48, 36) < 0.3 && at(79, 36) > 0.3, "ramp spans the average");
+        assert!(
+            at(48, 36) < 0.3 && at(79, 36) > 0.3,
+            "ramp spans the average"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1474,12 +1587,23 @@ mod tests {
         let dir = tmpdir("roi");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let full = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+        let full = BlendParams {
+            feather_px: 16.0,
+            downsample: 1,
+            band_rows: 16,
+            mode: BlendMode::Feather,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut full_sink = MemSink::new();
         blend(&session, &phot, None, &graph, &full, &mut full_sink).unwrap();
 
         // ROI spanning the overlap: canvas [40,100)x[20,60), clipped to union y<64.
-        let roi = BlendParams { roi: Some([40, 20, 100, 60]), ..full.clone() };
+        let roi = BlendParams {
+            roi: Some([40, 20, 100, 60]),
+            ..full.clone()
+        };
         let mut roi_sink = MemSink::new();
         blend(&session, &phot, None, &graph, &roi, &mut roi_sink).unwrap();
 
@@ -1488,12 +1612,18 @@ mod tests {
             for x in 0..roi_sink.w {
                 // ROI output (x,y) = canvas (40+x, 20+y) = full output (32+x, 12+y).
                 let (a, b) = (roi_sink.at(0, x, y), full_sink.at(0, x + 32, y + 12));
-                assert!((a - b).abs() < 1e-6, "mismatch at roi ({x},{y}): {a} vs {b}");
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "mismatch at roi ({x},{y}): {a} vs {b}"
+                );
             }
         }
 
         // Disjoint ROI errors.
-        let miss = BlendParams { roi: Some([0, 0, 4, 4]), ..full.clone() };
+        let miss = BlendParams {
+            roi: Some([0, 0, 4, 4]),
+            ..full.clone()
+        };
         assert!(blend(&session, &phot, None, &graph, &miss, &mut MemSink::new()).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1508,7 +1638,15 @@ mod tests {
             gains: vec![vec![2.0, 1.0]],
             offsets: vec![vec![0.01, 0.0]],
         };
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 16.0,
+            downsample: 1,
+            band_rows: 64,
+            mode: BlendMode::Feather,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1530,10 +1668,7 @@ mod tests {
         // canvas coords, canvas 128×64); panel B gets zero.
         let surf = crate::surfaces::Surfaces {
             order: 2,
-            coeffs: vec![vec![
-                vec![0.05, 0.1, -0.02, 0.2, 0.0, 0.0],
-                vec![0.0; 6],
-            ]],
+            coeffs: vec![vec![vec![0.05, 0.1, -0.02, 0.2, 0.0, 0.0], vec![0.0; 6]]],
             max_abs_s: vec![],
             bg_mad: vec![],
         };
@@ -1542,7 +1677,15 @@ mod tests {
             0.05 + 0.1 * xn - 0.02 * yn + 0.2 * xn * xn
         };
 
-        let params = BlendParams { feather_px: 16.0, downsample: 1, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 16.0,
+            downsample: 1,
+            band_rows: 16,
+            mode: BlendMode::Feather,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
         let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
@@ -1551,8 +1694,15 @@ mod tests {
         // (both full weight): mean of corrected values.
         let (ax, ay) = (24u64, 32u64);
         let expect_a = 0.2 + s_at(ax as f64, ay as f64) as f32;
-        assert!((at(ax, ay) - expect_a).abs() < 1e-5, "A interior {} vs {expect_a}", at(ax, ay));
-        assert!((at(104, 40) - 0.4).abs() < 1e-6, "B interior must stay uncorrected");
+        assert!(
+            (at(ax, ay) - expect_a).abs() < 1e-5,
+            "A interior {} vs {expect_a}",
+            at(ax, ay)
+        );
+        assert!(
+            (at(104, 40) - 0.4).abs() < 1e-6,
+            "B interior must stay uncorrected"
+        );
         let expect_mid = 0.5 * ((0.2 + s_at(64.0, 36.0) as f32) + 0.4);
         assert!(
             (at(64, 36) - expect_mid).abs() < 1e-5,
@@ -1561,13 +1711,24 @@ mod tests {
         );
 
         // Same corrections must hold on the L8 preview path (cell centers).
-        let params8 = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 4, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+        let params8 = BlendParams {
+            feather_px: 16.0,
+            downsample: 8,
+            band_rows: 4,
+            mode: BlendMode::Feather,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink8 = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params8, &mut sink8).unwrap();
         // Canvas cell (3,4) is A-only; center pixel (28, 36).
         let got = sink8.at(0, 3 - 1, 4 - 1);
         let expect_cell = 0.2 + s_at(28.0, 36.0) as f32;
-        assert!((got - expect_cell).abs() < 1e-5, "L8 A-only cell {got} vs {expect_cell}");
+        assert!(
+            (got - expect_cell).abs() < 1e-5,
+            "L8 A-only cell {got} vs {expect_cell}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1577,7 +1738,15 @@ mod tests {
         let dir = tmpdir("l8");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 8, band_rows: 3, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 16.0,
+            downsample: 8,
+            band_rows: 3,
+            mode: BlendMode::Feather,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -1648,7 +1817,10 @@ mod tests {
         };
 
         let run = |use_mask: bool, mode: BlendMode| -> MemSink {
-            let params = BlendParams { mode, ..params.clone() };
+            let params = BlendParams {
+                mode,
+                ..params.clone()
+            };
             let mut sink = MemSink::new();
             blend_twoband_impl(&session, &phot, None, &graph, &params, &mut sink, use_mask)
                 .unwrap();
@@ -1720,11 +1892,7 @@ mod tests {
                     pixels
                         .iter()
                         .map(|&(x, y)| {
-                            let merged = sink.at(
-                                0,
-                                x - bbox[0] as usize,
-                                y - bbox[1] as usize,
-                            );
+                            let merged = sink.at(0, x - bbox[0] as usize, y - bbox[1] as usize);
                             (merged - corrected[p][y * w + x]).abs()
                         })
                         .fold(0.0f32, f32::max)
@@ -1825,8 +1993,7 @@ mod tests {
             .map(|p| L8Summary::read(&session.summary_path(p.id)).unwrap())
             .collect();
         let masks: Vec<Vec<bool>> = summaries.iter().map(crate::seam::star_mask).collect();
-        let owner =
-            compute_owner_map(&summaries, &graph, &phot, None, session.canvas, 24.0);
+        let owner = compute_owner_map(&summaries, &graph, &phot, None, session.canvas, 24.0);
         for &(_, dx, dy, len, _) in &spec.panel_defects {
             for x in dx..dx + len as u64 {
                 let cell =
@@ -1874,8 +2041,7 @@ mod tests {
             let mut worst = 0.0f32;
             for y in dy - 1..=dy + 1 {
                 for x in dx - 1..dx + len as u64 + 1 {
-                    let merged =
-                        sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
+                    let merged = sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
                     worst = worst.max((merged - corrected0[y as usize * w + x as usize]).abs());
                 }
             }
@@ -1883,9 +2049,10 @@ mod tests {
         };
 
         let thresh = 6.0 * noise;
-        for (mode, on, off) in
-            [(BlendMode::TwoBand, &on, &off), (BlendMode::Pyramid, &on_pyr, &off_pyr)]
-        {
+        for (mode, on, off) in [
+            (BlendMode::TwoBand, &on, &off),
+            (BlendMode::Pyramid, &on_pyr, &off_pyr),
+        ] {
             for (name, d) in [("trail", trail), ("ray", ray)] {
                 let d_on = defect_dist(on, d);
                 let d_off = defect_dist(off, d);
@@ -1968,7 +2135,10 @@ mod tests {
             }
         }
         eprintln!("outside-overlap defect: max |merged − corrected input| = {worst:.2e}");
-        assert!(worst < 1e-4, "owner value must stand untouched, max diff {worst}");
+        assert!(
+            worst < 1e-4,
+            "owner value must stand untouched, max diff {worst}"
+        );
 
         // And the defect really is present in the output (not vetoed away):
         // the defect pixel towers over the row 4 px below by ~the amplitude.
@@ -2004,10 +2174,7 @@ mod tests {
     /// plus a small background anchor that keeps the DP seam mid-band in the
     /// unmasked rows. Panel A's exact pixel values are returned so tests can
     /// measure the merged output's deviation profile `D = out − A`.
-    fn structure_band_panels(
-        dir: &Path,
-        mismatch: f32,
-    ) -> (Session, OverlapGraph, Vec<f32>) {
+    fn structure_band_panels(dir: &Path, mismatch: f32) -> (Session, OverlapGraph, Vec<f32>) {
         std::fs::create_dir_all(dir).unwrap();
         let (w, h) = (512u64, 640u64);
         let ridge = |y: f64| 0.3 * (-((y - 320.0) * (y - 320.0)) / (2.0 * 50.0 * 50.0)).exp();
@@ -2030,8 +2197,7 @@ mod tests {
 
         // The full-canvas A-frame sky — the reference D is measured against
         // (defined everywhere, unlike panel A's zero-padded window).
-        let truth_a: Vec<f32> =
-            (0..w * h).map(|i| sky_a(i % w, i / w)).collect();
+        let truth_a: Vec<f32> = (0..w * h).map(|i| sky_a(i % w, i / w)).collect();
 
         let mut frame = vec![0f32; (w * h) as usize];
         for y in 0..h {
@@ -2082,8 +2248,7 @@ mod tests {
         let dir = tmpdir("structseam");
         let mismatch = 0.03f32;
         let (session, graph, truth_a) = structure_band_panels(&dir.join("mm"), mismatch);
-        let (ctrl_session, ctrl_graph, ctrl_truth) =
-            structure_band_panels(&dir.join("ctrl"), 0.0);
+        let (ctrl_session, ctrl_graph, ctrl_truth) = structure_band_panels(&dir.join("ctrl"), 0.0);
         let phot = identity_phot(2, 1);
 
         // Preconditions — the scenario must reproduce the M42 diagnosis:
@@ -2093,8 +2258,10 @@ mod tests {
         let summaries = load_summaries(&session).unwrap();
         let (w8, h8) = (summaries[0].w8, summaries[0].h8);
         let masks: Vec<Vec<bool>> = summaries.iter().map(star_mask).collect();
-        let splits: Vec<(Vec<bool>, Vec<bool>)> =
-            masks.iter().map(|m| split_mask_components(m, w8, h8)).collect();
+        let splits: Vec<(Vec<bool>, Vec<bool>)> = masks
+            .iter()
+            .map(|m| split_mask_components(m, w8, h8))
+            .collect();
         for y8 in 34..46u32 {
             for x8 in 28..36u32 {
                 let i = (y8 * w8 + x8) as usize;
@@ -2155,9 +2322,7 @@ mod tests {
         let jump = |sink: &MemSink, truth: &[f32]| -> f32 {
             let mut worst = 0.0f32;
             for y in (248..392u64).step_by(4) {
-                let d = |x: u64| {
-                    sink.at(0, x as usize, y as usize) - truth[(y * 512 + x) as usize]
-                };
+                let d = |x: u64| sink.at(0, x as usize, y as usize) - truth[(y * 512 + x) as usize];
                 // Whole shared band incl. its edge cells: the DP may hug a
                 // band edge in fully-masked rows, putting the transition at
                 // x=224/288 — the panel rims, where the ramp is truncated by
@@ -2186,9 +2351,7 @@ mod tests {
 
             let j_mm = jump(&out, &truth_a);
             let j_ctrl = jump(&ctrl, &ctrl_truth);
-            eprintln!(
-                "{mode:?}: max D-jump {j_mm:.4} (control {j_ctrl:.4}, mismatch {mismatch})"
-            );
+            eprintln!("{mode:?}: max D-jump {j_mm:.4} (control {j_ctrl:.4}, mismatch {mismatch})");
             assert!(
                 j_mm < (2.0 * j_ctrl).max(0.008),
                 "{mode:?}: seam through structure steps by {j_mm} \
@@ -2370,7 +2533,15 @@ mod tests {
         let dir = tmpdir("badds");
         let (session, graph) = make_panels(&dir);
         let phot = identity_phot(2, 1);
-        let params = BlendParams { feather_px: 16.0, downsample: 4, band_rows: 16, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 16.0,
+            downsample: 4,
+            band_rows: 16,
+            mode: BlendMode::Feather,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         assert!(blend(&session, &phot, None, &graph, &params, &mut sink).is_err());
         std::fs::remove_dir_all(&dir).unwrap();

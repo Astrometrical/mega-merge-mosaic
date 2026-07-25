@@ -119,13 +119,19 @@ impl Session {
 
     /// Path of panel `id`'s L8 summary: `panels/<id>/summary.bin`.
     pub fn summary_path(&self, id: usize) -> PathBuf {
-        self.dir.join("panels").join(id.to_string()).join("summary.bin")
+        self.dir
+            .join("panels")
+            .join(id.to_string())
+            .join("summary.bin")
     }
 
     /// Path of panel `id`'s reprojection cache: `panels/<id>/aligned.bin`.
     /// Only exists for solved (reprojected) input panels.
     pub fn aligned_path(&self, id: usize) -> PathBuf {
-        self.dir.join("panels").join(id.to_string()).join("aligned.bin")
+        self.dir
+            .join("panels")
+            .join(id.to_string())
+            .join("aligned.bin")
     }
 
     /// Path of the overlap graph: `analysis/overlap_graph.json`.
@@ -165,7 +171,9 @@ mod tests {
             ch_min: vec![0.001, 0.002, 0.003],
             ch_max: vec![0.9, 0.8, 0.7],
             ch_mean: vec![0.01, 0.02, 0.03],
-            storage: PanelStorage::CroppedCache { bbox: [10, 20, 300, 400] },
+            storage: PanelStorage::CroppedCache {
+                bbox: [10, 20, 300, 400],
+            },
         });
         session.input = InputKind::Solved;
         session.frame = Some(MosaicFrame {
@@ -186,7 +194,12 @@ mod tests {
         assert_eq!(p.source, Some(PathBuf::from("/data/raw0.xisf")));
         assert_eq!(p.bbox, [10, 20, 300, 400]);
         assert_eq!(p.ch_max, vec![0.9, 0.8, 0.7]);
-        assert_eq!(p.storage, PanelStorage::CroppedCache { bbox: [10, 20, 300, 400] });
+        assert_eq!(
+            p.storage,
+            PanelStorage::CroppedCache {
+                bbox: [10, 20, 300, 400]
+            }
+        );
         assert_eq!(reopened.input, InputKind::Solved);
         assert_eq!(reopened.frame, session.frame);
         assert_eq!(reopened.align_secs, None, "align timing must not persist");
@@ -205,8 +218,21 @@ mod tests {
 
         // Later stages depend on these exact JSON field names.
         let json = std::fs::read_to_string(dir.join("session.json")).unwrap();
-        for key in ["canvas", "panels", "id", "path", "bbox", "nonzero_frac", "ch_min", "ch_max", "ch_mean"] {
-            assert!(json.contains(&format!("\"{key}\"")), "session.json missing key {key}");
+        for key in [
+            "canvas",
+            "panels",
+            "id",
+            "path",
+            "bbox",
+            "nonzero_frac",
+            "ch_min",
+            "ch_max",
+            "ch_mean",
+        ] {
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "session.json missing key {key}"
+            );
         }
         // The directory itself must not be baked into the JSON.
         assert!(!json.contains("\"dir\""));

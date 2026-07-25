@@ -78,7 +78,11 @@ impl L8Summary {
     pub fn write(&self, path: &Path) -> Result<()> {
         let cells = self.w8 as usize * self.h8 as usize;
         assert_eq!(self.coverage.len(), cells, "coverage plane size mismatch");
-        assert_eq!(self.mean.len(), self.channels as usize * cells, "mean planes size mismatch");
+        assert_eq!(
+            self.mean.len(),
+            self.channels as usize * cells,
+            "mean planes size mismatch"
+        );
         assert_eq!(
             self.detail.len(),
             self.channels as usize * cells,
@@ -124,7 +128,10 @@ impl L8Summary {
         if bytes.len() != expected {
             return Err(Error::format(
                 path,
-                format!("summary size {} != expected {expected} for {w8}x{h8}x{channels}", bytes.len()),
+                format!(
+                    "summary size {} != expected {expected} for {w8}x{h8}x{channels}",
+                    bytes.len()
+                ),
             ));
         }
         let read_plane = |off: usize, n: usize| -> Vec<f32> {
@@ -136,7 +143,14 @@ impl L8Summary {
         let coverage = read_plane(16, cells);
         let mean = read_plane(16 + cells * 4, ch_cells);
         let detail = read_plane(16 + (cells + ch_cells) * 4, ch_cells);
-        Ok(Self { w8, h8, channels, coverage, mean, detail })
+        Ok(Self {
+            w8,
+            h8,
+            channels,
+            coverage,
+            mean,
+            detail,
+        })
     }
 }
 
@@ -209,7 +223,10 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let err = L8Summary::read(&path).unwrap_err().to_string();
-        assert!(err.contains("re-run analyze"), "error must tell the user to re-run analyze: {err}");
+        assert!(
+            err.contains("re-run analyze"),
+            "error must tell the user to re-run analyze: {err}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

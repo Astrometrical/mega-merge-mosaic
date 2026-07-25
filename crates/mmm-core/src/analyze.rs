@@ -167,7 +167,11 @@ fn analyze_aligned(
         }
     }
 
-    if auto && scans.iter().any(|s| s.meta.nonzero_frac >= ALIGNED_MAX_COVERAGE) {
+    if auto
+        && scans
+            .iter()
+            .any(|s| s.meta.nonzero_frac >= ALIGNED_MAX_COVERAGE)
+    {
         tracing::info!(
             "panels share one geometry but cover >= {:.0}% of it — treating input as solved \
              raw panels (--input aligned overrides)",
@@ -198,8 +202,11 @@ fn analyze_solved(
                 let h = p.header();
                 match WcsModel::from_properties(&h.properties, h.width, h.height) {
                     Some(m) => panels.push((p, m)),
-                    None => errors
-                        .push(format!("{}: {}", path.display(), describe_unsolved(&h.properties))),
+                    None => errors.push(format!(
+                        "{}: {}",
+                        path.display(),
+                        describe_unsolved(&h.properties)
+                    )),
                 }
             }
             Err(e) => errors.push(e.to_string()),
@@ -218,7 +225,11 @@ fn analyze_solved(
     if let Some((p, _)) = panels.iter().find(|(p, _)| p.channels() != ch) {
         return Err(Error::format(
             p.path(),
-            format!("panel has {} channels, expected {ch} like {}", p.channels(), paths[0].display()),
+            format!(
+                "panel has {} channels, expected {ch} like {}",
+                p.channels(),
+                paths[0].display()
+            ),
         ));
     }
 
@@ -256,7 +267,11 @@ fn analyze_solved(
         aligned.push(ap);
     }
     let align_secs = t_align.elapsed().as_secs_f64();
-    tracing::info!("align stage: {} panels in {:.2}s", aligned.len(), align_secs);
+    tracing::info!(
+        "align stage: {} panels in {:.2}s",
+        aligned.len(),
+        align_secs
+    );
     drop(panels); // source mmaps no longer needed
 
     // Scan the caches exactly like aligned frames, through PanelReader.
@@ -301,10 +316,9 @@ fn describe_unsolved(props: &[XisfProperty]) -> String {
         .collect();
     if !missing.is_empty() {
         format!("missing astrometric properties: {}", missing.join(", "))
-    } else if props
-        .iter()
-        .any(|p| p.id.starts_with("PCL:AstrometricSolution:SplineWorldTransformation:"))
-    {
+    } else if props.iter().any(|p| {
+        p.id.starts_with("PCL:AstrometricSolution:SplineWorldTransformation:")
+    }) {
         "spline solution present but its interpolation grids are missing or failed validation"
             .to_string()
     } else {
@@ -329,8 +343,10 @@ fn finish_session(
         scan.summary.write(&path)
     })?;
 
-    let (metas, summaries): (Vec<_>, Vec<_>) =
-        scans.into_iter().map(|scan| (scan.meta, scan.summary)).unzip();
+    let (metas, summaries): (Vec<_>, Vec<_>) = scans
+        .into_iter()
+        .map(|scan| (scan.meta, scan.summary))
+        .unzip();
     session.panels = metas;
 
     let graph = OverlapGraph::build(&summaries);
@@ -344,8 +360,7 @@ fn finish_session(
 
     match surface_order {
         Some(order) => {
-            let surfaces =
-                crate::surfaces::fit_surfaces(&summaries, &graph, &phot, canvas, order)?;
+            let surfaces = crate::surfaces::fit_surfaces(&summaries, &graph, &phot, canvas, order)?;
             surfaces.save(&session.surfaces_path())?;
         }
         None => {
@@ -481,13 +496,33 @@ fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
         }
     }
 
-    meta.bbox = if covered_total == 0 { [0, 0, 0, 0] } else { [x0, y0, x1, y1] };
+    meta.bbox = if covered_total == 0 {
+        [0, 0, 0, 0]
+    } else {
+        [x0, y0, x1, y1]
+    };
     meta.nonzero_frac = covered_total as f64 / (w * h) as f64;
-    meta.ch_min = ch_min.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect();
-    meta.ch_max = ch_max.into_iter().map(|v| if v.is_finite() { v } else { 0.0 }).collect();
+    meta.ch_min = ch_min
+        .into_iter()
+        .map(|v| if v.is_finite() { v } else { 0.0 })
+        .collect();
+    meta.ch_max = ch_max
+        .into_iter()
+        .map(|v| if v.is_finite() { v } else { 0.0 })
+        .collect();
     meta.ch_mean = ch_sum
         .into_iter()
-        .map(|s| if covered_total > 0 { s / covered_total as f64 } else { 0.0 })
+        .map(|s| {
+            if covered_total > 0 {
+                s / covered_total as f64
+            } else {
+                0.0
+            }
+        })
         .collect();
-    Ok(PanelScan { meta, summary, canvas: (w, h, ch) })
+    Ok(PanelScan {
+        meta,
+        summary,
+        canvas: (w, h, ch),
+    })
 }

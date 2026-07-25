@@ -158,7 +158,10 @@ pub fn build_masked(plane: &[f32], valid: &[f32], w8: u32, h8: u32, n_levels: u3
     let mut a: Vec<f32> = plane.iter().zip(valid).map(|(&d, &v)| d * v).collect();
     let mut v = valid.to_vec();
     let ratio = |a: &[f32], v: &[f32]| -> Vec<f32> {
-        a.iter().zip(v).map(|(&av, &vv)| if vv > EPS_WEIGHT { av / vv } else { 0.0 }).collect()
+        a.iter()
+            .zip(v)
+            .map(|(&av, &vv)| if vv > EPS_WEIGHT { av / vv } else { 0.0 })
+            .collect()
     };
     let mut gauss = vec![ratio(&a, &v)];
     for l in 0..n_levels as usize {
@@ -196,13 +199,7 @@ pub fn build_masked(plane: &[f32], valid: &[f32], w8: u32, h8: u32, n_levels: u3
 /// wherever its mask is nonzero its data pyramid is a genuine normalized
 /// convolution of covered cells. Masks of all-ones validity (tests, single
 /// dense panel) are unaffected.
-pub fn mask_pyramid(
-    mask: &[f32],
-    valid: &[f32],
-    w8: u32,
-    h8: u32,
-    n_levels: u32,
-) -> CellPyramid {
+pub fn mask_pyramid(mask: &[f32], valid: &[f32], w8: u32, h8: u32, n_levels: u32) -> CellPyramid {
     let (w, h) = (w8 as usize, h8 as usize);
     assert_eq!(mask.len(), w * h, "mask must be w8*h8");
     assert_eq!(valid.len(), w * h, "valid must be w8*h8");
@@ -260,12 +257,24 @@ pub fn blend_pyramids_guarded(
     masks: &[&CellPyramid],
 ) -> (Vec<f32>, Vec<bool>) {
     assert!(!datas.is_empty(), "pyramid blend needs at least one panel");
-    assert_eq!(datas.len(), masks.len(), "one mask pyramid per data pyramid");
+    assert_eq!(
+        datas.len(),
+        masks.len(),
+        "one mask pyramid per data pyramid"
+    );
     let (w8, h8) = (datas[0].w8, datas[0].h8);
     let n_lv = datas[0].levels.len();
     for (d, m) in datas.iter().zip(masks) {
-        assert_eq!((d.w8, d.h8, d.levels.len()), (w8, h8, n_lv), "pyramid shapes must match");
-        assert_eq!((m.w8, m.h8, m.levels.len()), (w8, h8, n_lv), "pyramid shapes must match");
+        assert_eq!(
+            (d.w8, d.h8, d.levels.len()),
+            (w8, h8, n_lv),
+            "pyramid shapes must match"
+        );
+        assert_eq!(
+            (m.w8, m.h8, m.levels.len()),
+            (w8, h8, n_lv),
+            "pyramid shapes must match"
+        );
     }
 
     // Per level: mask-weighted sum, renormalized per cell.
@@ -276,8 +285,10 @@ pub fn blend_pyramids_guarded(
         let mut acc = vec![0.0f32; cells];
         let mut wsum = vec![0.0f32; cells];
         for (d, m) in datas.iter().zip(masks) {
-            for ((a, s), (&dv, &mv)) in
-                acc.iter_mut().zip(&mut wsum).zip(d.levels[l].iter().zip(&m.levels[l]))
+            for ((a, s), (&dv, &mv)) in acc
+                .iter_mut()
+                .zip(&mut wsum)
+                .zip(d.levels[l].iter().zip(&m.levels[l]))
             {
                 *a += mv * dv;
                 *s += mv;
@@ -336,12 +347,20 @@ mod tests {
     /// on random planes of several sizes, including non-power-of-two.
     #[test]
     fn build_collapse_is_identity() {
-        for &(w, h, n) in
-            &[(16u32, 16u32, 3u32), (13, 9, 2), (57, 41, 4), (128, 1, 3), (1157, 33, 5)]
-        {
+        for &(w, h, n) in &[
+            (16u32, 16u32, 3u32),
+            (13, 9, 2),
+            (57, 41, 4),
+            (128, 1, 3),
+            (1157, 33, 5),
+        ] {
             let plane = random_plane(w as usize, h as usize, 7 + w as u64 * h as u64);
             let p = build(&plane, w, h, n);
-            assert_eq!(p.levels.len(), n as usize + 1, "n Laplacian levels + residual");
+            assert_eq!(
+                p.levels.len(),
+                n as usize + 1,
+                "n Laplacian levels + residual"
+            );
             let back = collapse(&p);
             let max = plane
                 .iter()
@@ -398,9 +417,19 @@ mod tests {
         let ones = vec![1.0f32; plane.len()];
         let mask = mask_pyramid(&ones, &ones, w, h, 3);
         let (out, def) = blend_pyramids_guarded(&[&data], &[&mask]);
-        assert!(def.iter().all(|&d| d), "constant mask must be defined everywhere");
-        let max = plane.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max < 1e-5, "single-panel blend must reproduce the plane, max err {max}");
+        assert!(
+            def.iter().all(|&d| d),
+            "constant mask must be defined everywhere"
+        );
+        let max = plane
+            .iter()
+            .zip(&out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max < 1e-5,
+            "single-panel blend must reproduce the plane, max err {max}"
+        );
     }
 
     /// Two constant panels split left/right: the blend transitions from one
@@ -413,8 +442,9 @@ mod tests {
         let cells = wu * hu;
         let a = vec![0.2f32; cells];
         let b = vec![0.8f32; cells];
-        let mask_a: Vec<f32> =
-            (0..cells).map(|i| if i % wu < wu / 2 { 1.0 } else { 0.0 }).collect();
+        let mask_a: Vec<f32> = (0..cells)
+            .map(|i| if i % wu < wu / 2 { 1.0 } else { 0.0 })
+            .collect();
         let mask_b: Vec<f32> = mask_a.iter().map(|&m| 1.0 - m).collect();
         let n = 3;
         let ones = vec![1.0f32; cells];
@@ -425,7 +455,11 @@ mod tests {
         // Plateau tolerance 5e-3: the residual level's transition is ±~2·2ⁿ
         // cells wide by design, so its far tails still graze the grid edges.
         let y = hu / 2;
-        assert!((out[y * wu] - 0.2).abs() < 5e-3, "left plateau: {}", out[y * wu]);
+        assert!(
+            (out[y * wu] - 0.2).abs() < 5e-3,
+            "left plateau: {}",
+            out[y * wu]
+        );
         assert!(
             (out[y * wu + wu - 1] - 0.8).abs() < 5e-3,
             "right plateau: {}",
@@ -434,8 +468,14 @@ mod tests {
         let mut prev = f32::NEG_INFINITY;
         for x in 0..wu {
             let v = out[y * wu + x];
-            assert!(v >= prev - 1e-4, "profile not monotone at x={x}: {v} < {prev}");
-            assert!((0.2 - 1e-3..=0.8 + 1e-3).contains(&v), "overshoot at x={x}: {v}");
+            assert!(
+                v >= prev - 1e-4,
+                "profile not monotone at x={x}: {v} < {prev}"
+            );
+            assert!(
+                (0.2 - 1e-3..=0.8 + 1e-3).contains(&v),
+                "overshoot at x={x}: {v}"
+            );
             prev = v;
         }
     }
@@ -450,7 +490,10 @@ mod tests {
         let data = build(&plane, w, h, 2);
         let mask = mask_pyramid(&vec![0.0f32; cells], &vec![1.0f32; cells], w, h, 2);
         let (out, def) = blend_pyramids_guarded(&[&data], &[&mask]);
-        assert!(def.iter().all(|&d| !d), "zero masks must be undefined everywhere");
+        assert!(
+            def.iter().all(|&d| !d),
+            "zero masks must be undefined everywhere"
+        );
         assert!(out.iter().all(|&v| v == 0.0));
     }
 
@@ -472,13 +515,16 @@ mod tests {
         let (edge_a, edge_b) = (224usize, 192usize);
         let a = vec![0.5f32; cells];
         let b = vec![0.1f32; cells];
-        let valid_a: Vec<f32> =
-            (0..cells).map(|i| if i % wu < edge_a { 1.0 } else { 0.0 }).collect();
-        let valid_b: Vec<f32> =
-            (0..cells).map(|i| if i % wu >= edge_b { 1.0 } else { 0.0 }).collect();
+        let valid_a: Vec<f32> = (0..cells)
+            .map(|i| if i % wu < edge_a { 1.0 } else { 0.0 })
+            .collect();
+        let valid_b: Vec<f32> = (0..cells)
+            .map(|i| if i % wu >= edge_b { 1.0 } else { 0.0 })
+            .collect();
         // Ownership splits mid-overlap.
-        let mask_a: Vec<f32> =
-            (0..cells).map(|i| if i % wu < 208 { 1.0 } else { 0.0 }).collect();
+        let mask_a: Vec<f32> = (0..cells)
+            .map(|i| if i % wu < 208 { 1.0 } else { 0.0 })
+            .collect();
         let mask_b: Vec<f32> = mask_a.iter().map(|&m| 1.0 - m).collect();
 
         let pa = build_masked(&a, &valid_a, w, h, n);

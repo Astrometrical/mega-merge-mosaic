@@ -81,7 +81,10 @@ impl FitsSink {
 impl RowSink for FitsSink {
     fn begin(&mut self, w: u64, h: u64, ch: u64) -> Result<()> {
         if w == 0 || h == 0 || ch == 0 {
-            return Err(Error::format(&self.path, "FITS output dimensions must be nonzero"));
+            return Err(Error::format(
+                &self.path,
+                "FITS output dimensions must be nonzero",
+            ));
         }
         self.dims = (w, h, ch);
 
@@ -94,7 +97,11 @@ impl RowSink for FitsSink {
             card("NAXIS3", &ch.to_string(), "channels"),
             card("ROWORDER", "'TOP-DOWN'", "row order"),
         ];
-        cards.extend(self.keywords.iter().map(|k| card(&k.name, &k.value, &k.comment)));
+        cards.extend(
+            self.keywords
+                .iter()
+                .map(|k| card(&k.name, &k.value, &k.comment)),
+        );
         cards.push(card("END", "", ""));
         // The END card must not carry the "= " marker.
         *cards.last_mut().unwrap() = {
@@ -127,7 +134,10 @@ impl RowSink for FitsSink {
         if plane_stride == 0 || !rows.len().is_multiple_of(plane_stride) {
             return Err(Error::format(
                 &self.path,
-                format!("band length {} is not a multiple of ch*w = {plane_stride}", rows.len()),
+                format!(
+                    "band length {} is not a multiple of ch*w = {plane_stride}",
+                    rows.len()
+                ),
             ));
         }
         let band_rows = (rows.len() / plane_stride) as u64;
@@ -146,7 +156,9 @@ impl RowSink for FitsSink {
                 buf.extend_from_slice(&v.to_be_bytes());
             }
             let off = self.data_start + (c * h + y0) * w * 4;
-            self.file.seek(SeekFrom::Start(off)).map_err(|e| self.io(e))?;
+            self.file
+                .seek(SeekFrom::Start(off))
+                .map_err(|e| self.io(e))?;
             self.file.write_all(&buf).map_err(|e| self.io(e))?;
         }
         self.rows_written += band_rows;
@@ -188,8 +200,11 @@ pub fn keywords_for_output(src: &[FitsKeyword], crop: (u64, u64)) -> Vec<FitsKey
                 // base cancels: new = old − crop_origin.
                 if let Ok(v) = kw.value.trim().parse::<f64>() {
                     let nv = v - shift;
-                    kw.value =
-                        if nv.fract() == 0.0 { format!("{nv:.1}") } else { format!("{nv}") };
+                    kw.value = if nv.fract() == 0.0 {
+                        format!("{nv:.1}")
+                    } else {
+                        format!("{nv}")
+                    };
                 }
             }
             Some(kw)
@@ -236,7 +251,11 @@ mod tests {
         sink.finish().unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(bytes.len(), 5760, "one header block + one padded data block");
+        assert_eq!(
+            bytes.len(),
+            5760,
+            "one header block + one padded data block"
+        );
 
         let header = &bytes[..2880];
         assert!(String::from_utf8_lossy(&header[..CARD]).starts_with("SIMPLE  ="));
@@ -255,7 +274,10 @@ mod tests {
             let off = 2880 + i * 4;
             assert_eq!(bytes[off..off + 4], v.to_be_bytes(), "sample {i}");
         }
-        assert!(bytes[2880 + 48..].iter().all(|&b| b == 0), "data padding must be zero");
+        assert!(
+            bytes[2880 + 48..].iter().all(|&b| b == 0),
+            "data padding must be zero"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -270,7 +292,11 @@ mod tests {
                 value: "'M42'".into(),
                 comment: "target".into(),
             },
-            FitsKeyword { name: "CRVAL1".into(), value: "83.822".into(), comment: "".into() },
+            FitsKeyword {
+                name: "CRVAL1".into(),
+                value: "83.822".into(),
+                comment: "".into(),
+            },
         ];
         let mut sink = FitsSink::create(&path, kws).unwrap();
         sink.begin(2, 2, 1).unwrap();
@@ -320,13 +346,20 @@ mod tests {
         ];
         let out = keywords_for_output(&src, (100, 200));
 
-        for gone in ["SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND", "BSCALE", "BZERO", "ROWORDER"] {
+        for gone in [
+            "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND", "BSCALE", "BZERO",
+            "ROWORDER",
+        ] {
             assert!(out.iter().all(|k| k.name != gone), "{gone} must be dropped");
         }
         let get = |name: &str| out.iter().find(|k| k.name == name).unwrap().value.clone();
         assert_eq!(get("CRPIX1").parse::<f64>().unwrap(), 4527.5);
         assert_eq!(get("CRPIX2").parse::<f64>().unwrap(), 8955.0);
-        assert_eq!(get("OBJECT"), "'M42'", "non-structural values pass through untouched");
+        assert_eq!(
+            get("OBJECT"),
+            "'M42'",
+            "non-structural values pass through untouched"
+        );
         assert_eq!(get("CRVAL1"), "83.822");
     }
 }

@@ -63,7 +63,9 @@ impl XisfPanel {
             .checked_add(header.data_size)
             .filter(|&end| end <= mmap.len() as u64)
             .ok_or_else(|| Error::format(path, "data block extends past end of file"))?;
-        let expected = header.width * header.height * header.channels
+        let expected = header.width
+            * header.height
+            * header.channels
             * header.sample_format.bytes_per_sample() as u64;
         if header.data_size != expected {
             return Err(Error::format(
@@ -79,7 +81,10 @@ impl XisfPanel {
         if header.sample_format != SampleFormat::Float32 {
             return Err(Error::format(
                 path,
-                format!("unsupported sample format {:?} (only Float32 for now)", header.sample_format),
+                format!(
+                    "unsupported sample format {:?} (only Float32 for now)",
+                    header.sample_format
+                ),
             ));
         }
         if header.data_offset % 4 != 0 {
@@ -88,7 +93,11 @@ impl XisfPanel {
             return Err(Error::format(path, "attachment offset not 4-byte aligned"));
         }
 
-        Ok(Self { path: path.to_path_buf(), mmap, header })
+        Ok(Self {
+            path: path.to_path_buf(),
+            mmap,
+            header,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -135,7 +144,10 @@ impl XisfPanel {
 
 fn parse_header(path: &Path, mmap: &Mmap) -> Result<XisfHeader> {
     if mmap.len() < 16 || &mmap[0..8] != SIGNATURE {
-        return Err(Error::format(path, "not a monolithic XISF file (bad signature)"));
+        return Err(Error::format(
+            path,
+            "not a monolithic XISF file (bad signature)",
+        ));
     }
     let header_len = u32::from_le_bytes(mmap[8..12].try_into().unwrap()) as usize;
     if mmap.len() < 16 + header_len {
@@ -268,7 +280,9 @@ fn parse_property_start(path: &Path, e: &quick_xml::events::BytesStart) -> Resul
 fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfProperty> {
     let err = |msg: String| Error::format(path, msg);
     let scalar = |p: &PendingProperty| -> String {
-        p.value_attr.clone().unwrap_or_else(|| text.trim().to_string())
+        p.value_attr
+            .clone()
+            .unwrap_or_else(|| text.trim().to_string())
     };
 
     let mut location = None;
@@ -290,12 +304,16 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
             "0" | "false" => PropertyValue::I64(0),
             v => return Err(err(format!("property {}: bad boolean '{v}'", p.id))),
         },
-        "String" | "TimePoint" => {
-            PropertyValue::Str(p.value_attr.clone().unwrap_or_else(|| text.trim().to_string()))
-        }
+        "String" | "TimePoint" => PropertyValue::Str(
+            p.value_attr
+                .clone()
+                .unwrap_or_else(|| text.trim().to_string()),
+        ),
         "F64Vector" | "F64Matrix" => {
             let n = if p.type_ == "F64Vector" {
-                p.length.ok_or_else(|| err(format!("property {}: missing length", p.id)))? as usize
+                p.length
+                    .ok_or_else(|| err(format!("property {}: missing length", p.id)))?
+                    as usize
             } else {
                 let (r, c) = p
                     .rows
@@ -324,10 +342,16 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
                 Some(loc) if loc.starts_with("attachment:") => {
                     let mut it = loc.splitn(3, ':').skip(1);
                     let off: u64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                        err(format!("property {}: bad attachment location '{loc}'", p.id))
+                        err(format!(
+                            "property {}: bad attachment location '{loc}'",
+                            p.id
+                        ))
                     })?;
                     let size: u64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                        err(format!("property {}: bad attachment location '{loc}'", p.id))
+                        err(format!(
+                            "property {}: bad attachment location '{loc}'",
+                            p.id
+                        ))
                     })?;
                     if size != (n * 8) as u64 {
                         return Err(err(format!(
@@ -349,7 +373,11 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
             if p.type_ == "F64Vector" {
                 PropertyValue::F64Vec(data)
             } else {
-                PropertyValue::F64Mat { rows: p.rows.unwrap(), cols: p.cols.unwrap(), data }
+                PropertyValue::F64Mat {
+                    rows: p.rows.unwrap(),
+                    cols: p.cols.unwrap(),
+                    data,
+                }
             }
         }
         _ => match p.value_attr.clone() {
@@ -358,7 +386,12 @@ fn finish_property(path: &Path, p: PendingProperty, text: &str) -> Result<XisfPr
         },
     };
 
-    Ok(XisfProperty { id: p.id, type_: p.type_, value, location })
+    Ok(XisfProperty {
+        id: p.id,
+        type_: p.type_,
+        value,
+        location,
+    })
 }
 
 /// Decode `inline:base64` / `inline:hex` payload text to raw bytes.
@@ -415,11 +448,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Typed reader for an attachment-located f64 vector/matrix property: reads
 /// `location` bytes from the mapped file and returns the filled-in value.
-pub fn read_attached_f64s(
-    file: &[u8],
-    path: &Path,
-    prop: &XisfProperty,
-) -> Result<PropertyValue> {
+pub fn read_attached_f64s(file: &[u8], path: &Path, prop: &XisfProperty) -> Result<PropertyValue> {
     let (off, size) = prop
         .location
         .ok_or_else(|| Error::format(path, format!("property {} has no attachment", prop.id)))?;
@@ -427,22 +456,32 @@ pub fn read_attached_f64s(
         .checked_add(size)
         .filter(|&e| e <= file.len() as u64)
         .ok_or_else(|| {
-            Error::format(path, format!("property {}: attachment out of bounds", prop.id))
+            Error::format(
+                path,
+                format!("property {}: attachment out of bounds", prop.id),
+            )
         })?;
     let bytes = &file[off as usize..end as usize];
     if !bytes.len().is_multiple_of(8) {
         return Err(Error::format(
             path,
-            format!("property {}: attachment size {} not a multiple of 8", prop.id, size),
+            format!(
+                "property {}: attachment size {} not a multiple of 8",
+                prop.id, size
+            ),
         ));
     }
-    let data: Vec<f64> =
-        bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+    let data: Vec<f64> = bytes
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
     match &prop.value {
         PropertyValue::F64Vec(_) => Ok(PropertyValue::F64Vec(data)),
-        PropertyValue::F64Mat { rows, cols, .. } => {
-            Ok(PropertyValue::F64Mat { rows: *rows, cols: *cols, data })
-        }
+        PropertyValue::F64Mat { rows, cols, .. } => Ok(PropertyValue::F64Mat {
+            rows: *rows,
+            cols: *cols,
+            data,
+        }),
         _ => Err(Error::format(
             path,
             format!("property {}: not an f64 vector/matrix", prop.id),
@@ -450,7 +489,11 @@ pub fn read_attached_f64s(
     }
 }
 
-fn attr_string(path: &Path, e: &quick_xml::events::BytesStart, key: &[u8]) -> Result<Option<String>> {
+fn attr_string(
+    path: &Path,
+    e: &quick_xml::events::BytesStart,
+    key: &[u8],
+) -> Result<Option<String>> {
     for attr in e.attributes() {
         let attr = attr.map_err(|err| Error::format(path, format!("bad XML attribute: {err}")))?;
         if attr.key.local_name().as_ref() == key {
@@ -466,10 +509,18 @@ fn attr_string(path: &Path, e: &quick_xml::events::BytesStart, key: &[u8]) -> Re
 fn parse_image_element(path: &Path, e: &quick_xml::events::BytesStart) -> Result<XisfHeader> {
     let geometry = attr_string(path, e, b"geometry")?
         .ok_or_else(|| Error::format(path, "<Image> missing geometry"))?;
-    let dims: Vec<u64> = geometry.split(':').map(|p| p.parse().unwrap_or(0)).collect();
+    let dims: Vec<u64> = geometry
+        .split(':')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect();
     let (width, height, channels) = match dims.as_slice() {
         [w, h, c] if *w > 0 && *h > 0 && *c > 0 => (*w, *h, *c),
-        _ => return Err(Error::format(path, format!("unsupported geometry '{geometry}' (need W:H:C)"))),
+        _ => {
+            return Err(Error::format(
+                path,
+                format!("unsupported geometry '{geometry}' (need W:H:C)"),
+            ));
+        }
     };
 
     let sample_format_s = attr_string(path, e, b"sampleFormat")?
@@ -482,8 +533,9 @@ fn parse_image_element(path: &Path, e: &quick_xml::events::BytesStart) -> Result
     let loc: Vec<&str> = location.split(':').collect();
     let (data_offset, data_size) = match loc.as_slice() {
         ["attachment", off, size] => (
-            off.parse::<u64>()
-                .map_err(|_| Error::format(path, format!("bad attachment offset in '{location}'")))?,
+            off.parse::<u64>().map_err(|_| {
+                Error::format(path, format!("bad attachment offset in '{location}'"))
+            })?,
             size.parse::<u64>()
                 .map_err(|_| Error::format(path, format!("bad attachment size in '{location}'")))?,
         ),
@@ -504,12 +556,18 @@ fn parse_image_element(path: &Path, e: &quick_xml::events::BytesStart) -> Result
     if let Some(storage) = attr_string(path, e, b"pixelStorage")?
         && storage != "Planar"
     {
-        return Err(Error::format(path, format!("unsupported pixelStorage '{storage}'")));
+        return Err(Error::format(
+            path,
+            format!("unsupported pixelStorage '{storage}'"),
+        ));
     }
     if let Some(order) = attr_string(path, e, b"byteOrder")?
         && order != "little"
     {
-        return Err(Error::format(path, format!("unsupported byteOrder '{order}'")));
+        return Err(Error::format(
+            path,
+            format!("unsupported byteOrder '{order}'"),
+        ));
     }
 
     Ok(XisfHeader {
@@ -585,7 +643,11 @@ mod tests {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut s = String::new();
         for chunk in bytes.chunks(3) {
-            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
             let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
             for i in 0..4 {
                 if i <= chunk.len() {
@@ -636,7 +698,10 @@ mod tests {
         bytes.extend_from_slice(&(xml.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(xml.as_bytes());
-        assert!(bytes.len() <= 1536, "header must fit below the attachment payload");
+        assert!(
+            bytes.len() <= 1536,
+            "header must fit below the attachment payload"
+        );
         bytes.resize(1536, 0);
         for v in att {
             bytes.extend_from_slice(&v.to_le_bytes());
@@ -659,13 +724,19 @@ mod tests {
         let panel = XisfPanel::open(&path).unwrap();
         let props = &panel.header().properties;
         let get = |id: &str| {
-            props.iter().find(|p| p.id == id).unwrap_or_else(|| panic!("property {id} missing"))
+            props
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("property {id} missing"))
         };
 
         assert_eq!(get("P:Scalar").value.as_f64(), Some(1.5));
         assert_eq!(get("P:Scalar").type_, "Float64");
         assert_eq!(get("P:Int").value, PropertyValue::I64(-7));
-        assert_eq!(get("P:Time").value.as_str(), Some("2026-07-24T03:43:50.946Z"));
+        assert_eq!(
+            get("P:Time").value.as_str(),
+            Some("2026-07-24T03:43:50.946Z")
+        );
         assert_eq!(get("P:Text").value.as_str(), Some("hello & world"));
         assert_eq!(get("P:Vec").value.as_f64_vec(), Some(&[4627.5, 9155.0][..]));
         let (rows, cols, data) = get("P:Mat").value.as_f64_mat().unwrap();
@@ -673,14 +744,22 @@ mod tests {
         assert_eq!(data, &[-4.4e-4, 0.0, 0.0, 4.4e-4]);
 
         let att = get("P:Att");
-        assert_eq!(att.location, Some((1536, 24)), "attachment offset/size exposed");
+        assert_eq!(
+            att.location,
+            Some((1536, 24)),
+            "attachment offset/size exposed"
+        );
         assert_eq!(
             att.value.as_f64_vec(),
             Some(&[10.5, -20.25, 30.0][..]),
             "attachment-located f64 vector resolved on open"
         );
 
-        assert_eq!(get("P:Odd").value, PropertyValue::Unread, "undecoded types stay Unread");
+        assert_eq!(
+            get("P:Odd").value,
+            PropertyValue::Unread,
+            "undecoded types stay Unread"
+        );
 
         // Image data still reads with properties present.
         assert_eq!(panel.channel(0), &[0.0, 1.0, 2.0, 3.0]);
@@ -693,9 +772,14 @@ mod tests {
         // Exact bytes captured from a real MosaicByCoordinates panel header
         // (PCL:AstrometricSolution:LinearTransformationMatrix).
         let bytes = base64_decode("qj/NbcwTPb8AAAAAAAAAAAAAAAAAAAAAqj/NbcwTPT8=").unwrap();
-        let vals: Vec<f64> =
-            bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
-        assert_eq!(vals, vec![-4.436849683786501e-4, 0.0, 0.0, 4.436849683786501e-4]);
+        let vals: Vec<f64> = bytes
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            vals,
+            vec![-4.436849683786501e-4, 0.0, 0.0, 4.436849683786501e-4]
+        );
     }
 
     #[test]

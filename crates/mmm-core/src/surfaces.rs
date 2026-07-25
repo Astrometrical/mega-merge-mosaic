@@ -167,8 +167,20 @@ pub fn fit_surfaces(
     let mut bg_mads = Vec::with_capacity(channels);
 
     for c in 0..channels {
-        let gain = |p: usize| phot.gains.get(c).and_then(|v| v.get(p)).copied().unwrap_or(1.0);
-        let offs = |p: usize| phot.offsets.get(c).and_then(|v| v.get(p)).copied().unwrap_or(0.0);
+        let gain = |p: usize| {
+            phot.gains
+                .get(c)
+                .and_then(|v| v.get(p))
+                .copied()
+                .unwrap_or(1.0)
+        };
+        let offs = |p: usize| {
+            phot.offsets
+                .get(c)
+                .and_then(|v| v.get(p))
+                .copied()
+                .unwrap_or(0.0)
+        };
 
         // Guard rail: per-panel background threshold median + 3×MAD over the
         // corrected means of the panel's fully covered cells.
@@ -320,8 +332,9 @@ pub fn fit_surfaces(
         }
 
         let z = solve_dense(&mut a, &mut b, n)?;
-        let ch_coeffs: Vec<Vec<f64>> =
-            (0..n_panels).map(|p| z[p * t..(p + 1) * t].to_vec()).collect();
+        let ch_coeffs: Vec<Vec<f64>> = (0..n_panels)
+            .map(|p| z[p * t..(p + 1) * t].to_vec())
+            .collect();
 
         // Diagnostics: max |s| over each panel's covered footprint.
         let mut ch_max = vec![0.0f64; n_panels];
@@ -345,7 +358,12 @@ pub fn fit_surfaces(
         bg_mads.push(mads);
     }
 
-    Ok(Surfaces { order, coeffs, max_abs_s, bg_mad: bg_mads })
+    Ok(Surfaces {
+        order,
+        coeffs,
+        max_abs_s,
+        bg_mad: bg_mads,
+    })
 }
 
 /// Count of fully covered L8 cells — must mirror photometry's gauge measure.
@@ -372,7 +390,11 @@ fn sorted(v: &mut [f64]) -> &[f64] {
 
 fn median_of_sorted(v: &[f64]) -> f64 {
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 #[cfg(test)]
@@ -502,17 +524,24 @@ mod tests {
         assert_eq!(surf.coeffs[0][0].len(), 6);
 
         let amp = injected_amplitude(&res, (canvas.0, canvas.1));
-        assert!(amp > 1e-3, "spec should inject a visible gradient, amp = {amp}");
+        assert!(
+            amp > 1e-3,
+            "spec should inject a visible gradient, amp = {amp}"
+        );
 
-        let rms_before =
-            overlap_residual_rms(&summaries, &graph, &phot, &zero_like(&surf), canvas);
+        let rms_before = overlap_residual_rms(&summaries, &graph, &phot, &zero_like(&surf), canvas);
         let rms_after = overlap_residual_rms(&summaries, &graph, &phot, &surf, canvas);
-        eprintln!("amp {amp:.4e}  overlap residual RMS before {rms_before:.4e} after {rms_after:.4e}");
+        eprintln!(
+            "amp {amp:.4e}  overlap residual RMS before {rms_before:.4e} after {rms_after:.4e}"
+        );
         assert!(
             rms_after < 0.05 * amp,
             "post-correction residual RMS {rms_after:.4e} >= 5% of amplitude {amp:.4e}"
         );
-        assert!(rms_after < 0.2 * rms_before, "correction barely improved the residual");
+        assert!(
+            rms_after < 0.2 * rms_before,
+            "correction barely improved the residual"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -566,7 +595,10 @@ mod tests {
                 }
             }
         }
-        assert!(max_field > 1e-3, "no-star surfaces should be non-trivial: {max_field:.3e}");
+        assert!(
+            max_field > 1e-3,
+            "no-star surfaces should be non-trivial: {max_field:.3e}"
+        );
 
         let mut max_diff = 0.0f64;
         for p in 0..4 {

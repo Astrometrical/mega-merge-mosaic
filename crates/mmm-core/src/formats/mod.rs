@@ -44,7 +44,11 @@ pub enum PropertyValue {
     F64(f64),
     I64(i64),
     F64Vec(Vec<f64>),
-    F64Mat { rows: u32, cols: u32, data: Vec<f64> },
+    F64Mat {
+        rows: u32,
+        cols: u32,
+        data: Vec<f64>,
+    },
     Unread,
 }
 

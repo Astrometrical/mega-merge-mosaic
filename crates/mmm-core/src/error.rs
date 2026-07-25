@@ -17,10 +17,16 @@ pub enum Error {
 
 impl Error {
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
-        Error::Io { path: path.into(), source }
+        Error::Io {
+            path: path.into(),
+            source,
+        }
     }
 
     pub fn format(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
-        Error::Format { path: path.into(), reason: reason.into() }
+        Error::Format {
+            path: path.into(),
+            reason: reason.into(),
+        }
     }
 }

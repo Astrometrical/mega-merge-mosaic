@@ -92,7 +92,10 @@ impl MosaicFrame {
     pub fn linear_wcs(&self) -> LinearWcs {
         LinearWcs {
             crval: self.crval,
-            crpix: [self.width as f64 / 2.0 + 0.5, self.height as f64 / 2.0 + 0.5],
+            crpix: [
+                self.width as f64 / 2.0 + 0.5,
+                self.height as f64 / 2.0 + 0.5,
+            ],
             cd: [[-self.scale_deg, 0.0], [0.0, self.scale_deg]],
             ctype: ["RA---TAN".to_string(), "DEC--TAN".to_string()],
             radesys: "ICRS".to_string(),
@@ -166,7 +169,13 @@ pub fn choose_frame(models: &[WcsModel]) -> MosaicFrame {
 
     // Union footprint in a provisional frame centered on the spherical mean
     // (reference pixel at 0 — only extents matter here).
-    let prov = MosaicFrame { crval: mean, scale_deg: scale, width: 0, height: 0 }.linear_wcs();
+    let prov = MosaicFrame {
+        crval: mean,
+        scale_deg: scale,
+        width: 0,
+        height: 0,
+    }
+    .linear_wcs();
     let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
     let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
     for m in models {
@@ -184,7 +193,12 @@ pub fn choose_frame(models: &[WcsModel]) -> MosaicFrame {
     let width = (x1 - x0).ceil() as u64 + 2 * FRAME_MARGIN_PX;
     let height = (y1 - y0).ceil() as u64 + 2 * FRAME_MARGIN_PX;
     let (cra, cdec) = prov.pixel_to_sky((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-    MosaicFrame { crval: [cra, cdec], scale_deg: scale, width, height }
+    MosaicFrame {
+        crval: [cra, cdec],
+        scale_deg: scale,
+        width,
+        height,
+    }
 }
 
 /// Lanczos-3 kernel: `sinc(t)·sinc(t/3)` for |t| < 3.
@@ -337,7 +351,10 @@ pub fn reproject_panel(
     }
     w.flush().map_err(|e| Error::io(&path, e))?;
 
-    Ok(AlignedPanel { bbox: [x0, y0, x1, y1], path })
+    Ok(AlignedPanel {
+        bbox: [x0, y0, x1, y1],
+        path,
+    })
 }
 
 #[cfg(test)]
@@ -357,7 +374,12 @@ mod tests {
     }
 
     fn prop(id: &str, type_: &str, value: PropertyValue) -> XisfProperty {
-        XisfProperty { id: id.into(), type_: type_.into(), value, location: None }
+        XisfProperty {
+            id: id.into(),
+            type_: type_.into(),
+            value,
+            location: None,
+        }
     }
 
     /// Linear-only model: reference at `refimg` (PixInsight image coords),
@@ -404,17 +426,39 @@ mod tests {
     fn choose_frame_takes_median_scale_and_mean_center() {
         // Three co-centered panels with scales s, s, 3s: median = s.
         let mk = |scale: f64| {
-            linear_model([10.0, 0.0], [50.0, 40.0], [[-scale, 0.0], [0.0, scale]], 100, 80)
+            linear_model(
+                [10.0, 0.0],
+                [50.0, 40.0],
+                [[-scale, 0.0], [0.0, scale]],
+                100,
+                80,
+            )
         };
         let frame = choose_frame(&[mk(S), mk(3.0 * S), mk(S)]);
-        assert!((frame.scale_deg - S).abs() < 1e-15, "median scale, got {}", frame.scale_deg);
+        assert!(
+            (frame.scale_deg - S).abs() < 1e-15,
+            "median scale, got {}",
+            frame.scale_deg
+        );
         // Center: all panels centered at (10, 0); the 3s panel's footprint
         // dominates symmetrically, so the frame stays centered there.
-        assert!((frame.crval[0] - 10.0).abs() < 1e-6, "ra {}", frame.crval[0]);
+        assert!(
+            (frame.crval[0] - 10.0).abs() < 1e-6,
+            "ra {}",
+            frame.crval[0]
+        );
         assert!(frame.crval[1].abs() < 1e-6, "dec {}", frame.crval[1]);
         // Canvas: the 3s panel spans 300×240 frame pixels; + 2×16 margin.
-        assert!((frame.width as i64 - 332).abs() <= 2, "width {}", frame.width);
-        assert!((frame.height as i64 - 272).abs() <= 2, "height {}", frame.height);
+        assert!(
+            (frame.width as i64 - 332).abs() <= 2,
+            "width {}",
+            frame.width
+        );
+        assert!(
+            (frame.height as i64 - 272).abs() <= 2,
+            "height {}",
+            frame.height
+        );
     }
 
     #[test]
@@ -424,10 +468,22 @@ mod tests {
         let a = linear_model([10.0, 0.0], [50.0, 40.0], [[-S, 0.0], [0.0, S]], 100, 80);
         let b = linear_model([10.05, 0.0], [50.0, 40.0], [[-S, 0.0], [0.0, S]], 100, 80);
         let frame = choose_frame(&[a, b]);
-        assert!((frame.width as i64 - 182).abs() <= 2, "width {}", frame.width);
-        assert!((frame.height as i64 - 112).abs() <= 2, "height {}", frame.height);
+        assert!(
+            (frame.width as i64 - 182).abs() <= 2,
+            "width {}",
+            frame.width
+        );
+        assert!(
+            (frame.height as i64 - 112).abs() <= 2,
+            "height {}",
+            frame.height
+        );
         // Recentered between the two panels.
-        assert!((frame.crval[0] - 10.025).abs() < 1e-4, "ra {}", frame.crval[0]);
+        assert!(
+            (frame.crval[0] - 10.025).abs() < 1e-4,
+            "ra {}",
+            frame.crval[0]
+        );
         assert!(frame.crval[1].abs() < 1e-6, "dec {}", frame.crval[1]);
         // The union footprint fits with the margin on every side: each
         // panel's corners land at least FRAME_MARGIN_PX − 1 inside.
@@ -478,11 +534,21 @@ mod tests {
         let dir = tmpdir("translate");
         let (sw, sh, nch) = (64usize, 48usize, 2usize);
         let panel = write_pattern_panel(&dir, sw, sh, nch);
-        let frame = MosaicFrame { crval: [30.0, 0.0], scale_deg: S, width: 40, height: 32 };
+        let frame = MosaicFrame {
+            crval: [30.0, 0.0],
+            scale_deg: S,
+            width: 40,
+            height: 32,
+        };
         // u = ox + (refimg_x − W/2 − 0.5): refimg_x = 20.5 − 8 → u = ox − 8;
         // v = oy + (refimg_y − H/2 − 0.5): refimg_y = 16.5 + 20 → v = oy + 20.
-        let model =
-            linear_model([30.0, 0.0], [12.5, 36.5], [[-S, 0.0], [0.0, S]], sw as u64, sh as u64);
+        let model = linear_model(
+            [30.0, 0.0],
+            [12.5, 36.5],
+            [[-S, 0.0], [0.0, S]],
+            sw as u64,
+            sh as u64,
+        );
         let ap = reproject_panel(&panel, &model, &frame, &dir.join("out")).unwrap();
         // Forward-mapped footprint: f_x = p_x + 7.5 ∈ [7.5, 71.5] → x ∈ [4, 40)
         // after padding/clamping; f_y = p_y − 20.5 ∈ [−20.5, 27.5] → y ∈ [0, 32).
@@ -528,7 +594,10 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 500, "translation test barely sampled ({checked} px)");
+        assert!(
+            checked > 500,
+            "translation test barely sampled ({checked} px)"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -540,13 +609,23 @@ mod tests {
         let dir = tmpdir("rot90");
         let (sw, sh, nch) = (48usize, 32usize, 1usize);
         let panel = write_pattern_panel(&dir, sw, sh, nch);
-        let frame = MosaicFrame { crval: [30.0, 0.0], scale_deg: S, width: 40, height: 36 };
+        let frame = MosaicFrame {
+            crval: [30.0, 0.0],
+            scale_deg: S,
+            width: 40,
+            height: 36,
+        };
         // Matrix s·[[0,1],[1,0]]: ξ = s·dy, η = s·dx (axis swap, det < 0 —
         // the standard astro mirror). Composing with the frame:
         //   u = oy + (refimg_x − H/2 − 0.5),  v = −ox + (refimg_y + W/2 − 0.5).
         // refimg = (22.5, 11.5) → u = oy + 4, v = 31 − ox.
-        let model =
-            linear_model([30.0, 0.0], [22.5, 11.5], [[0.0, S], [S, 0.0]], sw as u64, sh as u64);
+        let model = linear_model(
+            [30.0, 0.0],
+            [22.5, 11.5],
+            [[0.0, S], [S, 0.0]],
+            sw as u64,
+            sh as u64,
+        );
         let ap = reproject_panel(&panel, &model, &frame, &dir.join("out")).unwrap();
         let [x0, y0, x1, y1] = ap.bbox;
         let bw = (x1 - x0) as usize;
@@ -587,8 +666,12 @@ mod tests {
         let dir = tmpdir("halfpx");
         let (sw, sh) = (48usize, 40usize);
         let panel = write_pattern_panel(&dir, sw, sh, 1);
-        let frame =
-            MosaicFrame { crval: [30.0, 0.0], scale_deg: S, width: sw as u64, height: sh as u64 };
+        let frame = MosaicFrame {
+            crval: [30.0, 0.0],
+            scale_deg: S,
+            width: sw as u64,
+            height: sh as u64,
+        };
         // Model identical to the frame's own solution.
         let model = linear_model(
             [30.0, 0.0],
@@ -630,7 +713,12 @@ mod tests {
     fn reproject_rejects_disjoint_panel_and_geometry_mismatch() {
         let dir = tmpdir("disjoint");
         let panel = write_pattern_panel(&dir, 32, 24, 1);
-        let frame = MosaicFrame { crval: [30.0, 0.0], scale_deg: S, width: 40, height: 32 };
+        let frame = MosaicFrame {
+            crval: [30.0, 0.0],
+            scale_deg: S,
+            width: 40,
+            height: 32,
+        };
         // Panel 10° away on the sky: footprint misses the canvas entirely.
         let far = linear_model([40.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 32, 24);
         assert!(reproject_panel(&panel, &far, &frame, &dir.join("out")).is_err());
@@ -681,7 +769,11 @@ mod tests {
         // 1.597″/px): geometry must come out in the same ballpark.
         assert!((frame.scale_deg * 3600.0 - 1.597).abs() < 0.05, "scale");
         assert!(frame.width.abs_diff(9255) < 400, "width {}", frame.width);
-        assert!(frame.height.abs_diff(18310) < 400, "height {}", frame.height);
+        assert!(
+            frame.height.abs_diff(18310) < 400,
+            "height {}",
+            frame.height
+        );
 
         let out = std::env::temp_dir().join(format!("mmm-align-real-{}", std::process::id()));
         let panel = XisfPanel::open(&path(1)).unwrap();

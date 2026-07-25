@@ -99,7 +99,11 @@ fn analyze_two_overlapping_panels() {
             let expect_cov = if x8 < 5 { 1.0 } else { 0.0 };
             assert_eq!(sa.cov(x8, y8), expect_cov, "panel A cov at ({x8},{y8})");
             let expect_mean = if x8 < 5 { 0.4 } else { 0.0 };
-            assert_eq!(sa.cell(1, x8, y8), expect_mean, "panel A ch1 mean at ({x8},{y8})");
+            assert_eq!(
+                sa.cell(1, x8, y8),
+                expect_mean,
+                "panel A ch1 mean at ({x8},{y8})"
+            );
         }
     }
     let sb = L8Summary::read(&session.summary_path(1)).unwrap();
@@ -108,7 +112,11 @@ fn analyze_two_overlapping_panels() {
             let expect_cov = if x8 >= 3 { 1.0 } else { 0.0 };
             assert_eq!(sb.cov(x8, y8), expect_cov, "panel B cov at ({x8},{y8})");
             let expect_mean = if x8 >= 3 { 0.25 } else { 0.0 };
-            assert_eq!(sb.cell(0, x8, y8), expect_mean, "panel B ch0 mean at ({x8},{y8})");
+            assert_eq!(
+                sb.cell(0, x8, y8),
+                expect_mean,
+                "panel B ch0 mean at ({x8},{y8})"
+            );
         }
     }
 
@@ -135,8 +143,14 @@ fn analyze_builds_and_saves_overlap_graph() {
 
     let session = analyze(&[a, b], &dir.join("s.mmm-session")).unwrap();
     let graph_path = session.overlap_graph_path();
-    assert_eq!(graph_path, session.dir.join("analysis").join("overlap_graph.json"));
-    assert!(graph_path.is_file(), "analyze must persist analysis/overlap_graph.json");
+    assert_eq!(
+        graph_path,
+        session.dir.join("analysis").join("overlap_graph.json")
+    );
+    assert!(
+        graph_path.is_file(),
+        "analyze must persist analysis/overlap_graph.json"
+    );
 
     let graph = OverlapGraph::load(&graph_path).unwrap();
     assert_eq!(graph.edges.len(), 1);
@@ -171,8 +185,14 @@ fn detail_plane_is_in_cell_rms() {
     for y8 in 0..2 {
         for x8 in 0..2u32 {
             assert!((s.cell(0, x8, y8) - 0.4).abs() < 1e-6);
-            assert!((s.det(0, x8, y8) - 0.2).abs() < 1e-6, "ch0 RMS at ({x8},{y8})");
-            assert!(s.det(1, x8, y8).abs() < 1e-6, "constant channel must have zero detail");
+            assert!(
+                (s.det(0, x8, y8) - 0.2).abs() < 1e-6,
+                "ch0 RMS at ({x8},{y8})"
+            );
+            assert!(
+                s.det(1, x8, y8).abs() < 1e-6,
+                "constant channel must have zero detail"
+            );
         }
     }
 

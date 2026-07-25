@@ -154,8 +154,9 @@ fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {
     let meta_hash = fnv(meta_txt.as_bytes());
 
     let file_hash = |path: PathBuf| fnv(&std::fs::read(&path).unwrap());
-    let summary_hashes: Vec<u64> =
-        (0..4).map(|id| file_hash(session.summary_path(id))).collect();
+    let summary_hashes: Vec<u64> = (0..4)
+        .map(|id| file_hash(session.summary_path(id)))
+        .collect();
     let graph_hash = file_hash(session.overlap_graph_path());
     let phot_hash = file_hash(session.photometry_path());
     let surf_hash = file_hash(session.surfaces_path());
@@ -193,8 +194,14 @@ fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {
     assert_eq!(graph_hash, GRAPH_HASH, "overlap graph changed");
     assert_eq!(phot_hash, PHOTOMETRY_HASH, "photometry changed");
     assert_eq!(surf_hash, SURFACES_HASH, "surfaces changed");
-    assert_eq!(blend_hashes[0], BLEND_FEATHER_HASH, "feather blend output changed");
-    assert_eq!(blend_hashes[1], BLEND_PYRAMID_HASH, "pyramid blend output changed");
+    assert_eq!(
+        blend_hashes[0], BLEND_FEATHER_HASH,
+        "feather blend output changed"
+    );
+    assert_eq!(
+        blend_hashes[1], BLEND_PYRAMID_HASH,
+        "pyramid blend output changed"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

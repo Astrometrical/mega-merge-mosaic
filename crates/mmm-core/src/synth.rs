@@ -130,8 +130,15 @@ struct Rng {
 impl Rng {
     fn new(seed: u64) -> Self {
         // xorshift state must be nonzero.
-        let state = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
-        Self { state, spare_gauss: None }
+        let state = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
+        Self {
+            state,
+            spare_gauss: None,
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -202,7 +209,10 @@ fn panel_window(spec: &SynthSpec, cx: u32, cy: u32) -> [u64; 4] {
 pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
     let (w, h) = spec.canvas;
     if w == 0 || h == 0 || spec.channels == 0 || spec.grid.0 == 0 || spec.grid.1 == 0 {
-        return Err(Error::format(dir, "SynthSpec canvas/channels/grid must all be nonzero"));
+        return Err(Error::format(
+            dir,
+            "SynthSpec canvas/channels/grid must all be nonzero",
+        ));
     }
     std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
 
@@ -217,20 +227,18 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
             let sx = rng.range_f64(0.0, w as f64);
             let sy = rng.range_f64(0.0, h as f64);
             let sigma = rng.range_f64(1.0, 3.0);
-            let t = if spec.n_stars > 1 { i as f64 / (spec.n_stars - 1) as f64 } else { 0.0 };
+            let t = if spec.n_stars > 1 {
+                i as f64 / (spec.n_stars - 1) as f64
+            } else {
+                0.0
+            };
             let amp = 1.0 * (0.02f64 / 1.0).powf(t); // log-spaced 1.0 .. 0.02
             (sx, sy, sigma, amp)
         })
         .collect();
 
     /// Render the stars into a canvas-sized plane, centers shifted by `(dx, dy)`.
-    fn render_stars(
-        stars: &[(f64, f64, f64, f64)],
-        w: u64,
-        h: u64,
-        dx: f64,
-        dy: f64,
-    ) -> Vec<f32> {
+    fn render_stars(stars: &[(f64, f64, f64, f64)], w: u64, h: u64, dx: f64, dy: f64) -> Vec<f32> {
         let mut plane = vec![0.0f32; (w * h) as usize];
         for &(sx0, sy0, sigma, amp) in stars {
             let (sx, sy) = (sx0 + dx, sy0 + dy);
@@ -304,7 +312,10 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         })
         .collect();
     let blob_stars = |dx: f64, dy: f64| -> Vec<(f64, f64, f64, f64)> {
-        blobs.iter().map(|&(bx, by, amp)| (bx + dx, by + dy, BLOB_SIGMA_PX, amp)).collect()
+        blobs
+            .iter()
+            .map(|&(bx, by, amp)| (bx + dx, by + dy, BLOB_SIGMA_PX, amp))
+            .collect()
     };
     let blob_plane =
         (!blobs.is_empty()).then(|| render_stars(&blob_stars(0.0, 0.0), w, h, 0.0, 0.0));
@@ -382,14 +393,18 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
     for cy in 0..spec.grid.1 {
         for cx in 0..spec.grid.0 {
             let id = (cy * spec.grid.0 + cx) as usize;
-            let gain =
-                prng.range_f64(spec.panel_gain_range.0 as f64, spec.panel_gain_range.1 as f64)
-                    as f32;
-            let offset =
-                prng.range_f64(spec.panel_offset_range.0 as f64, spec.panel_offset_range.1 as f64)
-                    as f32;
-            let (glo, ghi) =
-                (spec.panel_gradient_range.0 as f64, spec.panel_gradient_range.1 as f64);
+            let gain = prng.range_f64(
+                spec.panel_gain_range.0 as f64,
+                spec.panel_gain_range.1 as f64,
+            ) as f32;
+            let offset = prng.range_f64(
+                spec.panel_offset_range.0 as f64,
+                spec.panel_offset_range.1 as f64,
+            ) as f32;
+            let (glo, ghi) = (
+                spec.panel_gradient_range.0 as f64,
+                spec.panel_gradient_range.1 as f64,
+            );
             let ga = prng.range_f64(glo, ghi) as f32;
             let gb = prng.range_f64(glo, ghi) as f32;
             let gc = prng.range_f64(glo, ghi) as f32;
@@ -404,8 +419,11 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                 None
             } else {
                 let shifted = render_stars(&stars, w, h, shift.0 as f64, shift.1 as f64);
-                let mut d: Vec<f32> =
-                    shifted.iter().zip(&star_plane).map(|(&s, &u)| s - u).collect();
+                let mut d: Vec<f32> = shifted
+                    .iter()
+                    .zip(&star_plane)
+                    .map(|(&s, &u)| s - u)
+                    .collect();
                 if let Some(tsp) = &truth_spikes {
                     let psp =
                         render_spikes(&stars, w, h, shift.0 as f64, shift.1 as f64, angle as f64);
@@ -475,7 +493,15 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         }
     }
 
-    Ok(SynthResult { truth, panel_paths, applied, applied_grad, windows, spiked, blobs })
+    Ok(SynthResult {
+        truth,
+        panel_paths,
+        applied,
+        applied_grad,
+        windows,
+        spiked,
+        blobs,
+    })
 }
 
 /// Linear astrometric solution attached to a synthetic *solved* panel, in
@@ -498,7 +524,11 @@ fn base64_encode(bytes: &[u8]) -> String {
     const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -570,7 +600,10 @@ fn write_xisf_impl(
     if planes.len() != n {
         return Err(Error::format(
             path,
-            format!("planes length {} does not match geometry {w}x{h}x{ch} ({n})", planes.len()),
+            format!(
+                "planes length {} does not match geometry {w}x{h}x{ch} ({n})",
+                planes.len()
+            ),
         ));
     }
 
@@ -581,7 +614,10 @@ fn write_xisf_impl(
         r#"<?xml version="1.0" encoding="UTF-8"?><xisf version="1.0" xmlns="http://www.pixinsight.com/xisf"><Image geometry="{w}:{h}:{ch}" sampleFormat="Float32" colorSpace="{color_space}" pixelStorage="Planar" byteOrder="little" location="attachment:{DATA_OFFSET}:{data_size}"><FITSKeyword name="CREATOR" value="'mmm-synth'" comment="synthetic ground-truth frame"/>{extra_xml}</Image></xisf>"#
     );
     if 16 + xml.len() > DATA_OFFSET {
-        return Err(Error::format(path, "XISF header does not fit before the 4096-byte attachment"));
+        return Err(Error::format(
+            path,
+            "XISF header does not fit before the 4096-byte attachment",
+        ));
     }
 
     let mut bytes = Vec::with_capacity(DATA_OFFSET + n * 4);
@@ -647,7 +683,10 @@ mod tests {
         );
         let plane = (w * h) as usize;
         for c in 0..ch {
-            assert_eq!(panel.channel(c), &planes[c as usize * plane..(c as usize + 1) * plane]);
+            assert_eq!(
+                panel.channel(c),
+                &planes[c as usize * plane..(c as usize + 1) * plane]
+            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -670,9 +709,16 @@ mod tests {
         write_xisf_solved(&path, w, h, ch, &planes, &wcs).unwrap();
 
         let panel = XisfPanel::open(&path).unwrap();
-        assert_eq!((panel.width(), panel.height(), panel.channels()), (w, h, ch));
+        assert_eq!(
+            (panel.width(), panel.height(), panel.channels()),
+            (w, h, ch)
+        );
         let plane = (w * h) as usize;
-        assert_eq!(panel.channel(1), &planes[plane..2 * plane], "pixel data intact");
+        assert_eq!(
+            panel.channel(1),
+            &planes[plane..2 * plane],
+            "pixel data intact"
+        );
 
         let hdr = panel.header();
         let model = crate::astrometry::WcsModel::from_properties(&hdr.properties, w, h)
@@ -680,7 +726,10 @@ mod tests {
         assert!(!model.is_spline(), "linear-only solution");
         assert_eq!(model.linear.crval, wcs.crval);
         // FITS = PixInsight image coords + 0.5 on both axes.
-        assert_eq!(model.linear.crpix, [wcs.refimg[0] + 0.5, wcs.refimg[1] + 0.5]);
+        assert_eq!(
+            model.linear.crpix,
+            [wcs.refimg[0] + 0.5, wcs.refimg[1] + 0.5]
+        );
         assert_eq!(model.linear.cd, wcs.cd);
         assert_eq!(model.linear.ctype[0], "RA---TAN");
 
@@ -720,7 +769,10 @@ mod tests {
         let mut max_v = f32::MIN;
         for &v in &res.truth {
             assert!(v.is_finite());
-            assert!(v > 0.0, "truth must never be exactly 0 or negative, got {v}");
+            assert!(
+                v > 0.0,
+                "truth must never be exactly 0 or negative, got {v}"
+            );
             max_v = max_v.max(v);
         }
         assert!(max_v > 0.3, "expected a bright star, max was {max_v}");
@@ -766,11 +818,18 @@ mod tests {
         // Adjacent panel windows must actually overlap.
         let [ax0, _, ax1, _] = res.windows[0];
         let [bx0, _, bx1, _] = res.windows[1];
-        assert!(bx0 < ax1 && ax0 < bx1, "horizontally adjacent panels must overlap");
+        assert!(
+            bx0 < ax1 && ax0 < bx1,
+            "horizontally adjacent panels must overlap"
+        );
 
         // Default gradient range (0,0) is a strict no-op.
         for &(a, b, c) in &res.applied_grad {
-            assert_eq!((a, b, c), (0.0, 0.0, 0.0), "gradient range (0,0) must draw zeros");
+            assert_eq!(
+                (a, b, c),
+                (0.0, 0.0, 0.0),
+                "gradient range (0,0) must draw zeros"
+            );
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -800,8 +859,7 @@ mod tests {
                 for y in (y0..y1).step_by(3) {
                     for x in (x0..x1).step_by(3) {
                         let i = (y * w + x) as usize;
-                        let grad =
-                            ga + gb * (x as f32 / w as f32) + gc * (y as f32 / h as f32);
+                        let grad = ga + gb * (x as f32 / w as f32) + gc * (y as f32 / h as f32);
                         let expected = truth_plane[i] * gain + offset + grad;
                         let got = data[i];
                         let tol = 1e-5 + expected.abs() * 1e-5;
@@ -959,7 +1017,10 @@ mod tests {
         };
         let dir_plain = tmpdir("spikes-plain");
         let plain = generate(&base, &dir_plain).unwrap();
-        assert!(plain.spiked.is_empty(), "no spikes requested → none reported");
+        assert!(
+            plain.spiked.is_empty(),
+            "no spikes requested → none reported"
+        );
 
         let mut spec = base.clone();
         spec.panel_spike_angle = vec![0.0, std::f64::consts::FRAC_PI_2 as f32];
@@ -970,11 +1031,17 @@ mod tests {
         // Truth difference = exactly the spike plane (same seed → same stars
         // and noise): zero far from spiked stars, elevated along the +x arm.
         let (w, h) = (base.canvas.0 as usize, base.canvas.1 as usize);
-        let diff: Vec<f32> =
-            sp.truth[..w * h].iter().zip(&plain.truth[..w * h]).map(|(a, b)| a - b).collect();
+        let diff: Vec<f32> = sp.truth[..w * h]
+            .iter()
+            .zip(&plain.truth[..w * h])
+            .map(|(a, b)| a - b)
+            .collect();
         let &(sx, sy, len) = sp.spiked.iter().max_by(|a, b| a.2.total_cmp(&b.2)).unwrap();
         for &(_, _, l) in &sp.spiked {
-            assert!(l >= SPIKE_MIN_AMP * SPIKE_LEN_PER_AMP, "arm length ∝ amplitude");
+            assert!(
+                l >= SPIKE_MIN_AMP * SPIKE_LEN_PER_AMP,
+                "arm length ∝ amplitude"
+            );
         }
         let mut max_far = 0.0f32;
         for y in 0..h {
@@ -987,7 +1054,10 @@ mod tests {
                 }
             }
         }
-        assert!(max_far < 1e-6, "spike flux only near spiked stars, saw {max_far}");
+        assert!(
+            max_far < 1e-6,
+            "spike flux only near spiked stars, saw {max_far}"
+        );
         // Sample the +x arm of the brightest spiked star (angle 0 in truth).
         let t = (len * 0.25).round();
         let (ax, ay) = ((sx + t).round() as usize, sy.round() as usize);
@@ -1011,7 +1081,10 @@ mod tests {
                 max_dev = max_dev.max((data[i] - sp.truth[i]).abs());
             }
         }
-        assert!(max_dev < 1e-5, "π/2-rotated spikes must be identical, max dev {max_dev}");
+        assert!(
+            max_dev < 1e-5,
+            "π/2-rotated spikes must be identical, max dev {max_dev}"
+        );
 
         // A π/4 rotation is not: flux moves off the truth's arms.
         let mut spec4 = base.clone();
@@ -1081,8 +1154,11 @@ mod tests {
         // Truth diff = exactly the blob plane: zero far from every blob,
         // ≈ amp at each blob center (up to neighbouring blob tails).
         let (w, h) = (base.canvas.0 as usize, base.canvas.1 as usize);
-        let diff: Vec<f32> =
-            res.truth[..w * h].iter().zip(&clean.truth[..w * h]).map(|(a, b)| a - b).collect();
+        let diff: Vec<f32> = res.truth[..w * h]
+            .iter()
+            .zip(&clean.truth[..w * h])
+            .map(|(a, b)| a - b)
+            .collect();
         let r = 4.0 * BLOB_SIGMA_PX;
         let mut max_far = 0.0f32;
         for y in 0..h {
@@ -1095,7 +1171,10 @@ mod tests {
                 }
             }
         }
-        assert!(max_far < 1e-6, "blob flux only near blob centers, saw {max_far}");
+        assert!(
+            max_far < 1e-6,
+            "blob flux only near blob centers, saw {max_far}"
+        );
         for &(bx, by, amp) in &res.blobs {
             let (cx, cy) = (bx.round() as usize, by.round() as usize);
             if cx < w && cy < h {
@@ -1123,8 +1202,14 @@ mod tests {
         let blob_in_window = res.blobs.iter().any(|&(bx, by, _)| {
             bx + r >= x0 as f64 && bx - r < x1 as f64 && by + r >= y0 as f64 && by - r < y1 as f64
         });
-        assert!(blob_in_window, "seed must place a blob touching panel 1's window");
-        assert!(max_dev > 5e-3, "shifted blobs must move flux in panel 1, max dev {max_dev}");
+        assert!(
+            blob_in_window,
+            "seed must place a blob touching panel 1's window"
+        );
+        assert!(
+            max_dev > 5e-3,
+            "shifted blobs must move flux in panel 1, max dev {max_dev}"
+        );
 
         // …and with shift_blobs = false the same panel matches the truth.
         let mut spec_ns = spec.clone();
@@ -1163,7 +1248,10 @@ mod tests {
         assert_eq!(a.windows, b.windows);
         let bytes_a = std::fs::read(&a.panel_paths[0]).unwrap();
         let bytes_b = std::fs::read(&b.panel_paths[0]).unwrap();
-        assert_eq!(bytes_a, bytes_b, "panel files must be byte-identical for a fixed seed");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "panel files must be byte-identical for a fixed seed"
+        );
 
         std::fs::remove_dir_all(&dir_a).unwrap();
         std::fs::remove_dir_all(&dir_b).unwrap();

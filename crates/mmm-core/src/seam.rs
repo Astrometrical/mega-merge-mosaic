@@ -134,11 +134,16 @@ pub fn star_mask(summary: &L8Summary) -> Vec<bool> {
     let (w, h) = (summary.w8 as usize, summary.h8 as usize);
     let cells = w * h;
     let nch = summary.channels as usize;
-    let chdet =
-        |i: usize| -> f32 { (0..nch).map(|c| summary.detail[c * cells + i]).fold(0.0, f32::max) };
+    let chdet = |i: usize| -> f32 {
+        (0..nch)
+            .map(|c| summary.detail[c * cells + i])
+            .fold(0.0, f32::max)
+    };
 
-    let mut det_cov: Vec<f32> =
-        (0..cells).filter(|&i| summary.coverage[i] >= 1.0).map(chdet).collect();
+    let mut det_cov: Vec<f32> = (0..cells)
+        .filter(|&i| summary.coverage[i] >= 1.0)
+        .map(chdet)
+        .collect();
     if det_cov.is_empty() {
         return vec![false; cells];
     }
@@ -214,8 +219,7 @@ pub fn split_mask_components(mask: &[bool], w8: u32, h8: u32) -> (Vec<bool>, Vec
         comp.clear();
         stack.push(start);
         seen[start] = true;
-        let (mut x0, mut y0, mut x1, mut y1) =
-            (start % w, start / w, start % w, start / w);
+        let (mut x0, mut y0, mut x1, mut y1) = (start % w, start / w, start % w, start / w);
         while let Some(i) = stack.pop() {
             comp.push(i);
             let (x, y) = (i % w, i / w);
@@ -234,7 +238,11 @@ pub fn split_mask_components(mask: &[bool], w8: u32, h8: u32) -> (Vec<bool>, Vec
         let is_compact = comp.len() <= COMPACT_MAX_AREA
             || max_dim <= COMPACT_MAX_DIM as usize
             || comp.len() <= COMPACT_THIN_RATIO * max_dim;
-        let out = if is_compact { &mut compact } else { &mut structure };
+        let out = if is_compact {
+            &mut compact
+        } else {
+            &mut structure
+        };
         for &i in &comp {
             out[i] = true;
         }
@@ -302,7 +310,9 @@ pub(crate) fn compute_owner_map_masked(
                     continue;
                 }
                 let d = dists[p][i];
-                let wgt = (d * BLOCK as f32 * inv_feather).clamp(0.0, 1.0).max(MIN_WEIGHT);
+                let wgt = (d * BLOCK as f32 * inv_feather)
+                    .clamp(0.0, 1.0)
+                    .max(MIN_WEIGHT);
                 if best.is_none_or(|(bw, bd, _)| wgt > bw || (wgt == bw && d > bd)) {
                     best = Some((wgt, d, p));
                 }
@@ -320,10 +330,22 @@ pub(crate) fn compute_owner_map_masked(
         .map(|(p, s)| CellCorr {
             summary: s,
             gains: (0..nch)
-                .map(|c| phot.gains.get(c).and_then(|t| t.get(p)).copied().unwrap_or(1.0) as f32)
+                .map(|c| {
+                    phot.gains
+                        .get(c)
+                        .and_then(|t| t.get(p))
+                        .copied()
+                        .unwrap_or(1.0) as f32
+                })
                 .collect(),
             offsets: (0..nch)
-                .map(|c| phot.offsets.get(c).and_then(|t| t.get(p)).copied().unwrap_or(0.0) as f32)
+                .map(|c| {
+                    phot.offsets
+                        .get(c)
+                        .and_then(|t| t.get(p))
+                        .copied()
+                        .unwrap_or(0.0) as f32
+                })
                 .collect(),
             surf_terms: (0..nch)
                 .map(|c| {
@@ -368,9 +390,17 @@ fn edge_seam(
     }
     let along_x = dx >= dy;
     // Long-axis length T, short-axis cell count s_len.
-    let (t_len, s_len) = if along_x { (dx as usize, dy as usize) } else { (dy as usize, dx as usize) };
+    let (t_len, s_len) = if along_x {
+        (dx as usize, dy as usize)
+    } else {
+        (dy as usize, dx as usize)
+    };
     let cell_at = |t: usize, s: usize| -> (u32, u32) {
-        if along_x { (x0 + t as u32, y0 + s as u32) } else { (x0 + s as u32, y0 + t as u32) }
+        if along_x {
+            (x0 + t as u32, y0 + s as u32)
+        } else {
+            (x0 + s as u32, y0 + t as u32)
+        }
     };
 
     let (ca, cb) = (&corrs[e.a], &corrs[e.b]);
@@ -400,7 +430,11 @@ fn edge_seam(
             masked[k] = masks[e.a][i] || masks[e.b][i];
         }
     }
-    let mut shared: Vec<f32> = cost.iter().copied().filter(|&c| c < UNSHARED_COST).collect();
+    let mut shared: Vec<f32> = cost
+        .iter()
+        .copied()
+        .filter(|&c| c < UNSHARED_COST)
+        .collect();
     if !shared.is_empty() {
         let mid = shared.len() / 2;
         let median = *shared.select_nth_unstable_by(mid, f32::total_cmp).1;
@@ -466,8 +500,11 @@ fn edge_seam(
         let i = y as usize * w8 as usize + x as usize;
         low_score += (dists[e.a][i] - dists[e.b][i]) as f64;
     }
-    let (low, high) =
-        if low_score >= 0.0 { (e.a as u16, e.b as u16) } else { (e.b as u16, e.a as u16) };
+    let (low, high) = if low_score >= 0.0 {
+        (e.a as u16, e.b as u16)
+    } else {
+        (e.b as u16, e.a as u16)
+    };
 
     // Relabel shared full-coverage cells on each side of the seam.
     let mut ops = Vec::new();
@@ -593,16 +630,21 @@ mod tests {
 
         let mask = star_mask(&s);
         // Seed-only mask (what the raw 3× threshold would protect): core only.
-        let seed_only: Vec<bool> =
-            s.detail.iter().map(|&d| d > MASK_SEED_FACTOR * 0.01).collect();
-        assert_eq!(seed_only.iter().filter(|&&m| m).count(), 1, "only the core seeds");
+        let seed_only: Vec<bool> = s
+            .detail
+            .iter()
+            .map(|&d| d > MASK_SEED_FACTOR * 0.01)
+            .collect();
+        assert_eq!(
+            seed_only.iter().filter(|&&m| m).count(),
+            1,
+            "only the core seeds"
+        );
 
         // The connected mask covers core and every arm cell — and nothing else.
         assert!(mask[idx(cx, cy)], "core must be masked");
         for t in 1..=arm {
-            for (x, y) in
-                [(cx + t, cy), (cx - t, cy), (cx, cy + t), (cx + t, cy - t)]
-            {
+            for (x, y) in [(cx + t, cy), (cx - t, cy), (cx, cy + t), (cx + t, cy - t)] {
                 assert!(mask[idx(x, y)], "arm cell ({x},{y}) must be masked");
             }
         }
@@ -655,10 +697,16 @@ mod tests {
         let masks: Vec<Vec<bool>> = summaries.iter().map(star_mask).collect();
         // Sanity: core + arm are masked in both panels, corridor is not.
         for x in 12..18usize {
-            assert!(masks[0][40 * 32 + x] && masks[1][40 * 32 + x], "arm cell x={x}");
+            assert!(
+                masks[0][40 * 32 + x] && masks[1][40 * 32 + x],
+                "arm cell x={x}"
+            );
         }
         for x in 18..20usize {
-            assert!(!masks[0][40 * 32 + x] && !masks[1][40 * 32 + x], "corridor x={x}");
+            assert!(
+                !masks[0][40 * 32 + x] && !masks[1][40 * 32 + x],
+                "corridor x={x}"
+            );
         }
 
         let map = compute_owner_map(
@@ -680,8 +728,10 @@ mod tests {
         }
 
         // Teeth: all-false masks (mask disabled) → the seam cuts the arm.
-        let no_masks: Vec<Vec<bool>> =
-            summaries.iter().map(|s| vec![false; (s.w8 * s.h8) as usize]).collect();
+        let no_masks: Vec<Vec<bool>> = summaries
+            .iter()
+            .map(|s| vec![false; (s.w8 * s.h8) as usize])
+            .collect();
         let unmasked = compute_owner_map_masked(
             &summaries,
             &graph,
@@ -754,16 +804,23 @@ mod tests {
         }
         assert!(compact[idx(30, 10)], "spiked star core must be compact");
         for t in 1..=5u32 {
-            for (x, y) in
-                [(30 + t, 10), (30 - t, 10), (30, 10 + t), (30 + t, 10 - t)]
-            {
-                assert!(compact[idx(x, y)], "spike arm cell ({x},{y}) must be compact");
+            for (x, y) in [(30 + t, 10), (30 - t, 10), (30, 10 + t), (30 + t, 10 - t)] {
+                assert!(
+                    compact[idx(x, y)],
+                    "spike arm cell ({x},{y}) must be compact"
+                );
             }
         }
         for y in 30..50u32 {
             for x in 10..20u32 {
-                assert!(structure[idx(x, y)], "blob cell ({x},{y}) must be structure");
-                assert!(!compact[idx(x, y)], "blob cell ({x},{y}) must not be compact");
+                assert!(
+                    structure[idx(x, y)],
+                    "blob cell ({x},{y}) must be structure"
+                );
+                assert!(
+                    !compact[idx(x, y)],
+                    "blob cell ({x},{y}) must not be compact"
+                );
             }
         }
         assert!(
@@ -772,7 +829,11 @@ mod tests {
         );
         // Partition: compact ∪ structure = mask, compact ∩ structure = ∅.
         for i in 0..mask.len() {
-            assert_eq!(compact[i] || structure[i], mask[i], "union must equal the mask");
+            assert_eq!(
+                compact[i] || structure[i],
+                mask[i],
+                "union must equal the mask"
+            );
             assert!(!(compact[i] && structure[i]), "parts must be disjoint");
         }
     }
@@ -796,13 +857,19 @@ mod tests {
         // Every covered cell still has an owner from the overlapping pair.
         for y in 0..80 {
             for x in 12..20 {
-                assert!(map.at(x, y) < 2, "band cell ({x},{y}) must stay owned by a/b");
+                assert!(
+                    map.at(x, y) < 2,
+                    "band cell ({x},{y}) must stay owned by a/b"
+                );
             }
         }
 
         // The seam still separates the panels somewhere in the band…
         let pairs = boundary_pairs(&map);
-        assert!(!pairs.is_empty(), "owner boundary must exist in the overlap band");
+        assert!(
+            !pairs.is_empty(),
+            "owner boundary must exist in the overlap band"
+        );
 
         // …but never within 2 cells (Chebyshev) of the star.
         for ((x, y), (x2, y2)) in pairs {

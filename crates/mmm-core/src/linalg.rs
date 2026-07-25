@@ -14,7 +14,11 @@ pub fn solve_dense(a: &mut [f64], b: &mut [f64], n: usize) -> Result<Vec<f64>> {
 
     // Scale-relative singularity threshold.
     let anorm = a.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-    let tiny = if anorm > 0.0 { anorm * 1e-13 } else { f64::MIN_POSITIVE };
+    let tiny = if anorm > 0.0 {
+        anorm * 1e-13
+    } else {
+        f64::MIN_POSITIVE
+    };
 
     for k in 0..n {
         // Partial pivot: largest |a[r][k]| for r ≥ k.

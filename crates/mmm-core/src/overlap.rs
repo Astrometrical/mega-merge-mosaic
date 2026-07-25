@@ -78,8 +78,12 @@ impl OverlapGraph {
                         }
                     }
                 }
-                (n_cells >= MIN_EDGE_CELLS)
-                    .then_some(OverlapEdge { a, b, bbox8: [ex0, ey0, ex1, ey1], n_cells })
+                (n_cells >= MIN_EDGE_CELLS).then_some(OverlapEdge {
+                    a,
+                    b,
+                    bbox8: [ex0, ey0, ex1, ey1],
+                    n_cells,
+                })
             })
             .collect();
         OverlapGraph { edges }
@@ -94,8 +98,7 @@ impl OverlapGraph {
 
     pub fn load(p: &Path) -> Result<OverlapGraph> {
         let json = std::fs::read_to_string(p).map_err(|e| Error::io(p, e))?;
-        serde_json::from_str(&json)
-            .map_err(|e| Error::format(p, format!("bad overlap graph: {e}")))
+        serde_json::from_str(&json).map_err(|e| Error::format(p, format!("bad overlap graph: {e}")))
     }
 
     /// Connected components over panels `0..n_panels`; each component sorted
@@ -161,8 +164,10 @@ pub fn distance_map(cov: &[f32], w8: u32, h8: u32) -> Vec<f32> {
     assert_eq!(cov.len(), w * h, "coverage plane size mismatch");
     const SQ2: f32 = std::f32::consts::SQRT_2;
 
-    let mut d: Vec<f32> =
-        cov.iter().map(|&c| if c < 1.0 { 0.0 } else { f32::INFINITY }).collect();
+    let mut d: Vec<f32> = cov
+        .iter()
+        .map(|&c| if c < 1.0 { 0.0 } else { f32::INFINITY })
+        .collect();
 
     // Forward pass: left, up-left, up, up-right.
     for y in 0..h {

@@ -163,7 +163,17 @@ pub fn seam_deltas(
         e.0 += 1;
         e.1 += d as f64;
     }
-    acc.into_iter().map(|(k, (n, sum))| (k, SeamDelta { n, delta: sum / n as f64 })).collect()
+    acc.into_iter()
+        .map(|(k, (n, sum))| {
+            (
+                k,
+                SeamDelta {
+                    n,
+                    delta: sum / n as f64,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Load the session's L8 summaries and compute the shared owner map exactly
@@ -177,7 +187,14 @@ pub fn load_owner_map(
     feather_px: f32,
 ) -> Result<(Vec<L8Summary>, OwnerMap)> {
     let summaries = load_summaries(session)?;
-    let owner = compute_owner_map(&summaries, graph, phot, surfaces, session.canvas, feather_px);
+    let owner = compute_owner_map(
+        &summaries,
+        graph,
+        phot,
+        surfaces,
+        session.canvas,
+        feather_px,
+    );
     Ok((summaries, owner))
 }
 
@@ -230,7 +247,11 @@ pub fn write_seam_map(
 ) -> Result<()> {
     // Blended L8 preview (at 1/8 the base band is the whole signal, so this
     // is the feather path regardless of mode).
-    let params = BlendParams { feather_px, downsample: 8, ..Default::default() };
+    let params = BlendParams {
+        feather_px,
+        downsample: 8,
+        ..Default::default()
+    };
     let mut sink = BufSink::default();
     blend(session, phot, surfaces, graph, &params, &mut sink)?;
     let (w, h, ch) = (sink.w, sink.h, sink.ch);
@@ -238,7 +259,10 @@ pub fn write_seam_map(
 
     // The preview's crop origin on the L8 grid (mirrors the preview blend).
     let bbox = output_bbox(session, &params)?;
-    let (gx0, gy0) = ((bbox[0] / BLOCK as u64) as usize, (bbox[1] / BLOCK as u64) as usize);
+    let (gx0, gy0) = (
+        (bbox[0] / BLOCK as u64) as usize,
+        (bbox[1] / BLOCK as u64) as usize,
+    );
     let w8 = owner.w8 as usize;
 
     // Autostretched luminance (channel mean; covered ⟺ all channels nonzero).
@@ -316,7 +340,11 @@ pub fn write_seam_map(
 /// Draw `id` in 3×5 bitmap digits (scaled), centered on `(cx, cy)`, white on
 /// a 1-px dark outline. Out-of-bounds pixels are clipped.
 fn draw_label(buf: &mut [u8], w: usize, h: usize, cx: i64, cy: i64, id: usize, scale: usize) {
-    let text: Vec<usize> = id.to_string().bytes().map(|b| (b - b'0') as usize).collect();
+    let text: Vec<usize> = id
+        .to_string()
+        .bytes()
+        .map(|b| (b - b'0') as usize)
+        .collect();
     let s = scale as i64;
     let x0 = cx - (text.len() as i64 * 4 - 1) * s / 2; // 3 cols + 1 gap each
     let y0 = cy - 5 * s / 2;
@@ -389,7 +417,11 @@ mod tests {
     fn boundary_cell_bordering_two_owners_reports_both() {
         //   1 0 2   → the middle cell borders 1 and 2 (and reports each once,
         //   1 0 2     despite two 2-neighbours in column layout below).
-        let owner = OwnerMap { w8: 3, h8: 2, owner: vec![1, 0, 2, 1, 0, 2] };
+        let owner = OwnerMap {
+            w8: 3,
+            h8: 2,
+            owner: vec![1, 0, 2, 1, 0, 2],
+        };
         let mut got = boundary_cells(&owner);
         got.sort_unstable();
         assert_eq!(
@@ -426,7 +458,9 @@ mod tests {
         let owner = OwnerMap {
             w8,
             h8,
-            owner: (0..w8 * h8).map(|i| if i % w8 < 4 { 0 } else { 1 }).collect(),
+            owner: (0..w8 * h8)
+                .map(|i| if i % w8 < 4 { 0 } else { 1 })
+                .collect(),
         };
         (vec![mk(0, 5, a_mean), mk(3, 8, b_mean)], owner)
     }
@@ -459,7 +493,11 @@ mod tests {
         let deltas = seam_deltas(&summaries, &owner, &phot, None, (64, 32, 1));
         let d = deltas[&(0, 1)];
         assert_eq!(d.n, 8);
-        assert!((d.delta - 0.17).abs() < 1e-6, "corrected delta: {}", d.delta);
+        assert!(
+            (d.delta - 0.17).abs() < 1e-6,
+            "corrected delta: {}",
+            d.delta
+        );
     }
 
     /// Boundary cells not fully covered by both panels are skipped.

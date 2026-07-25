@@ -32,7 +32,11 @@ pub struct PngSink {
 
 impl PngSink {
     pub fn create(path: &Path) -> Self {
-        Self { path: path.to_path_buf(), dims: (0, 0, 0), data: Vec::new() }
+        Self {
+            path: path.to_path_buf(),
+            dims: (0, 0, 0),
+            data: Vec::new(),
+        }
     }
 }
 
@@ -70,7 +74,10 @@ impl RowSink for PngSink {
         if stride == 0 || !rows.len().is_multiple_of(stride) {
             return Err(Error::format(
                 &self.path,
-                format!("band length {} is not a multiple of ch*w = {stride}", rows.len()),
+                format!(
+                    "band length {} is not a multiple of ch*w = {stride}",
+                    rows.len()
+                ),
             ));
         }
         let band_rows = (rows.len() / stride) as u64;
@@ -90,7 +97,11 @@ impl RowSink for PngSink {
     }
 
     fn finish(&mut self) -> Result<()> {
-        let (w, h, ch) = (self.dims.0 as usize, self.dims.1 as usize, self.dims.2 as usize);
+        let (w, h, ch) = (
+            self.dims.0 as usize,
+            self.dims.1 as usize,
+            self.dims.2 as usize,
+        );
         let plane = w * h;
 
         // Per-channel stretch parameters from the covered pixels only
@@ -117,7 +128,11 @@ impl RowSink for PngSink {
 
         let file = File::create(&self.path).map_err(|e| Error::io(&self.path, e))?;
         let mut enc = png::Encoder::new(BufWriter::new(file), w as u32, h as u32);
-        enc.set_color(if ch == 3 { png::ColorType::Rgb } else { png::ColorType::Grayscale });
+        enc.set_color(if ch == 3 {
+            png::ColorType::Rgb
+        } else {
+            png::ColorType::Grayscale
+        });
         enc.set_depth(png::BitDepth::Eight);
         let mut writer = enc
             .write_header()
@@ -226,8 +241,14 @@ mod tests {
         // land at the midtone target 0.25 → 64/255. (Shadow clip is 0 here:
         // median − 2.8·1.4826·MAD < 0.)
         let mid = px(0, 1) as i32;
-        assert!((mid - 64).abs() <= 1, "median pixel should map to ~64, got {mid}");
-        assert!(i32::from(px(3, 1)) > mid, "bright end must stretch above the midtone");
+        assert!(
+            (mid - 64).abs() <= 1,
+            "median pixel should map to ~64, got {mid}"
+        );
+        assert!(
+            i32::from(px(3, 1)) > mid,
+            "bright end must stretch above the midtone"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -257,7 +278,10 @@ mod tests {
         let err = sink.begin(9000, 8000, 3);
         assert!(err.is_err(), "72 Mpx must be refused");
         let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("downsample"), "error should point at --downsample: {msg}");
+        assert!(
+            msg.contains("downsample"),
+            "error should point at --downsample: {msg}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

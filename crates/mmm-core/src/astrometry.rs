@@ -333,9 +333,13 @@ impl WcsModel {
                 v.len() == 2 && (v[0] - expect[0]).abs() < 1e-9 && (v[1] - expect[1]).abs() < 1e-9
             }),
         };
-        if !std_native("PCL:AstrometricSolution:ReferenceNativeCoordinates", [0.0, 90.0])
-            || !std_native("PCL:AstrometricSolution:CelestialPoleNativeCoordinates", [180.0, 90.0])
-        {
+        if !std_native(
+            "PCL:AstrometricSolution:ReferenceNativeCoordinates",
+            [0.0, 90.0],
+        ) || !std_native(
+            "PCL:AstrometricSolution:CelestialPoleNativeCoordinates",
+            [180.0, 90.0],
+        ) {
             return None;
         }
 
@@ -408,7 +412,9 @@ impl WcsModel {
         match &self.native_to_image {
             Some(g) => {
                 let m = g.delta;
-                if xi < g.rect[0] - m || xi > g.rect[2] + m || eta < g.rect[1] - m
+                if xi < g.rect[0] - m
+                    || xi > g.rect[2] + m
+                    || eta < g.rect[1] - m
                     || eta > g.rect[3] + m
                 {
                     return None;
@@ -439,7 +445,10 @@ fn grid_from_properties(props: &[XisfProperty], dir: &str) -> Option<Grid2D> {
     let delta = get("Delta")?.as_f64()?;
     let (rows, cols, gx) = get("GridX")?.as_f64_mat()?;
     let (ry, cy, gy) = get("GridY")?.as_f64_mat()?;
-    if rect_v.len() != 4 || !delta.is_finite() || delta <= 0.0 || (rows, cols) != (ry, cy)
+    if rect_v.len() != 4
+        || !delta.is_finite()
+        || delta <= 0.0
+        || (rows, cols) != (ry, cy)
         || rows < 2
         || cols < 2
     {
@@ -457,7 +466,14 @@ fn grid_from_properties(props: &[XisfProperty], dir: &str) -> Option<Grid2D> {
     {
         return None;
     }
-    Some(Grid2D { rect, delta, rows, cols, gx: gx.to_vec(), gy: gy.to_vec() })
+    Some(Grid2D {
+        rect,
+        delta,
+        rows,
+        cols,
+        gx: gx.to_vec(),
+        gy: gy.to_vec(),
+    })
 }
 
 /// PixInsight node count for a grid axis: `1 + ⌈extent/Δ⌉`, with a tolerance
@@ -467,7 +483,11 @@ fn expected_nodes(extent: f64, delta: f64) -> Option<u32> {
         return None;
     }
     let cells = extent / delta;
-    let cells = if (cells - cells.round()).abs() < 1e-6 { cells.round() } else { cells.ceil() };
+    let cells = if (cells - cells.round()).abs() < 1e-6 {
+        cells.round()
+    } else {
+        cells.ceil()
+    };
     (cells >= 1.0 && cells < f64::from(u32::MAX)).then(|| cells as u32 + 1)
 }
 
@@ -481,8 +501,8 @@ pub fn wcs_from_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
 
     let crval = find("PCL:AstrometricSolution:ReferenceCelestialCoordinates")?.as_f64_vec()?;
     let refimg = find("PCL:AstrometricSolution:ReferenceImageCoordinates")?.as_f64_vec()?;
-    let (rows, cols, m) = find("PCL:AstrometricSolution:LinearTransformationMatrix")?
-        .as_f64_mat()?;
+    let (rows, cols, m) =
+        find("PCL:AstrometricSolution:LinearTransformationMatrix")?.as_f64_mat()?;
     if crval.len() != 2 || refimg.len() != 2 || (rows, cols) != (2, 2) {
         return None;
     }
@@ -490,8 +510,8 @@ pub fn wcs_from_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
     // Missing projection property defaults to Gnomonic — the only projection
     // MosaicByCoordinates produces; an explicit unknown one refuses (better no
     // WCS than a wrong CTYPE).
-    let proj = find("PCL:AstrometricSolution:ProjectionSystem")
-        .map_or(Some("Gnomonic"), |v| v.as_str());
+    let proj =
+        find("PCL:AstrometricSolution:ProjectionSystem").map_or(Some("Gnomonic"), |v| v.as_str());
     let code = projection_code(proj?)?;
 
     let radesys = find("Observation:CelestialReferenceSystem")
@@ -505,7 +525,10 @@ pub fn wcs_from_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
         // FITS pixel coords (centers at integers, 1-based): +0.5 both axes.
         crpix: [refimg[0] + 0.5, refimg[1] + 0.5],
         cd: [[m[0], m[1]], [m[2], m[3]]],
-        ctype: [format!("{:-<5}{code}", "RA"), format!("{:-<5}{code}", "DEC")],
+        ctype: [
+            format!("{:-<5}{code}", "RA"),
+            format!("{:-<5}{code}", "DEC"),
+        ],
         radesys,
     })
 }
@@ -558,14 +581,38 @@ pub fn wcs_cards(w: &LinearWcs, crop_origin: (u64, u64), out_height: u64) -> Vec
     vec![
         kw("CTYPE1", q(&w.ctype[0]), "projection"),
         kw("CTYPE2", q(&w.ctype[1]), "projection"),
-        kw("CRVAL1", w.crval[0].to_string(), "[deg] RA at reference point"),
-        kw("CRVAL2", w.crval[1].to_string(), "[deg] Dec at reference point"),
+        kw(
+            "CRVAL1",
+            w.crval[0].to_string(),
+            "[deg] RA at reference point",
+        ),
+        kw(
+            "CRVAL2",
+            w.crval[1].to_string(),
+            "[deg] Dec at reference point",
+        ),
         kw("CRPIX1", crpix1.to_string(), "reference pixel x"),
         kw("CRPIX2", crpix2.to_string(), "reference pixel y (top-down)"),
-        kw("CD1_1", w.cd[0][0].to_string(), "[deg/px] transformation matrix"),
-        kw("CD1_2", w.cd[0][1].to_string(), "[deg/px] transformation matrix"),
-        kw("CD2_1", w.cd[1][0].to_string(), "[deg/px] transformation matrix"),
-        kw("CD2_2", w.cd[1][1].to_string(), "[deg/px] transformation matrix"),
+        kw(
+            "CD1_1",
+            w.cd[0][0].to_string(),
+            "[deg/px] transformation matrix",
+        ),
+        kw(
+            "CD1_2",
+            w.cd[0][1].to_string(),
+            "[deg/px] transformation matrix",
+        ),
+        kw(
+            "CD2_1",
+            w.cd[1][0].to_string(),
+            "[deg/px] transformation matrix",
+        ),
+        kw(
+            "CD2_2",
+            w.cd[1][1].to_string(),
+            "[deg/px] transformation matrix",
+        ),
         kw("CUNIT1", q("deg"), "axis unit"),
         kw("CUNIT2", q("deg"), "axis unit"),
         kw("RADESYS", q(&w.radesys), "celestial reference system"),
@@ -584,7 +631,13 @@ pub fn wcs_cards_flipped(
     let mut cards = wcs_cards(w, crop_origin, out_height);
     let crpix2 = w.crpix[1] - crop_origin.1 as f64;
     // Avoid "-0" card text when a matrix element is exactly zero.
-    let neg_s = |v: f64| if v == 0.0 { "0".to_string() } else { (-v).to_string() };
+    let neg_s = |v: f64| {
+        if v == 0.0 {
+            "0".to_string()
+        } else {
+            (-v).to_string()
+        }
+    };
     for kw in &mut cards {
         match kw.name.as_str() {
             "CRPIX2" => kw.value = (out_height as f64 + 1.0 - crpix2).to_string(),
@@ -602,7 +655,12 @@ mod tests {
     use crate::formats::PropertyValue;
 
     fn prop(id: &str, type_: &str, value: PropertyValue) -> XisfProperty {
-        XisfProperty { id: id.into(), type_: type_.into(), value, location: None }
+        XisfProperty {
+            id: id.into(),
+            type_: type_.into(),
+            value,
+            location: None,
+        }
     }
 
     /// Property set replicating the real Orion mosaic canvas solution.
@@ -622,7 +680,11 @@ mod tests {
             prop(
                 "PCL:AstrometricSolution:LinearTransformationMatrix",
                 "F64Matrix",
-                PropertyValue::F64Mat { rows: 2, cols: 2, data: vec![-S, 0.0, 0.0, S] },
+                PropertyValue::F64Mat {
+                    rows: 2,
+                    cols: 2,
+                    data: vec![-S, 0.0, 0.0, S],
+                },
             ),
             prop(
                 "PCL:AstrometricSolution:ProjectionSystem",
@@ -661,7 +723,10 @@ mod tests {
             .find(|p| p.id.ends_with("ProjectionSystem"))
             .unwrap()
             .value = PropertyValue::Str("FancyUnknownProjection".into());
-        assert!(wcs_from_properties(&p).is_none(), "unknown projection must not emit wrong CTYPE");
+        assert!(
+            wcs_from_properties(&p).is_none(),
+            "unknown projection must not emit wrong CTYPE"
+        );
 
         assert!(wcs_from_properties(&[]).is_none());
     }
@@ -690,17 +755,28 @@ mod tests {
     #[test]
     fn sky_pixel_round_trip() {
         let w = wcs_from_properties(&orion_props()).unwrap();
-        for &(x, y) in &[(1.0, 1.0), (9255.0, 18310.0), (100.5, 17000.25), (4628.0, 9155.5)] {
+        for &(x, y) in &[
+            (1.0, 1.0),
+            (9255.0, 18310.0),
+            (100.5, 17000.25),
+            (4628.0, 9155.5),
+        ] {
             let (ra, dec) = w.pixel_to_sky(x, y);
             let (x2, y2) = w.sky_to_pixel(ra, dec);
-            assert!((x - x2).abs() < 1e-6 && (y - y2).abs() < 1e-6, "({x},{y}) -> ({x2},{y2})");
+            assert!(
+                (x - x2).abs() < 1e-6 && (y - y2).abs() < 1e-6,
+                "({x},{y}) -> ({x2},{y2})"
+            );
         }
     }
 
     /// Rebuild a LinearWcs from emitted cards (test-side parse).
     fn wcs_from_cards(cards: &[FitsKeyword]) -> LinearWcs {
         let get = |n: &str| {
-            cards.iter().find(|k| k.name == n).unwrap_or_else(|| panic!("card {n} missing"))
+            cards
+                .iter()
+                .find(|k| k.name == n)
+                .unwrap_or_else(|| panic!("card {n} missing"))
         };
         let f = |n: &str| get(n).value.parse::<f64>().unwrap();
         let s = |n: &str| get(n).value.trim_matches('\'').trim().to_string();
@@ -734,10 +810,18 @@ mod tests {
         let c = wcs_from_cards(&cards);
         assert_eq!(c.crval, w.crval);
         assert_eq!(c.crpix, w.crpix);
-        for &(x, y) in &[(1.0, 1.0), (9255.0, 18310.0), (100.5, 17000.25), (4628.0, 9155.5)] {
+        for &(x, y) in &[
+            (1.0, 1.0),
+            (9255.0, 18310.0),
+            (100.5, 17000.25),
+            (4628.0, 9155.5),
+        ] {
             let (ra1, dec1) = w.pixel_to_sky(x, y);
             let (ra2, dec2) = c.pixel_to_sky(x, y);
-            assert!((ra1 - ra2).abs() < 1e-9 && (dec1 - dec2).abs() < 1e-9, "({x},{y})");
+            assert!(
+                (ra1 - ra2).abs() < 1e-9 && (dec1 - dec2).abs() < 1e-9,
+                "({x},{y})"
+            );
         }
     }
 
@@ -839,9 +923,11 @@ mod tests {
         let (ra_kw, dec_kw) = (kw("RA"), kw("DEC"));
         let (cx, cy) = ((h.width as f64 + 1.0) / 2.0, (h.height as f64 + 1.0) / 2.0);
         let (ra, dec) = w.pixel_to_sky(cx, cy);
-        let err_arcsec =
-            (((ra - ra_kw) * dec_kw.to_radians().cos()).hypot(dec - dec_kw)) * 3600.0;
-        eprintln!("CRVAL {:?}  CRPIX {:?}  CD {:?}  CTYPE {:?}", w.crval, w.crpix, w.cd, w.ctype);
+        let err_arcsec = (((ra - ra_kw) * dec_kw.to_radians().cos()).hypot(dec - dec_kw)) * 3600.0;
+        eprintln!(
+            "CRVAL {:?}  CRPIX {:?}  CD {:?}  CTYPE {:?}",
+            w.crval, w.crpix, w.cd, w.ctype
+        );
         eprintln!(
             "canvas center ({cx}, {cy}) -> RA {ra:.10}, Dec {dec:.10}; \
              RA/DEC keywords ({ra_kw}, {dec_kw}); error {err_arcsec:.3e} arcsec"
@@ -856,7 +942,10 @@ mod tests {
         // must land in the canvas bottom-right quadrant (see module docs).
         let (px, py) = w.sky_to_pixel(82.8949, -0.2871);
         eprintln!("raw PANEL-1 sky center -> canvas pixel ({px:.1}, {py:.1})");
-        assert!(px > cx && py > cy, "orientation: expected bottom-right, got ({px:.1}, {py:.1})");
+        assert!(
+            px > cx && py > cy,
+            "orientation: expected bottom-right, got ({px:.1}, {py:.1})"
+        );
     }
 
     // ---- Grid2D ----
@@ -869,24 +958,44 @@ mod tests {
         let mut gy = Vec::with_capacity((rows * cols) as usize);
         for r in 0..rows {
             for c in 0..cols {
-                let (ox, oy) = f(rect[0] + f64::from(c) * delta, rect[1] + f64::from(r) * delta);
+                let (ox, oy) = f(
+                    rect[0] + f64::from(c) * delta,
+                    rect[1] + f64::from(r) * delta,
+                );
                 gx.push(ox);
                 gy.push(oy);
             }
         }
-        Grid2D { rect, delta, rows, cols, gx, gy }
+        Grid2D {
+            rect,
+            delta,
+            rows,
+            cols,
+            gx,
+            gy,
+        }
     }
 
     #[test]
     fn grid_eval_reproduces_node_values() {
-        let g = grid_from_fn([0.0, 0.0, 40.0, 24.0], 8.0, |x, y| (0.3 * x - y, 0.01 * y * y + x));
+        let g = grid_from_fn([0.0, 0.0, 40.0, 24.0], 8.0, |x, y| {
+            (0.3 * x - y, 0.01 * y * y + x)
+        });
         for r in 0..g.rows {
             for c in 0..g.cols {
                 let (x, y) = (f64::from(c) * 8.0, f64::from(r) * 8.0);
                 let i = (r * g.cols + c) as usize;
                 let (ox, oy) = g.eval(x, y);
-                assert!((ox - g.gx[i]).abs() < 1e-12, "node ({r},{c}) x: {ox} vs {}", g.gx[i]);
-                assert!((oy - g.gy[i]).abs() < 1e-12, "node ({r},{c}) y: {oy} vs {}", g.gy[i]);
+                assert!(
+                    (ox - g.gx[i]).abs() < 1e-12,
+                    "node ({r},{c}) x: {ox} vs {}",
+                    g.gx[i]
+                );
+                assert!(
+                    (oy - g.gy[i]).abs() < 1e-12,
+                    "node ({r},{c}) y: {oy} vs {}",
+                    g.gy[i]
+                );
             }
         }
     }
@@ -897,12 +1006,20 @@ mod tests {
         // the border cells.
         let f = |x: f64, y: f64| (1.5 + 0.25 * x - 0.75 * y, -2.0 + 0.5 * x + 0.125 * y);
         let g = grid_from_fn([0.0, 0.0, 100.0, 60.0], 10.0, f);
-        for &(x, y) in
-            &[(0.0, 0.0), (0.3, 0.7), (99.9, 59.9), (50.0, 30.0), (3.1, 59.0), (97.0, 1.0)]
-        {
+        for &(x, y) in &[
+            (0.0, 0.0),
+            (0.3, 0.7),
+            (99.9, 59.9),
+            (50.0, 30.0),
+            (3.1, 59.0),
+            (97.0, 1.0),
+        ] {
             let (ox, oy) = g.eval(x, y);
             let (ex, ey) = f(x, y);
-            assert!((ox - ex).abs() < 1e-9 && (oy - ey).abs() < 1e-9, "({x},{y}): ({ox},{oy})");
+            assert!(
+                (ox - ex).abs() < 1e-9 && (oy - ey).abs() < 1e-9,
+                "({x},{y}): ({ox},{oy})"
+            );
         }
     }
 
@@ -911,13 +1028,25 @@ mod tests {
         // Catmull-Rom (Keys a = −1/2) reproduces degree-2 polynomials exactly
         // wherever the full 4×4 support lies inside the grid.
         let f = |x: f64, y: f64| {
-            (0.01 * x * x + 0.02 * x * y - 0.005 * y * y + x, 0.5 * y + 0.003 * y * y - 0.001 * x * x)
+            (
+                0.01 * x * x + 0.02 * x * y - 0.005 * y * y + x,
+                0.5 * y + 0.003 * y * y - 0.001 * x * x,
+            )
         };
         let g = grid_from_fn([0.0, 0.0, 100.0, 100.0], 10.0, f);
-        for &(x, y) in &[(15.0, 15.0), (50.5, 42.3), (84.9, 15.1), (33.3, 66.6), (20.0, 80.0)] {
+        for &(x, y) in &[
+            (15.0, 15.0),
+            (50.5, 42.3),
+            (84.9, 15.1),
+            (33.3, 66.6),
+            (20.0, 80.0),
+        ] {
             let (ox, oy) = g.eval(x, y);
             let (ex, ey) = f(x, y);
-            assert!((ox - ex).abs() < 1e-9 && (oy - ey).abs() < 1e-9, "({x},{y}): ({ox},{oy})");
+            assert!(
+                (ox - ex).abs() < 1e-9 && (oy - ey).abs() < 1e-9,
+                "({x},{y}): ({ox},{oy})"
+            );
         }
     }
 
@@ -933,9 +1062,14 @@ mod tests {
 
     #[test]
     fn tan_native_celestial_round_trips_including_poles() {
-        for crval in
-            [[84.2, -3.24], [0.3, 45.0], [359.5, -89.5], [123.0, 89.9], [200.0, 90.0], [10.0, -90.0]]
-        {
+        for crval in [
+            [84.2, -3.24],
+            [0.3, 45.0],
+            [359.5, -89.5],
+            [123.0, 89.9],
+            [200.0, 90.0],
+            [10.0, -90.0],
+        ] {
             for native in [(0.0, 0.0), (0.5, -1.1), (-2.0, 1.5), (0.0, 3.0)] {
                 let (ra, dec) = tan_deproject(crval, native.0, native.1);
                 let (xi, eta) = tan_project_checked(crval, ra, dec).expect("within hemisphere");
@@ -956,29 +1090,58 @@ mod tests {
 
     #[test]
     fn tan_project_rejects_far_hemisphere() {
-        assert!(tan_project_checked([0.0, 0.0], 180.0, 0.0).is_none(), "antipode");
-        assert!(tan_project_checked([0.0, 0.0], 90.0, 0.0).is_none(), "exactly 90 deg away");
-        assert!(tan_project_checked([0.0, 0.0], 95.0, 20.0).is_none(), "beyond 90 deg");
-        assert!(tan_project_checked([0.0, 0.0], 89.0, 0.0).is_some(), "inside hemisphere");
+        assert!(
+            tan_project_checked([0.0, 0.0], 180.0, 0.0).is_none(),
+            "antipode"
+        );
+        assert!(
+            tan_project_checked([0.0, 0.0], 90.0, 0.0).is_none(),
+            "exactly 90 deg away"
+        );
+        assert!(
+            tan_project_checked([0.0, 0.0], 95.0, 20.0).is_none(),
+            "beyond 90 deg"
+        );
+        assert!(
+            tan_project_checked([0.0, 0.0], 89.0, 0.0).is_some(),
+            "inside hemisphere"
+        );
     }
 
     // ---- WcsModel ----
 
     fn grid_props(dir: &str, g: &Grid2D) -> Vec<XisfProperty> {
-        let base =
-            format!("PCL:AstrometricSolution:SplineWorldTransformation:PointGridInterpolation:{dir}");
+        let base = format!(
+            "PCL:AstrometricSolution:SplineWorldTransformation:PointGridInterpolation:{dir}"
+        );
         vec![
-            prop(&format!("{base}:Rect"), "F64Vector", PropertyValue::F64Vec(g.rect.to_vec())),
-            prop(&format!("{base}:Delta"), "Float64", PropertyValue::F64(g.delta)),
+            prop(
+                &format!("{base}:Rect"),
+                "F64Vector",
+                PropertyValue::F64Vec(g.rect.to_vec()),
+            ),
+            prop(
+                &format!("{base}:Delta"),
+                "Float64",
+                PropertyValue::F64(g.delta),
+            ),
             prop(
                 &format!("{base}:GridX"),
                 "F64Matrix",
-                PropertyValue::F64Mat { rows: g.rows, cols: g.cols, data: g.gx.clone() },
+                PropertyValue::F64Mat {
+                    rows: g.rows,
+                    cols: g.cols,
+                    data: g.gx.clone(),
+                },
             ),
             prop(
                 &format!("{base}:GridY"),
                 "F64Matrix",
-                PropertyValue::F64Mat { rows: g.rows, cols: g.cols, data: g.gy.clone() },
+                PropertyValue::F64Mat {
+                    rows: g.rows,
+                    cols: g.cols,
+                    data: g.gy.clone(),
+                },
             ),
         ]
     }
@@ -1006,9 +1169,17 @@ mod tests {
         let corners = [lin(0.0, 0.0), lin(w, 0.0), lin(0.0, h), lin(w, h)];
         let pad = 0.01;
         let nx0 = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min) - pad;
-        let nx1 = corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max) + pad;
+        let nx1 = corners
+            .iter()
+            .map(|c| c.0)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + pad;
         let ny0 = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min) - pad;
-        let ny1 = corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max) + pad;
+        let ny1 = corners
+            .iter()
+            .map(|c| c.1)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + pad;
         let n2i = grid_from_fn([nx0, ny0, nx1, ny1], 0.01, inv);
 
         let mut props = vec![
@@ -1076,10 +1247,19 @@ mod tests {
     fn spline_model_round_trips_pixels() {
         let (w, h) = (1000u64, 700u64);
         let model = WcsModel::from_properties(&spline_props(w as f64, h as f64), w, h).unwrap();
-        for &(x, y) in &[(0.5, 0.5), (500.0, 350.0), (999.5, 699.5), (13.7, 683.2), (990.0, 5.0)] {
+        for &(x, y) in &[
+            (0.5, 0.5),
+            (500.0, 350.0),
+            (999.5, 699.5),
+            (13.7, 683.2),
+            (990.0, 5.0),
+        ] {
             let (ra, dec) = model.pixel_to_sky(x, y);
             let (x2, y2) = model.sky_to_pixel(ra, dec).expect("inside grid domain");
-            assert!((x - x2).abs() < 1e-6 && (y - y2).abs() < 1e-6, "({x},{y}) -> ({x2},{y2})");
+            assert!(
+                (x - x2).abs() < 1e-6 && (y - y2).abs() < 1e-6,
+                "({x},{y}) -> ({x2},{y2})"
+            );
         }
     }
 
@@ -1092,9 +1272,16 @@ mod tests {
         assert!(model.sky_to_pixel(ra, dec).is_none(), "outside grid domain");
         // Antipodal point: beyond the tangent hemisphere.
         let (ra, dec) = (model.linear.crval[0] + 180.0, -model.linear.crval[1]);
-        assert!(model.sky_to_pixel(ra.rem_euclid(360.0), dec).is_none(), "far hemisphere");
+        assert!(
+            model.sky_to_pixel(ra.rem_euclid(360.0), dec).is_none(),
+            "far hemisphere"
+        );
         // The reference point itself maps.
-        assert!(model.sky_to_pixel(model.linear.crval[0], model.linear.crval[1]).is_some());
+        assert!(
+            model
+                .sky_to_pixel(model.linear.crval[0], model.linear.crval[1])
+                .is_some()
+        );
     }
 
     #[test]
@@ -1106,7 +1293,10 @@ mod tests {
         assert!((ra - 84.19917732858325).abs() < 1e-12);
         assert!((dec - -3.240007111323072).abs() < 1e-12);
         let (x, y) = model.sky_to_pixel(ra, dec).unwrap();
-        assert!((x - 4627.5).abs() < 1e-9 && (y - 9155.0).abs() < 1e-9, "({x},{y})");
+        assert!(
+            (x - 4627.5).abs() < 1e-9 && (y - 9155.0).abs() < 1e-9,
+            "({x},{y})"
+        );
     }
 
     #[test]
@@ -1118,9 +1308,15 @@ mod tests {
         assert!(WcsModel::from_properties(&base, w, h).is_some());
 
         // Spline marker present but grids missing: never approximate silently.
-        let p: Vec<_> =
-            base.iter().filter(|p| !p.id.contains("PointGridInterpolation")).cloned().collect();
-        assert!(WcsModel::from_properties(&p, w, h).is_none(), "grids required once spline");
+        let p: Vec<_> = base
+            .iter()
+            .filter(|p| !p.id.contains("PointGridInterpolation"))
+            .cloned()
+            .collect();
+        assert!(
+            WcsModel::from_properties(&p, w, h).is_none(),
+            "grids required once spline"
+        );
 
         // Transposed matrix dims are inconsistent with Rect/Delta.
         let mut p = base.clone();
@@ -1131,7 +1327,10 @@ mod tests {
                 std::mem::swap(rows, cols);
             }
         }
-        assert!(WcsModel::from_properties(&p, w, h).is_none(), "transposed dims");
+        assert!(
+            WcsModel::from_properties(&p, w, h).is_none(),
+            "transposed dims"
+        );
 
         // Corrupted grid values fail the reference-point/corner checks.
         let mut p = base.clone();
@@ -1144,16 +1343,27 @@ mod tests {
                 }
             }
         }
-        assert!(WcsModel::from_properties(&p, w, h).is_none(), "corrupt grid values");
+        assert!(
+            WcsModel::from_properties(&p, w, h).is_none(),
+            "corrupt grid values"
+        );
 
         // Non-standard native frame: rotation math would differ.
         let mut p = base.clone();
-        p.iter_mut().find(|q| q.id.ends_with("ReferenceNativeCoordinates")).unwrap().value =
-            PropertyValue::F64Vec(vec![0.0, 45.0]);
-        assert!(WcsModel::from_properties(&p, w, h).is_none(), "non-standard native frame");
+        p.iter_mut()
+            .find(|q| q.id.ends_with("ReferenceNativeCoordinates"))
+            .unwrap()
+            .value = PropertyValue::F64Vec(vec![0.0, 45.0]);
+        assert!(
+            WcsModel::from_properties(&p, w, h).is_none(),
+            "non-standard native frame"
+        );
 
         // Geometry mismatch: grid rect is no longer the image bounds.
-        assert!(WcsModel::from_properties(&base, 2 * w, h).is_none(), "geometry mismatch");
+        assert!(
+            WcsModel::from_properties(&base, 2 * w, h).is_none(),
+            "geometry mismatch"
+        );
     }
 
     #[test]
@@ -1167,7 +1377,9 @@ mod tests {
     use crate::formats::xisf::XisfPanel;
 
     fn test_data(rel: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data").join(rel)
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data")
+            .join(rel)
     }
 
     fn raw_panel_path(n: u32) -> std::path::PathBuf {
@@ -1297,7 +1509,12 @@ mod tests {
     fn detect_stars(panel: &XisfPanel, count: usize) -> Vec<(f64, f64)> {
         let (w, h) = (panel.width() as usize, panel.height() as usize);
         let v = panel.channel(1);
-        let mut sample: Vec<f32> = v.iter().step_by(1009).copied().filter(|x| *x > 0.0).collect();
+        let mut sample: Vec<f32> = v
+            .iter()
+            .step_by(1009)
+            .copied()
+            .filter(|x| *x > 0.0)
+            .collect();
         sample.sort_by(f32::total_cmp);
         let thresh = sample[sample.len() - sample.len() / 1000 - 1];
         const M: usize = 40;
@@ -1325,7 +1542,9 @@ mod tests {
             if kept.len() == count {
                 break;
             }
-            if kept.iter().all(|(kx, ky)| (kx - x as f64).hypot(ky - y as f64) > 100.0)
+            if kept
+                .iter()
+                .all(|(kx, ky)| (kx - x as f64).hypot(ky - y as f64) > 100.0)
                 && let Some(c) = centroid(v, w, h, x, y, local_median(v, w, x, y))
             {
                 kept.push(c);
@@ -1371,7 +1590,11 @@ mod tests {
             wcs_from_properties(&reg.header().properties).expect("registered linear solution");
 
         let stars = detect_stars(&raw, 25);
-        assert!(stars.len() >= 12, "only {} stars detected in the raw panel", stars.len());
+        assert!(
+            stars.len() >= 12,
+            "only {} stars detected in the raw panel",
+            stars.len()
+        );
         let mut residuals = Vec::new();
         let (mut sdx, mut sdy) = (Vec::new(), Vec::new());
         for &(x, y) in &stars {
@@ -1384,7 +1607,9 @@ mod tests {
             // frame in the plain span convention leaves a constant
             // (+0.5, +0.5) canvas-frame residual, reported below.
             let pred = (fx, fy);
-            let Some(det) = refine_at(&reg, pred) else { continue };
+            let Some(det) = refine_at(&reg, pred) else {
+                continue;
+            };
             let r = (det.0 - pred.0).hypot(det.1 - pred.1);
             eprintln!(
                 "raw ({x:7.2},{y:7.2}) -> sky ({ra:10.6},{dec:+9.6}) -> pred ({:8.2},{:8.2}) \
@@ -1395,7 +1620,11 @@ mod tests {
             sdx.push(det.0 - pred.0 + 0.5); // naive span reading, documents the
             sdy.push(det.1 - pred.1 + 0.5); // measured half-pixel placement law
         }
-        assert!(residuals.len() >= 10, "only {} stars matched", residuals.len());
+        assert!(
+            residuals.len() >= 10,
+            "only {} stars matched",
+            residuals.len()
+        );
         residuals.sort_by(f64::total_cmp);
         sdx.sort_by(f64::total_cmp);
         sdy.sort_by(f64::total_cmp);

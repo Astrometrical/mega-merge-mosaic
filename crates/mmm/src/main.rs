@@ -109,7 +109,10 @@ enum Command {
 }
 
 fn parse_roi(s: &str) -> anyhow::Result<[u64; 4]> {
-    let v: Vec<u64> = s.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>()?;
+    let v: Vec<u64> = s
+        .split(',')
+        .map(|p| p.trim().parse())
+        .collect::<Result<_, _>>()?;
     let [x, y, w, h] = v.as_slice() else {
         anyhow::bail!("--roi must be x,y,w,h (got '{s}')");
     };
@@ -127,8 +130,7 @@ fn main() -> anyhow::Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| level.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
         )
         .init();
 
@@ -139,7 +141,12 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Analyze { panels, session, surface, input } => {
+        Command::Analyze {
+            panels,
+            session,
+            surface,
+            input,
+        } => {
             tracing::info!(?session, n_panels = panels.len(), "analyze requested");
             let surface_order = match surface.as_str() {
                 "off" => None,
@@ -278,9 +285,12 @@ fn geometry_card(name: &str) -> bool {
             | "EPOCH"
             | "LONPOLE"
             | "LATPOLE"
-    ) || ["CRVAL", "CRPIX", "CDELT", "CROTA", "CTYPE", "CUNIT", "CD1_", "CD2_", "PC1_", "PC2_", "PV1_", "PV2_"]
-        .iter()
-        .any(|p| n.starts_with(p))
+    ) || [
+        "CRVAL", "CRPIX", "CDELT", "CROTA", "CTYPE", "CUNIT", "CD1_", "CD2_", "PC1_", "PC2_",
+        "PV1_", "PV2_",
+    ]
+    .iter()
+    .any(|p| n.starts_with(p))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -371,12 +381,17 @@ fn blend_cmd(
     );
 
     let surfaces = if session.surfaces_path().exists() {
-        Some(mmm_core::surfaces::Surfaces::load(&session.surfaces_path())?)
+        Some(mmm_core::surfaces::Surfaces::load(
+            &session.surfaces_path(),
+        )?)
     } else {
         None
     };
     match &surfaces {
-        Some(s) => println!("surfaces: applying residual corrections (order {})", s.order),
+        Some(s) => println!(
+            "surfaces: applying residual corrections (order {})",
+            s.order
+        ),
         None => println!("surfaces: none (analyze ran with --surface off)"),
     }
     match flatten {
@@ -391,10 +406,24 @@ fn blend_cmd(
         Some(png_path) => {
             let mut png_sink = PngSink::create(png_path);
             let mut tee = Tee::new(&mut fits, &mut png_sink);
-            blend(&session, &phot, surfaces.as_ref(), &graph, &params, &mut tee)?;
+            blend(
+                &session,
+                &phot,
+                surfaces.as_ref(),
+                &graph,
+                &params,
+                &mut tee,
+            )?;
             println!("png preview: {}", png_path.display());
         }
-        None => blend(&session, &phot, surfaces.as_ref(), &graph, &params, &mut fits)?,
+        None => blend(
+            &session,
+            &phot,
+            surfaces.as_ref(),
+            &graph,
+            &params,
+            &mut fits,
+        )?,
     }
     println!("blend + write: {:.2}s", t1.elapsed().as_secs_f64());
 
@@ -466,7 +495,11 @@ fn report(session_dir: &std::path::Path, seam_png: Option<&std::path::Path>) -> 
     });
 
     let name = |id: usize| -> String {
-        session.panels.get(id).map(panel_name).unwrap_or_else(|| format!("panel {id}"))
+        session
+            .panels
+            .get(id)
+            .map(panel_name)
+            .unwrap_or_else(|| format!("panel {id}"))
     };
     println!(
         "\noverlap edges ({}; seam Δ = mean |corrected step| across owner boundary, ⚠ > 3× median):",
@@ -488,7 +521,11 @@ fn report(session_dir: &std::path::Path, seam_png: Option<&std::path::Path>) -> 
         let (delta, flag) = match sd {
             Some(d) => (
                 format!("{:.3e}", d.delta),
-                if seam_median > 0.0 && d.delta > 3.0 * seam_median { "  ⚠ seam" } else { "" },
+                if seam_median > 0.0 && d.delta > 3.0 * seam_median {
+                    "  ⚠ seam"
+                } else {
+                    ""
+                },
             ),
             None => ("-".to_string(), ""),
         };
@@ -509,7 +546,11 @@ fn report(session_dir: &std::path::Path, seam_png: Option<&std::path::Path>) -> 
     let comps = graph.components(session.panels.len());
     println!("\nconnected components: {}", comps.len());
     for (i, comp) in comps.iter().enumerate() {
-        let ids = comp.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(" ");
+        let ids = comp
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         println!("  #{i}: {ids}");
     }
 
@@ -543,8 +584,18 @@ fn report_surfaces(surf: &mmm_core::surfaces::Surfaces, name: &dyn Fn(usize) -> 
         let mut row = format!("{p:>3} ");
         let mut warn = false;
         for c in 0..channels {
-            let s = surf.max_abs_s.get(c).and_then(|v| v.get(p)).copied().unwrap_or(0.0);
-            let mad = surf.bg_mad.get(c).and_then(|v| v.get(p)).copied().unwrap_or(0.0);
+            let s = surf
+                .max_abs_s
+                .get(c)
+                .and_then(|v| v.get(p))
+                .copied()
+                .unwrap_or(0.0);
+            let mad = surf
+                .bg_mad
+                .get(c)
+                .and_then(|v| v.get(p))
+                .copied()
+                .unwrap_or(0.0);
             warn |= mad > 0.0 && s > WARN_MAD_FACTOR * mad;
             row.push_str(&format!(" {s:>11.3e} {mad:>11.3e}"));
         }
@@ -583,7 +634,11 @@ fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usiz
     );
     for f in &phot.edge_fits {
         let med = median_rms.get(f.channel as usize).copied().unwrap_or(0.0);
-        let flag = if med > 0.0 && f.rms > 3.0 * med { "  ⚠ suspect" } else { "" };
+        let flag = if med > 0.0 && f.rms > 3.0 * med {
+            "  ⚠ suspect"
+        } else {
+            ""
+        };
         println!(
             "{:>3}-{:<3} {:>2} {:>9.4} {:>10.6} {:>10.3e} {:>7}{}",
             f.a, f.b, f.channel, f.gain, f.offset, f.rms, f.n, flag
@@ -600,7 +655,10 @@ fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usiz
     for p in 0..n_panels {
         let mut row = format!("{p:>3} ");
         for c in 0..channels {
-            row.push_str(&format!(" {:>9.4} {:>+11.6}", phot.gains[c][p], phot.offsets[c][p]));
+            row.push_str(&format!(
+                " {:>9.4} {:>+11.6}",
+                phot.gains[c][p], phot.offsets[c][p]
+            ));
         }
         println!("{row}  {}", name(p));
     }
@@ -617,7 +675,10 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
         h.width, h.height, h.channels, h.sample_format, h.data_offset, h.data_size
     );
     for kw in &h.fits_keywords {
-        if matches!(kw.name.as_str(), "OBJECT" | "RA" | "DEC" | "INSTRUME" | "BAYERPAT" | "EXPTIME") {
+        if matches!(
+            kw.name.as_str(),
+            "OBJECT" | "RA" | "DEC" | "INSTRUME" | "BAYERPAT" | "EXPTIME"
+        ) {
             println!("  {:8} = {}", kw.name, kw.value);
         }
     }
@@ -627,7 +688,8 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
         let t0 = std::time::Instant::now();
         for c in 0..panel.channels() {
             let plane = panel.channel(c);
-            let (mut min, mut max, mut zeros, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0u64, 0f64);
+            let (mut min, mut max, mut zeros, mut sum) =
+                (f32::INFINITY, f32::NEG_INFINITY, 0u64, 0f64);
             for &v in plane {
                 if v == 0.0 {
                     zeros += 1;
@@ -644,7 +706,11 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
                 100.0 * nonzero as f64 / n as f64,
                 min,
                 max,
-                if nonzero > 0 { sum / nonzero as f64 } else { 0.0 }
+                if nonzero > 0 {
+                    sum / nonzero as f64
+                } else {
+                    0.0
+                }
             );
         }
         println!("  stats scan: {:.2}s", t0.elapsed().as_secs_f64());

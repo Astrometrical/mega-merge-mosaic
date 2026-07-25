@@ -39,7 +39,13 @@ struct MemSink {
 
 impl MemSink {
     fn new() -> Self {
-        Self { w: 0, h: 0, ch: 0, data: Vec::new(), finished: false }
+        Self {
+            w: 0,
+            h: 0,
+            ch: 0,
+            data: Vec::new(),
+            finished: false,
+        }
     }
 
     fn at(&self, c: usize, x: usize, y: usize) -> f32 {
@@ -135,7 +141,15 @@ fn full_pipeline_recovers_ground_truth() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+    let params = BlendParams {
+        feather_px: 24.0,
+        downsample: 1,
+        band_rows: 64,
+        mode: BlendMode::Feather,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+    };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -184,7 +198,10 @@ fn full_pipeline_recovers_ground_truth() {
     }
 
     // (c) No NaNs/Infs anywhere in the output.
-    assert!(sink.data.iter().all(|v| v.is_finite()), "output must contain no NaN/Inf");
+    assert!(
+        sink.data.iter().all(|v| v.is_finite()),
+        "output must contain no NaN/Inf"
+    );
 
     // (b) RMSE(merged, truth) per channel over pixels ≥ 16 px inside the
     // union of the panel windows. The blend crops to the union content bbox,
@@ -192,7 +209,14 @@ fn full_pipeline_recovers_ground_truth() {
     let (w, h) = (spec.canvas.0 as usize, spec.canvas.1 as usize);
     let bbox = union_bbox(&session).unwrap();
     let (cx0, cy0) = (bbox[0] as usize, bbox[1] as usize);
-    assert_eq!((sink.w, sink.h, sink.ch), ((bbox[2] - bbox[0]) as usize, (bbox[3] - bbox[1]) as usize, nch));
+    assert_eq!(
+        (sink.w, sink.h, sink.ch),
+        (
+            (bbox[2] - bbox[0]) as usize,
+            (bbox[3] - bbox[1]) as usize,
+            nch
+        )
+    );
 
     let mut mask = vec![false; w * h];
     for &[x0, y0, x1, y1] in &res.windows {
@@ -227,7 +251,10 @@ fn full_pipeline_recovers_ground_truth() {
         let rmse = (sum_sq / n as f64).sqrt();
         let bound = 2.0 * spec.noise_sigma as f64;
         eprintln!("ch {c}: RMSE {rmse:.3e} vs bound {bound:.3e} over {n} interior px");
-        assert!(rmse < bound, "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6} over {n} px");
+        assert!(
+            rmse < bound,
+            "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6} over {n} px"
+        );
     }
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -313,11 +340,22 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
     let surf = Surfaces::load(&session.surfaces_path()).unwrap();
     assert_eq!(surf.order, 2);
 
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+    let params = BlendParams {
+        feather_px: 24.0,
+        downsample: 1,
+        band_rows: 64,
+        mode: BlendMode::Feather,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+    };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
-    assert!(sink.data.iter().all(|v| v.is_finite()), "output must contain no NaN/Inf");
+    assert!(
+        sink.data.iter().all(|v| v.is_finite()),
+        "output must contain no NaN/Inf"
+    );
 
     let n_panels = res.applied.len();
     let nch = spec.channels as usize;
@@ -385,7 +423,10 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
             .sum::<f64>()
             / n as f64)
             .sqrt();
-        assert!(raw_rms < 0.02, "ch {c}: raw residual RMS {raw_rms:.4} is runaway");
+        assert!(
+            raw_rms < 0.02,
+            "ch {c}: raw residual RMS {raw_rms:.4} is runaway"
+        );
 
         let max_field = remove_global_field(&mut residual, &interior, w, h);
         assert!(
@@ -406,7 +447,10 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
             "ch {c}: raw RMS {raw_rms:.3e}, field-removed RMSE {rmse:.3e} vs bound {bound:.3e}, \
              global field max {max_field:.3e}"
         );
-        assert!(rmse < bound, "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}");
+        assert!(
+            rmse < bound,
+            "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}"
+        );
     }
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -441,15 +485,29 @@ fn surface_off_bypasses_cleanly() {
 
     // Default analyze writes surfaces.json…
     let session = analyze(&res.panel_paths, &sdir).unwrap();
-    assert!(session.surfaces_path().exists(), "default analyze must fit surfaces");
+    assert!(
+        session.surfaces_path().exists(),
+        "default analyze must fit surfaces"
+    );
 
     // …and an explicit off re-analyze removes it again.
     let session = analyze_opts(&res.panel_paths, &sdir, None).unwrap();
-    assert!(!session.surfaces_path().exists(), "--surface off must not leave surfaces.json");
+    assert!(
+        !session.surfaces_path().exists(),
+        "--surface off must not leave surfaces.json"
+    );
 
     let phot = Photometry::load(&session.photometry_path()).unwrap();
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
-    let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode: BlendMode::Feather, roi: None, defect_veto: true, flatten: None };
+    let params = BlendParams {
+        feather_px: 24.0,
+        downsample: 1,
+        band_rows: 64,
+        mode: BlendMode::Feather,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+    };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
@@ -511,11 +569,22 @@ fn full_pipeline_twoband_recovers_ground_truth() {
     let plane = w * h;
 
     for mode in [BlendMode::TwoBand, BlendMode::Pyramid] {
-        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample: 1,
+            band_rows: 64,
+            mode,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
         assert!(sink.finished);
-        assert!(sink.data.iter().all(|v| v.is_finite()), "output must contain no NaN/Inf");
+        assert!(
+            sink.data.iter().all(|v| v.is_finite()),
+            "output must contain no NaN/Inf"
+        );
 
         for c in 0..nch {
             let truth = &res.truth[c * plane..(c + 1) * plane];
@@ -536,7 +605,10 @@ fn full_pipeline_twoband_recovers_ground_truth() {
             let rmse = (sum_sq / n as f64).sqrt();
             let bound = 2.0 * spec.noise_sigma as f64;
             eprintln!("{mode:?} ch {c}: RMSE {rmse:.3e} vs bound {bound:.3e} over {n} interior px");
-            assert!(rmse < bound, "{mode:?} ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}");
+            assert!(
+                rmse < bound,
+                "{mode:?} ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}"
+            );
         }
     }
 
@@ -579,7 +651,15 @@ fn twoband_single_panel_reconstructs_input() {
     let bbox = union_bbox(&session).unwrap();
     let [x0, y0, x1, y1] = res.windows[0];
     for mode in [BlendMode::TwoBand, BlendMode::Pyramid] {
-        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 32, mode, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample: 1,
+            band_rows: 32,
+            mode,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
 
@@ -624,9 +704,8 @@ fn bright_overlap_peaks(
             if v < floor {
                 continue;
             }
-            let is_max = (y - 3..=y + 3).all(|yy| {
-                (x - 3..=x + 3).all(|xx| img[yy * w + xx] <= v || (xx == x && yy == y))
-            });
+            let is_max = (y - 3..=y + 3)
+                .all(|yy| (x - 3..=x + 3).all(|xx| img[yy * w + xx] <= v || (xx == x && yy == y)));
             if !is_max {
                 continue;
             }
@@ -686,7 +765,15 @@ fn twoband_never_averages_misregistered_stars() {
     let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
 
     let run = |mode: BlendMode| -> MemSink {
-        let params = BlendParams { feather_px: 24.0, downsample: 1, band_rows: 64, mode, roi: None, defect_veto: true, flatten: None };
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample: 1,
+            band_rows: 64,
+            mode,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
         sink
@@ -713,9 +800,16 @@ fn twoband_never_averages_misregistered_stars() {
     let (cx0, cy0) = (bbox[0] as usize, bbox[1] as usize);
     const R: usize = 6; // neighbourhood half-width around each star peak
     let peaks = bright_overlap_peaks(&two.data, two.w, two.h, 0.15, R, &res.windows);
-    assert!(peaks.len() >= 3, "need several bright overlap stars, found {}", peaks.len());
+    assert!(
+        peaks.len() >= 3,
+        "need several bright overlap stars, found {}",
+        peaks.len()
+    );
     let shifted_overlap = peaks.iter().any(|(_, _, covering)| covering.contains(&1));
-    assert!(shifted_overlap, "at least one star must lie in an overlap of the shifted panel");
+    assert!(
+        shifted_overlap,
+        "at least one star must lie in an overlap of the shifted panel"
+    );
 
     // Per star and mode: distance to the *closest single panel* — max abs
     // diff over the neighbourhood, minimized over the covering panels.
@@ -848,8 +942,7 @@ fn pyramid_reduces_midfrequency_ghosting() {
         .collect();
     let (summaries, owner) =
         mmm_core::diag::load_owner_map(&session, &graph, &phot, None, feather).unwrap();
-    let masks: Vec<Vec<bool>> =
-        summaries.iter().map(mmm_core::seam::star_mask).collect();
+    let masks: Vec<Vec<bool>> = summaries.iter().map(mmm_core::seam::star_mask).collect();
     let bbox = union_bbox(&session).unwrap();
     let (cx0, cy0) = (bbox[0] as usize, bbox[1] as usize);
 
@@ -858,8 +951,7 @@ fn pyramid_reduces_midfrequency_ghosting() {
     let seam_x = |y: u64| -> Option<f64> {
         let y8 = (y / 8) as u32;
         (1..owner.w8).find_map(|x8| {
-            (owner.at(x8 - 1, y8) == 0 && owner.at(x8, y8) == 1)
-                .then_some((x8 as f64) * 8.0)
+            (owner.at(x8 - 1, y8) == 0 && owner.at(x8, y8) == 1).then_some((x8 as f64) * 8.0)
         })
     };
 
@@ -918,7 +1010,10 @@ fn pyramid_reduces_midfrequency_ghosting() {
         sum_pyr += d_pyr as f64;
         n_metric += 1;
     }
-    assert!(n_metric >= 2, "need ≥ 2 clear overlap blobs, got {n_metric} (reseed)");
+    assert!(
+        n_metric >= 2,
+        "need ≥ 2 clear overlap blobs, got {n_metric} (reseed)"
+    );
     let ratio = sum_pyr / sum_two;
     eprintln!(
         "ghost metric over {n_metric} blobs: twoband {:.5}, pyramid {:.5}, ratio {ratio:.3}",
@@ -949,8 +1044,13 @@ fn pyramid_reduces_midfrequency_ghosting() {
         .expect("at least one clear overlap blob");
     let (bx, by, _) = near;
     let sx = seam_x(by as u64).unwrap();
-    eprintln!("profile blob at ({bx:.1},{by:.1}), seam at {sx:.1} (dist {:.1})", (bx - sx).abs());
-    let rows: Vec<usize> = ((by as i64 - 16)..=(by as i64 + 16)).map(|y| y as usize).collect();
+    eprintln!(
+        "profile blob at ({bx:.1},{by:.1}), seam at {sx:.1} (dist {:.1})",
+        (bx - sx).abs()
+    );
+    let rows: Vec<usize> = ((by as i64 - 16)..=(by as i64 + 16))
+        .map(|y| y as usize)
+        .collect();
     // Clamp the profile to the shared-coverage band (16 px margin): outside
     // it one of the "panels" is uncovered and its corrected value means
     // nothing, and panel-rim cells are the feather's job, not the seam's.
@@ -981,7 +1081,10 @@ fn pyramid_reduces_midfrequency_ghosting() {
     eprintln!(
         "profile: {} measurable columns; α = {:?}",
         alphas.len(),
-        alphas.iter().map(|&(_, a)| (a * 100.0).round() / 100.0).collect::<Vec<_>>()
+        alphas
+            .iter()
+            .map(|&(_, a)| (a * 100.0).round() / 100.0)
+            .collect::<Vec<_>>()
     );
     for pair in alphas.windows(2) {
         let (&(x0, a0), &(x1, a1)) = (&pair[0], &pair[1]);
@@ -1161,7 +1264,10 @@ fn background_residual_samples(
             samples.push((x as f64 / w as f64, y as f64 / h as f64, r as f64));
         }
     }
-    assert!(samples.len() > 10_000, "background sample unexpectedly small");
+    assert!(
+        samples.len() > 10_000,
+        "background sample unexpectedly small"
+    );
     samples
 }
 
@@ -1196,7 +1302,10 @@ fn flatten_removes_common_sky_gradient() {
         sink
     };
     let flat = run(Some(1), 1);
-    assert!(flat.data.iter().all(|v| v.is_finite()), "no NaN/Inf in flattened output");
+    assert!(
+        flat.data.iter().all(|v| v.is_finite()),
+        "no NaN/Inf in flattened output"
+    );
 
     let n_panels = res.applied.len();
     let reference = (0..n_panels)
@@ -1214,7 +1323,10 @@ fn flatten_removes_common_sky_gradient() {
         .map(|&(x, y, _)| (x, y, gb as f64 * x + gc as f64 * y))
         .collect();
     let amp_inj = plane_amp_about_center(&injected);
-    assert!(amp_inj > 0.2, "injected gradient amplitude sanity: {amp_inj:.3}");
+    assert!(
+        amp_inj > 0.2,
+        "injected gradient amplitude sanity: {amp_inj:.3}"
+    );
 
     eprintln!("flatten on: residual plane amp {amp_flat:.4} vs injected {amp_inj:.4}");
     assert!(
@@ -1243,7 +1355,11 @@ fn flatten_removes_common_sky_gradient() {
             diffs.push((xn, yn, (voff - von) as f64));
         }
     }
-    assert!(diffs.len() > 500, "too few covered preview cells: {}", diffs.len());
+    assert!(
+        diffs.len() > 500,
+        "too few covered preview cells: {}",
+        diffs.len()
+    );
     let amp_l8 = plane_amp_about_center(&diffs);
     eprintln!("L8 preview subtracted-field amp {amp_l8:.4} vs injected {amp_inj:.4}");
     assert!(
@@ -1375,7 +1491,11 @@ impl Scene {
                 let u = rng.range(16.0, w - 16.0);
                 let v = rng.range(16.0, h - 16.0);
                 let sigma = rng.range(1.4, 2.4);
-                let t = if n_stars > 1 { i as f64 / (n_stars - 1) as f64 } else { 0.0 };
+                let t = if n_stars > 1 {
+                    i as f64 / (n_stars - 1) as f64
+                } else {
+                    0.0
+                };
                 let amp = 0.7 * (0.03f64 / 0.7).powf(t); // log-spaced 0.7 .. 0.03
                 (u, v, sigma, amp)
             })
@@ -1439,7 +1559,10 @@ fn write_solved_panels(
         let (cra, cdec) = scene.wcs.pixel_to_sky(spec.center_uv.0, spec.center_uv.1);
         let (sr, cr) = spec.rot_deg.to_radians().sin_cos();
         // R(rot)·diag(−s, +s): the standard astro E-W mirror is preserved.
-        let cd = [[-scale_deg * cr, -scale_deg * sr], [-scale_deg * sr, scale_deg * cr]];
+        let cd = [
+            [-scale_deg * cr, -scale_deg * sr],
+            [-scale_deg * sr, scale_deg * cr],
+        ];
         let refimg = [spec.w as f64 / 2.0, spec.h as f64 / 2.0];
         let lin = LinearWcs {
             crval: [cra, cdec],
@@ -1473,7 +1596,11 @@ fn write_solved_panels(
             spec.h,
             channels as u64,
             &planes,
-            &SynthWcs { crval: [cra, cdec], refimg, cd },
+            &SynthWcs {
+                crval: [cra, cdec],
+                refimg,
+                cd,
+            },
         )
         .unwrap();
         paths.push(path);
@@ -1496,29 +1623,41 @@ fn solved_input_pipeline_recovers_ground_truth() {
     let scene = Scene::new([66.0, 18.0], S, 360.0, 280.0, 30, 4242);
     let gains = [1.0f32, 0.85, 1.2, 1.05];
     let offsets = [0.0f32, 0.01, -0.005, 0.004];
-    let specs: Vec<SolvedPanelSpec> = [(100.0, 80.0), (260.0, 80.0), (100.0, 200.0), (260.0, 200.0)]
-        .iter()
-        .zip([0.0f64, 2.0, -1.5, 3.0])
-        .enumerate()
-        .map(|(k, (&center_uv, rot_deg))| SolvedPanelSpec {
-            w: 210 + 2 * k as u64, // every panel its own geometry
-            h: 170 - 2 * k as u64,
-            rot_deg,
-            center_uv,
-            gain: gains[k],
-            offset: offsets[k],
-        })
-        .collect();
+    let specs: Vec<SolvedPanelSpec> =
+        [(100.0, 80.0), (260.0, 80.0), (100.0, 200.0), (260.0, 200.0)]
+            .iter()
+            .zip([0.0f64, 2.0, -1.5, 3.0])
+            .enumerate()
+            .map(|(k, (&center_uv, rot_deg))| SolvedPanelSpec {
+                w: 210 + 2 * k as u64, // every panel its own geometry
+                h: 170 - 2 * k as u64,
+                rot_deg,
+                center_uv,
+                gain: gains[k],
+                offset: offsets[k],
+            })
+            .collect();
     let paths = write_solved_panels(&dir.join("panels"), &scene, &specs, nch, S, noise_sigma, 7);
 
-    let session =
-        analyze_input(&paths, &dir.join("s.mmm-session"), Some(2), InputSelect::Solved).unwrap();
+    let session = analyze_input(
+        &paths,
+        &dir.join("s.mmm-session"),
+        Some(2),
+        InputSelect::Solved,
+    )
+    .unwrap();
     assert_eq!(session.input, InputKind::Solved);
-    let frame = session.frame.clone().expect("solved session must persist its frame");
+    let frame = session
+        .frame
+        .clone()
+        .expect("solved session must persist its frame");
     assert_eq!(session.canvas, (frame.width, frame.height, nch as u64));
     assert!((frame.scale_deg - S).abs() < 1e-12, "median scale");
     for p in &session.panels {
-        assert!(p.source.is_some(), "reprojected panels record their source file");
+        assert!(
+            p.source.is_some(),
+            "reprojected panels record their source file"
+        );
     }
 
     let phot = Photometry::load(&session.photometry_path()).unwrap();
@@ -1537,7 +1676,10 @@ fn solved_input_pipeline_recovers_ground_truth() {
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
     assert!(sink.finished);
-    assert!(sink.data.iter().all(|v| v.is_finite()), "output must contain no NaN/Inf");
+    assert!(
+        sink.data.iter().all(|v| v.is_finite()),
+        "output must contain no NaN/Inf"
+    );
 
     // The gauge panel fixes the output's photometric frame.
     let n_panels = specs.len();
@@ -1589,7 +1731,10 @@ fn solved_input_pipeline_recovers_ground_truth() {
         let rmse = (sum_sq / n as f64).sqrt();
         let bound = 2.0 * noise_sigma;
         eprintln!("solved e2e ch {c}: RMSE {rmse:.3e} vs bound {bound:.3e} over {n} interior px");
-        assert!(rmse < bound, "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}");
+        assert!(
+            rmse < bound,
+            "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}"
+        );
     }
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1622,10 +1767,18 @@ fn auto_detects_input_kind() {
         seed: 11,
     };
     let res = generate(&spec, &dir.join("aligned-panels")).unwrap();
-    let session =
-        analyze_input(&res.panel_paths, &dir.join("a.mmm-session"), None, InputSelect::Auto)
-            .unwrap();
-    assert_eq!(session.input, InputKind::Aligned, "full-canvas frames must scan as aligned");
+    let session = analyze_input(
+        &res.panel_paths,
+        &dir.join("a.mmm-session"),
+        None,
+        InputSelect::Auto,
+    )
+    .unwrap();
+    assert_eq!(
+        session.input,
+        InputKind::Aligned,
+        "full-canvas frames must scan as aligned"
+    );
     assert!(session.frame.is_none());
     assert_eq!(session.canvas, (256, 192, 1));
 
@@ -1633,20 +1786,52 @@ fn auto_detects_input_kind() {
     const S: f64 = 1.0e-3;
     let scene = Scene::new([120.0, -25.0], S, 260.0, 140.0, 8, 99);
     let mixed = [
-        SolvedPanelSpec { w: 150, h: 120, rot_deg: 0.0, center_uv: (80.0, 70.0), gain: 1.0, offset: 0.0 },
-        SolvedPanelSpec { w: 154, h: 118, rot_deg: 2.0, center_uv: (180.0, 70.0), gain: 1.1, offset: 0.002 },
+        SolvedPanelSpec {
+            w: 150,
+            h: 120,
+            rot_deg: 0.0,
+            center_uv: (80.0, 70.0),
+            gain: 1.0,
+            offset: 0.0,
+        },
+        SolvedPanelSpec {
+            w: 154,
+            h: 118,
+            rot_deg: 2.0,
+            center_uv: (180.0, 70.0),
+            gain: 1.1,
+            offset: 0.002,
+        },
     ];
     let paths = write_solved_panels(&dir.join("mixed"), &scene, &mixed, 1, S, 0.001, 3);
     let session =
         analyze_input(&paths, &dir.join("b.mmm-session"), None, InputSelect::Auto).unwrap();
-    assert_eq!(session.input, InputKind::Solved, "mixed geometries must go solved");
+    assert_eq!(
+        session.input,
+        InputKind::Solved,
+        "mixed geometries must go solved"
+    );
     assert!(session.frame.is_some());
 
     // (c) Same-geometry raw solved panels (full coverage): the geometry
     // signal alone says aligned, the ≥ 50%-coverage rule re-dispatches.
     let same = [
-        SolvedPanelSpec { w: 150, h: 120, rot_deg: 0.0, center_uv: (80.0, 70.0), gain: 1.0, offset: 0.0 },
-        SolvedPanelSpec { w: 150, h: 120, rot_deg: 0.0, center_uv: (140.0, 70.0), gain: 0.95, offset: 0.001 },
+        SolvedPanelSpec {
+            w: 150,
+            h: 120,
+            rot_deg: 0.0,
+            center_uv: (80.0, 70.0),
+            gain: 1.0,
+            offset: 0.0,
+        },
+        SolvedPanelSpec {
+            w: 150,
+            h: 120,
+            rot_deg: 0.0,
+            center_uv: (140.0, 70.0),
+            gain: 0.95,
+            offset: 0.001,
+        },
     ];
     let paths = write_solved_panels(&dir.join("same"), &scene, &same, 1, S, 0.001, 4);
     let session =
@@ -1672,8 +1857,14 @@ fn auto_detects_input_kind() {
     )
     .unwrap_err()
     .to_string();
-    assert!(err.contains("nowcs_a.xisf") && err.contains("nowcs_b.xisf"), "err: {err}");
-    assert!(err.contains("ReferenceCelestialCoordinates"), "err must name what is missing: {err}");
+    assert!(
+        err.contains("nowcs_a.xisf") && err.contains("nowcs_b.xisf"),
+        "err: {err}"
+    );
+    assert!(
+        err.contains("ReferenceCelestialCoordinates"),
+        "err must name what is missing: {err}"
+    );
 
     // (e) --input solved on unsolved aligned frames errors the same way.
     let err = analyze_input(
@@ -1705,8 +1896,8 @@ struct FitsImage {
 
 impl FitsImage {
     fn open(path: &Path) -> FitsImage {
-        let file = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        let file =
+            std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
         let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
         let mut cards = std::collections::HashMap::new();
         let mut off = 0;
@@ -1832,7 +2023,10 @@ fn detect_stars(img: &[f32], w: usize, h: usize, floor: f32, min_sep: f64) -> Ve
     cands.sort_by(|a, b| b.2.total_cmp(&a.2));
     let mut picked: Vec<(f64, f64, f32)> = Vec::new();
     for c in cands {
-        if picked.iter().all(|p| (p.0 - c.0).hypot(p.1 - c.1) >= min_sep) {
+        if picked
+            .iter()
+            .all(|p| (p.0 - c.0).hypot(p.1 - c.1) >= min_sep)
+        {
             picked.push(c);
         }
         if picked.len() >= 30 {
@@ -1866,8 +2060,8 @@ fn real_solved_pipeline_matches_registered() {
     use mmm_core::output::fits::{FitsSink, keywords_for_output};
     use mmm_core::session::Session;
 
-    let raw_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test_data/orion_mosaic_raw_panels");
+    let raw_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/orion_mosaic_raw_panels");
     let paths: Vec<PathBuf> = (1..=12)
         .map(|n| {
             raw_dir.join(format!(
@@ -1886,7 +2080,11 @@ fn real_solved_pipeline_matches_registered() {
     let t0 = std::time::Instant::now();
     let session = analyze_input(&paths, &session_dir, Some(2), InputSelect::Auto).unwrap();
     let analyze_secs = t0.elapsed().as_secs_f64();
-    assert_eq!(session.input, InputKind::Solved, "auto-detect must pick solved");
+    assert_eq!(
+        session.input,
+        InputKind::Solved,
+        "auto-detect must pick solved"
+    );
     let frame = session.frame.clone().unwrap();
     eprintln!(
         "raw analyze: {analyze_secs:.1}s total, align stage {:.1}s; frame {}x{} @ {:.4}\"/px",
@@ -1951,7 +2149,10 @@ fn real_solved_pipeline_matches_registered() {
     // --- compare: star positions via WCS sky matching --------------------
     let a = FitsImage::open(&raw_fits);
     let b = FitsImage::open(&reg_fits);
-    eprintln!("raw output {}x{}x{}, registered {}x{}x{}", a.w, a.h, a.ch, b.w, b.h, b.ch);
+    eprintln!(
+        "raw output {}x{}x{}, registered {}x{}x{}",
+        a.w, a.h, a.ch, b.w, b.h, b.ch
+    );
 
     let t = std::time::Instant::now();
     let plane_a = a.plane(0);
@@ -1964,7 +2165,10 @@ fn real_solved_pipeline_matches_registered() {
         stars_b.len(),
         t.elapsed().as_secs_f64()
     );
-    assert!(stars_a.len() >= 10 && stars_b.len() >= 10, "need ≥ 10 bright stars in both");
+    assert!(
+        stars_a.len() >= 10 && stars_b.len() >= 10,
+        "need ≥ 10 bright stars in both"
+    );
 
     let mut residuals: Vec<f64> = Vec::new();
     for &(ax, ay, amp) in &stars_a {
@@ -1985,7 +2189,11 @@ fn real_solved_pipeline_matches_registered() {
             residuals.push(d);
         }
     }
-    assert!(residuals.len() >= 10, "only {} stars matched across the outputs", residuals.len());
+    assert!(
+        residuals.len() >= 10,
+        "only {} stars matched across the outputs",
+        residuals.len()
+    );
     residuals.sort_by(f64::total_cmp);
     let median = residuals[residuals.len() / 2];
     let max = residuals[residuals.len() - 1];
@@ -1993,7 +2201,10 @@ fn real_solved_pipeline_matches_registered() {
         "star match: {} stars, median residual {median:.3} px, max {max:.3} px",
         residuals.len()
     );
-    assert!(median < 1.0, "median star residual {median:.3} px must be < 1 px");
+    assert!(
+        median < 1.0,
+        "median star residual {median:.3} px must be < 1 px"
+    );
 
     // --- overall difference, sampled through the sky mapping --------------
     let mut n = 0u64;
@@ -2007,7 +2218,9 @@ fn real_solved_pipeline_matches_registered() {
             }
             let (ra, dec) = a.wcs.pixel_to_sky(x as f64 + 1.0, r as f64 + 1.0);
             let (px, py) = b.wcs.sky_to_pixel(ra, dec);
-            let Some(vb) = b.sample(0, px - 1.0, py - 1.0) else { continue };
+            let Some(vb) = b.sample(0, px - 1.0, py - 1.0) else {
+                continue;
+            };
             let d = f64::from(va[0]) - vb;
             diffs.push(d.abs());
             sum_ratio += f64::from(va[0]) / vb;
@@ -2112,8 +2325,7 @@ fn pyramid_deep_single_coverage_matches_panel() {
     let mut worst = (0u64, 0u64);
     for y in zy0..zy1 {
         for x in zx0..zx1 {
-            let merged =
-                sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
+            let merged = sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
             let input = data[(y * spec.canvas.0 + x) as usize] * g + o;
             let d = (merged - input).abs();
             if d > max_diff {

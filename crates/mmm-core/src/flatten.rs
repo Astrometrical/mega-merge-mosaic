@@ -108,10 +108,16 @@ pub fn fit_flatten(
     ctx: &Path,
 ) -> Result<Flatten> {
     if !(1..=2).contains(&order) {
-        return Err(Error::format(ctx, format!("flatten order must be 1 or 2, got {order}")));
+        return Err(Error::format(
+            ctx,
+            format!("flatten order must be 1 or 2, got {order}"),
+        ));
     }
     if summaries.is_empty() {
-        return Err(Error::format(ctx, "flatten needs at least one panel summary"));
+        return Err(Error::format(
+            ctx,
+            "flatten needs at least one panel summary",
+        ));
     }
     let nch = canvas.2 as usize;
     let (w8, h8) = (summaries[0].w8 as usize, summaries[0].h8 as usize);
@@ -181,16 +187,23 @@ pub fn fit_flatten(
         }
     }
     if considered == 0 {
-        return Err(Error::format(ctx, "flatten found no fully-covered L8 cells"));
+        return Err(Error::format(
+            ctx,
+            "flatten found no fully-covered L8 cells",
+        ));
     }
 
     // Per-channel bright cut: merged > median + 3×MAD (over mask-clear cells)
     // in any channel marks the cell as signal.
     let mut bright = vec![false; cells];
     for c in 0..nch {
-        let mut vals: Vec<f64> =
-            (0..cells).filter(|&i| clear[i]).map(|i| merged[c * cells + i]).collect();
-        let Some((med, mad)) = median_mad(&mut vals) else { continue };
+        let mut vals: Vec<f64> = (0..cells)
+            .filter(|&i| clear[i])
+            .map(|i| merged[c * cells + i])
+            .collect();
+        let Some((med, mad)) = median_mad(&mut vals) else {
+            continue;
+        };
         let thr = med + BG_MAD_K * mad;
         for (i, b) in bright.iter_mut().enumerate() {
             if clear[i] && merged[c * cells + i] > thr {
@@ -239,7 +252,11 @@ pub fn fit_flatten(
         coeffs.push(crate::linalg::solve_dense(&mut a, &mut b, t)?);
     }
     tracing::info!(order, bg_frac, n_bg = bg.len(), "global flatten fitted");
-    Ok(Flatten { order, coeffs, bg_frac })
+    Ok(Flatten {
+        order,
+        coeffs,
+        bg_frac,
+    })
 }
 
 /// Basis vector `[1, x, y, x², xy, y²]` truncated to `t` terms — the same
@@ -263,7 +280,11 @@ fn median_mad(vals: &mut [f64]) -> Option<(f64, f64)> {
     fn median(v: &mut [f64]) -> f64 {
         v.sort_by(f64::total_cmp);
         let n = v.len();
-        if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            0.5 * (v[n / 2 - 1] + v[n / 2])
+        }
     }
     if vals.is_empty() {
         return None;
@@ -334,8 +355,9 @@ mod tests {
     #[test]
     fn fit_order2_recovers_quadratic_background() {
         let canvas = (256u64, 256u64, 1u64);
-        let field = |xn: f64, yn: f64| 0.02 + 0.01 * xn + 0.02 * yn - 0.015 * xn * xn
-            + 0.005 * xn * yn + 0.01 * yn * yn;
+        let field = |xn: f64, yn: f64| {
+            0.02 + 0.01 * xn + 0.02 * yn - 0.015 * xn * xn + 0.005 * xn * yn + 0.01 * yn * yn
+        };
         let s = field_summary(32, 32, (canvas.0, canvas.1), field);
         let masks = vec![vec![false; 32 * 32]];
         let phot = identity_phot(1, 1);
@@ -345,7 +367,10 @@ mod tests {
         for &(xn, yn) in &[(0.1, 0.2), (0.8, 0.9), (0.5, 0.1)] {
             let want = field(xn, yn) - field(0.5, 0.5);
             let got = f.delta(0, xn, yn);
-            assert!((got - want).abs() < 1e-6, "delta({xn},{yn}) {got} vs {want}");
+            assert!(
+                (got - want).abs() < 1e-6,
+                "delta({xn},{yn}) {got} vs {want}"
+            );
         }
     }
 
@@ -399,8 +424,16 @@ mod tests {
         let phot = identity_phot(1, 1);
         for bad in [0u32, 3] {
             assert!(
-                fit_flatten(std::slice::from_ref(&s), &masks, &phot, None, canvas, bad, &PathBuf::new())
-                    .is_err(),
+                fit_flatten(
+                    std::slice::from_ref(&s),
+                    &masks,
+                    &phot,
+                    None,
+                    canvas,
+                    bad,
+                    &PathBuf::new()
+                )
+                .is_err(),
                 "order {bad} must be rejected"
             );
         }
@@ -428,13 +461,21 @@ mod tests {
         let masks = vec![vec![false; (w8 * h8) as usize]; 2];
         let phot = identity_phot(2, 1);
 
-        let f =
-            fit_flatten(&summaries, &masks, &phot, None, canvas, 1, &PathBuf::new()).unwrap();
+        let f = fit_flatten(&summaries, &masks, &phot, None, canvas, 1, &PathBuf::new()).unwrap();
         // The fitted plane rises from A's level to B's level along x.
         let left = f.eval(0, 0.15, 0.5);
         let right = f.eval(0, 0.85, 0.5);
-        assert!(left < right, "plane must tilt from 0.02 toward 0.04: {left} vs {right}");
-        assert!((0.01..=0.03).contains(&left), "left end near A's level: {left}");
-        assert!((0.03..=0.05).contains(&right), "right end near B's level: {right}");
+        assert!(
+            left < right,
+            "plane must tilt from 0.02 toward 0.04: {left} vs {right}"
+        );
+        assert!(
+            (0.01..=0.03).contains(&left),
+            "left end near A's level: {left}"
+        );
+        assert!(
+            (0.03..=0.05).contains(&right),
+            "right end near B's level: {right}"
+        );
     }
 }

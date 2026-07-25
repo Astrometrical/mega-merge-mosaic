@@ -120,7 +120,11 @@ pub fn solve(summaries: &[L8Summary], graph: &OverlapGraph) -> Result<Photometry
         offsets.push(o);
     }
 
-    Ok(Photometry { edge_fits, gains, offsets })
+    Ok(Photometry {
+        edge_fits,
+        gains,
+        offsets,
+    })
 }
 
 /// Count of fully covered L8 cells — the panel-size measure for gauge choice.
@@ -220,7 +224,10 @@ fn global_solve(
     let mut a = vec![0.0f64; n * n];
     let mut b = vec![0.0f64; n];
 
-    for f in fits.iter().filter(|f| f.channel == channel && f.stats[0] > 0.0) {
+    for f in fits
+        .iter()
+        .filter(|f| f.channel == channel && f.stats[0] > 0.0)
+    {
         let nn = f.stats[0];
         // Normalized sufficient statistics: n' = 1, the rest are means.
         let en = 1.0;
@@ -288,12 +295,7 @@ mod tests {
 
     /// 1-channel summary with `cov = 1.0` and `mean = f(x, y)` inside
     /// `region = [x0, y0, x1, y1)`, zero elsewhere.
-    fn summary_from(
-        w8: u32,
-        h8: u32,
-        region: [u32; 4],
-        f: impl Fn(u32, u32) -> f32,
-    ) -> L8Summary {
+    fn summary_from(w8: u32, h8: u32, region: [u32; 4], f: impl Fn(u32, u32) -> f32) -> L8Summary {
         let mut s = L8Summary::zeroed(w8, h8, 1);
         for y in region[1]..region[3] {
             for x in region[0]..region[2] {
@@ -424,8 +426,7 @@ mod tests {
             gains: vec![vec![1.0, 0.8]],
             offsets: vec![vec![0.0, 0.01]],
         };
-        let dir =
-            std::env::temp_dir().join(format!("mmm-phot-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mmm-phot-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("photometry.json");
         phot.save(&path).unwrap();

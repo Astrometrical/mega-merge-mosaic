@@ -107,7 +107,11 @@ impl PanelReader {
                         ),
                     ));
                 }
-                Ok(PanelReader { backing: Backing::Cache(mmap), bbox, canvas })
+                Ok(PanelReader {
+                    backing: Backing::Cache(mmap),
+                    bbox,
+                    canvas,
+                })
             }
         }
     }
@@ -269,11 +273,29 @@ mod tests {
         }
 
         // Size mismatch and out-of-canvas bboxes are refused.
-        let bad = meta(path.clone(), PanelStorage::CroppedCache { bbox: [10, 20, 15, 23] });
+        let bad = meta(
+            path.clone(),
+            PanelStorage::CroppedCache {
+                bbox: [10, 20, 15, 23],
+            },
+        );
         assert!(PanelReader::open(&bad, canvas).is_err(), "size mismatch");
-        let out = meta(path.clone(), PanelStorage::CroppedCache { bbox: [98, 78, 102, 81] });
-        assert!(PanelReader::open(&out, canvas).is_err(), "bbox outside canvas");
-        let empty = meta(path, PanelStorage::CroppedCache { bbox: [10, 20, 10, 23] });
+        let out = meta(
+            path.clone(),
+            PanelStorage::CroppedCache {
+                bbox: [98, 78, 102, 81],
+            },
+        );
+        assert!(
+            PanelReader::open(&out, canvas).is_err(),
+            "bbox outside canvas"
+        );
+        let empty = meta(
+            path,
+            PanelStorage::CroppedCache {
+                bbox: [10, 20, 10, 23],
+            },
+        );
         assert!(PanelReader::open(&empty, canvas).is_err(), "empty bbox");
 
         std::fs::remove_dir_all(&dir).unwrap();
