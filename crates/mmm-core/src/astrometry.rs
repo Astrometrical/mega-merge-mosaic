@@ -550,6 +550,8 @@ pub fn wcs_cards(w: &LinearWcs, crop_origin: (u64, u64), out_height: u64) -> Vec
     // independent PixInsight annotation tests proved reflected cards mirror,
     // whichever way the pixel rows are stored. `out_height` is kept in the
     // signature for the historical record and deliberately unused.
+    // (An unresolved user-side mirror remains an open issue; the CLI's
+    // `--wcs-frame flipped` escape hatch calls [`wcs_cards_flipped`].)
     let _ = out_height;
     let crpix1 = w.crpix[0] - crop_origin.0 as f64;
     let crpix2 = w.crpix[1] - crop_origin.1 as f64;
@@ -568,6 +570,30 @@ pub fn wcs_cards(w: &LinearWcs, crop_origin: (u64, u64), out_height: u64) -> Vec
         kw("CUNIT2", q("deg"), "axis unit"),
         kw("RADESYS", q(&w.radesys), "celestial reference system"),
     ]
+}
+
+/// [`wcs_cards`] reflected into the bottom-up frame: CRPIX2 mirrored about
+/// the output height, dy-dependent CD column negated. An escape hatch for
+/// readers that interpret cards in the standard bottom-up frame against our
+/// top-down rows (CLI: `--wcs-frame flipped`); see the open mirror issue.
+pub fn wcs_cards_flipped(
+    w: &LinearWcs,
+    crop_origin: (u64, u64),
+    out_height: u64,
+) -> Vec<FitsKeyword> {
+    let mut cards = wcs_cards(w, crop_origin, out_height);
+    let crpix2 = w.crpix[1] - crop_origin.1 as f64;
+    // Avoid "-0" card text when a matrix element is exactly zero.
+    let neg_s = |v: f64| if v == 0.0 { "0".to_string() } else { (-v).to_string() };
+    for kw in &mut cards {
+        match kw.name.as_str() {
+            "CRPIX2" => kw.value = (out_height as f64 + 1.0 - crpix2).to_string(),
+            "CD1_2" => kw.value = neg_s(w.cd[0][1]),
+            "CD2_2" => kw.value = neg_s(w.cd[1][1]),
+            _ => {}
+        }
+    }
+    cards
 }
 
 #[cfg(test)]
@@ -743,6 +769,33 @@ mod tests {
             let (cx, cy) = c.sky_to_pixel(ra, dec);
             assert!((cx - x).abs() < 1e-6, "x: {cx} vs {x}");
             assert!((cy - y).abs() < 1e-6, "y: {cy} vs {y}");
+        }
+    }
+
+    /// The `--wcs-frame flipped` escape hatch: cards reflected bottom-up.
+    /// An object at top-down pixel (x, y) projects through the flipped cards
+    /// to (x, H+1-y). Non-diagonal matrix so a wrong negation choice fails.
+    #[test]
+    fn flipped_cards_reflect_y_bottom_up() {
+        const H: u64 = 4000;
+        let w = LinearWcs {
+            crval: [84.0, -3.0],
+            crpix: [1500.0, 1200.0],
+            cd: [[-3.8e-4, 2.2e-4], [2.2e-4, 3.8e-4]],
+            ctype: ["RA---TAN".into(), "DEC--TAN".into()],
+            radesys: "ICRS".into(),
+        };
+        let c = wcs_from_cards(&wcs_cards_flipped(&w, (0, 0), H));
+        assert_eq!(c.cd[0][0], w.cd[0][0]);
+        assert_eq!(c.cd[1][0], w.cd[1][0]);
+        assert_eq!(c.cd[0][1], -w.cd[0][1]);
+        assert_eq!(c.cd[1][1], -w.cd[1][1]);
+        assert_eq!(c.crpix[1], H as f64 + 1.0 - w.crpix[1]);
+        for &(x, y) in &[(100.0, 250.0), (3000.0, 3900.0), (1500.0, 1200.0)] {
+            let (ra, dec) = w.pixel_to_sky(x, y);
+            let (cx, cy) = c.sky_to_pixel(ra, dec);
+            assert!((cx - x).abs() < 1e-6, "x: {cx} vs {x}");
+            assert!((cy - (H as f64 + 1.0 - y)).abs() < 1e-6, "y: {cy}");
         }
     }
 

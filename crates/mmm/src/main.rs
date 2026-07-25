@@ -100,6 +100,11 @@ enum Command {
         /// signal-dominated (nebula-heavy) mosaics
         #[arg(long, default_value = "off")]
         flatten: String,
+
+        /// WCS card convention: topdown (PI display-space, default) or
+        /// flipped (reflected bottom-up) for readers that mirror annotations
+        #[arg(long, default_value = "topdown")]
+        wcs_frame: String,
     },
 }
 
@@ -196,7 +201,18 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Report { session, seam_png } => report(&session, seam_png.as_deref()),
-        Command::Blend { session, output, downsample, feather, mode, png, roi, defect_veto, flatten } => {
+        Command::Blend {
+            session,
+            output,
+            downsample,
+            feather,
+            mode,
+            png,
+            roi,
+            defect_veto,
+            flatten,
+            wcs_frame,
+        } => {
             let mode = match mode.as_str() {
                 "feather" => mmm_core::blend::BlendMode::Feather,
                 "twoband" => mmm_core::blend::BlendMode::TwoBand,
@@ -214,6 +230,11 @@ fn main() -> anyhow::Result<()> {
                 "2" => Some(2),
                 other => anyhow::bail!("--flatten must be off, 1 or 2 (got {other})"),
             };
+            let wcs_flip = match wcs_frame.as_str() {
+                "topdown" => false,
+                "flipped" => true,
+                other => anyhow::bail!("--wcs-frame must be topdown or flipped (got {other})"),
+            };
             let roi = roi.as_deref().map(parse_roi).transpose()?;
             blend_cmd(
                 &session,
@@ -225,6 +246,7 @@ fn main() -> anyhow::Result<()> {
                 roi,
                 defect_veto,
                 flatten,
+                wcs_flip,
             )
         }
     }
@@ -272,8 +294,9 @@ fn blend_cmd(
     roi: Option<[u64; 4]>,
     defect_veto: bool,
     flatten: Option<u32>,
+    wcs_flip: bool,
 ) -> anyhow::Result<()> {
-    use mmm_core::astrometry::{wcs_cards, wcs_from_properties};
+    use mmm_core::astrometry::{wcs_cards, wcs_cards_flipped, wcs_from_properties};
     use mmm_core::blend::{BlendParams, blend, output_bbox};
     use mmm_core::formats::xisf::XisfPanel;
     use mmm_core::output::Tee;
@@ -322,9 +345,14 @@ fn blend_cmd(
         };
         match wcs {
             Some(wcs) => {
-                // Output height fixes the bottom-up y reflection of the cards.
-                keywords.extend(wcs_cards(&wcs, (bbox[0], bbox[1]), bbox[3] - bbox[1]));
-                println!("wcs: cards attached");
+                let (origin, out_h) = ((bbox[0], bbox[1]), bbox[3] - bbox[1]);
+                if wcs_flip {
+                    keywords.extend(wcs_cards_flipped(&wcs, origin, out_h));
+                    println!("wcs: cards attached (flipped bottom-up frame)");
+                } else {
+                    keywords.extend(wcs_cards(&wcs, origin, out_h));
+                    println!("wcs: cards attached");
+                }
             }
             None => println!("wcs: no astrometric solution found in panel 0"),
         }
