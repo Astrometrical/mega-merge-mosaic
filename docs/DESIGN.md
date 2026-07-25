@@ -153,13 +153,15 @@ double mid-scale structure.
   analysis/photometry.json  # per-edge fits + global gains/offsets per channel
 ```
 
-## CLI surface (POC)
+## CLI surface
 
 ```
 mmm info <files…> [--stats]
-mmm analyze <panels…> --session S [--input auto|aligned|solved]
-mmm report --session S            # graph + fit table, warnings on poor fits
-mmm blend --session S -o out.fits [--downsample N] [--feather PX] [--png P]
+mmm analyze <panels…> --session S [--surface off|0|1|2] [--input auto|aligned|solved]
+mmm report --session S [--seam-png P]   # graph + fit/seam tables, ⚠ on outliers
+mmm blend --session S -o out.fits [--downsample 1|8] [--feather PX]
+          [--mode pyramid|twoband|feather] [--png P] [--roi x,y,w,h]
+          [--defect-veto on|off] [--flatten off|1|2] [--wcs-frame topdown|flipped]
 ```
 
 ## Testing

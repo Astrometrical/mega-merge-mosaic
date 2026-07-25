@@ -1,7 +1,9 @@
 # Releasing mmm
 
 A from-zero guide to publishing this repository on GitHub and cutting binary
-releases with GitHub Actions. No prior Actions experience assumed.
+releases with GitHub Actions. No prior Actions experience assumed. (For the
+day-to-day build/test workflow CI enforces, see
+[DEVELOPMENT.md](DEVELOPMENT.md).)
 
 Two workflow files in `.github/workflows/` do all the work:
 
