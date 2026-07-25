@@ -463,7 +463,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Typed reader for an attachment-located f64 vector/matrix property: reads
 /// `location` bytes from the mapped file and returns the filled-in value.
-pub fn read_attached_f64s(file: &[u8], path: &Path, prop: &XisfProperty) -> Result<PropertyValue> {
+fn read_attached_f64s(file: &[u8], path: &Path, prop: &XisfProperty) -> Result<PropertyValue> {
     let (off, size) = prop
         .location
         .ok_or_else(|| Error::format(path, format!("property {} has no attachment", prop.id)))?;
