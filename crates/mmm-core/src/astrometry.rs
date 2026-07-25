@@ -541,24 +541,29 @@ pub fn wcs_cards(w: &LinearWcs, crop_origin: (u64, u64), out_height: u64) -> Vec
         comment: comment.to_string(),
     };
     let q = |s: &str| format!("'{s}'");
-    // Crop translation in the top-down frame (CRPIX is 1-based but the shift
-    // is a pure translation, so the base cancels), then the y reflection into
-    // the bottom-up FITS frame.
+    // Cards are emitted in the PI top-down convention, verbatim from the
+    // solution, shifted by the crop translation (CRPIX is 1-based but the
+    // shift is pure translation, so the base cancels). With top-down row
+    // storage this is simultaneously correct in data-index terms (Astropy,
+    // DS9 — verified against catalog stars) and in PixInsight's display-space
+    // interpretation of the cards. Do NOT reflect the y axis here: two
+    // independent PixInsight annotation tests proved reflected cards mirror,
+    // whichever way the pixel rows are stored. `out_height` is kept in the
+    // signature for the historical record and deliberately unused.
+    let _ = out_height;
     let crpix1 = w.crpix[0] - crop_origin.0 as f64;
-    let crpix2 = out_height as f64 + 1.0 - (w.crpix[1] - crop_origin.1 as f64);
-    // Avoid "-0" card text when a matrix element is exactly zero.
-    let neg = |v: f64| if v == 0.0 { 0.0 } else { -v };
+    let crpix2 = w.crpix[1] - crop_origin.1 as f64;
     vec![
         kw("CTYPE1", q(&w.ctype[0]), "projection"),
         kw("CTYPE2", q(&w.ctype[1]), "projection"),
         kw("CRVAL1", w.crval[0].to_string(), "[deg] RA at reference point"),
         kw("CRVAL2", w.crval[1].to_string(), "[deg] Dec at reference point"),
         kw("CRPIX1", crpix1.to_string(), "reference pixel x"),
-        kw("CRPIX2", crpix2.to_string(), "reference pixel y (bottom-up)"),
+        kw("CRPIX2", crpix2.to_string(), "reference pixel y (top-down)"),
         kw("CD1_1", w.cd[0][0].to_string(), "[deg/px] transformation matrix"),
-        kw("CD1_2", neg(w.cd[0][1]).to_string(), "[deg/px] transformation matrix"),
+        kw("CD1_2", w.cd[0][1].to_string(), "[deg/px] transformation matrix"),
         kw("CD2_1", w.cd[1][0].to_string(), "[deg/px] transformation matrix"),
-        kw("CD2_2", neg(w.cd[1][1]).to_string(), "[deg/px] transformation matrix"),
+        kw("CD2_2", w.cd[1][1].to_string(), "[deg/px] transformation matrix"),
         kw("CUNIT1", q("deg"), "axis unit"),
         kw("CUNIT2", q("deg"), "axis unit"),
         kw("RADESYS", q(&w.radesys), "celestial reference system"),
@@ -697,25 +702,27 @@ mod tests {
         // No "-0" text for the zero off-diagonal elements.
         assert_eq!(get("CD1_2"), "0");
 
-        // Cards are the same solution reflected into the bottom-up FITS
-        // frame: card pixel (x, H+1-y) ≡ top-down pixel (x, y).
+        // Cards carry the solution verbatim in the top-down convention
+        // (matching top-down row storage — data-index space and PixInsight
+        // display space coincide).
         let c = wcs_from_cards(&cards);
         assert_eq!(c.crval, w.crval);
-        assert_eq!(c.crpix[0], w.crpix[0]);
-        assert_eq!(c.crpix[1], ORION_H as f64 + 1.0 - w.crpix[1]);
+        assert_eq!(c.crpix, w.crpix);
         for &(x, y) in &[(1.0, 1.0), (9255.0, 18310.0), (100.5, 17000.25), (4628.0, 9155.5)] {
             let (ra1, dec1) = w.pixel_to_sky(x, y);
-            let (ra2, dec2) = c.pixel_to_sky(x, ORION_H as f64 + 1.0 - y);
+            let (ra2, dec2) = c.pixel_to_sky(x, y);
             assert!((ra1 - ra2).abs() < 1e-9 && (dec1 - dec2).abs() < 1e-9, "({x},{y})");
         }
     }
 
-    /// The emitted cards must place a sky object at the mirrored row of the
-    /// bottom-up frame — the fix for the north–south mirror PixInsight showed
-    /// when the top-down solution was emitted verbatim. Uses a non-diagonal
-    /// matrix so a wrong choice of negated elements (row vs column) fails.
+    /// Cards must be the verbatim top-down solution — no y reflection.
+    /// Two independent PixInsight annotation tests showed that reflected
+    /// cards mirror north-south whichever way pixel rows are stored; with
+    /// top-down storage, verbatim cards are also data-index-correct (verified
+    /// against catalog stars in the real mosaic). Non-diagonal matrix so any
+    /// stray negation fails.
     #[test]
-    fn cards_flip_y_into_bottom_up_frame() {
+    fn cards_are_verbatim_top_down() {
         const H: u64 = 4000;
         let w = LinearWcs {
             crval: [84.0, -3.0],
@@ -726,21 +733,16 @@ mod tests {
             radesys: "ICRS".into(),
         };
         let c = wcs_from_cards(&wcs_cards(&w, (0, 0), H));
-
-        // dy-dependent terms (second column) negate; dx terms don't.
-        assert_eq!(c.cd[0][0], w.cd[0][0]);
-        assert_eq!(c.cd[1][0], w.cd[1][0]);
-        assert_eq!(c.cd[0][1], -w.cd[0][1]);
-        assert_eq!(c.cd[1][1], -w.cd[1][1]);
-        assert_eq!(c.crpix[1], H as f64 + 1.0 - w.crpix[1]);
+        assert_eq!(c.cd, w.cd);
+        assert_eq!(c.crpix, w.crpix);
 
         // Round trip: an object at top-down pixel (x, y) projects through the
-        // cards to (x, H+1-y) — the same stored row, addressed bottom-up.
+        // cards back to exactly (x, y).
         for &(x, y) in &[(100.0, 250.0), (3000.0, 3900.0), (1500.0, 1200.0)] {
             let (ra, dec) = w.pixel_to_sky(x, y);
             let (cx, cy) = c.sky_to_pixel(ra, dec);
             assert!((cx - x).abs() < 1e-6, "x: {cx} vs {x}");
-            assert!((cy - (H as f64 + 1.0 - y)).abs() < 1e-6, "y: {cy} vs {}", H as f64 + 1.0 - y);
+            assert!((cy - y).abs() < 1e-6, "y: {cy} vs {y}");
         }
     }
 
@@ -748,18 +750,14 @@ mod tests {
     fn crop_shift_keeps_sky_of_a_fixed_pixel_invariant() {
         let w = wcs_from_properties(&orion_props()).unwrap();
         let full = wcs_from_cards(&wcs_cards(&w, (0, 0), ORION_H));
-        // Crop [1000, 2500) origin: output height shrinks by the y origin.
+        // Crop origin (1000, 2500): CRPIX shifts by minus the origin.
         let (oy, crop_h) = (2500u64, ORION_H - 2500);
         let cropped = wcs_from_cards(&wcs_cards(&w, (1000, oy), crop_h));
         assert_eq!(cropped.crpix[0], full.crpix[0] - 1000.0);
-        // Bottom-up CRPIX2 is measured from the crop's bottom edge, which the
-        // top crop does not move: it stays put.
-        assert_eq!(cropped.crpix[1], crop_h as f64 + 1.0 - (w.crpix[1] - oy as f64));
-        // A fixed canvas pixel keeps its sky coordinates after cropping
-        // (top-down canvas pixel (6100, 12000), addressed bottom-up in both).
-        let (ra1, dec1) = full.pixel_to_sky(6100.0, ORION_H as f64 + 1.0 - 12000.0);
-        let (ra2, dec2) =
-            cropped.pixel_to_sky(6100.0 - 1000.0, crop_h as f64 + 1.0 - (12000.0 - oy as f64));
+        assert_eq!(cropped.crpix[1], full.crpix[1] - oy as f64);
+        // A fixed canvas pixel keeps its sky coordinates after cropping.
+        let (ra1, dec1) = full.pixel_to_sky(6100.0, 12000.0);
+        let (ra2, dec2) = cropped.pixel_to_sky(6100.0 - 1000.0, 12000.0 - oy as f64);
         assert!((ra1 - ra2).abs() < 1e-9 && (dec1 - dec2).abs() < 1e-9);
     }
 
