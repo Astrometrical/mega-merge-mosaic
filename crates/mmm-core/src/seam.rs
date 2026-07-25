@@ -32,6 +32,29 @@ pub const MASK_SEED_FACTOR: f32 = 3.0;
 /// fall below the seed threshold.
 pub const MASK_GROW_FACTOR: f32 = 1.5;
 
+/// Compact-component area bound, in L8 cells: a [`star_mask`] connected
+/// component with at most this many cells is *compact* (a star core plus its
+/// diffraction-spike arms fits comfortably) regardless of its bounding box —
+/// spike arms make star components elongated but never large.
+pub const COMPACT_MAX_AREA: usize = 40;
+
+/// Compact-component bounding-box bound, in L8 cells: a component whose
+/// bounding box does not exceed this along its longer side is compact
+/// regardless of area (a dense little clump of saturated cells).
+pub const COMPACT_MAX_DIM: u32 = 12;
+
+/// Compact-component thinness bound: a component with
+/// `area ≤ this × bbox max dimension` is compact regardless of size. A star
+/// core with four ~1-cell-wide spike arms has area ≈ 2 × dim + core — even
+/// two merged bright spiked stars measure ≈ 4.6 × dim (observed on the
+/// spike-integrity fixture, area 78 over dim 17) — while a mask flooded
+/// across extended structure fills its bounding box (area ≈ dim²/2 and up,
+/// far above this line for any component the other two rules don't already
+/// admit). Without this rule the brightest spiked stars (arms of 6+ cells)
+/// exceed both bounds above and would lose the star-lock snap that protects
+/// their arms from being averaged across the seam.
+pub const COMPACT_THIN_RATIO: usize = 6;
+
 /// DP seam penalty for star-masked cells: this factor × the band's median
 /// cell cost, added per cell masked in either panel — large but finite, so a
 /// band that is entirely structure still yields a least-bad seam.
@@ -143,6 +166,75 @@ pub fn star_mask(summary: &L8Summary) -> Vec<bool> {
         }
     }
     mask
+}
+
+/// Split a connected [`star_mask`] into its *compact* part (star cores plus
+/// attached diffraction-spike arms — the misregistration-sensitive point
+/// sources that must be taken whole from one panel) and its *extended
+/// structure* part (bright nebular signal the flood fill crossed because
+/// everything connects to star seeds through it — e.g. the whole M42 core).
+///
+/// A connected component (8-connectivity, matching the flood fill) is compact
+/// iff its area is ≤ [`COMPACT_MAX_AREA`] cells, OR its bounding box is
+/// ≤ [`COMPACT_MAX_DIM`] cells along its longer side, OR it is thin —
+/// area ≤ [`COMPACT_THIN_RATIO`] × its bbox max dimension, which keeps the
+/// brightest spiked stars (long cross-shaped skeletons) compact while filled
+/// floods stay structure. Everything else is structure. Consumers differ
+/// deliberately:
+/// - the detail-transition star-lock and the base-band exclusion act on the
+///   **compact** part only — snapping the transition across extended
+///   structure imprints the full inter-panel mismatch as a hard
+///   L8-quantized step (the user-reported M42 staircase), and onion-filling
+///   the base under a nebula core pushes all its flux into that snapped
+///   detail band; smooth extended structure is safe to ramp/blend because
+///   only compact misregistered sources risk doubling;
+/// - the DP seam cost and the defect-veto exemption keep using the **full**
+///   mask — seams should still avoid bright structure when a cheaper path
+///   exists, and nebula detail legitimately differs between panels.
+///
+/// Returns `(compact, structure)`, each `w8*h8` flags; their union is the
+/// input mask and they are disjoint.
+pub fn split_mask_components(mask: &[bool], w8: u32, h8: u32) -> (Vec<bool>, Vec<bool>) {
+    let (w, h) = (w8 as usize, h8 as usize);
+    debug_assert_eq!(mask.len(), w * h);
+    let mut compact = vec![false; mask.len()];
+    let mut structure = vec![false; mask.len()];
+    let mut seen = vec![false; mask.len()];
+    let mut comp: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..mask.len() {
+        if !mask[start] || seen[start] {
+            continue;
+        }
+        comp.clear();
+        stack.push(start);
+        seen[start] = true;
+        let (mut x0, mut y0, mut x1, mut y1) =
+            (start % w, start / w, start % w, start / w);
+        while let Some(i) = stack.pop() {
+            comp.push(i);
+            let (x, y) = (i % w, i / w);
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            for yy in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+                for xx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                    let j = yy * w + xx;
+                    if mask[j] && !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        let max_dim = (x1 - x0 + 1).max(y1 - y0 + 1);
+        let is_compact = comp.len() <= COMPACT_MAX_AREA
+            || max_dim <= COMPACT_MAX_DIM as usize
+            || comp.len() <= COMPACT_THIN_RATIO * max_dim;
+        let out = if is_compact { &mut compact } else { &mut structure };
+        for &i in &comp {
+            out[i] = true;
+        }
+    }
+    (compact, structure)
 }
 
 /// Compute the shared owner map: Voronoi labels from feather weights, then a
@@ -604,6 +696,80 @@ mod tests {
             "without the mask the cheap straight seam must cross the arm — \
              otherwise this test has no teeth"
         );
+    }
+
+    /// Mandatory M42-staircase-fix test 1 (component classification): a
+    /// 3-cell star, a star with four spike arms (~20 cells, bbox 11×11) and a
+    /// 200-cell blob (10×20 — over both compactness bounds) on one mask →
+    /// the first two classify compact, the blob classifies structure; the
+    /// two parts partition the mask exactly.
+    #[test]
+    fn mask_components_split_by_compactness() {
+        let (w8, h8) = (64u32, 64u32);
+        let mut mask = vec![false; (w8 * h8) as usize];
+        let idx = |x: u32, y: u32| (y * w8 + x) as usize;
+
+        // 3-cell star at (5,5)..(7,5).
+        for x in 5..8 {
+            mask[idx(x, 5)] = true;
+        }
+        // Star + 4 spike arms at (30,10): core + arms of 5 cells each
+        // (one arm diagonal — 8-connectivity), 21 cells, bbox 11×11.
+        mask[idx(30, 10)] = true;
+        for t in 1..=5u32 {
+            mask[idx(30 + t, 10)] = true;
+            mask[idx(30 - t, 10)] = true;
+            mask[idx(30, 10 + t)] = true;
+            mask[idx(30 + t, 10 - t)] = true;
+        }
+        // 200-cell blob: 10 wide × 20 tall at (10,30).
+        for y in 30..50 {
+            for x in 10..20 {
+                mask[idx(x, y)] = true;
+            }
+        }
+        // Very bright spiked star: 3×3 core at (46,45) + 4 straight arms of
+        // 14 cells — area 65 over a 29-cell bbox, past both the area and dim
+        // bounds; only the thinness rule (65 ≤ 6×29) keeps it compact.
+        for y in 44..47u32 {
+            for x in 45..48u32 {
+                mask[idx(x, y)] = true;
+            }
+        }
+        for t in 2..=15u32 {
+            mask[idx(46 + t, 45)] = true;
+            mask[idx(46 - t, 45)] = true;
+            mask[idx(46, 45 + t)] = true;
+            mask[idx(46, 45 - t)] = true;
+        }
+
+        let (compact, structure) = split_mask_components(&mask, w8, h8);
+        for x in 5..8u32 {
+            assert!(compact[idx(x, 5)], "3-cell star must be compact");
+        }
+        assert!(compact[idx(30, 10)], "spiked star core must be compact");
+        for t in 1..=5u32 {
+            for (x, y) in
+                [(30 + t, 10), (30 - t, 10), (30, 10 + t), (30 + t, 10 - t)]
+            {
+                assert!(compact[idx(x, y)], "spike arm cell ({x},{y}) must be compact");
+            }
+        }
+        for y in 30..50u32 {
+            for x in 10..20u32 {
+                assert!(structure[idx(x, y)], "blob cell ({x},{y}) must be structure");
+                assert!(!compact[idx(x, y)], "blob cell ({x},{y}) must not be compact");
+            }
+        }
+        assert!(
+            compact[idx(46, 45)] && compact[idx(61, 45)] && compact[idx(46, 60)],
+            "long-armed spiked star must be compact via the thinness rule"
+        );
+        // Partition: compact ∪ structure = mask, compact ∩ structure = ∅.
+        for i in 0..mask.len() {
+            assert_eq!(compact[i] || structure[i], mask[i], "union must equal the mask");
+            assert!(!(compact[i] && structure[i]), "parts must be disjoint");
+        }
     }
 
     /// Mandatory test 1: with a bright star mid-band, the seam must route

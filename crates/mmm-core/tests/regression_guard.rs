@@ -90,7 +90,15 @@ const GRAPH_HASH: u64 = 0x27e6_9998_d3cc_c51c;
 const PHOTOMETRY_HASH: u64 = 0x65a5_2f09_d3a9_7e4c;
 const SURFACES_HASH: u64 = 0x49cc_d828_e18f_3455;
 const BLEND_FEATHER_HASH: u64 = 0x2e65_c7ff_0be0_c3de;
-const BLEND_PYRAMID_HASH: u64 = 0xdd24_79de_b5b5_3fb7;
+/// Recaptured for the M42-staircase fix (compact/structure mask split,
+/// `seam::split_mask_components`): this spec's dense star field floods into
+/// a few filled mask components (~110 cells each on panels 1–3) that now
+/// classify as extended structure, so they stay in the base band and their
+/// detail transitions ramp instead of snapping — a deliberate behaviour
+/// change of the TwoBand/Pyramid detail stage. All analyze artifacts and the
+/// Feather blend remain byte-identical to the original 0e9dbf6 capture
+/// (previous value: 0xdd24_79de_b5b5_3fb7).
+const BLEND_PYRAMID_HASH: u64 = 0x6a78_dfa4_bb05_6c08;
 
 #[test]
 fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {
