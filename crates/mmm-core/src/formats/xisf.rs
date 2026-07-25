@@ -68,7 +68,7 @@ impl XisfPanel {
             }
         }
 
-        let end = header
+        header
             .data_offset
             .checked_add(header.data_size)
             .filter(|&end| end <= mmap.len() as u64)
@@ -86,7 +86,6 @@ impl XisfPanel {
                 ),
             ));
         }
-        let _ = end;
 
         if header.sample_format != SampleFormat::Float32 {
             return Err(Error::format(

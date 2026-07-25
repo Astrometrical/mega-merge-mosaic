@@ -146,67 +146,7 @@ fn main() -> anyhow::Result<()> {
             session,
             surface,
             input,
-        } => {
-            tracing::info!(?session, n_panels = panels.len(), "analyze requested");
-            let surface_order = match surface.as_str() {
-                "off" => None,
-                "0" => Some(0),
-                "1" => Some(1),
-                "2" => Some(2),
-                other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
-            };
-            let input = match input.as_str() {
-                "auto" => mmm_core::analyze::InputSelect::Auto,
-                "aligned" => mmm_core::analyze::InputSelect::Aligned,
-                "solved" => mmm_core::analyze::InputSelect::Solved,
-                other => anyhow::bail!("--input must be auto, aligned or solved (got {other})"),
-            };
-            let t0 = std::time::Instant::now();
-            let s = mmm_core::analyze::analyze_input(&panels, &session, surface_order, input)?;
-            match (&s.frame, s.align_secs) {
-                (Some(f), align_secs) => println!(
-                    "input: solved panels — {} reprojected onto a fresh {}x{} frame \
-                     ({:.3}\"/px, center RA {:.4} Dec {:+.4}) in {:.2}s",
-                    s.panels.len(),
-                    f.width,
-                    f.height,
-                    f.scale_deg * 3600.0,
-                    f.crval[0],
-                    f.crval[1],
-                    align_secs.unwrap_or(0.0),
-                ),
-                _ => println!("input: aligned full-canvas frames"),
-            }
-            let (w, h, ch) = s.canvas;
-            println!("canvas: {w}x{h} x{ch}ch   session: {}", s.dir.display());
-            println!(
-                "{:>3}  {:<28} {:>26} {:>8}  per-channel mean",
-                "id", "file", "bbox [x0,x1)x[y0,y1)", "nonzero"
-            );
-            for p in &s.panels {
-                let name = panel_name(p);
-                let bbox = format!(
-                    "[{},{})x[{},{})",
-                    p.bbox[0], p.bbox[2], p.bbox[1], p.bbox[3]
-                );
-                let means = p
-                    .ch_mean
-                    .iter()
-                    .map(|m| format!("{m:.6}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!(
-                    "{:>3}  {:<28} {:>26} {:>7.1}%  {}",
-                    p.id,
-                    name,
-                    bbox,
-                    100.0 * p.nonzero_frac,
-                    means
-                );
-            }
-            println!("analyze: {:.2}s", t0.elapsed().as_secs_f64());
-            Ok(())
-        }
+        } => analyze_cmd(&panels, &session, &surface, &input),
         Command::Report { session, seam_png } => report(&session, seam_png.as_deref()),
         Command::Blend {
             session,
@@ -257,6 +197,75 @@ fn main() -> anyhow::Result<()> {
             )
         }
     }
+}
+
+/// `mmm analyze`: scan the input panels into a session directory and print
+/// the per-panel table.
+fn analyze_cmd(
+    panels: &[std::path::PathBuf],
+    session: &std::path::Path,
+    surface: &str,
+    input: &str,
+) -> anyhow::Result<()> {
+    tracing::info!(?session, n_panels = panels.len(), "analyze requested");
+    let surface_order = match surface {
+        "off" => None,
+        "0" => Some(0),
+        "1" => Some(1),
+        "2" => Some(2),
+        other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
+    };
+    let input = match input {
+        "auto" => mmm_core::analyze::InputSelect::Auto,
+        "aligned" => mmm_core::analyze::InputSelect::Aligned,
+        "solved" => mmm_core::analyze::InputSelect::Solved,
+        other => anyhow::bail!("--input must be auto, aligned or solved (got {other})"),
+    };
+    let t0 = std::time::Instant::now();
+    let s = mmm_core::analyze::analyze_input(panels, session, surface_order, input)?;
+    match (&s.frame, s.align_secs) {
+        (Some(f), align_secs) => println!(
+            "input: solved panels — {} reprojected onto a fresh {}x{} frame \
+             ({:.3}\"/px, center RA {:.4} Dec {:+.4}) in {:.2}s",
+            s.panels.len(),
+            f.width,
+            f.height,
+            f.scale_deg * 3600.0,
+            f.crval[0],
+            f.crval[1],
+            align_secs.unwrap_or(0.0),
+        ),
+        _ => println!("input: aligned full-canvas frames"),
+    }
+    let (w, h, ch) = s.canvas;
+    println!("canvas: {w}x{h} x{ch}ch   session: {}", s.dir.display());
+    println!(
+        "{:>3}  {:<28} {:>26} {:>8}  per-channel mean",
+        "id", "file", "bbox [x0,x1)x[y0,y1)", "nonzero"
+    );
+    for p in &s.panels {
+        let name = panel_name(p);
+        let bbox = format!(
+            "[{},{})x[{},{})",
+            p.bbox[0], p.bbox[2], p.bbox[1], p.bbox[3]
+        );
+        let means = p
+            .ch_mean
+            .iter()
+            .map(|m| format!("{m:.6}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "{:>3}  {:<28} {:>26} {:>7.1}%  {}",
+            p.id,
+            name,
+            bbox,
+            100.0 * p.nonzero_frac,
+            means
+        );
+    }
+    println!("analyze: {:.2}s", t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// Display name for a panel: the original input file for reprojected panels
