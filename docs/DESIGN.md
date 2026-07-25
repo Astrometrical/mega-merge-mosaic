@@ -290,12 +290,18 @@ star path untouched. 107 tests, clippy clean.
   transition zones; seam map byte-identical (ownership unchanged). On this
   well-registered set the pyramid is insurance, not a visible improvement —
   its benefit case is differing PSF or few-px misregistration between panels.
-- WCS N–S mirror fixed (user-reported): PI's solution is top-down; FITS
-  consumers interpret WCS bottom-up. `wcs_cards` now reflects CRPIX2 and
-  negates the CD second column; verified empirically (Alnitak/Alnilam/
-  Mintaka/Trapezium land within px; before the fix stars sat at exactly the
-  mirrored row). No flip property exists in the XISF — orientation is
-  carried entirely by the matrix convention.
+- WCS N–S mirror (user-reported), full story: PI's XISF solution is defined
+  in top-down image coordinates; no flip property exists — orientation is
+  carried entirely by the matrix convention. A first fix reflected the WCS
+  cards into the bottom-up frame while keeping top-down pixel storage +
+  ROWORDER='TOP-DOWN'; the user's annotation test showed it STILL mirrored,
+  and independent re-verification proved that fix had inverted a correct
+  solution (its verifier contained the same flip — lesson: verify fixes with
+  independent tooling). **Final resolution: store pixel rows bottom-up**
+  (ROWORDER='BOTTOM-UP', exactly what PixInsight writes) with the WCS cards
+  in the same standard frame. Data and WCS now share one frame, so readers
+  cannot disagree regardless of their ROWORDER handling; catalog stars
+  (Alnitak/Alnilam/Mintaka/Trapezium) verified at predicted data indices.
 
 ## Performance notes
 

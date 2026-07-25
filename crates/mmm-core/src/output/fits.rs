@@ -2,12 +2,15 @@
 //!
 //! Output: single HDU, `BITPIX = -32`, `NAXIS = 3` (planar: NAXIS1 = width,
 //! NAXIS2 = height, NAXIS3 = channels), big-endian samples, 2880-byte header
-//! blocks and data padding. Rows are written top-down and declared with
-//! `ROWORDER= 'TOP-DOWN'` (the astro-camera convention the inputs use). WCS
-//! cards must nonetheless reference the standard bottom-up frame — see
-//! `astrometry::wcs_cards`, which reflects the y axis accordingly. Bands may
-//! arrive in any order — each channel slice is written at its absolute file
-//! offset.
+//! blocks and data padding. Rows are stored **bottom-up** (first data row =
+//! bottom image row, `ROWORDER= 'BOTTOM-UP'`) — the convention PixInsight
+//! itself uses when writing solved FITS — with WCS cards in the matching
+//! standard frame (`astrometry::wcs_cards`). Storing data and WCS in the same
+//! standard frame is what makes the file interpret identically in PixInsight,
+//! Astropy, and DS9; a top-down file with ROWORDER proved ambiguous in
+//! practice (readers disagree on whether ROWORDER affects WCS y). Bands
+//! arrive in top-down blend order and are reflected here — each channel slice
+//! is written at its absolute file offset, rows reversed within the band.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
@@ -89,7 +92,7 @@ impl RowSink for FitsSink {
             card("NAXIS1", &w.to_string(), "width"),
             card("NAXIS2", &h.to_string(), "height"),
             card("NAXIS3", &ch.to_string(), "channels"),
-            card("ROWORDER", "'TOP-DOWN'", "row order"),
+            card("ROWORDER", "'BOTTOM-UP'", "row order"),
         ];
         cards.extend(self.keywords.iter().map(|k| card(&k.name, &k.value, &k.comment)));
         cards.push(card("END", "", ""));
@@ -139,10 +142,14 @@ impl RowSink for FitsSink {
         for c in 0..ch {
             let plane = &rows[(c * band_rows * w) as usize..][..(band_rows * w) as usize];
             buf.clear();
-            for &v in plane {
-                buf.extend_from_slice(&v.to_be_bytes());
+            // Reflect into bottom-up storage: the band's top-down rows
+            // y0..y0+n land at data rows (h-y0-n)..(h-y0), reversed.
+            for r in (0..band_rows as usize).rev() {
+                for &v in &plane[r * w as usize..(r + 1) * w as usize] {
+                    buf.extend_from_slice(&v.to_be_bytes());
+                }
             }
-            let off = self.data_start + (c * h + y0) * w * 4;
+            let off = self.data_start + (c * h + (h - y0 - band_rows)) * w * 4;
             self.file.seek(SeekFrom::Start(off)).map_err(|e| self.io(e))?;
             self.file.write_all(&buf).map_err(|e| self.io(e))?;
         }
@@ -243,11 +250,15 @@ mod tests {
         assert_eq!(value(&card(header, "NAXIS1").unwrap()), "4");
         assert_eq!(value(&card(header, "NAXIS2").unwrap()), "3");
         assert_eq!(value(&card(header, "NAXIS3").unwrap()), "1");
-        assert!(card(header, "ROWORDER").unwrap().contains("'TOP-DOWN'"));
+        assert!(card(header, "ROWORDER").unwrap().contains("'BOTTOM-UP'"));
         assert!(card(header, "END").is_some());
 
-        // Payload is big-endian f32 at 2880, zero-padded to the block end.
-        for (i, &v) in vals.iter().enumerate() {
+        // Payload is big-endian f32 at 2880, rows reflected bottom-up: the
+        // first stored row is the last band row (top-down row 2 = vals[8..12]),
+        // then row 1, then row 0. Zero-padded to the block end.
+        let expect: Vec<f32> =
+            vals[8..12].iter().chain(&vals[4..8]).chain(&vals[0..4]).copied().collect();
+        for (i, &v) in expect.iter().enumerate() {
             let off = 2880 + i * 4;
             assert_eq!(bytes[off..off + 4], v.to_be_bytes(), "sample {i}");
         }
