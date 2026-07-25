@@ -315,6 +315,24 @@ star path untouched. 107 tests, clippy clean.
   (rim fade) so transitions forced onto coverage rims complete inside
   coverage. Verified: staircase gone (metric 0.0015 vs 0.028 pre-fix),
   moats gone, stars pixel-identical, all guarantees green.
+- Dark-streak fix (user-reported, 2026-07-25): broad dark bands (~1e-4 deep,
+  hundreds of px wide) in panels' single-coverage zones next to seam bands.
+  Cause: `mask_pyramid` smoothed ownership masks with no validity limit, so
+  at coarse levels a partner's mask support extended ~700 px past its
+  geometric coverage — where its data pyramid is the normalized-convolution
+  0.0 sentinel or a baseless extrapolation; blending those dragged the base
+  down. Fix: mask chain + stored levels are clamped to zero where the
+  identically-downsampled validity (the same plane `build_masked` uses)
+  falls below `MASK_SUPPORT_MIN` — a panel's blend weight is now strictly
+  zero beyond its coverage dilated by ~2 cells of each level's grid, and
+  wherever its mask is nonzero its data is a genuine normalized convolution.
+  Deep-single-coverage identity is enforced by e2e test (panel influence
+  measured zero beyond 454 px at feather 256 vs ~1000 px pre-fix; deliberate
+  0.13 background mismatch). Real data: detached streaks gone (0 blocks
+  < −5e-5 beyond 384 px of any overlap, was 1108), residual differences
+  confined to the seams' transition widths at less than half the depth;
+  ghost metric unchanged (ratio 0.181); M42 core byte-level unchanged;
+  blend 8.1 s. Pyramid hash recaptured; Feather/TwoBand byte-identical.
 
 ## Phase 5 results (2026-07-25): unaligned solved-panel input
 

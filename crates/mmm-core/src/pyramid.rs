@@ -24,6 +24,17 @@
 /// Threshold below which an accumulated mask/validity weight counts as zero.
 const EPS_WEIGHT: f32 = 1e-6;
 
+/// Minimum downsampled-validity fraction for a cell to carry ownership-mask
+/// weight at a pyramid level ([`mask_pyramid`]). Below it, the panel's data
+/// pyramid holds the 0.0 sentinel or an extrapolation from a vanishing sliver
+/// of its coverage — blending either with real mask weight drags the base
+/// toward the wrong value far outside the panel (the user-visible dark
+/// streak in a neighbour's single-coverage zone). The validity chain decays
+/// over ~2 cells of each level's grid beyond the panel's coverage, so this
+/// clamp bounds a panel's mask support to its geometric coverage dilated by
+/// at most that level's transition width.
+const MASK_SUPPORT_MIN: f32 = 1e-3;
+
 /// A pyramid of L8-grid planes: Laplacian levels 0..n (finest first) followed
 /// by the Gaussian residual as the last level. [`mask_pyramid`] reuses the
 /// container for Gaussian (non-Laplacian) mask levels of the same shape.
@@ -172,18 +183,45 @@ pub fn build_masked(plane: &[f32], valid: &[f32], w8: u32, h8: u32, n_levels: u3
 /// a data pyramid's). Each stored level is smoothed once more, so even level
 /// 0 transitions over ~a cell rather than switching hard — the transition
 /// width at level ℓ is a few level-ℓ cells, i.e. proportional to 2^ℓ·8 px.
-/// The mask must be 0 outside the panel's validity (ownership implies
-/// coverage), which makes it its own premultiplied validity weight.
-pub fn mask_pyramid(mask: &[f32], w8: u32, h8: u32, n_levels: u32) -> CellPyramid {
+///
+/// `valid` is the same validity plane the panel's [`build_masked`] uses
+/// (1 = trusted cell). Both the mask chain and every stored level are
+/// clamped to zero where the identically-downsampled validity falls below
+/// [`MASK_SUPPORT_MIN`]: without the clamp, the per-level smoothing walks
+/// the mask support outward without limit — by the coarse levels a panel
+/// held blend weight hundreds of px past its geometric coverage, exactly
+/// where its data pyramid is the 0.0 sentinel or a baseless extrapolation
+/// (the dark-streak bug). With it, a panel's contribution is strictly zero
+/// beyond its coverage dilated by ~2 cells of each level's grid, and
+/// wherever its mask is nonzero its data pyramid is a genuine normalized
+/// convolution of covered cells. Masks of all-ones validity (tests, single
+/// dense panel) are unaffected.
+pub fn mask_pyramid(
+    mask: &[f32],
+    valid: &[f32],
+    w8: u32,
+    h8: u32,
+    n_levels: u32,
+) -> CellPyramid {
     let (w, h) = (w8 as usize, h8 as usize);
     assert_eq!(mask.len(), w * h, "mask must be w8*h8");
-    let mut cur = mask.to_vec();
-    let mut levels = vec![smooth(&cur, w, h)];
+    assert_eq!(valid.len(), w * h, "valid must be w8*h8");
+    let clamp = |m: Vec<f32>, v: &[f32]| -> Vec<f32> {
+        m.iter()
+            .zip(v)
+            .map(|(&mv, &vv)| if vv >= MASK_SUPPORT_MIN { mv } else { 0.0 })
+            .collect()
+    };
+    let mut v = valid.to_vec();
+    let mut cur = clamp(mask.to_vec(), &v);
+    let mut levels = vec![clamp(smooth(&cur, w, h), &v)];
     for l in 0..n_levels as usize {
         let (lw, lh) = level_dims(w, h, l);
         cur = downsample(&cur, lw, lh);
+        v = downsample(&v, lw, lh);
+        cur = clamp(cur, &v);
         let (cw, ch) = level_dims(w, h, l + 1);
-        levels.push(smooth(&cur, cw, ch));
+        levels.push(clamp(smooth(&cur, cw, ch), &v));
     }
     CellPyramid { levels, w8, h8 }
 }
@@ -357,7 +395,8 @@ mod tests {
         let (w, h) = (40u32, 24u32);
         let plane = random_plane(w as usize, h as usize, 99);
         let data = build(&plane, w, h, 3);
-        let mask = mask_pyramid(&vec![1.0f32; plane.len()], w, h, 3);
+        let ones = vec![1.0f32; plane.len()];
+        let mask = mask_pyramid(&ones, &ones, w, h, 3);
         let (out, def) = blend_pyramids_guarded(&[&data], &[&mask]);
         assert!(def.iter().all(|&d| d), "constant mask must be defined everywhere");
         let max = plane.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -378,8 +417,9 @@ mod tests {
             (0..cells).map(|i| if i % wu < wu / 2 { 1.0 } else { 0.0 }).collect();
         let mask_b: Vec<f32> = mask_a.iter().map(|&m| 1.0 - m).collect();
         let n = 3;
-        let pa = (build(&a, w, h, n), mask_pyramid(&mask_a, w, h, n));
-        let pb = (build(&b, w, h, n), mask_pyramid(&mask_b, w, h, n));
+        let ones = vec![1.0f32; cells];
+        let pa = (build(&a, w, h, n), mask_pyramid(&mask_a, &ones, w, h, n));
+        let pb = (build(&b, w, h, n), mask_pyramid(&mask_b, &ones, w, h, n));
         let out = blend_pyramids(&[pa, pb]);
 
         // Plateau tolerance 5e-3: the residual level's transition is ±~2·2ⁿ
@@ -408,10 +448,84 @@ mod tests {
         let cells = (w * h) as usize;
         let plane = random_plane(w as usize, h as usize, 5);
         let data = build(&plane, w, h, 2);
-        let mask = mask_pyramid(&vec![0.0f32; cells], w, h, 2);
+        let mask = mask_pyramid(&vec![0.0f32; cells], &vec![1.0f32; cells], w, h, 2);
         let (out, def) = blend_pyramids_guarded(&[&data], &[&mask]);
         assert!(def.iter().all(|&d| !d), "zero masks must be undefined everywhere");
         assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    /// Support clamp (dark-streak regression): two panels with different
+    /// constant backgrounds, each valid only over its own half (+overlap).
+    /// (a) A panel's mask pyramid must be exactly zero at every level beyond
+    /// its validity dilated by that level's transition width; (b) deep in
+    /// panel A's single-coverage zone the blend equals A's plane exactly;
+    /// (c) the blend never dips below the darker panel's level — pre-clamp,
+    /// the partner's bled mask weighted its 0.0-sentinel data there, digging
+    /// a below-both-backgrounds streak.
+    #[test]
+    fn partner_mask_and_influence_stop_at_dilated_coverage() {
+        let (w, h) = (384u32, 32u32);
+        let (wu, hu) = (w as usize, h as usize);
+        let cells = wu * hu;
+        let n = 3u32;
+        // A: bright background, valid x < 224; B: darker, valid x >= 192.
+        let (edge_a, edge_b) = (224usize, 192usize);
+        let a = vec![0.5f32; cells];
+        let b = vec![0.1f32; cells];
+        let valid_a: Vec<f32> =
+            (0..cells).map(|i| if i % wu < edge_a { 1.0 } else { 0.0 }).collect();
+        let valid_b: Vec<f32> =
+            (0..cells).map(|i| if i % wu >= edge_b { 1.0 } else { 0.0 }).collect();
+        // Ownership splits mid-overlap.
+        let mask_a: Vec<f32> =
+            (0..cells).map(|i| if i % wu < 208 { 1.0 } else { 0.0 }).collect();
+        let mask_b: Vec<f32> = mask_a.iter().map(|&m| 1.0 - m).collect();
+
+        let pa = build_masked(&a, &valid_a, w, h, n);
+        let pb = build_masked(&b, &valid_b, w, h, n);
+        let ma = mask_pyramid(&mask_a, &valid_a, w, h, n);
+        let mb = mask_pyramid(&mask_b, &valid_b, w, h, n);
+
+        // (a) B's mask support stops within ~2 cells of each level's grid
+        // (the validity chain's decay) beyond B's validity edge.
+        for (l, lv) in mb.levels.iter().enumerate() {
+            let (lw, lh) = mb.level_dims(l);
+            let scale = 1usize << l;
+            let reach = 4 * scale; // 2 chain cells + smoothing, in fine cells
+            for y in 0..lh {
+                for x in 0..lw {
+                    let fine_x = x * scale;
+                    if fine_x + reach < edge_b {
+                        assert_eq!(
+                            lv[y * lw + x],
+                            0.0,
+                            "level {l}: B mask nonzero at fine x {fine_x}, \
+                             {} cells past its validity",
+                            edge_b - fine_x
+                        );
+                    }
+                }
+            }
+        }
+
+        // (b) + (c): blend both, compare against A alone.
+        let (out, def) = blend_pyramids_guarded(&[&pa, &pb], &[&ma, &mb]);
+        let solo = collapse(&pa);
+        let y = hu / 2;
+        for x in 0..edge_b - 64 {
+            let (o, s) = (out[y * wu + x], solo[y * wu + x]);
+            assert!(
+                (o - s).abs() < 1e-6,
+                "deep single coverage x={x}: blend {o} != A alone {s}"
+            );
+        }
+        for x in 0..wu {
+            if !def[y * wu + x] {
+                continue;
+            }
+            let o = out[y * wu + x];
+            assert!(o > 0.1 - 1e-3, "below-both-panels dip at x={x}: {o}");
+        }
     }
 
     #[test]

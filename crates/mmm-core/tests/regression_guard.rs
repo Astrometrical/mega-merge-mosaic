@@ -105,7 +105,13 @@ const BLEND_FEATHER_HASH: u64 = 0x2e65_c7ff_0be0_c3de;
 ///   content away from ramp zones is back to the phase-4 behaviour. All
 ///   analyze artifacts and the Feather blend remain byte-identical to the
 ///   original 0e9dbf6 capture throughout.
-const BLEND_PYRAMID_HASH: u64 = 0x514b_6e63_ed0d_f737;
+/// - Dark-streak fix (`pyramid::mask_pyramid` validity clamp): ownership
+///   masks no longer carry weight where the panel's downsampled validity
+///   vanishes, so a partner's sentinel/extrapolated base can't bleed into a
+///   panel's deep single-coverage zone (previous value:
+///   0x514b_6e63_ed0d_f737). Base values change only near coverage edges
+///   and in bled zones; Feather stays byte-identical.
+const BLEND_PYRAMID_HASH: u64 = 0x1860_7b7e_788f_918d;
 
 #[test]
 fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {

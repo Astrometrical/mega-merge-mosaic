@@ -2027,3 +2027,109 @@ fn real_solved_pipeline_matches_registered() {
     );
     assert!(n > 5_000, "too few comparable samples: {n}");
 }
+
+/// Deep-single-coverage identity (regression for the user-reported dark
+/// streak, 2026-07-25): two panels whose *corrected* backgrounds genuinely
+/// differ — a hand-built photometry lifts panel 0 and darkens panel 1
+/// instead of reconciling them, emulating real data where the global solve
+/// cannot fully match backgrounds — must still satisfy: in panel 0's
+/// single-coverage zone deeper than the largest base transition width from
+/// the overlap, the Pyramid output equals panel 0's corrected input within
+/// 1e-5.
+///
+/// Pre-fix, `mask_pyramid` smoothed each panel's ownership mask with no
+/// regard to the panel's validity, so at coarse levels the partner's mask
+/// support extended hundreds of px past its geometric coverage — where its
+/// data pyramid holds the normalized-convolution 0.0 sentinel (validity
+/// zero) or wild extrapolation. Blending those with real weight dragged the
+/// base toward zero: a broad dark streak in the neighbour's single-coverage
+/// territory (observed at ~1e-4 depth over hundreds of px on the Orion
+/// mosaic). This test fails on that implementation by >1e-3.
+#[test]
+fn pyramid_deep_single_coverage_matches_panel() {
+    let dir = tempdir("deepsingle");
+    let spec = SynthSpec {
+        canvas: (4608, 384),
+        channels: 1,
+        grid: (2, 1),
+        overlap_frac: 0.05,
+        n_stars: 60,
+        noise_sigma: 0.002,
+        panel_gain_range: (1.0, 1.0),
+        panel_offset_range: (0.0, 0.0),
+        panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
+        panel_shift: vec![],
+        panel_spike_angle: vec![],
+        panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
+        seed: 42,
+    };
+    let feather = 256.0f32; // real-data config: 5 pyramid levels
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+    let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), None).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+    // Identity gains, deliberately unreconciled offsets: panel 0 bright,
+    // panel 1 darker by 0.13 — the cross-panel base difference the pyramid
+    // must confine to the overlap's transition zone.
+    let phot = Photometry {
+        edge_fits: vec![],
+        gains: vec![vec![1.0, 1.0]],
+        offsets: vec![vec![0.1, -0.03]],
+    };
+
+    let params = BlendParams {
+        feather_px: feather,
+        downsample: 1,
+        band_rows: 64,
+        mode: BlendMode::Pyramid,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+    };
+    let mut sink = MemSink::new();
+    blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+    let bbox = union_bbox(&session).unwrap();
+
+    // Deep zone: inside panel 0's window, ≥ 64 px from its own rims, and
+    // ≥ DEEP px west of panel 1's coverage. DEEP = the largest transition
+    // width (level-5 scale: clamped mask support reaches ≤ ~2 level-5 cells
+    // = 512 px past coverage; measured influence ends by 454 px) + margin.
+    // Pre-fix the bleed reached ~1000 px (1.6e-3 at 646 px — the RED proof).
+    const DEEP: u64 = 640;
+    let [x0_b, _, _, _] = res.windows[1];
+    let [ax0, ay0, ax1, ay1] = res.windows[0];
+    let (zx0, zx1) = (ax0 + 64, x0_b - DEEP);
+    let (zy0, zy1) = (ay0 + 64, ay1 - 64);
+    assert!(zx1 > zx0 + 512, "zone unexpectedly small: [{zx0},{zx1})");
+    assert!(ax1 > x0_b, "windows must overlap");
+
+    let panel = XisfPanel::open(&res.panel_paths[0]).unwrap();
+    let data = panel.channel(0);
+    let (g, o) = (phot.gains[0][0] as f32, phot.offsets[0][0] as f32);
+    let mut max_diff = 0.0f32;
+    let mut worst = (0u64, 0u64);
+    for y in zy0..zy1 {
+        for x in zx0..zx1 {
+            let merged =
+                sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
+            let input = data[(y * spec.canvas.0 + x) as usize] * g + o;
+            let d = (merged - input).abs();
+            if d > max_diff {
+                max_diff = d;
+                worst = (x, y);
+            }
+        }
+    }
+    eprintln!(
+        "deep single-coverage zone x[{zx0},{zx1}) y[{zy0},{zy1}): \
+         max |merged − corrected input| = {max_diff:.2e} at {worst:?}"
+    );
+    assert!(
+        max_diff < 1e-5,
+        "partner influence bled {max_diff:.2e} into deep single coverage at {worst:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

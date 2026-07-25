@@ -903,7 +903,10 @@ fn pyramid_base_planes(
                     build_masked(&p.corr8[c * cells..(c + 1) * cells], &valid, w8, h8, n_levels)
                 })
                 .collect();
-            PanelPyr { data, mask: mask_pyramid(&mask, w8, h8, n_levels) }
+            // The mask pyramid is clamped to the same validity plane the
+            // data build uses, so this panel carries no blend weight where
+            // its base pyramid would be sentinel/extrapolated garbage.
+            PanelPyr { data, mask: mask_pyramid(&mask, &valid, w8, h8, n_levels) }
         })
         .collect();
 
