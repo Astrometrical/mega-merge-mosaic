@@ -181,16 +181,21 @@ pub fn star_mask(summary: &L8Summary) -> Vec<bool> {
 /// brightest spiked stars (long cross-shaped skeletons) compact while filled
 /// floods stay structure. Everything else is structure. Consumers differ
 /// deliberately:
-/// - the detail-transition star-lock and the base-band exclusion act on the
-///   **compact** part only — snapping the transition across extended
-///   structure imprints the full inter-panel mismatch as a hard
-///   L8-quantized step (the user-reported M42 staircase), and onion-filling
-///   the base under a nebula core pushes all its flux into that snapped
-///   detail band; smooth extended structure is safe to ramp/blend because
-///   only compact misregistered sources risk doubling;
-/// - the DP seam cost and the defect-veto exemption keep using the **full**
-///   mask — seams should still avoid bright structure when a cheaper path
-///   exists, and nebula detail legitimately differs between panels.
+/// - only the detail-transition star-lock acts on the **compact** part —
+///   snapping the transition across extended structure imprints the full
+///   inter-panel mismatch as a hard L8-quantized step (the user-reported
+///   M42 staircase), so structure ramps instead, over the widened
+///   `blend::WIDE_RAMP_PX` half-width;
+/// - the DP seam cost, the defect-veto exemption, AND the base-band
+///   exclusion keep using the **full** mask. The base in particular must
+///   exclude structure components too: a bright star's reflection halo
+///   floods its component past every compactness bound, and letting the
+///   star+halo cell means into the pyramid base blends the panels'
+///   disagreeing halos with level-dependent mask weights — the halo's
+///   Laplacian negative lobes stop cancelling, imprinting a wide dark moat
+///   around the star (a user-reported regression when base exclusion was
+///   briefly compact-only; pinned by the
+///   `bright_star_halo_leaves_no_dark_moat` blend test).
 ///
 /// Returns `(compact, structure)`, each `w8*h8` flags; their union is the
 /// input mask and they are disjoint.

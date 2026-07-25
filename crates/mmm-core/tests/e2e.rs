@@ -1065,8 +1065,16 @@ fn feather_and_twoband_outputs_are_bit_stable() {
         feather, 0x4e5d_7ebe_25f4_b6e9,
         "Feather output changed — must stay bit-identical"
     );
+    // Recaptured for the dark-moat fix
+    // (`blend::tests::bright_star_halo_leaves_no_dark_moat`): the detail mix
+    // gained a ±32 px coverage-rim fade that keeps ramped transitions
+    // continuous where an ownership boundary rides a panel rim — that fade
+    // is what moves this spec's output (its mask components are all compact,
+    // so the accompanying full-mask base revert is a no-op here; the
+    // previous value 0x536f_0323_8796_27da was the phase-3 capture, which
+    // had survived both the pyramid work and the staircase fix).
     assert_eq!(
-        twoband, 0x536f_0323_8796_27da,
+        twoband, 0xa1a7_7370_c8d8_e7b7,
         "TwoBand output changed — must stay bit-identical"
     );
 

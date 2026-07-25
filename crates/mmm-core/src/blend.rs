@@ -24,7 +24,12 @@
 //! the mask's *extended-structure* part (bright nebular signal the flood
 //! fill crossed, e.g. the whole M42 core) ramp instead, over the widened
 //! ±[`WIDE_RAMP_PX`] px — snapping there imprinted the residual panel
-//! mismatch as a visible L8-quantized staircase on real data.
+//! mismatch as a visible L8-quantized staircase on real data. In the ramped
+//! mix each panel's contribution additionally fades over its last
+//! ±[`WIDE_RAMP_PX`] px of coverage (rim fade): where a transition is
+//! forced onto a panel's coverage rim — the DP seam hugs band edges through
+//! fully-masked rows — the partner panel simply ends mid-ramp, and without
+//! the fade the unfinished ramp fraction would step at the rim.
 //!
 //! [`BlendMode::Pyramid`] (the default) keeps the whole TwoBand detail stage
 //! byte-for-byte but replaces the *base's* single wide feather with an
@@ -103,14 +108,17 @@ pub const WIDE_RAMP_PX: f32 = 32.0;
 pub const STAR_LOCK_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 
 /// Base-band exclusion parameter, retained under its historical name: also
-/// the connected star mask's seed factor. Cells covered by the *compact*
-/// part of the mask are excluded from the base band (their base value is
-/// filled from the surrounding background instead). The base must be
-/// star-free: raw cell means near bright stars differ between misregistered
-/// panels, and blending them would leave cell-scale coloured blobs around
-/// stars and their spikes. Extended structure stays in the base — its cell
-/// means only differ by residual photometric mismatch, which the base blend
-/// absorbs smoothly (see [`crate::seam::split_mask_components`]).
+/// the connected star mask's seed factor. Cells covered by the FULL mask
+/// (compact ∪ extended structure) are excluded from the base band (their
+/// base value is filled from the surrounding background instead). The base
+/// must be star-free: raw cell means near bright stars differ between
+/// misregistered panels, and blending them would leave cell-scale coloured
+/// blobs around stars and their spikes. Excluding the full mask — not just
+/// its compact components — matters because a bright star's reflection halo
+/// floods its component past every compactness bound: letting that
+/// star+halo content into the pyramid base once mixed the panels'
+/// disagreeing halos with level-dependent weights, imprinting a wide dark
+/// moat around the star (see `bright_star_halo_leaves_no_dark_moat`).
 pub const BASE_STAR_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 
 /// Defect-veto trigger: in the TwoBand detail stage, |owner detail − other
@@ -290,15 +298,7 @@ fn prep_panels(
     let summaries = load_summaries(session)?;
     let masks: Vec<Vec<bool>> = summaries.par_iter().map(star_mask).collect();
     let flat = fit_flatten_opt(&summaries, &masks, phot, surfaces, session, flatten_order)?;
-    // Base exclusion is compact-only (matching the two-band path); the
-    // feather and L8-preview callers of this prep never read `corr8`, so
-    // the split is semantic hygiene here, not behaviour.
-    let (w8s, h8s) = (summaries[0].w8, summaries[0].h8);
-    let compact: Vec<Vec<bool>> = masks
-        .par_iter()
-        .map(|m| crate::seam::split_mask_components(m, w8s, h8s).0)
-        .collect();
-    Ok(prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &compact))
+    Ok(prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks))
 }
 
 /// Fit the global flatten when requested ([`BlendParams::flatten`]).
@@ -326,10 +326,10 @@ fn fit_flatten_opt(
 }
 
 /// Build the per-panel blend contexts from already-loaded summaries;
-/// `base_masks` are the cells to exclude from the base band — the *compact*
-/// part of the panels' connected star masks (stars + spike arms; extended
-/// structure stays in the base, where the feather/pyramid blend can merge it
-/// smoothly instead of the detail stage switching its full flux). When `flat`
+/// `base_masks` are the cells to exclude from the base band — the panels'
+/// FULL connected star masks (stars, spike arms, and mask-flooded extended
+/// structure; see [`BASE_STAR_FACTOR`] for why structure components must not
+/// enter the base either). When `flat`
 /// is set, its delta `f(x,y) − f(center)` is folded (negated) into every
 /// panel's surface terms — subtracting the same global field from every
 /// panel's correction subtracts it from the blended output on every path
@@ -445,16 +445,19 @@ pub(crate) fn corrected_cell_means(
 }
 
 /// Make the base band star-free and rim-safe: a cell's raw mean is trusted
-/// only when the cell is *fully covered* and outside `mask` — the *compact*
-/// part of the panel's connected star mask (star cores plus attached spike
-/// arms, [`crate::seam::split_mask_components`]). Extended structure (nebular
-/// cores) deliberately stays in the base: its cell means differ between
-/// panels only by the residual photometric mismatch, which the feathered /
-/// pyramid base blend absorbs smoothly — excluding it would onion-fill away
-/// the real large-scale signal shape and push the structure's entire flux
-/// (mismatch included) into the hard-switched detail band, which is what
-/// produced the M42 seam staircase. Everything else the bilinear base taps
-/// can reach —
+/// only when the cell is *fully covered* and outside `mask` — the panel's
+/// FULL connected star mask ([`crate::seam::star_mask`]: star cores, spike
+/// arms, and any extended structure the flood fill crossed). Structure must
+/// be excluded along with the compact parts: a bright star's reflection
+/// halo floods its component past the compactness bounds, and letting the
+/// star+halo cell means into the pyramid base mixes the panels' disagreeing
+/// halos with level-dependent mask weights — the halo's Laplacian negative
+/// lobes stop cancelling and a wide dark moat appears around the star (the
+/// regression pinned by `bright_star_halo_leaves_no_dark_moat`). The
+/// resulting cross-panel mismatch of structure flux lives in the detail
+/// band instead, where the widened structure ramp (±[`WIDE_RAMP_PX`])
+/// spreads it smoothly — that ramp, not base inclusion, is what fixed the
+/// M42 seam staircase. Everything else the bilinear base taps can reach —
 /// masked cells, partially covered rim cells (registration-interpolation
 /// garbage on real data), and the one ring of uncovered cells beyond the rim
 /// — is replaced by an onion-peel fill from the trusted background cells.
@@ -952,9 +955,11 @@ fn blend_twoband_impl(
         summaries.iter().map(|s| vec![false; s.w8 as usize * s.h8 as usize]).collect()
     };
     // Compact components (stars + spike arms) vs extended structure (nebular
-    // cores the mask flooded across): star-lock and base exclusion act on
-    // the compact part only; the seam DP cost and the defect-veto exemption
-    // below keep the full mask (see `seam::split_mask_components`).
+    // cores the mask flooded across): the star-lock snap acts on the compact
+    // part only (structure ramps, ±WIDE_RAMP_PX); the seam DP cost, the
+    // defect-veto exemption, and the base exclusion keep the FULL mask (see
+    // `seam::split_mask_components` — a reflection halo flooded into a
+    // structure component must not enter the base band).
     let (w8s, h8s) = (summaries[0].w8, summaries[0].h8);
     let splits: Vec<(Vec<bool>, Vec<bool>)> =
         masks.par_iter().map(|m| crate::seam::split_mask_components(m, w8s, h8s)).collect();
@@ -972,7 +977,7 @@ fn blend_twoband_impl(
     let (ramps, hard) = detail_transition_maps(&owner, &compact, &structure);
     let flat = fit_flatten_opt(&summaries, &masks, phot, surfaces, session, params.flatten)?;
     let mut preps =
-        prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &compact);
+        prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks);
     for p in &mut preps {
         p.summary.detail = Vec::new(); // only needed for the maps above
     }
@@ -1047,8 +1052,8 @@ fn blend_twoband_impl(
                 let gy_c = (cy as f32 + 0.5) * inv_block - 0.5; // cell centers
                 let own_row = (cy / BLOCK as u64) as usize * w8 as usize;
                 // Per-pixel scratch: which prow entries cover the pixel, their
-                // feather weight and base values.
-                let mut cov: Vec<(usize, f32)> = Vec::with_capacity(prow.len());
+                // feather weight, rim distance (px), and base values.
+                let mut cov: Vec<(usize, f32, f32)> = Vec::with_capacity(prow.len());
                 let mut bases = vec![0.0f32; prow.len() * nch];
                 let mut base_acc = vec![0.0f32; nch];
                 let mut det = vec![0.0f32; nch];
@@ -1074,14 +1079,15 @@ fn blend_twoband_impl(
                         }
                         let bld = bl_d.get_or_insert_with(|| BiLin::at(w8, h8, gx_d, gy_d));
                         let blc = bl_c.get_or_insert_with(|| BiLin::at(w8, h8, gx_c, gy_c));
-                        let wgt = weight(BLOCK as f32 * bld.sample(&p.dist), inv_feather);
+                        let d_px = BLOCK as f32 * bld.sample(&p.dist);
+                        let wgt = weight(d_px, inv_feather);
                         let cells = p.summary.w8 as usize * p.summary.h8 as usize;
                         for (c, acc) in base_acc.iter_mut().enumerate() {
                             let b = blc.sample(&p.corr8[c * cells..(c + 1) * cells]);
                             bases[k * nch + c] = b;
                             *acc += wgt * b;
                         }
-                        cov.push((k, wgt));
+                        cov.push((k, wgt, d_px));
                         sum_w += wgt;
                     }
                     if cov.is_empty() {
@@ -1108,8 +1114,8 @@ fn blend_twoband_impl(
                         // covering panel when the owner is uncovered here).
                         let k = cov
                             .iter()
-                            .find(|&&(k, _)| prow[k].pi as u16 == cell_owner)
-                            .map(|&(k, _)| k)
+                            .find(|&&(k, _, _)| prow[k].pi as u16 == cell_owner)
+                            .map(|&(k, _, _)| k)
                             .unwrap_or_else(fallback);
                         for (c, d) in det.iter_mut().enumerate() {
                             *d = full(k, c) - bases[k * nch + c];
@@ -1117,9 +1123,20 @@ fn blend_twoband_impl(
                     } else {
                         let blc = bl_c.as_ref().expect("set for any covered pixel");
                         let mut rsum = 0.0f32;
-                        for &(k, _) in &cov {
+                        for &(k, _, d_px) in &cov {
                             let Some(ramp) = &ramps[prow[k].pi] else { continue };
-                            let rv = blc.sample(ramp);
+                            // Rim fade: a panel's detail contribution falls
+                            // to 0 over its last ±WIDE_RAMP_PX of coverage.
+                            // Where the DP seam (or coverage itself) puts the
+                            // ownership transition at a panel's rim, the ramp
+                            // cannot complete — the partner simply ends — and
+                            // an unfaded mix would hand over the remaining
+                            // ramp fraction as a hard step exactly on the rim
+                            // (~half the cross-panel structure mismatch, the
+                            // residual staircase). Interior seams have both
+                            // panels deep in coverage (fade = 1): unchanged.
+                            let rv =
+                                blc.sample(ramp) * (d_px / WIDE_RAMP_PX).clamp(0.0, 1.0);
                             if rv <= 1e-6 {
                                 continue;
                             }
@@ -1149,13 +1166,13 @@ fn blend_twoband_impl(
                     if defect_veto && cov.len() >= 2 {
                         let ko = cov
                             .iter()
-                            .find(|&&(k, _)| prow[k].pi as u16 == cell_owner)
-                            .map(|&(k, _)| k);
+                            .find(|&&(k, _, _)| prow[k].pi as u16 == cell_owner)
+                            .map(|&(k, _, _)| k);
                         let kp = ko.and_then(|ko| {
                             cov.iter()
-                                .filter(|&&(k, _)| k != ko)
+                                .filter(|&&(k, _, _)| k != ko)
                                 .max_by(|a, b| a.1.total_cmp(&b.1))
-                                .map(|&(k, _)| k)
+                                .map(|&(k, _, _)| k)
                         });
                         if let (Some(ko), Some(kp)) = (ko, kp) {
                             let (po, pp) = (prow[ko].pi, prow[kp].pi);
@@ -2046,12 +2063,15 @@ mod tests {
     /// D is ~0 (A side) or ~the mismatch (B side); the max adjacent-pixel
     /// jump of D along rows crossing the band measures how abruptly the
     /// transition happens. A no-mismatch control run bounds the machinery's
-    /// baseline jump. Teeth: before the fix (star-lock snapping on the full
-    /// flooded mask + base exclusion under the structure) this measured a
-    /// max jump of 0.0283 ≈ the full band mismatch in both TwoBand and
-    /// Pyramid mode (control 0.0103) — the L8-quantized staircase; the
-    /// bound below fails loudly on that behaviour. After the fix: TwoBand
-    /// 0.0034 (control 0.0007), Pyramid 0.0008 (control 0.0010).
+    /// baseline jump. Teeth: with star-lock snapping on the full flooded
+    /// mask this measured a max jump of 0.0283 ≈ the full band mismatch in
+    /// both TwoBand and Pyramid mode (control 0.0103) — the L8-quantized
+    /// staircase; the bound below fails loudly on that behaviour. The ramp
+    /// alone still left 0.0147 ≈ *half* the mismatch, stepping at panel A's
+    /// coverage rim (x=287) where the DP hugs the band edge and the ramp is
+    /// truncated by coverage — the rim fade in the detail mix removes that
+    /// too. Current: TwoBand 0.0015 (control 0.0003), Pyramid 0.0015
+    /// (control 0.0006), with the base excluding the full star mask.
     #[test]
     fn seam_through_structure_ramps_the_mismatch() {
         use crate::seam::split_mask_components;
@@ -2136,9 +2156,11 @@ mod tests {
                     sink.at(0, x as usize, y as usize) - truth[(y * 512 + x) as usize]
                 };
                 // Whole shared band incl. its edge cells: the DP may hug a
-                // band edge in fully-masked rows, putting the snap at
-                // x=224/288; single-coverage pixels either side reconstruct
-                // their panel exactly, so D stays well-defined throughout.
+                // band edge in fully-masked rows, putting the transition at
+                // x=224/288 — the panel rims, where the ramp is truncated by
+                // coverage and only the rim fade keeps D continuous;
+                // single-coverage pixels either side reconstruct their panel
+                // exactly, so D stays well-defined throughout.
                 for x in 220..292u64 {
                     worst = worst.max((d(x + 1) - d(x)).abs());
                 }
@@ -2169,6 +2191,172 @@ mod tests {
                 "{mode:?}: seam through structure steps by {j_mm} \
                  (control baseline {j_ctrl}) — the mismatch must ramp, not snap"
             );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two panels reproducing the bright-star reflection-halo geometry behind
+    /// the user-reported dark moat: a vertical overlap band x∈[160,480) on a
+    /// 640×640 canvas, one bright star at (320,320) whose broad reflection
+    /// halo *differs between the panels* (halos are internal reflections —
+    /// optics- and position-dependent — so overlapping panels genuinely
+    /// disagree there: A carries 0.4·G(σ=24 px), B carries 0.3·G(σ=34 px)
+    /// centered 3 px off). The halo floods each panel's connected star mask
+    /// well past every compactness bound, so the star+halo component
+    /// classifies as extended structure in both panels — the exact trigger
+    /// of the regression. Shared deterministic noise gives the mask a
+    /// realistic median-detail floor and cancels out of cross-panel diffs.
+    fn halo_moat_panels(dir: &Path) -> (Session, OverlapGraph) {
+        std::fs::create_dir_all(dir).unwrap();
+        let (w, h) = (640u64, 640u64);
+        let (sx, sy) = (320.0f64, 320.0f64);
+        let value = |x: u64, y: u64, amp: f64, sigma: f64, halo_dx: f64| -> f32 {
+            let (dx, dy) = (x as f64 - sx, y as f64 - sy);
+            let core = 2.0 * (-(dx * dx + dy * dy) / (2.0 * 1.5 * 1.5)).exp();
+            let hx = dx - halo_dx;
+            let halo = amp * (-(hx * hx + dy * dy) / (2.0 * sigma * sigma)).exp();
+            0.05 + (core + halo) as f32 + hash_noise(x, y)
+        };
+        let mut frame = vec![0f32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..480u64 {
+                frame[(y * w + x) as usize] = value(x, y, 0.3, 26.0, 0.0);
+            }
+        }
+        let a = dir.join("a.xisf");
+        write_xisf(&a, w, h, 1, &frame).unwrap();
+
+        frame.fill(0.0);
+        for y in 0..h {
+            for x in 160..640u64 {
+                frame[(y * w + x) as usize] = value(x, y, 0.8, 40.0, 4.0);
+            }
+        }
+        let b = dir.join("b.xisf");
+        write_xisf(&b, w, h, 1, &frame).unwrap();
+
+        let session = analyze(&[a, b], &dir.join("s.mmm-session")).unwrap();
+        let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+        (session, graph)
+    }
+
+    /// Moat regression (user report on real Orion data, e.g. canvas
+    /// (2376,13912)): when base exclusion acted on *compact* mask components
+    /// only, a bright star's reflection halo — flooded into an
+    /// extended-structure component — entered the pyramid base band. Near
+    /// ownership/mask transitions the per-level masked blend then mixes the
+    /// panels' disagreeing halos with level-dependent weights, so the halo's
+    /// Laplacian negative lobes no longer cancel: a wide dark annulus
+    /// (clearly below background) around the star+halo. The base must
+    /// exclude the FULL star mask (compact ∪ structure) as in phase 3/4;
+    /// this test pins that: no annulus pixel between the halo edge and 1.5×
+    /// the halo radius may fall below the local background, in either
+    /// panel's single-owner zone. Teeth (measured red on the compact-only
+    /// base): Pyramid-mode B-owned annulus min 0.0361 vs background 0.05
+    /// (moat trough 0.0354 at r ≈ 125 px — a 30% deficit); after the fix
+    /// both sides sit at 0.0476+, within the ±0.002 noise floor. TwoBand's
+    /// per-pixel feather base is a convex combination and never dug a moat;
+    /// it is asserted too as a cheap guard.
+    #[test]
+    fn bright_star_halo_leaves_no_dark_moat() {
+        use crate::seam::split_mask_components;
+
+        let dir = tmpdir("halomoat");
+        let (session, graph) = halo_moat_panels(&dir);
+        let phot = identity_phot(2, 1);
+
+        // Preconditions — the mechanism's trigger must be present: in both
+        // panels the star's mask component exceeds every compactness bound
+        // and classifies as extended structure.
+        let summaries = load_summaries(&session).unwrap();
+        let (w8, h8) = (summaries[0].w8, summaries[0].h8);
+        let masks: Vec<Vec<bool>> = summaries.iter().map(star_mask).collect();
+        let star_cell = (40 * w8 + 40) as usize;
+        for (p, mask) in masks.iter().enumerate() {
+            let (compact, structure) = split_mask_components(mask, w8, h8);
+            assert!(mask[star_cell], "panel {p}: star cell must be masked");
+            assert!(
+                structure[star_cell] && !compact[star_cell],
+                "panel {p}: the halo-flooded component must classify as \
+                 structure — the moat mechanism's trigger"
+            );
+        }
+
+        // The owner map the blend will use (same inputs ⇒ identical),
+        // to attribute annulus pixels to single-owner zones.
+        let owner = crate::seam::compute_owner_map_masked(
+            &summaries,
+            &graph,
+            &phot,
+            None,
+            session.canvas,
+            256.0,
+            &masks,
+        );
+
+        // Annulus between the halo edge (both halos below the noise floor,
+        // r ≈ 110 px) and 1.5× that radius. Background is 0.05 ± 0.002
+        // (deterministic noise); tolerance 2× the noise amplitude.
+        let (r_lo, r_hi) = (140.0f64, 210.0f64);
+        let (bg, tol) = (0.05f32, 0.004f32);
+        for mode in [BlendMode::TwoBand, BlendMode::Pyramid] {
+            let params = BlendParams {
+                feather_px: 256.0,
+                downsample: 1,
+                band_rows: 64,
+                mode,
+                roi: None,
+                defect_veto: true,
+                flatten: None,
+            };
+            let mut sink = MemSink::new();
+            blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+
+            // Output coords == canvas coords (union bbox is the full canvas).
+            assert_eq!((sink.w, sink.h), (640, 640));
+            // Diagnostic radial profile: min per 10 px bin, r ∈ [80, 250).
+            let mut bins = [f32::INFINITY; 17];
+            for y in 0..640u64 {
+                for x in 0..640u64 {
+                    let r = ((x as f64 - 320.0).powi(2) + (y as f64 - 320.0).powi(2)).sqrt();
+                    if (80.0..250.0).contains(&r) {
+                        let b = ((r - 80.0) / 10.0) as usize;
+                        bins[b] = bins[b].min(sink.at(0, x as usize, y as usize));
+                    }
+                }
+            }
+            eprintln!("{mode:?} radial min profile (r=80..250, 10px bins): {bins:.4?}");
+            let mut mins = [f32::INFINITY; 2];
+            for y in 0..640u64 {
+                for x in 0..640u64 {
+                    let r = ((x as f64 - 320.0).powi(2) + (y as f64 - 320.0).powi(2)).sqrt();
+                    if !(r_lo..=r_hi).contains(&r) {
+                        continue;
+                    }
+                    let o = owner.at((x / 8) as u32, (y / 8) as u32);
+                    if o < 2 {
+                        let v = sink.at(0, x as usize, y as usize);
+                        mins[o as usize] = mins[o as usize].min(v);
+                    }
+                }
+            }
+            eprintln!(
+                "{mode:?}: annulus min A-owned {:.4}, B-owned {:.4} (background {bg}, tol {tol})",
+                mins[0], mins[1]
+            );
+            for (side, min) in ["A", "B"].iter().zip(mins) {
+                assert!(
+                    min.is_finite(),
+                    "{mode:?}: annulus must contain {side}-owned pixels"
+                );
+                assert!(
+                    min >= bg - tol,
+                    "{mode:?}: dark moat in the {side}-owned annulus: min {min} \
+                     < background {bg} − tol {tol} — the halo's base content is \
+                     bleeding Laplacian lobes into the blend"
+                );
+            }
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
