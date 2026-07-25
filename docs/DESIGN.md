@@ -258,24 +258,30 @@ Quality-only phase (user directive: no GPU). 97 tests, clippy clean.
   replacement; refuses when <20% background. Caveat: the background
   thresholds are relative, so a >80%-structure mosaic can evade the refusal.
 
-### WCS fix: north–south mirror (2026-07-25)
+### WCS north–south mirror: the full saga (2026-07-25, RESOLVED)
 
-User report: the blended FITS's astrometric solution appeared mirrored N–S in
-PixInsight. Root cause: PI's XISF solution lives in top-down image
-coordinates, and we emitted the cards verbatim (valid for our stored top-down
-rows read naively) — but FITS WCS consumers, PI included (PCL maps
-`y_topdown = H + 0.5 − y_fits` when converting keywords, regardless of
-`ROWORDER`), interpret the WCS in the standard bottom-up frame. Verified on
-catalog stars (Alnitak, Alnilam, Mintaka, Trapezium): under the bottom-up
-reading, predicted positions were empty sky and the stars sat at the mirrored
-row `2·CRPIX2 − y`. Fix (`wcs_cards`, now takes the output height): reflect
-the solution into the bottom-up frame — `CRPIX2 → H_out + 1 − CRPIX2`, negate
-the dy-dependent CD *column* (`CD1_2`, `CD2_2`; PI negates the same terms when
-it writes solved FITS). Data layout and `ROWORDER='TOP-DOWN'` are unchanged.
-After: all four stars within 0.1–4 px (Trapezium cluster centroid 15 px), on
-both the full frame and a `--roi` crop. No flip property exists in the XISF —
-`ReferenceNativeCoordinates`/`CelestialPoleNativeCoordinates` are the standard
-zenithal values; orientation is entirely in the matrix.
+Three rounds, preserved here so nobody re-litigates it. The final state:
+**top-down pixel rows + ROWORDER='TOP-DOWN' + WCS cards verbatim in the PI
+top-down convention** — the original phase-2/3 format.
+
+Round 1: a "seems mirrored" report led to reflecting the cards into the
+bottom-up frame (CRPIX2 → H+1−CRPIX2, negate the CD dy column) while keeping
+top-down storage. The verifying agent's own checker contained the same flip
+it applied, so it "confirmed" a fix that actually inverted a correct
+solution. Round 2 (user annotation screenshot = ground truth): still
+mirrored; independent re-verification proved the verbatim cards had been
+data-index-correct all along. We then stored rows bottom-up with the
+reflected (standard-frame) cards — self-consistent for Astropy — but a
+second annotation test STILL mirrored. The two screenshots together pin
+PixInsight's actual behaviour: it normalizes pixel rows via ROWORDER but
+interprets WCS cards in **display (top-down) space**. With top-down storage,
+display space and data-index space coincide, so verbatim cards are correct
+for PixInsight AND Astropy/DS9 simultaneously (catalog-star verified:
+Alnitak/Alnilam/Mintaka/Trapezium at predicted indices). Round 1's report
+appears in hindsight to have been a misdiagnosis. Lessons recorded: verify
+fixes with tooling independent of the fix, and treat a user screenshot as
+the ground truth over any model of a third-party reader. No flip property
+exists in the XISF — orientation is entirely in the matrix convention.
 
 ## Phase 4 results (2026-07-25)
 
@@ -292,18 +298,18 @@ star path untouched. 107 tests, clippy clean.
   transition zones; seam map byte-identical (ownership unchanged). On this
   well-registered set the pyramid is insurance, not a visible improvement —
   its benefit case is differing PSF or few-px misregistration between panels.
-- WCS N–S mirror (user-reported), full story: PI's XISF solution is defined
-  in top-down image coordinates; no flip property exists — orientation is
-  carried entirely by the matrix convention. A first fix reflected the WCS
-  cards into the bottom-up frame while keeping top-down pixel storage +
-  ROWORDER='TOP-DOWN'; the user's annotation test showed it STILL mirrored,
-  and independent re-verification proved that fix had inverted a correct
-  solution (its verifier contained the same flip — lesson: verify fixes with
-  independent tooling). **Final resolution: store pixel rows bottom-up**
-  (ROWORDER='BOTTOM-UP', exactly what PixInsight writes) with the WCS cards
-  in the same standard frame. Data and WCS now share one frame, so readers
-  cannot disagree regardless of their ROWORDER handling; catalog stars
-  (Alnitak/Alnilam/Mintaka/Trapezium) verified at predicted data indices.
+- WCS N–S mirror: see "§WCS north–south mirror: the full saga" above for the
+  final resolution (verbatim top-down cards + top-down rows).
+- Seam-through-structure fix (user-reported staircase in M42's bright edge):
+  the connected star mask floods across extended nebulosity, which used to
+  hard-snap the detail transition along the 8-px cell boundary exactly where
+  panel mismatch is largest. Masks are now split by component morphology —
+  compact components (stars + spike arms; area ≤ 40 cells, bbox dim ≤ 12, or
+  thin cross shapes) keep the snap; extended structure ramps with a widened
+  32 px half-width. Base exclusion also compact-only (structure cell means
+  blend fine; the pyramid base regains scale-matched blending under M42).
+  Verified: staircase gone on real data, stars pixel-identical, all
+  anti-pinching/spike/veto guarantees green.
 
 ## Phase 5 results (2026-07-25): unaligned solved-panel input
 
