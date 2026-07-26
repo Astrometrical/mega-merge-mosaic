@@ -151,7 +151,9 @@ impl XisfPanel {
     }
 
     /// Advise the OS that access will be sequential (large streaming scans).
+    /// A no-op where `madvise(2)` is unavailable (e.g. Windows).
     pub fn advise_sequential(&self) {
+        #[cfg(unix)]
         let _ = self.mmap.advise(memmap2::Advice::Sequential);
     }
 }

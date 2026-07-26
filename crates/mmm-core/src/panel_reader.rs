@@ -163,11 +163,13 @@ impl PanelReader {
     }
 
     /// Advise the OS that access will be sequential (large streaming scans).
+    /// The `madvise(2)` call is a no-op where unavailable (e.g. Windows).
     pub fn advise_sequential(&self) {
         match &self.backing {
             Backing::Xisf(p) => p.advise_sequential(),
-            Backing::Cache(mmap) => {
-                let _ = mmap.advise(memmap2::Advice::Sequential);
+            Backing::Cache(_mmap) => {
+                #[cfg(unix)]
+                let _ = _mmap.advise(memmap2::Advice::Sequential);
             }
         }
     }
