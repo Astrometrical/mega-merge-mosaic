@@ -94,9 +94,8 @@ Releases are driven entirely by git tags of the form `vX.Y.Z`.
    - `mmm-v0.1.0-aarch64-macos.tar.gz`
    - `SHA256SUMS`
 
-   Each archive contains the `mmm` binary, `README.md`, and `LICENSE` (once a
-   license file exists at the repo root — until then it is silently skipped;
-   add one before the first public release).
+   Each archive contains the `mmm` binary, `README.md`, `LICENSE`, and
+   `NOTICE` (the Apache-2.0 attribution notice).
 
 ## 4. Fixing a botched release
 

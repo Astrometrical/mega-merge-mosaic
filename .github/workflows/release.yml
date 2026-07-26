@@ -1,5 +1,5 @@
 # Release automation: pushing a tag like `v0.1.0` builds the `mmm` binary for
-# four targets on native runners, packages each with README/LICENSE, and
+# four targets on native runners, packages each with README/LICENSE/NOTICE, and
 # publishes a GitHub Release with SHA256 checksums and auto-generated notes.
 # See docs/RELEASING.md for the full release procedure.
 name: Release
@@ -62,7 +62,7 @@ jobs:
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/mmm" "$name/"
           cp README.md "$name/"
-          if [ -f LICENSE ]; then cp LICENSE "$name/"; fi
+          cp LICENSE NOTICE "$name/"
           tar czf "$name.tar.gz" "$name"
 
       - name: Package (zip)
@@ -73,7 +73,7 @@ jobs:
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/mmm.exe" $name/
           Copy-Item README.md $name/
-          if (Test-Path LICENSE) { Copy-Item LICENSE $name/ }
+          Copy-Item LICENSE, NOTICE $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip"
 
       - name: Upload package

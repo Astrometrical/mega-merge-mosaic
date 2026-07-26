@@ -109,8 +109,9 @@ releases are cut).
 
 ## CLI reference
 
-All commands accept `-v` / `-vv` for debug/trace logging. `--session`
-defaults to `mosaic.mmm-session` everywhere.
+All commands accept `-v` / `-vv` for debug/trace logging and `--no-banner`
+to suppress the startup banner (printed to stderr; useful when a frontend
+parses the output). `--session` defaults to `mosaic.mmm-session` everywhere.
 
 ### `mmm info <panels…> [--stats]`
 
