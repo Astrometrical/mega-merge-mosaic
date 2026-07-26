@@ -10,6 +10,23 @@ struct Cli {
     /// Increase log verbosity (-v, -vv)
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Suppress the Astrometrical banner (for machine parsing / integrators)
+    #[arg(long, global = true)]
+    no_banner: bool,
+}
+
+/// Two-line branding/attribution banner printed to stderr on every run unless
+/// `--no-banner` is given. stderr keeps it clear of any stdout a frontend may
+/// parse; the runtime self-identification carries the brand wherever `mmm`
+/// runs, per the Apache-2.0 NOTICE.
+fn banner() -> String {
+    format!(
+        "Mega Merge Mosaic v{} — an Astrometrical tool (Apache-2.0)\n\
+         https://github.com/Astrometrical/mega-merge-mosaic  ·  \
+         free & open — support: https://ko-fi.com/astrometrical",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 #[derive(Subcommand)]
@@ -122,6 +139,10 @@ fn parse_roi(s: &str) -> anyhow::Result<[u64; 4]> {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if !cli.no_banner {
+        eprintln!("{}", banner());
+    }
 
     let level = match cli.verbose {
         0 => "info",

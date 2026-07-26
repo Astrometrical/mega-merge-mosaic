@@ -5,9 +5,8 @@ members = ["crates/mmm-core", "crates/mmm"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# TODO before first public release: choose a license (see README "License"),
-# add the LICENSE file(s), and restore `license = "..."` here; also confirm
-# the repository URL matches the actual GitHub repo.
+license = "Apache-2.0"
+authors = ["Astrometrical <https://github.com/Astrometrical>"]
 repository = "https://github.com/Astrometrical/mega-merge-mosaic"
 
 [workspace.dependencies]
