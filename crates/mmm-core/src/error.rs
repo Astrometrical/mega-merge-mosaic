@@ -8,9 +8,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The error type for all mmm-core operations.
 ///
-/// Deliberately small: everything the pipeline does is either an I/O failure
-/// on a specific file or a "this file/value is not what it must be" condition,
-/// and both carry the offending path so CLI users can act on the message.
+/// Deliberately small: an I/O failure on a file, a malformed/unsupported file,
+/// or a computation that cannot proceed (a numerical failure, or an operation
+/// the caller asked for that the data does not support).
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An operating-system I/O failure on `path`.
@@ -27,9 +27,19 @@ pub enum Error {
     /// inconsistent with what the pipeline requires; `reason` says how.
     #[error("unsupported or malformed file {path}: {reason}")]
     Format {
-        /// The offending file (or context path for non-file validation).
+        /// The offending file.
         path: PathBuf,
         /// Human-readable explanation of what is wrong.
+        reason: String,
+    },
+
+    /// A computation could not be completed — a numerical failure (e.g. a
+    /// singular linear system) or an operation the input does not support
+    /// (e.g. refusing to flatten a signal-dominated mosaic). Carries no path
+    /// because it is not about a specific file.
+    #[error("{reason}")]
+    Compute {
+        /// Human-readable explanation of what went wrong.
         reason: String,
     },
 }
@@ -47,6 +57,13 @@ impl Error {
     pub fn format(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
         Error::Format {
             path: path.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Build a [`Error::Compute`] from a reason (no path — see the variant).
+    pub fn compute(reason: impl Into<String>) -> Self {
+        Error::Compute {
             reason: reason.into(),
         }
     }

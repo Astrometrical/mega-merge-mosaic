@@ -335,17 +335,7 @@ fn fit_flatten_opt(
     order: Option<u32>,
 ) -> Result<Option<Flatten>> {
     order
-        .map(|o| {
-            crate::flatten::fit_flatten(
-                summaries,
-                masks,
-                phot,
-                surfaces,
-                session.canvas,
-                o,
-                &session.dir,
-            )
-        })
+        .map(|o| crate::flatten::fit_flatten(summaries, masks, phot, surfaces, session.canvas, o))
         .transpose()
 }
 

@@ -33,7 +33,7 @@ fn banner() -> String {
 enum Command {
     /// Print header metadata for panel files (and optionally quick pixel stats)
     Info {
-        /// Input panel files (FITS/XISF)
+        /// Input panel files (XISF)
         #[arg(required = true)]
         panels: Vec<std::path::PathBuf>,
 

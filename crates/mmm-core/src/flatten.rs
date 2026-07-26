@@ -19,8 +19,6 @@
 //!   **refuses** with a clear error rather than flatten a signal-dominated
 //!   (pure-nebula) mosaic.
 
-use std::path::Path;
-
 use rayon::prelude::*;
 
 use crate::blend::{corrected_cell_means, panel_correction_terms};
@@ -97,7 +95,7 @@ impl Flatten {
 /// median + 3×MAD (over the survivors). The rest feed a per-channel least
 /// squares over normalized cell-center coordinates. Errors — refusing to
 /// flatten — when fewer than [`MIN_BG_FRAC`] of the considered cells are
-/// background. `ctx` is only used for error messages.
+/// background.
 pub fn fit_flatten(
     summaries: &[L8Summary],
     masks: &[Vec<bool>],
@@ -105,19 +103,14 @@ pub fn fit_flatten(
     surfaces: Option<&Surfaces>,
     canvas: (u64, u64, u64),
     order: u32,
-    ctx: &Path,
 ) -> Result<Flatten> {
     if !(1..=2).contains(&order) {
-        return Err(Error::format(
-            ctx,
-            format!("flatten order must be 1 or 2, got {order}"),
-        ));
+        return Err(Error::compute(format!(
+            "flatten order must be 1 or 2, got {order}"
+        )));
     }
     if summaries.is_empty() {
-        return Err(Error::format(
-            ctx,
-            "flatten needs at least one panel summary",
-        ));
+        return Err(Error::compute("flatten needs at least one panel summary"));
     }
     let nch = canvas.2 as usize;
     let (w8, h8) = (summaries[0].w8 as usize, summaries[0].h8 as usize);
@@ -187,10 +180,7 @@ pub fn fit_flatten(
         }
     }
     if considered == 0 {
-        return Err(Error::format(
-            ctx,
-            "flatten found no fully-covered L8 cells",
-        ));
+        return Err(Error::compute("flatten found no fully-covered L8 cells"));
     }
 
     // Per-channel bright cut: merged > median + 3×MAD (over mask-clear cells)
@@ -215,16 +205,13 @@ pub fn fit_flatten(
     let bg: Vec<usize> = (0..cells).filter(|&i| clear[i] && !bright[i]).collect();
     let bg_frac = bg.len() as f64 / considered as f64;
     if bg_frac < MIN_BG_FRAC {
-        return Err(Error::format(
-            ctx,
-            format!(
-                "refusing to flatten: only {:.0}% of the covered cells are background \
-                 (need ≥ {:.0}%) — the mosaic is signal-dominated (nebula-heavy); \
-                 run without --flatten",
-                100.0 * bg_frac,
-                100.0 * MIN_BG_FRAC
-            ),
-        ));
+        return Err(Error::compute(format!(
+            "refusing to flatten: only {:.0}% of the covered cells are background \
+             (need ≥ {:.0}%) — the mosaic is signal-dominated (nebula-heavy); \
+             run without --flatten",
+            100.0 * bg_frac,
+            100.0 * MIN_BG_FRAC
+        )));
     }
 
     // Per-channel least squares over the background cells, at normalized
@@ -298,7 +285,6 @@ fn median_mad(vals: &mut [f64]) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn identity_phot(n_panels: usize, ch: usize) -> Photometry {
         Photometry {
@@ -337,7 +323,7 @@ mod tests {
         let masks = vec![vec![false; 16 * 12]];
         let phot = identity_phot(1, 1);
 
-        let f = fit_flatten(&[s], &masks, &phot, None, canvas, 1, &PathBuf::new()).unwrap();
+        let f = fit_flatten(&[s], &masks, &phot, None, canvas, 1).unwrap();
         assert_eq!(f.order, 1);
         assert_eq!(f.coeffs.len(), 1);
         assert_eq!(f.coeffs[0].len(), 3);
@@ -362,7 +348,7 @@ mod tests {
         let masks = vec![vec![false; 32 * 32]];
         let phot = identity_phot(1, 1);
 
-        let f = fit_flatten(&[s], &masks, &phot, None, canvas, 2, &PathBuf::new()).unwrap();
+        let f = fit_flatten(&[s], &masks, &phot, None, canvas, 2).unwrap();
         assert_eq!(f.coeffs[0].len(), 6);
         for &(xn, yn) in &[(0.1, 0.2), (0.8, 0.9), (0.5, 0.1)] {
             let want = field(xn, yn) - field(0.5, 0.5);
@@ -386,7 +372,7 @@ mod tests {
         let masks = vec![vec![false; 16 * 12]];
         let phot = identity_phot(1, 1);
 
-        let f = fit_flatten(&[s], &masks, &phot, None, canvas, 1, &PathBuf::new()).unwrap();
+        let f = fit_flatten(&[s], &masks, &phot, None, canvas, 1).unwrap();
         for (got, want) in f.coeffs[0].iter().zip([0.03, 0.02, -0.01]) {
             assert!(
                 (got - want).abs() < 1e-6,
@@ -407,7 +393,7 @@ mod tests {
         let mask: Vec<bool> = (0..100).map(|i| i < 85).collect();
         let phot = identity_phot(1, 1);
 
-        let err = fit_flatten(&[s], &[mask], &phot, None, canvas, 1, &PathBuf::new())
+        let err = fit_flatten(&[s], &[mask], &phot, None, canvas, 1)
             .unwrap_err()
             .to_string();
         assert!(
@@ -424,16 +410,7 @@ mod tests {
         let phot = identity_phot(1, 1);
         for bad in [0u32, 3] {
             assert!(
-                fit_flatten(
-                    std::slice::from_ref(&s),
-                    &masks,
-                    &phot,
-                    None,
-                    canvas,
-                    bad,
-                    &PathBuf::new()
-                )
-                .is_err(),
+                fit_flatten(std::slice::from_ref(&s), &masks, &phot, None, canvas, bad,).is_err(),
                 "order {bad} must be rejected"
             );
         }
@@ -461,7 +438,7 @@ mod tests {
         let masks = vec![vec![false; (w8 * h8) as usize]; 2];
         let phot = identity_phot(2, 1);
 
-        let f = fit_flatten(&summaries, &masks, &phot, None, canvas, 1, &PathBuf::new()).unwrap();
+        let f = fit_flatten(&summaries, &masks, &phot, None, canvas, 1).unwrap();
         // The fitted plane rises from A's level to B's level along x.
         let left = f.eval(0, 0.15, 0.5);
         let right = f.eval(0, 0.85, 0.5);

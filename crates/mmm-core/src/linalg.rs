@@ -32,10 +32,9 @@ pub fn solve_dense(a: &mut [f64], b: &mut [f64], n: usize) -> Result<Vec<f64>> {
             }
         }
         if !pmax.is_finite() || pmax < tiny {
-            return Err(Error::format(
-                "solve_dense",
-                format!("singular system (pivot {pmax:.3e} at column {k}, n={n})"),
-            ));
+            return Err(Error::compute(format!(
+                "singular linear system (pivot {pmax:.3e} at column {k}, n={n})"
+            )));
         }
         if p != k {
             for c in k..n {
