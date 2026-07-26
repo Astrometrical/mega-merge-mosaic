@@ -15,22 +15,22 @@ Two workflow files in `.github/workflows/` do all the work:
 ## 1. One-time setup: publish the repository
 
 1. On <https://github.com/new>, create an empty repository (no README, no
-   license — this repo already has them). Pick the owner and name; below,
-   replace `OWNER/REPO` with what you chose (e.g. `dpaull/MergeMosaic`).
+   license — this repo already has them) named `mega-merge-mosaic` under the
+   `Astrometrical` organisation.
 
 2. Point this local repo at it and push:
 
    ```sh
-   git remote add origin https://github.com/OWNER/REPO.git
+   git remote add origin https://github.com/Astrometrical/mega-merge-mosaic.git
    git push -u origin main
    ```
 
    (If a remote named `origin` already exists, use
-   `git remote set-url origin https://github.com/OWNER/REPO.git` instead of `add`.)
+   `git remote set-url origin …` instead of `add`.)
 
-3. Make the `repository` field in the root `Cargo.toml`
-   (`[workspace.package]`) match the real URL. It is metadata only, but it is
-   what crates.io and tooling display, so keep it correct.
+3. The `repository` field in the root `Cargo.toml` (`[workspace.package]`)
+   already points at this URL. It is metadata only, but it is what crates.io
+   and tooling display, so keep it correct if the repo ever moves.
 
 That is all. **GitHub Actions needs no enabling** — the moment `main` (with
 `.github/workflows/` in it) lands on GitHub, the CI workflow runs

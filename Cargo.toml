@@ -8,7 +8,7 @@ edition = "2024"
 # TODO before first public release: choose a license (see README "License"),
 # add the LICENSE file(s), and restore `license = "..."` here; also confirm
 # the repository URL matches the actual GitHub repo.
-repository = "https://github.com/dpaull/MergeMosaic"
+repository = "https://github.com/Astrometrical/mega-merge-mosaic"
 
 [workspace.dependencies]
 mmm-core = { path = "crates/mmm-core" }

@@ -97,8 +97,8 @@ in [docs/DESIGN.md](docs/DESIGN.md).
 From source (Rust via [rustup](https://rustup.rs)):
 
 ```sh
-git clone https://github.com/dpaull/MergeMosaic.git
-cd MergeMosaic
+git clone https://github.com/Astrometrical/mega-merge-mosaic.git
+cd mega-merge-mosaic
 cargo build --release        # release build strongly recommended: inputs are GBs
 target/release/mmm --help
 ```
