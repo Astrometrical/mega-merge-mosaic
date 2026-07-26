@@ -249,6 +249,30 @@ on real mosaic data in PixInsight. Feedback, bug reports, and sample data
 that breaks it are very welcome — please open a GitHub issue.
 Contributors: start with [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
+## About Astrometrical
+
+`mmm` is an [Astrometrical](https://github.com/Astrometrical) tool — built by
+an astrophotographer making tooling for very large images. It is brand-neutral
+and community-first: not tied to any platform, and useful on its own terms.
+
+## Contributing
+
+Contributions, bug reports, and frontend integrations are welcome — start with
+[CONTRIBUTING.md](CONTRIBUTING.md) (and [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+for the build/test workflow and internals).
+
+## Support / donations
+
+`mmm` is free and open source, and always will be. If it saves you time and you
+want to say thanks, donations are welcome at
+[Ko-fi](https://ko-fi.com/astrometrical) — entirely optional. Contributions and
+frontend integrations are valued just as highly.
+
 ## License
 
-License: TBD — a license file will be added before the first binary release.
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+In plain terms: you are free to use, modify, and redistribute `mmm`, including
+commercially, provided you keep the attribution and license notices. The
+"Astrometrical" name and branding are a trademark of the project and are not
+licensed for endorsement or promotional use (Apache License §6).
