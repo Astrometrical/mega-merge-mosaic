@@ -38,14 +38,16 @@
 //! `--input aligned` overrides.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::align::{choose_frame, reproject_panel};
+use crate::align::{choose_frame, reproject_from_reader, reproject_panel};
 use crate::astrometry::WcsModel;
 use crate::formats::XisfProperty;
 use crate::formats::xisf::XisfPanel;
+use crate::ipc::client::HostLink;
 use crate::overlap::OverlapGraph;
 use crate::panel_reader::{PanelReader, PanelStorage};
 use crate::session::{InputKind, PanelMeta, Session};
@@ -328,6 +330,178 @@ fn describe_unsolved(props: &[XisfProperty]) -> String {
     }
 }
 
+/// The aligned path over panels streamed from an IPC host: mirrors
+/// `analyze_aligned`, but each panel is read through
+/// [`PanelReader::open_ipc`] instead of a file — no session metadata or
+/// pixel data is ever written to disk except the analyze artifacts
+/// themselves. Unlike the file path, this is an explicit entry point (no
+/// `--input auto` coverage re-dispatch): the host tells us the job mode.
+pub fn analyze_ipc_aligned(
+    link: Arc<HostLink>,
+    session_dir: &Path,
+    band_rows: usize,
+    surface_order: Option<u32>,
+) -> Result<Session> {
+    let mut session = Session::create(session_dir)?;
+
+    let [cw, ch_, cc] = link.canvas();
+    let canvas = (cw, ch_, cc);
+    let n_panels = link.panels().len();
+    if n_panels == 0 {
+        return Err(Error::format(session_dir, "IPC job has no input panels"));
+    }
+
+    let scans: Vec<PanelScan> = (0..n_panels)
+        .into_par_iter()
+        .map(|id| {
+            let reader = PanelReader::open_ipc(link.clone(), id as u32, canvas, band_rows);
+            let meta = PanelMeta {
+                id,
+                path: PathBuf::new(),
+                source: None,
+                bbox: [0, 0, 0, 0],
+                nonzero_frac: 0.0,
+                ch_min: vec![],
+                ch_max: vec![],
+                ch_mean: vec![],
+                storage: PanelStorage::Ipc {
+                    panel_id: id as u32,
+                },
+            };
+            scan_reader(meta, reader)
+        })
+        .collect::<Result<_>>()?;
+
+    session.canvas = canvas;
+    finish_session(session, scans, surface_order)
+}
+
+/// The solved path over raw panels streamed from an IPC host: mirrors
+/// `analyze_solved` — astrometric models (from
+/// [`crate::ipc::protocol::PanelDesc::properties`]) → mosaic frame →
+/// [`reproject_from_reader`] into `panels/<id>/aligned.bin` → the same
+/// scan/graph/photometry pipeline over the caches on disk.
+pub fn analyze_ipc_solved(
+    link: Arc<HostLink>,
+    session_dir: &Path,
+    band_rows: usize,
+    surface_order: Option<u32>,
+) -> Result<Session> {
+    let mut session = Session::create(session_dir)?;
+
+    let panels = link.panels();
+    if panels.is_empty() {
+        return Err(Error::format(session_dir, "IPC job has no input panels"));
+    }
+
+    // Every panel must yield a model; report all unusable panels at once.
+    let mut models: Vec<WcsModel> = Vec::with_capacity(panels.len());
+    let mut errors: Vec<String> = Vec::new();
+    for p in panels {
+        match WcsModel::from_properties(&p.properties, p.width, p.height) {
+            Some(m) => models.push(m),
+            None => errors.push(format!(
+                "panel {}: {}",
+                p.panel_id,
+                describe_unsolved(&p.properties)
+            )),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(Error::format(
+            session_dir,
+            format!(
+                "solved input requires an astrometric solution in every panel:\n  {}",
+                errors.join("\n  ")
+            ),
+        ));
+    }
+    let ch = panels[0].channels;
+    if let Some(p) = panels.iter().find(|p| p.channels != ch) {
+        return Err(Error::format(
+            session_dir,
+            format!(
+                "panel {} has {} channels, expected {ch} like panel {}",
+                p.panel_id, p.channels, panels[0].panel_id
+            ),
+        ));
+    }
+
+    let frame = choose_frame(&models);
+    let canvas = (frame.width, frame.height, ch);
+    tracing::info!(
+        "mosaic frame: {}x{} px, {:.3}\"/px, center RA {:.4} Dec {:+.4}",
+        frame.width,
+        frame.height,
+        frame.scale_deg * 3600.0,
+        frame.crval[0],
+        frame.crval[1]
+    );
+
+    // Align stage: reproject each panel into the session cache. Sequential
+    // over panels — reproject_from_reader materializes one panel's raw
+    // planes at a time (bounded memory), reproject_core is rayon-parallel
+    // over output rows — matching analyze_solved's sequential-per-panel
+    // design.
+    let t_align = Instant::now();
+    let mut aligned = Vec::with_capacity(panels.len());
+    for (id, (p, model)) in panels.iter().zip(models.iter()).enumerate() {
+        let t = Instant::now();
+        let out_dir = session.dir.join("panels").join(id.to_string());
+        let reader = PanelReader::open_ipc(
+            link.clone(),
+            p.panel_id,
+            (p.width, p.height, p.channels),
+            band_rows,
+        );
+        let ap = reproject_from_reader(&reader, model, &frame, &out_dir)?;
+        tracing::info!(
+            "aligned panel {}/{}: bbox [{},{})x[{},{}) in {:.2}s",
+            id + 1,
+            panels.len(),
+            ap.bbox[0],
+            ap.bbox[2],
+            ap.bbox[1],
+            ap.bbox[3],
+            t.elapsed().as_secs_f64()
+        );
+        aligned.push(ap);
+    }
+    let align_secs = t_align.elapsed().as_secs_f64();
+    tracing::info!(
+        "align stage: {} panels in {:.2}s",
+        aligned.len(),
+        align_secs
+    );
+
+    // Scan the caches exactly like aligned frames, through PanelReader.
+    let scans: Vec<PanelScan> = aligned
+        .par_iter()
+        .enumerate()
+        .map(|(id, ap)| {
+            let meta = PanelMeta {
+                id,
+                path: ap.path.clone(),
+                source: None,
+                bbox: [0, 0, 0, 0],
+                nonzero_frac: 0.0,
+                ch_min: vec![],
+                ch_max: vec![],
+                ch_mean: vec![],
+                storage: PanelStorage::CroppedCache { bbox: ap.bbox },
+            };
+            let reader = PanelReader::open(&meta, canvas)?;
+            scan_reader(meta, reader)
+        })
+        .collect::<Result<_>>()?;
+
+    session.canvas = canvas;
+    session.input = InputKind::Solved;
+    session.frame = Some(frame);
+    session.align_secs = Some(align_secs);
+    finish_session(session, scans, surface_order)
+}
+
 /// Shared tail of both paths: persist summaries, build/save the overlap
 /// graph, photometric solve, optional residual surfaces, and `session.json`.
 fn finish_session(
@@ -520,9 +694,104 @@ fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
             }
         })
         .collect();
+    // Surface a mid-scan IPC transport failure as a proper `Err` instead of a
+    // silently-wrong summary; a no-op for Xisf/Cache backings, which always
+    // report `None` here — so the file path stays byte-identical.
+    if let Some(e) = panel.ipc_error() {
+        return Err(e);
+    }
+
     Ok(PanelScan {
         meta,
         summary,
         canvas: (w, h, ch),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::client::HostLink;
+    use crate::ipc::testhost::MockHost;
+    use crate::synth::write_xisf;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mmm-analyze-ipc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Two overlapping full-canvas panels, written to disk and also returned
+    /// as planar buffers for [`MockHost::spawn`] — the same pixels served two
+    /// ways.
+    struct TwoPanels {
+        dir: PathBuf,
+        paths: Vec<PathBuf>,
+        planar: Vec<Vec<f32>>,
+    }
+
+    fn synth_two_full_canvas_panels() -> TwoPanels {
+        let dir = tmpdir("two");
+        let (w, h, ch) = (32u64, 24u64, 3u64);
+        let make = |lo: u64, hi: u64, base: f32| -> Vec<f32> {
+            let mut planes = vec![0f32; (w * h * ch) as usize];
+            for c in 0..ch {
+                for y in 0..h {
+                    for x in lo..hi {
+                        planes[(c * w * h + y * w + x) as usize] =
+                            base + c as f32 * 0.1 + x as f32 * 0.001 + y as f32 * 0.0005;
+                    }
+                }
+            }
+            planes
+        };
+        // Overlap in x ∈ [12, 20).
+        let a = make(0, 20, 0.3);
+        let b = make(12, 32, 0.15);
+        let pa = dir.join("a.xisf");
+        let pb = dir.join("b.xisf");
+        write_xisf(&pa, w, h, ch, &a).unwrap();
+        write_xisf(&pb, w, h, ch, &b).unwrap();
+        TwoPanels {
+            dir,
+            paths: vec![pa, pb],
+            planar: vec![a, b],
+        }
+    }
+
+    /// The IPC aligned scan must produce byte-identical session artifacts to
+    /// the file-based aligned scan for the same pixels: same summaries, same
+    /// photometry solve.
+    #[test]
+    fn ipc_aligned_analyze_matches_file_analyze() {
+        let f = synth_two_full_canvas_panels();
+        let ref_dir = f.dir.join("ref.mmm-session");
+        let ref_sess = analyze_opts(&f.paths, &ref_dir, Some(2)).unwrap();
+
+        let (w, h, ch) = ref_sess.canvas;
+        let job = MockHost::aligned_job(w, h, ch, f.paths.len() as u32, 8, w * ch * 32 * 4);
+        let (host, r, wr) = MockHost::spawn(job.clone(), f.planar.clone());
+        let link = HostLink::start(job, r, wr).unwrap();
+        let ipc_dir = f.dir.join("ipc.mmm-session");
+        let ipc_sess = analyze_ipc_aligned(link.clone(), &ipc_dir, 32, Some(2)).unwrap();
+        link.finish_ok().unwrap();
+        host.join();
+
+        assert_eq!(ref_sess.canvas, ipc_sess.canvas);
+        for id in 0..f.paths.len() {
+            assert_eq!(
+                std::fs::read(ref_sess.summary_path(id)).unwrap(),
+                std::fs::read(ipc_sess.summary_path(id)).unwrap(),
+                "summary {id}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(ref_sess.photometry_path()).unwrap(),
+            std::fs::read(ipc_sess.photometry_path()).unwrap()
+        );
+
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
 }

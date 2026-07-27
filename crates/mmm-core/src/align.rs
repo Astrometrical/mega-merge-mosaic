@@ -55,6 +55,7 @@ use rayon::prelude::*;
 
 use crate::astrometry::{LinearWcs, WcsModel};
 use crate::formats::xisf::XisfPanel;
+use crate::panel_reader::PanelReader;
 use crate::{Error, Result};
 
 /// Margin added around the union footprint when choosing the canvas.
@@ -221,6 +222,11 @@ fn lanczos3(t: f64) -> f64 {
 /// full-support-or-zero rule and the content placement law (module docs).
 /// Rayon-parallel over output rows; the mapping is evaluated exactly per
 /// pixel. Errors when the panel's footprint misses the canvas entirely.
+///
+/// The whole-plane source access is an mmap'd zero-copy gather from `panel`;
+/// see [`reproject_from_reader`] for the IPC-served equivalent, which
+/// materializes the same planes from a [`PanelReader`] first and then shares
+/// this function's resampling core (`reproject_core`).
 pub fn reproject_panel(
     panel: &XisfPanel,
     model: &WcsModel,
@@ -229,15 +235,71 @@ pub fn reproject_panel(
 ) -> Result<AlignedPanel> {
     let (sw, sh) = (panel.width() as usize, panel.height() as usize);
     let nch = panel.channels() as usize;
-    if (model.width, model.height) != (panel.width(), panel.height()) {
+    let planes: Vec<&[f32]> = (0..nch as u64).map(|c| panel.channel(c)).collect();
+    reproject_core(&planes, sw, sh, nch, panel.path(), model, frame, out_dir)
+}
+
+/// Reproject one raw panel served over IPC (any [`PanelReader`], addressed by
+/// its own raw geometry via [`PanelReader::canvas`]) onto the mosaic frame,
+/// exactly like [`reproject_panel`] but without an mmap to gather planes
+/// from.
+///
+/// The reader's rows are pulled sequentially (`y` outer, channel inner —
+/// efficient for a band-cached IPC backing) into owned per-channel planes:
+/// this materializes one raw panel's pixel data in memory, bounded — one
+/// panel at a time, matching [`crate::analyze::analyze_ipc_solved`]'s
+/// sequential-per-panel design, the same as the file path's `XisfPanel` mmap
+/// footprint. `reproject_core` then runs identically to the file path.
+///
+/// There is no source file for an IPC panel, so error messages that would
+/// otherwise cite the source path cite `out_dir` instead.
+pub fn reproject_from_reader(
+    reader: &PanelReader,
+    model: &WcsModel,
+    frame: &MosaicFrame,
+    out_dir: &Path,
+) -> Result<AlignedPanel> {
+    let (cw, ch_h, cch) = reader.canvas();
+    let (sw, sh, nch) = (cw as usize, ch_h as usize, cch as usize);
+    let mut planes = vec![vec![0f32; sw * sh]; nch];
+    for y in 0..sh {
+        for (c, plane) in planes.iter_mut().enumerate() {
+            let (x0, row) = reader
+                .row(c as u64, y as u64)
+                .ok_or_else(|| Error::compute("ipc reader returned no row during reprojection"))?;
+            debug_assert_eq!(x0, 0, "an IPC panel always covers its own full canvas");
+            plane[y * sw..y * sw + sw].copy_from_slice(row);
+        }
+    }
+    if let Some(e) = reader.ipc_error() {
+        return Err(e);
+    }
+    let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+    reproject_core(&refs, sw, sh, nch, out_dir, model, frame, out_dir)
+}
+
+/// The resampling core shared by [`reproject_panel`] and
+/// [`reproject_from_reader`]: everything after the source planes are in hand
+/// (whole per-channel `sw × sh` planes) — the bbox forward-map, the
+/// per-output-pixel Lanczos loop, and the cache write. `err_path` is used
+/// only for error messages (there is no real file behind an IPC panel).
+#[allow(clippy::too_many_arguments)] // pure extraction of reproject_panel's tail; see the doc above
+fn reproject_core(
+    planes: &[&[f32]],
+    sw: usize,
+    sh: usize,
+    nch: usize,
+    err_path: &Path,
+    model: &WcsModel,
+    frame: &MosaicFrame,
+    out_dir: &Path,
+) -> Result<AlignedPanel> {
+    if (model.width, model.height) != (sw as u64, sh as u64) {
         return Err(Error::format(
-            panel.path(),
+            err_path,
             format!(
                 "solved geometry {}x{} does not match panel {}x{}",
-                model.width,
-                model.height,
-                panel.width(),
-                panel.height()
+                model.width, model.height, sw, sh
             ),
         ));
     }
@@ -266,13 +328,11 @@ pub fn reproject_panel(
     let y1 = clamp(fy1.ceil() as i64 + 1 + BBOX_PAD, frame.height);
     if x0 >= x1 || y0 >= y1 {
         return Err(Error::format(
-            panel.path(),
+            err_path,
             "panel footprint does not intersect the mosaic frame",
         ));
     }
     let (bw, bh) = ((x1 - x0) as usize, (y1 - y0) as usize);
-
-    let planes: Vec<&[f32]> = (0..nch as u64).map(|c| panel.channel(c)).collect();
 
     // Rayon over output rows; each row holds nch × bw (channel-major).
     let rows_out: Vec<Vec<f32>> = (0..bh)
