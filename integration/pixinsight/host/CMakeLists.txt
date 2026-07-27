@@ -22,13 +22,24 @@ endforeach()
 
 # Golden aligned byte-identity test (Task 7): drives the real worker two ways
 # (Files-mode reference vs Aligned-mode shm serve) and asserts byte-identity.
-# `gen_fixtures` writes the deterministic 2-panel scene the test consumes.
+# `gen_fixtures` writes the deterministic 2-panel aligned scene AND (Task 8)
+# the two-panel raw solved scene both golden tests below consume.
 add_custom_target(gen_fixtures
   COMMAND cargo run --quiet --manifest-path ${MMM_CARGO_MANIFEST} -p mmm-ipc-worker --example gen_fixtures -- ${CMAKE_BINARY_DIR}/fixtures
-  BYPRODUCTS ${CMAKE_BINARY_DIR}/fixtures/meta.json
-  COMMENT "Generating aligned golden fixtures")
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/fixtures/meta.json ${CMAKE_BINARY_DIR}/fixtures/solved_meta.json
+  COMMENT "Generating aligned + solved golden fixtures")
 
 add_executable(test_golden_aligned test/test_golden_aligned.cpp)
 target_link_libraries(test_golden_aligned PRIVATE mmm_host)
 add_dependencies(test_golden_aligned gen_fixtures)
 add_test(NAME test_golden_aligned COMMAND test_golden_aligned ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
+
+# Golden solved-mode byte-identity test (Task 8): drives the real worker two
+# ways (Files(Solved)-mode reference vs Solved-mode shm serve, with
+# Host::probe_frame sizing the output slots) and asserts byte-identity.
+# `gen_fixtures` (extended for Task 8) also writes the solved fixtures this
+# test consumes.
+add_executable(test_golden_solved test/test_golden_solved.cpp)
+target_link_libraries(test_golden_solved PRIVATE mmm_host)
+add_dependencies(test_golden_solved gen_fixtures)
+add_test(NAME test_golden_solved COMMAND test_golden_solved ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
