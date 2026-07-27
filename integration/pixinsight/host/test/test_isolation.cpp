@@ -170,16 +170,21 @@ void test_crash_worker_exits_without_done() {
   mmm::Host host(std::move(cfg), never, collector);
 
   bool threw_host_error = false;
+  std::string host_error_message;
   try {
     host.run();
   } catch (const mmm::HostError& e) {
     threw_host_error = true;
+    host_error_message = e.what();
     std::fprintf(stderr, "  got expected HostError: %s\n", e.what());
   } catch (const std::exception& e) {
     std::fprintf(stderr, "  FAILED: wrong exception type escaped run(): %s\n", e.what());
   }
 
   CHECK(threw_host_error);
+  // Not just any HostError -- specifically the exit-without-Done path (see
+  // mmm_host.cpp), not e.g. a spawn failure or a shm setup error.
+  CHECK(host_error_message.find("worker exited before Done") != std::string::npos);
   CHECK(!collector.called);   // No partial output ever surfaced.
   CHECK(!host.cancelled());   // This is a crash, not a cancellation.
 

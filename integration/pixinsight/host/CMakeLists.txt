@@ -14,6 +14,16 @@ enable_testing()
 set(MMM_WORKER "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug/mmm-ipc-worker" CACHE FILEPATH "worker binary")
 set(MMM_CARGO_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/../../../Cargo.toml")
 
+# Build the worker binary itself as part of the normal `cmake --build`, so
+# ctest can never run the golden/isolation tests against a stale or missing
+# `mmm-ipc-worker` -- `cargo run --example gen_fixtures` (below) builds that
+# example target, not necessarily the worker's own main binary. Running this
+# unconditionally is harmless even when a user overrides MMM_WORKER to point
+# elsewhere: it just keeps the default-path binary current in the background.
+add_custom_target(build_worker
+  COMMAND cargo build --manifest-path ${MMM_CARGO_MANIFEST} -p mmm-ipc-worker
+  COMMENT "Building mmm-ipc-worker (debug)")
+
 foreach(t test_shm test_protocol)
   add_executable(${t} test/${t}.cpp)
   target_link_libraries(${t} PRIVATE mmm_host)
@@ -31,7 +41,7 @@ add_custom_target(gen_fixtures
 
 add_executable(test_golden_aligned test/test_golden_aligned.cpp)
 target_link_libraries(test_golden_aligned PRIVATE mmm_host)
-add_dependencies(test_golden_aligned gen_fixtures)
+add_dependencies(test_golden_aligned gen_fixtures build_worker)
 add_test(NAME test_golden_aligned COMMAND test_golden_aligned ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
 
 # Golden solved-mode byte-identity test (Task 8): drives the real worker two
@@ -41,7 +51,7 @@ add_test(NAME test_golden_aligned COMMAND test_golden_aligned ${CMAKE_BINARY_DIR
 # test consumes.
 add_executable(test_golden_solved test/test_golden_solved.cpp)
 target_link_libraries(test_golden_solved PRIVATE mmm_host)
-add_dependencies(test_golden_solved gen_fixtures)
+add_dependencies(test_golden_solved gen_fixtures build_worker)
 add_test(NAME test_golden_solved COMMAND test_golden_solved ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
 
 # Fault-isolation tests (Task 9): worker crash (exit-without-Done via
@@ -49,4 +59,5 @@ add_test(NAME test_golden_solved COMMAND test_golden_solved ${CMAKE_BINARY_DIR}/
 # fixtures needed -- panels are synthesized in-memory.
 add_executable(test_isolation test/test_isolation.cpp)
 target_link_libraries(test_isolation PRIVATE mmm_host)
+add_dependencies(test_isolation build_worker)
 add_test(NAME test_isolation COMMAND test_isolation ${MMM_WORKER})

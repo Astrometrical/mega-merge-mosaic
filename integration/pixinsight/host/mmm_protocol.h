@@ -15,8 +15,12 @@
 
 namespace mmm {
 
-/// Tags for frames the worker writes to its stdout (worker -> host).
+/// Tags for frames the worker writes to its stdout (worker -> host). `Invalid`
+/// is never sent on the wire (real worker tags are 1-6); it exists only as a
+/// safe default for a default-constructed `WorkerFrame` so an unfilled frame
+/// can never be mistaken for a real message (see `WorkerFrame::tag`).
 enum class WorkerTag : uint8_t {
+  Invalid = 0,
   BandRequest = 1,
   Progress = 2,
   Begin = 3,
@@ -64,7 +68,7 @@ struct OutputBand {
 /// A decoded worker->host frame (binary or JSON), tagged union style: only
 /// the fields matching `tag` are meaningful.
 struct WorkerFrame {
-  WorkerTag tag = WorkerTag::Done;
+  WorkerTag tag = WorkerTag::Invalid;
 
   BandRequest band_request{};  // valid iff tag == BandRequest
   OutputBand output_band{};    // valid iff tag == OutputBand
@@ -106,25 +110,6 @@ std::vector<uint8_t> encode_output_ack(uint32_t request_id);
 /// Builds a framed `Cancel` frame (tag 131, JSON bare string `"Cancel"`),
 /// ready to write with a single `write`.
 std::vector<uint8_t> encode_cancel();
-
-/// Mirrors `BlendParamsWire` (PROTOCOL.md Section 6 / protocol.rs). Not
-/// consumed by `encode_init` directly (that takes a pre-built
-/// `nlohmann::json`); this documents the field shape a caller building
-/// `InitJob.params` should follow. `roi`/`flatten`/`surface_order` are
-/// optional in the wire JSON (`null` when absent).
-struct InitParams {
-  double feather_px = 256.0;
-  uint32_t downsample = 1;
-  uint32_t band_rows = 256;
-  std::string mode = "pyramid";
-  bool has_roi = false;
-  uint64_t roi[4] = {0, 0, 0, 0};
-  bool defect_veto = true;
-  bool has_flatten = false;
-  uint32_t flatten = 0;
-  bool has_surface_order = true;
-  uint32_t surface_order = 2;
-};
 
 /// Builds a framed `Init` frame (tag 128) from a pre-built nlohmann JSON
 /// value (the caller constructs `{"Init": {...InitJob shape...}}` per

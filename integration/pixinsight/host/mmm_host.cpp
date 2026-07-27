@@ -210,6 +210,14 @@ void Host::run() {
           }
           throw HostError(std::string("worker error: ") + wf.error_message);
         }
+        case WorkerTag::Invalid: {
+          // Unreachable in practice: `read_worker_frame` only ever returns
+          // true after setting `tag` to one of the six real worker tags
+          // (any other byte on the wire throws before we get here). Guard
+          // it anyway so a default-constructed-but-unfilled frame can never
+          // silently fall through as a real message.
+          throw HostError("internal error: WorkerFrame::tag left Invalid");
+        }
       }
       if (saw_done || cancelled_.load()) break;
     }
