@@ -262,17 +262,34 @@ pub fn reproject_from_reader(
     let (cw, ch_h, cch) = reader.canvas();
     let (sw, sh, nch) = (cw as usize, ch_h as usize, cch as usize);
     let mut planes = vec![vec![0f32; sw * sh]; nch];
-    for y in 0..sh {
+    // A `None` row inside these bounds can only come from a `request_band`
+    // transport failure (the loop bounds exactly match `reader.canvas()`),
+    // whose real, actionable reason is latched in the reader — so a `None`
+    // breaks out (both loops, via `complete`/labeled break) to check
+    // `ipc_error()` below rather than returning inline with a generic
+    // message that would shadow it (the same pattern `scan_reader` uses for
+    // the same reason). Never fall through to `reproject_core` on a break —
+    // that would resample a half-materialized panel.
+    let mut complete = true;
+    'rows: for y in 0..sh {
         for (c, plane) in planes.iter_mut().enumerate() {
-            let (x0, row) = reader
-                .row(c as u64, y as u64)
-                .ok_or_else(|| Error::compute("ipc reader returned no row during reprojection"))?;
+            let Some((x0, row)) = reader.row(c as u64, y as u64) else {
+                complete = false;
+                break 'rows;
+            };
             debug_assert_eq!(x0, 0, "an IPC panel always covers its own full canvas");
             plane[y * sw..y * sw + sw].copy_from_slice(row);
         }
     }
     if let Some(e) = reader.ipc_error() {
         return Err(e);
+    }
+    if !complete {
+        // Unreachable in practice (see above): a `None` row with no latched
+        // transport error. Fail loudly rather than resample partial data.
+        return Err(Error::compute(
+            "ipc reader returned no row during reprojection and no transport error was latched",
+        ));
     }
     let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
     reproject_core(&refs, sw, sh, nch, out_dir, model, frame, out_dir)
