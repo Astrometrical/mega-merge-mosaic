@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 extern char** environ;
@@ -15,6 +16,22 @@ extern char** environ;
 namespace mmm {
 
 namespace {
+
+// Ignore SIGPIPE process-wide, once, so a write to the stdin of a worker that
+// has just died (its read end fully closed) fails with EPIPE instead of
+// delivering the default-fatal SIGPIPE that would terminate the whole host.
+// In the real PixInsight module a mistimed worker crash must NOT take down
+// PixInsight itself -- that is the isolation guarantee of spec §9/§18 ("worker
+// crash -> clean error, host keeps running"). With SIGPIPE ignored the write
+// returns -1/EPIPE, which `full_write_fd` turns into a clean `HostError` (and
+// which `cancel()` deliberately swallows). These are pipe `write()`s, so
+// `MSG_NOSIGNAL`/`send()` do not apply; process-wide `SIG_IGN` is the correct,
+// standard mechanism for a process doing pipe IO. `std::call_once` keeps it
+// idempotent so repeated `Host` construction never thrashes the disposition.
+void ignore_sigpipe_once() {
+  static std::once_flag flag;
+  std::call_once(flag, [] { ::signal(SIGPIPE, SIG_IGN); });
+}
 
 // Writes all `n` bytes of `buf` to `fd`, looping over short writes and
 // retrying on EINTR. Throws on a hard error.
@@ -82,7 +99,11 @@ pid_t spawn_worker(const std::string& path, char* const argv[], int child_stdin_
 }  // namespace
 
 Host::Host(HostConfig cfg, PanelSource& src, OutputCollector& out, ProgressCallback* prog)
-    : cfg_(std::move(cfg)), src_(src), out_(out), prog_(prog) {}
+    : cfg_(std::move(cfg)), src_(src), out_(out), prog_(prog) {
+  // Isolation guarantee (spec §9/§18): a dying worker must never signal the
+  // host to death via a pipe write. Idempotent; see ignore_sigpipe_once.
+  ignore_sigpipe_once();
+}
 
 void Host::write_framed_locked(const std::vector<uint8_t>& framed) {
   std::lock_guard<std::mutex> lk(stdin_mutex_);
