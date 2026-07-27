@@ -25,12 +25,19 @@
 #include <vector>
 
 #include "mmm_host.h"
+#include "test/golden_harness.h"
 #include "test/test_util.h"
 #include "third_party/json.hpp"
 
 namespace {
 
 using nlohmann::json;
+using mmm_test::BufCollector;
+using mmm_test::make_params;
+using mmm_test::MemSource;
+using mmm_test::NeverSource;
+using mmm_test::run_job;
+using mmm_test::RunResult;
 
 // Reads a whole file into a byte vector.
 std::vector<uint8_t> read_bytes(const std::string& path) {
@@ -47,69 +54,6 @@ std::vector<float> read_floats(const std::string& path, uint64_t count) {
   std::vector<float> out(count);
   std::memcpy(out.data(), bytes.data(), bytes.size());
   return out;
-}
-
-// Serves band requests from in-memory planar panels (solvedN.bin), each its
-// own w/h/ch -- unlike the aligned fixtures, solved panels are NOT all the
-// same size. Planar layout channels x height x width; fill_band copies rows
-// [y0,y1) into the slot in the band's planar layout:
-// index(c,r,x) = c*rows*w + r*w + x.
-struct MemSource : mmm::PanelSource {
-  std::vector<std::vector<float>> panels;
-  std::vector<uint64_t> w, h, ch;
-  bool fill_band(uint32_t id, uint64_t y0, uint64_t y1, float* dst) override {
-    const auto& p = panels[id];
-    uint64_t W = w[id], H = h[id], C = ch[id], rows = y1 - y0;
-    for (uint64_t c = 0; c < C; c++) {
-      for (uint64_t r = 0; r < rows; r++) {
-        std::memcpy(dst + (c * rows + r) * W, &p[(c * H + y0 + r) * W], W * sizeof(float));
-      }
-    }
-    return true;
-  }
-};
-
-// A PanelSource the worker must never call (Files mode reads panels itself).
-struct NeverSource : mmm::PanelSource {
-  bool fill_band(uint32_t, uint64_t, uint64_t, float*) override {
-    CHECK(false);  // Files mode must not issue BandRequests.
-    return false;
-  }
-};
-
-// Buffers streamed output bands into one planar (c*H + y)*W + x mosaic.
-struct BufCollector : mmm::OutputCollector {
-  uint64_t W = 0, H = 0, C = 0;
-  std::vector<float> data;
-  void begin(uint64_t w_, uint64_t h_, uint64_t c_) override {
-    W = w_;
-    H = h_;
-    C = c_;
-    data.assign(w_ * h_ * c_, 0.f);
-  }
-  void band(uint64_t y0, uint64_t rows, const float* p, uint64_t width, uint64_t c) override {
-    for (uint64_t ch = 0; ch < c; ch++) {
-      for (uint64_t r = 0; r < rows; r++) {
-        std::memcpy(&data[(ch * H + y0 + r) * width], p + (ch * rows + r) * width,
-                    width * sizeof(float));
-      }
-    }
-  }
-};
-
-// Builds the `params` object mirroring end_to_end.rs::blend_params /
-// `solved_mode_reprojection_matches_file`'s BlendParamsWire.
-json make_params(uint32_t band_rows, double feather_px) {
-  json p;
-  p["feather_px"] = feather_px;
-  p["downsample"] = 1;
-  p["band_rows"] = band_rows;
-  p["mode"] = "pyramid";
-  p["roi"] = nullptr;
-  p["defect_veto"] = true;
-  p["flatten"] = nullptr;
-  p["surface_order"] = 2;
-  return p;
 }
 
 // Builds the `panels` array from solved_meta.json, optionally splicing each
@@ -130,31 +74,6 @@ json make_panels(const json& meta, const json* props /* nullable */) {
     i++;
   }
   return panels;
-}
-
-// One run's result: the collected mosaic plus the geometry the worker
-// announced via Begin (the output canvas is the data bounding box, which the
-// worker computes -- not necessarily the full Init canvas).
-struct RunResult {
-  std::vector<float> data;
-  uint64_t w = 0, h = 0, ch = 0;
-};
-
-// Runs one job to completion and returns the collected mosaic + geometry.
-RunResult run_job(const std::string& worker_path, const json& init_body,
-                  const mmm::SlotLayout& layout, const std::string& shm_name,
-                  mmm::PanelSource& src) {
-  mmm::HostConfig cfg;
-  cfg.worker_path = worker_path;
-  cfg.layout = layout;
-  cfg.shm_name = shm_name;
-  cfg.init = json{{"Init", init_body}};
-
-  BufCollector out;
-  mmm::Host host(std::move(cfg), src, out);
-  host.run();
-  CHECK(!host.cancelled());
-  return RunResult{std::move(out.data), out.W, out.H, out.C};
 }
 
 }  // namespace

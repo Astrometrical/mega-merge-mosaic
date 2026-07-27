@@ -43,3 +43,10 @@ add_executable(test_golden_solved test/test_golden_solved.cpp)
 target_link_libraries(test_golden_solved PRIVATE mmm_host)
 add_dependencies(test_golden_solved gen_fixtures)
 add_test(NAME test_golden_solved COMMAND test_golden_solved ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
+
+# Fault-isolation tests (Task 9): worker crash (exit-without-Done via
+# /bin/false) and mid-run cancel(), both against the real Host driver. No
+# fixtures needed -- panels are synthesized in-memory.
+add_executable(test_isolation test/test_isolation.cpp)
+target_link_libraries(test_isolation PRIVATE mmm_host)
+add_test(NAME test_isolation COMMAND test_isolation ${MMM_WORKER})
