@@ -11,15 +11,22 @@
 //!
 //! Every blocking wait in this module (a `ReplySlot` waiting for its reply,
 //! a `SlotPool` waiting for a free slot) is a `while`-loop over a
-//! [`Condvar`] guarding a predicate that includes `shutdown`. When the
-//! reader thread observes the host pipe close (`Ok(None)`) or error out, it
-//! sets `shutdown` and then wakes *every* registered waiter — pending
-//! reply slots and both slot pools — so nothing can block forever after the
-//! host goes away. See `HostLink`'s private `run_reader` method for the
-//! exact sequencing that rules out the lost-wakeup race (store `shutdown`
-//! before acquiring each waiter's mutex, so any waiter either observes
-//! `shutdown` already true when it takes the lock, or is already asleep in
-//! `Condvar::wait` and gets woken by the subsequent `notify_all`).
+//! [`Condvar`] guarding a predicate that includes `shutdown` *and*
+//! `cancelled`. When the reader thread observes the host pipe close
+//! (`Ok(None)`) or error out, it sets `shutdown` and then wakes *every*
+//! registered waiter — pending reply slots and both slot pools — so nothing
+//! can block forever after the host goes away; a `HostMsg::Cancel` frame
+//! does the same with `cancelled` instead (`notify_cancel`), without tearing
+//! down the link itself, so a mid-stage cancellation unwinds promptly rather
+//! than waiting for a reply a cancelled host will never send. See
+//! `HostLink`'s private `run_reader` method for the exact sequencing that
+//! rules out the lost-wakeup race in both cases (store the flag before
+//! acquiring each waiter's mutex, so any waiter either observes the flag
+//! already true when it takes the lock, or is already asleep in
+//! `Condvar::wait` and gets woken by the subsequent `notify_all`). The
+//! reader thread's shutdown path additionally runs from a drop guard
+//! (`ShutdownGuard`), so it fires even if the reader thread panics instead
+//! of returning normally — see `run_reader`'s doc comment.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -63,8 +70,14 @@ impl ReplySlot {
         })
     }
 
-    /// Blocks until a reply is delivered or `shutdown` is set.
-    fn wait(&self, shutdown: &AtomicBool) -> Result<Reply> {
+    /// Blocks until a reply is delivered, `shutdown` is set, or `cancelled`
+    /// is set. A reply already in hand always wins (no point discarding
+    /// real data that arrived before/alongside a `Cancel`); `shutdown` is
+    /// checked before `cancelled` since a closed pipe is the more specific
+    /// diagnosis. Re-checked every wakeup, so the reader thread's
+    /// `notify_cancel`/`shut_down` (which wake *every* waiter, not just this
+    /// one) can never cause a lost wakeup — see the module docs.
+    fn wait(&self, shutdown: &AtomicBool, cancelled: &AtomicBool) -> Result<Reply> {
         let mut guard = self.slot.lock().unwrap();
         loop {
             if let Some(reply) = guard.take() {
@@ -74,6 +87,9 @@ impl ReplySlot {
                 return Err(Error::compute(
                     "HostLink: host pipe closed while waiting for a reply",
                 ));
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(Error::compute("cancelled"));
             }
             guard = self.cond.wait(guard).unwrap();
         }
@@ -113,8 +129,9 @@ impl SlotPool {
         }
     }
 
-    /// Blocks until a slot id is free or `shutdown` is set.
-    fn acquire(&self, shutdown: &AtomicBool) -> Result<u32> {
+    /// Blocks until a slot id is free, `shutdown` is set, or `cancelled` is
+    /// set (see [`ReplySlot::wait`] for the same check-ordering rationale).
+    fn acquire(&self, shutdown: &AtomicBool, cancelled: &AtomicBool) -> Result<u32> {
         let mut guard = self.free.lock().unwrap();
         loop {
             if let Some(id) = guard.pop() {
@@ -124,6 +141,9 @@ impl SlotPool {
                 return Err(Error::compute(
                     "HostLink: host pipe closed while waiting for a free slot",
                 ));
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(Error::compute("cancelled"));
             }
             guard = self.cond.wait(guard).unwrap();
         }
@@ -140,6 +160,25 @@ impl SlotPool {
     fn wake_for_shutdown(&self) {
         drop(self.free.lock().unwrap());
         self.cond.notify_all();
+    }
+}
+
+/// Drop guard that calls [`HostLink::shut_down`] no matter how the reader
+/// thread's closure exits — normal return, an `Err` arm, *or* a panic.
+///
+/// This is the mechanism behind the crash-detection guarantee: a
+/// `request_band`/`send_output_band` caller blocked in [`ReplySlot::wait`]
+/// or [`SlotPool::acquire`] must be woken with an error if the reader thread
+/// ever stops servicing the pipe, for *any* reason. An explicit
+/// `self.shut_down()` call only covers the arms the author remembered to put
+/// it in; a value whose `Drop` impl runs during unwind covers every exit
+/// path, including ones a future refactor adds without thinking about
+/// shutdown at all.
+struct ShutdownGuard(Arc<HostLink>);
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        self.0.shut_down();
     }
 }
 
@@ -218,7 +257,17 @@ impl HostLink {
     /// Reader thread body: demultiplexes `HostMsg`s from `input` onto
     /// pending [`ReplySlot`]s until the pipe closes or errors, then wakes
     /// every waiter so nothing blocks forever afterward.
+    ///
+    /// `_guard` ties `shut_down` to this closure's *exit*, not just its
+    /// normal EOF/error arm: whether the loop below returns cleanly or the
+    /// thread panics partway through (a malformed frame triggering a bug in
+    /// this function, say), `ShutdownGuard::drop` still runs and still wakes
+    /// every waiter. That is the crash-detection guarantee this module
+    /// promises — a dead/wedged host must never leave a `request_band` or
+    /// `send_output_band` call blocked forever — extended to cover a panic
+    /// in the reader thread itself, not just an orderly pipe close.
     fn run_reader(self: Arc<Self>, mut input: Box<dyn Read + Send>) {
+        let _guard = ShutdownGuard(self.clone());
         loop {
             match read_host_frame(&mut input) {
                 Ok(Some(HostMsg::BandReply(reply))) => {
@@ -229,7 +278,7 @@ impl HostLink {
                     self.deliver(request_id, Reply::OutputAck);
                 }
                 Ok(Some(HostMsg::Cancel)) => {
-                    self.cancelled.store(true, Ordering::SeqCst);
+                    self.notify_cancel();
                 }
                 Ok(Some(HostMsg::Init(_))) => {
                     // The host sends exactly one `Init`, already consumed by
@@ -238,7 +287,8 @@ impl HostLink {
                     // link that may still be making progress.
                 }
                 Ok(None) | Err(_) => {
-                    self.shut_down();
+                    // `_guard`'s drop (below, at function exit) calls
+                    // `shut_down`; no need to call it here too.
                     return;
                 }
             }
@@ -261,6 +311,31 @@ impl HostLink {
     /// module docs for the lost-wakeup argument.
     fn shut_down(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        let pending: Vec<Arc<ReplySlot>> = self
+            .pending
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
+        for slot in pending {
+            slot.wake_for_shutdown();
+        }
+        self.input_pool.wake_for_shutdown();
+        self.output_pool.wake_for_shutdown();
+    }
+
+    /// Marks the link cancelled (the host sent [`HostMsg::Cancel`]) and
+    /// wakes every waiter — pending reply slots and both slot pools — so a
+    /// `request_band`/`send_output_band` call blocked mid-wait fails
+    /// promptly instead of blocking for a reply that a cancelled host will
+    /// never send. Unlike [`Self::shut_down`], this does not tear down the
+    /// link or its pipe (the host may still be reachable, e.g. to observe a
+    /// later clean close) — only the in-flight job is aborted. Same
+    /// store-before-lock ordering as `shut_down`, for the same lost-wakeup
+    /// reason (module docs).
+    fn notify_cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
         let pending: Vec<Arc<ReplySlot>> = self
             .pending
             .lock()
@@ -307,7 +382,7 @@ impl HostLink {
             )));
         }
 
-        let slot_id = self.input_pool.acquire(&self.shutdown)?;
+        let slot_id = self.input_pool.acquire(&self.shutdown, &self.cancelled)?;
         let result = self.request_band_inner(panel_id, y0, y1, slot_id, dst);
         self.input_pool.release(slot_id);
         result
@@ -321,6 +396,13 @@ impl HostLink {
         slot_id: u32,
         dst: &mut [f32],
     ) -> Result<()> {
+        // Fail fast rather than round-tripping to a host that has already
+        // asked us to stop: a mid-stage `Cancel` must unwind the current
+        // analyze/blend stage promptly, not after one more (possibly never
+        // answered) request.
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(Error::compute("cancelled"));
+        }
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let reply_slot = ReplySlot::new();
         self.pending
@@ -340,7 +422,7 @@ impl HostLink {
             return Err(e);
         }
 
-        let reply_result = reply_slot.wait(&self.shutdown);
+        let reply_result = reply_slot.wait(&self.shutdown, &self.cancelled);
         self.pending.lock().unwrap().remove(&request_id);
         match reply_result? {
             Reply::Band(reply) => {
@@ -388,7 +470,7 @@ impl HostLink {
     /// output slot, sends it to the host, and blocks until the host
     /// acknowledges, then frees the slot.
     pub fn send_output_band(&self, y0: u64, rows: u64, planar: &[f32]) -> Result<()> {
-        let slot_id = self.output_pool.acquire(&self.shutdown)?;
+        let slot_id = self.output_pool.acquire(&self.shutdown, &self.cancelled)?;
         let result = self.send_output_band_inner(y0, rows, planar, slot_id);
         self.output_pool.release(slot_id);
         result
@@ -401,6 +483,10 @@ impl HostLink {
         planar: &[f32],
         slot_id: u32,
     ) -> Result<()> {
+        // Same fail-fast rationale as `request_band_inner`.
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(Error::compute("cancelled"));
+        }
         let dst = self
             .shm
             .slice_mut(self.layout.output_offset(slot_id), planar.len() as u64);
@@ -424,7 +510,7 @@ impl HostLink {
             return Err(e);
         }
 
-        let reply_result = reply_slot.wait(&self.shutdown);
+        let reply_result = reply_slot.wait(&self.shutdown, &self.cancelled);
         self.pending.lock().unwrap().remove(&request_id);
         match reply_result? {
             Reply::OutputAck => Ok(()),
