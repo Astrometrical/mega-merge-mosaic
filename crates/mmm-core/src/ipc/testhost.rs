@@ -208,7 +208,9 @@ impl MockHost {
     /// acknowledging `OutputBand`s into an accumulated result buffer.
     ///
     /// Returns the [`HostSide`] handle plus the pipe ends the worker side
-    /// (`HostLink::start`) should use as its `input`/`output`.
+    /// (`HostLink::start`) should use as its `input`/`output`. In-process
+    /// only: creates its own shm segment and its own in-process pipe shim,
+    /// then delegates to [`Self::serve_over`] for the actual serving loop.
     pub fn spawn(
         job: InitJob,
         panel_pixels: Vec<Vec<f32>>,
@@ -226,6 +228,36 @@ impl MockHost {
         let (worker_in, host_out) = pipe();
         let (host_in, worker_out) = pipe();
 
+        let host = Self::serve_over(job, panel_pixels, shm, host_in, host_out);
+        (host, Box::new(worker_in), Box::new(worker_out))
+    }
+
+    /// The same host-serving loop as [`Self::spawn`], but over a caller-
+    /// supplied transport: a real, already-created [`ShmSegment`] and
+    /// arbitrary `reader`/`writer` — typically a spawned child process's
+    /// real stdout/stdin — instead of the in-process pipe shim.
+    ///
+    /// This is what lets a cross-process integration test drive a real
+    /// `mmm-ipc-worker` child against the exact same reference-host logic
+    /// [`Self::spawn`] uses for in-process unit tests: there is only one
+    /// serving-loop implementation (`run_host`, private) behind both.
+    ///
+    /// The caller must have already written the `HostMsg::Init` frame to
+    /// `writer` (or be about to — `run_host` never sends `Init` itself; the
+    /// in-process `spawn` path hands `job` straight to `HostLink::start`
+    /// instead of putting it on the wire).
+    pub fn serve_over(
+        job: InitJob,
+        panel_pixels: Vec<Vec<f32>>,
+        shm: ShmSegment,
+        reader: impl Read + Send + 'static,
+        writer: impl Write + Send + 'static,
+    ) -> HostSide {
+        let layout = SlotLayout {
+            slot_bytes: job.slot_bytes,
+            input_slots: job.input_slots,
+            output_slots: job.output_slots,
+        };
         let result: Arc<Mutex<(ResultGeom, Vec<f32>)>> = Arc::new(Mutex::new(((0, 0, 0), vec![])));
         let result_for_thread = result.clone();
 
@@ -237,31 +269,31 @@ impl MockHost {
                     panel_pixels,
                     shm,
                     layout,
-                    host_in,
-                    host_out,
+                    reader,
+                    writer,
                     result_for_thread,
                 );
             })
             .expect("spawn mock host thread");
 
-        (
-            HostSide {
-                thread: Some(thread),
-                result,
-            },
-            Box::new(worker_in),
-            Box::new(worker_out),
-        )
+        HostSide {
+            thread: Some(thread),
+            result,
+        }
     }
 }
 
-fn run_host(
+/// The one reference host-serving loop, shared by [`MockHost::spawn`]
+/// (in-process pipe shim) and [`MockHost::serve_over`] (arbitrary
+/// `Read`/`Write`, e.g. a real child process): generic over the transport so
+/// neither caller needs its own copy.
+fn run_host<R: Read, W: Write>(
     job: InitJob,
     panel_pixels: Vec<Vec<f32>>,
     shm: ShmSegment,
     layout: SlotLayout,
-    mut host_in: PipeReader,
-    host_out: PipeWriter,
+    mut host_in: R,
+    host_out: W,
     result: Arc<Mutex<(ResultGeom, Vec<f32>)>>,
 ) {
     let host_out = Mutex::new(host_out);

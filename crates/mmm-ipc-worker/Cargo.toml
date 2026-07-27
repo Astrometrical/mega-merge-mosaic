@@ -9,3 +9,10 @@ repository.workspace = true
 [dependencies]
 mmm-core.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Same crate/path as the plain dependency above, plus `testkit` to reach
+# `mmm_core::ipc::testhost` — the reference host-serving loop — from this
+# crate's `tests/end_to_end.rs`, a separate crate that can't see mmm-core's
+# own `#[cfg(test)]` items.
+mmm-core = { path = "../mmm-core", features = ["testkit"] }
