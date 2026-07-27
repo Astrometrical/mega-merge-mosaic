@@ -157,7 +157,36 @@ pub enum JobMode {
     Files {
         /// One path per panel, in `panels` order.
         paths: Vec<String>,
+        /// The `Auto/Aligned/Solved` override (default `Auto`).
+        #[serde(default)]
+        input_select: InputSelectWire,
     },
+}
+
+/// Wire form of [`crate::analyze::InputSelect`] — the UI's `Auto/Aligned/Solved`
+/// override, threaded to the worker only for [`JobMode::Files`] (views modes are
+/// resolved host-side into `Aligned`/`Solved` directly). Serializes as a bare
+/// JSON string via serde's externally-tagged unit-variant encoding.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum InputSelectWire {
+    /// Detect aligned-vs-solved from the files (the default).
+    #[default]
+    Auto,
+    /// Force the aligned full-canvas path.
+    Aligned,
+    /// Force the solved (reproject) path.
+    Solved,
+}
+
+impl InputSelectWire {
+    /// Map to the `mmm-core` selector the file analyze path consumes.
+    pub fn to_input_select(self) -> crate::analyze::InputSelect {
+        match self {
+            InputSelectWire::Auto => crate::analyze::InputSelect::Auto,
+            InputSelectWire::Aligned => crate::analyze::InputSelect::Aligned,
+            InputSelectWire::Solved => crate::analyze::InputSelect::Solved,
+        }
+    }
 }
 
 /// Geometry and (for [`JobMode::Solved`]) plate-solution metadata of one
@@ -639,5 +668,32 @@ mod tests {
         let mut buf = Vec::new();
         let err = write_frame(&mut buf, &HostMsg::Init(job)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn files_mode_carries_input_select_and_round_trips() {
+        use super::*;
+        let m = JobMode::Files {
+            paths: vec!["a.xisf".into(), "b.xisf".into()],
+            input_select: InputSelectWire::Solved,
+        };
+        let js = serde_json::to_string(&m).unwrap();
+        // externally-tagged: the enum value round-trips exactly.
+        let back: JobMode = serde_json::from_str(&js).unwrap();
+        assert_eq!(m, back);
+        // InputSelectWire serializes as a bare string (unit variant).
+        assert_eq!(
+            serde_json::to_string(&InputSelectWire::Auto).unwrap(),
+            "\"Auto\""
+        );
+    }
+
+    #[test]
+    fn input_select_wire_maps_to_core() {
+        use super::InputSelectWire as W;
+        use crate::analyze::InputSelect as I;
+        assert_eq!(W::Auto.to_input_select(), I::Auto);
+        assert_eq!(W::Aligned.to_input_select(), I::Aligned);
+        assert_eq!(W::Solved.to_input_select(), I::Solved);
     }
 }

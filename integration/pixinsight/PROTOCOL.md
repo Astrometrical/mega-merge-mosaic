@@ -215,7 +215,7 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 
 ```jsonc
 {"Init": {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "shm_name": "/mmm-<unique>",
   "slot_bytes": 1048576,
   "input_slots": 8,
@@ -245,20 +245,24 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 }}
 ```
 
+`InitJob.protocol_version` must equal `2` (this document's version); a host
+built against a stale `1`-era copy of this file will be rejected outright by
+the worker rather than risk misinterpreting a frame under the wrong layout.
+
 Field-by-field (all field names are exactly as they appear in JSON — no
 `camelCase` conversion, these are serde's default snake_case-as-written
 names):
 
 | field | type | notes |
 |---|---|---|
-| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `1`, `crates/mmm-core/src/ipc/mod.rs`); the worker aborts on mismatch |
+| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `2`, `crates/mmm-core/src/ipc/mod.rs`); the worker aborts on mismatch |
 | `shm_name` | string | name of the shm segment the host already created |
 | `slot_bytes` | u64 | size in bytes of **one** slot — size for the largest band ever transferred (input or output) |
 | `input_slots` | u32 | number of input slots in the segment |
 | `output_slots` | u32 | number of output slots in the segment |
 | `canvas` | `[u64; 3]` (JSON array, 3 elements) | `[width, height, channels]` |
 | `panels` | array of `PanelDesc` | see below, in panel-id order |
-| `mode` | `JobMode` | `"Aligned"`, `"Solved"`, or `{"Files": {"paths": [...]}}` — see §11 |
+| `mode` | `JobMode` | `"Aligned"`, `"Solved"`, or `{"Files": {"paths": [...], "input_select": "Auto"}}` — see §11 |
 | `session_dir` | string | filesystem directory the worker reads/writes cached analyze artifacts to (must be a real path the worker process can access, even in an otherwise in-memory run) |
 | `params` | `BlendParamsWire` | see below |
 
@@ -495,10 +499,10 @@ its own writes to the worker's stdin.
 
 - **Version check.** `Init.protocol_version` must equal the worker's
   compiled-in `IPC_PROTOCOL_VERSION` (`crates/mmm-core/src/ipc/mod.rs`,
-  currently `1`). A mismatch is fatal: the worker refuses the job outright
+  currently `2`). A mismatch is fatal: the worker refuses the job outright
   rather than risk misinterpreting later frames under an incompatible
   layout. Bump this constant (and this document) on any wire-incompatible
-  change.
+  change. (`2` added `JobMode::Files`'s `input_select` field — see §11.)
 - **Cancel.** The host may send `Cancel` (tag 131) at any point after
   `Init`. This is **fail-fast**: every pending band/output request and any
   new one immediately errors out (`"cancelled"`), so an in-flight
@@ -557,14 +561,19 @@ its own writes to the worker's stdin.
   size output slots for its worst-case supported frame) to avoid
   undersizing `slot_bytes`; see §7's "Solved-mode sizing hazard" for the
   consequence of getting this wrong.
-- **`{"Files": {"paths": [...]}}`** — panels are read by the worker directly
-  from these filesystem paths (one per panel, in `panels` order), bypassing
-  the band-pull handshake entirely for input. This is the trivial
-  file-backed case (equivalent to the plain CLI path) and exists so a host
-  can hand off a job without holding pixels in shm at all when the panels
-  already live on disk. **Output still streams back over shm** via the
-  output-push handshake (§8.3) regardless of input mode — only the input
-  side differs.
+- **`{"Files": {"paths": [...], "input_select": "Auto"}}`** — panels are read
+  by the worker directly from these filesystem paths (one per panel, in
+  `panels` order), bypassing the band-pull handshake entirely for input.
+  This is the trivial file-backed case (equivalent to the plain CLI path)
+  and exists so a host can hand off a job without holding pixels in shm at
+  all when the panels already live on disk. `input_select` is one of
+  `"Auto"` (the default — detects aligned-vs-solved from the files
+  themselves, and is assumed if the field is omitted entirely, e.g. by a
+  `1`-era host), `"Aligned"`, or `"Solved"`; it forces the worker's file
+  analyze path (`mmm_core::analyze::InputSelect`, via
+  `InputSelectWire::to_input_select`) instead of relying on auto-detection.
+  **Output still streams back over shm** via the output-push handshake
+  (§8.3) regardless of input mode — only the input side differs.
 
 ## 12. Keeping this document accurate
 

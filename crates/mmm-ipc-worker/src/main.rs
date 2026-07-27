@@ -5,7 +5,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use mmm_core::analyze::{InputSelect, analyze_input, analyze_ipc_aligned, analyze_ipc_solved};
+use mmm_core::analyze::{analyze_input, analyze_ipc_aligned, analyze_ipc_solved};
 use mmm_core::blend::blend_with_source;
 use mmm_core::ipc::IPC_PROTOCOL_VERSION;
 use mmm_core::ipc::client::HostLink;
@@ -72,9 +72,17 @@ fn run() -> mmm_core::Result<()> {
             JobMode::Solved => {
                 analyze_ipc_solved(link.clone(), &session_dir, band_rows, surface_order)?
             }
-            JobMode::Files { paths } => {
+            JobMode::Files {
+                paths,
+                input_select,
+            } => {
                 let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-                analyze_input(&paths, &session_dir, surface_order, InputSelect::Auto)?
+                analyze_input(
+                    &paths,
+                    &session_dir,
+                    surface_order,
+                    input_select.to_input_select(),
+                )?
             }
         };
 
