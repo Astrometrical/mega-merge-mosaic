@@ -71,6 +71,7 @@
 use rayon::prelude::*;
 
 use crate::flatten::Flatten;
+use crate::ipc::source::{FileSource, PanelSource};
 use crate::overlap::{OverlapGraph, distance_map};
 use crate::panel_reader::PanelReader;
 use crate::photometry::Photometry;
@@ -290,14 +291,15 @@ pub(crate) fn load_summaries(session: &Session) -> Result<Vec<L8Summary>> {
         .collect()
 }
 
-/// Open every panel's pixel data for streaming reads ([`PanelReader`]
-/// validates each panel's storage against the session canvas).
-fn open_readers(session: &Session) -> Result<Vec<PanelReader>> {
+/// Open every panel's pixel data for streaming reads via `source` ([`PanelReader`]
+/// validates each panel's storage against the session canvas). `advise_sequential`
+/// applies to every source uniformly (a no-op for IPC-backed readers).
+fn open_readers(session: &Session, source: &dyn PanelSource) -> Result<Vec<PanelReader>> {
     session
         .panels
         .par_iter()
         .map(|p| {
-            let r = PanelReader::open(p, session.canvas)?;
+            let r = source.open_reader(p, session.canvas)?;
             r.advise_sequential();
             Ok(r)
         })
@@ -617,12 +619,31 @@ fn weight(d_px: f32, inv_feather: f32) -> f32 {
 
 /// Blend the session's panels into `sink`, applying the photometric
 /// corrections and (when given) the residual surfaces: `v' = g·v + o + s(x,y)`.
+/// Panel pixels are read from disk via [`FileSource`] — see
+/// [`blend_with_source`] to inject a different [`PanelSource`] (e.g. an IPC
+/// host).
 pub fn blend(
     session: &Session,
     phot: &Photometry,
     surfaces: Option<&Surfaces>,
     graph: &OverlapGraph,
     params: &BlendParams,
+    sink: &mut dyn RowSink,
+) -> Result<()> {
+    blend_with_source(session, phot, surfaces, graph, params, &FileSource, sink)
+}
+
+/// [`blend`] with an injectable [`PanelSource`] for panel pixels — files
+/// (the default, via [`FileSource`]) or the IPC host (via
+/// [`crate::ipc::source::IpcSource`]). The blend algorithm itself never
+/// learns which.
+pub fn blend_with_source(
+    session: &Session,
+    phot: &Photometry,
+    surfaces: Option<&Surfaces>,
+    graph: &OverlapGraph,
+    params: &BlendParams,
+    source: &dyn PanelSource,
     sink: &mut dyn RowSink,
 ) -> Result<()> {
     if session.panels.is_empty() {
@@ -635,9 +656,9 @@ pub fn blend(
         ));
     }
     match (params.downsample, params.mode) {
-        (1, BlendMode::Feather) => blend_full(session, phot, surfaces, params, sink),
+        (1, BlendMode::Feather) => blend_full(session, phot, surfaces, params, source, sink),
         (1, BlendMode::TwoBand | BlendMode::Pyramid) => {
-            blend_twoband(session, phot, surfaces, graph, params, sink)
+            blend_twoband(session, phot, surfaces, graph, params, source, sink)
         }
         // At 1/8 the base band is the whole signal: previews feather-blend
         // the L8 means in all modes.
@@ -694,12 +715,13 @@ fn blend_full(
     phot: &Photometry,
     surfaces: Option<&Surfaces>,
     params: &BlendParams,
+    source: &dyn PanelSource,
     sink: &mut dyn RowSink,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
     let nch = session.canvas.2 as usize;
     let preps = prep_panels(session, phot, surfaces, params.flatten)?;
-    let panels = open_readers(session)?;
+    let panels = open_readers(session, source)?;
 
     let bbox = output_bbox(session, params)?;
     let (cx0, cy0) = (bbox[0], bbox[1]);
@@ -989,9 +1011,10 @@ fn blend_twoband(
     surfaces: Option<&Surfaces>,
     graph: &OverlapGraph,
     params: &BlendParams,
+    source: &dyn PanelSource,
     sink: &mut dyn RowSink,
 ) -> Result<()> {
-    blend_twoband_impl(session, phot, surfaces, graph, params, sink, true)
+    blend_twoband_impl(session, phot, surfaces, graph, params, source, sink, true)
 }
 
 /// [`blend_twoband`] with the connected star masks optionally disabled
@@ -1004,6 +1027,7 @@ fn blend_twoband_impl(
     surfaces: Option<&Surfaces>,
     graph: &OverlapGraph,
     params: &BlendParams,
+    source: &dyn PanelSource,
     sink: &mut dyn RowSink,
     use_star_mask: bool,
 ) -> Result<()> {
@@ -1051,7 +1075,7 @@ fn blend_twoband_impl(
     // fallback). Everything else below is byte-for-byte the TwoBand path.
     let pyr_base = (params.mode == BlendMode::Pyramid)
         .then(|| pyramid_base_planes(&preps, &owner, nch, params.feather_px));
-    let panels = open_readers(session)?;
+    let panels = open_readers(session, source)?;
 
     let bbox = output_bbox(session, params)?;
     let (cx0, cy0) = (bbox[0], bbox[1]);

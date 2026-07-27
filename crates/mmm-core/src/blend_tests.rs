@@ -170,6 +170,55 @@ fn feather_blend_two_overlapping_panels() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Injecting the default [`crate::ipc::source::FileSource`] through
+/// `blend_with_source` must be byte-for-byte identical to the plain
+/// `blend` entry point — proves the `PanelSource` indirection changes
+/// nothing about the file-backed path. Exercises the two-band
+/// (`blend_twoband_impl`) `open_readers` choke-point, the default mode.
+#[test]
+fn blend_with_file_source_matches_plain_blend() {
+    let dir = tmpdir("filesrc");
+    let (session, graph) = make_panels(&dir);
+    let phot = identity_phot(2, 1);
+    let params = BlendParams {
+        feather_px: 16.0,
+        downsample: 1,
+        band_rows: 16,
+        mode: BlendMode::Pyramid,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+    };
+
+    let mut a = MemSink::new();
+    blend(&session, &phot, None, &graph, &params, &mut a).unwrap();
+
+    let mut b = MemSink::new();
+    blend_with_source(
+        &session,
+        &phot,
+        None,
+        &graph,
+        &params,
+        &crate::ipc::source::FileSource,
+        &mut b,
+    )
+    .unwrap();
+
+    assert_eq!(
+        (a.w, a.h, a.ch),
+        (b.w, b.h, b.ch),
+        "geometry must match between blend and blend_with_source"
+    );
+    assert_eq!(a.finished, b.finished);
+    assert_eq!(
+        a.data, b.data,
+        "injecting the default FileSource must not change output"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn roi_matches_full_blend_subregion() {
     let dir = tmpdir("roi");
@@ -410,7 +459,17 @@ fn twoband_spike_arms_match_one_panel() {
             ..params.clone()
         };
         let mut sink = MemSink::new();
-        blend_twoband_impl(&session, &phot, None, &graph, &params, &mut sink, use_mask).unwrap();
+        blend_twoband_impl(
+            &session,
+            &phot,
+            None,
+            &graph,
+            &params,
+            &crate::ipc::source::FileSource,
+            &mut sink,
+            use_mask,
+        )
+        .unwrap();
         sink
     };
     let with_mask = run(true, BlendMode::TwoBand);
