@@ -32,6 +32,25 @@ struct ThreadBand {
 /// A [`crate::panel_reader::PanelReader`] backing that serves rows of one
 /// panel by pulling bands over a [`HostLink`], one band-sized fetch per
 /// calling thread's working set.
+///
+/// # Concurrent-use invariant
+///
+/// `IpcBacking` is `Sync`, but only sound to call `row` on concurrently
+/// under a specific precondition: every calling thread must have a distinct
+/// [`rayon::current_thread_index`] value, with **at most one** concurrent
+/// caller for which that value is `None` (poolless callers share a single
+/// fallback cell). Concretely, that means:
+///
+/// - Any number of distinct worker threads of **one** rayon pool may call
+///   `row` concurrently (this is what `blend` does on the global pool).
+/// - At most one thread outside any rayon pool may call `row` at a time
+///   relative to any other caller (this is what the sequential `analyze`
+///   scan does).
+/// - Sharing one `IpcBacking` across two plain `std::thread::spawn` threads,
+///   or across workers from two *different* rayon pools/scopes, is **not**
+///   permitted — both cases can alias `current_thread_index() == None` (or
+///   an index reused across pools) onto the same cell, which is a data
+///   race. See the `unsafe impl Sync` below for the full argument.
 pub struct IpcBacking {
     link: Arc<HostLink>,
     panel_id: u32,
@@ -54,18 +73,35 @@ pub struct IpcBacking {
     error: Mutex<Option<String>>,
 }
 
-// SAFETY: `IpcBacking` is shared across rayon worker threads behind a
-// `PanelReader` that must itself be `Sync` (blend fans out row reads across
-// its thread pool). The only interior mutability is `cells`, a
-// `Vec<UnsafeCell<ThreadBand>>`; `row` indexes it with
-// `rayon::current_thread_index().unwrap_or(num_threads)`, which is a
-// distinct value for every live rayon worker thread within one pool (plus
-// exactly one extra reserved index for callers outside any pool). So two
-// threads calling `row` concurrently always dereference *different* cells —
-// the `&mut ThreadBand` each thread takes via `unsafe { &mut *cells[idx].get() }`
-// never aliases another thread's `&mut`, which is what `Sync` needs to be
-// sound here (no data race, even though the type is not internally
-// lock-protected).
+// SAFETY: this `unsafe impl` is sound ONLY under the precondition stated in
+// the type-level "Concurrent-use invariant" doc above — it is not
+// unconditionally sound for arbitrary concurrent callers, and callers that
+// violate it are themselves responsible for the resulting unsoundness (this
+// is the standard division of responsibility for an `unsafe impl Sync`: the
+// impl guarantees soundness *given* its stated precondition, not for every
+// possible use).
+//
+// The only interior mutability is `cells`, a `Vec<UnsafeCell<ThreadBand>>`;
+// `row` indexes it with `rayon::current_thread_index().unwrap_or(num_threads)`.
+// Given the precondition — every concurrent caller has a distinct
+// `current_thread_index()`, with at most one caller reporting `None` — two
+// concurrent `row` calls always compute *different* `idx` values, so the
+// `unsafe { &mut *cells[idx].get() }` each takes never aliases another
+// call's `&mut`. That disjointness is what `Sync` needs to be sound here (no
+// data race, even though the type has no lock).
+//
+// The precondition is upheld by every caller in this codebase today: the
+// `analyze` scan drives `row` sequentially (one caller, trivially
+// non-concurrent with itself), and `blend` fans `row` out across the global
+// rayon thread pool, where every worker has a distinct
+// `current_thread_index()` for the lifetime of the pool. It would be
+// violated by, e.g., sharing one `IpcBacking` across two plain
+// `std::thread::spawn` threads (both see `current_thread_index() == None`
+// and race on the fallback cell) or across two different rayon
+// pools/scopes — such callers must not be introduced without revisiting
+// this invariant (see the type doc; a future GUI or multi-pool consumer
+// must either serialize its poolless callers or give each pool/thread its
+// own `IpcBacking`).
 //
 // The `&[f32]` `row` returns borrows `&self` (not the `&mut ThreadBand`), so
 // by the time it's handed back to the caller the exclusive borrow is gone;
@@ -123,6 +159,16 @@ impl IpcBacking {
         }
         let num_threads = self.cells.len() - 1;
         let idx = rayon::current_thread_index().unwrap_or(num_threads);
+        // `cells` is sized from `current_num_threads()` at construction
+        // time; a call from a larger rayon pool than that (not currently
+        // reachable — see the type-level "Concurrent-use invariant" doc)
+        // would index out of range. The `Vec` index below is bounds-checked
+        // either way (not UB), but assert loudly in debug builds rather
+        // than let it surface as a bare index-out-of-bounds panic.
+        debug_assert!(
+            idx < self.cells.len(),
+            "IpcBacking::row called from a larger rayon pool than the one it was constructed in"
+        );
         // SAFETY: see the `unsafe impl Sync` justification above — `idx` is
         // unique to this thread (within the pool, plus the poolless
         // fallback), so this is the only live reference to `cells[idx]`.
