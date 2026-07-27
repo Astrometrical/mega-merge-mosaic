@@ -790,3 +790,93 @@ fn solved_mode_reprojection_matches_file() {
         std::fs::remove_dir_all(&dir).unwrap();
     });
 }
+
+#[test]
+fn probe_frame_prints_choose_frame_geometry() {
+    use std::io::Write;
+    let dir = tmpdir("probe");
+    let (paths, _planars) = write_two_solved_panels(&dir);
+
+    // Build the expected frame the same way analyze_ipc_solved will.
+    let headers: Vec<(u64, u64, u64, Vec<mmm_core::formats::XisfProperty>)> = paths
+        .iter()
+        .map(|p| {
+            let xp = XisfPanel::open(p).unwrap();
+            (
+                xp.width(),
+                xp.height(),
+                xp.channels(),
+                xp.header().properties.clone(),
+            )
+        })
+        .collect();
+    let models: Vec<WcsModel> = headers
+        .iter()
+        .map(|(w, h, _, props)| WcsModel::from_properties(props, *w, *h).unwrap())
+        .collect();
+    let frame = choose_frame(&models);
+    let ch = headers[0].2;
+
+    // Build the probe Init JSON (panels with properties; mode Solved).
+    let panels: Vec<PanelDesc> = headers
+        .iter()
+        .enumerate()
+        .map(|(id, (w, h, c, props))| PanelDesc {
+            panel_id: id as u32,
+            width: *w,
+            height: *h,
+            channels: *c,
+            properties: props.clone(),
+        })
+        .collect();
+    let job = InitJob {
+        protocol_version: IPC_PROTOCOL_VERSION,
+        shm_name: String::new(),
+        slot_bytes: 0,
+        input_slots: 0,
+        output_slots: 0,
+        canvas: [0, 0, ch],
+        panels,
+        mode: JobMode::Solved,
+        session_dir: String::new(),
+        params: BlendParamsWire {
+            feather_px: 0.0,
+            downsample: 1,
+            band_rows: 8,
+            mode: "pyramid".into(),
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+            surface_order: Some(2),
+        },
+    };
+    let json = serde_json::to_string(&job).unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_mmm-ipc-worker");
+    let mut child = std::process::Command::new(exe)
+        .arg("--probe-frame")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "probe exited nonzero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text.trim(),
+        format!("{} {} {}", frame.width, frame.height, ch)
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

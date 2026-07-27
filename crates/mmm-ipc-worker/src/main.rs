@@ -17,10 +17,44 @@ use mmm_core::photometry::Photometry;
 use mmm_core::surfaces::Surfaces;
 
 fn main() {
-    if let Err(e) = run() {
+    let probe = std::env::args().any(|a| a == "--probe-frame");
+    let result = if probe { probe_frame() } else { run() };
+    if let Err(e) = result {
         let _ = writeln!(std::io::stderr(), "mmm-ipc-worker: {e}");
         std::process::exit(1);
     }
+}
+
+/// `--probe-frame`: read an `InitJob`-shaped JSON object on stdin, build the
+/// WCS models from each panel's `properties`, run `choose_frame`, and print
+/// `"{w} {h} {ch}"`. Lets a host size the shm output slots for solved mode
+/// without duplicating the frame math (see PROTOCOL.md §11 / spec §15).
+fn probe_frame() -> mmm_core::Result<()> {
+    use mmm_core::align::choose_frame;
+    use mmm_core::astrometry::WcsModel;
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .map_err(|e| mmm_core::Error::compute(format!("reading probe JSON from stdin: {e}")))?;
+    let job: mmm_core::ipc::protocol::InitJob = serde_json::from_str(&buf)
+        .map_err(|e| mmm_core::Error::compute(format!("parsing probe InitJob JSON: {e}")))?;
+    if job.panels.is_empty() {
+        return Err(mmm_core::Error::compute("probe-frame: no panels"));
+    }
+    let mut models = Vec::with_capacity(job.panels.len());
+    for p in &job.panels {
+        let m = WcsModel::from_properties(&p.properties, p.width, p.height).ok_or_else(|| {
+            mmm_core::Error::compute(format!(
+                "probe-frame: panel {} lacks a usable solution",
+                p.panel_id
+            ))
+        })?;
+        models.push(m);
+    }
+    let frame = choose_frame(&models);
+    let ch = job.panels[0].channels;
+    writeln!(std::io::stdout(), "{} {} {}", frame.width, frame.height, ch)
+        .map_err(|e| mmm_core::Error::compute(format!("probe-frame: writing stdout: {e}")))?;
+    Ok(())
 }
 
 /// Reads the one `HostMsg::Init` frame off stdin, drives analyze then blend
