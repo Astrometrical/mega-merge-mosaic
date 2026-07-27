@@ -19,3 +19,16 @@ foreach(t test_shm test_protocol)
   target_link_libraries(${t} PRIVATE mmm_host)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# Golden aligned byte-identity test (Task 7): drives the real worker two ways
+# (Files-mode reference vs Aligned-mode shm serve) and asserts byte-identity.
+# `gen_fixtures` writes the deterministic 2-panel scene the test consumes.
+add_custom_target(gen_fixtures
+  COMMAND cargo run --quiet --manifest-path ${MMM_CARGO_MANIFEST} -p mmm-ipc-worker --example gen_fixtures -- ${CMAKE_BINARY_DIR}/fixtures
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/fixtures/meta.json
+  COMMENT "Generating aligned golden fixtures")
+
+add_executable(test_golden_aligned test/test_golden_aligned.cpp)
+target_link_libraries(test_golden_aligned PRIVATE mmm_host)
+add_dependencies(test_golden_aligned gen_fixtures)
+add_test(NAME test_golden_aligned COMMAND test_golden_aligned ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
