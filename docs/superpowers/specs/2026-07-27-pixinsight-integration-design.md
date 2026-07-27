@@ -1,7 +1,11 @@
 # PixInsight Integration — Design
 
-Status: **approved design, pre-implementation** (2026-07-27)
-Scope owner: mmm-core + a new `mmm-ipc-worker` crate + a C++ PCL module.
+Status: **Plan 1 complete** (Rust IPC transport + `mmm-ipc-worker`, committed on
+branch `pixinsight-integration`). **Plan 2 design approved** (2026-07-27): the
+C++ PCL module + packaging, detailed in §14–§18 below. §10 (UI) and §12
+(packaging) are updated from "TO VERIFY" to concrete decisions.
+Scope owner: mmm-core + the `mmm-ipc-worker` crate + a C++ PCL module under
+`integration/pixinsight/`.
 
 ## 1. Goal
 
@@ -207,20 +211,58 @@ The boundary exists for this, so it is a first-class requirement:
 - **Protocol/version mismatch** → the init handshake exchanges a protocol
   version; a mismatch is refused with a clear message rather than misbehaving.
 
-## 10. UI model (PixInsight side)
+## 10. UI model (PixInsight side) — concrete
 
-- A blend consumes **many** source views, so the Process runs in the **global
-  context** (no single target view; its parameters carry the *list* of input
-  view ids), like ImageIntegration or StarAlignment's multi-view mode — not a
-  per-view process.
-- The **ProcessInterface** (C++ UI) offers: a multi-view selector (or a
-  files-list toggle), a session-dir picker, a mode control
-  (aligned / solved / files), the blend parameters that map to the CLI
-  (`--mode`, `--feather`, `--flatten`, `--roi`, downsample preview, …), and a
-  progress + cancel area fed by worker progress messages.
-- Because it is a Process (not a script) the UI is **non-modal**: the user can
-  make a mid-run adjustment (rename a view, apply a mask, run SCNR) without
-  tearing down and restarting the tool.
+A blend consumes **many** source views, so the Process runs in the **global
+context** (no single target view; its parameters carry the *list* of input view
+ids), like ImageIntegration or StarAlignment's multi-view mode — not a per-view
+process. Because it is a Process (not a script) the UI is **non-modal**: the
+user can make a mid-run adjustment (rename a view, apply a mask, run SCNR)
+without tearing down and restarting the tool. Registered processes are
+PJSR-scriptable for free, so power users keep batch-scripting without us
+shipping any JS. The full `ProcessInterface` UI is built in this pass (not a
+minimal stub).
+
+**`mmmProcess` parameters** (the scriptable/serializable state, all mapping to
+the CLI/`InitJob`):
+
+| parameter | maps to | notes |
+|---|---|---|
+| `inputViews` | `panels` | ordered list of view ids (aligned/solved modes) |
+| `filePaths` | `JobMode::Files.paths` | ordered path list (files mode) |
+| `mode` | `InitJob.mode` | `aligned` / `solved` / `files` |
+| `sessionDir` | `InitJob.session_dir` | user-owned session directory |
+| `feather` | `params.feather_px` | f32, canvas px |
+| `blendMode` | `params.mode` | `feather` / `twoband` / `pyramid` |
+| `flatten` | `params.flatten` | opt-in polynomial order, or off |
+| `roi` | `params.roi` | optional `[x0,y0,x1,y1]`, or off |
+| `downsample` | `params.downsample` | `1` full-res, `8` L8 preview |
+| `defectVeto` | `params.defect_veto` | bool |
+| `surfaceOrder` | `params.surface_order` | analyze surface-fit order |
+| `bandRows` | `params.band_rows` | band granularity (sane default, advanced) |
+
+**`mmmInterface` controls**: a multi-view selector with a files-list toggle, a
+session-dir picker, a mode combo (aligned/solved/files), the blend-parameter
+controls above, and a progress bar + cancel button fed by the worker's
+`Progress` frames (§15). Enable/disable logic follows the mode (files list vs
+view selector).
+
+**Execution flow** (on Apply / global execute):
+
+1. Resolve the selection into ordered `PanelDesc`s. In **solved** mode, extract
+   each view's astrometric solution from its `ImageWindow` via
+   `AstrometricMetadata` and carry it verbatim as `PanelDesc.properties` — a C++
+   read of the in-memory solution, **not** a file re-parse.
+2. In **solved** mode, run the worker's `--probe-frame` (§15) once to obtain the
+   output frame `w×h×ch` and size `slot_bytes` from it (§7 hazard resolved by
+   making the worker the single source of truth). In **aligned**/**files** mode
+   the canvas width is known from the panels, so slots are sized directly.
+3. Create the shm segment, spawn + supervise the worker, and drive the blend via
+   the pure host library (§14), pumping `Progress` into the progress bar and
+   offering cancel.
+4. Assemble the streamed output bands into **one new `ImageWindow`** (allocated
+   once — §7, no doubling) and show it. Any host/worker error → a clean PI
+   message box, **no partial window**, the user's source views intact (§9).
 
 ## 11. Testing
 
@@ -234,29 +276,36 @@ The boundary exists for this, so it is a first-class requirement:
 - **The C++ PCL module** requires PixInsight → manual smoke test, like the
   existing real-data runs.
 
-## 12. Packaging & distribution — TO VERIFY
+## 12. Packaging & distribution — concrete (Linux/WSL first)
 
-Deferred and to be worked out during implementation; none of it is
-insurmountable. Working understanding (specifics to confirm against current
-PixInsight docs, as they may have drifted):
+Verified against the local install (`/opt/PixInsight`, core dated 2026-06-21,
+PCL headers + full PCL source present, Qt 6.8.7 bundled). Decisions:
 
-- A **Module** is the deployment container (`mmm-pxm.{dll,so,dylib}`), loaded by
-  the PixInsight core, which registers the **Process** and **ProcessInterface**
-  it contains.
+- A **Module** is the deployment container — on Linux the file is
+  **`mmm-pxm.so`** (the `-pxm.so` suffix is the PixInsight module convention,
+  matching the bundled `*-pxm.so` files). The core loads it and registers the
+  **Process** + **ProcessInterface** it contains via `InstallPixInsightModule`.
 - The **`mmm-ipc-worker` binary ships beside the module** in one folder; the
-  module resolves the worker's absolute path from its own on-disk location and
-  spawns it. No separate install or `PATH` setup for the worker.
-- **Dev distribution:** manual Install Modules (unsigned local modules are
-  loadable for development).
-- **Long-term distribution:** a **PixInsight update repository** (user adds a URL
-  once; auto-install + auto-update). Costs: a **code-signing certificate from
-  the PixInsight team**, and a **per-platform signed package matrix**
-  (Win/Linux/macOS).
-- **Gotchas from shipping a spawned helper binary:** macOS **notarization** of
-  `mmm-ipc-worker` (else Gatekeeper blocks the `exec`); Windows SmartScreen/AV
-  (Authenticode signing mitigates); the PCL module must be built against a
-  matching PixInsight PCL/SDK version and re-validated on PI ABI updates (the
-  worker is ABI-independent — it only talks the wire protocol).
+  module resolves its own on-disk path (`dladdr`) and spawns the sibling worker
+  — no separate install or `PATH` setup. The pure host library takes the worker
+  path as a parameter so the standalone test can point at the debug build.
+- **Now — dev distribution (implemented this pass):** build `mmm-pxm.so`, place
+  `mmm-ipc-worker` next to it, and load via PixInsight's manual **Install
+  Modules** (unsigned local modules load fine for development). One-time
+  prerequisite: build **`libPCL-pxi.a`** from the bundled source
+  (`/opt/PixInsight/src/pcl/linux/g++`, `make`), output directed to a
+  **project-local** lib dir so no writes to the root-owned install and no sudo.
+  Documented in `integration/pixinsight/README.md`.
+- **Later — repository distribution (planned, not implemented):** a PixInsight
+  **update repository** (user adds a URL once; auto-install + auto-update). Costs:
+  a **code-signing certificate from the PixInsight team** and a **per-platform
+  signed package matrix** (Win/Linux/macOS). Cross-platform work this defers:
+  Windows/macOS **shm ports** (`CreateFileMapping`/`MapViewOfFile`; the Rust
+  `shm.rs` already stubs non-Unix), macOS **notarization** of `mmm-ipc-worker`
+  (else Gatekeeper blocks the `exec`), and Windows Authenticode/SmartScreen.
+- The PCL module must be built against a matching PixInsight PCL/SDK version and
+  re-validated on PI ABI updates; the worker is ABI-independent (it only talks
+  the wire protocol), so a PI update never requires rebuilding the worker.
 
 ## 13. Explicitly out of scope
 
@@ -268,3 +317,148 @@ PixInsight docs, as they may have drifted):
   possible later optimisation, not v1.
 - Freeing/consuming the user's source views to save memory — unnecessary given
   the pull-based transport.
+
+---
+
+# Plan 2 — C++ host + PCL module (implementation design)
+
+Plan 1 delivered the Rust IPC transport and `mmm-ipc-worker` (byte-identical to
+the file-based blend, with cancel + crash-isolation e2e tests). Plan 2 builds the
+**production host**: the PixInsight-side C++ that drives that worker. The wire
+contract is fixed by `integration/pixinsight/PROTOCOL.md` and must be verified
+against the Rust code (`ipc/protocol.rs`, `shm.rs`, `client.rs`, `testhost.rs`)
+during implementation.
+
+## 14. Host/module split (the testability boundary)
+
+The C++ is split so the protocol implementation is testable **without**
+PixInsight, isolating the PixInsight-only parts to a manual smoke test.
+
+```
+integration/pixinsight/
+  PROTOCOL.md                 # the wire contract (exists)
+  README.md                   # build + one-time libPCL-pxi.a setup + dev install
+  host/                       # PURE transport layer — NO PCL dependency
+    mmm_shm.{h,cpp}           #   shm_open/ftruncate/mmap; SlotLayout math (mirrors shm.rs §7)
+    mmm_protocol.{h,cpp}      #   frame codec, tag table, binary band layouts, Init JSON writer
+    mmm_host.{h,cpp}          #   spawn+supervise worker, service loop, band serving, output collect
+  module/                     # THIN PCL wrapper — depends on host/ + PCL
+    mmmModule.cpp             #   MetaModule entry (InstallPixInsightModule)
+    mmmProcess.{h,cpp}        #   global-context MetaProcess + parameters (§10)
+    mmmInterface.{h,cpp}      #   ProcessInterface UI (§10)
+    Makefile, makefile-x64    #   PI MakefileGenerator-style; links libPCL-pxi.a + host/ objs
+  test/
+    host_golden_test.cpp      #   standalone; mirrors end_to_end.rs; NO PixInsight
+    CMakeLists.txt            #   builds host/ + this test via CMake
+```
+
+**Invariant: `host/` includes no PCL header.** It compiles and links against
+nothing but the C++ stdlib + POSIX, so `test/` exercises the whole protocol
+against the real `mmm-ipc-worker` with g++/CMake alone. `module/` is the only
+PCL-linked code and stays thin — it adapts PixInsight objects to the `host/`
+library's interfaces and back.
+
+### 14.1 `host/` — the pure transport library
+
+Mirrors `testhost.rs`'s `run_host` serving loop, as a reusable library:
+
+- **`mmm_shm`** — creates the named POSIX segment (`shm_open`+`ftruncate`+`mmap`),
+  carved into `input_slots` then `output_slots` fixed `slot_bytes` slots with the
+  exact `input_offset`/`output_offset` math of PROTOCOL §7. Name is
+  **deterministic** (`/mmm-<pid>-<counter>`, no RNG). The creator unlinks on
+  teardown and defensively at the start of a create under the same name (crash
+  cleanup). Enforces the 4-byte-alignment discipline (§7).
+- **`mmm_protocol`** — the frame codec (`tag:u8 | len:u32 LE | payload`), the tag
+  table (worker→host 1–6, host→worker 128–131), the three binary band layouts
+  (`BandRequest` 28 B, `BandReply` 9 B, `OutputBand` 24 B; all LE), and the
+  `Init` JSON writer. The writer enforces the **finite-float precondition**
+  (PROTOCOL §6): reject the write if any reachable float (`feather_px`, panel
+  `properties` F64/F64Vec/F64Mat data) is non-finite, since JSON has no NaN/Inf.
+- **`mmm_host`** — owns spawn/supervision + the service loop:
+  - **Spawn**: `posix_spawn` (or fork+exec) the worker, its stdin/stdout piped,
+    stderr inherited for human diagnostics. Worker path is a **constructor
+    parameter** (module passes the `dladdr`-resolved sibling; test passes
+    `target/debug/mmm-ipc-worker`).
+  - **Service loop**: one reader thread decodes worker→host frames.
+    `BandRequest` → look up `panel_id` geometry, memcpy rows `[y0,y1)` of every
+    channel into the slot in **planar, native-endian** order (§7), then
+    `BandReply{status:0}` (or `status:1` on an out-of-range request).
+    `Begin{w,h,ch}` → allocate the output collector once. `OutputBand` → copy the
+    band out of the slot into the collector at row `y0`, then `OutputAck`.
+    `Progress` → forwarded to a caller callback. `Done`/`Error` → terminate. All
+    host→worker writes are serialized behind one mutex (PROTOCOL §9).
+  - **`PanelSource` interface** — abstracts *where input pixels come from*: the
+    test supplies in-memory buffers; the module supplies `ImageVariant` rows via
+    an adapter. `host/` never knows about PixInsight.
+  - **Output collector** — the module supplies a sink (writes into the new
+    `ImageWindow`); the test supplies a buffer for byte comparison.
+  - **Fault isolation (§9, PROTOCOL §10)**: stdout EOF **without** a prior
+    `Done`/`Error`, or a non-zero worker exit, → a clean `HostError` to the
+    caller, shm unlinked, **no output surfaced**. `cancel()` sends `Cancel` (tag
+    131) and drains. Protocol-version mismatch is refused before the run.
+
+## 15. Rust-side changes (worker + mmm-core)
+
+Two additive changes; file-mode CLI behaviour and existing tests are unchanged;
+`cargo test --workspace` stays green.
+
+1. **`mmm-ipc-worker --probe-frame`.** Reads an `Init`-shaped JSON (panels with
+   solved-mode `properties`, `mode`) on stdin, builds the WCS models, runs
+   `align::choose_frame`, prints the resulting output frame as `w h ch` to
+   stdout, and exits — no shm, no compute. The host calls this once in **solved**
+   mode to size `slot_bytes`, keeping the worker the single source of truth for
+   frame geometry (resolves the §7 solved-mode sizing hazard without duplicating
+   WCS math in C++). Rust-unit-tested against a known solved fixture.
+2. **`Progress` emission.** The `Progress { stage, done, total }` frame already
+   exists in the protocol but no driver sends it. Wire minimal emission points
+   into the IPC analyze scan (`analyze_ipc_aligned`/`analyze_ipc_solved`) and the
+   blend band-sweep (`blend_with_source`'s IPC sink path) so the UI shows real
+   percentages. Emitted only over the `HostLink`; the file CLI path is untouched.
+
+## 16. Build system
+
+- **Module `.so`** — a PixInsight MakefileGenerator-style makefile (the
+  `makefile-x64` format found in `/opt/PixInsight/src/pcl/linux/g++`: g++,
+  `-std=c++20 -fPIC -pthread -D__PCL_LINUX`, AVX2/FMA, `-fvisibility=hidden`,
+  output `mmm-pxm.so`), linking `libPCL-pxi.a` + the compiled `host/` objects.
+  Hand-authored in that format; the README documents regenerating it via PI's
+  MakefileGenerator if the project definition changes.
+- **`host/` + `test/`** — CMake (no PCL): a `mmm_host` static lib target + the
+  `host_golden_test` executable, registered with CTest.
+- **One-time prerequisite** — `make` `libPCL-pxi.a` from the bundled PCL source
+  with `PCLSRCDIR`/`PCLINCDIR`/`PCLLIBDIR64` pointed so the archive lands in a
+  **project-local** dir (no writes to `/opt/PixInsight`, no sudo). README step.
+
+## 17. Testing
+
+- **Standalone C++ golden-identity test** (`test/host_golden_test.cpp`, CTest —
+  the C++ equivalent of `crates/mmm-ipc-worker/tests/end_to_end.rs`, needs **no
+  PixInsight**):
+  - Generate synthetic panels on disk (e.g. via `mmm synth`).
+  - **Aligned**: run the worker in **Files** mode → golden output; run it in
+    **Aligned** mode with the `host/` library serving the same pixels from
+    memory over shm → assert **byte-identical** to the golden.
+  - **Solved**: `--probe-frame` → size slots → serve → assert identical to the
+    file-based solved blend.
+  - **Isolation**: a worker-crash case (assert clean error, no output) and a
+    cancel case (assert prompt stop) — mirroring the Rust e2e tests.
+- **Rust**: unit tests for `--probe-frame` output and `Progress` emission;
+  `cargo test --workspace` stays green throughout.
+- **PCL module**: a manual smoke test inside PixInsight (like the existing
+  real-data runs) is the only PixInsight-requiring verification — load the
+  module, blend a few views in each mode, confirm the new window + a clean error
+  on an induced worker failure.
+
+## 18. Fault-isolation contract (host obligations)
+
+Restating §9 / PROTOCOL §10 as guarantees the `host/` library provides and the
+standalone test asserts:
+
+- Worker crash/panic (stdout EOF with no prior `Done`/`Error`, or non-zero exit)
+  → clean caller error, shm unlinked, **no partial `ImageWindow`**, PixInsight
+  and the user's views intact.
+- Cancel → `Cancel` frame; worker unwinds and exits promptly; treated as an
+  intentional stop, not a crash.
+- Protocol-version mismatch → refused before the run with a clear message.
+- The host, as shm creator, is solely responsible for unlinking the segment once
+  the worker is confirmed gone.
