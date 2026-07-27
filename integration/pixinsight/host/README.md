@@ -77,7 +77,7 @@ time, not just when the worker was built.
 | Test | Proves |
 |---|---|
 | `test_shm` | `SlotLayout` offset arithmetic and `ShmSegment` create/map/read/write round-trip through a real POSIX shm segment. |
-| `test_protocol` | Frame codec correctness: `BandReply`/`BandRequest` wire byte layout, `read_worker_frame` framing (including truncated-frame errors), and the `Init`/`OutputAck`/`Cancel` JSON encodings. |
+| `test_protocol` | Frame codec: `BandReply`'s exact 9-byte wire layout, decoding a `BandRequest` frame over a real pipe, and `encode_init` rejecting a non-finite float (the finite-float precondition). |
 | `test_golden_aligned` | Byte-identity: driving the real worker in `Files` mode (it reads the panels itself) vs. `Aligned` shm mode (our `PanelSource` serves the same pixels over shared memory) produces bit-identical blended output — proving the C++ `Host` serve loop reproduces the Rust reference host (`testhost.rs`) exactly. |
 | `test_golden_solved` | Byte-identity for the solved (unaligned/reprojected) path: `Files(Solved)` mode vs. `Solved` shm mode with `Host::probe_frame` sizing the output slots up front, as a real PixInsight host must. Also guards against output-slot mis-sizing, which would silently corrupt the shm bands. |
 | `test_isolation` | Fault isolation: a worker that exits immediately without ever touching the protocol (`/bin/false` in place of the worker) surfaces as a prompt `HostError`, never a hang; and a mid-run `Host::cancel()` from a second thread stops the run promptly with no partial-output confusion. |
