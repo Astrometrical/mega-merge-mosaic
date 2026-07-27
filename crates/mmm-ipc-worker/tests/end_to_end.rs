@@ -587,6 +587,88 @@ fn worker_crash_is_observable() {
     });
 }
 
+/// Cross-process proof that the worker actually emits `Progress` frames
+/// during a run: unlike `serve_n_band_requests`/`MockHost`, which silently
+/// skip non-`BandRequest` frames, this test hand-serves the whole run so it
+/// can count every `WorkerMsg::Progress` it sees. A regression that stops
+/// wiring `HostLink::send_progress` into the analyze scan or blend sweep
+/// would leave `progress_count` at 0 while the run still completes
+/// successfully — so `saw_done` alone would not catch it.
+#[test]
+fn progress_frames_are_emitted() {
+    with_watchdog(Duration::from_secs(20), || {
+        let dir = tmpdir("progress");
+        let (w, h, ch) = (96u64, 64u64, 1u64);
+        let band_rows = 8u32;
+        let (job, shm, panel_pixels) = aligned_two_panel_job(&dir, "progress", w, h, ch, band_rows);
+        let layout = SlotLayout {
+            slot_bytes: job.slot_bytes,
+            input_slots: job.input_slots,
+            output_slots: job.output_slots,
+        };
+        let (mut child, mut child_stdin, mut child_stdout) = spawn_worker_with_init(&job);
+
+        let mut progress_count = 0usize;
+        let mut saw_done = false;
+        loop {
+            match read_worker_frame(&mut child_stdout) {
+                Ok(Some(WorkerMsg::BandRequest(req))) => {
+                    let panel = &panel_pixels[req.panel_id as usize];
+                    let desc = &job.panels[req.panel_id as usize];
+                    let rows = req.y1 - req.y0;
+                    let dst = shm.slice_mut(
+                        layout.input_offset(req.slot_id),
+                        desc.channels * rows * desc.width,
+                    );
+                    let plane_stride = desc.height * desc.width;
+                    for c in 0..desc.channels {
+                        let ss = (c * plane_stride + req.y0 * desc.width) as usize;
+                        let sl = (rows * desc.width) as usize;
+                        let ds = (c * rows * desc.width) as usize;
+                        dst[ds..ds + sl].copy_from_slice(&panel[ss..ss + sl]);
+                    }
+                    write_frame(
+                        &mut child_stdin,
+                        &HostMsg::BandReply(mmm_core::ipc::protocol::BandReply {
+                            request_id: req.request_id,
+                            slot_id: req.slot_id,
+                            status: 0,
+                        }),
+                    )
+                    .unwrap();
+                    child_stdin.flush().unwrap();
+                }
+                Ok(Some(WorkerMsg::Progress { .. })) => progress_count += 1,
+                Ok(Some(WorkerMsg::Begin { .. })) => {}
+                Ok(Some(WorkerMsg::OutputBand(ob))) => {
+                    write_frame(
+                        &mut child_stdin,
+                        &HostMsg::OutputAck {
+                            request_id: ob.request_id,
+                        },
+                    )
+                    .unwrap();
+                    child_stdin.flush().unwrap();
+                }
+                Ok(Some(WorkerMsg::Done)) => {
+                    saw_done = true;
+                    break;
+                }
+                Ok(Some(WorkerMsg::Error { message })) => panic!("worker error: {message}"),
+                Ok(None) => break,
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+        child.wait().unwrap();
+        assert!(saw_done, "run should complete");
+        assert!(
+            progress_count > 0,
+            "expected at least one Progress frame, got {progress_count}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    });
+}
+
 /// Two raw solved panels with distinct geometry, rotation, and sky offset —
 /// enough overlap to exercise the photometric solve without depending on any
 /// analytic "ground truth" scene: this test only checks that the IPC and

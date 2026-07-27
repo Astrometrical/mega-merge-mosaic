@@ -39,6 +39,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -351,6 +352,8 @@ pub fn analyze_ipc_aligned(
         return Err(Error::format(session_dir, "IPC job has no input panels"));
     }
 
+    let done = AtomicU64::new(0);
+    let total = n_panels as u64;
     let scans: Vec<PanelScan> = (0..n_panels)
         .into_par_iter()
         .map(|id| {
@@ -368,7 +371,10 @@ pub fn analyze_ipc_aligned(
                     panel_id: id as u32,
                 },
             };
-            scan_reader(meta, reader)
+            let s = scan_reader(meta, reader)?;
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            link.send_progress("analyze", d, total);
+            Ok(s)
         })
         .collect::<Result<_>>()?;
 
@@ -475,6 +481,8 @@ pub fn analyze_ipc_solved(
     );
 
     // Scan the caches exactly like aligned frames, through PanelReader.
+    let done = AtomicU64::new(0);
+    let total = aligned.len() as u64;
     let scans: Vec<PanelScan> = aligned
         .par_iter()
         .enumerate()
@@ -491,7 +499,10 @@ pub fn analyze_ipc_solved(
                 storage: PanelStorage::CroppedCache { bbox: ap.bbox },
             };
             let reader = PanelReader::open(&meta, canvas)?;
-            scan_reader(meta, reader)
+            let s = scan_reader(meta, reader)?;
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            link.send_progress("analyze", d, total);
+            Ok(s)
         })
         .collect::<Result<_>>()?;
 

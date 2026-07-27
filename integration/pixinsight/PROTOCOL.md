@@ -180,11 +180,13 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 // tag 2
 {"Progress": {"stage": "blend", "done": 12, "total": 40}}
 // stage: string: done, total: u64
-// Wired in the protocol and in HostLink::send_progress, but not currently
-// called by mmm-ipc-worker's analyze/blend drivers — no Progress frames are
-// emitted by today's worker. A host may implement handling for it (it's
-// forward-looking, likely to be wired up once a GUI wants live progress),
-// but must not treat its absence as an error.
+// Emitted by both drivers: stage "analyze" reports one Progress per panel
+// completed during the IPC scan (done/total = panels scanned/panel count,
+// analyze_ipc_aligned and analyze_ipc_solved), and stage "blend" reports one
+// Progress per output band delivered during the band sweep (done/total =
+// output rows sent so far/canvas height, ShmRowSink::band). A host may
+// display these to show live percentages; their absence in the plain
+// file-mode CLI path is still fine — only the IPC worker emits them.
 
 // tag 3
 {"Begin": {"w": 9255, "h": 18310, "ch": 3}}

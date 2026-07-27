@@ -20,12 +20,20 @@ pub struct ShmRowSink {
     w: u64,
     /// Canvas channel count, captured from `begin` for the same reason.
     ch: u64,
+    /// Canvas height, captured from `begin` so `band` can report
+    /// `Progress { stage: "blend", .. }` against the right total.
+    out_h: u64,
 }
 
 impl ShmRowSink {
     /// Creates a sink that streams bands to the host over `link`.
     pub fn new(link: Arc<HostLink>) -> ShmRowSink {
-        ShmRowSink { link, w: 0, ch: 0 }
+        ShmRowSink {
+            link,
+            w: 0,
+            ch: 0,
+            out_h: 0,
+        }
     }
 }
 
@@ -33,12 +41,16 @@ impl RowSink for ShmRowSink {
     fn begin(&mut self, w: u64, h: u64, ch: u64) -> Result<()> {
         self.w = w;
         self.ch = ch;
+        self.out_h = h;
         self.link.begin_output(w, h, ch)
     }
 
     fn band(&mut self, y0: u64, rows: &[f32]) -> Result<()> {
         let rows_count = rows.len() as u64 / (self.ch * self.w);
-        self.link.send_output_band(y0, rows_count, rows)
+        self.link.send_output_band(y0, rows_count, rows)?;
+        self.link
+            .send_progress("blend", (y0 + rows_count).min(self.out_h), self.out_h);
+        Ok(())
     }
 
     // `finish` is deliberately a no-op: the `HostLink` completion handshake
