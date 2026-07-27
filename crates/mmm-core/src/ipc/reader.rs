@@ -85,10 +85,34 @@ pub struct IpcBacking {
 // `row` indexes it with `rayon::current_thread_index().unwrap_or(num_threads)`.
 // Given the precondition — every concurrent caller has a distinct
 // `current_thread_index()`, with at most one caller reporting `None` — two
-// concurrent `row` calls always compute *different* `idx` values, so the
-// `unsafe { &mut *cells[idx].get() }` each takes never aliases another
-// call's `&mut`. That disjointness is what `Sync` needs to be sound here (no
-// data race, even though the type has no lock).
+// concurrent `row` calls always compute *different* `idx` values, so no
+// access to `cells[idx]` made by one thread is ever concurrent with an
+// access to `cells[idx']` (`idx != idx'`) made by another. That
+// per-thread disjointness is what `Sync` needs to be sound here (no
+// cross-thread data race, even though the type has no lock).
+//
+// Within a single thread's own cell, `row` takes BOTH exclusive and shared
+// borrows of the `UnsafeCell`, at different points, and callers legitimately
+// hold multiple shared borrows of one cell alive at once (`analyze`'s
+// `scan_reader` and `blend`'s per-panel readers both collect one slice per
+// channel of a row, all borrowed from the same thread's cell, and read them
+// together). The true invariant `row` maintains to make that sound:
+//
+// - The `&mut` taken on a cache miss (to fill `buf` via `request_band`) is
+//   scoped to a block that ends, and is dropped, BEFORE `row` derives any
+//   `&self`-lifetime slice to return — so that exclusive borrow is never
+//   concurrent with, or overlapping the lifetime of, any slice handed back
+//   to a caller (this call's or an earlier one's).
+// - The value `row` returns is always derived from a fresh SHARED reborrow
+//   (`&*cells[idx].get()`) taken after that block closes. Any number of
+//   such shared reborrows for one thread's cell can coexist — that's what
+//   lets one thread hold every channel's slice of a row at once — because
+//   none of them overlaps the transient `&mut` from a miss, which by
+//   construction happens-before all of them are created.
+// - So on a given thread, the sequence is always: (optional) exclusive
+//   borrow to fetch → drop it → shared borrow(s) to read, repeated per call;
+//   never exclusive-concurrent-with-shared or exclusive-concurrent-with-
+//   exclusive within that cell.
 //
 // The precondition is upheld by every caller in this codebase today: the
 // `analyze` scan drives `row` sequentially (one caller, trivially
@@ -102,15 +126,6 @@ pub struct IpcBacking {
 // this invariant (see the type doc; a future GUI or multi-pool consumer
 // must either serialize its poolless callers or give each pool/thread its
 // own `IpcBacking`).
-//
-// The `&[f32]` `row` returns borrows `&self` (not the `&mut ThreadBand`), so
-// by the time it's handed back to the caller the exclusive borrow is gone;
-// nothing else touches that thread's cell until that same thread calls
-// `row` again, at which point the previous slice's lifetime has already
-// ended from the caller's point of view (analyze/blend read all channels of
-// one row, then advance to the next row, never holding a row slice past
-// that point) — this matches the doc contract on
-// [`crate::panel_reader::PanelReader::row`].
 unsafe impl Sync for IpcBacking {}
 
 impl IpcBacking {
@@ -169,14 +184,43 @@ impl IpcBacking {
             idx < self.cells.len(),
             "IpcBacking::row called from a larger rayon pool than the one it was constructed in"
         );
-        // SAFETY: see the `unsafe impl Sync` justification above — `idx` is
-        // unique to this thread (within the pool, plus the poolless
-        // fallback), so this is the only live reference to `cells[idx]`.
-        let band = unsafe { &mut *self.cells[idx].get() };
 
         let band_rows = self.band_rows as u64;
         let by0 = (canvas_y / band_rows) * band_rows;
-        if !band.valid || band.y0 != by0 {
+
+        // Cheap shared peek to decide whether this call needs to fetch. This
+        // is itself a `&*` reborrow — it coexists freely with any other live
+        // shared reborrows of this cell (e.g. slices this same thread
+        // returned for earlier channels of this row), so taking it can never
+        // invalidate them.
+        // SAFETY: see the `unsafe impl Sync` justification above — `idx` is
+        // unique to this thread, so this is one of possibly many concurrent
+        // shared reborrows of this thread's own cell, never of another
+        // thread's.
+        let need_fetch = {
+            let band = unsafe { &*self.cells[idx].get() };
+            !band.valid || band.y0 != by0
+        };
+
+        // Cache-miss path: fetch the needed band into this thread's cell.
+        // The `&mut` below is taken ONLY when a fetch is actually needed,
+        // and it is scoped to this block and dropped before any returned
+        // slice is derived (see the SAFETY note further down) — it must
+        // never be live at the same time as a `&self`-lifetime slice handed
+        // back to a previous call, because callers legitimately hold slices
+        // for every channel of one row simultaneously (see the `unsafe impl
+        // Sync` justification above). Callers only ever hit this path on the
+        // first channel of a row whose band hasn't been fetched yet, by
+        // which point any slices returned for a previous row have already
+        // been dropped by the caller — see the `unsafe impl Sync` doc.
+        if need_fetch {
+            // SAFETY: `idx` is unique to this thread, and — because
+            // `need_fetch` was true — no shared reborrow this call is about
+            // to derive exists yet; any shared reborrows from *earlier*
+            // calls on this thread reference a row the caller has already
+            // finished with (see above), so this exclusive borrow doesn't
+            // overlap a live one.
+            let band = unsafe { &mut *self.cells[idx].get() };
             let by1 = (by0 + band_rows).min(h);
             let bh = (by1 - by0) as usize;
             let w_usize = w as usize;
@@ -193,6 +237,18 @@ impl IpcBacking {
             band.y0 = by0;
             band.valid = true;
         }
+
+        // SAFETY: same `idx`-disjointness argument as above, but this is a
+        // SHARED reborrow, not exclusive. Any number of these may coexist
+        // for this thread's cell at once — which is exactly what callers
+        // need: `analyze`'s `scan_reader` and `blend`'s per-panel readers
+        // both hold one slice per channel of a row concurrently, all
+        // borrowed from the same cell. No `&mut` to this cell is created
+        // again until the *next* call to `row` on this thread, and that
+        // call's exclusive borrow (if any, on a cache miss) is confined to
+        // the block above, ending before it derives its own shared slice —
+        // so it never aliases a shared slice this call is about to return.
+        let band = unsafe { &*self.cells[idx].get() };
 
         // The ACTUAL height of the cached band (not `self.band_rows` — the
         // final band of the panel is shorter whenever `h` isn't a multiple

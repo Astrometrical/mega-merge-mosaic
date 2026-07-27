@@ -431,6 +431,11 @@ impl HostLink {
                         "HostLink::request_band: host reported an error filling request {request_id}"
                     )));
                 }
+                let len_in_bytes = dst.len() as u64 * 4;
+                debug_assert!(
+                    len_in_bytes <= self.layout.slot_bytes,
+                    "band exceeds slot_bytes — host undersized the shm slot"
+                );
                 let src = self
                     .shm
                     .slice(self.layout.input_offset(slot_id), dst.len() as u64);
@@ -487,6 +492,11 @@ impl HostLink {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(Error::compute("cancelled"));
         }
+        let len_in_bytes = planar.len() as u64 * 4;
+        debug_assert!(
+            len_in_bytes <= self.layout.slot_bytes,
+            "band exceeds slot_bytes — host undersized the shm slot"
+        );
         let dst = self
             .shm
             .slice_mut(self.layout.output_offset(slot_id), planar.len() as u64);

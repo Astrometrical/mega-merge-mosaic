@@ -180,6 +180,11 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 // tag 2
 {"Progress": {"stage": "blend", "done": 12, "total": 40}}
 // stage: string: done, total: u64
+// Wired in the protocol and in HostLink::send_progress, but not currently
+// called by mmm-ipc-worker's analyze/blend drivers — no Progress frames are
+// emitted by today's worker. A host may implement handling for it (it's
+// forward-looking, likely to be wired up once a GUI wants live progress),
+// but must not treat its absence as an error.
 
 // tag 3
 {"Begin": {"w": 9255, "h": 18310, "ch": 3}}
@@ -321,6 +326,24 @@ The shm segment is one contiguous byte buffer, `total_bytes` long, split
 into fixed-size **input slots** followed by fixed-size **output slots**.
 Every slot is `slot_bytes` bytes regardless of whether it holds an input or
 output band — size it for the largest band ever transferred.
+
+**Solved-mode sizing hazard.** `slot_bytes` must be fixed by the host
+*before* the worker starts (it's part of `Init`, and the host creates the
+shm segment before spawning the worker child — see §8.1). In `Aligned` mode
+that's straightforward: every panel and the output canvas share the same
+known width. In `Solved` mode (§11) the output band width is the width of
+the mosaic frame the *worker* computes at runtime (`choose_frame`, run over
+the panels' astrometric models) — a value the host cannot read off any
+panel's `PanelDesc` and does not know until after the worker has already
+attached to a shm segment sized by the host. A host that supports `Solved`
+mode must therefore either reproduce the frame-width computation itself
+before sizing `slot_bytes` (matching the worker's `choose_frame` logic
+exactly), or size output slots generously for the worst case it's willing
+to support; undersizing `slot_bytes` relative to the actual output band
+size is a silent-corruption bug (the copy overruns into the next slot), not
+something the protocol detects on its own. `mmm-core`'s debug builds assert
+on this (`HostLink::send_output_band`/`request_band` both `debug_assert!`
+that the band fits `slot_bytes`), but a release build will not catch it.
 
 ```
 total_bytes = slot_bytes * (input_slots + output_slots)
@@ -524,6 +547,16 @@ its own writes to the worker's stdin.
   still pulled over the same band-pull handshake as `Aligned`; the
   reprojection happens worker-side into its own on-disk session cache
   before blending begins.
+
+  **Slot-sizing note.** The output band width in `Solved` mode is the
+  worker-computed mosaic frame's width (`choose_frame` over the panels'
+  astrometric models), not any width the host can read from `Init` — but
+  `slot_bytes` must already be fixed when the host creates the shm segment,
+  before the worker runs `choose_frame` at all (§7). A host targeting
+  `Solved` mode must independently reproduce the frame-width computation (or
+  size output slots for its worst-case supported frame) to avoid
+  undersizing `slot_bytes`; see §7's "Solved-mode sizing hazard" for the
+  consequence of getting this wrong.
 - **`{"Files": {"paths": [...]}}`** — panels are read by the worker directly
   from these filesystem paths (one per panel, in `panels` order), bypassing
   the band-pull handshake entirely for input. This is the trivial
