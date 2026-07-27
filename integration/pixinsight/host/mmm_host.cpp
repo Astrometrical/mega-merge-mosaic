@@ -262,39 +262,54 @@ void Host::probe_frame(const std::string& worker_path, const nlohmann::json& ini
   in_pipe.close_read();
   out_pipe.close_write();
 
-  // Write the probe JSON, then close stdin so the worker sees EOF.
-  std::string payload = init_obj.dump();
-  full_write_fd(in_pipe.fd[1], reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
-  in_pipe.close_write();
-
-  // Read all of stdout.
-  std::string out;
-  {
-    char buf[4096];
-    for (;;) {
-      ssize_t r = ::read(out_pipe.fd[0], buf, sizeof(buf));
-      if (r < 0) {
-        if (errno == EINTR) continue;
-        break;
-      }
-      if (r == 0) break;
-      out.append(buf, static_cast<size_t>(r));
-    }
-  }
-  out_pipe.close_read();
-
+  // From here on the child is spawned but not yet reaped: any throw (stdin
+  // write EPIPE if the worker dies during startup, stdout drain, or parse)
+  // must still kill+reap it, mirroring run()'s fault-isolation guard, so a
+  // failing probe never leaks a zombie. `status`/`reaped` ensure the happy
+  // path waits exactly once.
   int status = 0;
-  ::waitpid(pid, &status, 0);
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    throw HostError("probe-frame: worker exited abnormally");
+  bool reaped = false;
+  try {
+    // Write the probe JSON, then close stdin so the worker sees EOF.
+    std::string payload = init_obj.dump();
+    full_write_fd(in_pipe.fd[1], reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+    in_pipe.close_write();
+
+    // Read all of stdout.
+    std::string out;
+    {
+      char buf[4096];
+      for (;;) {
+        ssize_t r = ::read(out_pipe.fd[0], buf, sizeof(buf));
+        if (r < 0) {
+          if (errno == EINTR) continue;
+          break;
+        }
+        if (r == 0) break;
+        out.append(buf, static_cast<size_t>(r));
+      }
+    }
+    out_pipe.close_read();
+
+    ::waitpid(pid, &status, 0);
+    reaped = true;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      throw HostError("probe-frame: worker exited abnormally");
+    }
+    unsigned long long pw = 0, ph = 0, pch = 0;
+    if (std::sscanf(out.c_str(), "%llu %llu %llu", &pw, &ph, &pch) != 3) {
+      throw HostError("probe-frame: could not parse \"w h ch\" from worker output: " + out);
+    }
+    w = pw;
+    h = ph;
+    ch = pch;
+  } catch (...) {
+    if (!reaped) {
+      ::kill(pid, SIGKILL);
+      ::waitpid(pid, &status, 0);
+    }
+    throw;
   }
-  unsigned long long pw = 0, ph = 0, pch = 0;
-  if (std::sscanf(out.c_str(), "%llu %llu %llu", &pw, &ph, &pch) != 3) {
-    throw HostError("probe-frame: could not parse \"w h ch\" from worker output: " + out);
-  }
-  w = pw;
-  h = ph;
-  ch = pch;
 }
 
 }  // namespace mmm
