@@ -1,0 +1,8 @@
+[package]
+name = "mmm-ipc-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mmm-core = { path = "../mmm-core" }
+serde_json = "1"

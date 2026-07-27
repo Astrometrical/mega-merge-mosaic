@@ -49,6 +49,7 @@ pub mod diag;
 pub mod error;
 pub mod flatten;
 pub mod formats;
+pub mod ipc;
 pub mod linalg;
 pub mod output;
 pub mod overlap;

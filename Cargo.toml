@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mmm-core", "crates/mmm"]
+members = ["crates/mmm-core", "crates/mmm", "crates/mmm-ipc-worker"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,3 +31,4 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 codegen-units = 1
+panic = "abort"
