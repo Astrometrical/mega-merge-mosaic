@@ -1,8 +1,11 @@
 [package]
 name = "mmm-ipc-worker"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
-mmm-core = { path = "../mmm-core" }
-serde_json = "1"
+mmm-core.workspace = true
+serde_json.workspace = true
