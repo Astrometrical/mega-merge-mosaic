@@ -5,7 +5,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use mmm_core::analyze::{analyze_input, analyze_ipc_aligned, analyze_ipc_solved};
+use mmm_core::analyze::{analyze_input, analyze_ipc_aligned, analyze_ipc_solved, solved_frame};
 use mmm_core::blend::blend_with_source;
 use mmm_core::ipc::IPC_PROTOCOL_VERSION;
 use mmm_core::ipc::client::HostLink;
@@ -26,12 +26,13 @@ fn main() {
 }
 
 /// `--probe-frame`: read an `InitJob`-shaped JSON object on stdin, build the
-/// WCS models from each panel's `properties`, run `choose_frame`, and print
-/// `"{w} {h} {ch}"`. Lets a host size the shm output slots for solved mode
-/// without duplicating the frame math (see PROTOCOL.md §11 / spec §15).
+/// WCS models from each panel's `properties` via
+/// [`mmm_core::analyze::solved_frame`], and print `"{w} {h} {ch}"`. Lets a
+/// host size the shm output slots for solved mode without duplicating the
+/// frame math (see PROTOCOL.md §11 / spec §15) — `solved_frame` is the same
+/// helper `analyze_ipc_solved` uses, so this preflight enforces the same
+/// cross-panel channel-count check the real analyze stage does.
 fn probe_frame() -> mmm_core::Result<()> {
-    use mmm_core::align::choose_frame;
-    use mmm_core::astrometry::WcsModel;
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
         .map_err(|e| mmm_core::Error::compute(format!("reading probe JSON from stdin: {e}")))?;
@@ -40,18 +41,7 @@ fn probe_frame() -> mmm_core::Result<()> {
     if job.panels.is_empty() {
         return Err(mmm_core::Error::compute("probe-frame: no panels"));
     }
-    let mut models = Vec::with_capacity(job.panels.len());
-    for p in &job.panels {
-        let m = WcsModel::from_properties(&p.properties, p.width, p.height).ok_or_else(|| {
-            mmm_core::Error::compute(format!(
-                "probe-frame: panel {} lacks a usable solution",
-                p.panel_id
-            ))
-        })?;
-        models.push(m);
-    }
-    let frame = choose_frame(&models);
-    let ch = job.panels[0].channels;
+    let (_models, frame, ch) = solved_frame(&job.panels).map_err(mmm_core::Error::compute)?;
     writeln!(std::io::stdout(), "{} {} {}", frame.width, frame.height, ch)
         .map_err(|e| mmm_core::Error::compute(format!("probe-frame: writing stdout: {e}")))?;
     Ok(())

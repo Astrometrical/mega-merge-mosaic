@@ -44,11 +44,12 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::align::{choose_frame, reproject_from_reader, reproject_panel};
+use crate::align::{MosaicFrame, choose_frame, reproject_from_reader, reproject_panel};
 use crate::astrometry::WcsModel;
 use crate::formats::XisfProperty;
 use crate::formats::xisf::XisfPanel;
 use crate::ipc::client::HostLink;
+use crate::ipc::protocol::PanelDesc;
 use crate::overlap::OverlapGraph;
 use crate::panel_reader::{PanelReader, PanelStorage};
 use crate::session::{InputKind, PanelMeta, Session};
@@ -331,6 +332,56 @@ fn describe_unsolved(props: &[XisfProperty]) -> String {
     }
 }
 
+/// Builds every panel's [`WcsModel`] from its carried `properties`, checks
+/// that all panels yield a usable solution and share one channel count, then
+/// chooses the shared [`crate::align::MosaicFrame`] via [`choose_frame`].
+///
+/// Shared by [`analyze_ipc_solved`] and the `mmm-ipc-worker` `--probe-frame`
+/// preflight so the two paths cannot drift apart — the probe used to run its
+/// own copy of this loop without the channel-count check, which is now
+/// enforced for both callers alike. `panels` must be non-empty; callers
+/// check that themselves first since their "no panels" errors carry
+/// different context (a session dir vs. none).
+///
+/// Also returns the built [`WcsModel`]s (in panel order) so a caller that
+/// goes on to reproject (`analyze_ipc_solved`) does not need to rebuild them.
+///
+/// Returns a plain string reason rather than an [`crate::Error`]: the two
+/// callers wrap failures in different variants (`Error::format` with a
+/// session dir vs. `Error::compute`).
+pub fn solved_frame(
+    panels: &[PanelDesc],
+) -> std::result::Result<(Vec<WcsModel>, MosaicFrame, u64), String> {
+    // Every panel must yield a model; report all unusable panels at once.
+    let mut models: Vec<WcsModel> = Vec::with_capacity(panels.len());
+    let mut errors: Vec<String> = Vec::new();
+    for p in panels {
+        match WcsModel::from_properties(&p.properties, p.width, p.height) {
+            Some(m) => models.push(m),
+            None => errors.push(format!(
+                "panel {}: {}",
+                p.panel_id,
+                describe_unsolved(&p.properties)
+            )),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "solved input requires an astrometric solution in every panel:\n  {}",
+            errors.join("\n  ")
+        ));
+    }
+    let ch = panels[0].channels;
+    if let Some(p) = panels.iter().find(|p| p.channels != ch) {
+        return Err(format!(
+            "panel {} has {} channels, expected {ch} like panel {}",
+            p.panel_id, p.channels, panels[0].panel_id
+        ));
+    }
+    let frame = choose_frame(&models);
+    Ok((models, frame, ch))
+}
+
 /// The aligned path over panels streamed from an IPC host: mirrors
 /// `analyze_aligned`, but each panel is read through
 /// [`PanelReader::open_ipc`] instead of a file — no session metadata or
@@ -400,40 +451,8 @@ pub fn analyze_ipc_solved(
         return Err(Error::format(session_dir, "IPC job has no input panels"));
     }
 
-    // Every panel must yield a model; report all unusable panels at once.
-    let mut models: Vec<WcsModel> = Vec::with_capacity(panels.len());
-    let mut errors: Vec<String> = Vec::new();
-    for p in panels {
-        match WcsModel::from_properties(&p.properties, p.width, p.height) {
-            Some(m) => models.push(m),
-            None => errors.push(format!(
-                "panel {}: {}",
-                p.panel_id,
-                describe_unsolved(&p.properties)
-            )),
-        }
-    }
-    if !errors.is_empty() {
-        return Err(Error::format(
-            session_dir,
-            format!(
-                "solved input requires an astrometric solution in every panel:\n  {}",
-                errors.join("\n  ")
-            ),
-        ));
-    }
-    let ch = panels[0].channels;
-    if let Some(p) = panels.iter().find(|p| p.channels != ch) {
-        return Err(Error::format(
-            session_dir,
-            format!(
-                "panel {} has {} channels, expected {ch} like panel {}",
-                p.panel_id, p.channels, panels[0].panel_id
-            ),
-        ));
-    }
-
-    let frame = choose_frame(&models);
+    let (models, frame, ch) =
+        solved_frame(panels).map_err(|reason| Error::format(session_dir, reason))?;
     let canvas = (frame.width, frame.height, ch);
     tracing::info!(
         "mosaic frame: {}x{} px, {:.3}\"/px, center RA {:.4} Dec {:+.4}",
