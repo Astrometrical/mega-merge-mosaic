@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 use crate::blend::{BlendMode, BlendParams};
-use crate::formats::XisfProperty;
+use crate::formats::{PropertyValue, XisfProperty};
 
 /// Worker→host: asks the host to fill a shared-memory slot with rows
 /// `[y0, y1)` of panel `panel_id`.
@@ -336,14 +336,63 @@ pub trait FrameBody: sealed::Sealed {
     /// Encodes this message to a `(tag, payload)` pair per the module-level
     /// frame layout.
     fn encode(&self) -> (u8, Vec<u8>);
+
+    /// Checks this message can be safely represented on the wire before
+    /// [`Self::encode`] runs. Only [`HostMsg::Init`] has anything to check
+    /// (a finite-float precondition on its floats); every other message is
+    /// valid by construction, so the default is a no-op.
+    fn validate(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Serializes `msg` as the JSON payload for a frame whose tag already
-/// disambiguates the variant. Panics only if `msg` contains data
-/// `serde_json` cannot represent (not the case for any message in this
-/// protocol: strings, integers, options, and vecs thereof).
+/// disambiguates the variant. `serde_json` cannot fail for the data shapes
+/// used in this protocol (strings, integers, options, and vecs thereof)
+/// *provided* every `f32`/`f64` in `msg` is finite: JSON has no
+/// representation for `NaN`/`Infinity`, so `serde_json` silently encodes
+/// them as `null` instead of erroring here, which then fails to
+/// *deserialize* on the far end with a confusing "invalid type: null,
+/// expected f64" error nowhere near the real cause. `write_frame` enforces
+/// that precondition via [`FrameBody::validate`] (see [`validate_finite`])
+/// before this function is ever reached.
 fn json_payload<T: Serialize + std::fmt::Debug>(msg: &T) -> Vec<u8> {
     serde_json::to_vec(msg).unwrap_or_else(|e| panic!("serialize {msg:?}: {e}"))
+}
+
+/// Checks every `f32`/`f64` reachable from `job` is finite (see
+/// [`json_payload`] for why): [`BlendParamsWire::feather_px`], and each
+/// panel's XISF [`PropertyValue::F64`]/`F64Vec`/`F64Mat` properties (the
+/// only float-carrying data in [`InitJob`]; reachable in practice because
+/// `formats::xisf`'s `Float64` property parser accepts `"nan"`/`"inf"`
+/// text via `str::parse`).
+fn validate_finite(job: &InitJob) -> io::Result<()> {
+    if !job.params.feather_px.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "InitJob.params.feather_px is not finite (NaN/Infinity)",
+        ));
+    }
+    for panel in &job.panels {
+        for prop in &panel.properties {
+            let finite = match &prop.value {
+                PropertyValue::F64(v) => v.is_finite(),
+                PropertyValue::F64Vec(vs) => vs.iter().all(|v| v.is_finite()),
+                PropertyValue::F64Mat { data, .. } => data.iter().all(|v| v.is_finite()),
+                PropertyValue::Str(_) | PropertyValue::I64(_) | PropertyValue::Unread => true,
+            };
+            if !finite {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "InitJob panel {} property {:?} is not finite (NaN/Infinity)",
+                        panel.panel_id, prop.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl FrameBody for WorkerMsg {
@@ -368,10 +417,23 @@ impl FrameBody for HostMsg {
             HostMsg::Cancel => (131, json_payload(self)),
         }
     }
+
+    fn validate(&self) -> io::Result<()> {
+        match self {
+            HostMsg::Init(job) => validate_finite(job),
+            HostMsg::BandReply(_) | HostMsg::OutputAck { .. } | HostMsg::Cancel => Ok(()),
+        }
+    }
 }
 
 /// Writes one frame to `w`: `[u8 tag][u32 LE payload_len][payload]`.
+///
+/// Calls [`FrameBody::validate`] first, so a message that can't be safely
+/// represented on the wire (currently: a non-finite float in a
+/// [`HostMsg::Init`]) fails here with a clear `io::Error` instead of
+/// silently corrupting the JSON payload.
 pub fn write_frame<W: Write>(w: &mut W, msg: &impl FrameBody) -> io::Result<()> {
+    msg.validate()?;
     let (tag, payload) = msg.encode();
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame payload too large"))?;
@@ -398,6 +460,9 @@ fn read_payload<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    // `len` is trusted, not attacker-bounded: both ends of this pipe are our
+    // own processes (host and `mmm-ipc-worker`) talking over their own
+    // stdin/stdout, not an external/adversarial input source.
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok(payload)
@@ -503,5 +568,76 @@ mod tests {
             HostMsg::Init(got) => assert_eq!(got, job),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    fn sample_init_job() -> InitJob {
+        InitJob {
+            protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+            shm_name: "/mmm-test".into(),
+            slot_bytes: 1 << 20,
+            input_slots: 1,
+            output_slots: 1,
+            canvas: [10, 10, 1],
+            panels: vec![PanelDesc {
+                panel_id: 0,
+                width: 10,
+                height: 10,
+                channels: 1,
+                properties: vec![],
+            }],
+            mode: JobMode::Aligned,
+            session_dir: "/tmp/x.mmm-session".into(),
+            params: BlendParamsWire::default(),
+        }
+    }
+
+    #[test]
+    fn truncated_payload_is_an_error_not_a_false_eof() {
+        let req = BandRequest {
+            request_id: 1,
+            panel_id: 1,
+            y0: 0,
+            y1: 1,
+            slot_id: 0,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &WorkerMsg::BandRequest(req)).unwrap();
+        buf.truncate(buf.len() - 1); // cut the frame mid-payload
+        let mut cur = std::io::Cursor::new(buf);
+        let err = read_worker_frame(&mut cur).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn unknown_tag_byte_is_an_error() {
+        let mut buf = Vec::new();
+        buf.push(200u8); // not a tag any WorkerMsg variant uses
+        buf.extend_from_slice(&0u32.to_le_bytes()); // zero-length payload
+        let mut cur = std::io::Cursor::new(buf);
+        let err = read_worker_frame(&mut cur).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_frame_rejects_non_finite_feather_px() {
+        let mut job = sample_init_job();
+        job.params.feather_px = f32::NAN;
+        let mut buf = Vec::new();
+        let err = write_frame(&mut buf, &HostMsg::Init(job)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_frame_rejects_non_finite_property_float() {
+        let mut job = sample_init_job();
+        job.panels[0].properties.push(XisfProperty {
+            id: "PCL:Test".into(),
+            type_: "Float64".into(),
+            value: PropertyValue::F64(f64::NAN),
+            location: None,
+        });
+        let mut buf = Vec::new();
+        let err = write_frame(&mut buf, &HostMsg::Init(job)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
