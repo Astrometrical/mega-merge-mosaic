@@ -390,10 +390,6 @@ default auto). 132 tests, clippy clean.
 - FITS output is big-endian: byte-swap on write. Write ROWORDER='TOP-DOWN'.
 - WSL2 caps RAM at 50% of host by default (`.wslconfig` to raise); mmap +
   streaming keeps us indifferent.
-```
-<!-- NOTE: the fence above closes a stray unterminated ``` left at the old
-     end of this file (nothing followed it); closing it here keeps the
-     section below from rendering as a code block. -->
 
 ## IPC transport (PixInsight)
 
