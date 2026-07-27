@@ -10,11 +10,14 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
 use crate::formats::xisf::XisfPanel;
+use crate::ipc::client::HostLink;
+use crate::ipc::reader::IpcBacking;
 use crate::session::PanelMeta;
 use crate::{Error, Result};
 
@@ -36,11 +39,21 @@ pub enum PanelStorage {
         /// Canvas placement of the cache, `[x0, y0, x1, y1]` exclusive.
         bbox: [u64; 4],
     },
+    /// Pixels served on demand from the IPC host, never a file on disk —
+    /// see [`crate::ipc::reader::IpcBacking`]. Not written into persisted
+    /// session metadata for real runs: an IPC job's panels are read once
+    /// per stage and re-derived from the live [`HostLink`] rather than
+    /// reopened from a session directory (see Task 8).
+    Ipc {
+        /// The panel id the host knows this panel by.
+        panel_id: u32,
+    },
 }
 
 enum Backing {
     Xisf(XisfPanel),
     Cache(Mmap),
+    Ipc(IpcBacking),
 }
 
 /// A memory-mapped panel reader presenting rows in canvas coordinates.
@@ -116,6 +129,9 @@ impl PanelReader {
                     canvas,
                 })
             }
+            PanelStorage::Ipc { .. } => Err(Error::compute(
+                "IPC panels are opened via open_ipc, not open",
+            )),
         }
     }
 
@@ -130,6 +146,36 @@ impl PanelReader {
             bbox: [0, 0, canvas.0, canvas.1],
             canvas,
         })
+    }
+
+    /// Open a panel served over IPC by `link`: rows are pulled from the host
+    /// on demand, `band_rows` canvas rows at a time (see
+    /// [`crate::ipc::reader::IpcBacking`]). No session metadata or file is
+    /// involved — used by IPC-driven runs, which never write panel pixels
+    /// to disk.
+    pub fn open_ipc(
+        link: Arc<HostLink>,
+        panel_id: u32,
+        canvas: (u64, u64, u64),
+        band_rows: usize,
+    ) -> PanelReader {
+        let (w, h, _ch) = canvas;
+        PanelReader {
+            backing: Backing::Ipc(IpcBacking::new(link, panel_id, canvas, band_rows)),
+            bbox: [0, 0, w, h],
+            canvas,
+        }
+    }
+
+    /// The first transport error latched while reading an IPC-backed panel,
+    /// if any; always `None` for non-IPC backings. Callers check this after
+    /// a scan/blend stage completes, since [`Self::row`] can't surface a
+    /// [`Result`] through its `Option` signature.
+    pub fn ipc_error(&self) -> Option<Error> {
+        match &self.backing {
+            Backing::Ipc(ipc) => ipc.ipc_error(),
+            Backing::Xisf(_) | Backing::Cache(_) => None,
+        }
     }
 
     /// Canvas geometry `(width, height, channels)` this reader addresses.
@@ -159,6 +205,7 @@ impl PanelReader {
                 let start = c as usize * bw * bh + (canvas_y - y0) as usize * bw;
                 Some((x0, &plane[start..start + bw]))
             }
+            Backing::Ipc(ipc) => ipc.row(c, canvas_y),
         }
     }
 
@@ -170,6 +217,10 @@ impl PanelReader {
             Backing::Cache(_mmap) => {
                 #[cfg(unix)]
                 let _ = _mmap.advise(memmap2::Advice::Sequential);
+            }
+            Backing::Ipc(_) => {
+                // No mmap to advise; bands are already fetched sequentially
+                // through the per-thread cache in `IpcBacking`.
             }
         }
     }
