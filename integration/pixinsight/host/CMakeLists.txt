@@ -5,9 +5,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -fPIC)
 find_package(Threads REQUIRED)
 
-# NOTE: mmm_host.cpp is created in Task 6; until then this library compiles
-# with mmm_shm.cpp + mmm_protocol.cpp so this task is self-contained.
-add_library(mmm_host STATIC mmm_shm.cpp mmm_protocol.cpp)
+add_library(mmm_host STATIC mmm_shm.cpp mmm_protocol.cpp mmm_host.cpp)
 target_include_directories(mmm_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_link_libraries(mmm_host PUBLIC Threads::Threads rt)
 
