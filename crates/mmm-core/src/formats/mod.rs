@@ -26,7 +26,7 @@ pub struct FitsKeyword {
 ///   `inline:hex` encoded vector/matrix data),
 /// - attachment data blocks (`location="attachment:offset:size"`), exposed via
 ///   [`XisfProperty::location`] and resolved on open for f64 vectors/matrices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct XisfProperty {
     /// Property identifier (e.g. `PCL:AstrometricSolution:ProjectionSystem`).
     pub id: String,
@@ -43,7 +43,7 @@ pub struct XisfProperty {
 /// Attachment-located `F64Vector`/`F64Matrix` properties parse with empty
 /// `data` (dimensions from the header attributes); `XisfPanel::open` resolves
 /// them from the file. `Unread` marks types we do not decode.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PropertyValue {
     /// String-like value (`String`, `TimePoint`, or any `value` attribute of
     /// an undecoded type).

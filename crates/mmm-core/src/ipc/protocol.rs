@@ -1,1 +1,507 @@
 //! Wire messages exchanged between the host and `mmm-ipc-worker` over stdin/stdout.
+//!
+//! One frame is `[u8 tag][u32 LE payload_len][payload bytes]`. Band-carrying
+//! messages ([`BandRequest`], [`BandReply`], [`OutputBand`]) encode as a
+//! fixed little-endian binary payload (cheap to build, no allocation-heavy
+//! parsing on the hot per-band path); every other message encodes as JSON
+//! ([`serde_json`]). See [`write_frame`] / [`read_worker_frame`] /
+//! [`read_host_frame`] for the codec, and [`FrameBody::encode`] for the
+//! tag assignment.
+
+use std::io::{self, Read, Write};
+
+use serde::{Deserialize, Serialize};
+
+use crate::blend::{BlendMode, BlendParams};
+use crate::formats::XisfProperty;
+
+/// Worker→host: asks the host to fill a shared-memory slot with rows
+/// `[y0, y1)` of panel `panel_id`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BandRequest {
+    /// Correlates this request with its [`BandReply`].
+    pub request_id: u32,
+    /// Panel to read from ([`PanelDesc::panel_id`]).
+    pub panel_id: u32,
+    /// First row requested (inclusive).
+    pub y0: u64,
+    /// Last row requested (exclusive).
+    pub y1: u64,
+    /// Shared-memory input slot the host should fill.
+    pub slot_id: u32,
+}
+
+impl BandRequest {
+    const WIRE_LEN: usize = 4 + 4 + 8 + 8 + 4;
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::WIRE_LEN);
+        buf.extend_from_slice(&self.request_id.to_le_bytes());
+        buf.extend_from_slice(&self.panel_id.to_le_bytes());
+        buf.extend_from_slice(&self.y0.to_le_bytes());
+        buf.extend_from_slice(&self.y1.to_le_bytes());
+        buf.extend_from_slice(&self.slot_id.to_le_bytes());
+        buf
+    }
+
+    fn from_bytes(buf: &[u8]) -> io::Result<Self> {
+        expect_len("BandRequest", Self::WIRE_LEN, buf)?;
+        Ok(Self {
+            request_id: read_u32(buf, 0),
+            panel_id: read_u32(buf, 4),
+            y0: read_u64(buf, 8),
+            y1: read_u64(buf, 16),
+            slot_id: read_u32(buf, 24),
+        })
+    }
+}
+
+/// Host→worker: the requested band is ready in `slot_id` (or an error
+/// occurred while filling it).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BandReply {
+    /// The [`BandRequest::request_id`] this replies to.
+    pub request_id: u32,
+    /// The slot the band was written to (or would have been).
+    pub slot_id: u32,
+    /// `0` = ok, `1` = error.
+    pub status: u8,
+}
+
+impl BandReply {
+    const WIRE_LEN: usize = 4 + 4 + 1;
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::WIRE_LEN);
+        buf.extend_from_slice(&self.request_id.to_le_bytes());
+        buf.extend_from_slice(&self.slot_id.to_le_bytes());
+        buf.push(self.status);
+        buf
+    }
+
+    fn from_bytes(buf: &[u8]) -> io::Result<Self> {
+        expect_len("BandReply", Self::WIRE_LEN, buf)?;
+        Ok(Self {
+            request_id: read_u32(buf, 0),
+            slot_id: read_u32(buf, 4),
+            status: buf[8],
+        })
+    }
+}
+
+/// Worker→host: a blended output band is ready in `slot_id`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct OutputBand {
+    /// Correlates this band with the host's [`HostMsg::OutputAck`].
+    pub request_id: u32,
+    /// First output row in this band.
+    pub y0: u64,
+    /// Row count in this band.
+    pub rows: u64,
+    /// Shared-memory output slot holding the pixel data.
+    pub slot_id: u32,
+}
+
+impl OutputBand {
+    const WIRE_LEN: usize = 4 + 8 + 8 + 4;
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::WIRE_LEN);
+        buf.extend_from_slice(&self.request_id.to_le_bytes());
+        buf.extend_from_slice(&self.y0.to_le_bytes());
+        buf.extend_from_slice(&self.rows.to_le_bytes());
+        buf.extend_from_slice(&self.slot_id.to_le_bytes());
+        buf
+    }
+
+    fn from_bytes(buf: &[u8]) -> io::Result<Self> {
+        expect_len("OutputBand", Self::WIRE_LEN, buf)?;
+        Ok(Self {
+            request_id: read_u32(buf, 0),
+            y0: read_u64(buf, 4),
+            rows: read_u64(buf, 12),
+            slot_id: read_u32(buf, 20),
+        })
+    }
+}
+
+fn read_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
+}
+
+fn read_u64(buf: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
+}
+
+fn expect_len(what: &str, expected: usize, buf: &[u8]) -> io::Result<()> {
+    if buf.len() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{what} frame: expected {expected} bytes, got {}", buf.len()),
+        ));
+    }
+    Ok(())
+}
+
+/// How the worker should read/align input panels for a run.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum JobMode {
+    /// Panels are already registered to a common canvas (MosaicByCoordinates
+    /// output); pixels are read as-is.
+    Aligned,
+    /// Panels carry a plate solution (in [`PanelDesc::properties`]) and must
+    /// be reprojected onto the shared canvas before blending.
+    Solved,
+    /// Panels are read directly from these file paths instead of over the
+    /// shared-memory band protocol.
+    Files {
+        /// One path per panel, in `panels` order.
+        paths: Vec<String>,
+    },
+}
+
+/// Geometry and (for [`JobMode::Solved`]) plate-solution metadata of one
+/// input panel.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PanelDesc {
+    /// Stable panel identifier, matching [`BandRequest::panel_id`].
+    pub panel_id: u32,
+    /// Panel width in pixels.
+    pub width: u64,
+    /// Panel height in pixels.
+    pub height: u64,
+    /// Channel count.
+    pub channels: u64,
+    /// XISF properties carried through from the input header; empty except
+    /// in [`JobMode::Solved`], where the plate solution lives here.
+    pub properties: Vec<XisfProperty>,
+}
+
+/// Wire form of [`BlendParams`]: plain data so it serializes with serde.
+/// `mode` travels as a string (see [`Self::to_params`]) so the wire format
+/// is stable across a `BlendMode` variant reorder; `surface_order` is not
+/// part of `BlendParams` (it feeds the analyze stage) and is ignored by
+/// `to_params`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BlendParamsWire {
+    /// Feather ramp length in canvas pixels.
+    pub feather_px: f32,
+    /// 1 = full resolution, 8 = blend from the L8 summaries (preview).
+    pub downsample: u32,
+    /// Output rows per band delivered to the sink.
+    pub band_rows: u32,
+    /// `"feather"`, `"twoband"`, or `"pyramid"` (unrecognized values map to
+    /// `"pyramid"` in [`Self::to_params`]).
+    pub mode: String,
+    /// Optional region of interest in full-res canvas coords `[x0,y0,x1,y1]`.
+    pub roi: Option<[u64; 4]>,
+    /// Cross-panel defect veto in the two-band/pyramid detail stage.
+    pub defect_veto: bool,
+    /// Opt-in global background flatten polynomial order (`None` = off).
+    pub flatten: Option<u32>,
+    /// Surface-fit polynomial order for the analyze stage; not consumed by
+    /// [`Self::to_params`].
+    pub surface_order: Option<u32>,
+}
+
+impl Default for BlendParamsWire {
+    fn default() -> Self {
+        Self {
+            feather_px: 256.0,
+            downsample: 1,
+            band_rows: 256,
+            mode: "pyramid".to_string(),
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+            surface_order: Some(2),
+        }
+    }
+}
+
+impl BlendParamsWire {
+    /// Converts wire parameters to [`BlendParams`]. `mode` maps
+    /// `"feather"`/`"twoband"`/`"pyramid"` to the matching [`BlendMode`];
+    /// any other string defaults to `Pyramid`. `surface_order` has no
+    /// `BlendParams` counterpart and is dropped.
+    pub fn to_params(&self) -> BlendParams {
+        let mode = match self.mode.as_str() {
+            "feather" => BlendMode::Feather,
+            "twoband" => BlendMode::TwoBand,
+            _ => BlendMode::Pyramid,
+        };
+        BlendParams {
+            feather_px: self.feather_px,
+            downsample: self.downsample,
+            band_rows: self.band_rows as usize,
+            mode,
+            roi: self.roi,
+            defect_veto: self.defect_veto,
+            flatten: self.flatten,
+        }
+    }
+}
+
+/// The one-time job description sent from host to worker to start a run.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct InitJob {
+    /// Wire-protocol version; the worker aborts on a mismatch with
+    /// [`crate::ipc::IPC_PROTOCOL_VERSION`].
+    pub protocol_version: u32,
+    /// Name of the shared-memory segment carrying band slots.
+    pub shm_name: String,
+    /// Size in bytes of one band slot.
+    pub slot_bytes: u64,
+    /// Number of input slots in the shared-memory segment.
+    pub input_slots: u32,
+    /// Number of output slots in the shared-memory segment.
+    pub output_slots: u32,
+    /// Canvas dimensions as `[width, height, channels]`.
+    pub canvas: [u64; 3],
+    /// Per-panel geometry and metadata, in panel-id order.
+    pub panels: Vec<PanelDesc>,
+    /// How to read/align input panels.
+    pub mode: JobMode,
+    /// Session directory the worker should read/write cached artifacts from.
+    pub session_dir: String,
+    /// Blend parameters for the run.
+    pub params: BlendParamsWire,
+}
+
+/// Messages sent from `mmm-ipc-worker` to the host.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum WorkerMsg {
+    /// Requests input pixels for a band (see [`BandRequest`]).
+    BandRequest(BandRequest),
+    /// Reports progress within a pipeline stage.
+    Progress {
+        /// Stage name (e.g. `"blend"`).
+        stage: String,
+        /// Units completed so far.
+        done: u64,
+        /// Total units expected.
+        total: u64,
+    },
+    /// Announces canvas geometry before output streaming begins.
+    Begin {
+        /// Canvas width in pixels.
+        w: u64,
+        /// Canvas height in pixels.
+        h: u64,
+        /// Channel count.
+        ch: u64,
+    },
+    /// A blended output band is ready (see [`OutputBand`]).
+    OutputBand(OutputBand),
+    /// The job completed successfully; no further messages follow.
+    Done,
+    /// The job failed; no further messages follow.
+    Error {
+        /// Human-readable error description.
+        message: String,
+    },
+}
+
+/// Messages sent from the host to `mmm-ipc-worker`.
+///
+/// `Init` is sent exactly once per run (never on a hot path), so the size
+/// gap to the other variants (dominated by `InitJob::panels`) is left
+/// unboxed — boxing it would also break the `HostMsg::Init(got) => ...
+/// assert_eq!(got, job)` pattern this protocol's tests rely on.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum HostMsg {
+    /// Starts a run (see [`InitJob`]); always the first message.
+    Init(InitJob),
+    /// Replies to a [`WorkerMsg::BandRequest`].
+    BandReply(BandReply),
+    /// Acknowledges an [`WorkerMsg::OutputBand`], freeing its slot for reuse.
+    OutputAck {
+        /// The [`OutputBand::request_id`] being acknowledged.
+        request_id: u32,
+    },
+    /// Aborts the run; the worker exits after cleaning up.
+    Cancel,
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::WorkerMsg {}
+    impl Sealed for super::HostMsg {}
+}
+
+/// Message envelopes that can be written with [`write_frame`]. Sealed: only
+/// [`WorkerMsg`] and [`HostMsg`] implement it.
+pub trait FrameBody: sealed::Sealed {
+    /// Encodes this message to a `(tag, payload)` pair per the module-level
+    /// frame layout.
+    fn encode(&self) -> (u8, Vec<u8>);
+}
+
+/// Serializes `msg` as the JSON payload for a frame whose tag already
+/// disambiguates the variant. Panics only if `msg` contains data
+/// `serde_json` cannot represent (not the case for any message in this
+/// protocol: strings, integers, options, and vecs thereof).
+fn json_payload<T: Serialize + std::fmt::Debug>(msg: &T) -> Vec<u8> {
+    serde_json::to_vec(msg).unwrap_or_else(|e| panic!("serialize {msg:?}: {e}"))
+}
+
+impl FrameBody for WorkerMsg {
+    fn encode(&self) -> (u8, Vec<u8>) {
+        match self {
+            WorkerMsg::BandRequest(b) => (1, b.to_bytes()),
+            WorkerMsg::Progress { .. } => (2, json_payload(self)),
+            WorkerMsg::Begin { .. } => (3, json_payload(self)),
+            WorkerMsg::OutputBand(b) => (4, b.to_bytes()),
+            WorkerMsg::Done => (5, json_payload(self)),
+            WorkerMsg::Error { .. } => (6, json_payload(self)),
+        }
+    }
+}
+
+impl FrameBody for HostMsg {
+    fn encode(&self) -> (u8, Vec<u8>) {
+        match self {
+            HostMsg::Init(_) => (128, json_payload(self)),
+            HostMsg::BandReply(b) => (129, b.to_bytes()),
+            HostMsg::OutputAck { .. } => (130, json_payload(self)),
+            HostMsg::Cancel => (131, json_payload(self)),
+        }
+    }
+}
+
+/// Writes one frame to `w`: `[u8 tag][u32 LE payload_len][payload]`.
+pub fn write_frame<W: Write>(w: &mut W, msg: &impl FrameBody) -> io::Result<()> {
+    let (tag, payload) = msg.encode();
+    let len = u32::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame payload too large"))?;
+    w.write_all(&[tag])?;
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(&payload)?;
+    Ok(())
+}
+
+/// Reads the tag byte of the next frame, if any.
+///
+/// Returns `Ok(None)` only when EOF is hit before any byte of a new frame
+/// (the peer closed its output cleanly). Any later EOF (mid-length or
+/// mid-payload) means the pipe was cut mid-frame and surfaces as a
+/// `io::ErrorKind::UnexpectedEof` from the subsequent `read_exact`.
+fn read_tag<R: Read>(r: &mut R) -> io::Result<Option<u8>> {
+    let mut tag = [0u8; 1];
+    let n = r.read(&mut tag)?;
+    Ok((n != 0).then_some(tag[0]))
+}
+
+/// Reads the `u32` LE length prefix and then that many payload bytes.
+fn read_payload<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+fn json_error(e: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+fn unknown_tag(direction: &str, tag: u8) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unknown {direction} frame tag {tag}"),
+    )
+}
+
+/// Reads one worker→host frame from `r`.
+///
+/// Returns `Ok(None)` on a clean EOF before any byte of a new frame (the
+/// worker process exited). Truncation or malformed payloads propagate as
+/// `io::Error`.
+pub fn read_worker_frame<R: Read>(r: &mut R) -> io::Result<Option<WorkerMsg>> {
+    let Some(tag) = read_tag(r)? else {
+        return Ok(None);
+    };
+    let payload = read_payload(r)?;
+    let msg = match tag {
+        1 => WorkerMsg::BandRequest(BandRequest::from_bytes(&payload)?),
+        2 | 3 | 5 | 6 => serde_json::from_slice(&payload).map_err(json_error)?,
+        4 => WorkerMsg::OutputBand(OutputBand::from_bytes(&payload)?),
+        other => return Err(unknown_tag("worker", other)),
+    };
+    Ok(Some(msg))
+}
+
+/// Reads one host→worker frame from `r`.
+///
+/// Returns `Ok(None)` on a clean EOF before any byte of a new frame (the
+/// host closed the pipe). Truncation or malformed payloads propagate as
+/// `io::Error`.
+pub fn read_host_frame<R: Read>(r: &mut R) -> io::Result<Option<HostMsg>> {
+    let Some(tag) = read_tag(r)? else {
+        return Ok(None);
+    };
+    let payload = read_payload(r)?;
+    let msg = match tag {
+        128 => serde_json::from_slice(&payload).map_err(json_error)?,
+        129 => HostMsg::BandReply(BandReply::from_bytes(&payload)?),
+        130 | 131 => serde_json::from_slice(&payload).map_err(json_error)?,
+        other => return Err(unknown_tag("host", other)),
+    };
+    Ok(Some(msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn band_request_round_trips_through_a_pipe_buffer() {
+        let req = BandRequest {
+            request_id: 7,
+            panel_id: 3,
+            y0: 256,
+            y1: 512,
+            slot_id: 2,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &WorkerMsg::BandRequest(req.clone())).unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        match read_worker_frame(&mut cur).unwrap().unwrap() {
+            WorkerMsg::BandRequest(got) => assert_eq!(got, req),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // A second read on the exhausted cursor is a clean EOF.
+        assert!(read_worker_frame(&mut cur).unwrap().is_none());
+    }
+
+    #[test]
+    fn init_job_json_round_trips() {
+        let job = InitJob {
+            protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+            shm_name: "/mmm-test".into(),
+            slot_bytes: 1 << 20,
+            input_slots: 8,
+            output_slots: 2,
+            canvas: [100, 80, 3],
+            panels: vec![PanelDesc {
+                panel_id: 0,
+                width: 100,
+                height: 80,
+                channels: 3,
+                properties: vec![],
+            }],
+            mode: JobMode::Aligned,
+            session_dir: "/tmp/x.mmm-session".into(),
+            params: BlendParamsWire::default(),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &HostMsg::Init(job.clone())).unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        match read_host_frame(&mut cur).unwrap().unwrap() {
+            HostMsg::Init(got) => assert_eq!(got, job),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+}
