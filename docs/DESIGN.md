@@ -391,3 +391,32 @@ default auto). 132 tests, clippy clean.
 - WSL2 caps RAM at 50% of host by default (`.wslconfig` to raise); mmap +
   streaming keeps us indifferent.
 ```
+<!-- NOTE: the fence above closes a stray unterminated ``` left at the old
+     end of this file (nothing followed it); closing it here keeps the
+     section below from rendering as a code block. -->
+
+## IPC transport (PixInsight)
+
+A native C++ PCL module (Plan 2) can drive mmm without writing panels to
+disk first by spawning `mmm-ipc-worker` — a Rust process that links
+`mmm-core` and does the actual analyze/blend — and talking to it over a
+control channel (the worker's stdin/stdout, length-prefixed frames) plus a
+named shared-memory segment for bulk pixels. Panel bands are pulled by the
+worker on demand (request → host fills a shm slot → reply), and blended
+output bands stream back the same way in reverse, so neither side ever
+needs a second full-canvas-resident copy of the mosaic; a worker crash or
+panic is isolated to its own process and cannot take down the host. Three
+job modes cover the input side: `Aligned` (already-registered full-canvas
+panels, read as-is), `Solved` (raw panels carrying a PixInsight plate
+solution, reprojected by mmm's phase-5 path before blending), and `Files`
+(plain file paths, bypassing the shm band-pull entirely on input).
+
+The Rust-side transport (`crates/mmm-core/src/ipc/`) and `mmm-ipc-worker`
+are implemented and tested; the C++ host module itself is Plan 2, not yet
+built. See the
+[design spec](superpowers/specs/2026-07-27-pixinsight-integration-design.md)
+for the full design rationale and the
+[wire protocol reference](../integration/pixinsight/PROTOCOL.md) for the
+exact frame format, every tag, binary field layouts, JSON schemas, and shm
+slot layout — the latter is the authoritative reference for the Plan-2 C++
+implementer.
