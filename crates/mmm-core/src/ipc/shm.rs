@@ -88,11 +88,16 @@ impl ShmSegment {
         )
         .map_err(|e| Error::compute(format!("shm_open({name}) failed: {e}")))?;
 
-        nix::unistd::ftruncate(&fd, total_bytes as libc::off_t).map_err(|e| {
-            Error::compute(format!(
+        if let Err(e) = nix::unistd::ftruncate(&fd, total_bytes as libc::off_t) {
+            // We already created the (now zero-length) named object; leaving
+            // it behind would only be cleaned up by a future `create` of the
+            // same name unlinking it first. Unlink it now instead so a
+            // failed `create` doesn't leak the shm object.
+            let _ = nix::sys::mman::shm_unlink(name);
+            return Err(Error::compute(format!(
                 "ftruncate({name}, {total_bytes} bytes) failed: {e}"
-            ))
-        })?;
+            )));
+        }
 
         let file = std::fs::File::from(fd);
         let map = unsafe {
@@ -144,7 +149,22 @@ impl ShmSegment {
 
     /// Bounds-check an `(offset_bytes, len_elements)` f32 slice request
     /// against the mapping, returning the validated byte range.
+    ///
+    /// Also enforces that `offset` is a multiple of `size_of::<f32>()`:
+    /// both [`slice`](Self::slice) (via `bytemuck::cast_slice`) and
+    /// [`slice_mut`](Self::slice_mut) (via a raw-pointer cast to `*mut
+    /// f32`, in [`Self::slice_mut_raw`]) require a 4-byte-aligned start —
+    /// for `slice_mut` a misaligned pointer would be immediate undefined
+    /// behavior when the slice is constructed, not just on access, so this
+    /// is the single chokepoint both paths go through to fail loudly
+    /// instead.
     fn checked_range(&self, offset: u64, len: u64) -> Result<std::ops::Range<usize>> {
+        if !offset.is_multiple_of(std::mem::size_of::<f32>() as u64) {
+            return Err(Error::compute(format!(
+                "slice offset {offset} is not a multiple of {} (f32 alignment)",
+                std::mem::size_of::<f32>()
+            )));
+        }
         let byte_len = len.checked_mul(4).ok_or_else(|| {
             Error::compute(format!("slice len {len} (elements) overflows byte length"))
         })?;
@@ -178,12 +198,13 @@ impl ShmSegment {
     /// Multiple callers may hold `&ShmSegment` and call `slice_mut`
     /// concurrently as long as their `(offset, len)` byte ranges are
     /// disjoint — see the `# Safety` note on the private `slice_mut_raw`, which
-    /// this delegates to after bounds-checking. [`SlotLayout`] offsets are
-    /// constructed so distinct slots never overlap.
+    /// this delegates to after bounds- and alignment-checking. [`SlotLayout`]
+    /// offsets are constructed so distinct slots never overlap.
     ///
     /// # Panics
     /// Panics if `[offset, offset + len * 4)` is out of bounds for the
-    /// segment.
+    /// segment, or if `offset` is not a multiple of 4 (required for `f32`
+    /// alignment).
     // This is the intentional public entry point for the interior-mutable
     // pattern described above and on `slice_mut_raw`'s `# Safety` section;
     // clippy's `mut_from_ref` lint fires on any `&self -> &mut` signature,
@@ -193,11 +214,10 @@ impl ShmSegment {
         let range = self
             .checked_range(offset, len)
             .expect("ShmSegment::slice_mut out of bounds");
-        let start = range.start;
-        let elems = range.len() / 4;
         // SAFETY: see `slice_mut_raw`'s `# Safety` section; `range` was just
-        // bounds-checked against the mapping above.
-        unsafe { self.slice_mut_raw(start, elems) }
+        // bounds- and alignment-checked against the mapping above (`offset`
+        // is a multiple of 4, so `range.start` is too).
+        unsafe { self.slice_mut_raw(range.start, len as usize) }
     }
 
     /// Hand out a mutable f32 slice into the mapping from a shared
@@ -208,9 +228,20 @@ impl ShmSegment {
     /// exists precisely so a host and worker (or multiple threads in one
     /// process) can write disjoint slots of the *same* segment concurrently
     /// through shared references, so this bypasses that requirement via a
-    /// raw pointer. The caller must guarantee:
-    /// - `offset_bytes + len * 4 <= self.map.len()` (both public callers
-    ///   above check this via `checked_range` before reaching here), and
+    /// raw pointer. Constructing a slice from a misaligned pointer is
+    /// undefined behavior the moment the slice is built (not just on
+    /// access), so the caller must guarantee:
+    /// - `offset_bytes + len * 4 <= self.map.len()`, and
+    /// - `offset_bytes` is a multiple of `size_of::<f32>()` (so
+    ///   `base.add(offset_bytes) as *mut f32` is properly aligned — the
+    ///   mapping's base address is page-aligned, so 4-byte alignment of the
+    ///   base plus a 4-byte-aligned offset guarantees a 4-byte-aligned
+    ///   result).
+    ///
+    /// Both of the above are established by `checked_range`, which every
+    /// caller of this function (`slice_mut` above) runs first. The one
+    /// invariant `checked_range` cannot check, and that remains the
+    /// caller's obligation, is:
     /// - the byte range `[offset_bytes, offset_bytes + len * 4)` does not
     ///   overlap any other `slice`/`slice_mut` byte range in concurrent use
     ///   (guaranteed by callers using [`SlotLayout`]-derived offsets, which
@@ -290,6 +321,39 @@ mod tests {
         assert_eq!(l.input_offset(2), 8192);
         assert_eq!(l.output_offset(0), 4096 * 3);
         assert_eq!(l.output_offset(1), 4096 * 4);
+    }
+
+    #[test]
+    fn misaligned_offset_is_rejected_by_checked_range() {
+        let name = format!("/mmm-shm-test-align-{}", std::process::id());
+        let host = ShmSegment::create(&name, 4096).unwrap();
+        // `slice_mut`'s public signature is pinned to `-> &mut [f32]` (no
+        // `Result`), so misalignment surfaces as a panic via `.expect()`
+        // rather than a value the caller can match on; `checked_range` is
+        // the private chokepoint both `slice` and `slice_mut` run through,
+        // and is where the alignment invariant is actually enforced.
+        assert!(host.checked_range(1, 1).is_err());
+        assert!(host.checked_range(3, 1).is_err());
+        // A 4-byte-aligned offset is accepted.
+        assert!(host.checked_range(4, 1).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of")]
+    fn slice_mut_panics_on_misaligned_offset() {
+        let name = format!("/mmm-shm-test-align-panic-{}", std::process::id());
+        let host = ShmSegment::create(&name, 4096).unwrap();
+        let _ = host.slice_mut(1, 1);
+    }
+
+    #[test]
+    fn slice_and_slice_mut_work_at_a_valid_aligned_offset() {
+        let name = format!("/mmm-shm-test-align-ok-{}", std::process::id());
+        let host = ShmSegment::create(&name, 4096).unwrap();
+        // Offset 4 (one f32 in) is 4-byte aligned and in bounds.
+        let w = host.slice_mut(4, 2);
+        w.copy_from_slice(&[5.0, 6.0]);
+        assert_eq!(host.slice(4, 2), &[5.0, 6.0]);
     }
 
     #[test]
