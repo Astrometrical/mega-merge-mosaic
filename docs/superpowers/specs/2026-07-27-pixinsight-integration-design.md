@@ -223,14 +223,46 @@ PJSR-scriptable for free, so power users keep batch-scripting without us
 shipping any JS. The full `ProcessInterface` UI is built in this pass (not a
 minimal stub).
 
+### 10.1 Mode is implied, not chosen
+
+There is **no required mode control**. The `JobMode` is derived from the
+selection, so the user never classifies their input in the common path:
+
+- **Files vs views** is implied by *which input the user populated* — the files
+  list or the view selector. The two are **mutually exclusive**: a selection that
+  mixes files and views is rejected with a clear error (v1 enforces a uniform
+  input type; mixed input is a possible later feature, not v1).
+- **Aligned vs solved** splits by input source:
+  - **Files** → the worker already auto-detects. `JobMode::Files` runs
+    `analyze_input(…, InputSelect::Auto)`, whose geometry-then-coverage heuristic
+    (same-geometry panels each covering < `ALIGNED_MAX_COVERAGE` ⇒ aligned; else
+    ⇒ solved) decides internally. **The host makes no aligned/solved decision for
+    files.**
+  - **Views** → the host must pick `JobMode::Aligned` vs `Solved` up front (they
+    hit different worker entry points and solved needs each view's plate solution
+    in `Init.panels[].properties`). It classifies by a **cheap, non-delicate**
+    signal: uniform view geometry ⇒ aligned (the MosaicByCoordinates case);
+    differing geometry ⇒ solved (extract each view's `AstrometricMetadata`; error
+    if any lacks a solution). This is a dimension comparison, not the delicate
+    frame math the worker owns (§15).
+- **The override.** A single **advanced control, `Input: Auto / Aligned /
+  Solved`** (default **Auto**), mirrors the CLI's existing `InputSelect` and lets
+  a user force the interpretation. It exists for the one case the pre-run signals
+  cannot catch: the file heuristic's coverage tiebreaker (same-geometry *raw*
+  panels that should be solved) needs a pixel scan the host does not have before
+  the run, and `analyze.rs` documents `--input solved` as the override for
+  exactly that. `Auto` applies the implied logic above; `Aligned`/`Solved` force
+  the corresponding `JobMode` (for views) or the corresponding `InputSelect` (for
+  files, threaded through to the worker).
+
 **`mmmProcess` parameters** (the scriptable/serializable state, all mapping to
 the CLI/`InitJob`):
 
 | parameter | maps to | notes |
 |---|---|---|
-| `inputViews` | `panels` | ordered list of view ids (aligned/solved modes) |
-| `filePaths` | `JobMode::Files.paths` | ordered path list (files mode) |
-| `mode` | `InitJob.mode` | `aligned` / `solved` / `files` |
+| `inputViews` | `panels` | ordered list of view ids; mutually exclusive with `filePaths` |
+| `filePaths` | `JobMode::Files.paths` | ordered path list; mutually exclusive with `inputViews` |
+| `inputSelect` | `JobMode` (views) / worker `InputSelect` (files) | advanced override: `Auto` (default) / `Aligned` / `Solved` — **not** a required mode picker |
 | `sessionDir` | `InitJob.session_dir` | user-owned session directory |
 | `feather` | `params.feather_px` | f32, canvas px |
 | `blendMode` | `params.mode` | `feather` / `twoband` / `pyramid` |
@@ -241,26 +273,31 @@ the CLI/`InitJob`):
 | `surfaceOrder` | `params.surface_order` | analyze surface-fit order |
 | `bandRows` | `params.band_rows` | band granularity (sane default, advanced) |
 
-**`mmmInterface` controls**: a multi-view selector with a files-list toggle, a
-session-dir picker, a mode combo (aligned/solved/files), the blend-parameter
-controls above, and a progress bar + cancel button fed by the worker's
-`Progress` frames (§15). Enable/disable logic follows the mode (files list vs
-view selector).
+**`mmmInterface` controls**: a multi-view selector *and* a files list (populating
+one clears/disables the other, giving the mutual-exclusion its UI form), a
+session-dir picker, the `Input: Auto/Aligned/Solved` advanced override, the
+blend-parameter controls above, and a progress bar + cancel button fed by the
+worker's `Progress` frames (§15).
 
 **Execution flow** (on Apply / global execute):
 
-1. Resolve the selection into ordered `PanelDesc`s. In **solved** mode, extract
-   each view's astrometric solution from its `ImageWindow` via
+1. Validate the selection is non-empty and a **single input type** (all files or
+   all views); reject a mixed or empty selection with a clear error.
+2. Resolve the effective `JobMode` from the input type + `inputSelect`
+   (§10.1). Build ordered `PanelDesc`s. When the resolved mode is **solved**,
+   extract each view's astrometric solution from its `ImageWindow` via
    `AstrometricMetadata` and carry it verbatim as `PanelDesc.properties` — a C++
-   read of the in-memory solution, **not** a file re-parse.
-2. In **solved** mode, run the worker's `--probe-frame` (§15) once to obtain the
-   output frame `w×h×ch` and size `slot_bytes` from it (§7 hazard resolved by
-   making the worker the single source of truth). In **aligned**/**files** mode
-   the canvas width is known from the panels, so slots are sized directly.
-3. Create the shm segment, spawn + supervise the worker, and drive the blend via
+   read of the in-memory solution, **not** a file re-parse. (Files mode passes no
+   properties; the worker reads solutions from the files itself.)
+3. When the resolved mode is **solved**, run the worker's `--probe-frame` (§15)
+   once to obtain the output frame `w×h×ch` and size `slot_bytes` from it (§7
+   hazard resolved by making the worker the single source of truth). In
+   **aligned**/**files** mode the canvas width is known from the panels/headers,
+   so slots are sized directly.
+4. Create the shm segment, spawn + supervise the worker, and drive the blend via
    the pure host library (§14), pumping `Progress` into the progress bar and
    offering cancel.
-4. Assemble the streamed output bands into **one new `ImageWindow`** (allocated
+5. Assemble the streamed output bands into **one new `ImageWindow`** (allocated
    once — §7, no doubling) and show it. Any host/worker error → a clean PI
    message box, **no partial window**, the user's source views intact (§9).
 
@@ -399,8 +436,9 @@ Mirrors `testhost.rs`'s `run_host` serving loop, as a reusable library:
 
 ## 15. Rust-side changes (worker + mmm-core)
 
-Two additive changes; file-mode CLI behaviour and existing tests are unchanged;
-`cargo test --workspace` stays green.
+Three additive changes; file-mode CLI behaviour and existing tests are unchanged;
+`cargo test --workspace` stays green. The third is a wire-format change, so it
+bumps `IPC_PROTOCOL_VERSION` (1 → 2) and updates `PROTOCOL.md` in the same task.
 
 1. **`mmm-ipc-worker --probe-frame`.** Reads an `Init`-shaped JSON (panels with
    solved-mode `properties`, `mode`) on stdin, builds the WCS models, runs
@@ -414,6 +452,15 @@ Two additive changes; file-mode CLI behaviour and existing tests are unchanged;
    into the IPC analyze scan (`analyze_ipc_aligned`/`analyze_ipc_solved`) and the
    blend band-sweep (`blend_with_source`'s IPC sink path) so the UI shows real
    percentages. Emitted only over the `HostLink`; the file CLI path is untouched.
+3. **`InputSelect` override for files mode.** Today `JobMode::Files` hardcodes
+   `InputSelect::Auto` in the worker `main`. To honour the UI's `Auto/Aligned/
+   Solved` override (§10.1) for **files** input, `JobMode::Files` gains an
+   `input_select` field (`"Auto"` default / `"Aligned"` / `"Solved"`, serialized
+   like the other externally-tagged enums) that the worker maps to `InputSelect`.
+   Views modes need no such field — the host resolves the override to
+   `JobMode::Aligned`/`Solved` directly, so it never reaches the worker as a
+   choice. This is the one wire-incompatible change, hence the version bump; the
+   `Aligned`/`Solved`/probe paths are unchanged on the wire.
 
 ## 16. Build system
 
