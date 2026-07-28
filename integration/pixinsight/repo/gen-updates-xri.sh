@@ -7,24 +7,26 @@ shift 4
 [ $# -ge 1 ] || { echo "at least one .meta required" >&2; exit 2; }
 
 os_to_xri() { case "$1" in macos) echo macosx ;; *) echo "$1" ;; esac; }
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 
 MID="${DATE}-mmm"
+XTITLE="$(xml_escape "$TITLE")"
+XVER="$(xml_escape "$VER")"
 {
   echo '<?xml version="1.0" encoding="UTF-8"?>'
   echo '<xri version="1.0" xmlns="http://www.pixinsight.com/xri">'
-  echo "   <description><p>${TITLE}.</p></description>"
+  echo "   <description><p>${XTITLE}.</p></description>"
   echo "   <metadata id=\"${MID}\" releaseDate=\"${DATE}\">"
-  echo "      <title>${TITLE}</title>"
-  echo "      <description><p>${TITLE}. MosaicMerge process for PixInsight.</p></description>"
+  echo "      <title>${XTITLE}</title>"
+  echo "      <description><p>${XTITLE}. MosaicMerge process for PixInsight.</p></description>"
   echo "   </metadata>"
   for META in "$@"; do
-    # shellcheck disable=SC1090
     fileName=""; sha1=""; os=""; arch=""
     while IFS='=' read -r k v; do
       case "$k" in fileName) fileName="$v";; sha1) sha1="$v";; os) os="$v";; arch) arch="$v";; esac
     done < "$META"
     xos="$(os_to_xri "$os")"
-    echo "   <platform os=\"${xos}\" arch=\"${arch}\" version=\"${VER}\">"
+    echo "   <platform os=\"${xos}\" arch=\"${arch}\" version=\"${XVER}\">"
     echo "      <package fileName=\"${fileName}\" sha1=\"${sha1}\" type=\"module\" releaseDate=\"${DATE}\" metadata=\"${MID}\"/>"
     echo "   </platform>"
   done

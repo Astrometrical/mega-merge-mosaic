@@ -43,7 +43,7 @@ jobs:
 
       - name: Cache libPCL-pxi.a (keyed on PCL commit)
         id: pcl-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: pcl-ci
           key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
@@ -51,6 +51,13 @@ jobs:
       - name: Build PCL (on cache miss)
         if: steps.pcl-cache.outputs.cache-hit != 'true'
         run: bash integration/pixinsight/ci/build-pcl.sh --out "$PWD/pcl-ci"
+
+      - name: Save libPCL-pxi.a cache (only after a successful build)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
 
       - name: Build module + worker, stage payload
         run: |

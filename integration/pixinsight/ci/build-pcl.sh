@@ -34,9 +34,15 @@ HEAD_SHA="$(git rev-parse HEAD)"
 # Soft version check against Version.cpp (belt-and-suspenders; SHA is the hard gate).
 VER_CPP="src/pcl/Version.cpp"
 if [ -f "$VER_CPP" ]; then
-  if ! grep -qE "return[[:space:]]+$PCL_VER_MINOR[[:space:]]*;" "$VER_CPP"; then
-    echo "warning: Version.cpp minor != $PCL_VER_MINOR (source may have shifted)" >&2
-  fi
+  check_ver_fn() {
+    # $1=Major|Minor|Release accessor name, $2=expected int value.
+    # Anchored to "int Version::<fn>()" (not "PixInsightVersion::<fn>()") so it
+    # only matches the PCL library version, not the confidential API version.
+    grep -A2 "^int Version::$1()" "$VER_CPP" | grep -qE "return[[:space:]]+$2[[:space:]]*;"
+  }
+  check_ver_fn Major   "$PCL_VER_MAJOR"   || echo "warning: Version.cpp major != $PCL_VER_MAJOR (source may have shifted)" >&2
+  check_ver_fn Minor   "$PCL_VER_MINOR"   || echo "warning: Version.cpp minor != $PCL_VER_MINOR (source may have shifted)" >&2
+  check_ver_fn Release "$PCL_VER_RELEASE" || echo "warning: Version.cpp release != $PCL_VER_RELEASE (source may have shifted)" >&2
 fi
 
 # Build only the static PCL library (the module links -lPCL-pxi and nothing else;

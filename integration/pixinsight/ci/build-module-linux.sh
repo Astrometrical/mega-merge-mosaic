@@ -17,7 +17,17 @@ done
 
 MODULE_DIR="$REPO_ROOT/integration/pixinsight/module"
 make -C "$MODULE_DIR" clean
-make -C "$MODULE_DIR" PCLINCDIR="$PCL/include" PCLLIBDIR="$PCL/lib"
+
+build_log="$(mktemp)"
+trap 'rm -f "$build_log"' EXIT
+make -C "$MODULE_DIR" PCLINCDIR="$PCL/include" PCLLIBDIR="$PCL/lib" 2>&1 | tee "$build_log"
+
+# The module build must be warning-free under -Wall (binding constraint, not convention).
+if grep -q 'warning:' "$build_log"; then
+  echo "ERROR: -Wall warnings in module build" >&2
+  grep 'warning:' "$build_log" >&2
+  exit 1
+fi
 
 SO="$MODULE_DIR/mmm-pxm.so"
 [ -f "$SO" ] || { echo "mmm-pxm.so not built" >&2; exit 1; }
