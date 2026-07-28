@@ -85,8 +85,24 @@ constexpr uint32_t kOutputSlots = 2;
 // interface's progress Label, pump the GUI event queue so a queued Cancel-
 // button click is delivered, and poll the Console's own Abort button; either
 // path calls Host::cancel(). This is the synchronous v1 (spec section 15): the
-// tool window is not repainted mid-run beyond ProcessEvents() pumps, and a
-// fully non-blocking pcl::Thread driver is a documented follow-up.
+// tool window is not repainted mid-run beyond ProcessEvents() pumps.
+//
+// Deliberately NOT pursuing a pcl::Thread background-execution rewrite to make
+// the whole tool window interactive during the blend -- this was considered and
+// rejected, not merely deferred:
+//   - It is non-idiomatic for a PixInsight process. Core processes such as
+//     ImageIntegration run synchronously with Console progress plus a working
+//     abort, which is exactly the model here.
+//   - It is blocked by PCL's main-thread affinity for View/ImageWindow access:
+//     DriveHost's serve loop reads source views (ViewPanelSource) and builds the
+//     output ImageWindow (ImageWindowCollector), both of which must happen on
+//     the GUI thread. Moving the run onto a worker pcl::Thread would require
+//     marshalling all of that back to the main thread anyway, for no gain over
+//     the current ProcessEvents()-pumped Console/interface progress model.
+// Progress visibility (reproject/analyze/blend Progress frames, see
+// PROTOCOL.md section 6) and a clean Cancel (ProcessAborted, not a modal error)
+// are the fixes that make this synchronous model feel responsive; revisit this
+// note before reopening the background-thread idea.
 class ConsoleProgress : public mmm::ProgressCallback
 {
 public:
@@ -262,7 +278,10 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    {
       if ( !collector.Window().IsNull() )
          collector.Window().Close();
-      throw Error( "MosaicMerge: blend cancelled by user." );
+      // pcl::ProcessAborted (not pcl::Error, not std::exception -- see
+      // MmmProcess.cpp ExecuteGlobal) signals a clean user cancellation: PixInsight
+      // treats it as an abort rather than a fault, so no red error dialog appears.
+      throw ProcessAborted();
    }
 
    // A run that completed (Done) without ever streaming a Begin/band leaves no
