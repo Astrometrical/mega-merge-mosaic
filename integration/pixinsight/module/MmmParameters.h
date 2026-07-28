@@ -51,7 +51,7 @@ class MmmInputImagesParameter : public MetaTable
 public:
 
    MmmInputImagesParameter( MetaProcess* P ) : MetaTable( P ) {}
-   IsoString Id() const override { return "inputImages"; }
+   IsoString Id() const override { return "inputViews"; }
    size_type MinLength() const override { return 2; }   // need >= 2 views to blend
 };
 
@@ -84,6 +84,7 @@ public:
 
    MmmFilePathsParameter( MetaProcess* P ) : MetaTable( P ) {}
    IsoString Id() const override { return "filePaths"; }
+   size_type MinLength() const override { return 2; }   // need >= 2 files to blend
 };
 
 extern MmmFilePathsParameter* TheMmmFilePathsParameter;

@@ -533,6 +533,8 @@ void run_blend( MmmBlendInstance& in )
       throw Error( "MosaicMerge: no input selected. Add at least two views or files." );
    if ( haveViews && haveFiles )
       throw Error( "MosaicMerge: mixed input. Select either views or files, not both." );
+   if ( ( haveViews && in.p_viewIds.Length() < 2 ) || ( haveFiles && in.p_filePaths.Length() < 2 ) )
+      throw Error( "MosaicMerge: need at least two views or files to blend." );
    if ( in.p_sessionDir.IsEmpty() )
       throw Error( "MosaicMerge: select a session directory (the worker caches analysis there)." );
 
