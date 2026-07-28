@@ -360,6 +360,10 @@ PCL headers + full PCL source present, Qt 6.8.7 bundled). Decisions:
   Windows/macOS **shm ports** (`CreateFileMapping`/`MapViewOfFile`; the Rust
   `shm.rs` already stubs non-Unix), macOS **notarization** of `mmm-ipc-worker`
   (else Gatekeeper blocks the `exec`), and Windows Authenticode/SmartScreen.
+  - **Superseded by** `2026-07-28-pixinsight-ci-and-distribution-design.md`: CI
+    now builds the module against pinned open-source PCL and a dormant
+    repository pipeline (packages + `updates.xri` + CPD signing) is in place,
+    gated on the CPD certificate (applied 2026-07-28).
 - The PCL module must be built against a matching PixInsight PCL/SDK version and
   re-validated on PI ABI updates; the worker is ABI-independent (it only talks
   the wire protocol), so a PI update never requires rebuilding the worker.
