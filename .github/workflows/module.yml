@@ -1,0 +1,100 @@
+# Builds the PixInsight module (mmm-pxm) + mmm-ipc-worker against the pinned
+# open-source PCL, with NO PixInsight on the runner. Linux is the live build;
+# Windows/macOS are scaffolded placeholders until the native ports land.
+name: Module
+
+on:
+  push:
+    paths:
+      - "integration/pixinsight/**"
+      - "crates/mmm-core/src/ipc/**"
+      - "crates/mmm-ipc-worker/**"
+      - ".github/workflows/module.yml"
+  pull_request:
+    paths:
+      - "integration/pixinsight/**"
+      - "crates/mmm-core/src/ipc/**"
+      - "crates/mmm-ipc-worker/**"
+      - ".github/workflows/module.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: module-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: build+test (linux-x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read PCL pin
+        id: pcl
+        run: |
+          . integration/pixinsight/ci/pcl-pin.env
+          echo "sha=$PCL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libPCL-pxi.a (keyed on PCL commit)
+        id: pcl-cache
+        uses: actions/cache@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+
+      - name: Build PCL (on cache miss)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        run: bash integration/pixinsight/ci/build-pcl.sh --out "$PWD/pcl-ci"
+
+      - name: Build module + worker, stage payload
+        run: |
+          bash integration/pixinsight/ci/build-module-linux.sh \
+            --pcl "$PWD/pcl-ci" --stage "$PWD/stage"
+
+      - name: Rust tests (ipc crates; ci.yml owns full workspace on main)
+        run: cargo test -p mmm-core -p mmm-ipc-worker
+
+      - name: Host golden CTest suite (no PixInsight)
+        run: |
+          cmake -S integration/pixinsight/host -B integration/pixinsight/host/ci-build
+          cmake --build integration/pixinsight/host/ci-build
+          ctest --test-dir integration/pixinsight/host/ci-build --output-on-failure
+
+      - name: Upload unsigned module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmm-pxm-linux-x64
+          path: stage/bin/**
+          if-no-files-found: error
+
+  windows:
+    name: build+test (windows-x64) — placeholder
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native port pending (Plan 3a)
+        shell: bash
+        run: |
+          echo "Windows shm + host transport port not yet implemented (Plan 3a)."
+          echo "This job is a scaffolded placeholder; it will build the module"
+          echo "once crates/mmm-core/src/ipc/shm.rs and host/ support Windows."
+          exit 1
+
+  macos:
+    name: build+test (macos-x64) — placeholder
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native port pending (Plan 3a)
+        run: |
+          echo "macOS validation + worker notarization not yet implemented (Plan 3a)."
+          echo "This job is a scaffolded placeholder."
+          exit 1
