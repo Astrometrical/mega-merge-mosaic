@@ -78,6 +78,16 @@ bool MmmBlendInterface::ImportProcess( const ProcessImplementation& p )
    // spec 10.1). Default to Views mode if both sides happen to be empty.
    m_viewsMode = !m_instance.p_viewIds.IsEmpty() || m_instance.p_filePaths.IsEmpty();
 
+   // Nothing in Assign()/the copy constructor prevents a foreign (legacy or
+   // scripted) instance from carrying BOTH arrays populated at once. Enforce
+   // the same single-input-type invariant here that every other mutation
+   // point (e_ModeClick, e_AddViewsClick, e_AddFilesClick) enforces: clear
+   // whichever side m_viewsMode did NOT select.
+   if ( m_viewsMode )
+      m_instance.p_filePaths.Clear();
+   else
+      m_instance.p_viewIds.Clear();
+
    if ( GUI != nullptr )
       UpdateControls();
 
