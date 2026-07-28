@@ -12,8 +12,11 @@
 #ifndef __MmmProcess_h
 #define __MmmProcess_h
 
+#include <pcl/Array.h>
+#include <pcl/MetaParameter.h>
 #include <pcl/MetaProcess.h>
 #include <pcl/ProcessImplementation.h>
+#include <pcl/String.h>
 
 namespace pcl
 {
@@ -74,6 +77,36 @@ public:
    bool CanExecuteGlobal( String& whyNot ) const override;
    bool CanExecuteOn( const View& view, String& whyNot ) const override;
    bool ExecuteGlobal() override;
+
+   // Parameter storage plumbing (dispatch by MetaParameter* pointer identity).
+   void*     LockParameter( const MetaParameter* p, size_type tableRow ) override;
+   bool      AllocateParameter( size_type sizeOrLength, const MetaParameter* p, size_type tableRow ) override;
+   size_type ParameterLength( const MetaParameter* p, size_type tableRow ) const override;
+
+private:
+
+   // Per-instance parameter values. Booleans/enums MUST use pcl_bool/pcl_enum
+   // (both int32-based) for ABI compatibility with the core, never C++
+   // bool/enum. The two Array<String> members are the runtime row storage for
+   // the inputImages/filePaths MetaTables (one String per row); the MetaString
+   // columns index into them by tableRow.
+   Array<String> p_viewIds;         // inputImages table rows (view ids)
+   Array<String> p_filePaths;       // filePaths table rows (file paths)
+   pcl_enum      p_inputSelect;     // Auto / Aligned / Solved
+   String        p_sessionDir;      // *.mmm-session directory
+   float         p_feather;         // feather ramp length, canvas px
+   pcl_enum      p_blendMode;       // Feather / TwoBand / Pyramid
+   int32         p_flatten;         // background-flatten polynomial order
+   pcl_bool      p_flattenEnabled;  // whether flatten is applied
+   int32         p_roi[ 4 ];        // ROI [x0,y0,x1,y1], full-res canvas coords
+   pcl_bool      p_roiEnabled;      // whether the ROI is applied
+   int32         p_downsample;      // 1 = full res, 8 = L8 preview
+   pcl_bool      p_defectVeto;      // cross-panel defect veto
+   int32         p_surfaceOrder;    // analyze surface-fit order
+   int32         p_bandRows;        // output band granularity, rows
+
+   friend class MmmBlendProcess;
+   friend class MmmBlendInterface;
 };
 
 // ----------------------------------------------------------------------------

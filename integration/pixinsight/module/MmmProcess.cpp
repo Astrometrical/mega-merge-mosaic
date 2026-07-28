@@ -2,6 +2,7 @@
 
 #include "MmmProcess.h"
 #include "MmmInterface.h"
+#include "MmmParameters.h"
 
 namespace pcl
 {
@@ -68,7 +69,21 @@ ProcessInterface* MmmBlendProcess::DefaultInterface() const
 
 MmmBlendInstance::MmmBlendInstance( const MetaProcess* m )
    : ProcessImplementation( m )
+   , p_inputSelect( TheMmmInputSelectParameter->ElementValue( TheMmmInputSelectParameter->DefaultValueIndex() ) )
+   , p_feather( float( TheMmmFeatherParameter->DefaultValue() ) )
+   , p_blendMode( TheMmmBlendModeParameter->ElementValue( TheMmmBlendModeParameter->DefaultValueIndex() ) )
+   , p_flatten( int32( TheMmmFlattenParameter->DefaultValue() ) )
+   , p_flattenEnabled( TheMmmFlattenEnabledParameter->DefaultValue() )
+   , p_roiEnabled( TheMmmRoiEnabledParameter->DefaultValue() )
+   , p_downsample( int32( TheMmmDownsampleParameter->DefaultValue() ) )
+   , p_defectVeto( TheMmmDefectVetoParameter->DefaultValue() )
+   , p_surfaceOrder( int32( TheMmmSurfaceOrderParameter->DefaultValue() ) )
+   , p_bandRows( int32( TheMmmBandRowsParameter->DefaultValue() ) )
 {
+   p_roi[0] = int32( TheMmmRoiX0Parameter->DefaultValue() );
+   p_roi[1] = int32( TheMmmRoiY0Parameter->DefaultValue() );
+   p_roi[2] = int32( TheMmmRoiX1Parameter->DefaultValue() );
+   p_roi[3] = int32( TheMmmRoiY1Parameter->DefaultValue() );
 }
 
 MmmBlendInstance::MmmBlendInstance( const MmmBlendInstance& x )
@@ -79,12 +94,28 @@ MmmBlendInstance::MmmBlendInstance( const MmmBlendInstance& x )
 
 void MmmBlendInstance::Assign( const ProcessImplementation& p )
 {
-   // No parameters yet; nothing to copy. The dynamic_cast documents intent and
-   // guards against cross-type assignment once parameters exist.
+   // Deep-copy every parameter member. The dynamic_cast guards against a
+   // cross-type assignment; a no-op on a foreign type is the correct behavior.
    const MmmBlendInstance* x = dynamic_cast<const MmmBlendInstance*>( &p );
    if ( x != nullptr )
    {
-      // (future: copy parameter members from *x)
+      p_viewIds       = x->p_viewIds;
+      p_filePaths     = x->p_filePaths;
+      p_inputSelect   = x->p_inputSelect;
+      p_sessionDir    = x->p_sessionDir;
+      p_feather       = x->p_feather;
+      p_blendMode     = x->p_blendMode;
+      p_flatten       = x->p_flatten;
+      p_flattenEnabled = x->p_flattenEnabled;
+      p_roi[0]        = x->p_roi[0];
+      p_roi[1]        = x->p_roi[1];
+      p_roi[2]        = x->p_roi[2];
+      p_roi[3]        = x->p_roi[3];
+      p_roiEnabled    = x->p_roiEnabled;
+      p_downsample    = x->p_downsample;
+      p_defectVeto    = x->p_defectVeto;
+      p_surfaceOrder  = x->p_surfaceOrder;
+      p_bandRows      = x->p_bandRows;
    }
 }
 
@@ -104,6 +135,106 @@ bool MmmBlendInstance::ExecuteGlobal()
 {
    // Task 1: no-op. Real blend orchestration arrives in later tasks.
    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Parameter storage hooks. The core calls these keyed by the MetaParameter*
+// singleton pointer (identity dispatch) plus a tableRow index for table/column
+// parameters. For the two MetaTables the core never Lock()s the table itself:
+// row count is served by ParameterLength and row allocation by
+// AllocateParameter; only the MetaString columns and the scalar parameters are
+// ever locked for a value pointer.
+// ----------------------------------------------------------------------------
+
+void* MmmBlendInstance::LockParameter( const MetaParameter* p, size_type tableRow )
+{
+   // Table string columns: return a raw pointer into that row's UTF-16 buffer.
+   if ( p == TheMmmViewIdParameter )
+      return p_viewIds[tableRow].Begin();
+   if ( p == TheMmmPathParameter )
+      return p_filePaths[tableRow].Begin();
+
+   // Scalars.
+   if ( p == TheMmmInputSelectParameter )   return &p_inputSelect;
+   if ( p == TheMmmSessionDirParameter )    return p_sessionDir.Begin();
+   if ( p == TheMmmFeatherParameter )       return &p_feather;
+   if ( p == TheMmmBlendModeParameter )     return &p_blendMode;
+   if ( p == TheMmmFlattenParameter )       return &p_flatten;
+   if ( p == TheMmmFlattenEnabledParameter ) return &p_flattenEnabled;
+   if ( p == TheMmmRoiX0Parameter )         return &p_roi[0];
+   if ( p == TheMmmRoiY0Parameter )         return &p_roi[1];
+   if ( p == TheMmmRoiX1Parameter )         return &p_roi[2];
+   if ( p == TheMmmRoiY1Parameter )         return &p_roi[3];
+   if ( p == TheMmmRoiEnabledParameter )    return &p_roiEnabled;
+   if ( p == TheMmmDownsampleParameter )    return &p_downsample;
+   if ( p == TheMmmDefectVetoParameter )    return &p_defectVeto;
+   if ( p == TheMmmSurfaceOrderParameter )  return &p_surfaceOrder;
+   if ( p == TheMmmBandRowsParameter )      return &p_bandRows;
+
+   return nullptr;
+}
+
+bool MmmBlendInstance::AllocateParameter( size_type sizeOrLength, const MetaParameter* p, size_type tableRow )
+{
+   // Tables: sizeOrLength is a ROW COUNT -> resize the backing Array<String>.
+   if ( p == TheMmmInputImagesParameter )
+   {
+      p_viewIds.Clear();
+      if ( sizeOrLength > 0 )
+         p_viewIds.Add( String(), sizeOrLength );
+      return true;
+   }
+   if ( p == TheMmmFilePathsParameter )
+   {
+      p_filePaths.Clear();
+      if ( sizeOrLength > 0 )
+         p_filePaths.Add( String(), sizeOrLength );
+      return true;
+   }
+
+   // String columns / scalar strings: sizeOrLength is a CHARACTER LENGTH.
+   if ( p == TheMmmViewIdParameter )
+   {
+      p_viewIds[tableRow].Clear();
+      if ( sizeOrLength > 0 )
+         p_viewIds[tableRow].SetLength( sizeOrLength );
+      return true;
+   }
+   if ( p == TheMmmPathParameter )
+   {
+      p_filePaths[tableRow].Clear();
+      if ( sizeOrLength > 0 )
+         p_filePaths[tableRow].SetLength( sizeOrLength );
+      return true;
+   }
+   if ( p == TheMmmSessionDirParameter )
+   {
+      p_sessionDir.Clear();
+      if ( sizeOrLength > 0 )
+         p_sessionDir.SetLength( sizeOrLength );
+      return true;
+   }
+
+   return false;
+}
+
+size_type MmmBlendInstance::ParameterLength( const MetaParameter* p, size_type tableRow ) const
+{
+   // Tables: report the ROW COUNT.
+   if ( p == TheMmmInputImagesParameter )
+      return p_viewIds.Length();
+   if ( p == TheMmmFilePathsParameter )
+      return p_filePaths.Length();
+
+   // String columns / scalar strings: report the CHARACTER LENGTH.
+   if ( p == TheMmmViewIdParameter )
+      return p_viewIds[tableRow].Length();
+   if ( p == TheMmmPathParameter )
+      return p_filePaths[tableRow].Length();
+   if ( p == TheMmmSessionDirParameter )
+      return p_sessionDir.Length();
+
+   return 0;
 }
 
 // ----------------------------------------------------------------------------

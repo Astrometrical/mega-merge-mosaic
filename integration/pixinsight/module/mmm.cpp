@@ -12,6 +12,7 @@
 #include <pcl/MetaModule.h>
 
 #include "MmmInterface.h"
+#include "MmmParameters.h"
 #include "MmmProcess.h"
 
 #define MMM_MODULE_VERSION_MAJOR     1
@@ -77,7 +78,34 @@ PCL_MODULE_EXPORT pcl::int32 InstallPixInsightModule( pcl::int32 mode )
    if ( mode == pcl::InstallMode::FullInstall )
    {
       new pcl::MmmBlendProcess;     // self-registers under pcl::Module
-      new pcl::MmmBlendInterface;   // self-registers under pcl::Module
+
+      // Parameter singletons self-register under their owning MetaProcess* (or,
+      // for a table string column, its MetaTable*) via MetaObject's ctor. Each
+      // TheMmm...Parameter global captures the singleton for pointer-identity
+      // dispatch in the instance hooks. Construct each table before its string
+      // column so the column is appended to the correct parent.
+      using namespace pcl;
+      TheMmmInputImagesParameter   = new MmmInputImagesParameter( TheMmmBlendProcess );
+      TheMmmViewIdParameter        = new MmmViewIdParameter( TheMmmInputImagesParameter );
+      TheMmmFilePathsParameter     = new MmmFilePathsParameter( TheMmmBlendProcess );
+      TheMmmPathParameter          = new MmmPathParameter( TheMmmFilePathsParameter );
+      TheMmmInputSelectParameter   = new MmmInputSelectParameter( TheMmmBlendProcess );
+      TheMmmSessionDirParameter    = new MmmSessionDirParameter( TheMmmBlendProcess );
+      TheMmmFeatherParameter       = new MmmFeatherParameter( TheMmmBlendProcess );
+      TheMmmBlendModeParameter     = new MmmBlendModeParameter( TheMmmBlendProcess );
+      TheMmmFlattenParameter       = new MmmFlattenParameter( TheMmmBlendProcess );
+      TheMmmFlattenEnabledParameter = new MmmFlattenEnabledParameter( TheMmmBlendProcess );
+      TheMmmRoiX0Parameter         = new MmmRoiX0Parameter( TheMmmBlendProcess );
+      TheMmmRoiY0Parameter         = new MmmRoiY0Parameter( TheMmmBlendProcess );
+      TheMmmRoiX1Parameter         = new MmmRoiX1Parameter( TheMmmBlendProcess );
+      TheMmmRoiY1Parameter         = new MmmRoiY1Parameter( TheMmmBlendProcess );
+      TheMmmRoiEnabledParameter    = new MmmRoiEnabledParameter( TheMmmBlendProcess );
+      TheMmmDownsampleParameter    = new MmmDownsampleParameter( TheMmmBlendProcess );
+      TheMmmDefectVetoParameter    = new MmmDefectVetoParameter( TheMmmBlendProcess );
+      TheMmmSurfaceOrderParameter  = new MmmSurfaceOrderParameter( TheMmmBlendProcess );
+      TheMmmBandRowsParameter      = new MmmBandRowsParameter( TheMmmBlendProcess );
+
+      new MmmBlendInterface;   // self-registers under pcl::Module
    }
 
    return 0;

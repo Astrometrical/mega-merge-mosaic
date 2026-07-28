@@ -31,6 +31,7 @@ LIBS     = -L"$(PCLLIBDIR)" -lPCL-pxi -lpthread -lrt
 
 MODULE_OBJS = $(OBJDIR)/mmm.o \
               $(OBJDIR)/MmmProcess.o \
+              $(OBJDIR)/MmmParameters.o \
               $(OBJDIR)/MmmInterface.o
 
 HOST_OBJS   = $(OBJDIR)/mmm_shm.o \
