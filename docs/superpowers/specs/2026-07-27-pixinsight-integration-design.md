@@ -344,8 +344,12 @@ PCL headers + full PCL source present, Qt 6.8.7 bundled). Decisions:
   Pleiades certificate**: PixInsight's **local signing identity** (bundled
   `SigningKeys` script → a `.xssk` keys file tied to the developer's license)
   signs the `.so` via `PixInsight --sign-module-file=… --xssk-file=… --xssk-password=…`,
-  producing an `mmm-pxm.xsgn` the local core trusts. A `make sign` target and
-  the exact commands live in `integration/pixinsight/module/README.md`. The
+  producing an `mmm-pxm.xsgn`. **Two one-time steps, not one:** the `.xssk`
+  generation only creates the keypair; the identity's public key must then be
+  **installed into the core** via **Script → Local Signing Identity…** (select
+  the `.xssk`, make it persistent) or the core rejects the signature with
+  *"Unknown code signing identity."* A `make sign` target and the exact commands
+  live in `integration/pixinsight/module/README.md`. The
   Pleiades **Certified-Developer** certificate is only required to distribute a
   signature *other* machines will trust (repository distribution below).
   With the local signing step, dev distribution is otherwise complete.

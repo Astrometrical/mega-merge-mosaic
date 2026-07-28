@@ -101,9 +101,18 @@ certificate is only needed to distribute to *other* people (spec §12).
 **1. Generate a local signing key — once (GUI, needs your license).** Run the
 bundled **SigningKeys** script (open `/opt/PixInsight/src/scripts/SigningKeys/SigningKeys.js`
 in the Script editor, or find it under the Script menu). Tick **"Local signing
-identity"**, enter any Developer id, and write a keys file, e.g.
-`~/mmm-dev.xssk`, with a password. (Back this file up — losing it loses the
-identity.)
+identity"** (the Developer id field is ignored for a local identity — it's
+derived from your license) and write a keys file, e.g. `~/mmm-dev.xssk`, with a
+password. (Back this file up — losing it loses the identity.)
+
+**1b. Install the local signing identity into the core — once.** Generating the
+`.xssk` only creates the keypair; the core will still reject a module signed
+with it (*"Unknown code signing identity '…'"*) until the identity's **public**
+key is installed. Run **Script → Local Signing Identity…**, and in the *Manage
+Local Signing Identity* dialog: select your `~/mmm-dev.xssk`, enter its
+password, and enable the **"make persistent"** option (stores the encrypted
+public key in global settings so it loads on every startup). After this the core
+trusts modules/scripts signed with that identity.
 
 **2. Sign the module — each build:**
 
