@@ -55,4 +55,4 @@ run "$PIXINSIGHT" --automation-mode -n \
 if [ -n "$OUT" ]; then
   run cp -r "$STAGE_ROOT" "$XRI" "$OUT/"
 fi
-echo "signing complete${DRY:+ (dry-run)}"
+if [ "$DRY" -eq 1 ]; then echo "signing complete (dry-run)"; else echo "signing complete"; fi
