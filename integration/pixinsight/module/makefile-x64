@@ -33,6 +33,7 @@ MODULE_OBJS = $(OBJDIR)/mmm.o \
               $(OBJDIR)/MmmProcess.o \
               $(OBJDIR)/MmmParameters.o \
               $(OBJDIR)/MmmInterface.o \
+              $(OBJDIR)/MmmExecution.o \
               $(OBJDIR)/ViewPanelSource.o \
               $(OBJDIR)/ImageWindowCollector.o \
               $(OBJDIR)/AstrometryProps.o

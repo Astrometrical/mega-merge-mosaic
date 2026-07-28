@@ -1,8 +1,13 @@
 // MmmProcess.cpp -- implementation of the trivial MergeMosaic process/instance.
 
 #include "MmmProcess.h"
+#include "MmmExecution.h"
 #include "MmmInterface.h"
 #include "MmmParameters.h"
+
+#include <exception>
+
+#include <pcl/Exception.h>
 
 namespace pcl
 {
@@ -133,7 +138,23 @@ bool MmmBlendInstance::CanExecuteOn( const View&, String& whyNot ) const
 
 bool MmmBlendInstance::ExecuteGlobal()
 {
-   // Task 1: no-op. Real blend orchestration arrives in later tasks.
+   // Drive the whole blend (spec section 10.1). A pcl::Error/pcl::ProcessAborted
+   // propagates so PixInsight surfaces it (and no output window is shown); a
+   // host-library failure (mmm::HostError, a std::exception) is converted to a
+   // clean pcl::Error. On any error the source views are left intact and no
+   // partial window exists (fault isolation, spec section 9).
+   try
+   {
+      run_blend( *this );
+   }
+   catch ( const Error& )
+   {
+      throw;
+   }
+   catch ( const std::exception& e )
+   {
+      throw Error( String( e.what() ) );
+   }
    return true;
 }
 

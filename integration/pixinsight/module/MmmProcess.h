@@ -107,6 +107,9 @@ private:
 
    friend class MmmBlendProcess;
    friend class MmmBlendInterface;
+   // Task 5: the ExecuteGlobal orchestration reads the instance's parameters
+   // directly to build the worker Init job (see MmmExecution.cpp).
+   friend void run_blend( MmmBlendInstance& );
 };
 
 // ----------------------------------------------------------------------------

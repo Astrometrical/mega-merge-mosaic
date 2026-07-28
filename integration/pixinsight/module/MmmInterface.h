@@ -63,6 +63,11 @@ public:
    bool                   Launch( const MetaProcess&, const ProcessImplementation*,
                                   bool& dynamic, unsigned& flags ) override;
 
+   // Task 5 run-state hooks, called from the ExecuteGlobal orchestration
+   // (MmmExecution.cpp). Both are no-ops if the control tree is not built yet.
+   void SetBlendRunning( bool running );        // enable/disable the Cancel button
+   void SetProgressText( const String& text );  // live worker-progress text
+
 private:
 
    /*!

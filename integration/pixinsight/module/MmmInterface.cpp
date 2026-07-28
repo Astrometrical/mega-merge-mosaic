@@ -17,6 +17,7 @@
 // against the reference doc -- see task-3-report.md).
 
 #include "MmmInterface.h"
+#include "MmmExecution.h"
 
 #include <pcl/Array.h>
 #include <pcl/FileDialog.h>
@@ -638,9 +639,31 @@ void MmmBlendInterface::e_RoiValueUpdated( NumericEdit& sender, double value )
 
 void MmmBlendInterface::e_CancelClick( Button&, bool )
 {
-   // Placeholder: Cancel_PushButton starts disabled and is not yet reachable.
-   // Task 5 wires this to the worker's cancellation path (docs/DESIGN.md IPC
-   // section) and drives Progress_Label from the worker's Progress frames.
+   // Ask the running blend to stop (spec section 15). The button is enabled only
+   // for the duration of a run (SetBlendRunning); request_cancel() is a no-op if
+   // nothing is running. The synchronous v1 delivers this click via the
+   // ProcessEvents() pump inside the run's progress callback.
+   request_cancel();
+}
+
+// ----------------------------------------------------------------------------
+// Task 5 run-state hooks (called from MmmExecution.cpp on the execute thread).
+// ----------------------------------------------------------------------------
+
+void MmmBlendInterface::SetBlendRunning( bool running )
+{
+   if ( GUI == nullptr )
+      return;
+   GUI->Cancel_PushButton.Enable( running );
+   if ( !running )
+      GUI->Progress_Label.Clear();
+}
+
+void MmmBlendInterface::SetProgressText( const String& text )
+{
+   if ( GUI == nullptr )
+      return;
+   GUI->Progress_Label.SetText( text );
 }
 
 // ----------------------------------------------------------------------------
