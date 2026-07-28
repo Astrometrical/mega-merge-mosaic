@@ -66,11 +66,28 @@ jobs:
           cmake --build integration/pixinsight/host/ci-build
           ctest --test-dir integration/pixinsight/host/ci-build --output-on-failure
 
-      - name: Upload unsigned module artifact
+      - name: Generate + validate repository package and updates.xri (no publish)
+        run: |
+          sudo apt-get update && sudo apt-get install -y libxml2-utils
+          bash integration/pixinsight/repo/gen-package.sh linux x64 "$PWD/stage" "$PWD/repo-out"
+          bash integration/pixinsight/repo/gen-updates-xri.sh \
+            "$(date -u +%Y%m%d)" "1.9.4:1.9.4" "MergeMosaic module" \
+            "$PWD/repo-out/updates.xri" "$PWD/repo-out/linux-x64.meta"
+          xmllint --noout "$PWD/repo-out/updates.xri"
+          echo "repository artifacts generated + validated (dormant: not published)"
+
+      - name: Run repo generator tests
+        run: |
+          bash integration/pixinsight/repo/test/test-gen-package.sh
+          bash integration/pixinsight/repo/test/test-gen-updates-xri.sh
+
+      - name: Upload unsigned module + repo artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mmm-pxm-linux-x64
-          path: stage/bin/**
+          path: |
+            stage/bin/**
+            repo-out/**
           if-no-files-found: error
 
   windows:
