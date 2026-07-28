@@ -50,6 +50,37 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $(TARGET) $(OBJS) $(LIBS)
 
+# --- Code signing (PixInsight >= 1.9 refuses unsigned modules) ---------------
+# PixInsight 1.9 removed the "allow unsigned modules" option. For LOCAL
+# development you do NOT need a Pleiades certificate: generate a *local signing
+# identity* once via the bundled SigningKeys script (tick "Local signing
+# identity" -> writes a .xssk keys file tied to your license), then sign the
+# module here. That produces mmm-pxm.xsgn beside the .so, which the local core
+# trusts. The Pleiades Certified-Developer cert is only needed to distribute to
+# OTHER machines (see integration/pixinsight/module/README.md and spec §12).
+#
+#   make sign XSSK_FILE=$HOME/mmm-dev.xssk XSSK_PASSWORD='your-password'
+#
+# If PixInsight stays open after signing on your version, adjust SIGN_EXIT.
+PIXINSIGHT    ?= PixInsight
+XSSK_FILE     ?=
+XSSK_PASSWORD ?=
+SIGN_EXIT     ?= --force-exit
+
+.PHONY: sign
+sign: $(TARGET)
+	@test -n "$(XSSK_FILE)" || { \
+	  echo "error: set XSSK_FILE=/path/to/your.xssk (generate it via the PixInsight"; \
+	  echo "       SigningKeys script with 'Local signing identity' ticked)."; \
+	  exit 1; }
+	$(PIXINSIGHT) --automation-mode -n \
+	  --sign-module-file="$(CURDIR)/$(TARGET)" \
+	  --xssk-file="$(XSSK_FILE)" --xssk-password="$(XSSK_PASSWORD)" \
+	  $(SIGN_EXIT)
+	@test -f "$(CURDIR)/mmm-pxm.xsgn" \
+	  && echo "signed: mmm-pxm.xsgn written beside the module" \
+	  || echo "note: mmm-pxm.xsgn not found — check the signing output above (flags/password)."
+
 # Module sources (this directory).
 $(OBJDIR)/%.o: %.cpp | $(OBJDIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $<

@@ -89,20 +89,58 @@ cp target/release/mmm-ipc-worker integration/pixinsight/module/
 If the worker binary is missing, `MosaicMerge` reports a clear PixInsight
 error at execute time rather than failing silently or hanging.
 
+## Code signing (required — PixInsight ≥ 1.9)
+
+PixInsight **1.9 removed the "allow installation of unsigned modules" option**;
+an unsigned module now fails to install with *"Required module signature not
+found"*. For **local development you do NOT need a Pleiades certificate** —
+PixInsight provides a *local signing identity* (tied to your license, valid only
+on machines where you hold a valid PixInsight license). The Certified-Developer
+certificate is only needed to distribute to *other* people (spec §12).
+
+**1. Generate a local signing key — once (GUI, needs your license).** Run the
+bundled **SigningKeys** script (open `/opt/PixInsight/src/scripts/SigningKeys/SigningKeys.js`
+in the Script editor, or find it under the Script menu). Tick **"Local signing
+identity"**, enter any Developer id, and write a keys file, e.g.
+`~/mmm-dev.xssk`, with a password. (Back this file up — losing it loses the
+identity.)
+
+**2. Sign the module — each build:**
+
+```sh
+make -f makefile-x64 sign \
+  XSSK_FILE=$HOME/mmm-dev.xssk XSSK_PASSWORD='your-password'
+```
+
+which runs, roughly:
+
+```sh
+PixInsight --automation-mode -n \
+  --sign-module-file="$PWD/mmm-pxm.so" \
+  --xssk-file="$HOME/mmm-dev.xssk" --xssk-password='your-password' \
+  --force-exit
+```
+
+That writes `mmm-pxm.xsgn` beside the `.so`. If PixInsight stays open after
+signing on your version, override the exit behavior:
+`make -f makefile-x64 sign … SIGN_EXIT=--force-exit` (or drop `-n`) — adjust once
+for your build and it's stable thereafter.
+
 ## Installing into PixInsight (dev flow)
 
-There is no signed update repository yet (spec §12) — install the freshly
-built folder directly:
+There is no signed update repository yet (spec §12) — install the freshly built,
+**signed** module directly:
 
-1. In PixInsight: **Process → Modules → Install Modules…**
-2. Point it at `integration/pixinsight/module/` (the folder containing
-   `mmm-pxm.so` and `mmm-ipc-worker`), or select `mmm-pxm.so` directly.
-3. Restart PixInsight if prompted.
-4. Confirm **MosaicMerge** now appears under the **Mosaic** category in the
+1. Ensure `mmm-pxm.so` **and its `mmm-pxm.xsgn`** (from the signing step above)
+   are together in the folder, alongside `mmm-ipc-worker`.
+2. In PixInsight: **Process → Modules → Install Modules…**
+3. Point it at `integration/pixinsight/module/`, or select `mmm-pxm.so` directly.
+4. Restart PixInsight if prompted.
+5. Confirm **MosaicMerge** now appears under the **Mosaic** category in the
    Process menu.
 
-Unsigned local modules load without issue for development; this is the whole
-distribution story for now.
+A module signed with your local identity loads on your licensed machine(s); this
+is the whole dev-distribution story for now.
 
 ## Manual smoke test
 

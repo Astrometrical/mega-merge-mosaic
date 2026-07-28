@@ -329,17 +329,26 @@ PCL headers + full PCL source present, Qt 6.8.7 bundled). Decisions:
 - **Dev distribution on Linux/WSL — implemented (Plan 2b):** `mmm-pxm.so`
   builds warning-free (`integration/pixinsight/module`, plain `make` linking
   `libPCL-pxi.a` + the `host/` transport objects), `mmm-ipc-worker` ships
-  beside it, and it loads via PixInsight's manual **Install Modules**
-  (unsigned local modules load fine for development; `InstallPixInsightModule`
-  registers **MosaicMerge** under the **Mosaic** category). One-time
-  prerequisite: build **`libPCL-pxi.a`** out-of-tree from a copy of the
-  bundled source (`/opt/PixInsight/src/{pcl,3rdparty}`, root-owned in place),
-  output directed to a **project-local** lib dir (`~/.local/pcl-build/lib`)
-  so no writes to the root-owned install and no sudo. Full commands, the
-  module build, worker placement, the Install Modules flow, and the manual
-  smoke-test checklist are documented in
-  `integration/pixinsight/module/README.md`. Remaining for this path: nothing
-  functional — it is the whole dev-distribution story today.
+  beside it, `InstallPixInsightModule` registers **MosaicMerge** under the
+  **Mosaic** category, and it loads via PixInsight's manual **Install
+  Modules**. One-time prerequisite: build **`libPCL-pxi.a`** out-of-tree from a
+  copy of the bundled source (`/opt/PixInsight/src/{pcl,3rdparty}`, root-owned
+  in place), output directed to a **project-local** lib dir
+  (`~/.local/pcl-build/lib`) so no writes to the root-owned install and no
+  sudo.
+- **Module signing is required, even for dev (corrected — PixInsight ≥ 1.9).**
+  The earlier working assumption that *unsigned* local modules load for
+  development is **wrong on current PixInsight**: 1.9 removed the "allow
+  installation of unsigned modules" option, and an unsigned module fails with
+  *"Required module signature not found."* The supported dev path needs **no
+  Pleiades certificate**: PixInsight's **local signing identity** (bundled
+  `SigningKeys` script → a `.xssk` keys file tied to the developer's license)
+  signs the `.so` via `PixInsight --sign-module-file=… --xssk-file=… --xssk-password=…`,
+  producing an `mmm-pxm.xsgn` the local core trusts. A `make sign` target and
+  the exact commands live in `integration/pixinsight/module/README.md`. The
+  Pleiades **Certified-Developer** certificate is only required to distribute a
+  signature *other* machines will trust (repository distribution below).
+  With the local signing step, dev distribution is otherwise complete.
 - **Later — repository distribution (planned, not implemented):** a PixInsight
   **update repository** (user adds a URL once; auto-install + auto-update). Costs:
   a **code-signing certificate from the PixInsight team** and a **per-platform
