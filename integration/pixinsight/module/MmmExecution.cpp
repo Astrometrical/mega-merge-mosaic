@@ -20,6 +20,7 @@
 #include <pcl/ImageVariant.h>
 #include <pcl/ImageWindow.h>
 #include <pcl/MetaModule.h>
+#include <pcl/Property.h>
 #include <pcl/View.h>
 
 #include "AstrometryProps.h"
@@ -264,6 +265,10 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
       throw Error( "MosaicMerge: blend cancelled by user." );
    }
 
+   // A run that completed (Done) without ever streaming a Begin/band leaves no
+   // window -- surface that as a clean error rather than Show()ing a null window.
+   if ( collector.Window().IsNull() )
+      throw Error( "MosaicMerge: the worker completed without producing an output image." );
    collector.Window().Show();
 }
 
@@ -282,13 +287,16 @@ void RunViews( const Params& in, const std::string& worker_path )
    }
 
    // Lock all views for the duration of the run (ViewPanelSource contract);
-   // unlock on every exit path.
+   // unlock on every exit path. The lock loop is INSIDE the try so that a
+   // throwing Lock() still releases the [0, locked) views already acquired
+   // (locked counts successfully-locked views: it is only incremented after a
+   // Lock() returns).
    size_type locked = 0;
-   for ( ; locked < views.Length(); ++locked )
-      views[locked].Lock();
-
    try
    {
+      for ( ; locked < views.Length(); ++locked )
+         views[locked].Lock();
+
       // Collect geometry; note whether all views share identical dimensions.
       Array<uint64_t> ws, hs, cs;
       bool uniform = true;
@@ -404,14 +412,17 @@ void RunViews( const Params& in, const std::string& worker_path )
 
 void RunFiles( const Params& in, const std::string& worker_path )
 {
-   // Read each file's geometry (no pixel load) to build PanelDescs and size the
-   // slots. The worker reads pixels off disk itself, so no properties/pixels
-   // travel over shm (PROTOCOL.md section 11).
-   json panels     = json::array();
-   json file_paths = json::array();
-   uint64_t max_w  = 0;
-   uint64_t ch0    = 0;
-   uint32_t pid    = 0;
+   // Read each file's geometry AND astrometric properties (no pixel load). The
+   // run itself sends empty PanelDesc.properties -- the worker re-derives the
+   // solution from the files it reads (PROTOCOL.md section 11) -- but we keep the
+   // read properties to size the output slot safely (see the probe below).
+   json     panels        = json::array();   // the run panels (empty properties)
+   json     probe_panels  = json::array();   // the same panels WITH properties, for --probe-frame
+   json     file_paths    = json::array();
+   uint64_t max_w         = 0;
+   uint64_t ch0           = 0;
+   uint32_t pid           = 0;
+   bool     allHaveSolution = true;
    for ( const String& path : in.filePaths )
    {
       FileFormat         format( File::ExtractExtension( path ), true /*toRead*/, false /*toWrite*/ );
@@ -421,13 +432,24 @@ void RunFiles( const Params& in, const std::string& worker_path )
          throw Error( "MosaicMerge: cannot read image file: " + path );
       const ImageInfo& info = images[0].info;
 
+      // Read this file's astrometric solution, if the format carries one.
+      json props = json::array();
+      if ( format.CanStoreImageProperties() )
+         props = extract_astrometry_props( file.ReadImageProperties() );
+      if ( props.empty() )
+         allHaveSolution = false;
+
       json pd;
-      pd["panel_id"]   = pid;
-      pd["width"]      = uint64_t( info.width );
-      pd["height"]     = uint64_t( info.height );
-      pd["channels"]   = uint64_t( info.numberOfChannels );
-      pd["properties"] = json::array();
+      pd["panel_id"] = pid;
+      pd["width"]    = uint64_t( info.width );
+      pd["height"]   = uint64_t( info.height );
+      pd["channels"] = uint64_t( info.numberOfChannels );
+
+      json ppd            = pd;
+      pd["properties"]    = json::array();
+      ppd["properties"]   = std::move( props );
       panels.push_back( std::move( pd ) );
+      probe_panels.push_back( std::move( ppd ) );
       file_paths.push_back( std::string( path.ToUTF8().c_str() ) );
 
       if ( uint64_t( info.width ) > max_w )
@@ -441,13 +463,41 @@ void RunFiles( const Params& in, const std::string& worker_path )
 
    const uint64_t band_rows = uint64_t( uint32_t( in.bandRows ) );
 
-   // First-pass slot sizing (spec section 10.1): the worker derives its own
-   // frame in Files mode, so we size from the widest input file. This is exact
-   // for aligned on-disk panels (canvas width == file width); solved-content
-   // files whose reprojected frame exceeds the widest input width are a known
-   // v1 limitation (there is no probe path for Files mode -- the probe needs the
-   // in-memory PanelDesc.properties that Files mode does not carry).
-   const uint64_t slot_bytes = max_w * ch0 * band_rows * 4;
+   // Output-slot sizing. The output band width is the width of the frame the
+   // worker computes, which differs by how Files mode resolves aligned-vs-solved
+   // (PROTOCOL.md section 11):
+   //   * SOLVED  -- the worker reprojects onto its own choose_frame, whose width
+   //     can EXCEED every input file's width. Sizing by input width alone would
+   //     silently overrun the output slot (section 7 hazard). So when the run can
+   //     resolve to solved (input_select Solved or Auto) AND every file carries a
+   //     plate solution, probe the worker for the frame width -- exactly as
+   //     test_golden_solved.cpp sizes its Files(Solved) run -- and take the max.
+   //   * ALIGNED -- the output canvas width == the (shared) file width, so the
+   //     widest input file is exact. This covers input_select Aligned, and Auto
+   //     with registered (no-solution) files.
+   const bool canSolve = ( in.inputSelect == MmmInputSelectParameter::Solved ) ||
+                         ( in.inputSelect == MmmInputSelectParameter::Auto );
+   uint64_t width = max_w;
+   if ( canSolve && allHaveSolution )
+   {
+      json probe_init;
+      probe_init["protocol_version"] = 2;
+      probe_init["shm_name"]         = "";
+      probe_init["slot_bytes"]       = 0;
+      probe_init["input_slots"]      = 0;
+      probe_init["output_slots"]     = 0;
+      probe_init["canvas"]           = { uint64_t( 0 ), uint64_t( 0 ), ch0 };
+      probe_init["panels"]           = std::move( probe_panels );
+      probe_init["mode"]             = "Solved";
+      probe_init["session_dir"]      = "";
+      probe_init["params"]           = BuildParams( in );
+
+      uint64_t fw = 0, fh = 0, fch = 0;
+      mmm::Host::probe_frame( worker_path, probe_init, fw, fh, fch );
+      if ( fw > width )
+         width = fw;
+   }
+   const uint64_t slot_bytes = width * ch0 * band_rows * 4;
 
    json init_body;
    init_body["protocol_version"] = 2;

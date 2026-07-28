@@ -149,11 +149,10 @@ static bool VariantToPropertyValue( const Variant& v, std::string& type_, json& 
 
 // ----------------------------------------------------------------------------
 
-nlohmann::json extract_astrometry_props( const View& view )
+nlohmann::json extract_astrometry_props( const PropertyArray& properties )
 {
    json arr = json::array();
 
-   const PropertyArray properties = view.Properties();
    for ( const Property& p : properties )
    {
       const IsoString& id = p.Id();
@@ -169,11 +168,16 @@ nlohmann::json extract_astrometry_props( const View& view )
       prop["id"]       = std::string( id.c_str() );
       prop["type_"]    = std::move( type_ );
       prop["value"]    = std::move( value );
-      prop["location"] = nullptr;   // view properties are in-memory, never attachment-located
+      prop["location"] = nullptr;   // in-memory properties, never attachment-located
       arr.push_back( std::move( prop ) );
    }
 
    return arr;
+}
+
+nlohmann::json extract_astrometry_props( const View& view )
+{
+   return extract_astrometry_props( view.Properties() );
 }
 
 // ----------------------------------------------------------------------------

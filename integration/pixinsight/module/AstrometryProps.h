@@ -16,6 +16,7 @@
 #ifndef __MmmAstrometryProps_h
 #define __MmmAstrometryProps_h
 
+#include <pcl/Property.h>
 #include <pcl/View.h>
 
 #include "third_party/json.hpp"
@@ -24,20 +25,25 @@ namespace pcl
 {
 
 /*!
- * \brief Serializes a solved view's "PCL:AstrometricSolution:*" properties as
- * the worker's XisfProperty JSON array.
+ * \brief Serializes the "PCL:AstrometricSolution:*" entries of a PropertyArray
+ * as the worker's XisfProperty JSON array.
  *
- * Iterates \a view.Properties(), keeps ids beginning "PCL:AstrometricSolution:",
- * and maps each pcl::Variant value to the matching PropertyValue JSON variant
- * (vector -> F64Vec, matrix -> F64Mat, string/time -> Str, float -> F64,
- * integer/bool -> I64). type_ is set to the XISF type name; location is always
- * null (view properties are read in memory, not attachment-located).
- * Properties carrying a non-finite float, and properties of an unsupported
- * Variant type, are skipped -- so the finite-float precondition the worker's
- * Init decoder enforces (PROTOCOL.md section 6) always holds.
+ * Keeps ids beginning "PCL:AstrometricSolution:" and maps each pcl::Variant
+ * value to the matching PropertyValue JSON variant (vector -> F64Vec, matrix ->
+ * F64Mat, string/time -> Str, float -> F64, integer/bool -> I64). type_ is set
+ * to the XISF type name; location is always null (properties are read in
+ * memory, not attachment-located). Properties carrying a non-finite float, and
+ * properties of an unsupported Variant type, are skipped -- so the finite-float
+ * precondition the worker's Init decoder enforces (PROTOCOL.md section 6)
+ * always holds.
  *
  * The returned value is a JSON array suitable for a PanelDesc.properties field.
+ * The \a view overload forwards \a view.Properties(); the PropertyArray overload
+ * lets a caller pass properties read straight from a file
+ * (FileFormatInstance::ReadImageProperties) so a Files-mode host can probe a
+ * solved frame without a live view.
  */
+nlohmann::json extract_astrometry_props( const PropertyArray& properties );
 nlohmann::json extract_astrometry_props( const View& view );
 
 // ----------------------------------------------------------------------------
