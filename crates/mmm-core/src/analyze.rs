@@ -491,6 +491,7 @@ pub fn analyze_ipc_solved(
             t.elapsed().as_secs_f64()
         );
         aligned.push(ap);
+        link.send_progress("reproject", (id as u64) + 1, panels.len() as u64);
     }
     let align_secs = t_align.elapsed().as_secs_f64();
     tracing::info!(

@@ -184,9 +184,13 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 // completed during the IPC scan (done/total = panels scanned/panel count,
 // analyze_ipc_aligned and analyze_ipc_solved), and stage "blend" reports one
 // Progress per output band delivered during the band sweep (done/total =
-// output rows sent so far/canvas height, ShmRowSink::band). A host may
-// display these to show live percentages; their absence in the plain
-// file-mode CLI path is still fine — only the IPC worker emits them.
+// output rows sent so far/canvas height, ShmRowSink::band). In solved mode
+// (analyze_ipc_solved), stage "reproject" also reports one Progress per
+// panel completed during the sequential align/reproject loop (done/total =
+// panels reprojected so far/panel count), emitted before the "analyze"
+// scan begins. A host may display these to show live percentages; their
+// absence in the plain file-mode CLI path is still fine — only the IPC
+// worker emits them.
 
 // tag 3
 {"Begin": {"w": 9255, "h": 18310, "ch": 3}}
