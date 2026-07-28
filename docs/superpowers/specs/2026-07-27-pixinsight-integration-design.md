@@ -326,13 +326,20 @@ PCL headers + full PCL source present, Qt 6.8.7 bundled). Decisions:
   module resolves its own on-disk path (`dladdr`) and spawns the sibling worker
   — no separate install or `PATH` setup. The pure host library takes the worker
   path as a parameter so the standalone test can point at the debug build.
-- **Now — dev distribution (implemented this pass):** build `mmm-pxm.so`, place
-  `mmm-ipc-worker` next to it, and load via PixInsight's manual **Install
-  Modules** (unsigned local modules load fine for development). One-time
-  prerequisite: build **`libPCL-pxi.a`** from the bundled source
-  (`/opt/PixInsight/src/pcl/linux/g++`, `make`), output directed to a
-  **project-local** lib dir so no writes to the root-owned install and no sudo.
-  Documented in `integration/pixinsight/README.md`.
+- **Dev distribution on Linux/WSL — implemented (Plan 2b):** `mmm-pxm.so`
+  builds warning-free (`integration/pixinsight/module`, plain `make` linking
+  `libPCL-pxi.a` + the `host/` transport objects), `mmm-ipc-worker` ships
+  beside it, and it loads via PixInsight's manual **Install Modules**
+  (unsigned local modules load fine for development; `InstallPixInsightModule`
+  registers **MosaicMerge** under the **Mosaic** category). One-time
+  prerequisite: build **`libPCL-pxi.a`** out-of-tree from a copy of the
+  bundled source (`/opt/PixInsight/src/{pcl,3rdparty}`, root-owned in place),
+  output directed to a **project-local** lib dir (`~/.local/pcl-build/lib`)
+  so no writes to the root-owned install and no sudo. Full commands, the
+  module build, worker placement, the Install Modules flow, and the manual
+  smoke-test checklist are documented in
+  `integration/pixinsight/module/README.md`. Remaining for this path: nothing
+  functional — it is the whole dev-distribution story today.
 - **Later — repository distribution (planned, not implemented):** a PixInsight
   **update repository** (user adds a URL once; auto-install + auto-update). Costs:
   a **code-signing certificate from the PixInsight team** and a **per-platform
