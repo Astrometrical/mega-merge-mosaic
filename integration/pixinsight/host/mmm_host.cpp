@@ -1,21 +1,112 @@
 #include "mmm_host.h"
 
+#include "mmm_os.h"
+
+#ifndef _WIN32
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <csignal>
+#endif
 
 #include <cerrno>
-#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
+#ifndef _WIN32
 extern char** environ;
+#endif
 
 namespace mmm {
 
 namespace {
+
+#ifdef _WIN32
+// Formats the current GetLastError() as a human string for diagnostics.
+std::string last_error() {
+  DWORD e = GetLastError();
+  char* msg = nullptr;
+  DWORD n = FormatMessageA(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+          FORMAT_MESSAGE_IGNORE_INSERTS,
+      nullptr, e, 0, reinterpret_cast<char*>(&msg), 0, nullptr);
+  std::string out = "os error " + std::to_string(e);
+  if (n && msg) {
+    out += ": ";
+    out.append(msg, n);
+    LocalFree(msg);
+  }
+  return out;
+}
+
+// Widen a UTF-8 narrow string to UTF-16 for the Win32 *W APIs.
+std::wstring widen(const std::string& s) {
+  if (s.empty()) return std::wstring();
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+  std::wstring w(static_cast<size_t>(n), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+  return w;
+}
+
+// Appends `arg` to `cmd` using the standard Win32 command-line quoting rules
+// (CommandLineToArgvW's inverse): quote only when the arg is empty or contains
+// whitespace/quotes, doubling backslashes that precede a quote or the closing
+// quote. Keeps simple args (e.g. "/c", "--probe-frame") unquoted.
+void append_win_arg(std::wstring& cmd, const std::wstring& arg) {
+  bool need_quote = arg.empty() || arg.find_first_of(L" \t\n\v\"") != std::wstring::npos;
+  if (!need_quote) {
+    cmd += arg;
+    return;
+  }
+  cmd += L'"';
+  for (size_t i = 0; i < arg.size();) {
+    size_t backslashes = 0;
+    while (i < arg.size() && arg[i] == L'\\') {
+      ++i;
+      ++backslashes;
+    }
+    if (i == arg.size()) {
+      cmd.append(backslashes * 2, L'\\');  // escape trailing backslashes before closing quote
+      break;
+    } else if (arg[i] == L'"') {
+      cmd.append(backslashes * 2 + 1, L'\\');  // escape backslashes + the quote
+      cmd += L'"';
+      ++i;
+    } else {
+      cmd.append(backslashes, L'\\');
+      cmd += arg[i];
+      ++i;
+    }
+  }
+  cmd += L'"';
+}
+
+// Builds a mutable UTF-16 command line for CreateProcessW (which may modify the
+// buffer in place, so callers pass `cmd.data()`):
+//   "<worker>" <arg0> <arg1> ... [--probe-frame]
+// The worker exe is ALWAYS quoted so a spaced install path
+// (e.g. C:\Program Files\PixInsight\bin\mmm-ipc-worker.exe) resolves correctly
+// and the `C:\Program.exe` local-hijack misparse is avoided. Additional args
+// come from HostConfig::worker_args (production leaves it empty; tests use it to
+// spawn a real quick-exit process such as cmd.exe /c exit 1). `--probe-frame`
+// is appended in probe mode.
+std::wstring build_command_line_w(const std::string& worker_path,
+                                  const std::vector<std::string>& args, bool probe) {
+  std::wstring cmd;
+  cmd += L'"';
+  cmd += widen(worker_path);
+  cmd += L'"';
+  for (const std::string& a : args) {
+    cmd += L' ';
+    append_win_arg(cmd, widen(a));
+  }
+  if (probe) cmd += L" --probe-frame";
+  return cmd;
+}
+#endif
 
 // Ignore SIGPIPE process-wide, once, so a write to the stdin of a worker that
 // has just died (its read end fully closed) fails with EPIPE instead of
@@ -28,20 +119,31 @@ namespace {
 // `MSG_NOSIGNAL`/`send()` do not apply; process-wide `SIG_IGN` is the correct,
 // standard mechanism for a process doing pipe IO. `std::call_once` keeps it
 // idempotent so repeated `Host` construction never thrashes the disposition.
+//
+// Windows has no SIGPIPE: a write to a broken pipe fails with
+// ERROR_BROKEN_PIPE (surfaced by `os_write` as -1), never a fatal signal, so
+// this is a no-op there.
 void ignore_sigpipe_once() {
+#ifndef _WIN32
   static std::once_flag flag;
   std::call_once(flag, [] { ::signal(SIGPIPE, SIG_IGN); });
+#endif
 }
 
 // Writes all `n` bytes of `buf` to `fd`, looping over short writes and
-// retrying on EINTR. Throws on a hard error.
-void full_write_fd(int fd, const uint8_t* buf, size_t n) {
+// retrying on EINTR (POSIX only). Throws on a hard error (including a broken
+// pipe, which `os_write` reports as -1).
+void full_write_fd(os_handle fd, const uint8_t* buf, size_t n) {
   size_t total = 0;
   while (total < n) {
-    ssize_t w = ::write(fd, buf + total, n - total);
+    long w = os_write(fd, buf + total, n - total);
     if (w < 0) {
+#ifndef _WIN32
       if (errno == EINTR) continue;
       throw HostError(std::string("write to worker: ") + std::strerror(errno));
+#else
+      throw HostError("write to worker: broken pipe or write error");
+#endif
     }
     total += static_cast<size_t>(w);
   }
@@ -49,22 +151,35 @@ void full_write_fd(int fd, const uint8_t* buf, size_t n) {
 
 // A pipe pair; [0] = read end, [1] = write end.
 struct Pipe {
-  int fd[2] = {-1, -1};
+  os_handle fd[2] = {os_invalid_handle, os_invalid_handle};
   Pipe() {
+#ifdef _WIN32
+    // Create both ends inheritable; the caller marks the parent-retained end
+    // non-inheritable via SetHandleInformation before spawning, so only the
+    // child-side end is inherited (essential for correct EOF propagation).
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
+    if (!CreatePipe(&fd[0], &fd[1], &sa, 0)) {
+      throw HostError(std::string("CreatePipe failed: ") + last_error());
+    }
+#else
     if (::pipe(fd) != 0) {
       throw HostError(std::string("pipe: ") + std::strerror(errno));
     }
+#endif
   }
   void close_read() {
-    if (fd[0] >= 0) {
-      ::close(fd[0]);
-      fd[0] = -1;
+    if (fd[0] != os_invalid_handle) {
+      os_close(fd[0]);
+      fd[0] = os_invalid_handle;
     }
   }
   void close_write() {
-    if (fd[1] >= 0) {
-      ::close(fd[1]);
-      fd[1] = -1;
+    if (fd[1] != os_invalid_handle) {
+      os_close(fd[1]);
+      fd[1] = os_invalid_handle;
     }
   }
   ~Pipe() {
@@ -73,6 +188,7 @@ struct Pipe {
   }
 };
 
+#ifndef _WIN32
 // Spawns `path` with `argv`, redirecting the child's stdin to `child_stdin_rd`
 // and stdout to `child_stdout_wr` (stderr inherited). The four raw pipe fds
 // are closed in the child after the dup2s so no descriptor leaks across exec.
@@ -95,6 +211,37 @@ pid_t spawn_worker(const std::string& path, char* const argv[], int child_stdin_
   }
   return pid;
 }
+#else
+// Windows spawn: CreateProcessW with STARTF_USESTDHANDLES wiring the child's
+// stdin to `child_stdin_rd` and stdout to `child_stdout_wr` (stderr inherited
+// from the host). `bInheritHandles = TRUE` is required for STARTF_USESTDHANDLES
+// to take effect; the caller must have already made the parent-retained pipe
+// ends non-inheritable so the child does not keep them open (which would
+// prevent EOF). Returns the child process HANDLE (caller closes it after
+// reaping).
+HANDLE spawn_worker_win(const std::string& path, const std::vector<std::string>& args, bool probe,
+                        os_handle child_stdin_rd, os_handle child_stdout_wr) {
+  STARTUPINFOW si;
+  ZeroMemory(&si, sizeof si);
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = child_stdin_rd;    // child reads its stdin
+  si.hStdOutput = child_stdout_wr;  // child writes its stdout
+  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);  // inherit host stderr
+
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof pi);
+
+  std::wstring cmd = build_command_line_w(path, args, probe);
+  BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
+                           TRUE /*inherit handles*/, 0, nullptr, nullptr, &si, &pi);
+  if (!ok) {
+    throw HostError("CreateProcessW(" + path + ") failed: " + last_error());
+  }
+  CloseHandle(pi.hThread);
+  return pi.hProcess;
+}
+#endif
 
 }  // namespace
 
@@ -107,14 +254,14 @@ Host::Host(HostConfig cfg, PanelSource& src, OutputCollector& out, ProgressCallb
 
 void Host::write_framed_locked(const std::vector<uint8_t>& framed) {
   std::lock_guard<std::mutex> lk(stdin_mutex_);
-  if (stdin_fd_ < 0) return;  // worker gone; nothing to write.
+  if (stdin_fd_ == os_invalid_handle) return;  // worker gone; nothing to write.
   full_write_fd(stdin_fd_, framed.data(), framed.size());
 }
 
 void Host::cancel() {
   cancel_requested_.store(true);
   std::lock_guard<std::mutex> lk(stdin_mutex_);
-  if (stdin_fd_ < 0) return;  // run() not started or already finished.
+  if (stdin_fd_ == os_invalid_handle) return;  // run() not started or finished.
   std::vector<uint8_t> framed = encode_cancel();
   // Best-effort: a worker that already exited yields EPIPE here; that's fine,
   // the reader loop will observe EOF and unwind. Swallow the write error.
@@ -125,19 +272,37 @@ void Host::cancel() {
 }
 
 void Host::run() {
-  // RAII: the segment is unlinked when `shm` leaves scope on ANY path.
+  // RAII: the segment is released when `shm` leaves scope on ANY path (POSIX
+  // unlinks; Windows drops its handle -- the mapping vanishes on last close).
   ShmSegment shm = ShmSegment::create(cfg_.shm_name, cfg_.layout.total_bytes());
 
   Pipe in_pipe;   // host writes in_pipe[1] -> worker stdin (in_pipe[0])
   Pipe out_pipe;  // worker stdout (out_pipe[1]) -> host reads out_pipe[0]
 
-  std::string arg0 = cfg_.worker_path;
-  char* argv[] = {arg0.data(), nullptr};
-  pid_t pid = spawn_worker(cfg_.worker_path, argv, in_pipe.fd[0], out_pipe.fd[1], in_pipe.fd[1],
-                           out_pipe.fd[0]);
+#ifdef _WIN32
+  // Only the child-inherited ends stay inheritable; make the host-retained
+  // ends non-inheritable so the child does not hold copies (breaks EOF).
+  SetHandleInformation(in_pipe.fd[1], HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(out_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
+  HANDLE child = spawn_worker_win(cfg_.worker_path, cfg_.worker_args, /*probe=*/false,
+                                  in_pipe.fd[0], out_pipe.fd[1]);
+#else
+  // argv[0] is the exact exe path (no quoting needed for exec); any extra
+  // worker_args follow it. Storage must outlive posix_spawn.
+  std::vector<std::string> argv_store;
+  argv_store.reserve(1 + cfg_.worker_args.size());
+  argv_store.push_back(cfg_.worker_path);
+  for (const std::string& a : cfg_.worker_args) argv_store.push_back(a);
+  std::vector<char*> argv;
+  argv.reserve(argv_store.size() + 1);
+  for (std::string& s : argv_store) argv.push_back(s.data());
+  argv.push_back(nullptr);
+  pid_t pid = spawn_worker(cfg_.worker_path, argv.data(), in_pipe.fd[0], out_pipe.fd[1],
+                           in_pipe.fd[1], out_pipe.fd[0]);
+#endif
 
-  // The child holds its own dup'd copies of stdin-rd / stdout-wr now; close
-  // our copies of the child ends so EOF propagates correctly.
+  // The child holds its own copies of stdin-rd / stdout-wr now; close our
+  // copies of the child ends so EOF propagates correctly.
   in_pipe.close_read();
   out_pipe.close_write();
 
@@ -145,7 +310,7 @@ void Host::run() {
     std::lock_guard<std::mutex> lk(stdin_mutex_);
     stdin_fd_ = in_pipe.fd[1];
   }
-  int stdout_fd = out_pipe.fd[0];
+  os_handle stdout_fd = out_pipe.fd[0];
 
   bool saw_done = false;
   try {
@@ -174,7 +339,7 @@ void Host::run() {
           std::vector<uint8_t> payload = encode_band_reply(reply);
           {
             std::lock_guard<std::mutex> lk(stdin_mutex_);
-            if (stdin_fd_ >= 0) {
+            if (stdin_fd_ != os_invalid_handle) {
               write_frame_raw(stdin_fd_, static_cast<uint8_t>(HostTag::BandReply), payload.data(),
                               static_cast<uint32_t>(payload.size()));
             }
@@ -223,20 +388,26 @@ void Host::run() {
     }
   } catch (...) {
     // Fault isolation: reap the child (kill first in case it is wedged) so we
-    // never hang, close our fds, let `shm` unlink via RAII, and surface a
+    // never hang, close our fds, let `shm` release via RAII, and surface a
     // clean HostError. The collector's partial buffer is the caller's to
     // discard -- we present no partial output as success.
+#ifdef _WIN32
+    TerminateProcess(child, 1);
+    WaitForSingleObject(child, INFINITE);
+    CloseHandle(child);
+#else
     ::kill(pid, SIGKILL);
     int st = 0;
     ::waitpid(pid, &st, 0);
-    ::close(stdout_fd);
+#endif
+    os_close(stdout_fd);
     {
       std::lock_guard<std::mutex> lk(stdin_mutex_);
-      if (stdin_fd_ >= 0) ::close(stdin_fd_);
-      stdin_fd_ = -1;
+      if (stdin_fd_ != os_invalid_handle) os_close(stdin_fd_);
+      stdin_fd_ = os_invalid_handle;
     }
-    in_pipe.fd[1] = -1;  // already closed above; disarm Pipe dtor.
-    out_pipe.fd[0] = -1;
+    in_pipe.fd[1] = os_invalid_handle;   // already closed above; disarm Pipe dtor.
+    out_pipe.fd[0] = os_invalid_handle;
     try {
       throw;
     } catch (const HostError&) {
@@ -246,17 +417,24 @@ void Host::run() {
     }
   }
 
-  ::close(stdout_fd);
-  out_pipe.fd[0] = -1;
+  os_close(stdout_fd);
+  out_pipe.fd[0] = os_invalid_handle;
   {
     std::lock_guard<std::mutex> lk(stdin_mutex_);
-    if (stdin_fd_ >= 0) ::close(stdin_fd_);
-    stdin_fd_ = -1;
+    if (stdin_fd_ != os_invalid_handle) os_close(stdin_fd_);
+    stdin_fd_ = os_invalid_handle;
   }
-  in_pipe.fd[1] = -1;
+  in_pipe.fd[1] = os_invalid_handle;
 
+#ifdef _WIN32
+  DWORD code = 0;
+  WaitForSingleObject(child, INFINITE);
+  GetExitCodeProcess(child, &code);
+  CloseHandle(child);
+#else
   int status = 0;
   ::waitpid(pid, &status, 0);
+#endif
 
   if (cancelled_.load()) {
     // A cancelled run is a clean, intentional stop -- distinct from a crash
@@ -267,6 +445,14 @@ void Host::run() {
   if (!saw_done) {
     throw HostError("worker exited before Done");
   }
+#ifdef _WIN32
+  // Windows has no WIFSIGNALED/exit-signal distinction; a TerminateProcess'd
+  // or nonzero-exiting child is reported as an abnormal exit with its code.
+  if (code != 0) {
+    throw HostError(std::string("worker exited with status ") + std::to_string(code) +
+                    " after Done");
+  }
+#else
   if (WIFSIGNALED(status)) {
     throw HostError(std::string("worker terminated by signal ") +
                     std::to_string(WTERMSIG(status)) + " after Done");
@@ -275,6 +461,7 @@ void Host::run() {
     throw HostError(std::string("worker exited with status ") +
                     std::to_string(WEXITSTATUS(status)) + " after Done");
   }
+#endif
 }
 
 void Host::probe_frame(const std::string& worker_path, const nlohmann::json& init_obj, uint64_t& w,
@@ -282,22 +469,33 @@ void Host::probe_frame(const std::string& worker_path, const nlohmann::json& ini
   Pipe in_pipe;
   Pipe out_pipe;
 
+#ifdef _WIN32
+  SetHandleInformation(in_pipe.fd[1], HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(out_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
+  HANDLE child = spawn_worker_win(worker_path, /*args=*/{}, /*probe=*/true, in_pipe.fd[0],
+                                  out_pipe.fd[1]);
+#else
   std::string arg0 = worker_path;
   std::string arg1 = "--probe-frame";
   char* argv[] = {arg0.data(), arg1.data(), nullptr};
 
   pid_t pid = spawn_worker(worker_path, argv, in_pipe.fd[0], out_pipe.fd[1], in_pipe.fd[1],
                            out_pipe.fd[0]);
+#endif
   in_pipe.close_read();
   out_pipe.close_write();
 
   // From here on the child is spawned but not yet reaped: any throw (stdin
   // write EPIPE if the worker dies during startup, stdout drain, or parse)
   // must still kill+reap it, mirroring run()'s fault-isolation guard, so a
-  // failing probe never leaks a zombie. `status`/`reaped` ensure the happy
-  // path waits exactly once.
-  int status = 0;
+  // failing probe never leaks a zombie. `reaped` ensures the happy path waits
+  // exactly once.
   bool reaped = false;
+#ifndef _WIN32
+  int status = 0;
+#else
+  DWORD code = 0;
+#endif
   try {
     // Write the probe JSON, then close stdin so the worker sees EOF.
     std::string payload = init_obj.dump();
@@ -309,9 +507,11 @@ void Host::probe_frame(const std::string& worker_path, const nlohmann::json& ini
     {
       char buf[4096];
       for (;;) {
-        ssize_t r = ::read(out_pipe.fd[0], buf, sizeof(buf));
+        long r = os_read(out_pipe.fd[0], buf, sizeof(buf));
         if (r < 0) {
+#ifndef _WIN32
           if (errno == EINTR) continue;
+#endif
           break;
         }
         if (r == 0) break;
@@ -320,11 +520,21 @@ void Host::probe_frame(const std::string& worker_path, const nlohmann::json& ini
     }
     out_pipe.close_read();
 
+#ifdef _WIN32
+    WaitForSingleObject(child, INFINITE);
+    GetExitCodeProcess(child, &code);
+    CloseHandle(child);
+    reaped = true;
+    if (code != 0) {
+      throw HostError("probe-frame: worker exited abnormally");
+    }
+#else
     ::waitpid(pid, &status, 0);
     reaped = true;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
       throw HostError("probe-frame: worker exited abnormally");
     }
+#endif
     unsigned long long pw = 0, ph = 0, pch = 0;
     if (std::sscanf(out.c_str(), "%llu %llu %llu", &pw, &ph, &pch) != 3) {
       throw HostError("probe-frame: could not parse \"w h ch\" from worker output: " + out);
@@ -334,8 +544,14 @@ void Host::probe_frame(const std::string& worker_path, const nlohmann::json& ini
     ch = pch;
   } catch (...) {
     if (!reaped) {
+#ifdef _WIN32
+      TerminateProcess(child, 1);
+      WaitForSingleObject(child, INFINITE);
+      CloseHandle(child);
+#else
       ::kill(pid, SIGKILL);
       ::waitpid(pid, &status, 0);
+#endif
     }
     throw;
   }

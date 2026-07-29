@@ -10,8 +10,6 @@
 // against a vacuous pass by requiring the golden to be non-empty and
 // non-constant.
 
-#include <unistd.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -84,7 +82,7 @@ int main(int argc, char** argv) {
   const uint64_t slot_bytes = w * ch * band_rows * 4;
   mmm::SlotLayout layout{slot_bytes, 8, 2};
 
-  const int pid = static_cast<int>(::getpid());
+  const int pid = mmm_test_getpid();
   json panels = make_panels(meta);
   json params = make_params(band_rows, feather_px);
 

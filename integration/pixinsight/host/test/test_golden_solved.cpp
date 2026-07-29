@@ -14,8 +14,6 @@
 // wrong slot size (input panel width vs. reprojected frame width) would
 // silently corrupt the shm bands and fail this compare.
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -92,7 +90,7 @@ int main(int argc, char** argv) {
   CHECK(props.is_array());
   CHECK(props.size() == n_panels);
 
-  const int pid = static_cast<int>(::getpid());
+  const int pid = mmm_test_getpid();
   json params = make_params(band_rows, feather_px);
 
   // Max raw panel width, for slot sizing (an input band is one raw panel's
