@@ -266,18 +266,220 @@ impl Drop for ShmSegment {
     }
 }
 
+/// Windows named shared-memory segment (a pagefile-backed file mapping),
+/// mirroring the POSIX [`ShmSegment`]: the host `create`s a named mapping and
+/// the worker `attach`es to the same name. The name carried in the JSON `Init`
+/// message is the POSIX-style `/name`; both sides normalize it identically to a
+/// Windows object name (see [`win_object_name`]).
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct ShmSegment {
+    name: String,
+    is_creator: bool,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    base: *mut u8,
+    size: usize,
+}
+
+// SAFETY: identical contract to the Unix impl (whose `MmapMut` is `Send+Sync`).
+// The raw `base` pointer is only ever handed out as disjoint sub-slices via
+// `SlotLayout`-derived offsets (see `slice_mut_raw`'s `# Safety`); the `HANDLE`
+// is only closed on `Drop`. `HostLink` shares `ShmSegment` across its reader
+// thread behind an `Arc`, so `Send + Sync` is required and upheld by that
+// disjoint-access discipline.
+#[cfg(windows)]
+unsafe impl Send for ShmSegment {}
+#[cfg(windows)]
+unsafe impl Sync for ShmSegment {}
+
+/// Normalize a POSIX-style shm name (`/mmm-foo`) to a Windows object name
+/// (`Local\mmm-foo`). Applied identically here and in the C++ host so the
+/// name string exchanged in the `Init` message round-trips.
+#[cfg(windows)]
+fn win_object_name(name: &str) -> Vec<u16> {
+    let base = name.strip_prefix('/').unwrap_or(name);
+    let full = format!("Local\\{base}");
+    full.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+impl ShmSegment {
+    /// Create a new named pagefile-backed segment of `total_bytes` and map it.
+    pub fn create(name: &str, total_bytes: u64) -> Result<ShmSegment> {
+        use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
+        };
+        let wname = win_object_name(name);
+        let hi = (total_bytes >> 32) as u32;
+        let lo = (total_bytes & 0xFFFF_FFFF) as u32;
+        // SAFETY: FFI; INVALID_HANDLE_VALUE requests a pagefile-backed mapping.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                hi,
+                lo,
+                wname.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(Error::compute(format!(
+                "CreateFileMappingW({name}) failed: os error {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        // SAFETY: FFI; map the whole segment ([0, total_bytes)).
+        let view =
+            unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total_bytes as usize) };
+        if view.Value.is_null() {
+            let e = unsafe { GetLastError() };
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(Error::compute(format!(
+                "MapViewOfFile({name}) failed: os error {e}"
+            )));
+        }
+        Ok(ShmSegment {
+            name: name.to_string(),
+            is_creator: true,
+            handle,
+            base: view.Value as *mut u8,
+            size: total_bytes as usize,
+        })
+    }
+
+    /// Attach to an existing named segment created by [`create`](Self::create).
+    ///
+    /// The mapping is opened by name and a view of `total_bytes` is mapped;
+    /// requesting more than the creator allocated fails, so an oversized
+    /// `total_bytes` is rejected. Unlike the POSIX impl, Windows offers no cheap
+    /// exact-size assertion, so a *smaller* `total_bytes` within a larger
+    /// segment is accepted — the creator's size is the contract.
+    pub fn attach(name: &str, total_bytes: u64) -> Result<ShmSegment> {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW,
+        };
+        let wname = win_object_name(name);
+        // SAFETY: FFI.
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wname.as_ptr()) };
+        if handle.is_null() {
+            return Err(Error::compute(format!(
+                "OpenFileMappingW({name}) failed: os error {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        // SAFETY: FFI.
+        let view =
+            unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total_bytes as usize) };
+        if view.Value.is_null() {
+            let e = unsafe { GetLastError() };
+            unsafe { CloseHandle(handle) };
+            return Err(Error::compute(format!(
+                "MapViewOfFile({name}, {total_bytes} bytes) failed: os error {e}"
+            )));
+        }
+        Ok(ShmSegment {
+            name: name.to_string(),
+            is_creator: false,
+            handle,
+            base: view.Value as *mut u8,
+            size: total_bytes as usize,
+        })
+    }
+
+    /// Bounds/alignment-check an `(offset, len)` f32 request — identical logic
+    /// to the Unix impl (see its doc); the single chokepoint for both `slice`
+    /// and `slice_mut`.
+    fn checked_range(&self, offset: u64, len: u64) -> Result<std::ops::Range<usize>> {
+        if !offset.is_multiple_of(std::mem::size_of::<f32>() as u64) {
+            return Err(Error::compute(format!(
+                "slice offset {offset} is not a multiple of {} (f32 alignment)",
+                std::mem::size_of::<f32>()
+            )));
+        }
+        let byte_len = len.checked_mul(4).ok_or_else(|| {
+            Error::compute(format!("slice len {len} (elements) overflows byte length"))
+        })?;
+        let end = offset.checked_add(byte_len).ok_or_else(|| {
+            Error::compute(format!("slice offset {offset} + len {len} overflows"))
+        })?;
+        if end > self.size as u64 {
+            return Err(Error::compute(format!(
+                "slice range [{offset}, {end}) is out of bounds for segment of {} bytes",
+                self.size
+            )));
+        }
+        Ok(offset as usize..end as usize)
+    }
+
+    /// Read `len` f32 elements starting at byte `offset`. Panics if out of
+    /// bounds or misaligned (see the Unix impl's doc for the contract).
+    pub fn slice(&self, offset: u64, len: u64) -> &[f32] {
+        let range = self
+            .checked_range(offset, len)
+            .expect("ShmSegment::slice out of bounds");
+        // SAFETY: `range` is bounds/alignment-checked against the mapping; the
+        // base pointer is page-aligned so a 4-byte-aligned offset stays aligned.
+        unsafe {
+            std::slice::from_raw_parts(self.base.add(range.start) as *const f32, len as usize)
+        }
+    }
+
+    /// Write `len` f32 elements starting at byte `offset` from a shared
+    /// reference — the interior-mutable shared-memory pattern; see the Unix
+    /// impl's `# Safety`. Panics if out of bounds or misaligned.
+    #[allow(clippy::mut_from_ref)]
+    pub fn slice_mut(&self, offset: u64, len: u64) -> &mut [f32] {
+        let range = self
+            .checked_range(offset, len)
+            .expect("ShmSegment::slice_mut out of bounds");
+        // SAFETY: as `slice`, plus the caller's disjoint-range obligation
+        // (upheld by `SlotLayout`), identical to the Unix `slice_mut_raw`.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.base.add(range.start) as *mut f32, len as usize)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShmSegment {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: `base`/`handle` came from a successful map in create/attach.
+        // A Windows file mapping is refcounted by open handles and vanishes when
+        // the last handle closes — there is no `shm_unlink` analog, so both the
+        // creator and attachers simply unmap + close. `is_creator` (and `name`)
+        // are retained for symmetry with the Unix impl and for this debug trace;
+        // they drive no special teardown.
+        tracing::trace!(
+            name = %self.name,
+            is_creator = self.is_creator,
+            "dropping ShmSegment"
+        );
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.base as *mut core::ffi::c_void,
+            });
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 /// A named shared-memory segment.
 ///
-/// Shared memory is a POSIX-only transport; this platform stub exists only
-/// so `mmm-core` compiles on non-Unix targets. Every operation fails with
-/// [`Error::Compute`].
-#[cfg(not(unix))]
+/// Shared memory is a POSIX/Windows-only transport; this platform stub
+/// exists only so `mmm-core` compiles on other targets. Every operation
+/// fails with [`Error::Compute`].
+#[cfg(all(not(unix), not(windows)))]
 #[derive(Debug)]
 pub struct ShmSegment {
     _unused: (),
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 impl ShmSegment {
     /// Always fails: shared memory is not supported on this platform.
     pub fn create(_name: &str, _total_bytes: u64) -> Result<ShmSegment> {
@@ -302,6 +504,37 @@ impl ShmSegment {
     #[allow(clippy::mut_from_ref)]
     pub fn slice_mut(&self, _offset: u64, _len: u64) -> &mut [f32] {
         unreachable!("ShmSegment cannot be constructed on non-unix platforms")
+    }
+}
+
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+
+    #[test]
+    fn create_write_attach_read_same_bytes() {
+        let name = format!("mmm-shm-wtest-{}", std::process::id());
+        let total = 4096u64;
+        let host = ShmSegment::create(&name, total).unwrap();
+        host.slice_mut(0, 4).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let worker = ShmSegment::attach(&name, total).unwrap();
+        assert_eq!(worker.slice(0, 4), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of")]
+    fn slice_mut_panics_on_misaligned_offset() {
+        let name = format!("mmm-shm-wtest-align-{}", std::process::id());
+        let host = ShmSegment::create(&name, 4096).unwrap();
+        let _ = host.slice_mut(1, 1);
+    }
+
+    #[test]
+    fn slice_roundtrip_at_aligned_offset() {
+        let name = format!("mmm-shm-wtest-ok-{}", std::process::id());
+        let host = ShmSegment::create(&name, 4096).unwrap();
+        host.slice_mut(4, 2).copy_from_slice(&[5.0, 6.0]);
+        assert_eq!(host.slice(4, 2), &[5.0, 6.0]);
     }
 }
 

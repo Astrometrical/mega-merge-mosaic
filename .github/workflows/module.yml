@@ -143,6 +143,9 @@ jobs:
         shell: pwsh
         run: if (-not (Test-Path "$PWD/pcl-ci/lib/PCL-pxi.lib")) { exit 1 }
 
+      - name: Rust tests (ipc crates)
+        run: cargo test -p mmm-core -p mmm-ipc-worker
+
   macos:
     name: build+test (macos-arm64)
     runs-on: macos-latest
