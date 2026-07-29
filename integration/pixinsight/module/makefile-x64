@@ -22,26 +22,43 @@ OBJDIR   = x64/Release
 # are this makefile's own addition (see note below) so the Darwin branch
 # actually compiles and links against PCL rather than just changing the
 # output name.
+#
+# NOTE on CXX: GNU Make ships a built-in default of CXX=g++ (origin
+# "default"), and `?=` only assigns when a variable is *undefined* -- a
+# built-in default counts as already-defined, so plain `CXX ?= clang++`
+# would silently never take effect on Darwin. Guard on `$(origin CXX)` so a
+# real user/environment override (`make CXX=...` or `CXX=... make`) still
+# wins, but the make-supplied default doesn't block the platform choice.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-  CXX     ?= clang++
+  ifeq ($(origin CXX),default)
+    CXX := clang++
+  endif
   MODULE_EXT := dylib
   SHARED_FLAGS := -dynamiclib -install_name @rpath/mmm-pxm.dylib
   # PCL's own src/pcl/macosx/g++/makefile-arm64 (pinned SHA) selects Apple
   # code paths off __PCL_MACOSX and builds arm64 with -arch arm64
-  # -stdlib=libc++; the Linux branch's -D__PCL_AVX2/-D__PCL_FMA/-mavx2/-mfma
-  # are x86-only (invalid on Apple Silicon) and -fnon-call-exceptions is a
-  # GCC extension clang++ does not recognize, so this branch does not reuse
-  # the Linux flags verbatim. macOS has no librt (shm_open etc. are in libc).
+  # -stdlib=libc++; the Linux branch's -D__PCL_AVX2/-D__PCL_FMA/-mavx2/-mfma/
+  # -m64/-minline-all-stringops are GCC-only x86 flags (invalid/unrecognized
+  # on clang++ -arch arm64) and -fnon-call-exceptions is a GCC extension
+  # clang++ does not recognize, so this branch does not reuse the Linux
+  # flags verbatim. macOS has no librt (shm_open etc. are in libc). The
+  # three -Wno-* flags mirror PCL's own macosx/g++/makefile-arm64, which
+  # needs them to stay warning-free under -Wall when compiling PCL headers
+  # with clang++; our module pulls those headers via plain -I (not
+  # -isystem), so the same warnings can fire here too.
   PLATFORM_CXXFLAGS := -arch arm64 -mmacosx-version-min=14 -stdlib=libc++ \
-                        -D__PCL_MACOSX
+                        -D__PCL_MACOSX \
+                        -Wno-missing-braces -Wno-nan-infinity-disabled -Wno-extern-c-compat
   PLATFORM_LIBS :=
 else
-  CXX     ?= g++
+  ifeq ($(origin CXX),default)
+    CXX := g++
+  endif
   MODULE_EXT := so
   SHARED_FLAGS := -shared
   PLATFORM_CXXFLAGS := -m64 -D__PCL_LINUX -D__PCL_AVX2 -D__PCL_FMA \
-                        -mavx2 -mfma -fnon-call-exceptions
+                        -mavx2 -mfma -fnon-call-exceptions -minline-all-stringops
   PLATFORM_LIBS := -lrt
 endif
 
@@ -51,7 +68,6 @@ INCLUDES = -I"$(PCLINCDIR)" -I"$(HOSTDIR)" -I"$(HOSTDIR)/third_party"
 
 CXXFLAGS = -c -pipe -pthread -fPIC \
            -D_REENTRANT $(PLATFORM_CXXFLAGS) \
-           -minline-all-stringops \
            -O3 -ffunction-sections -fdata-sections \
            -fvisibility=hidden -fvisibility-inlines-hidden \
            -std=c++20 -Wall -Wno-parentheses
