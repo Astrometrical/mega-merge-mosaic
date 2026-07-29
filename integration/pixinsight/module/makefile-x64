@@ -50,7 +50,17 @@ ifeq ($(UNAME_S),Darwin)
   PLATFORM_CXXFLAGS := -arch arm64 -mmacosx-version-min=14 -stdlib=libc++ \
                         -D__PCL_MACOSX \
                         -Wno-missing-braces -Wno-nan-infinity-disabled -Wno-extern-c-compat
-  PLATFORM_LIBS :=
+  # Apple's linker is strict about undefined symbols in a .dylib (unlike GNU
+  # ld, which tolerates them in a .so): libPCL-pxi.a alone pulls in
+  # CoreFoundation/Foundation/objc (via AppKit) and lcms/lz4/zstd/zlib/
+  # RFC6234/cminpack (PCL's own vendored 3rdparty static libs, now built and
+  # published alongside libPCL-pxi.a by build-pcl-macos.sh) transitively.
+  # -lPCL-pxi must precede the 3rdparty libs it depends on. One
+  # `-framework AppKit` resolves all the CF/NS/objc symbols by re-exporting
+  # Foundation/CoreFoundation/libobjc -- do not add those individually.
+  PLATFORM_LIBS := -framework AppKit -lpthread -lPCL-pxi \
+                    -llz4-pxi -lzstd-pxi -lzlib-pxi -lRFC6234-pxi \
+                    -llcms-pxi -lcminpack-pxi
 else
   ifeq ($(origin CXX),default)
     CXX := g++
@@ -59,7 +69,7 @@ else
   SHARED_FLAGS := -shared
   PLATFORM_CXXFLAGS := -m64 -D__PCL_LINUX -D__PCL_AVX2 -D__PCL_FMA \
                         -mavx2 -mfma -fnon-call-exceptions -minline-all-stringops
-  PLATFORM_LIBS := -lrt
+  PLATFORM_LIBS := -lPCL-pxi -lpthread -lrt
 endif
 
 TARGET   = mmm-pxm.$(MODULE_EXT)
@@ -73,7 +83,7 @@ CXXFLAGS = -c -pipe -pthread -fPIC \
            -std=c++20 -Wall -Wno-parentheses
 
 LDFLAGS  = $(SHARED_FLAGS) -fPIC
-LIBS     = -L"$(PCLLIBDIR)" -lPCL-pxi -lpthread $(PLATFORM_LIBS)
+LIBS     = -L"$(PCLLIBDIR)" $(PLATFORM_LIBS)
 
 MODULE_OBJS = $(OBJDIR)/mmm.o \
               $(OBJDIR)/MmmProcess.o \

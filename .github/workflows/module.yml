@@ -166,7 +166,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
 
       - name: Build PCL (on cache miss)
         if: steps.pcl-cache.outputs.cache-hit != 'true'
@@ -177,7 +177,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
 
       - name: Confirm PCL archive
         run: test -f "$PWD/pcl-ci/lib/libPCL-pxi.a"
