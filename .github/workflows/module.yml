@@ -98,18 +98,50 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: build+test (windows-x64) — placeholder
+    name: build+test (windows-x64)
     runs-on: windows-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Native port pending (Plan 3a)
+
+      - name: Install stable Rust (msvc)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Read PCL pin
+        id: pcl
         shell: bash
         run: |
-          echo "Windows shm + host transport port not yet implemented (Plan 3a)."
-          echo "This job is a scaffolded placeholder; it will build the module"
-          echo "once crates/mmm-core/src/ipc/shm.rs and host/ support Windows."
-          exit 1
+          . integration/pixinsight/ci/pcl-pin.env
+          echo "sha=$PCL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache PCL-pxi.lib (keyed on PCL commit)
+        id: pcl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+
+      - name: Build PCL (on cache miss)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: integration/pixinsight/ci/build-pcl-windows.ps1 -Out "$PWD/pcl-ci"
+
+      - name: Save PCL-pxi.lib cache (only after a successful build)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+
+      - name: Confirm PCL archive
+        shell: pwsh
+        run: if (-not (Test-Path "$PWD/pcl-ci/lib/PCL-pxi.lib")) { exit 1 }
 
   macos:
     name: build+test (macos-arm64)
