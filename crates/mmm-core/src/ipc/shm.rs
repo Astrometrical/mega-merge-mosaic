@@ -100,8 +100,18 @@ impl ShmSegment {
         }
 
         let file = std::fs::File::from(fd);
+        // Map an explicit length rather than the file's fstat-derived length:
+        // macOS page-rounds a POSIX shm object's size up to the page size (16
+        // KiB on Apple Silicon, vs. 4 KiB on Linux), so mapping "the whole
+        // file" would give a mapping longer than `total_bytes` and drift the
+        // segment's logical size (which `checked_range` bounds against) away
+        // from what the caller asked for. An explicit length maps exactly
+        // `total_bytes` on every platform.
         let map = unsafe {
-            memmap2::MmapMut::map_mut(&file).map_err(|e| Error::io(format!("shm:{name}"), e))?
+            memmap2::MmapOptions::new()
+                .len(total_bytes as usize)
+                .map_mut(&file)
+                .map_err(|e| Error::io(format!("shm:{name}"), e))?
         };
 
         Ok(ShmSegment {
@@ -117,9 +127,13 @@ impl ShmSegment {
     /// The segment must already exist (created by
     /// [`create`](ShmSegment::create) in another process); `attach` never
     /// creates, resizes, or unlinks it — only the creator owns the segment's
-    /// size. `total_bytes` must match the size the creator established;
-    /// mismatches are rejected rather than silently truncating someone
-    /// else's mapping.
+    /// size. The underlying object must be *at least* `total_bytes` (on
+    /// Linux the creator's `ftruncate` makes it exactly `total_bytes`; on
+    /// macOS the OS page-rounds a shm object's size up, so it may be
+    /// larger) — a too-small object is rejected rather than silently
+    /// mapping a truncated segment. The mapping `attach` produces is always
+    /// exactly `total_bytes`, regardless of the underlying object's actual
+    /// (possibly page-rounded) size.
     pub fn attach(name: &str, total_bytes: u64) -> Result<ShmSegment> {
         use nix::fcntl::OFlag;
         use nix::sys::mman::shm_open;
@@ -129,16 +143,30 @@ impl ShmSegment {
             .map_err(|e| Error::compute(format!("shm_open({name}) failed: {e}")))?;
 
         let file = std::fs::File::from(fd);
-        let map = unsafe {
-            memmap2::MmapMut::map_mut(&file).map_err(|e| Error::io(format!("shm:{name}"), e))?
-        };
 
-        if map.len() as u64 != total_bytes {
+        // Validate the underlying object is large enough before mapping: an
+        // exact-equality check here would fail spuriously on macOS, where
+        // the creator's `ftruncate(total_bytes)` gets rounded up to the
+        // page size by the OS.
+        let actual = file
+            .metadata()
+            .map_err(|e| Error::io(format!("shm:{name}"), e))?
+            .len();
+        if actual < total_bytes {
             return Err(Error::compute(format!(
-                "shm segment {name} is {} bytes, but attach expected {total_bytes}",
-                map.len()
+                "shm segment {name} is {actual} bytes, but attach expected at least {total_bytes}"
             )));
         }
+
+        // Map an explicit length (see the matching comment in `create`) so
+        // `self.map.len() == total_bytes` exactly, independent of the
+        // underlying object's (possibly page-rounded) actual size.
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .len(total_bytes as usize)
+                .map_mut(&file)
+                .map_err(|e| Error::io(format!("shm:{name}"), e))?
+        };
 
         Ok(ShmSegment {
             name: name.to_string(),
