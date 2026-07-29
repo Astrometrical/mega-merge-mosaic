@@ -100,7 +100,6 @@ jobs:
   windows:
     name: build+test (windows-x64)
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -125,7 +124,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1') }}
 
       - name: Build PCL (on cache miss)
         if: steps.pcl-cache.outputs.cache-hit != 'true'
@@ -137,7 +136,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1') }}
 
       - name: Confirm PCL archive
         shell: pwsh
@@ -152,6 +151,17 @@ jobs:
           cmake -S integration/pixinsight/host -B integration/pixinsight/host/ci-build
           cmake --build integration/pixinsight/host/ci-build --config Release
           ctest --test-dir integration/pixinsight/host/ci-build --build-config Release --output-on-failure
+
+      - name: Build module + worker, stage payload
+        shell: pwsh
+        run: integration/pixinsight/ci/build-module-windows.ps1 -Pcl "$PWD/pcl-ci" -Stage "$PWD/stage"
+
+      - name: Upload unsigned module artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmm-pxm-windows-x64
+          path: stage/bin/**
+          if-no-files-found: error
 
   macos:
     name: build+test (macos-arm64)
