@@ -125,7 +125,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1') }}
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1', 'integration/pixinsight/ci/win/PCL.vcxproj') }}
 
       - name: Build PCL (on cache miss)
         if: steps.pcl-cache.outputs.cache-hit != 'true'
@@ -137,7 +137,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1') }}
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1', 'integration/pixinsight/ci/win/PCL.vcxproj') }}
 
       - name: Confirm PCL archive
         shell: pwsh
