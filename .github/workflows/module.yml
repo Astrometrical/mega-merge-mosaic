@@ -146,6 +146,13 @@ jobs:
       - name: Rust tests (ipc crates)
         run: cargo test -p mmm-core -p mmm-ipc-worker
 
+      - name: Host golden CTest suite (no PixInsight)
+        shell: bash
+        run: |
+          cmake -S integration/pixinsight/host -B integration/pixinsight/host/ci-build
+          cmake --build integration/pixinsight/host/ci-build --config Release
+          ctest --test-dir integration/pixinsight/host/ci-build --build-config Release --output-on-failure
+
   macos:
     name: build+test (macos-arm64)
     runs-on: macos-latest

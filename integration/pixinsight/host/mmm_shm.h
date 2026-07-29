@@ -1,11 +1,17 @@
 #pragma once
-// POSIX shared-memory segment + fixed slot layout, mirroring
+// Named shared-memory segment + fixed slot layout, mirroring
 // crates/mmm-core/src/ipc/shm.rs's `SlotLayout`/`ShmSegment`. No PCL
-// headers here -- only the C++ stdlib + POSIX -- so this compiles and
+// headers here -- only the C++ stdlib + POSIX/Win32 -- so this compiles and
 // tests without PixInsight installed.
+//
+// POSIX backs the segment with `shm_open`+`mmap`; Windows backs it with a
+// pagefile-backed `CreateFileMappingW`+`MapViewOfFile`. The public interface
+// is identical on both; only the private handle member differs.
 
 #include <cstdint>
 #include <string>
+
+#include "mmm_os.h"
 
 namespace mmm {
 
@@ -27,11 +33,15 @@ struct SlotLayout {
   }
 };
 
-/// A named POSIX shared-memory segment mapped into this process.
+/// A named shared-memory segment mapped into this process.
 ///
-/// The creator (`create`) ftruncates + mmaps the segment and unlinks the
-/// named object on destruction. A moved-from instance is left in a state
-/// that performs no unmap/unlink on destruction.
+/// POSIX: the creator (`create`) ftruncates + mmaps the segment and unlinks
+/// the named object on destruction. Windows: the creator maps a pagefile-
+/// backed `CreateFileMappingW` object; there is NO `shm_unlink` analog -- the
+/// object is handle-refcounted by the kernel and vanishes when the last handle
+/// (host + worker) closes, so the destructor only unmaps the view and closes
+/// the mapping handle. A moved-from instance performs no unmap/close on
+/// destruction.
 class ShmSegment {
  public:
   /// Create a new shared-memory segment named `name`, sized
@@ -58,12 +68,18 @@ class ShmSegment {
   const std::string& name() const { return name_; }
 
  private:
+  ShmSegment() = default;
   ShmSegment(std::string name, uint8_t* base, uint64_t size, bool is_creator);
 
   std::string name_;
   uint8_t* base_ = nullptr;
   uint64_t size_ = 0;
   bool is_creator_ = false;
+#ifdef _WIN32
+  // The file-mapping object handle. On Windows there is no shm_unlink; the
+  // mapping lives as long as any handle to it is open (see class docs).
+  os_handle hMap_ = nullptr;
+#endif
 };
 
 }  // namespace mmm

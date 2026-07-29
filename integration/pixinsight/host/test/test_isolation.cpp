@@ -21,8 +21,6 @@
 // A wall-clock watchdog thread aborts the process after ~20s so a hang FAILS
 // loudly (nonzero exit, clear stderr message) instead of hanging CI.
 
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -56,7 +54,7 @@ void start_watchdog(std::chrono::seconds timeout) {
                  "treating as a hang regression and aborting.\n",
                  static_cast<long>(timeout.count()));
     std::fflush(stderr);
-    ::_exit(1);
+    std::_Exit(1);  // hard, portable, no-cleanup abort (POSIX _exit equivalent)
   }).detach();
 }
 
@@ -135,7 +133,7 @@ json make_init(uint64_t w, uint64_t h, uint64_t ch, uint32_t band_rows, uint64_t
 std::string unique_tmp_dir(const std::string& tag) {
   namespace fs = std::filesystem;
   fs::path dir = fs::temp_directory_path() /
-                 ("mmm-isolation-" + tag + "-" + std::to_string(::getpid()));
+                 ("mmm-isolation-" + tag + "-" + std::to_string(mmm_test_getpid()));
   std::error_code ec;
   fs::remove_all(dir, ec);
   fs::create_directories(dir, ec);
@@ -157,10 +155,19 @@ void test_crash_worker_exits_without_done() {
   mmm::SlotLayout layout{slot_bytes, 4, 2};
 
   std::string session_dir = unique_tmp_dir("crash");
-  std::string shm_name = "/mmm-isolation-crash-" + std::to_string(::getpid());
+  std::string shm_name = "/mmm-isolation-crash-" + std::to_string(mmm_test_getpid());
 
   mmm::HostConfig cfg;
+  // A program that exits immediately without reading Init or writing any frame,
+  // so Host::run() observes clean EOF before Done and throws HostError. POSIX
+  // uses /bin/false; Windows uses `cmd /c exit 1` (writes nothing to stdout and
+  // exits at once). Host::build_command_line_w does not quote worker_path, so
+  // the shell command's arguments pass through verbatim.
+#ifdef _WIN32
+  cfg.worker_path = "cmd /c exit 1";
+#else
   cfg.worker_path = "/bin/false";
+#endif
   cfg.layout = layout;
   cfg.shm_name = shm_name;
   cfg.init = json{{"Init", make_init(w, h, ch, band_rows, slot_bytes, layout, shm_name, session_dir)}};
@@ -209,7 +216,7 @@ void test_cancel_midrun_stops_promptly(const std::string& worker_path) {
   mmm::SlotLayout layout{slot_bytes, 4, 2};
 
   std::string session_dir = unique_tmp_dir("cancel");
-  std::string shm_name = "/mmm-isolation-cancel-" + std::to_string(::getpid());
+  std::string shm_name = "/mmm-isolation-cancel-" + std::to_string(mmm_test_getpid());
 
   SignalingSource src;
   src.inner.w = {w, w};

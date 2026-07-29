@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "mmm_os.h"
 #include "mmm_protocol.h"
 #include "mmm_shm.h"
 #include "third_party/json.hpp"
@@ -120,7 +121,7 @@ class Host {
   ProgressCallback* prog_;
 
   std::mutex stdin_mutex_;
-  int stdin_fd_ = -1;  // host -> worker; valid for the duration of run().
+  os_handle stdin_fd_ = os_invalid_handle;  // host -> worker; valid during run().
   std::atomic<bool> cancel_requested_{false};
   std::atomic<bool> cancelled_{false};
 

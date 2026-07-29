@@ -2,19 +2,39 @@ cmake_minimum_required(VERSION 3.16)
 project(mmm_host CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-add_compile_options(-Wall -Wextra -fPIC)
-find_package(Threads REQUIRED)
+if(MSVC)
+  # /W4 warning level, /EHsc standard C++ exception model. The host static lib
+  # does not link PCL, so /EHsc is correct here (the module DLL matches PCL's
+  # /EHa separately). UTF-8 source/exec charset keeps narrow string literals
+  # well-defined for the FormatMessageA/widen paths.
+  add_compile_options(/W4 /EHsc /utf-8)
+else()
+  add_compile_options(-Wall -Wextra -fPIC)
+endif()
+
+# std::thread/std::mutex need pthreads on Linux; on MSVC they work without an
+# explicit Threads dependency, so only require it off-Windows.
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+endif()
 
 add_library(mmm_host STATIC mmm_shm.cpp mmm_protocol.cpp mmm_host.cpp)
 target_include_directories(mmm_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-target_link_libraries(mmm_host PUBLIC Threads::Threads)
+if(NOT WIN32)
+  target_link_libraries(mmm_host PUBLIC Threads::Threads)
+endif()
 if(NOT WIN32 AND NOT APPLE)
   target_link_libraries(mmm_host PUBLIC rt)
 endif()
 
 enable_testing()
 # Path to the debug worker binary, overridable; default assumes cargo target dir.
-set(MMM_WORKER "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug/mmm-ipc-worker" CACHE FILEPATH "worker binary")
+# On Windows the cargo binary has the .exe suffix.
+if(WIN32)
+  set(MMM_WORKER "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug/mmm-ipc-worker.exe" CACHE FILEPATH "worker binary")
+else()
+  set(MMM_WORKER "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug/mmm-ipc-worker" CACHE FILEPATH "worker binary")
+endif()
 set(MMM_CARGO_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/../../../Cargo.toml")
 
 # Build the worker binary itself as part of the normal `cmake --build`, so

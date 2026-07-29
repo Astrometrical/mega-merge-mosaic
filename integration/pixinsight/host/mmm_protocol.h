@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "mmm_os.h"
 #include "third_party/json.hpp"
 
 namespace mmm {
@@ -92,12 +93,12 @@ struct WorkerFrame {
 /// cleanly). Throws `std::runtime_error` if EOF is hit mid-length-prefix or
 /// mid-payload (a truncated frame), or if the tag is not one of the six
 /// worker tags.
-bool read_worker_frame(int fd, WorkerFrame& out);
+bool read_worker_frame(os_handle fd, WorkerFrame& out);
 
 /// Writes one frame: tag byte, 4-byte LE payload length, then `len` bytes
 /// of payload. The caller is responsible for serializing writes under a
 /// mutex when called from multiple threads; this function does not lock.
-void write_frame_raw(int fd, uint8_t tag, const uint8_t* payload, uint32_t len);
+void write_frame_raw(os_handle fd, uint8_t tag, const uint8_t* payload, uint32_t len);
 
 /// Encodes a `BandReply` as its 9-byte little-endian wire form (does not
 /// frame it -- pass the result to `write_frame_raw` with tag 129).
