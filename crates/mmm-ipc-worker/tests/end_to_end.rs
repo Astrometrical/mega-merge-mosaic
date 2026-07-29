@@ -170,7 +170,7 @@ fn worker_blend_is_byte_identical_to_file_blend() {
         input_slots: 8,
         output_slots: 2,
     };
-    let shm_name = format!("/mmm-ipc-worker-e2e-{}", std::process::id());
+    let shm_name = format!("/mmm-e2e-{}", std::process::id());
     let shm = ShmSegment::create(&shm_name, layout.total_bytes()).unwrap();
 
     let panel_descs: Vec<PanelDesc> = (0..planar.len() as u32)
@@ -407,7 +407,7 @@ fn aligned_two_panel_job(
         input_slots: 4,
         output_slots: 2,
     };
-    let shm_name = format!("/mmm-ipc-worker-e2e-{tag}-{}", std::process::id());
+    let shm_name = format!("/mmm-e2e-{tag}-{}", std::process::id());
     let shm = ShmSegment::create(&shm_name, layout.total_bytes()).unwrap();
     let panel_descs: Vec<PanelDesc> = (0..2u32)
         .map(|panel_id| PanelDesc {
@@ -805,7 +805,7 @@ fn solved_mode_reprojection_matches_file() {
             input_slots: 8,
             output_slots: 2,
         };
-        let shm_name = format!("/mmm-ipc-worker-e2e-solved-{}", std::process::id());
+        let shm_name = format!("/mmm-e2e-solved-{}", std::process::id());
         let shm = ShmSegment::create(&shm_name, layout.total_bytes()).unwrap();
         let panel_descs: Vec<PanelDesc> = panel_headers
             .iter()

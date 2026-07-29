@@ -66,6 +66,13 @@ impl ShmSegment {
     /// Any stale segment left behind under `name` (e.g. from a crashed
     /// previous run) is unlinked first so `create` never fails with
     /// "already exists".
+    ///
+    /// macOS limits POSIX shm object names to 31 characters (`PSHMNAMLEN`),
+    /// including the leading `/`; `shm_open`/`shm_unlink` fail with `EINVAL`
+    /// beyond that. Keep `name` short. The production name generator
+    /// (`MakeShmName` in the C++ host) already produces short names
+    /// (`/mmm-pxm-<pid>-<ctr>`, ~20 chars); this only bites long ad hoc test
+    /// names.
     pub fn create(name: &str, total_bytes: u64) -> Result<ShmSegment> {
         use nix::errno::Errno;
         use nix::fcntl::OFlag;
@@ -623,7 +630,7 @@ mod tests {
 
     #[test]
     fn misaligned_offset_is_rejected_by_checked_range() {
-        let name = format!("/mmm-shm-test-align-{}", std::process::id());
+        let name = format!("/mmm-shm-align-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         // `slice_mut`'s public signature is pinned to `-> &mut [f32]` (no
         // `Result`), so misalignment surfaces as a panic via `.expect()`
@@ -639,14 +646,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "not a multiple of")]
     fn slice_mut_panics_on_misaligned_offset() {
-        let name = format!("/mmm-shm-test-align-panic-{}", std::process::id());
+        let name = format!("/mmm-shm-align-panic-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         let _ = host.slice_mut(1, 1);
     }
 
     #[test]
     fn slice_and_slice_mut_work_at_a_valid_aligned_offset() {
-        let name = format!("/mmm-shm-test-align-ok-{}", std::process::id());
+        let name = format!("/mmm-shm-align-ok-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         // Offset 4 (one f32 in) is 4-byte aligned and in bounds.
         let w = host.slice_mut(4, 2);
