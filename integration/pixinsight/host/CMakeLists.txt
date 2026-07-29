@@ -7,7 +7,10 @@ find_package(Threads REQUIRED)
 
 add_library(mmm_host STATIC mmm_shm.cpp mmm_protocol.cpp mmm_host.cpp)
 target_include_directories(mmm_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-target_link_libraries(mmm_host PUBLIC Threads::Threads rt)
+target_link_libraries(mmm_host PUBLIC Threads::Threads)
+if(NOT WIN32 AND NOT APPLE)
+  target_link_libraries(mmm_host PUBLIC rt)
+endif()
 
 enable_testing()
 # Path to the debug worker binary, overridable; default assumes cargo target dir.

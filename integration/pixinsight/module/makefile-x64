@@ -1,33 +1,63 @@
 ######################################################################
-# MergeMosaic PixInsight module (mmm-pxm.so) -- Linux/g++/x64
+# MergeMosaic PixInsight module (mmm-pxm) -- Linux/g++/x64 + macOS/clang++/arm64
 #
-# Flags mirror /opt/PixInsight/src/pcl/linux/g++/makefile-x64 (the flags
-# PixInsight itself builds PCL with). The module links libPCL-pxi.a plus the
-# PCL-free host/ objects (used by later tasks; Task 1 only proves they compile
-# into the link). Do NOT add -Wl,--no-undefined: the module's low-level
-# PixInsight-core symbols are resolved by the core at load time, so undefined
-# core symbols in the .so are expected and correct.
+# Flags mirror /opt/PixInsight/src/pcl/<platform>/<compiler>/makefile-*  (the
+# flags PixInsight itself builds PCL with: linux/g++/makefile-x64 resp.
+# macosx/g++/makefile-arm64). The module links libPCL-pxi.a plus the PCL-free
+# host/ objects (used by later tasks; Task 1 only proves they compile into
+# the link). Do NOT add -Wl,--no-undefined (Linux) or otherwise strip
+# undefined symbols: the module's low-level PixInsight-core symbols are
+# resolved by the core at load time, so undefined core symbols in the module
+# are expected and correct.
 ######################################################################
 
 PCLINCDIR ?= /opt/PixInsight/include
 PCLLIBDIR ?= $(HOME)/.local/pcl-build/lib
 HOSTDIR    = ../host
 
-CXX     ?= g++
 OBJDIR   = x64/Release
-TARGET   = mmm-pxm.so
+
+# Platform switch. Only the compiler, module extension and shared-link flag
+# are dictated by the port brief verbatim; PLATFORM_CXXFLAGS/PLATFORM_LIBS
+# are this makefile's own addition (see note below) so the Darwin branch
+# actually compiles and links against PCL rather than just changing the
+# output name.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+  CXX     ?= clang++
+  MODULE_EXT := dylib
+  SHARED_FLAGS := -dynamiclib -install_name @rpath/mmm-pxm.dylib
+  # PCL's own src/pcl/macosx/g++/makefile-arm64 (pinned SHA) selects Apple
+  # code paths off __PCL_MACOSX and builds arm64 with -arch arm64
+  # -stdlib=libc++; the Linux branch's -D__PCL_AVX2/-D__PCL_FMA/-mavx2/-mfma
+  # are x86-only (invalid on Apple Silicon) and -fnon-call-exceptions is a
+  # GCC extension clang++ does not recognize, so this branch does not reuse
+  # the Linux flags verbatim. macOS has no librt (shm_open etc. are in libc).
+  PLATFORM_CXXFLAGS := -arch arm64 -mmacosx-version-min=14 -stdlib=libc++ \
+                        -D__PCL_MACOSX
+  PLATFORM_LIBS :=
+else
+  CXX     ?= g++
+  MODULE_EXT := so
+  SHARED_FLAGS := -shared
+  PLATFORM_CXXFLAGS := -m64 -D__PCL_LINUX -D__PCL_AVX2 -D__PCL_FMA \
+                        -mavx2 -mfma -fnon-call-exceptions
+  PLATFORM_LIBS := -lrt
+endif
+
+TARGET   = mmm-pxm.$(MODULE_EXT)
 
 INCLUDES = -I"$(PCLINCDIR)" -I"$(HOSTDIR)" -I"$(HOSTDIR)/third_party"
 
-CXXFLAGS = -c -pipe -pthread -m64 -fPIC \
-           -D_REENTRANT -D__PCL_LINUX -D__PCL_AVX2 -D__PCL_FMA \
-           -mavx2 -mfma -minline-all-stringops \
+CXXFLAGS = -c -pipe -pthread -fPIC \
+           -D_REENTRANT $(PLATFORM_CXXFLAGS) \
+           -minline-all-stringops \
            -O3 -ffunction-sections -fdata-sections \
-           -fvisibility=hidden -fvisibility-inlines-hidden -fnon-call-exceptions \
+           -fvisibility=hidden -fvisibility-inlines-hidden \
            -std=c++20 -Wall -Wno-parentheses
 
-LDFLAGS  = -shared -fPIC
-LIBS     = -L"$(PCLLIBDIR)" -lPCL-pxi -lpthread -lrt
+LDFLAGS  = $(SHARED_FLAGS) -fPIC
+LIBS     = -L"$(PCLLIBDIR)" -lPCL-pxi -lpthread $(PLATFORM_LIBS)
 
 MODULE_OBJS = $(OBJDIR)/mmm.o \
               $(OBJDIR)/MmmProcess.o \

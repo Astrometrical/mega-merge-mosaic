@@ -149,3 +149,24 @@ jobs:
 
       - name: Confirm PCL archive
         run: test -f "$PWD/pcl-ci/lib/libPCL-pxi.a"
+
+      - name: Build module + worker, stage payload
+        run: |
+          bash integration/pixinsight/ci/build-module-macos.sh \
+            --pcl "$PWD/pcl-ci" --stage "$PWD/stage"
+
+      - name: Rust tests (ipc crates)
+        run: cargo test -p mmm-core -p mmm-ipc-worker
+
+      - name: Host golden CTest suite (no PixInsight)
+        run: |
+          cmake -S integration/pixinsight/host -B integration/pixinsight/host/ci-build
+          cmake --build integration/pixinsight/host/ci-build
+          ctest --test-dir integration/pixinsight/host/ci-build --output-on-failure
+
+      - name: Upload unsigned module artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmm-pxm-macos-arm64
+          path: stage/bin/**
+          if-no-files-found: error
