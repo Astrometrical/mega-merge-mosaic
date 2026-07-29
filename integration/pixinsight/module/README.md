@@ -8,8 +8,15 @@ byte-exact analyze/blend pipeline as the `mmm` CLI. It is PixInsight-only code
 (`host/`) has no PCL dependency and is tested independently (see
 `../host/README.md`).
 
-Linux/WSL only for now — see [spec §12](../../../docs/superpowers/specs/2026-07-27-pixinsight-integration-design.md#12-packaging--distribution--concrete-linuxwsl-first)
-for what Windows/macOS and signed-repository distribution still need.
+All three platforms **build and test in CI** (`.github/workflows/module.yml`:
+`linux-x64`, `macos-arm64`, `windows-x64` — see
+[`../ci/README.md`](../ci/README.md)). The **development flow below** (build
+via `make`/`makefile-x64`, sign, install) is still Linux/WSL-only — it is the
+maintainer's own day-to-day loop, documented in detail because it's what gets
+exercised most. See the [macOS/Windows build](#macos-and-windows-builds)
+and [Windows GUI validation](#windows-gui-validation-manual) sections below
+for the other two platforms, and [spec §12](../../../docs/superpowers/specs/2026-07-27-pixinsight-integration-design.md#12-packaging--distribution--concrete-linuxwsl-first)
+for what signed-repository distribution still needs.
 
 ## One-time prerequisite: build `libPCL-pxi.a`
 
@@ -88,6 +95,45 @@ cp target/release/mmm-ipc-worker integration/pixinsight/module/
 
 If the worker binary is missing, `MosaicMerge` reports a clear PixInsight
 error at execute time rather than failing silently or hanging.
+
+## macOS and Windows builds
+
+CI builds and tests the module on all three platforms (see
+[`../ci/README.md`](../ci/README.md) for the full per-platform build/test
+story); this section covers what's specific to each non-Linux target for
+anyone building locally.
+
+**macOS** builds the same way Linux does — `make` via `makefile-x64` grows a
+macOS branch (`-dynamiclib`, `.dylib` suffix, **no `-lrt`**: macOS's libc
+already provides `shm_open`) — producing `mmm-pxm.dylib`. `PCLLIBDIR` must
+contain not just `libPCL-pxi.a` but the six vendored 3rdparty static
+libraries the real PCL modules also link (`cminpack`, `lcms`, `lz4`,
+`RFC6234`, `zlib`, `zstd`) — `integration/pixinsight/ci/build-pcl-macos.sh`
+builds and stages all seven. `integration/pixinsight/ci/build-module-macos.sh`
+drives the module + worker build end to end and stages `bin/{mmm-pxm.dylib,mmm-ipc-worker}`.
+
+**Windows** cannot reuse `makefile-x64` (GNU-make + g++); it has its own
+CMake build, [`CMakeLists.txt`](CMakeLists.txt), producing `mmm-pxm.dll` from
+the same module sources plus the `host/` transport objects. Configure with
+`-DPCL_PREFIX=<dir with lib/PCL-pxi.lib + the six lib/*-pxi.lib + include/>`
+(that prefix comes from `integration/pixinsight/ci/build-pcl-windows.ps1`,
+which also builds the pinned `PCL.vcxproj` — see
+[`../ci/README.md`](../ci/README.md#the-pinned-winpclvcxproj)). Because
+Windows requires every symbol resolved at link time (unlike the `.so`/
+`.dylib` load-time resolution against the PixInsight core), the DLL links the
+full PCL closure directly: `PCL-pxi.lib` + the six 3rdparty `-pxi.lib`s, plus
+the Win32 system import libs the real PCL Windows modules link
+(`user32`, `gdi32`, `shell32`, `ole32`, `shlwapi`, `mscms`, and others — see
+`CMakeLists.txt` for the full list). **The ABI flags must match the pinned
+PCL build exactly** or the DLL fails to link/load against `PCL-pxi.lib`:
+`/MD` (`MultiThreadedDLL` runtime), `/EHa` (async exception handling),
+C++20 (`stdcpp20`), `/permissive- /Zc:__cplusplus`, `/arch:AVX2`, and the
+`v143` toolset — `CMakeLists.txt` sets all of these to mirror
+`integration/pixinsight/ci/win/PCL.vcxproj`.
+`integration/pixinsight/ci/build-module-windows.ps1` drives the configure +
+build, enforces a warning-free build, builds the worker
+(`cargo build --release --target x86_64-pc-windows-msvc -p mmm-ipc-worker` →
+`mmm-ipc-worker.exe`), and stages `bin/{mmm-pxm.dll,mmm-ipc-worker.exe}`.
 
 ## Code signing (required — PixInsight ≥ 1.9)
 
@@ -180,15 +226,52 @@ run:
    update and use the Console Abort (or the interface **Cancel** button) →
    the run stops with a clean "cancelled" error and no output window.
 
+## Windows GUI validation (manual)
+
+The Windows port is CI-green (build + `cargo test` + host CTest all pass in
+`windows-x64`), but — like the Linux smoke test above — the module's actual
+PixInsight *runtime* behavior can only be verified inside a real GUI, which
+CI does not run. This is a **manual maintainer step, not a CI gate** (there
+is a licensed PixInsight install on Windows available for this; there is not
+one on macOS, so the equivalent macOS check is deferred entirely — see
+"Future work" below).
+
+1. **Get artifacts**: either download the `mmm-pxm-windows-x64` artifact from
+   a green `module.yml` run, or build locally with
+   `integration/pixinsight/ci/build-module-windows.ps1 -Pcl <pcl-prefix> -Stage <dir>`
+   — either way you end up with `mmm-pxm.dll` + `mmm-ipc-worker.exe`.
+2. **Sign the module**: the module-signing flow is cross-platform — the same
+   `PixInsight --sign-module-file` mechanism used in "Code signing" above
+   signs a `.dll` exactly like a `.so` (gated only on the `-pxm` basename and
+   a `{.so,.dylib,.dll}` extension, not the binary format), so sign
+   `mmm-pxm.dll` from **any** licensed PixInsight install — Linux, WSL, or
+   Windows itself — with your local signing identity (or run it directly on
+   the Windows machine, matching `makefile-x64`'s `sign` target):
+   ```
+   PixInsight --automation-mode -n --sign-module-file="<path>\mmm-pxm.dll" ^
+     --xssk-file="<path>\mmm-dev.xssk" --xssk-password="your-password" --force-exit
+   ```
+   producing `mmm-pxm.xsgn` beside the `.dll`.
+3. **Install**: same as "Installing into PixInsight (dev flow)" above —
+   Process → Modules → Install Modules… on the folder containing
+   `mmm-pxm.dll` + `mmm-pxm.xsgn` + `mmm-ipc-worker.exe`, restart if prompted.
+4. **Confirm**: MosaicMerge appears under the Mosaic category and runs —
+   ideally repeat the same checklist as the Linux "Manual smoke test" above
+   (aligned/solved/files modes, fault isolation, cancel).
+
 ## Future work (not implemented — see spec §12)
 
 - A signed PixInsight **update repository** for one-click install/auto-update
   (needs a code-signing certificate from the PixInsight team and a
   per-platform signed package matrix).
-- **Windows/macOS** ports: Windows/macOS shared-memory transport
-  (`CreateFileMapping`/`MapViewOfFile` — the Rust `shm.rs` already stubs
-  non-Unix), macOS notarization of `mmm-ipc-worker` (else Gatekeeper blocks
-  the `exec`), Windows Authenticode/SmartScreen.
+- **Worker signing**: macOS notarization of `mmm-ipc-worker` (else Gatekeeper
+  blocks the `exec` of a *downloaded/quarantined* worker — a source build,
+  including CI, is unaffected) and Windows Authenticode / Azure Trusted
+  Signing. CI is green **unsigned** on all three platforms — see
+  [`../ci/README.md`](../ci/README.md#scope-ci-green-is-unsigned).
+- **macOS GUI smoke test**: deferred — no Mac with a licensed PixInsight
+  install is currently available. (The Windows equivalent is a manual,
+  non-CI-gated step — see "Windows GUI validation (manual)" above.)
 
 ## PCL ABI note
 
