@@ -51,21 +51,58 @@ std::wstring widen(const std::string& s) {
   return w;
 }
 
-// Builds a mutable UTF-16 command line: `<worker> [--probe-frame]`. CreateProcessW
-// may modify the buffer in place, so callers pass `cmd.data()`.
-//
-// The worker path is NOT wrapped in quotes. This is deliberate: `Host` exposes
-// only a single `worker_path` string with no separate argv channel, and the
-// isolation test needs to spawn a shell command (`cmd /c exit 1`) that exits
-// immediately without writing to stdout. Leaving the string un-quoted lets a
-// caller pass either a bare executable path (the real worker, whose CMake-
-// derived CI path contains no spaces) or a full shell command. CreateProcessW
-// accepts forward-slash executable paths, so the CMake `D:/a/.../worker.exe`
-// form resolves correctly. RISK: a worker path containing spaces would
-// misparse -- not a concern for the golden/isolation CI paths, but a future
-// caller with spaced paths would need an explicit argv API.
-std::wstring build_command_line_w(const std::string& worker_path, bool probe) {
-  std::wstring cmd = widen(worker_path);
+// Appends `arg` to `cmd` using the standard Win32 command-line quoting rules
+// (CommandLineToArgvW's inverse): quote only when the arg is empty or contains
+// whitespace/quotes, doubling backslashes that precede a quote or the closing
+// quote. Keeps simple args (e.g. "/c", "--probe-frame") unquoted.
+void append_win_arg(std::wstring& cmd, const std::wstring& arg) {
+  bool need_quote = arg.empty() || arg.find_first_of(L" \t\n\v\"") != std::wstring::npos;
+  if (!need_quote) {
+    cmd += arg;
+    return;
+  }
+  cmd += L'"';
+  for (size_t i = 0; i < arg.size();) {
+    size_t backslashes = 0;
+    while (i < arg.size() && arg[i] == L'\\') {
+      ++i;
+      ++backslashes;
+    }
+    if (i == arg.size()) {
+      cmd.append(backslashes * 2, L'\\');  // escape trailing backslashes before closing quote
+      break;
+    } else if (arg[i] == L'"') {
+      cmd.append(backslashes * 2 + 1, L'\\');  // escape backslashes + the quote
+      cmd += L'"';
+      ++i;
+    } else {
+      cmd.append(backslashes, L'\\');
+      cmd += arg[i];
+      ++i;
+    }
+  }
+  cmd += L'"';
+}
+
+// Builds a mutable UTF-16 command line for CreateProcessW (which may modify the
+// buffer in place, so callers pass `cmd.data()`):
+//   "<worker>" <arg0> <arg1> ... [--probe-frame]
+// The worker exe is ALWAYS quoted so a spaced install path
+// (e.g. C:\Program Files\PixInsight\bin\mmm-ipc-worker.exe) resolves correctly
+// and the `C:\Program.exe` local-hijack misparse is avoided. Additional args
+// come from HostConfig::worker_args (production leaves it empty; tests use it to
+// spawn a real quick-exit process such as cmd.exe /c exit 1). `--probe-frame`
+// is appended in probe mode.
+std::wstring build_command_line_w(const std::string& worker_path,
+                                  const std::vector<std::string>& args, bool probe) {
+  std::wstring cmd;
+  cmd += L'"';
+  cmd += widen(worker_path);
+  cmd += L'"';
+  for (const std::string& a : args) {
+    cmd += L' ';
+    append_win_arg(cmd, widen(a));
+  }
   if (probe) cmd += L" --probe-frame";
   return cmd;
 }
@@ -182,8 +219,8 @@ pid_t spawn_worker(const std::string& path, char* const argv[], int child_stdin_
 // ends non-inheritable so the child does not keep them open (which would
 // prevent EOF). Returns the child process HANDLE (caller closes it after
 // reaping).
-HANDLE spawn_worker_win(const std::string& path, bool probe, os_handle child_stdin_rd,
-                        os_handle child_stdout_wr) {
+HANDLE spawn_worker_win(const std::string& path, const std::vector<std::string>& args, bool probe,
+                        os_handle child_stdin_rd, os_handle child_stdout_wr) {
   STARTUPINFOW si;
   ZeroMemory(&si, sizeof si);
   si.cb = sizeof si;
@@ -195,7 +232,7 @@ HANDLE spawn_worker_win(const std::string& path, bool probe, os_handle child_std
   PROCESS_INFORMATION pi;
   ZeroMemory(&pi, sizeof pi);
 
-  std::wstring cmd = build_command_line_w(path, probe);
+  std::wstring cmd = build_command_line_w(path, args, probe);
   BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
                            TRUE /*inherit handles*/, 0, nullptr, nullptr, &si, &pi);
   if (!ok) {
@@ -247,13 +284,21 @@ void Host::run() {
   // ends non-inheritable so the child does not hold copies (breaks EOF).
   SetHandleInformation(in_pipe.fd[1], HANDLE_FLAG_INHERIT, 0);
   SetHandleInformation(out_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
-  HANDLE child = spawn_worker_win(cfg_.worker_path, /*probe=*/false, in_pipe.fd[0],
-                                  out_pipe.fd[1]);
+  HANDLE child = spawn_worker_win(cfg_.worker_path, cfg_.worker_args, /*probe=*/false,
+                                  in_pipe.fd[0], out_pipe.fd[1]);
 #else
-  std::string arg0 = cfg_.worker_path;
-  char* argv[] = {arg0.data(), nullptr};
-  pid_t pid = spawn_worker(cfg_.worker_path, argv, in_pipe.fd[0], out_pipe.fd[1], in_pipe.fd[1],
-                           out_pipe.fd[0]);
+  // argv[0] is the exact exe path (no quoting needed for exec); any extra
+  // worker_args follow it. Storage must outlive posix_spawn.
+  std::vector<std::string> argv_store;
+  argv_store.reserve(1 + cfg_.worker_args.size());
+  argv_store.push_back(cfg_.worker_path);
+  for (const std::string& a : cfg_.worker_args) argv_store.push_back(a);
+  std::vector<char*> argv;
+  argv.reserve(argv_store.size() + 1);
+  for (std::string& s : argv_store) argv.push_back(s.data());
+  argv.push_back(nullptr);
+  pid_t pid = spawn_worker(cfg_.worker_path, argv.data(), in_pipe.fd[0], out_pipe.fd[1],
+                           in_pipe.fd[1], out_pipe.fd[0]);
 #endif
 
   // The child holds its own copies of stdin-rd / stdout-wr now; close our
@@ -427,7 +472,8 @@ void Host::probe_frame(const std::string& worker_path, const nlohmann::json& ini
 #ifdef _WIN32
   SetHandleInformation(in_pipe.fd[1], HANDLE_FLAG_INHERIT, 0);
   SetHandleInformation(out_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
-  HANDLE child = spawn_worker_win(worker_path, /*probe=*/true, in_pipe.fd[0], out_pipe.fd[1]);
+  HANDLE child = spawn_worker_win(worker_path, /*args=*/{}, /*probe=*/true, in_pipe.fd[0],
+                                  out_pipe.fd[1]);
 #else
   std::string arg0 = worker_path;
   std::string arg1 = "--probe-frame";

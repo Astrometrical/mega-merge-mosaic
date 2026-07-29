@@ -158,14 +158,31 @@ void test_crash_worker_exits_without_done() {
   std::string shm_name = "/mmm-isolation-crash-" + std::to_string(mmm_test_getpid());
 
   mmm::HostConfig cfg;
-  // A program that exits immediately without reading Init or writing any frame,
-  // so Host::run() observes clean EOF before Done and throws HostError. Windows
-  // uses `cmd /c exit 1` (writes nothing to stdout and exits at once);
-  // Host::build_command_line_w does not quote worker_path, so the shell
-  // command's arguments pass through verbatim. `false` lives at a different
-  // absolute path per Unix: macOS keeps it in /usr/bin, Linux in /bin.
+  // A real program that exits immediately without reading Init or writing any
+  // frame, so Host::run() observes clean EOF before Done and throws HostError.
+  // The exe path and its args are kept SEPARATE (worker_path is a real
+  // executable the host quotes; worker_args carries flags) -- production quotes
+  // the worker exe for spaced install paths, and this test exercises that same
+  // path with a real quick-exit process on every OS:
+  //   Windows: cmd.exe /c exit 1  (exits nonzero at once, writes nothing)
+  //   macOS:   /usr/bin/false     (bare exe, exits 1)
+  //   Linux:   /bin/false         (bare exe, exits 1)
 #ifdef _WIN32
-  cfg.worker_path = "cmd /c exit 1";
+  std::string cmd_path = "C:\\Windows\\System32\\cmd.exe";
+  {
+    wchar_t comspec[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"ComSpec", comspec, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+      int bytes = WideCharToMultiByte(CP_UTF8, 0, comspec, static_cast<int>(n), nullptr, 0,
+                                      nullptr, nullptr);
+      std::string s(static_cast<size_t>(bytes), '\0');
+      WideCharToMultiByte(CP_UTF8, 0, comspec, static_cast<int>(n), s.data(), bytes, nullptr,
+                          nullptr);
+      cmd_path = std::move(s);
+    }
+  }
+  cfg.worker_path = cmd_path;
+  cfg.worker_args = {"/c", "exit", "1"};
 #elif defined(__APPLE__)
   cfg.worker_path = "/usr/bin/false";
 #else

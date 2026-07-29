@@ -15,6 +15,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "mmm_os.h"
 #include "mmm_protocol.h"
@@ -59,7 +60,13 @@ struct ProgressCallback {
 /// JSON object (per PROTOCOL.md Section 6), `layout` must agree with the
 /// slot sizing inside `init`, and `shm_name` names the segment to create.
 struct HostConfig {
-  std::string worker_path;  // absolute path to mmm-ipc-worker
+  std::string worker_path;  // absolute path to mmm-ipc-worker (exact exe, no args)
+  // Extra arguments passed to the worker after argv[0]. Production leaves this
+  // empty (the worker takes no positional args in a normal run); tests use it
+  // to spawn a real quick-exit process with its own flags. On Windows the exe
+  // is quoted and each arg appended separately, so a spaced install path
+  // (e.g. C:\Program Files\PixInsight\...) is handled correctly.
+  std::vector<std::string> worker_args;
   nlohmann::json init;      // the full {"Init":{...}} object
   SlotLayout layout;        // must match init's shm sizing
   std::string shm_name;
