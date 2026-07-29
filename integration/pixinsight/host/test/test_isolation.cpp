@@ -159,12 +159,15 @@ void test_crash_worker_exits_without_done() {
 
   mmm::HostConfig cfg;
   // A program that exits immediately without reading Init or writing any frame,
-  // so Host::run() observes clean EOF before Done and throws HostError. POSIX
-  // uses /bin/false; Windows uses `cmd /c exit 1` (writes nothing to stdout and
-  // exits at once). Host::build_command_line_w does not quote worker_path, so
-  // the shell command's arguments pass through verbatim.
+  // so Host::run() observes clean EOF before Done and throws HostError. Windows
+  // uses `cmd /c exit 1` (writes nothing to stdout and exits at once);
+  // Host::build_command_line_w does not quote worker_path, so the shell
+  // command's arguments pass through verbatim. `false` lives at a different
+  // absolute path per Unix: macOS keeps it in /usr/bin, Linux in /bin.
 #ifdef _WIN32
   cfg.worker_path = "cmd /c exit 1";
+#elif defined(__APPLE__)
+  cfg.worker_path = "/usr/bin/false";
 #else
   cfg.worker_path = "/bin/false";
 #endif
