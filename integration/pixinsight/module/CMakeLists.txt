@@ -72,8 +72,10 @@ target_include_directories(mmm-pxm PRIVATE
 
 # ABI + preprocessor defines: same set the pinned PCL.vcxproj / 3rdparty vcxproj
 # compile with (WarningLevel Level3 == /W3, as the real PCL modules use).
+# C++20 comes from CMAKE_CXX_STANDARD above (do not also pass /std:c++20 here,
+# or MSVC gets the flag twice).
 target_compile_options(mmm-pxm PRIVATE
-  /std:c++20 /permissive- /Zc:__cplusplus /EHa /arch:AVX2 /W3)
+  /permissive- /Zc:__cplusplus /EHa /arch:AVX2 /W3)
 target_compile_definitions(mmm-pxm PRIVATE
   WIN32 WIN64 _WINDOWS UNICODE _UNICODE
   __PCL_WINDOWS __PCL_NO_WIN32_MINIMUM_VERSIONS __PCL_AVX2 __PCL_FMA

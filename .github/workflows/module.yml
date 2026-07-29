@@ -1,6 +1,7 @@
 # Builds the PixInsight module (mmm-pxm) + mmm-ipc-worker against the pinned
-# open-source PCL, with NO PixInsight on the runner. Linux is the live build;
-# Windows/macOS are scaffolded placeholders until the native ports land.
+# open-source PCL, with NO PixInsight on the runner. All three targets --
+# Linux (x64), macOS (arm64), and Windows (x64) -- are live, required
+# build+test jobs.
 name: Module
 
 on:
@@ -140,7 +141,9 @@ jobs:
 
       - name: Confirm PCL archive
         shell: pwsh
-        run: if (-not (Test-Path "$PWD/pcl-ci/lib/PCL-pxi.lib")) { exit 1 }
+        run: |
+          if (-not (Test-Path "$PWD/pcl-ci/lib/PCL-pxi.lib")) { exit 1 }
+          if (-not (Test-Path "$PWD/pcl-ci/lib/lcms-pxi.lib")) { exit 1 }
 
       - name: Rust tests (ipc crates)
         run: cargo test -p mmm-core -p mmm-ipc-worker

@@ -17,8 +17,10 @@ $moduleDir = Join-Path $repo 'integration/pixinsight/module'
 $build = Join-Path $moduleDir 'win-build'
 $Pcl = (Resolve-Path $Pcl).Path
 
-# Configure (x64 explicitly so we match the x64 PCL-pxi.lib) and build Release.
-cmake -S $moduleDir -B $build -A x64 -DPCL_PREFIX="$Pcl"
+# Configure (x64 + toolset v143, both pinned to match the hard-pinned x64/v143
+# PCL-pxi.lib so the module's ABI can't drift if the runner image advances) and
+# build Release.
+cmake -S $moduleDir -B $build -A x64 -T v143 -DPCL_PREFIX="$Pcl"
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
 
 $buildLog = cmake --build $build --config Release 2>&1 | Tee-Object -Variable _bl
