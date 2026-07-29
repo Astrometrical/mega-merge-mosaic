@@ -88,14 +88,23 @@ impl ShmSegment {
         )
         .map_err(|e| Error::compute(format!("shm_open({name}) failed: {e}")))?;
 
-        if let Err(e) = nix::unistd::ftruncate(&fd, total_bytes as libc::off_t) {
+        // A job with 0 input slots and 0 output slots (a degenerate
+        // test-only case; see `ipc::client::tests`) yields `total_bytes ==
+        // 0`. macOS's `mmap` rejects a zero-length mapping with EINVAL, so
+        // allocate (and map) a minimum of 1 byte that is never accessed —
+        // `checked_range` below still bounds logical accesses against
+        // `total_bytes`, not the allocation, so a zero-byte segment
+        // continues to reject any nonzero-length `slice`/`slice_mut`.
+        let alloc = total_bytes.max(1);
+
+        if let Err(e) = nix::unistd::ftruncate(&fd, alloc as libc::off_t) {
             // We already created the (now zero-length) named object; leaving
             // it behind would only be cleaned up by a future `create` of the
             // same name unlinking it first. Unlink it now instead so a
             // failed `create` doesn't leak the shm object.
             let _ = nix::sys::mman::shm_unlink(name);
             return Err(Error::compute(format!(
-                "ftruncate({name}, {total_bytes} bytes) failed: {e}"
+                "ftruncate({name}, {alloc} bytes) failed: {e}"
             )));
         }
 
@@ -106,10 +115,11 @@ impl ShmSegment {
         // file" would give a mapping longer than `total_bytes` and drift the
         // segment's logical size (which `checked_range` bounds against) away
         // from what the caller asked for. An explicit length maps exactly
-        // `total_bytes` on every platform.
+        // `alloc` (== `total_bytes`, except in the zero-byte case above) on
+        // every platform.
         let map = unsafe {
             memmap2::MmapOptions::new()
-                .len(total_bytes as usize)
+                .len(alloc as usize)
                 .map_mut(&file)
                 .map_err(|e| Error::io(format!("shm:{name}"), e))?
         };
@@ -158,12 +168,17 @@ impl ShmSegment {
             )));
         }
 
+        // See the matching comment in `create`: a degenerate 0-slot job
+        // yields `total_bytes == 0`, and macOS's `mmap` rejects a
+        // zero-length mapping, so map at least 1 byte (never accessed).
+        let alloc = total_bytes.max(1);
+
         // Map an explicit length (see the matching comment in `create`) so
-        // `self.map.len() == total_bytes` exactly, independent of the
-        // underlying object's (possibly page-rounded) actual size.
+        // `self.map.len() == alloc` exactly, independent of the underlying
+        // object's (possibly page-rounded) actual size.
         let map = unsafe {
             memmap2::MmapOptions::new()
-                .len(total_bytes as usize)
+                .len(alloc as usize)
                 .map_mut(&file)
                 .map_err(|e| Error::io(format!("shm:{name}"), e))?
         };
@@ -339,8 +354,16 @@ impl ShmSegment {
             CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
         };
         let wname = win_object_name(name);
-        let hi = (total_bytes >> 32) as u32;
-        let lo = (total_bytes & 0xFFFF_FFFF) as u32;
+        // A job with 0 input slots and 0 output slots (a degenerate
+        // test-only case; see `ipc::client::tests`) yields `total_bytes ==
+        // 0`. `CreateFileMappingW` rejects a zero-size mapping with
+        // ERROR_INVALID_PARAMETER, so allocate (and map) a minimum of 1
+        // byte that is never accessed — `self.size` stays `total_bytes`
+        // (not `alloc`), so `checked_range` still rejects any nonzero
+        // access to a logically zero-byte segment.
+        let alloc = total_bytes.max(1);
+        let hi = (alloc >> 32) as u32;
+        let lo = (alloc & 0xFFFF_FFFF) as u32;
         // SAFETY: FFI; INVALID_HANDLE_VALUE requests a pagefile-backed mapping.
         let handle = unsafe {
             CreateFileMappingW(
@@ -358,9 +381,8 @@ impl ShmSegment {
                 unsafe { GetLastError() }
             )));
         }
-        // SAFETY: FFI; map the whole segment ([0, total_bytes)).
-        let view =
-            unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total_bytes as usize) };
+        // SAFETY: FFI; map the whole allocation ([0, alloc)).
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, alloc as usize) };
         if view.Value.is_null() {
             let e = unsafe { GetLastError() };
             unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
@@ -398,9 +420,13 @@ impl ShmSegment {
                 unsafe { GetLastError() }
             )));
         }
+        // See the matching comment in `create`: a degenerate 0-slot job
+        // yields `total_bytes == 0`, and `MapViewOfFile` rejects a
+        // zero-size view, so map at least 1 byte (never accessed); `size`
+        // (below) stays `total_bytes`, not `alloc`.
+        let alloc = total_bytes.max(1);
         // SAFETY: FFI.
-        let view =
-            unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, total_bytes as usize) };
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, alloc as usize) };
         if view.Value.is_null() {
             let e = unsafe { GetLastError() };
             unsafe { CloseHandle(handle) };
@@ -564,6 +590,17 @@ mod win_tests {
         host.slice_mut(4, 2).copy_from_slice(&[5.0, 6.0]);
         assert_eq!(host.slice(4, 2), &[5.0, 6.0]);
     }
+
+    #[test]
+    fn zero_byte_segment_creates_and_slices_empty() {
+        // A degenerate 0-input/0-output-slot job yields `total_bytes == 0`;
+        // `CreateFileMappingW` rejects a zero-size mapping, so `create`
+        // clamps its OS allocation to a minimum of 1 byte. The segment
+        // still reports (and enforces) a logical size of 0.
+        let name = format!("mmm-shm-wtest-zero-{}", std::process::id());
+        let host = ShmSegment::create(&name, 0).unwrap();
+        assert_eq!(host.slice(0, 0), &[] as &[f32]);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -627,5 +664,16 @@ mod tests {
         let worker = ShmSegment::attach(&name, total).unwrap();
         assert_eq!(worker.slice(0, 4), &[1.0, 2.0, 3.0, 4.0]);
         // Cleanup happens on host drop (unlink); attach drop just unmaps.
+    }
+
+    #[test]
+    fn zero_byte_segment_creates_and_slices_empty() {
+        // A degenerate 0-input/0-output-slot job yields `total_bytes == 0`;
+        // macOS's `mmap` rejects a zero-length mapping, so `create` clamps
+        // its OS allocation to a minimum of 1 byte. The segment still
+        // reports (and enforces, via `checked_range`) a logical size of 0.
+        let name = format!("/mmm-shm-test-zero-{}", std::process::id());
+        let host = ShmSegment::create(&name, 0).unwrap();
+        assert_eq!(host.slice(0, 0), &[] as &[f32]);
     }
 }
