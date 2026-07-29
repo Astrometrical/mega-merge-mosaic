@@ -112,13 +112,40 @@ jobs:
           exit 1
 
   macos:
-    name: build+test (macos-x64) — placeholder
+    name: build+test (macos-arm64)
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Native port pending (Plan 3a)
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read PCL pin
+        id: pcl
         run: |
-          echo "macOS validation + worker notarization not yet implemented (Plan 3a)."
-          echo "This job is a scaffolded placeholder."
-          exit 1
+          . integration/pixinsight/ci/pcl-pin.env
+          echo "sha=$PCL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libPCL-pxi.a (keyed on PCL commit)
+        id: pcl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+
+      - name: Build PCL (on cache miss)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        run: bash integration/pixinsight/ci/build-pcl-macos.sh --out "$PWD/pcl-ci"
+
+      - name: Save libPCL-pxi.a cache (only after a successful build)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}
+
+      - name: Confirm PCL archive
+        run: test -f "$PWD/pcl-ci/lib/libPCL-pxi.a"
