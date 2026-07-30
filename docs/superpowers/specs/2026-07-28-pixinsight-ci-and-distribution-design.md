@@ -7,6 +7,18 @@ automation + distribution** phase and supersedes the forward-looking parts of
 that document's §12. Scope owner: `.github/workflows/`, the PCL-in-CI build, and
 new packaging/repository tooling under `integration/pixinsight/`.
 
+**Update (2026-07-30):** the **repository/distribution** half of this spec is
+extended and partially superseded by
+[`2026-07-30-distribution-relocation-and-repo-trust-findings.md`](2026-07-30-distribution-relocation-and-repo-trust-findings.md).
+Two things changed: (1) the repository trust model was investigated empirically
+— a **local signing identity is accepted for the maintainer's own machines**, so
+repository distribution is **not** blocked on CPD (the "dormant until CPD"
+framing here applies only to *public* trust); and (2) the repository + publishing
+pipeline **relocates to a separate, private "Astrometrical" website repository**
+(Cloudflare Pages), so `integration/pixinsight/repo/` is now a *starting point to
+lift out*, not work to finish in this repo. The **CI build** half of this spec
+(§4, `module.yml`) is unaffected and remains current.
+
 **Update (2026-07-29):** §2's deferred native Windows/macOS ports are now
 **implemented** by
 [`2026-07-29-pixinsight-winmac-ports-design.md`](2026-07-29-pixinsight-winmac-ports-design.md)

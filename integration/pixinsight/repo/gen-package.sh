@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# RELOCATING (2026-07-30): moving to the private "Astrometrical" website repo.
+# Kept here as the tested starting point. See
+# docs/superpowers/specs/2026-07-30-distribution-relocation-and-repo-trust-findings.md
+#
 # Assemble one platform's update package (tar.gz overlay) + its .meta.
 # Usage: gen-package.sh <os> <arch> <staging-dir> <out-dir>
 set -euo pipefail
