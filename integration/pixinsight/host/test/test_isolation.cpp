@@ -21,8 +21,6 @@
 // A wall-clock watchdog thread aborts the process after ~20s so a hang FAILS
 // loudly (nonzero exit, clear stderr message) instead of hanging CI.
 
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -56,7 +54,7 @@ void start_watchdog(std::chrono::seconds timeout) {
                  "treating as a hang regression and aborting.\n",
                  static_cast<long>(timeout.count()));
     std::fflush(stderr);
-    ::_exit(1);
+    std::_Exit(1);  // hard, portable, no-cleanup abort (POSIX _exit equivalent)
   }).detach();
 }
 
@@ -135,7 +133,7 @@ json make_init(uint64_t w, uint64_t h, uint64_t ch, uint32_t band_rows, uint64_t
 std::string unique_tmp_dir(const std::string& tag) {
   namespace fs = std::filesystem;
   fs::path dir = fs::temp_directory_path() /
-                 ("mmm-isolation-" + tag + "-" + std::to_string(::getpid()));
+                 ("mmm-isolation-" + tag + "-" + std::to_string(mmm_test_getpid()));
   std::error_code ec;
   fs::remove_all(dir, ec);
   fs::create_directories(dir, ec);
@@ -157,10 +155,39 @@ void test_crash_worker_exits_without_done() {
   mmm::SlotLayout layout{slot_bytes, 4, 2};
 
   std::string session_dir = unique_tmp_dir("crash");
-  std::string shm_name = "/mmm-isolation-crash-" + std::to_string(::getpid());
+  std::string shm_name = "/mmm-isolation-crash-" + std::to_string(mmm_test_getpid());
 
   mmm::HostConfig cfg;
+  // A real program that exits immediately without reading Init or writing any
+  // frame, so Host::run() observes clean EOF before Done and throws HostError.
+  // The exe path and its args are kept SEPARATE (worker_path is a real
+  // executable the host quotes; worker_args carries flags) -- production quotes
+  // the worker exe for spaced install paths, and this test exercises that same
+  // path with a real quick-exit process on every OS:
+  //   Windows: cmd.exe /c exit 1  (exits nonzero at once, writes nothing)
+  //   macOS:   /usr/bin/false     (bare exe, exits 1)
+  //   Linux:   /bin/false         (bare exe, exits 1)
+#ifdef _WIN32
+  std::string cmd_path = "C:\\Windows\\System32\\cmd.exe";
+  {
+    wchar_t comspec[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"ComSpec", comspec, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+      int bytes = WideCharToMultiByte(CP_UTF8, 0, comspec, static_cast<int>(n), nullptr, 0,
+                                      nullptr, nullptr);
+      std::string s(static_cast<size_t>(bytes), '\0');
+      WideCharToMultiByte(CP_UTF8, 0, comspec, static_cast<int>(n), s.data(), bytes, nullptr,
+                          nullptr);
+      cmd_path = std::move(s);
+    }
+  }
+  cfg.worker_path = cmd_path;
+  cfg.worker_args = {"/c", "exit", "1"};
+#elif defined(__APPLE__)
+  cfg.worker_path = "/usr/bin/false";
+#else
   cfg.worker_path = "/bin/false";
+#endif
   cfg.layout = layout;
   cfg.shm_name = shm_name;
   cfg.init = json{{"Init", make_init(w, h, ch, band_rows, slot_bytes, layout, shm_name, session_dir)}};
@@ -209,7 +236,7 @@ void test_cancel_midrun_stops_promptly(const std::string& worker_path) {
   mmm::SlotLayout layout{slot_bytes, 4, 2};
 
   std::string session_dir = unique_tmp_dir("cancel");
-  std::string shm_name = "/mmm-isolation-cancel-" + std::to_string(::getpid());
+  std::string shm_name = "/mmm-isolation-cancel-" + std::to_string(mmm_test_getpid());
 
   SignalingSource src;
   src.inner.w = {w, w};

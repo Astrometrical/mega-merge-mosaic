@@ -4,7 +4,8 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
-#include <unistd.h>
+
+#include "mmm_os.h"
 
 namespace mmm {
 
@@ -31,18 +32,24 @@ void put_u32_le(std::vector<uint8_t>& buf, uint32_t v) {
   }
 }
 
-// ---- full read/write over a raw fd (handle short reads/writes + EINTR) --
+// ---- full read/write over an os_handle (handle short reads/writes + EINTR) --
 
-// Reads up to `n` bytes into `buf`, looping over `read()` until `n` bytes
+// Reads up to `n` bytes into `buf`, looping over `os_read()` until `n` bytes
 // have been read or EOF is hit. Returns the number of bytes actually read
-// (< n only on EOF). Throws on a hard read error.
-size_t full_read(int fd, uint8_t* buf, size_t n) {
+// (< n only on EOF). Throws on a hard read error. The EINTR retry only exists
+// on POSIX; Windows `ReadFile` never returns EINTR, so a single `os_read` per
+// iteration is the loop body there.
+size_t full_read(os_handle fd, uint8_t* buf, size_t n) {
   size_t total = 0;
   while (total < n) {
-    ssize_t r = ::read(fd, buf + total, n - total);
+    long r = os_read(fd, buf + total, n - total);
     if (r < 0) {
+#ifndef _WIN32
       if (errno == EINTR) continue;
       throw std::runtime_error(std::string("read: ") + std::strerror(errno));
+#else
+      throw std::runtime_error("read: os_read failed");
+#endif
     }
     if (r == 0) break;  // EOF
     total += static_cast<size_t>(r);
@@ -50,13 +57,17 @@ size_t full_read(int fd, uint8_t* buf, size_t n) {
   return total;
 }
 
-void full_write(int fd, const uint8_t* buf, size_t n) {
+void full_write(os_handle fd, const uint8_t* buf, size_t n) {
   size_t total = 0;
   while (total < n) {
-    ssize_t w = ::write(fd, buf + total, n - total);
+    long w = os_write(fd, buf + total, n - total);
     if (w < 0) {
+#ifndef _WIN32
       if (errno == EINTR) continue;
       throw std::runtime_error(std::string("write: ") + std::strerror(errno));
+#else
+      throw std::runtime_error("write: os_write failed");
+#endif
     }
     total += static_cast<size_t>(w);
   }
@@ -93,7 +104,7 @@ void check_finite(const nlohmann::json& node) {
 
 }  // namespace
 
-bool read_worker_frame(int fd, WorkerFrame& out) {
+bool read_worker_frame(os_handle fd, WorkerFrame& out) {
   uint8_t tag_byte = 0;
   size_t n = full_read(fd, &tag_byte, 1);
   if (n == 0) {
@@ -175,7 +186,7 @@ bool read_worker_frame(int fd, WorkerFrame& out) {
   return true;
 }
 
-void write_frame_raw(int fd, uint8_t tag, const uint8_t* payload, uint32_t len) {
+void write_frame_raw(os_handle fd, uint8_t tag, const uint8_t* payload, uint32_t len) {
   std::vector<uint8_t> header;
   header.reserve(5);
   header.push_back(tag);

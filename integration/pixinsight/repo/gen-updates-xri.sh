@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# RELOCATING (2026-07-30): moving to the private "Astrometrical" website repo.
+# Kept here as the tested starting point. See
+# docs/superpowers/specs/2026-07-30-distribution-relocation-and-repo-trust-findings.md
+#
 # Emit a schema-valid PixInsight updates.xri from one or more package .meta files.
 # Usage: gen-updates-xri.sh <releaseDate YYYYMMDD> <versionRange> <title> <out> <meta...>
 set -euo pipefail

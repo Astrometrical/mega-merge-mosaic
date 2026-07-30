@@ -2,8 +2,18 @@
 
 #include "MmmExecution.h"
 
-#include <dlfcn.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX  // keep windows.h from defining min()/max() macros
+#  endif
+#  include <windows.h>
+#else
+#  include <dlfcn.h>
+#  include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cmath>
@@ -146,10 +156,29 @@ struct NullPanelSource : mmm::PanelSource
 
 // ----------------------------------------------------------------------------
 
-// Directory containing this loaded module .so, via dladdr on a module symbol
-// (PCL exposes no module-path API; PCL_API_REFERENCE.md section 8).
+// Directory containing this loaded module (.so/.dylib on POSIX, .dll on
+// Windows), located via the address of a module symbol (PCL exposes no
+// module-path API; PCL_API_REFERENCE.md section 8). POSIX uses dladdr; Windows
+// uses GetModuleHandleExW(FROM_ADDRESS) + GetModuleFileNameW.
 String ModuleDirectory()
 {
+#ifdef _WIN32
+   HMODULE hmod = nullptr;
+   if ( ::GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>( &run_blend ), &hmod ) )
+   {
+      wchar_t buf[ 32768 ];
+      DWORD n = ::GetModuleFileNameW( hmod, buf, DWORD( sizeof buf / sizeof buf[0] ) );
+      if ( n > 0 && n < DWORD( sizeof buf / sizeof buf[0] ) )
+      {
+         // wchar_t is 16-bit on Windows == PCL String's UTF-16 code unit.
+         String path( reinterpret_cast<const char16_t*>( buf ) );
+         return File::ExtractDrive( path ) + File::ExtractDirectory( path );
+      }
+   }
+   throw Error( "MosaicMerge: could not determine the module path via GetModuleFileNameW()." );
+#else
    Dl_info info;
    if ( dladdr( reinterpret_cast<void*>( &run_blend ), &info ) != 0 && info.dli_fname != nullptr )
    {
@@ -157,6 +186,7 @@ String ModuleDirectory()
       return File::ExtractDrive( path ) + File::ExtractDirectory( path );
    }
    throw Error( "MosaicMerge: could not determine the module path via dladdr()." );
+#endif
 }
 
 // Absolute path to the sibling mmm-ipc-worker binary; errors clearly if absent.
@@ -165,11 +195,19 @@ std::string ResolveWorkerPath()
    String dir = ModuleDirectory();
    if ( !dir.EndsWith( '/' ) )
       dir += '/';
+#ifdef _WIN32
+   String worker = dir + "mmm-ipc-worker.exe";
+   if ( !File::Exists( worker ) )
+      throw Error( "MosaicMerge: worker binary not found next to the module: " + worker +
+                   "\nBuild it with `cargo build --release -p mmm-ipc-worker` and copy "
+                   "`mmm-ipc-worker.exe` beside mmm-pxm.dll." );
+#else
    String worker = dir + "mmm-ipc-worker";
    if ( !File::Exists( worker ) )
       throw Error( "MosaicMerge: worker binary not found next to the module: " + worker +
                    "\nBuild it with `cargo build --release -p mmm-ipc-worker` and copy "
                    "`mmm-ipc-worker` beside mmm-pxm.so." );
+#endif
    return std::string( worker.ToUTF8().c_str() );
 }
 
@@ -224,8 +262,13 @@ json BuildParams( const Params& in )
 // A fresh, process-unique shm segment name (PROTOCOL.md section 2).
 std::string MakeShmName()
 {
-   return "/mmm-pxm-" + std::to_string( (unsigned long) ::getpid() ) + "-" +
-          std::to_string( s_runCounter.fetch_add( 1 ) );
+   return "/mmm-pxm-" +
+#ifdef _WIN32
+          std::to_string( (unsigned long) ::GetCurrentProcessId() )
+#else
+          std::to_string( (unsigned long) ::getpid() )
+#endif
+          + "-" + std::to_string( s_runCounter.fetch_add( 1 ) );
 }
 
 // Enable/disable the interface Cancel button around a run (best-effort; the

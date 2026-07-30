@@ -1,9 +1,23 @@
 # PixInsight module — CI build & distribution
 
-This directory holds the **dormant PixInsight update-repository pipeline**
-(package + `updates.xri` + signing) for the `mmm-pxm` module. The pipeline is
-built and CI-validated end to end, but it does not publish anything yet — see
-[Going live (post-CPD)](#going-live-post-cpd) below for what flips it on.
+> **⚠️ RELOCATING (2026-07-30).** These scripts are being **moved out of
+> MergeMosaic** into a separate, private **"Astrometrical" website repository**
+> that hosts the PixInsight update repository as static files on Cloudflare
+> Pages. They are **kept here, annotated, as the tested starting point to lift
+> into that project** — do not treat them as something to finish *in this repo*.
+> The decision, the (favorable) repository trust findings, the corrected
+> sign-then-package ordering, and the bundle contract are recorded in
+> [`docs/superpowers/specs/2026-07-30-distribution-relocation-and-repo-trust-findings.md`](../../../docs/superpowers/specs/2026-07-30-distribution-relocation-and-repo-trust-findings.md).
+> Key correction to the text below: a **local signing identity is accepted for
+> the maintainer's own machines** — repository distribution is **not** blocked
+> on CPD; CPD only makes the repo trusted by *other* people. The "dormant until
+> CPD" framing below is superseded accordingly.
+
+This directory holds the (originally dormant) PixInsight update-repository
+pipeline (package + `updates.xri` + signing) for the `mmm-pxm` module. The
+pipeline is built and CI-validated end to end. See the relocation spec above for
+the current plan; the historical "dormant until CPD" details below are retained
+for the lift-and-shift.
 
 The full design (why these decisions, the package/XRI format, the signing
 architecture, and open items) lives in

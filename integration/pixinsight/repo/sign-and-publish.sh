@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-# DORMANT repository signing + publish driver.
+# RELOCATING (2026-07-30): moving to the private "Astrometrical" website repo.
+# Kept here as the tested starting point. See
+# docs/superpowers/specs/2026-07-30-distribution-relocation-and-repo-trust-findings.md
+#
+# Findings that change this script when re-homed (do NOT edit it in place here):
+#   - A LOCAL signing identity is accepted for the maintainer's own machines, so
+#     signing is NOT gated on CPD; drop the MMM_CPD_XSSK dormant gate for a single
+#     key input (MMM_XSSK / MMM_XSSK_PASSWORD) defaulting to the local key.
+#   - `--sign-xml-file` is confirmed real (the "caveat" is retired).
+#   - ORDERING BUG: sign modules FIRST, then package (so .xsgn is inside the
+#     tar.gz and the updates.xri sha1 matches). This script currently signs a
+#     stage tree whose tarball was already built upstream.
+#
+# DORMANT repository signing + publish driver (historical framing; see above).
 #
 # Module signing requires the PixInsight binary (there is no standalone signer)
 # AND a globally trusted CPD identity. Until a CPD .xssk is provided via

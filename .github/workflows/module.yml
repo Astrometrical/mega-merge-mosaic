@@ -1,6 +1,7 @@
 # Builds the PixInsight module (mmm-pxm) + mmm-ipc-worker against the pinned
-# open-source PCL, with NO PixInsight on the runner. Linux is the live build;
-# Windows/macOS are scaffolded placeholders until the native ports land.
+# open-source PCL, with NO PixInsight on the runner. All three targets --
+# Linux (x64), macOS (arm64), and Windows (x64) -- are live, required
+# build+test jobs.
 name: Module
 
 on:
@@ -98,27 +99,129 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: build+test (windows-x64) — placeholder
+    name: build+test (windows-x64)
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Native port pending (Plan 3a)
+
+      - name: Install stable Rust (msvc)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Read PCL pin
+        id: pcl
         shell: bash
         run: |
-          echo "Windows shm + host transport port not yet implemented (Plan 3a)."
-          echo "This job is a scaffolded placeholder; it will build the module"
-          echo "once crates/mmm-core/src/ipc/shm.rs and host/ support Windows."
-          exit 1
+          . integration/pixinsight/ci/pcl-pin.env
+          echo "sha=$PCL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache PCL-pxi.lib (keyed on PCL commit)
+        id: pcl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1', 'integration/pixinsight/ci/win/PCL.vcxproj') }}
+
+      - name: Build PCL (on cache miss)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: integration/pixinsight/ci/build-pcl-windows.ps1 -Out "$PWD/pcl-ci"
+
+      - name: Save PCL-pxi.lib cache (only after a successful build)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-windows.ps1', 'integration/pixinsight/ci/win/PCL.vcxproj') }}
+
+      - name: Confirm PCL archive
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$PWD/pcl-ci/lib/PCL-pxi.lib")) { exit 1 }
+          if (-not (Test-Path "$PWD/pcl-ci/lib/lcms-pxi.lib")) { exit 1 }
+
+      - name: Rust tests (ipc crates)
+        run: cargo test -p mmm-core -p mmm-ipc-worker
+
+      - name: Host golden CTest suite (no PixInsight)
+        shell: bash
+        run: |
+          cmake -S integration/pixinsight/host -B integration/pixinsight/host/ci-build
+          cmake --build integration/pixinsight/host/ci-build --config Release
+          ctest --test-dir integration/pixinsight/host/ci-build --build-config Release --output-on-failure
+
+      - name: Build module + worker, stage payload
+        shell: pwsh
+        run: integration/pixinsight/ci/build-module-windows.ps1 -Pcl "$PWD/pcl-ci" -Stage "$PWD/stage"
+
+      - name: Upload unsigned module artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmm-pxm-windows-x64
+          path: stage/bin/**
+          if-no-files-found: error
 
   macos:
-    name: build+test (macos-x64) — placeholder
+    name: build+test (macos-arm64)
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Native port pending (Plan 3a)
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read PCL pin
+        id: pcl
         run: |
-          echo "macOS validation + worker notarization not yet implemented (Plan 3a)."
-          echo "This job is a scaffolded placeholder."
-          exit 1
+          . integration/pixinsight/ci/pcl-pin.env
+          echo "sha=$PCL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libPCL-pxi.a (keyed on PCL commit)
+        id: pcl-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
+
+      - name: Build PCL (on cache miss)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        run: bash integration/pixinsight/ci/build-pcl-macos.sh --out "$PWD/pcl-ci"
+
+      - name: Save libPCL-pxi.a cache (only after a successful build)
+        if: steps.pcl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: pcl-ci
+          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
+
+      - name: Confirm PCL archive
+        run: test -f "$PWD/pcl-ci/lib/libPCL-pxi.a"
+
+      - name: Build module + worker, stage payload
+        run: |
+          bash integration/pixinsight/ci/build-module-macos.sh \
+            --pcl "$PWD/pcl-ci" --stage "$PWD/stage"
+
+      - name: Rust tests (ipc crates)
+        run: cargo test -p mmm-core -p mmm-ipc-worker
+
+      - name: Host golden CTest suite (no PixInsight)
+        run: |
+          cmake -S integration/pixinsight/host -B integration/pixinsight/host/ci-build
+          cmake --build integration/pixinsight/host/ci-build
+          ctest --test-dir integration/pixinsight/host/ci-build --output-on-failure
+
+      - name: Upload unsigned module artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmm-pxm-macos-arm64
+          path: stage/bin/**
+          if-no-files-found: error

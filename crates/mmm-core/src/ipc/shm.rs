@@ -66,6 +66,13 @@ impl ShmSegment {
     /// Any stale segment left behind under `name` (e.g. from a crashed
     /// previous run) is unlinked first so `create` never fails with
     /// "already exists".
+    ///
+    /// macOS limits POSIX shm object names to 31 characters (`PSHMNAMLEN`),
+    /// including the leading `/`; `shm_open`/`shm_unlink` fail with `EINVAL`
+    /// beyond that. Keep `name` short. The production name generator
+    /// (`MakeShmName` in the C++ host) already produces short names
+    /// (`/mmm-pxm-<pid>-<ctr>`, ~20 chars); this only bites long ad hoc test
+    /// names.
     pub fn create(name: &str, total_bytes: u64) -> Result<ShmSegment> {
         use nix::errno::Errno;
         use nix::fcntl::OFlag;
@@ -88,20 +95,40 @@ impl ShmSegment {
         )
         .map_err(|e| Error::compute(format!("shm_open({name}) failed: {e}")))?;
 
-        if let Err(e) = nix::unistd::ftruncate(&fd, total_bytes as libc::off_t) {
+        // A job with 0 input slots and 0 output slots (a degenerate
+        // test-only case; see `ipc::client::tests`) yields `total_bytes ==
+        // 0`. macOS's `mmap` rejects a zero-length mapping with EINVAL, so
+        // allocate (and map) a minimum of 1 byte that is never accessed —
+        // `checked_range` below still bounds logical accesses against
+        // `total_bytes`, not the allocation, so a zero-byte segment
+        // continues to reject any nonzero-length `slice`/`slice_mut`.
+        let alloc = total_bytes.max(1);
+
+        if let Err(e) = nix::unistd::ftruncate(&fd, alloc as libc::off_t) {
             // We already created the (now zero-length) named object; leaving
             // it behind would only be cleaned up by a future `create` of the
             // same name unlinking it first. Unlink it now instead so a
             // failed `create` doesn't leak the shm object.
             let _ = nix::sys::mman::shm_unlink(name);
             return Err(Error::compute(format!(
-                "ftruncate({name}, {total_bytes} bytes) failed: {e}"
+                "ftruncate({name}, {alloc} bytes) failed: {e}"
             )));
         }
 
         let file = std::fs::File::from(fd);
+        // Map an explicit length rather than the file's fstat-derived length:
+        // macOS page-rounds a POSIX shm object's size up to the page size (16
+        // KiB on Apple Silicon, vs. 4 KiB on Linux), so mapping "the whole
+        // file" would give a mapping longer than `total_bytes` and drift the
+        // segment's logical size (which `checked_range` bounds against) away
+        // from what the caller asked for. An explicit length maps exactly
+        // `alloc` (== `total_bytes`, except in the zero-byte case above) on
+        // every platform.
         let map = unsafe {
-            memmap2::MmapMut::map_mut(&file).map_err(|e| Error::io(format!("shm:{name}"), e))?
+            memmap2::MmapOptions::new()
+                .len(alloc as usize)
+                .map_mut(&file)
+                .map_err(|e| Error::io(format!("shm:{name}"), e))?
         };
 
         Ok(ShmSegment {
@@ -117,9 +144,13 @@ impl ShmSegment {
     /// The segment must already exist (created by
     /// [`create`](ShmSegment::create) in another process); `attach` never
     /// creates, resizes, or unlinks it — only the creator owns the segment's
-    /// size. `total_bytes` must match the size the creator established;
-    /// mismatches are rejected rather than silently truncating someone
-    /// else's mapping.
+    /// size. The underlying object must be *at least* `total_bytes` (on
+    /// Linux the creator's `ftruncate` makes it exactly `total_bytes`; on
+    /// macOS the OS page-rounds a shm object's size up, so it may be
+    /// larger) — a too-small object is rejected rather than silently
+    /// mapping a truncated segment. The mapping `attach` produces is always
+    /// exactly `total_bytes`, regardless of the underlying object's actual
+    /// (possibly page-rounded) size.
     pub fn attach(name: &str, total_bytes: u64) -> Result<ShmSegment> {
         use nix::fcntl::OFlag;
         use nix::sys::mman::shm_open;
@@ -129,16 +160,35 @@ impl ShmSegment {
             .map_err(|e| Error::compute(format!("shm_open({name}) failed: {e}")))?;
 
         let file = std::fs::File::from(fd);
-        let map = unsafe {
-            memmap2::MmapMut::map_mut(&file).map_err(|e| Error::io(format!("shm:{name}"), e))?
-        };
 
-        if map.len() as u64 != total_bytes {
+        // Validate the underlying object is large enough before mapping: an
+        // exact-equality check here would fail spuriously on macOS, where
+        // the creator's `ftruncate(total_bytes)` gets rounded up to the
+        // page size by the OS.
+        let actual = file
+            .metadata()
+            .map_err(|e| Error::io(format!("shm:{name}"), e))?
+            .len();
+        if actual < total_bytes {
             return Err(Error::compute(format!(
-                "shm segment {name} is {} bytes, but attach expected {total_bytes}",
-                map.len()
+                "shm segment {name} is {actual} bytes, but attach expected at least {total_bytes}"
             )));
         }
+
+        // See the matching comment in `create`: a degenerate 0-slot job
+        // yields `total_bytes == 0`, and macOS's `mmap` rejects a
+        // zero-length mapping, so map at least 1 byte (never accessed).
+        let alloc = total_bytes.max(1);
+
+        // Map an explicit length (see the matching comment in `create`) so
+        // `self.map.len() == alloc` exactly, independent of the underlying
+        // object's (possibly page-rounded) actual size.
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .len(alloc as usize)
+                .map_mut(&file)
+                .map_err(|e| Error::io(format!("shm:{name}"), e))?
+        };
 
         Ok(ShmSegment {
             name: name.to_string(),
@@ -266,18 +316,231 @@ impl Drop for ShmSegment {
     }
 }
 
+/// Windows named shared-memory segment (a pagefile-backed file mapping),
+/// mirroring the POSIX [`ShmSegment`]: the host `create`s a named mapping and
+/// the worker `attach`es to the same name. The name carried in the JSON `Init`
+/// message is the POSIX-style `/name`; both sides normalize it identically to a
+/// Windows object name (see [`win_object_name`]).
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct ShmSegment {
+    name: String,
+    is_creator: bool,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    base: *mut u8,
+    size: usize,
+}
+
+// SAFETY: identical contract to the Unix impl (whose `MmapMut` is `Send+Sync`).
+// The raw `base` pointer is only ever handed out as disjoint sub-slices via
+// `SlotLayout`-derived offsets (see `slice_mut_raw`'s `# Safety`); the `HANDLE`
+// is only closed on `Drop`. `HostLink` shares `ShmSegment` across its reader
+// thread behind an `Arc`, so `Send + Sync` is required and upheld by that
+// disjoint-access discipline.
+#[cfg(windows)]
+unsafe impl Send for ShmSegment {}
+#[cfg(windows)]
+unsafe impl Sync for ShmSegment {}
+
+/// Normalize a POSIX-style shm name (`/mmm-foo`) to a Windows object name
+/// (`Local\mmm-foo`). Applied identically here and in the C++ host so the
+/// name string exchanged in the `Init` message round-trips.
+#[cfg(windows)]
+fn win_object_name(name: &str) -> Vec<u16> {
+    let base = name.strip_prefix('/').unwrap_or(name);
+    let full = format!("Local\\{base}");
+    full.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+impl ShmSegment {
+    /// Create a new named pagefile-backed segment of `total_bytes` and map it.
+    pub fn create(name: &str, total_bytes: u64) -> Result<ShmSegment> {
+        use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
+        };
+        let wname = win_object_name(name);
+        // A job with 0 input slots and 0 output slots (a degenerate
+        // test-only case; see `ipc::client::tests`) yields `total_bytes ==
+        // 0`. `CreateFileMappingW` rejects a zero-size mapping with
+        // ERROR_INVALID_PARAMETER, so allocate (and map) a minimum of 1
+        // byte that is never accessed — `self.size` stays `total_bytes`
+        // (not `alloc`), so `checked_range` still rejects any nonzero
+        // access to a logically zero-byte segment.
+        let alloc = total_bytes.max(1);
+        let hi = (alloc >> 32) as u32;
+        let lo = (alloc & 0xFFFF_FFFF) as u32;
+        // SAFETY: FFI; INVALID_HANDLE_VALUE requests a pagefile-backed mapping.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                hi,
+                lo,
+                wname.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(Error::compute(format!(
+                "CreateFileMappingW({name}) failed: os error {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        // SAFETY: FFI; map the whole allocation ([0, alloc)).
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, alloc as usize) };
+        if view.Value.is_null() {
+            let e = unsafe { GetLastError() };
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(Error::compute(format!(
+                "MapViewOfFile({name}) failed: os error {e}"
+            )));
+        }
+        Ok(ShmSegment {
+            name: name.to_string(),
+            is_creator: true,
+            handle,
+            base: view.Value as *mut u8,
+            size: total_bytes as usize,
+        })
+    }
+
+    /// Attach to an existing named segment created by [`create`](Self::create).
+    ///
+    /// The mapping is opened by name and a view of `total_bytes` is mapped;
+    /// requesting more than the creator allocated fails, so an oversized
+    /// `total_bytes` is rejected. Unlike the POSIX impl, Windows offers no cheap
+    /// exact-size assertion, so a *smaller* `total_bytes` within a larger
+    /// segment is accepted — the creator's size is the contract.
+    pub fn attach(name: &str, total_bytes: u64) -> Result<ShmSegment> {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW,
+        };
+        let wname = win_object_name(name);
+        // SAFETY: FFI.
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wname.as_ptr()) };
+        if handle.is_null() {
+            return Err(Error::compute(format!(
+                "OpenFileMappingW({name}) failed: os error {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        // See the matching comment in `create`: a degenerate 0-slot job
+        // yields `total_bytes == 0`, and `MapViewOfFile` rejects a
+        // zero-size view, so map at least 1 byte (never accessed); `size`
+        // (below) stays `total_bytes`, not `alloc`.
+        let alloc = total_bytes.max(1);
+        // SAFETY: FFI.
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, alloc as usize) };
+        if view.Value.is_null() {
+            let e = unsafe { GetLastError() };
+            unsafe { CloseHandle(handle) };
+            return Err(Error::compute(format!(
+                "MapViewOfFile({name}, {total_bytes} bytes) failed: os error {e}"
+            )));
+        }
+        Ok(ShmSegment {
+            name: name.to_string(),
+            is_creator: false,
+            handle,
+            base: view.Value as *mut u8,
+            size: total_bytes as usize,
+        })
+    }
+
+    /// Bounds/alignment-check an `(offset, len)` f32 request — identical logic
+    /// to the Unix impl (see its doc); the single chokepoint for both `slice`
+    /// and `slice_mut`.
+    fn checked_range(&self, offset: u64, len: u64) -> Result<std::ops::Range<usize>> {
+        if !offset.is_multiple_of(std::mem::size_of::<f32>() as u64) {
+            return Err(Error::compute(format!(
+                "slice offset {offset} is not a multiple of {} (f32 alignment)",
+                std::mem::size_of::<f32>()
+            )));
+        }
+        let byte_len = len.checked_mul(4).ok_or_else(|| {
+            Error::compute(format!("slice len {len} (elements) overflows byte length"))
+        })?;
+        let end = offset.checked_add(byte_len).ok_or_else(|| {
+            Error::compute(format!("slice offset {offset} + len {len} overflows"))
+        })?;
+        if end > self.size as u64 {
+            return Err(Error::compute(format!(
+                "slice range [{offset}, {end}) is out of bounds for segment of {} bytes",
+                self.size
+            )));
+        }
+        Ok(offset as usize..end as usize)
+    }
+
+    /// Read `len` f32 elements starting at byte `offset`. Panics if out of
+    /// bounds or misaligned (see the Unix impl's doc for the contract).
+    pub fn slice(&self, offset: u64, len: u64) -> &[f32] {
+        let range = self
+            .checked_range(offset, len)
+            .expect("ShmSegment::slice out of bounds");
+        // SAFETY: `range` is bounds/alignment-checked against the mapping; the
+        // base pointer is page-aligned so a 4-byte-aligned offset stays aligned.
+        unsafe {
+            std::slice::from_raw_parts(self.base.add(range.start) as *const f32, len as usize)
+        }
+    }
+
+    /// Write `len` f32 elements starting at byte `offset` from a shared
+    /// reference — the interior-mutable shared-memory pattern; see the Unix
+    /// impl's `# Safety`. Panics if out of bounds or misaligned.
+    #[allow(clippy::mut_from_ref)]
+    pub fn slice_mut(&self, offset: u64, len: u64) -> &mut [f32] {
+        let range = self
+            .checked_range(offset, len)
+            .expect("ShmSegment::slice_mut out of bounds");
+        // SAFETY: as `slice`, plus the caller's disjoint-range obligation
+        // (upheld by `SlotLayout`), identical to the Unix `slice_mut_raw`.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.base.add(range.start) as *mut f32, len as usize)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShmSegment {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: `base`/`handle` came from a successful map in create/attach.
+        // A Windows file mapping is refcounted by open handles and vanishes when
+        // the last handle closes — there is no `shm_unlink` analog, so both the
+        // creator and attachers simply unmap + close. `is_creator` (and `name`)
+        // are retained for symmetry with the Unix impl and for this debug trace;
+        // they drive no special teardown.
+        tracing::trace!(
+            name = %self.name,
+            is_creator = self.is_creator,
+            "dropping ShmSegment"
+        );
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.base as *mut core::ffi::c_void,
+            });
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 /// A named shared-memory segment.
 ///
-/// Shared memory is a POSIX-only transport; this platform stub exists only
-/// so `mmm-core` compiles on non-Unix targets. Every operation fails with
-/// [`Error::Compute`].
-#[cfg(not(unix))]
+/// Shared memory is a POSIX/Windows-only transport; this platform stub
+/// exists only so `mmm-core` compiles on other targets. Every operation
+/// fails with [`Error::Compute`].
+#[cfg(all(not(unix), not(windows)))]
 #[derive(Debug)]
 pub struct ShmSegment {
     _unused: (),
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 impl ShmSegment {
     /// Always fails: shared memory is not supported on this platform.
     pub fn create(_name: &str, _total_bytes: u64) -> Result<ShmSegment> {
@@ -305,6 +568,48 @@ impl ShmSegment {
     }
 }
 
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+
+    #[test]
+    fn create_write_attach_read_same_bytes() {
+        let name = format!("mmm-shm-wtest-{}", std::process::id());
+        let total = 4096u64;
+        let host = ShmSegment::create(&name, total).unwrap();
+        host.slice_mut(0, 4).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let worker = ShmSegment::attach(&name, total).unwrap();
+        assert_eq!(worker.slice(0, 4), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a multiple of")]
+    fn slice_mut_panics_on_misaligned_offset() {
+        let name = format!("mmm-shm-wtest-align-{}", std::process::id());
+        let host = ShmSegment::create(&name, 4096).unwrap();
+        let _ = host.slice_mut(1, 1);
+    }
+
+    #[test]
+    fn slice_roundtrip_at_aligned_offset() {
+        let name = format!("mmm-shm-wtest-ok-{}", std::process::id());
+        let host = ShmSegment::create(&name, 4096).unwrap();
+        host.slice_mut(4, 2).copy_from_slice(&[5.0, 6.0]);
+        assert_eq!(host.slice(4, 2), &[5.0, 6.0]);
+    }
+
+    #[test]
+    fn zero_byte_segment_creates_and_slices_empty() {
+        // A degenerate 0-input/0-output-slot job yields `total_bytes == 0`;
+        // `CreateFileMappingW` rejects a zero-size mapping, so `create`
+        // clamps its OS allocation to a minimum of 1 byte. The segment
+        // still reports (and enforces) a logical size of 0.
+        let name = format!("mmm-shm-wtest-zero-{}", std::process::id());
+        let host = ShmSegment::create(&name, 0).unwrap();
+        assert_eq!(host.slice(0, 0), &[] as &[f32]);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -325,7 +630,7 @@ mod tests {
 
     #[test]
     fn misaligned_offset_is_rejected_by_checked_range() {
-        let name = format!("/mmm-shm-test-align-{}", std::process::id());
+        let name = format!("/mmm-shm-align-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         // `slice_mut`'s public signature is pinned to `-> &mut [f32]` (no
         // `Result`), so misalignment surfaces as a panic via `.expect()`
@@ -341,14 +646,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "not a multiple of")]
     fn slice_mut_panics_on_misaligned_offset() {
-        let name = format!("/mmm-shm-test-align-panic-{}", std::process::id());
+        let name = format!("/mmm-shm-align-panic-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         let _ = host.slice_mut(1, 1);
     }
 
     #[test]
     fn slice_and_slice_mut_work_at_a_valid_aligned_offset() {
-        let name = format!("/mmm-shm-test-align-ok-{}", std::process::id());
+        let name = format!("/mmm-shm-align-ok-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         // Offset 4 (one f32 in) is 4-byte aligned and in bounds.
         let w = host.slice_mut(4, 2);
@@ -366,5 +671,16 @@ mod tests {
         let worker = ShmSegment::attach(&name, total).unwrap();
         assert_eq!(worker.slice(0, 4), &[1.0, 2.0, 3.0, 4.0]);
         // Cleanup happens on host drop (unlink); attach drop just unmaps.
+    }
+
+    #[test]
+    fn zero_byte_segment_creates_and_slices_empty() {
+        // A degenerate 0-input/0-output-slot job yields `total_bytes == 0`;
+        // macOS's `mmap` rejects a zero-length mapping, so `create` clamps
+        // its OS allocation to a minimum of 1 byte. The segment still
+        // reports (and enforces, via `checked_range`) a logical size of 0.
+        let name = format!("/mmm-shm-test-zero-{}", std::process::id());
+        let host = ShmSegment::create(&name, 0).unwrap();
+        assert_eq!(host.slice(0, 0), &[] as &[f32]);
     }
 }

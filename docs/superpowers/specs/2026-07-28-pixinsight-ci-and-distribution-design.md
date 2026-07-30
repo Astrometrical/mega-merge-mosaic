@@ -7,6 +7,29 @@ automation + distribution** phase and supersedes the forward-looking parts of
 that document's §12. Scope owner: `.github/workflows/`, the PCL-in-CI build, and
 new packaging/repository tooling under `integration/pixinsight/`.
 
+**Update (2026-07-30):** the **repository/distribution** half of this spec is
+extended and partially superseded by
+[`2026-07-30-distribution-relocation-and-repo-trust-findings.md`](2026-07-30-distribution-relocation-and-repo-trust-findings.md).
+Two things changed: (1) the repository trust model was investigated empirically
+— a **local signing identity is accepted for the maintainer's own machines**, so
+repository distribution is **not** blocked on CPD (the "dormant until CPD"
+framing here applies only to *public* trust); and (2) the repository + publishing
+pipeline **relocates to a separate, private "Astrometrical" website repository**
+(Cloudflare Pages), so `integration/pixinsight/repo/` is now a *starting point to
+lift out*, not work to finish in this repo. The **CI build** half of this spec
+(§4, `module.yml`) is unaffected and remains current.
+
+**Update (2026-07-29):** §2's deferred native Windows/macOS ports are now
+**implemented** by
+[`2026-07-29-pixinsight-winmac-ports-design.md`](2026-07-29-pixinsight-winmac-ports-design.md)
+(Plan 3a) — all three OSes (`linux-x64`, `macos-arm64`, `windows-x64`) build
+and test as required jobs in `.github/workflows/module.yml`, no longer
+`continue-on-error` placeholders. The one outstanding follow-up from that
+plan is **worker signing**: macOS notarization and Windows
+Authenticode/Azure Trusted Signing remain unimplemented — CI is green
+**unsigned** on all three platforms (see that spec's §7 and
+`integration/pixinsight/ci/README.md`).
+
 ## 1. Goal
 
 Make the PixInsight module **easy to get onto test machines**, in service of
@@ -37,6 +60,11 @@ sign, which our own licensed machines can already do.
 | Signing (cross-platform) | **One PixInsight install signs all three platforms' modules.** A single Linux signer signs `mmm-pxm.so`/`.dll`/`.dylib` (+ the `.xri`) in one headless `--automation-mode` pass with one `.xssk`. | Confirmed (§6): module signing is a hash-and-sign over file bytes (SHA-512 + Ed25519); the CodeSign path gates only on extension ∈ {.so,.dylib,.dll} and a `-pxm` basename — no host-OS branch, no binary-format inspection. |
 | Distribution | Stand up the **full repository pipeline** (generator + signing + publish), but keep it **dormant until CPD**. No GitHub Releases in the interim; the interim on-ramp is CI **artifacts** + local `make sign`. | The module `.so`/`.dll`/`.dylib` **must be signed to load** in 1.9 regardless of delivery mechanism; a repository can't serve a loadable module without a CPD-trusted signature, and CPD is being pursued. |
 | Sequencing | This phase = **Plan 3b (CI) + Plan 3c (repo pipeline, dormant)**, all-platform-structured with Linux live. **Plan 3a (native Win/mac ports)** is a later, separate plan that lights up the matrix. | Clean dependency order without a half-built matrix blocking progress. |
+
+*(2026-07-29: Plan 3a has since landed — see the update note at the top of
+this document. The "Platform scope" and "Sequencing" rows above are recorded
+as of the original 2026-07-28 decision and are now historical; the matrix is
+no longer `continue-on-error` on Windows/macOS.)*
 
 **Non-goals this phase** (explicit): the Windows/macOS **native ports**
 (`CreateFileMapping`/`MapViewOfFile` in `crates/mmm-core/src/ipc/shm.rs`; the C++
