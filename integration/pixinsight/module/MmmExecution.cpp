@@ -86,12 +86,12 @@ constexpr uint32_t kOutputSlots = 2;
 // --- Progress + cooperative abort ------------------------------------------
 //
 // The host invokes on_progress() synchronously on this (the ExecuteGlobal)
-// thread between worker frames, so it is safe to touch the Console and the
-// interface here. We echo a percentage to the Console, mirror it to the
-// interface's progress Label, pump the GUI event queue so a queued Cancel-
-// button click is delivered, and poll the Console's own Abort button; either
-// path calls Host::cancel(). This is the synchronous v1 (spec section 15): the
-// tool window is not repainted mid-run beyond ProcessEvents() pumps.
+// thread between worker frames, so it is safe to touch the Console here.
+// Progress is Console-only (the interface no longer mirrors it): we render an
+// in-place, single-line bar per stage, pump the GUI event queue so a queued
+// Cancel-button click is delivered, and poll the Console's own Abort button;
+// either path calls Host::cancel(). This is the synchronous v1 (spec section
+// 15): the tool window is not repainted mid-run beyond ProcessEvents() pumps.
 //
 // Deliberately NOT pursuing a pcl::Thread background-execution rewrite to make
 // the whole tool window interactive during the blend -- this was considered and
@@ -116,18 +116,46 @@ public:
 
    void on_progress( const std::string& stage, uint64_t done, uint64_t total ) override
    {
-      std::string msg = stage;
-      msg += ": ";
+      // Friendly stage names; fall back to the wire string verbatim.
+      String name;
+      if ( stage == "reproject" )    name = "Reprojecting";
+      else if ( stage == "analyze" ) name = "Analyzing";
+      else if ( stage == "blend" )   name = "Blending";
+      else                           name = String( stage.c_str() );
+
+      if ( name != m_stage )
+      {
+         // Commit the previous stage's line before starting a new one.
+         if ( !m_stage.IsEmpty() )
+            m_console.WriteLn();
+         m_stage = name;
+         m_lastPercent = -1;
+      }
+
       if ( total > 0 )
-         msg += std::to_string( 100 * done / total ) + "%";
+      {
+         int percent = int( 100*done/total );
+         if ( percent != m_lastPercent )
+         {
+            m_lastPercent = percent;
+            // 24-char bar in Astrometrical teal; \r rewrites the line in place.
+            int fill = 24*percent/100;
+            String bar;
+            for ( int i = 0; i < 24; ++i )
+               bar += ( i < fill ) ? "#" : "-";
+            m_console.Write( String().Format(
+               "<end>\r<b>%-13s</b> \x1b[38;2;42;149;171m[%s]\x1b[39m %3d%%",
+               IsoString( m_stage ).c_str(), IsoString( bar ).c_str(), percent ) );
+            if ( percent == 100 )
+               m_console.WriteLn();
+         }
+      }
       else
-         msg += std::to_string( done );
+         m_console.Write( String().Format( "<end>\r<b>%-13s</b> %llu",
+                                           IsoString( m_stage ).c_str(), (unsigned long long)done ) );
 
-      String s( msg.c_str() );
-      m_console.WriteLn( s );
-
-      // Deliver any pending interface events and surface
-      // a Console abort request; both drive the same cancellation path.
+      // Deliver pending GUI events and honor the Console's own abort button --
+      // this is the (only) cancellation path.
       Module->ProcessEvents();
       if ( m_console.AbortRequested() )
       {
@@ -139,6 +167,8 @@ public:
 
 private:
    Console m_console;
+   String  m_stage;
+   int     m_lastPercent = -1;
 };
 
 // A PanelSource the worker never calls: Files mode reads panels off disk itself
