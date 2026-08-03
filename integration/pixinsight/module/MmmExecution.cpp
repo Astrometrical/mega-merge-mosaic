@@ -191,6 +191,9 @@ private:
 
    // Erase the previously drawn glyphs with backspaces (the console's <bsp>
    // deletes a glyph; <bol>+write inserts, so \r cannot be used), then draw.
+   // Invariant: between Redraw calls of a stage, this class owns the current
+   // console line; any other Console write in that window would be partially
+   // erased by the next call's backspaces.
    void Redraw( const String& line, int visible )
    {
       String s = "<end>";
@@ -723,6 +726,9 @@ void run_blend( MmmBlendInstance& in )
 #endif
                  ) + "-" + String( (unsigned long long) s_runCounter.fetch_add( 1 ) );
       p.sessionDir      = std::string( t.ToUTF8().c_str() );
+      // Defend against a stale same-named dir left behind by a failed prior
+      // cleanup (e.g. after a module reload) being silently reused as cache.
+      RemoveSessionDir( p.sessionDir );
       sessionGuard.dir    = p.sessionDir;
       sessionGuard.active = true;
    }

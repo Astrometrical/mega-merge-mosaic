@@ -222,23 +222,32 @@ run:
 1. **Install** as above; confirm MegaMergeMosaic appears under Mosaic.
 2. **Aligned views** — open ≥2 registered full-canvas panels
    (MosaicByCoordinates output) as views. Launch MegaMergeMosaic, **Add Views…**,
-   pick a session directory, **Input = Auto**, Apply → a new blended
-   `ImageWindow` appears; the Console shows analyze/blend progress
-   percentages.
+   set **Panel registration method = Auto**, leave the session directory empty
+   (it's in the collapsed **Advanced** section, alongside Band rows — empty
+   means an auto temp dir that's created for the run and removed on exit),
+   Apply → a new blended `ImageWindow` appears; the Process Console shows
+   analyze/blend progress bars for each stage.
 3. **Solved views** — open raw plate-solved panels as views (differing
-   geometry, each with an astrometric solution). `Input = Auto` (resolves to
-   Solved) or forced `Input = Solved`, pick a session directory, Apply → new
-   blended window. A view lacking a solution must yield a clear error and no
-   window.
-4. **Files mode** — switch to **Files**, **Add Files…** on-disk panels, pick a
-   session directory, Apply → new blended window.
-5. **Fault isolation** — start a run, then induce a worker failure (rename or
+   geometry, each with an astrometric solution). **Panel registration method
+   = Auto** (resolves to astrometric alignment) or forced **Align by
+   astrometric solution**, Apply → new blended window. A view lacking a
+   solution must yield a clear error and no window.
+4. **Files mode** — switch to **Files**, **Add Files…** on-disk panels, Apply
+   (session directory still optional, as above) → new blended window.
+5. **Session directory (optional, explicit)** — expand **Advanced**, set a
+   session directory to a path of your choosing, run a blend, and confirm the
+   directory is populated with the analysis cache and *not* removed
+   afterwards (unlike the auto temp dir in steps 2-4). Re-running with the
+   same inputs and directory should reuse the cached analysis stages.
+6. **Fault isolation** — start a run, then induce a worker failure (rename or
    delete `mmm-ipc-worker` before running, or kill it mid-run) → a clean
    PixInsight error dialog, **no partial window**, source views intact,
    PixInsight itself still alive.
-6. **Cancel/progress** — during a longer run, watch the `Progress` label
-   update and use the Console Abort (or the interface **Cancel** button) →
-   the run stops with a clean "cancelled" error and no output window.
+7. **Progress/cancel** — during a longer run, watch the per-stage
+   (Reprojecting/Analyzing/Blending) progress bars redraw in place in the
+   Process Console, and use the Process Console's own **Pause/Abort** button
+   (there is no separate interface Cancel button) → the run stops with a
+   clean "cancelled" error and no output window.
 
 ## Windows GUI validation (manual)
 

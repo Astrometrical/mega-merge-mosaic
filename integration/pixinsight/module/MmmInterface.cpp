@@ -258,7 +258,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    SessionDir_ToolButton.SetIcon( Bitmap( w.ScaledResource( ":/browser/select-file.png" ) ) );
    SessionDir_ToolButton.SetScaledFixedSize( 20, 20 );
    SessionDir_ToolButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SessionDirBrowseClick, w );
-   SessionDir_ToolButton.SetToolTip( "<p>Select the session directory.</p>" );
+   SessionDir_ToolButton.SetToolTip( "<p>Select the optional session directory.</p>" );
 
    SessionDir_Sizer.SetSpacing( 4 );
    SessionDir_Sizer.Add( SessionDir_Label );
