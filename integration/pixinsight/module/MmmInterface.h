@@ -64,10 +64,6 @@ public:
                                   bool& dynamic, unsigned& flags ) override;
    IsoString              IconImageSVG() const override;
 
-   // Task 5 run-state hooks, called from the ExecuteGlobal orchestration
-   // (MmmExecution.cpp). Both are no-ops if the control tree is not built yet.
-   void SetBlendRunning( bool running );        // enable/disable the Cancel button
-   void SetProgressText( const String& text );  // live worker-progress text
 
 private:
 
@@ -134,12 +130,6 @@ private:
       HorizontalSizer Flatten_Sizer;
       CheckBox        FlattenEnabled_CheckBox;
       SpinBox         FlattenOrder_SpinBox;
-
-      // --- Progress / cancel ------------------------------------------------------
-      GroupBox        Progress_GroupBox;
-      HorizontalSizer Progress_Sizer;
-      Label           Progress_Label;
-      PushButton      Cancel_PushButton;
    };
 
    GUIData* GUI = nullptr;
@@ -181,8 +171,6 @@ private:
    void e_DefectVetoClick( Button& sender, bool checked );
    void e_FlattenEnabledClick( Button& sender, bool checked );
    void e_FlattenOrderValueUpdated( SpinBox& sender, int value );
-
-   void e_CancelClick( Button& sender, bool checked );
 };
 
 /*!

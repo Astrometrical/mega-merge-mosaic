@@ -285,21 +285,6 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    BlendParams_GroupBox.SetSizer( BlendParams_Sizer );
 
    //
-   // Progress + cancel. Task 5 wires the live progress feed and enables
-   // Cancel_PushButton; here the control exists but starts disabled.
-   //
-   Cancel_PushButton.SetText( "Cancel" );
-   Cancel_PushButton.Disable();
-   Cancel_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_CancelClick, w );
-
-   Progress_Sizer.SetSpacing( 6 );
-   Progress_Sizer.Add( Progress_Label, 100 );
-   Progress_Sizer.Add( Cancel_PushButton );
-
-   Progress_GroupBox.SetTitle( "Progress" );
-   Progress_GroupBox.SetSizer( Progress_Sizer );
-
-   //
    // Top-level layout.
    //
    Global_Sizer.SetMargin( 8 );
@@ -308,7 +293,6 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Global_Sizer.Add( SessionDir_Sizer );
    Global_Sizer.Add( InputSelect_Sizer );
    Global_Sizer.Add( BlendParams_GroupBox );
-   Global_Sizer.Add( Progress_GroupBox );
 
    w.SetSizer( Global_Sizer );
    w.AdjustToContents();
@@ -555,35 +539,6 @@ void MmmBlendInterface::e_FlattenEnabledClick( Button&, bool checked )
 void MmmBlendInterface::e_FlattenOrderValueUpdated( SpinBox&, int value )
 {
    m_instance.p_flatten = int32( value );
-}
-
-void MmmBlendInterface::e_CancelClick( Button&, bool )
-{
-   // Ask the running blend to stop (spec section 15). The button is enabled only
-   // for the duration of a run (SetBlendRunning); request_cancel() is a no-op if
-   // nothing is running. The synchronous v1 delivers this click via the
-   // ProcessEvents() pump inside the run's progress callback.
-   request_cancel();
-}
-
-// ----------------------------------------------------------------------------
-// Task 5 run-state hooks (called from MmmExecution.cpp on the execute thread).
-// ----------------------------------------------------------------------------
-
-void MmmBlendInterface::SetBlendRunning( bool running )
-{
-   if ( GUI == nullptr )
-      return;
-   GUI->Cancel_PushButton.Enable( running );
-   if ( !running )
-      GUI->Progress_Label.Clear();
-}
-
-void MmmBlendInterface::SetProgressText( const String& text )
-{
-   if ( GUI == nullptr )
-      return;
-   GUI->Progress_Label.SetText( text );
 }
 
 // ----------------------------------------------------------------------------

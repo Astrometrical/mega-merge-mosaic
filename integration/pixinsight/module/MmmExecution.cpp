@@ -35,7 +35,6 @@
 
 #include "AstrometryProps.h"
 #include "ImageWindowCollector.h"
-#include "MmmInterface.h"
 #include "MmmParameters.h"
 #include "MmmProcess.h"
 #include "ViewPanelSource.h"
@@ -49,8 +48,8 @@ using nlohmann::json;
 
 // ----------------------------------------------------------------------------
 // Module-scope state for cooperative cancellation. run_blend() publishes the
-// live host here for the duration of a run so request_cancel() (interface
-// Cancel button / Console abort) can reach it; both Host::cancel() and the
+// live host here for the duration of a run so the Console abort handler
+// (ConsoleProgress::on_progress) can reach it; both Host::cancel() and the
 // atomic pointer are safe to touch from another thread (mmm_host.h).
 // ----------------------------------------------------------------------------
 
@@ -126,10 +125,8 @@ public:
 
       String s( msg.c_str() );
       m_console.WriteLn( s );
-      if ( TheMmmBlendInterface != nullptr )
-         TheMmmBlendInterface->SetProgressText( s );
 
-      // Deliver any pending interface events (e.g. a Cancel click) and surface
+      // Deliver any pending interface events and surface
       // a Console abort request; both drive the same cancellation path.
       Module->ProcessEvents();
       if ( m_console.AbortRequested() )
@@ -260,14 +257,6 @@ std::string MakeShmName()
           + "-" + std::to_string( s_runCounter.fetch_add( 1 ) );
 }
 
-// Enable/disable the interface Cancel button around a run (best-effort; the
-// interface may not be open).
-void SetRunningUI( bool running )
-{
-   if ( TheMmmBlendInterface != nullptr )
-      TheMmmBlendInterface->SetBlendRunning( running );
-}
-
 // Drives one fully-assembled job to completion and shows the output window on
 // success. Throws on any fault or cancellation, leaving no window shown.
 void DriveHost( const std::string& worker_path, json init_body, const std::string& shm_name,
@@ -286,7 +275,6 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    mmm::Host host( std::move( cfg ), source, collector, &prog );
    prog.host = &host;
    s_activeHost.store( &host );
-   SetRunningUI( true );
 
    try
    {
@@ -295,7 +283,6 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    catch ( ... )
    {
       s_activeHost.store( nullptr );
-      SetRunningUI( false );
       // Discard any partially-built (hidden, never-shown) output window so no
       // partial result lingers (spec section 9).
       if ( !collector.Window().IsNull() )
@@ -304,7 +291,6 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    }
 
    s_activeHost.store( nullptr );
-   SetRunningUI( false );
 
    if ( host.cancelled() )
    {
@@ -610,12 +596,6 @@ void run_blend( MmmBlendInstance& in )
       RunViews( p, worker_path );
    else
       RunFiles( p, worker_path );
-}
-
-void request_cancel()
-{
-   if ( mmm::Host* h = s_activeHost.load() )
-      h->cancel();
 }
 
 // ----------------------------------------------------------------------------
