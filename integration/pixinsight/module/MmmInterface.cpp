@@ -47,7 +47,7 @@ MmmBlendInterface::~MmmBlendInterface()
 
 IsoString MmmBlendInterface::Id() const
 {
-   return "MosaicMerge";
+   return "MegaMergeMosaic";
 }
 
 MetaProcess* MmmBlendInterface::Process() const
@@ -106,7 +106,7 @@ bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*
    if ( GUI == nullptr )
    {
       GUI = new GUIData( *this );
-      SetWindowTitle( "MosaicMerge" );
+      SetWindowTitle( "Mega Merge Mosaic" );
       UpdateControls();
    }
 

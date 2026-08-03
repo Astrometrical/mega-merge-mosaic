@@ -14,11 +14,8 @@
 #include "MmmInterface.h"
 #include "MmmParameters.h"
 #include "MmmProcess.h"
+#include "MmmVersion.h"
 
-#define MMM_MODULE_VERSION_MAJOR     1
-#define MMM_MODULE_VERSION_MINOR     0
-#define MMM_MODULE_VERSION_REVISION  0
-#define MMM_MODULE_VERSION_BUILD     1
 #define MMM_MODULE_VERSION_LANGUAGE  eng
 
 namespace pcl
@@ -38,26 +35,36 @@ public:
 
    const char* Version() const override
    {
-      return PCL_MODULE_VERSION( MMM_MODULE_VERSION_MAJOR,
-                                 MMM_MODULE_VERSION_MINOR,
-                                 MMM_MODULE_VERSION_REVISION,
-                                 MMM_MODULE_VERSION_BUILD,
+      return PCL_MODULE_VERSION( MMM_VERSION_MAJOR,
+                                 MMM_VERSION_MINOR,
+                                 MMM_VERSION_REVISION,
+                                 MMM_VERSION_BUILD,
                                  MMM_MODULE_VERSION_LANGUAGE );
    }
 
    IsoString Name() const override
    {
-      return "MergeMosaic";
+      return "MegaMergeMosaic";
    }
 
    String Description() const override
    {
-      return "MergeMosaic: fast merge/blend for pre-aligned astro mosaic panels.";
+      return "Mega Merge Mosaic: fast merge/blend for pre-aligned astro mosaic panels.";
    }
 
    String Company() const override
    {
-      return "MergeMosaic";
+      return "Astrometrical";
+   }
+
+   String Author() const override
+   {
+      return "Daniel Paull";
+   }
+
+   String Copyright() const override
+   {
+      return "Copyright (c) 2026 Astrometrical";
    }
 };
 

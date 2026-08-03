@@ -38,6 +38,7 @@ public:
    MmmBlendProcess();
 
    IsoString              Id() const override;
+   IsoString              Aliases() const override;
    IsoString              Categories() const override;
    uint32                 Version() const override;
    String                 Description() const override;

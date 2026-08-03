@@ -174,7 +174,7 @@ String ModuleDirectory()
          return File::ExtractDrive( path ) + File::ExtractDirectory( path );
       }
    }
-   throw Error( "MosaicMerge: could not determine the module path via GetModuleFileNameW()." );
+   throw Error( "MegaMergeMosaic: could not determine the module path via GetModuleFileNameW()." );
 #else
    Dl_info info;
    if ( dladdr( reinterpret_cast<void*>( &run_blend ), &info ) != 0 && info.dli_fname != nullptr )
@@ -182,7 +182,7 @@ String ModuleDirectory()
       String path( info.dli_fname );
       return File::ExtractDrive( path ) + File::ExtractDirectory( path );
    }
-   throw Error( "MosaicMerge: could not determine the module path via dladdr()." );
+   throw Error( "MegaMergeMosaic: could not determine the module path via dladdr()." );
 #endif
 }
 
@@ -195,13 +195,13 @@ std::string ResolveWorkerPath()
 #ifdef _WIN32
    String worker = dir + "mmm-ipc-worker.exe";
    if ( !File::Exists( worker ) )
-      throw Error( "MosaicMerge: worker binary not found next to the module: " + worker +
+      throw Error( "MegaMergeMosaic: worker binary not found next to the module: " + worker +
                    "\nBuild it with `cargo build --release -p mmm-ipc-worker` and copy "
                    "`mmm-ipc-worker.exe` beside mmm-pxm.dll." );
 #else
    String worker = dir + "mmm-ipc-worker";
    if ( !File::Exists( worker ) )
-      throw Error( "MosaicMerge: worker binary not found next to the module: " + worker +
+      throw Error( "MegaMergeMosaic: worker binary not found next to the module: " + worker +
                    "\nBuild it with `cargo build --release -p mmm-ipc-worker` and copy "
                    "`mmm-ipc-worker` beside mmm-pxm.so." );
 #endif
@@ -319,7 +319,7 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    // A run that completed (Done) without ever streaming a Begin/band leaves no
    // window -- surface that as a clean error rather than Show()ing a null window.
    if ( collector.Window().IsNull() )
-      throw Error( "MosaicMerge: the worker completed without producing an output image." );
+      throw Error( "MegaMergeMosaic: the worker completed without producing an output image." );
    collector.Window().Show();
 }
 
@@ -333,7 +333,7 @@ void RunViews( const Params& in, const std::string& worker_path )
    {
       View v = View::ViewById( id );
       if ( v.IsNull() )
-         throw Error( "MosaicMerge: input view not found: " + id );
+         throw Error( "MegaMergeMosaic: input view not found: " + id );
       views.Add( v );
    }
 
@@ -355,9 +355,9 @@ void RunViews( const Params& in, const std::string& worker_path )
       {
          const ImageVariant img = views[i].Image();
          if ( !img )
-            throw Error( "MosaicMerge: input view carries no image: " + views[i].FullId() );
+            throw Error( "MegaMergeMosaic: input view carries no image: " + views[i].FullId() );
          if ( img.IsComplexSample() )
-            throw Error( "MosaicMerge: complex images are not supported: " + views[i].FullId() );
+            throw Error( "MegaMergeMosaic: complex images are not supported: " + views[i].FullId() );
          const uint64_t w = uint64_t( img.Width() );
          const uint64_t h = uint64_t( img.Height() );
          const uint64_t c = uint64_t( img.NumberOfChannels() );
@@ -382,7 +382,7 @@ void RunViews( const Params& in, const std::string& worker_path )
       if ( solved )
          for ( size_type i = 0; i < views.Length(); ++i )
             if ( !views[i].Window().HasAstrometricSolution() )
-               throw Error( "MosaicMerge: solved mode requires an astrometric solution on every "
+               throw Error( "MegaMergeMosaic: solved mode requires an astrometric solution on every "
                             "view; this one has none: " + views[i].FullId() );
 
       const uint64_t ch        = cs[0];
@@ -433,7 +433,7 @@ void RunViews( const Params& in, const std::string& worker_path )
       else
       {
          if ( !uniform )
-            throw Error( "MosaicMerge: aligned mode requires all views to share the same "
+            throw Error( "MegaMergeMosaic: aligned mode requires all views to share the same "
                          "dimensions; use solved mode for unregistered panels." );
          init_body["mode"]   = "Aligned";
          init_body["canvas"] = { ws[0], hs[0], ch };
@@ -480,7 +480,7 @@ void RunFiles( const Params& in, const std::string& worker_path )
       FileFormatInstance file( format );
       ImageDescriptionArray images;
       if ( !file.Open( images, path ) || images.IsEmpty() )
-         throw Error( "MosaicMerge: cannot read image file: " + path );
+         throw Error( "MegaMergeMosaic: cannot read image file: " + path );
       const ImageInfo& info = images[0].info;
 
       // Read this file's astrometric solution, if the format carries one.
@@ -581,13 +581,13 @@ void run_blend( MmmBlendInstance& in )
    const bool haveViews = !in.p_viewIds.IsEmpty();
    const bool haveFiles = !in.p_filePaths.IsEmpty();
    if ( !haveViews && !haveFiles )
-      throw Error( "MosaicMerge: no input selected. Add at least two views or files." );
+      throw Error( "MegaMergeMosaic: no input selected. Add at least two views or files." );
    if ( haveViews && haveFiles )
-      throw Error( "MosaicMerge: mixed input. Select either views or files, not both." );
+      throw Error( "MegaMergeMosaic: mixed input. Select either views or files, not both." );
    if ( ( haveViews && in.p_viewIds.Length() < 2 ) || ( haveFiles && in.p_filePaths.Length() < 2 ) )
-      throw Error( "MosaicMerge: need at least two views or files to blend." );
+      throw Error( "MegaMergeMosaic: need at least two views or files to blend." );
    if ( in.p_sessionDir.IsEmpty() )
-      throw Error( "MosaicMerge: select a session directory (the worker caches analysis there)." );
+      throw Error( "MegaMergeMosaic: select a session directory (the worker caches analysis there)." );
 
    const std::string worker_path = ResolveWorkerPath();
 

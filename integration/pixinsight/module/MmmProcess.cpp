@@ -26,6 +26,12 @@ MmmBlendProcess::MmmBlendProcess()
 
 IsoString MmmBlendProcess::Id() const
 {
+   return "MegaMergeMosaic";
+}
+
+IsoString MmmBlendProcess::Aliases() const
+{
+   // Pre-rename id; lets any existing icons/scripts keep resolving.
    return "MosaicMerge";
 }
 
@@ -41,7 +47,9 @@ uint32 MmmBlendProcess::Version() const
 
 String MmmBlendProcess::Description() const
 {
-   return "Fast merge/blend for pre-aligned astro mosaic panels.";
+   return "<html><p>Merges pre-aligned astro mosaic panels (e.g. MosaicByCoordinates output) "
+          "into a single seamless image using overlap-band analysis, gain/offset matching and "
+          "multiband blending.</p><p>Big mosaics, no big deal.</p></html>";
 }
 
 ProcessImplementation* MmmBlendProcess::Create() const
@@ -120,7 +128,7 @@ bool MmmBlendInstance::CanExecuteGlobal( String& whyNot ) const
 
 bool MmmBlendInstance::CanExecuteOn( const View&, String& whyNot ) const
 {
-   whyNot = "MosaicMerge can only be executed in the global context.";
+   whyNot = "MegaMergeMosaic can only be executed in the global context.";
    return false;
 }
 
