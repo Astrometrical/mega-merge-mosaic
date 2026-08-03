@@ -122,21 +122,15 @@ coverage.</td>
 </tr>
 
 <tr>
-<td class="name">Session directory</td>
-<td>Directory used as the analysis cache (a <code>*.mmm-session</code>
-folder). All intermediate stage results are written here; re-running the
-process against the same session directory reuses any stage that has
-already completed, instead of recomputing it.</td>
-</tr>
-
-<tr>
-<td class="name">Input</td>
+<td class="name">Panel registration method</td>
 <td><b>Auto</b> (default) inspects the target frames: if they all share
-identical pixel dimensions, they are treated as registered full-canvas
+identical pixel dimensions, they are treated as pre-aligned full-canvas
 panels; otherwise the process falls back to plate-solved panels and
-reprojects them from their astrometric solutions. <b>Aligned</b> forces
-the registered full-canvas path. <b>Solved</b> forces reprojection from
-astrometric solutions, even if the frames happen to share dimensions.</td>
+reprojects them from their astrometric solutions. <b>Pre-aligned (MosaicByCoordinates)</b>
+forces the registered full-canvas path (registered full-canvas frames
+sharing identical pixel dimensions and a common canvas). <b>Align by astrometric solution</b>
+forces reprojection from astrometric solutions, even if the frames happen
+to share dimensions.</td>
 </tr>
 
 <tr>
@@ -158,19 +152,11 @@ of averaging over a wider region.</td>
 </tr>
 
 <tr>
-<td class="name">Surface fit order</td>
-<td>Polynomial order used when matching panel backgrounds (gain/offset)
-across overlaps. <code>0</code> fits a constant offset, <code>1</code> a
-plane, and <code>2</code> (default) a quadratic surface, allowing
-smoothly varying gradients across a panel to be matched.</td>
-</tr>
-
-<tr>
-<td class="name">Band rows</td>
-<td>Number of image rows processed per streaming band. Controls the
-granularity of the overlap-band analysis and the peak memory used while
-processing; default 256. Smaller values reduce peak memory at the cost of
-more processing steps.</td>
+<td class="name">Gradient fit order</td>
+<td>Polynomial order used for per-panel background matching before blending.
+<code>0</code> fits a constant offset, <code>1</code> a plane, and <code>2</code>
+(default) a quadratic surface, allowing smoothly varying gradients across
+a panel to be matched.</td>
 </tr>
 
 <tr>
@@ -182,10 +168,31 @@ unaffected panel(s).</td>
 </tr>
 
 <tr>
-<td class="name">Flatten background</td>
-<td>Optional global gradient removal applied to the final merged mosaic,
+<td class="name">Gradient removal</td>
+<td>Optional global gradient removal applied to the final merged result,
 order 1 or 2. Disabled by default. The central level of the image is
 preserved; only large-scale gradients are removed.</td>
+</tr>
+
+<tr>
+<td colspan="2" style="background-color: #f0f0f0; font-weight: bold; text-align: left;">Advanced</td>
+</tr>
+
+<tr>
+<td class="name">Session directory</td>
+<td>Optional directory used as the analysis cache (a <code>*.mmm-session</code>
+folder). All intermediate stage results are written here; re-running the
+process against the same session directory and inputs reuses any stage
+that has already completed, instead of recomputing it. If empty (default),
+an automatic temporary directory is used and removed when the run finishes.</td>
+</tr>
+
+<tr>
+<td class="name">Band rows</td>
+<td>Number of image rows processed per streaming band. Controls the
+granularity of the overlap-band analysis and the peak memory used while
+processing; default 256. Smaller values reduce peak memory at the cost of
+more processing steps.</td>
 </tr>
 
 </table>
@@ -196,8 +203,9 @@ preserved; only large-scale gradients are removed.</td>
   <li>Add at least two target frames (views or files) from the same
   mosaic using the <b>Add Views...</b> or <b>Add Files...</b>
   controls.</li>
-  <li>Choose a session directory; this is required before the process can
-  run.</li>
+  <li>Optionally, set a session directory in the <b>Advanced</b> section
+  to cache analysis results and resume re-runs with the same inputs; if not
+  set, an automatic temporary directory is used.</li>
   <li>Click the <b>Apply Global</b> button (or press F6) to start the
   merge; this process runs only in the global context and cannot be
   dropped onto a view. Progress for each stage is reported in the Process
