@@ -24,7 +24,7 @@ void ImageWindowCollector::begin( uint64_t w, uint64_t h, uint64_t ch )
    m_window = ImageWindow( int( w ), int( h ), int( ch ),
                            32 /*bitsPerSample*/, true /*floatSample*/,
                            ch >= 3 /*color*/, true /*initialProcessing*/,
-                           "MergeMosaic" );
+                           "MegaMergeMosaic" );
 }
 
 // ----------------------------------------------------------------------------

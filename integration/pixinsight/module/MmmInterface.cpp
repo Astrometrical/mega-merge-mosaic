@@ -502,7 +502,7 @@ void MmmBlendInterface::e_SessionDirEditCompleted( Edit& sender )
 void MmmBlendInterface::e_SessionDirBrowseClick( Button&, bool )
 {
    GetDirectoryDialog d;
-   d.SetCaption( "MergeMosaic: Select Session Directory" );
+   d.SetCaption( "Mega Merge Mosaic: Select Session Directory" );
    if ( d.Execute() )
    {
       m_instance.p_sessionDir = d.Directory();
