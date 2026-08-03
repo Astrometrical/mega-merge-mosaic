@@ -1,4 +1,4 @@
-// MmmInterface.h -- MergeMosaic ProcessInterface (Task 3: full control tree).
+// MmmInterface.h -- MegaMergeMosaic ProcessInterface (Task 3: full control tree).
 //
 // MmmBlendInterface is a static (non-dynamic), global-context, instance-
 // generating ProcessInterface: it owns a private MmmBlendInstance (m_instance)
@@ -18,17 +18,19 @@
 #ifndef __MmmInterface_h
 #define __MmmInterface_h
 
+#include <pcl/Bitmap.h>
 #include <pcl/CheckBox.h>
 #include <pcl/ComboBox.h>
 #include <pcl/Edit.h>
-#include <pcl/GroupBox.h>
 #include <pcl/Label.h>
 #include <pcl/NumericControl.h>
 #include <pcl/ProcessInterface.h>
 #include <pcl/PushButton.h>
 #include <pcl/RadioButton.h>
+#include <pcl/SectionBar.h>
 #include <pcl/Sizer.h>
 #include <pcl/SpinBox.h>
+#include <pcl/ToolButton.h>
 #include <pcl/TreeBox.h>
 
 #include "MmmProcess.h"
@@ -60,13 +62,10 @@ public:
    InterfaceFeatures      Features() const override;
    ProcessImplementation* NewProcess() const override;
    bool                   ImportProcess( const ProcessImplementation& ) override;
+   void                   ResetInstance() override;
    bool                   Launch( const MetaProcess&, const ProcessImplementation*,
                                   bool& dynamic, unsigned& flags ) override;
-
-   // Task 5 run-state hooks, called from the ExecuteGlobal orchestration
-   // (MmmExecution.cpp). Both are no-ops if the control tree is not built yet.
-   void SetBlendRunning( bool running );        // enable/disable the Cancel button
-   void SetProgressText( const String& text );  // live worker-progress text
+   IsoString              IconImageSVG() const override;
 
 private:
 
@@ -80,77 +79,63 @@ private:
 
       VerticalSizer   Global_Sizer;
 
-      // --- Input source: Views vs Files toggle -------------------------------
-      GroupBox        InputSource_GroupBox;
-      VerticalSizer   InputSource_Sizer;
+      // --- Header notice: logo + title/tagline/copyright ---------------------
+      Control         Notice_Control;
+      HorizontalSizer Notice_Sizer;
+      Control         Logo_Control;          // paints the chevron bitmap
+      VerticalSizer   NoticeText_Sizer;
+      Label           Title_Label;
+      Label           Tagline_Label;
+      Label           Copyright_Label;
+      Bitmap          Logo_Bitmap;           // rendered from MMM_CHEVRON_SVG
+
+      // --- Target Frames section --------------------------------------------
+      SectionBar      TargetFrames_SectionBar;
+      Control         TargetFrames_Control;
+      VerticalSizer   TargetFrames_Sizer;
       HorizontalSizer InputMode_Sizer;
       RadioButton     ViewsMode_RadioButton;
       RadioButton     FilesMode_RadioButton;
-
-      VerticalSizer   Views_Sizer;
       TreeBox         Views_TreeBox;
       HorizontalSizer ViewButtons_Sizer;
       PushButton      AddViews_PushButton;
       PushButton      RemoveView_PushButton;
-
-      VerticalSizer   Files_Sizer;
       TreeBox         Files_TreeBox;
       HorizontalSizer FileButtons_Sizer;
       PushButton      AddFiles_PushButton;
       PushButton      RemoveFile_PushButton;
 
-      // --- Session directory --------------------------------------------------
+      // --- Parameters section ------------------------------------------------
+      SectionBar      Parameters_SectionBar;
+      Control         Parameters_Control;
+      VerticalSizer   Parameters_Sizer;
       HorizontalSizer SessionDir_Sizer;
       Label           SessionDir_Label;
       Edit            SessionDir_Edit;
-      PushButton      SessionDir_PushButton;
-
-      // --- Input override ------------------------------------------------------
+      ToolButton      SessionDir_ToolButton;
       HorizontalSizer InputSelect_Sizer;
       Label           InputSelect_Label;
       ComboBox        InputSelect_ComboBox;
-
-      // --- Blend parameters -----------------------------------------------------
-      GroupBox        BlendParams_GroupBox;
-      VerticalSizer   BlendParams_Sizer;
-
       HorizontalSizer BlendMode_Sizer;
       Label           BlendMode_Label;
       ComboBox        BlendMode_ComboBox;
-
       NumericControl  Feather_NumericControl;
-
-      HorizontalSizer Downsample_Sizer;
-      Label           Downsample_Label;
-      SpinBox         Downsample_SpinBox;
-
       HorizontalSizer SurfaceOrder_Sizer;
       Label           SurfaceOrder_Label;
       SpinBox         SurfaceOrder_SpinBox;
-
       HorizontalSizer BandRows_Sizer;
       Label           BandRows_Label;
       SpinBox         BandRows_SpinBox;
-
+      HorizontalSizer DefectVeto_Sizer;
       CheckBox        DefectVeto_CheckBox;
-
       HorizontalSizer Flatten_Sizer;
       CheckBox        FlattenEnabled_CheckBox;
       SpinBox         FlattenOrder_SpinBox;
 
-      VerticalSizer   Roi_Sizer;
-      CheckBox        RoiEnabled_CheckBox;
-      HorizontalSizer RoiFields_Sizer;
-      NumericEdit     RoiX0_NumericEdit;
-      NumericEdit     RoiY0_NumericEdit;
-      NumericEdit     RoiX1_NumericEdit;
-      NumericEdit     RoiY1_NumericEdit;
-
-      // --- Progress / cancel ------------------------------------------------------
-      GroupBox        Progress_GroupBox;
-      HorizontalSizer Progress_Sizer;
-      Label           Progress_Label;
-      PushButton      Cancel_PushButton;
+      // --- Advanced section ---------------------------------------------------
+      SectionBar      Advanced_SectionBar;
+      Control         Advanced_Control;
+      VerticalSizer   Advanced_Sizer;
    };
 
    GUIData* GUI = nullptr;
@@ -168,7 +153,6 @@ private:
    void UpdateControls();
    void UpdateInputModeControls();
    void UpdateFlattenControls();
-   void UpdateRoiControls();
    void PopulateViewsTreeBox();
    void PopulateFilesTreeBox();
 
@@ -187,7 +171,6 @@ private:
    void e_BlendModeItemSelected( ComboBox& sender, int itemIndex );
 
    void e_FeatherValueUpdated( NumericEdit& sender, double value );
-   void e_DownsampleValueUpdated( SpinBox& sender, int value );
    void e_SurfaceOrderValueUpdated( SpinBox& sender, int value );
    void e_BandRowsValueUpdated( SpinBox& sender, int value );
 
@@ -195,14 +178,14 @@ private:
    void e_FlattenEnabledClick( Button& sender, bool checked );
    void e_FlattenOrderValueUpdated( SpinBox& sender, int value );
 
-   void e_RoiEnabledClick( Button& sender, bool checked );
-   void e_RoiValueUpdated( NumericEdit& sender, double value );
-
-   void e_CancelClick( Button& sender, bool checked );
+   void e_ToggleSection( SectionBar& sender, Control& section, bool start );
+   void e_NoticeMouseRelease( Control& sender, const pcl::Point& pos,
+                              int button, unsigned buttons, unsigned modifiers );
+   void e_LogoPaint( Control& sender, const pcl::Rect& updateRect );
 };
 
 /*!
- * \brief The MergeMosaic interface singleton.
+ * \brief The MegaMergeMosaic interface singleton.
  *
  * Instantiated once by InstallPixInsightModule(); non-owning global handle.
  */

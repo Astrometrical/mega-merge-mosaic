@@ -1,9 +1,11 @@
-// MmmProcess.cpp -- implementation of the trivial MergeMosaic process/instance.
+// MmmProcess.cpp -- implementation of the trivial MegaMergeMosaic process/instance.
 
 #include "MmmProcess.h"
 #include "MmmExecution.h"
+#include "MmmIcon.h"
 #include "MmmInterface.h"
 #include "MmmParameters.h"
+#include "MmmVersion.h"
 
 #include <exception>
 
@@ -26,6 +28,12 @@ MmmBlendProcess::MmmBlendProcess()
 
 IsoString MmmBlendProcess::Id() const
 {
+   return "MegaMergeMosaic";
+}
+
+IsoString MmmBlendProcess::Aliases() const
+{
+   // Pre-rename id; lets any existing icons/scripts keep resolving.
    return "MosaicMerge";
 }
 
@@ -36,12 +44,14 @@ IsoString MmmBlendProcess::Categories() const
 
 uint32 MmmBlendProcess::Version() const
 {
-   return 0x100;   // 1.0.0
+   return ( MMM_VERSION_MAJOR << 8 ) | ( MMM_VERSION_MINOR << 4 ) | MMM_VERSION_REVISION;
 }
 
 String MmmBlendProcess::Description() const
 {
-   return "Fast merge/blend for pre-aligned astro mosaic panels.";
+   return "<html><p>Merges pre-aligned astro mosaic panels (e.g. MosaicByCoordinates output) "
+          "into a single seamless image using overlap-band analysis, gain/offset matching and "
+          "multiband blending.</p><p>Big mosaics, no big deal.</p></html>";
 }
 
 ProcessImplementation* MmmBlendProcess::Create() const
@@ -70,25 +80,24 @@ ProcessInterface* MmmBlendProcess::DefaultInterface() const
    return TheMmmBlendInterface;
 }
 
+IsoString MmmBlendProcess::IconImageSVG() const
+{
+   return MMM_PROCESS_ICON_SVG;
+}
+
 // ----------------------------------------------------------------------------
 
 MmmBlendInstance::MmmBlendInstance( const MetaProcess* m )
    : ProcessImplementation( m )
    , p_inputSelect( TheMmmInputSelectParameter->ElementValue( TheMmmInputSelectParameter->DefaultValueIndex() ) )
-   , p_feather( float( TheMmmFeatherParameter->DefaultValue() ) )
+   , p_feather( int32( TheMmmFeatherParameter->DefaultValue() ) )
    , p_blendMode( TheMmmBlendModeParameter->ElementValue( TheMmmBlendModeParameter->DefaultValueIndex() ) )
    , p_flatten( int32( TheMmmFlattenParameter->DefaultValue() ) )
    , p_flattenEnabled( TheMmmFlattenEnabledParameter->DefaultValue() )
-   , p_roiEnabled( TheMmmRoiEnabledParameter->DefaultValue() )
-   , p_downsample( int32( TheMmmDownsampleParameter->DefaultValue() ) )
    , p_defectVeto( TheMmmDefectVetoParameter->DefaultValue() )
    , p_surfaceOrder( int32( TheMmmSurfaceOrderParameter->DefaultValue() ) )
    , p_bandRows( int32( TheMmmBandRowsParameter->DefaultValue() ) )
 {
-   p_roi[0] = int32( TheMmmRoiX0Parameter->DefaultValue() );
-   p_roi[1] = int32( TheMmmRoiY0Parameter->DefaultValue() );
-   p_roi[2] = int32( TheMmmRoiX1Parameter->DefaultValue() );
-   p_roi[3] = int32( TheMmmRoiY1Parameter->DefaultValue() );
 }
 
 MmmBlendInstance::MmmBlendInstance( const MmmBlendInstance& x )
@@ -112,12 +121,6 @@ void MmmBlendInstance::Assign( const ProcessImplementation& p )
       p_blendMode     = x->p_blendMode;
       p_flatten       = x->p_flatten;
       p_flattenEnabled = x->p_flattenEnabled;
-      p_roi[0]        = x->p_roi[0];
-      p_roi[1]        = x->p_roi[1];
-      p_roi[2]        = x->p_roi[2];
-      p_roi[3]        = x->p_roi[3];
-      p_roiEnabled    = x->p_roiEnabled;
-      p_downsample    = x->p_downsample;
       p_defectVeto    = x->p_defectVeto;
       p_surfaceOrder  = x->p_surfaceOrder;
       p_bandRows      = x->p_bandRows;
@@ -132,7 +135,7 @@ bool MmmBlendInstance::CanExecuteGlobal( String& whyNot ) const
 
 bool MmmBlendInstance::CanExecuteOn( const View&, String& whyNot ) const
 {
-   whyNot = "MosaicMerge can only be executed in the global context.";
+   whyNot = "MegaMergeMosaic can only be executed in the global context.";
    return false;
 }
 
@@ -182,12 +185,6 @@ void* MmmBlendInstance::LockParameter( const MetaParameter* p, size_type tableRo
    if ( p == TheMmmBlendModeParameter )     return &p_blendMode;
    if ( p == TheMmmFlattenParameter )       return &p_flatten;
    if ( p == TheMmmFlattenEnabledParameter ) return &p_flattenEnabled;
-   if ( p == TheMmmRoiX0Parameter )         return &p_roi[0];
-   if ( p == TheMmmRoiY0Parameter )         return &p_roi[1];
-   if ( p == TheMmmRoiX1Parameter )         return &p_roi[2];
-   if ( p == TheMmmRoiY1Parameter )         return &p_roi[3];
-   if ( p == TheMmmRoiEnabledParameter )    return &p_roiEnabled;
-   if ( p == TheMmmDownsampleParameter )    return &p_downsample;
    if ( p == TheMmmDefectVetoParameter )    return &p_defectVeto;
    if ( p == TheMmmSurfaceOrderParameter )  return &p_surfaceOrder;
    if ( p == TheMmmBandRowsParameter )      return &p_bandRows;

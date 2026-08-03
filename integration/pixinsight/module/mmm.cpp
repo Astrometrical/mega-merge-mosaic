@@ -1,4 +1,4 @@
-// mmm.cpp -- MergeMosaic PixInsight module (MmmModule) + installation entry point.
+// mmm.cpp -- MegaMergeMosaic PixInsight module (MmmModule) + installation entry point.
 //
 // Per PCL_API_REFERENCE.md section 1: the three module entry points have C
 // linkage and are free functions, not members of MetaModule. PixInsight's own
@@ -14,11 +14,8 @@
 #include "MmmInterface.h"
 #include "MmmParameters.h"
 #include "MmmProcess.h"
+#include "MmmVersion.h"
 
-#define MMM_MODULE_VERSION_MAJOR     1
-#define MMM_MODULE_VERSION_MINOR     0
-#define MMM_MODULE_VERSION_REVISION  0
-#define MMM_MODULE_VERSION_BUILD     1
 #define MMM_MODULE_VERSION_LANGUAGE  eng
 
 namespace pcl
@@ -28,7 +25,7 @@ namespace pcl
 
 /*!
  * \class MmmModule
- * \brief The MergeMosaic module meta-object (tree root).
+ * \brief The MegaMergeMosaic module meta-object (tree root).
  */
 class MmmModule : public MetaModule
 {
@@ -38,26 +35,36 @@ public:
 
    const char* Version() const override
    {
-      return PCL_MODULE_VERSION( MMM_MODULE_VERSION_MAJOR,
-                                 MMM_MODULE_VERSION_MINOR,
-                                 MMM_MODULE_VERSION_REVISION,
-                                 MMM_MODULE_VERSION_BUILD,
+      return PCL_MODULE_VERSION( MMM_VERSION_MAJOR,
+                                 MMM_VERSION_MINOR,
+                                 MMM_VERSION_REVISION,
+                                 MMM_VERSION_BUILD,
                                  MMM_MODULE_VERSION_LANGUAGE );
    }
 
    IsoString Name() const override
    {
-      return "MergeMosaic";
+      return "MegaMergeMosaic";
    }
 
    String Description() const override
    {
-      return "MergeMosaic: fast merge/blend for pre-aligned astro mosaic panels.";
+      return "Mega Merge Mosaic: fast merge/blend for pre-aligned astro mosaic panels.";
    }
 
    String Company() const override
    {
-      return "MergeMosaic";
+      return "Astrometrical";
+   }
+
+   String Author() const override
+   {
+      return "Daniel Paull";
+   }
+
+   String Copyright() const override
+   {
+      return "Copyright (c) 2026 Astrometrical";
    }
 };
 
@@ -95,12 +102,6 @@ PCL_MODULE_EXPORT pcl::int32 InstallPixInsightModule( pcl::int32 mode )
       TheMmmBlendModeParameter     = new MmmBlendModeParameter( TheMmmBlendProcess );
       TheMmmFlattenParameter       = new MmmFlattenParameter( TheMmmBlendProcess );
       TheMmmFlattenEnabledParameter = new MmmFlattenEnabledParameter( TheMmmBlendProcess );
-      TheMmmRoiX0Parameter         = new MmmRoiX0Parameter( TheMmmBlendProcess );
-      TheMmmRoiY0Parameter         = new MmmRoiY0Parameter( TheMmmBlendProcess );
-      TheMmmRoiX1Parameter         = new MmmRoiX1Parameter( TheMmmBlendProcess );
-      TheMmmRoiY1Parameter         = new MmmRoiY1Parameter( TheMmmBlendProcess );
-      TheMmmRoiEnabledParameter    = new MmmRoiEnabledParameter( TheMmmBlendProcess );
-      TheMmmDownsampleParameter    = new MmmDownsampleParameter( TheMmmBlendProcess );
       TheMmmDefectVetoParameter    = new MmmDefectVetoParameter( TheMmmBlendProcess );
       TheMmmSurfaceOrderParameter  = new MmmSurfaceOrderParameter( TheMmmBlendProcess );
       TheMmmBandRowsParameter      = new MmmBandRowsParameter( TheMmmBlendProcess );

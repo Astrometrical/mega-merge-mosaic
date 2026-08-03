@@ -1,4 +1,4 @@
-// MmmProcess.h -- MergeMosaic global-context process + instance (Task 1: trivial skeleton).
+// MmmProcess.h -- MegaMergeMosaic global-context process + instance (Task 1: trivial skeleton).
 //
 // MmmBlendProcess is a pure global-context MetaProcess (no target view); its
 // instance, MmmBlendInstance, currently executes as a no-op (ExecuteGlobal()
@@ -25,7 +25,7 @@ namespace pcl
 
 /*!
  * \class MmmBlendProcess
- * \brief Meta-object for the MergeMosaic global-context blend process.
+ * \brief Meta-object for the MegaMergeMosaic global-context blend process.
  *
  * Registers itself under the module singleton on construction (MetaObject
  * parent = pcl::Module). Global-only: CanProcessViews() is false and
@@ -38,6 +38,7 @@ public:
    MmmBlendProcess();
 
    IsoString              Id() const override;
+   IsoString              Aliases() const override;
    IsoString              Categories() const override;
    uint32                 Version() const override;
    String                 Description() const override;
@@ -46,10 +47,11 @@ public:
    bool                   CanProcessViews() const override;
    bool                   PrefersGlobalExecution() const override;
    ProcessInterface*      DefaultInterface() const override;
+   IsoString              IconImageSVG() const override;
 };
 
 /*!
- * \brief The MergeMosaic process meta-object singleton.
+ * \brief The MegaMergeMosaic process meta-object singleton.
  *
  * Instantiated once by InstallPixInsightModule(); non-owning global handle used
  * by the interface and instance code.
@@ -94,13 +96,10 @@ private:
    Array<String> p_filePaths;       // filePaths table rows (file paths)
    pcl_enum      p_inputSelect;     // Auto / Aligned / Solved
    String        p_sessionDir;      // *.mmm-session directory
-   float         p_feather;         // feather ramp length, canvas px
+   int32         p_feather;         // feather ramp length, canvas px
    pcl_enum      p_blendMode;       // Feather / TwoBand / Pyramid
    int32         p_flatten;         // background-flatten polynomial order
    pcl_bool      p_flattenEnabled;  // whether flatten is applied
-   int32         p_roi[ 4 ];        // ROI [x0,y0,x1,y1], full-res canvas coords
-   pcl_bool      p_roiEnabled;      // whether the ROI is applied
-   int32         p_downsample;      // 1 = full res, 8 = L8 preview
    pcl_bool      p_defectVeto;      // cross-panel defect veto
    int32         p_surfaceOrder;    // analyze surface-fit order
    int32         p_bandRows;        // output band granularity, rows

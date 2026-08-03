@@ -1,4 +1,4 @@
-// MmmInterface.cpp -- MergeMosaic ProcessInterface implementation (Task 3).
+// MmmInterface.cpp -- MegaMergeMosaic ProcessInterface implementation (Task 3).
 //
 // Builds the real control tree (deferred-init GUIData, per PCL_API_REFERENCE.md
 // section 4) and wires every control to the interface's private working
@@ -18,10 +18,16 @@
 
 #include "MmmInterface.h"
 #include "MmmExecution.h"
+#include "MmmIcon.h"
+#include "MmmVersion.h"
 
 #include <pcl/Array.h>
+#include <pcl/Cursor.h>
+#include <pcl/ExternalProcess.h>
 #include <pcl/FileDialog.h>
+#include <pcl/Graphics.h>
 #include <pcl/MultiViewSelectionDialog.h>
+#include <pcl/StringList.h>
 #include <pcl/View.h>
 
 namespace pcl
@@ -47,7 +53,7 @@ MmmBlendInterface::~MmmBlendInterface()
 
 IsoString MmmBlendInterface::Id() const
 {
-   return "MosaicMerge";
+   return "MegaMergeMosaic";
 }
 
 MetaProcess* MmmBlendInterface::Process() const
@@ -95,6 +101,14 @@ bool MmmBlendInterface::ImportProcess( const ProcessImplementation& p )
    return true;
 }
 
+void MmmBlendInterface::ResetInstance()
+{
+   // The control bar's Reset button. Import a default-constructed instance;
+   // ImportProcess() re-derives the Views/Files mode and refreshes controls.
+   MmmBlendInstance defaultInstance( TheMmmBlendProcess );
+   ImportProcess( defaultInstance );
+}
+
 bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*,
                                  bool& dynamic, unsigned& /*flags*/ )
 {
@@ -106,12 +120,17 @@ bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*
    if ( GUI == nullptr )
    {
       GUI = new GUIData( *this );
-      SetWindowTitle( "MosaicMerge" );
+      SetWindowTitle( "Mega Merge Mosaic" );
       UpdateControls();
    }
 
    dynamic = false;
    return true;
+}
+
+IsoString MmmBlendInterface::IconImageSVG() const
+{
+   return MMM_PROCESS_ICON_SVG;
 }
 
 // ----------------------------------------------------------------------------
@@ -120,15 +139,50 @@ bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*
 
 MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 {
+   int labelWidth1 = w.Font().Width( String( "Panel registration method:" ) + 'M' );
+   int editWidth1  = w.Font().Width( String( '0', 8 ) );
+
    //
-   // Input source: Views / Files toggle + the two list widgets.
+   // Header notice: chevron logo + title / tagline / copyright, in the style
+   // of the MosaicByCoordinates script header.
+   //
+   Logo_Bitmap = Bitmap( MMM_CHEVRON_SVG, sizeof( MMM_CHEVRON_SVG ) - 1, "SVG" );
+
+   Logo_Control.SetScaledFixedSize( 40, 40 );
+   Logo_Control.OnPaint( (Control::paint_event_handler)&MmmBlendInterface::e_LogoPaint, w );
+
+   Title_Label.SetText( "Mega Merge Mosaic version " MMM_VERSION_STRING );
+   Title_Label.SetStyleSheet( w.ScaledStyleSheet( "QLabel { font-weight: bold; }" ) );
+
+   Tagline_Label.SetText( "Big mosaics, no big deal." );
+
+   Copyright_Label.SetText( "Copyright (c) 2026 Astrometrical | astrometrical.com" );
+   Copyright_Label.SetToolTip( "<p>Visit https://astrometrical.com</p>" );
+   Copyright_Label.SetCursor( StdCursor::PointingHand );
+   Copyright_Label.OnMouseRelease( (Control::mouse_button_event_handler)&MmmBlendInterface::e_NoticeMouseRelease, w );
+
+   NoticeText_Sizer.SetSpacing( 2 );
+   NoticeText_Sizer.Add( Title_Label );
+   NoticeText_Sizer.Add( Tagline_Label );
+   NoticeText_Sizer.Add( Copyright_Label );
+
+   Notice_Sizer.SetMargin( 6 );
+   Notice_Sizer.SetSpacing( 8 );
+   Notice_Sizer.Add( Logo_Control );
+   Notice_Sizer.Add( NoticeText_Sizer, 100 );
+   Notice_Control.SetSizer( Notice_Sizer );
+
+   //
+   // Target Frames section.
    //
    ViewsMode_RadioButton.SetText( "Views" );
    ViewsMode_RadioButton.SetChecked();
    ViewsMode_RadioButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ModeClick, w );
+   ViewsMode_RadioButton.SetToolTip( "<p>Blend image views that are open in the current PixInsight workspace.</p>" );
 
    FilesMode_RadioButton.SetText( "Files" );
    FilesMode_RadioButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ModeClick, w );
+   FilesMode_RadioButton.SetToolTip( "<p>Blend image files read directly from disk, without opening them as views.</p>" );
 
    InputMode_Sizer.SetSpacing( 8 );
    InputMode_Sizer.Add( ViewsMode_RadioButton );
@@ -138,78 +192,100 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Views_TreeBox.SetNumberOfColumns( 1 );
    Views_TreeBox.SetHeaderText( 0, "View Id" );
    Views_TreeBox.EnableMultipleSelections();
-   Views_TreeBox.SetScaledMinHeight( 100 );
+   Views_TreeBox.SetScaledMinSize( 400, 120 );
+   Views_TreeBox.SetToolTip( "<p>The mosaic panels to merge. All panels must belong to the same mosaic: "
+      "registered full-canvas panels (e.g. MosaicByCoordinates output) or plate-solved panels.</p>" );
 
-   AddViews_PushButton.SetText( "Add Views…" );
+   AddViews_PushButton.SetText( "Add Views..." );
    AddViews_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_AddViewsClick, w );
+   AddViews_PushButton.SetToolTip( "<p>Add open views as mosaic panels.</p>" );
 
    RemoveView_PushButton.SetText( "Remove" );
    RemoveView_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_RemoveViewClick, w );
+   RemoveView_PushButton.SetToolTip( "<p>Remove the selected views from the list.</p>" );
 
    ViewButtons_Sizer.SetSpacing( 6 );
    ViewButtons_Sizer.Add( AddViews_PushButton );
    ViewButtons_Sizer.Add( RemoveView_PushButton );
    ViewButtons_Sizer.AddStretch();
 
-   Views_Sizer.SetSpacing( 4 );
-   Views_Sizer.Add( Views_TreeBox );
-   Views_Sizer.Add( ViewButtons_Sizer );
-
    Files_TreeBox.SetNumberOfColumns( 1 );
    Files_TreeBox.SetHeaderText( 0, "File Path" );
    Files_TreeBox.EnableMultipleSelections();
-   Files_TreeBox.SetScaledMinHeight( 100 );
+   Files_TreeBox.SetScaledMinSize( 400, 120 );
+   Files_TreeBox.SetToolTip( "<p>The mosaic panel files to merge. All panels must belong to the same mosaic: "
+      "registered full-canvas panels (e.g. MosaicByCoordinates output) or plate-solved panels.</p>" );
 
-   AddFiles_PushButton.SetText( "Add Files…" );
+   AddFiles_PushButton.SetText( "Add Files..." );
    AddFiles_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_AddFilesClick, w );
+   AddFiles_PushButton.SetToolTip( "<p>Add image files as mosaic panels.</p>" );
 
    RemoveFile_PushButton.SetText( "Remove" );
    RemoveFile_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_RemoveFileClick, w );
+   RemoveFile_PushButton.SetToolTip( "<p>Remove the selected files from the list.</p>" );
 
    FileButtons_Sizer.SetSpacing( 6 );
    FileButtons_Sizer.Add( AddFiles_PushButton );
    FileButtons_Sizer.Add( RemoveFile_PushButton );
    FileButtons_Sizer.AddStretch();
 
-   Files_Sizer.SetSpacing( 4 );
-   Files_Sizer.Add( Files_TreeBox );
-   Files_Sizer.Add( FileButtons_Sizer );
+   TargetFrames_Sizer.SetSpacing( 4 );
+   TargetFrames_Sizer.Add( InputMode_Sizer );
+   TargetFrames_Sizer.Add( Views_TreeBox );
+   TargetFrames_Sizer.Add( ViewButtons_Sizer );
+   TargetFrames_Sizer.Add( Files_TreeBox );
+   TargetFrames_Sizer.Add( FileButtons_Sizer );
+   TargetFrames_Control.SetSizer( TargetFrames_Sizer );
 
-   InputSource_Sizer.SetSpacing( 6 );
-   InputSource_Sizer.Add( InputMode_Sizer );
-   InputSource_Sizer.Add( Views_Sizer );
-   InputSource_Sizer.Add( Files_Sizer );
-
-   InputSource_GroupBox.SetTitle( "Input Source" );
-   InputSource_GroupBox.SetSizer( InputSource_Sizer );
+   TargetFrames_SectionBar.SetTitle( "Target Frames" );
+   TargetFrames_SectionBar.SetSection( TargetFrames_Control );
+   TargetFrames_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
 
    //
-   // Session directory.
+   // Parameters section.
    //
    SessionDir_Label.SetText( "Session directory:" );
+   SessionDir_Label.SetFixedWidth( labelWidth1 );
+   SessionDir_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    SessionDir_Edit.OnEditCompleted( (Edit::edit_event_handler)&MmmBlendInterface::e_SessionDirEditCompleted, w );
+   SessionDir_Edit.SetToolTip( "<p>Optional working directory for the analysis cache "
+      "(a *.mmm-session folder).</p>"
+      "<p>Leave empty (default) to use a temporary directory that is removed automatically "
+      "when the run finishes. Set a directory to keep the cache: re-running with the same "
+      "directory and inputs resumes completed analysis stages.</p>" );
 
-   SessionDir_PushButton.SetText( "…" );
-   SessionDir_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SessionDirBrowseClick, w );
+   SessionDir_ToolButton.SetIcon( Bitmap( w.ScaledResource( ":/browser/select-file.png" ) ) );
+   SessionDir_ToolButton.SetScaledFixedSize( 20, 20 );
+   SessionDir_ToolButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SessionDirBrowseClick, w );
+   SessionDir_ToolButton.SetToolTip( "<p>Select the optional session directory.</p>" );
 
-   SessionDir_Sizer.SetSpacing( 6 );
+   SessionDir_Sizer.SetSpacing( 4 );
    SessionDir_Sizer.Add( SessionDir_Label );
    SessionDir_Sizer.Add( SessionDir_Edit, 100 );
-   SessionDir_Sizer.Add( SessionDir_PushButton );
+   SessionDir_Sizer.Add( SessionDir_ToolButton );
 
    //
    // Input override (advanced): Auto / Aligned / Solved.
    // Element order MUST match MmmInputSelectParameter (Auto=0/Aligned=1/Solved=2).
    //
-   InputSelect_Label.SetText( "Input:" );
+   InputSelect_Label.SetText( "Panel registration method:" );
+   InputSelect_Label.SetFixedWidth( labelWidth1 );
+   InputSelect_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    InputSelect_ComboBox.AddItem( "Auto" );
-   InputSelect_ComboBox.AddItem( "Aligned" );
-   InputSelect_ComboBox.AddItem( "Solved" );
+   InputSelect_ComboBox.AddItem( "Pre-aligned (MosaicByCoordinates)" );
+   InputSelect_ComboBox.AddItem( "Align by astrometric solution" );
    InputSelect_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_InputSelectItemSelected, w );
+   InputSelect_ComboBox.SetMinWidth( editWidth1*2 );
+   InputSelect_ComboBox.SetToolTip( "<p>How panels are placed on the output canvas:</p>"
+      "<p><b>Auto</b> - detect the correct mode automatically from the inputs.</p>"
+      "<p><b>Pre-aligned (MosaicByCoordinates)</b> - panels are registered full-canvas frames "
+      "sharing the same dimensions (e.g. MosaicByCoordinates output); blend them directly.</p>"
+      "<p><b>Align by astrometric solution</b> - reproject each panel onto a common frame "
+      "using its astrometric solution (every panel must be plate-solved).</p>" );
 
-   InputSelect_Sizer.SetSpacing( 6 );
+   InputSelect_Sizer.SetSpacing( 4 );
    InputSelect_Sizer.Add( InputSelect_Label );
    InputSelect_Sizer.Add( InputSelect_ComboBox );
    InputSelect_Sizer.AddStretch();
@@ -218,139 +294,192 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    // Blend parameters.
    //
    BlendMode_Label.SetText( "Blend mode:" );
+   BlendMode_Label.SetFixedWidth( labelWidth1 );
+   BlendMode_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    // Element order MUST match MmmBlendModeParameter (Feather=0/TwoBand=1/Pyramid=2).
    BlendMode_ComboBox.AddItem( "Feather" );
    BlendMode_ComboBox.AddItem( "TwoBand" );
    BlendMode_ComboBox.AddItem( "Pyramid" );
    BlendMode_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_BlendModeItemSelected, w );
+   BlendMode_ComboBox.SetMinWidth( editWidth1*2 );
+   BlendMode_ComboBox.SetToolTip( "<p><b>Feather</b> - weighted-average ramp across the overlap.</p>"
+      "<p><b>TwoBand</b> - low frequencies feathered, high frequencies seam-cut.</p>"
+      "<p><b>Pyramid</b> - full multiband blend; best quality (default).</p>" );
 
-   BlendMode_Sizer.SetSpacing( 6 );
+   BlendMode_Sizer.SetSpacing( 4 );
    BlendMode_Sizer.Add( BlendMode_Label );
    BlendMode_Sizer.Add( BlendMode_ComboBox );
    BlendMode_Sizer.AddStretch();
 
-   Feather_NumericControl.label.SetText( "Feather (px):" );
-   Feather_NumericControl.SetReal();
-   Feather_NumericControl.SetPrecision( 2 );
-   Feather_NumericControl.SetRange( 0, 100000 );
+   Feather_NumericControl.label.SetText( "Feather:" );
+   Feather_NumericControl.label.SetFixedWidth( labelWidth1 );
+   Feather_NumericControl.edit.SetFixedWidth( editWidth1 );
+   Feather_NumericControl.SetInteger();
+   Feather_NumericControl.SetRange( 1, 1024 );
    Feather_NumericControl.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_FeatherValueUpdated, w );
+   Feather_NumericControl.SetToolTip( "<p>Feather ramp length in canvas pixels (1-1024). "
+      "Larger values give smoother low-frequency transitions across panel overlaps.</p>" );
 
-   Downsample_Label.SetText( "Downsample:" );
-   Downsample_SpinBox.SetRange( 1, 64 );
-   Downsample_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_DownsampleValueUpdated, w );
-
-   Downsample_Sizer.SetSpacing( 6 );
-   Downsample_Sizer.Add( Downsample_Label );
-   Downsample_Sizer.Add( Downsample_SpinBox );
-   Downsample_Sizer.AddStretch();
-
-   SurfaceOrder_Label.SetText( "Surface fit order:" );
-   SurfaceOrder_SpinBox.SetRange( 0, 8 );
+   SurfaceOrder_Label.SetText( "Gradient fit order:" );
+   SurfaceOrder_Label.SetFixedWidth( labelWidth1 );
+   SurfaceOrder_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
+   SurfaceOrder_SpinBox.SetRange( 0, 2 );
    SurfaceOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_SurfaceOrderValueUpdated, w );
+   SurfaceOrder_SpinBox.SetFixedWidth( editWidth1 );
+   SurfaceOrder_SpinBox.SetToolTip( "<p>Polynomial order (0-2) of the per-panel gradient fit used "
+      "to match panel backgrounds before blending: 0 = constant offset, 1 = plane, "
+      "2 = quadratic (default).</p>" );
 
-   SurfaceOrder_Sizer.SetSpacing( 6 );
+   SurfaceOrder_Sizer.SetSpacing( 4 );
    SurfaceOrder_Sizer.Add( SurfaceOrder_Label );
    SurfaceOrder_Sizer.Add( SurfaceOrder_SpinBox );
    SurfaceOrder_Sizer.AddStretch();
 
    BandRows_Label.SetText( "Band rows:" );
+   BandRows_Label.SetFixedWidth( labelWidth1 );
+   BandRows_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
    BandRows_SpinBox.SetRange( 1, 65536 );
    BandRows_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_BandRowsValueUpdated, w );
+   BandRows_SpinBox.SetFixedWidth( editWidth1 );
+   BandRows_SpinBox.SetToolTip( "<p>Output rows per streamed band. Advanced: affects streaming granularity "
+      "and peak memory only; the default (256) is fine for most images.</p>" );
 
-   BandRows_Sizer.SetSpacing( 6 );
+   BandRows_Sizer.SetSpacing( 4 );
    BandRows_Sizer.Add( BandRows_Label );
    BandRows_Sizer.Add( BandRows_SpinBox );
    BandRows_Sizer.AddStretch();
 
    DefectVeto_CheckBox.SetText( "Cross-panel defect veto" );
    DefectVeto_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_DefectVetoClick, w );
+   DefectVeto_CheckBox.SetToolTip( "<p>Reject single-panel defects (satellite trails, stacking edge artifacts) "
+      "in overlap regions by cross-checking panels during the detail blend.</p>" );
 
-   FlattenEnabled_CheckBox.SetText( "Flatten background, order:" );
+   DefectVeto_Sizer.SetSpacing( 4 );
+   DefectVeto_Sizer.AddUnscaledSpacing( labelWidth1 + w.LogicalPixelsToPhysical( 4 ) );
+   DefectVeto_Sizer.Add( DefectVeto_CheckBox );
+   DefectVeto_Sizer.AddStretch();
+
+   FlattenEnabled_CheckBox.SetText( "Gradient removal, order:" );
    FlattenEnabled_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_FlattenEnabledClick, w );
+   FlattenEnabled_CheckBox.SetToolTip( "<p>Remove the residual global background gradient from the "
+      "merged result, fitting a polynomial of the chosen order. The central background level "
+      "is preserved.</p>" );
 
-   FlattenOrder_SpinBox.SetRange( 0, 8 );
+   FlattenOrder_SpinBox.SetRange( 1, 2 );
    FlattenOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_FlattenOrderValueUpdated, w );
+   FlattenOrder_SpinBox.SetFixedWidth( editWidth1 );
+   FlattenOrder_SpinBox.SetToolTip( "<p>Gradient removal polynomial order: 1 = plane, 2 = quadratic.</p>" );
 
-   Flatten_Sizer.SetSpacing( 6 );
+   Flatten_Sizer.SetSpacing( 4 );
+   Flatten_Sizer.AddUnscaledSpacing( labelWidth1 + w.LogicalPixelsToPhysical( 4 ) );
    Flatten_Sizer.Add( FlattenEnabled_CheckBox );
    Flatten_Sizer.Add( FlattenOrder_SpinBox );
    Flatten_Sizer.AddStretch();
 
-   RoiEnabled_CheckBox.SetText( "Region of interest" );
-   RoiEnabled_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_RoiEnabledClick, w );
+   Parameters_Sizer.SetSpacing( 4 );
+   Parameters_Sizer.Add( InputSelect_Sizer );
+   Parameters_Sizer.Add( BlendMode_Sizer );
+   Parameters_Sizer.Add( Feather_NumericControl );
+   Parameters_Sizer.Add( SurfaceOrder_Sizer );
+   Parameters_Sizer.Add( DefectVeto_Sizer );
+   Parameters_Sizer.Add( Flatten_Sizer );
+   Parameters_Control.SetSizer( Parameters_Sizer );
 
-   RoiX0_NumericEdit.label.SetText( "x0:" );
-   RoiX0_NumericEdit.SetInteger();
-   RoiX0_NumericEdit.SetRange( 0, int32_max );
-   RoiX0_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiY0_NumericEdit.label.SetText( "y0:" );
-   RoiY0_NumericEdit.SetInteger();
-   RoiY0_NumericEdit.SetRange( 0, int32_max );
-   RoiY0_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiX1_NumericEdit.label.SetText( "x1:" );
-   RoiX1_NumericEdit.SetInteger();
-   RoiX1_NumericEdit.SetRange( 0, int32_max );
-   RoiX1_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiY1_NumericEdit.label.SetText( "y1:" );
-   RoiY1_NumericEdit.SetInteger();
-   RoiY1_NumericEdit.SetRange( 0, int32_max );
-   RoiY1_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiFields_Sizer.SetSpacing( 6 );
-   RoiFields_Sizer.Add( RoiX0_NumericEdit );
-   RoiFields_Sizer.Add( RoiY0_NumericEdit );
-   RoiFields_Sizer.Add( RoiX1_NumericEdit );
-   RoiFields_Sizer.Add( RoiY1_NumericEdit );
-
-   Roi_Sizer.SetSpacing( 4 );
-   Roi_Sizer.Add( RoiEnabled_CheckBox );
-   Roi_Sizer.Add( RoiFields_Sizer );
-
-   BlendParams_Sizer.SetSpacing( 6 );
-   BlendParams_Sizer.Add( BlendMode_Sizer );
-   BlendParams_Sizer.Add( Feather_NumericControl );
-   BlendParams_Sizer.Add( Downsample_Sizer );
-   BlendParams_Sizer.Add( SurfaceOrder_Sizer );
-   BlendParams_Sizer.Add( BandRows_Sizer );
-   BlendParams_Sizer.Add( DefectVeto_CheckBox );
-   BlendParams_Sizer.Add( Flatten_Sizer );
-   BlendParams_Sizer.Add( Roi_Sizer );
-
-   BlendParams_GroupBox.SetTitle( "Blend Parameters" );
-   BlendParams_GroupBox.SetSizer( BlendParams_Sizer );
+   Parameters_SectionBar.SetTitle( "Parameters" );
+   Parameters_SectionBar.SetSection( Parameters_Control );
+   Parameters_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
 
    //
-   // Progress + cancel. Task 5 wires the live progress feed and enables
-   // Cancel_PushButton; here the control exists but starts disabled.
+   // Advanced section (collapsed by default).
    //
-   Cancel_PushButton.SetText( "Cancel" );
-   Cancel_PushButton.Disable();
-   Cancel_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_CancelClick, w );
+   Advanced_Sizer.SetSpacing( 4 );
+   Advanced_Sizer.Add( SessionDir_Sizer );
+   Advanced_Sizer.Add( BandRows_Sizer );
+   Advanced_Control.SetSizer( Advanced_Sizer );
 
-   Progress_Sizer.SetSpacing( 6 );
-   Progress_Sizer.Add( Progress_Label, 100 );
-   Progress_Sizer.Add( Cancel_PushButton );
-
-   Progress_GroupBox.SetTitle( "Progress" );
-   Progress_GroupBox.SetSizer( Progress_Sizer );
+   Advanced_SectionBar.SetTitle( "Advanced" );
+   Advanced_SectionBar.SetSection( Advanced_Control );
+   Advanced_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
 
    //
    // Top-level layout.
    //
    Global_Sizer.SetMargin( 8 );
-   Global_Sizer.SetSpacing( 8 );
-   Global_Sizer.Add( InputSource_GroupBox );
-   Global_Sizer.Add( SessionDir_Sizer );
-   Global_Sizer.Add( InputSelect_Sizer );
-   Global_Sizer.Add( BlendParams_GroupBox );
-   Global_Sizer.Add( Progress_GroupBox );
+   Global_Sizer.SetSpacing( 6 );
+   Global_Sizer.Add( Notice_Control );
+   Global_Sizer.Add( TargetFrames_SectionBar );
+   Global_Sizer.Add( TargetFrames_Control );
+   Global_Sizer.Add( Parameters_SectionBar );
+   Global_Sizer.Add( Parameters_Control );
+   Global_Sizer.Add( Advanced_SectionBar );
+   Global_Sizer.Add( Advanced_Control );
 
    w.SetSizer( Global_Sizer );
+
+   // Start collapsed: HideSection() keeps the bar's own collapse/arrow state
+   // in sync (unlike calling Control::Hide() on the section directly).
+   Advanced_SectionBar.HideSection();
+
+   w.EnsureLayoutUpdated();
    w.AdjustToContents();
+}
+
+// ----------------------------------------------------------------------------
+// Header notice: logo paint + copyright link.
+// ----------------------------------------------------------------------------
+
+void MmmBlendInterface::e_LogoPaint( Control& sender, const pcl::Rect& )
+{
+   Graphics g( sender );
+   if ( !GUI->Logo_Bitmap.IsNull() )
+      g.DrawScaledBitmap( sender.BoundsRect(), GUI->Logo_Bitmap );
+}
+
+void MmmBlendInterface::e_NoticeMouseRelease( Control&, const pcl::Point&, int button, unsigned, unsigned )
+{
+   if ( button != MouseButton::Left )
+      return;
+   try
+   {
+#ifdef _WIN32
+      ExternalProcess::StartProgram( "cmd.exe", StringList() << "/c" << "start" << "" << "https://astrometrical.com" );
+#elif defined( __APPLE__ )
+      ExternalProcess::StartProgram( "open", StringList() << "https://astrometrical.com" );
+#else
+      ExternalProcess::StartProgram( "xdg-open", StringList() << "https://astrometrical.com" );
+#endif
+   }
+   catch ( ... )
+   {
+      // Non-fatal: the URL is visible in the label text anyway.
+   }
+}
+
+// ----------------------------------------------------------------------------
+// SectionBar toggle: fix tree box heights while animating, restore afterwards,
+// and let the window shrink when a section closes.
+// ----------------------------------------------------------------------------
+
+void MmmBlendInterface::e_ToggleSection( SectionBar&, Control& section, bool start )
+{
+   if ( start )
+   {
+      GUI->Views_TreeBox.SetFixedHeight();
+      GUI->Files_TreeBox.SetFixedHeight();
+   }
+   else
+   {
+      GUI->Views_TreeBox.SetScaledMinHeight( 120 );
+      GUI->Views_TreeBox.SetMaxHeight( int_max );
+      GUI->Files_TreeBox.SetScaledMinHeight( 120 );
+      GUI->Files_TreeBox.SetMaxHeight( int_max );
+      if ( GUI->TargetFrames_Control.IsVisible() )
+         SetVariableHeight();
+      else
+         SetFixedHeight();
+      AdjustToContents();
+   }
 }
 
 // ----------------------------------------------------------------------------
@@ -372,7 +501,6 @@ void MmmBlendInterface::UpdateControls()
    GUI->BlendMode_ComboBox.SetCurrentItem( m_instance.p_blendMode );
 
    GUI->Feather_NumericControl.SetValue( m_instance.p_feather );
-   GUI->Downsample_SpinBox.SetValue( m_instance.p_downsample );
    GUI->SurfaceOrder_SpinBox.SetValue( m_instance.p_surfaceOrder );
    GUI->BandRows_SpinBox.SetValue( m_instance.p_bandRows );
 
@@ -381,38 +509,27 @@ void MmmBlendInterface::UpdateControls()
    GUI->FlattenEnabled_CheckBox.SetChecked( m_instance.p_flattenEnabled );
    GUI->FlattenOrder_SpinBox.SetValue( m_instance.p_flatten );
    UpdateFlattenControls();
-
-   GUI->RoiEnabled_CheckBox.SetChecked( m_instance.p_roiEnabled );
-   GUI->RoiX0_NumericEdit.SetValue( m_instance.p_roi[0] );
-   GUI->RoiY0_NumericEdit.SetValue( m_instance.p_roi[1] );
-   GUI->RoiX1_NumericEdit.SetValue( m_instance.p_roi[2] );
-   GUI->RoiY1_NumericEdit.SetValue( m_instance.p_roi[3] );
-   UpdateRoiControls();
 }
 
 void MmmBlendInterface::UpdateInputModeControls()
 {
-   GUI->Views_TreeBox.Enable( m_viewsMode );
-   GUI->AddViews_PushButton.Enable( m_viewsMode );
-   GUI->RemoveView_PushButton.Enable( m_viewsMode );
+   // Show only the active side's list; hiding (not disabling) matches the
+   // reference tools and keeps the window compact.
+   GUI->Views_TreeBox.SetVisible( m_viewsMode );
+   GUI->AddViews_PushButton.SetVisible( m_viewsMode );
+   GUI->RemoveView_PushButton.SetVisible( m_viewsMode );
 
-   GUI->Files_TreeBox.Enable( !m_viewsMode );
-   GUI->AddFiles_PushButton.Enable( !m_viewsMode );
-   GUI->RemoveFile_PushButton.Enable( !m_viewsMode );
+   GUI->Files_TreeBox.SetVisible( !m_viewsMode );
+   GUI->AddFiles_PushButton.SetVisible( !m_viewsMode );
+   GUI->RemoveFile_PushButton.SetVisible( !m_viewsMode );
+
+   EnsureLayoutUpdated();
+   AdjustToContents();
 }
 
 void MmmBlendInterface::UpdateFlattenControls()
 {
    GUI->FlattenOrder_SpinBox.Enable( m_instance.p_flattenEnabled );
-}
-
-void MmmBlendInterface::UpdateRoiControls()
-{
-   bool e = m_instance.p_roiEnabled;
-   GUI->RoiX0_NumericEdit.Enable( e );
-   GUI->RoiY0_NumericEdit.Enable( e );
-   GUI->RoiX1_NumericEdit.Enable( e );
-   GUI->RoiY1_NumericEdit.Enable( e );
 }
 
 void MmmBlendInterface::PopulateViewsTreeBox()
@@ -564,7 +681,7 @@ void MmmBlendInterface::e_SessionDirEditCompleted( Edit& sender )
 void MmmBlendInterface::e_SessionDirBrowseClick( Button&, bool )
 {
    GetDirectoryDialog d;
-   d.SetCaption( "MergeMosaic: Select Session Directory" );
+   d.SetCaption( "Mega Merge Mosaic: Select Session Directory" );
    if ( d.Execute() )
    {
       m_instance.p_sessionDir = d.Directory();
@@ -584,12 +701,7 @@ void MmmBlendInterface::e_BlendModeItemSelected( ComboBox&, int itemIndex )
 
 void MmmBlendInterface::e_FeatherValueUpdated( NumericEdit&, double value )
 {
-   m_instance.p_feather = float( value );
-}
-
-void MmmBlendInterface::e_DownsampleValueUpdated( SpinBox&, int value )
-{
-   m_instance.p_downsample = int32( value );
+   m_instance.p_feather = int32( value );
 }
 
 void MmmBlendInterface::e_SurfaceOrderValueUpdated( SpinBox&, int value )
@@ -616,54 +728,6 @@ void MmmBlendInterface::e_FlattenEnabledClick( Button&, bool checked )
 void MmmBlendInterface::e_FlattenOrderValueUpdated( SpinBox&, int value )
 {
    m_instance.p_flatten = int32( value );
-}
-
-void MmmBlendInterface::e_RoiEnabledClick( Button&, bool checked )
-{
-   m_instance.p_roiEnabled = checked;
-   UpdateRoiControls();
-}
-
-void MmmBlendInterface::e_RoiValueUpdated( NumericEdit& sender, double value )
-{
-   int32 v = int32( value );
-   if ( &sender == &GUI->RoiX0_NumericEdit )
-      m_instance.p_roi[0] = v;
-   else if ( &sender == &GUI->RoiY0_NumericEdit )
-      m_instance.p_roi[1] = v;
-   else if ( &sender == &GUI->RoiX1_NumericEdit )
-      m_instance.p_roi[2] = v;
-   else if ( &sender == &GUI->RoiY1_NumericEdit )
-      m_instance.p_roi[3] = v;
-}
-
-void MmmBlendInterface::e_CancelClick( Button&, bool )
-{
-   // Ask the running blend to stop (spec section 15). The button is enabled only
-   // for the duration of a run (SetBlendRunning); request_cancel() is a no-op if
-   // nothing is running. The synchronous v1 delivers this click via the
-   // ProcessEvents() pump inside the run's progress callback.
-   request_cancel();
-}
-
-// ----------------------------------------------------------------------------
-// Task 5 run-state hooks (called from MmmExecution.cpp on the execute thread).
-// ----------------------------------------------------------------------------
-
-void MmmBlendInterface::SetBlendRunning( bool running )
-{
-   if ( GUI == nullptr )
-      return;
-   GUI->Cancel_PushButton.Enable( running );
-   if ( !running )
-      GUI->Progress_Label.Clear();
-}
-
-void MmmBlendInterface::SetProgressText( const String& text )
-{
-   if ( GUI == nullptr )
-      return;
-   GUI->Progress_Label.SetText( text );
 }
 
 // ----------------------------------------------------------------------------

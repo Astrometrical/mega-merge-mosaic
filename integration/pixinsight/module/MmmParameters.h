@@ -1,7 +1,7 @@
 // MmmParameters.h -- MetaParameter singletons for MmmBlendProcess (Task 2).
 //
 // Each class below is a formal, per-process metadata description of one
-// scriptable/serializable parameter of the MergeMosaic blend process. They
+// scriptable/serializable parameter of the MegaMergeMosaic blend process. They
 // carry NO per-instance value: actual values live in MmmBlendInstance as
 // ordinary C++ members and are exposed to the core through the five
 // LockParameter/AllocateParameter/ParameterLength/... hooks, dispatched by
@@ -24,8 +24,8 @@
 //   feather            -> params.feather_px
 //   blendMode          -> params.mode ("feather"/"twoband"/"pyramid")
 //   flatten(+enabled)  -> params.flatten (u32 or null)
-//   roi*(+enabled)     -> params.roi ([x0,y0,x1,y1] or null)
-//   downsample         -> params.downsample
+//   (roi removed from UI; wire field is mandatory -> params.roi = null)
+//   (downsample removed from UI; wire field is mandatory -> params.downsample = 1)
 //   defectVeto         -> params.defect_veto
 //   surfaceOrder       -> params.surface_order
 //   bandRows           -> params.band_rows
@@ -188,18 +188,17 @@ extern MmmSessionDirParameter* TheMmmSessionDirParameter;
 // ----------------------------------------------------------------------------
 
 /*!
- * \brief Float parameter: feather ramp length in canvas pixels.
+ * \brief Int32 parameter: feather ramp length in canvas pixels.
  */
-class MmmFeatherParameter : public MetaFloat
+class MmmFeatherParameter : public MetaInt32
 {
 public:
 
-   MmmFeatherParameter( MetaProcess* P ) : MetaFloat( P ) {}
+   MmmFeatherParameter( MetaProcess* P ) : MetaInt32( P ) {}
    IsoString Id() const override { return "feather"; }
-   int Precision() const override { return 2; }
    double DefaultValue() const override { return 256; }
-   double MinimumValue() const override { return 0; }
-   double MaximumValue() const override { return 100000; }
+   double MinimumValue() const override { return 1; }      // mmm-core rejects feather_px <= 0
+   double MaximumValue() const override { return 1024; }
 };
 
 extern MmmFeatherParameter* TheMmmFeatherParameter;
@@ -218,9 +217,9 @@ public:
 
    MmmFlattenParameter( MetaProcess* P ) : MetaInt32( P ) {}
    IsoString Id() const override { return "flatten"; }
-   double DefaultValue() const override { return 4; }
-   double MinimumValue() const override { return 0; }
-   double MaximumValue() const override { return 8; }
+   double DefaultValue() const override { return 2; }
+   double MinimumValue() const override { return 1; }
+   double MaximumValue() const override { return 2; }
 };
 
 extern MmmFlattenParameter* TheMmmFlattenParameter;
@@ -238,109 +237,6 @@ public:
 };
 
 extern MmmFlattenEnabledParameter* TheMmmFlattenEnabledParameter;
-
-// ----------------------------------------------------------------------------
-// roiX0/Y0/X1/Y1 (+ roiEnabled): optional region of interest in full-res
-// canvas coords (params.roi = [x0,y0,x1,y1] or null). roiEnabled off => null.
-// ----------------------------------------------------------------------------
-
-/*!
- * \brief Int32 parameter: ROI left edge x0 (full-res canvas coord).
- */
-class MmmRoiX0Parameter : public MetaInt32
-{
-public:
-
-   MmmRoiX0Parameter( MetaProcess* P ) : MetaInt32( P ) {}
-   IsoString Id() const override { return "roiX0"; }
-   double DefaultValue() const override { return 0; }
-   double MinimumValue() const override { return 0; }
-   double MaximumValue() const override { return int32_max; }
-};
-
-extern MmmRoiX0Parameter* TheMmmRoiX0Parameter;
-
-/*!
- * \brief Int32 parameter: ROI top edge y0 (full-res canvas coord).
- */
-class MmmRoiY0Parameter : public MetaInt32
-{
-public:
-
-   MmmRoiY0Parameter( MetaProcess* P ) : MetaInt32( P ) {}
-   IsoString Id() const override { return "roiY0"; }
-   double DefaultValue() const override { return 0; }
-   double MinimumValue() const override { return 0; }
-   double MaximumValue() const override { return int32_max; }
-};
-
-extern MmmRoiY0Parameter* TheMmmRoiY0Parameter;
-
-/*!
- * \brief Int32 parameter: ROI right edge x1 (full-res canvas coord).
- */
-class MmmRoiX1Parameter : public MetaInt32
-{
-public:
-
-   MmmRoiX1Parameter( MetaProcess* P ) : MetaInt32( P ) {}
-   IsoString Id() const override { return "roiX1"; }
-   double DefaultValue() const override { return 0; }
-   double MinimumValue() const override { return 0; }
-   double MaximumValue() const override { return int32_max; }
-};
-
-extern MmmRoiX1Parameter* TheMmmRoiX1Parameter;
-
-/*!
- * \brief Int32 parameter: ROI bottom edge y1 (full-res canvas coord).
- */
-class MmmRoiY1Parameter : public MetaInt32
-{
-public:
-
-   MmmRoiY1Parameter( MetaProcess* P ) : MetaInt32( P ) {}
-   IsoString Id() const override { return "roiY1"; }
-   double DefaultValue() const override { return 0; }
-   double MinimumValue() const override { return 0; }
-   double MaximumValue() const override { return int32_max; }
-};
-
-extern MmmRoiY1Parameter* TheMmmRoiY1Parameter;
-
-/*!
- * \brief Boolean parameter: whether a region of interest is enabled.
- */
-class MmmRoiEnabledParameter : public MetaBoolean
-{
-public:
-
-   MmmRoiEnabledParameter( MetaProcess* P ) : MetaBoolean( P ) {}
-   IsoString Id() const override { return "roiEnabled"; }
-   bool DefaultValue() const override { return false; }
-};
-
-extern MmmRoiEnabledParameter* TheMmmRoiEnabledParameter;
-
-// ----------------------------------------------------------------------------
-// downsample: 1 = full resolution, 8 = blend from L8 summaries (preview).
-// ----------------------------------------------------------------------------
-
-/*!
- * \brief Int32 parameter: downsample factor (params.downsample).
- */
-class MmmDownsampleParameter : public MetaInt32
-{
-public:
-
-   MmmDownsampleParameter( MetaProcess* P ) : MetaInt32( P ) {}
-   IsoString Id() const override { return "downsample"; }
-   double DefaultValue() const override { return 1; }
-   double MinimumValue() const override { return 1; }
-   double MaximumValue() const override { return 64; }
-};
-
-extern MmmDownsampleParameter* TheMmmDownsampleParameter;
 
 // ----------------------------------------------------------------------------
 // defectVeto: cross-panel defect veto in two-band/pyramid detail stage.
@@ -375,7 +271,7 @@ public:
    IsoString Id() const override { return "surfaceOrder"; }
    double DefaultValue() const override { return 2; }
    double MinimumValue() const override { return 0; }
-   double MaximumValue() const override { return 8; }
+   double MaximumValue() const override { return 2; }
 };
 
 extern MmmSurfaceOrderParameter* TheMmmSurfaceOrderParameter;

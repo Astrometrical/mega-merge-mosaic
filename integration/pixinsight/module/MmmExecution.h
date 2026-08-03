@@ -1,4 +1,4 @@
-// MmmExecution.h -- ExecuteGlobal orchestration for the MergeMosaic blend (Task 5).
+// MmmExecution.h -- ExecuteGlobal orchestration for the MegaMergeMosaic blend (Task 5).
 //
 // run_blend() implements spec section 10.1's execution flow: validate the
 // selection, resolve the effective JobMode, build the ordered PanelDescs and
@@ -9,9 +9,8 @@
 //
 // Fault isolation (spec section 9): any host/worker failure surfaces as a clean
 // pcl::Error and NO partial output window is shown; the source views are left
-// intact. Cancellation is cooperative -- request_cancel() (wired to the
-// interface Cancel button and to the PixInsight Console's Abort) asks the
-// running host to stop.
+// intact. Cancellation is Console-only (Console's Pause/Abort button) and
+// handled inside ConsoleProgress::on_progress via AbortRequested().
 
 #ifndef __MmmExecution_h
 #define __MmmExecution_h
@@ -32,15 +31,6 @@ class MmmBlendInstance;
  * MmmBlendInstance::ExecuteGlobal().
  */
 void run_blend( MmmBlendInstance& instance );
-
-/*!
- * \brief Requests cancellation of the currently running blend, if any.
- *
- * Thread-safe and a no-op when no blend is running. Wired to the interface's
- * Cancel button; the run's progress callback also polls the PixInsight Console
- * abort flag and calls into the same host cancellation path.
- */
-void request_cancel();
 
 // ----------------------------------------------------------------------------
 

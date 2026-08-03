@@ -1,7 +1,7 @@
-# mmm-pxm — MergeMosaic PixInsight module
+# mmm-pxm — MegaMergeMosaic PixInsight module
 
 The PCL `Process`/`ProcessInterface` wrapper around the [`../host`](../host)
-transport library: a thin **Mosaic → MosaicMerge** process that drives
+transport library: a thin **Mosaic → MegaMergeMosaic** process that drives
 `mmm-ipc-worker` over shared memory from inside PixInsight, using the same
 byte-exact analyze/blend pipeline as the `mmm` CLI. It is PixInsight-only code
 (depends on `libPCL-pxi.a` and PCL headers); the transport it wraps
@@ -93,7 +93,7 @@ cargo build --release -p mmm-ipc-worker
 cp target/release/mmm-ipc-worker integration/pixinsight/module/
 ```
 
-If the worker binary is missing, `MosaicMerge` reports a clear PixInsight
+If the worker binary is missing, `MegaMergeMosaic` reports a clear PixInsight
 error at execute time rather than failing silently or hanging.
 
 ## macOS and Windows builds
@@ -191,11 +191,25 @@ There is no signed update repository yet (spec §12) — install the freshly bui
 2. In PixInsight: **Process → Modules → Install Modules…**
 3. Point it at `integration/pixinsight/module/`, or select `mmm-pxm.so` directly.
 4. Restart PixInsight if prompted.
-5. Confirm **MosaicMerge** now appears under the **Mosaic** category in the
+5. Confirm **MegaMergeMosaic** now appears under the **Mosaic** category in the
    Process menu.
 
 A module signed with your local identity loads on your licensed machine(s); this
 is the whole dev-distribution story for now.
+
+### Process documentation
+
+The integrated documentation page lives in
+[`../doc/tools/MegaMergeMosaic/`](../doc/tools/MegaMergeMosaic/). Install it so
+the tool window's Browse Documentation button works:
+
+```sh
+sudo mkdir -p /opt/PixInsight/doc/tools/MegaMergeMosaic
+sudo cp ../doc/tools/MegaMergeMosaic/MegaMergeMosaic.html /opt/PixInsight/doc/tools/MegaMergeMosaic/
+```
+
+The distribution package (relocating to the Astrometrical website repo — see
+[`../repo/README.md`](../repo/README.md)) should ship this file the same way.
 
 ## Manual smoke test
 
@@ -205,26 +219,35 @@ used during development (see `.superpowers/sdd/2026-07-28-pixinsight-plan2b-pcl-
 for the full narrative); repeat it after any module rebuild before trusting a
 run:
 
-1. **Install** as above; confirm MosaicMerge appears under Mosaic.
+1. **Install** as above; confirm MegaMergeMosaic appears under Mosaic.
 2. **Aligned views** — open ≥2 registered full-canvas panels
-   (MosaicByCoordinates output) as views. Launch MosaicMerge, **Add Views…**,
-   pick a session directory, **Input = Auto**, Apply → a new blended
-   `ImageWindow` appears; the Console shows analyze/blend progress
-   percentages.
+   (MosaicByCoordinates output) as views. Launch MegaMergeMosaic, **Add Views…**,
+   set **Panel registration method = Auto**, leave the session directory empty
+   (it's in the collapsed **Advanced** section, alongside Band rows — empty
+   means an auto temp dir that's created for the run and removed on exit),
+   Apply → a new blended `ImageWindow` appears; the Process Console shows
+   analyze/blend progress bars for each stage.
 3. **Solved views** — open raw plate-solved panels as views (differing
-   geometry, each with an astrometric solution). `Input = Auto` (resolves to
-   Solved) or forced `Input = Solved`, pick a session directory, Apply → new
-   blended window. A view lacking a solution must yield a clear error and no
-   window.
-4. **Files mode** — switch to **Files**, **Add Files…** on-disk panels, pick a
-   session directory, Apply → new blended window.
-5. **Fault isolation** — start a run, then induce a worker failure (rename or
+   geometry, each with an astrometric solution). **Panel registration method
+   = Auto** (resolves to astrometric alignment) or forced **Align by
+   astrometric solution**, Apply → new blended window. A view lacking a
+   solution must yield a clear error and no window.
+4. **Files mode** — switch to **Files**, **Add Files…** on-disk panels, Apply
+   (session directory still optional, as above) → new blended window.
+5. **Session directory (optional, explicit)** — expand **Advanced**, set a
+   session directory to a path of your choosing, run a blend, and confirm the
+   directory is populated with the analysis cache and *not* removed
+   afterwards (unlike the auto temp dir in steps 2-4). Re-running with the
+   same inputs and directory should reuse the cached analysis stages.
+6. **Fault isolation** — start a run, then induce a worker failure (rename or
    delete `mmm-ipc-worker` before running, or kill it mid-run) → a clean
    PixInsight error dialog, **no partial window**, source views intact,
    PixInsight itself still alive.
-6. **Cancel/progress** — during a longer run, watch the `Progress` label
-   update and use the Console Abort (or the interface **Cancel** button) →
-   the run stops with a clean "cancelled" error and no output window.
+7. **Progress/cancel** — during a longer run, watch the per-stage
+   (Reprojecting/Analyzing/Blending) progress bars redraw in place in the
+   Process Console, and use the Process Console's own **Pause/Abort** button
+   (there is no separate interface Cancel button) → the run stops with a
+   clean "cancelled" error and no output window.
 
 ## Windows GUI validation (manual)
 
@@ -255,7 +278,7 @@ one on macOS, so the equivalent macOS check is deferred entirely — see
 3. **Install**: same as "Installing into PixInsight (dev flow)" above —
    Process → Modules → Install Modules… on the folder containing
    `mmm-pxm.dll` + `mmm-pxm.xsgn` + `mmm-ipc-worker.exe`, restart if prompted.
-4. **Confirm**: MosaicMerge appears under the Mosaic category and runs —
+4. **Confirm**: MegaMergeMosaic appears under the Mosaic category and runs —
    ideally repeat the same checklist as the Linux "Manual smoke test" above
    (aligned/solved/files modes, fault isolation, cancel).
 

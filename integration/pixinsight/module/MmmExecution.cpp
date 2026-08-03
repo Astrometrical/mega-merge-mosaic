@@ -16,7 +16,7 @@
 #endif
 
 #include <atomic>
-#include <cmath>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -35,9 +35,9 @@
 
 #include "AstrometryProps.h"
 #include "ImageWindowCollector.h"
-#include "MmmInterface.h"
 #include "MmmParameters.h"
 #include "MmmProcess.h"
+#include "MmmVersion.h"
 #include "ViewPanelSource.h"
 #include "mmm_host.h"
 #include "third_party/json.hpp"
@@ -49,8 +49,8 @@ using nlohmann::json;
 
 // ----------------------------------------------------------------------------
 // Module-scope state for cooperative cancellation. run_blend() publishes the
-// live host here for the duration of a run so request_cancel() (interface
-// Cancel button / Console abort) can reach it; both Host::cancel() and the
+// live host here for the duration of a run so the Console abort handler
+// (ConsoleProgress::on_progress) can reach it; both Host::cancel() and the
 // atomic pointer are safe to touch from another thread (mmm_host.h).
 // ----------------------------------------------------------------------------
 
@@ -69,13 +69,10 @@ struct Params
    Array<String> filePaths;
    pcl_enum      inputSelect;
    std::string   sessionDir;
-   float         feather;
+   int32         feather;
    pcl_enum      blendMode;
    int32         flatten;
    bool          flattenEnabled;
-   int32         roi[ 4 ];
-   bool          roiEnabled;
-   int32         downsample;
    bool          defectVeto;
    int32         surfaceOrder;
    int32         bandRows;
@@ -90,12 +87,12 @@ constexpr uint32_t kOutputSlots = 2;
 // --- Progress + cooperative abort ------------------------------------------
 //
 // The host invokes on_progress() synchronously on this (the ExecuteGlobal)
-// thread between worker frames, so it is safe to touch the Console and the
-// interface here. We echo a percentage to the Console, mirror it to the
-// interface's progress Label, pump the GUI event queue so a queued Cancel-
-// button click is delivered, and poll the Console's own Abort button; either
-// path calls Host::cancel(). This is the synchronous v1 (spec section 15): the
-// tool window is not repainted mid-run beyond ProcessEvents() pumps.
+// thread between worker frames, so it is safe to touch the Console here.
+// Progress is Console-only (the interface no longer mirrors it): we render an
+// in-place, single-line bar per stage, pump the GUI event queue so a queued
+// Cancel-button click is delivered, and poll the Console's own Abort button;
+// either path calls Host::cancel(). This is the synchronous v1 (spec section
+// 15): the tool window is not repainted mid-run beyond ProcessEvents() pumps.
 //
 // Deliberately NOT pursuing a pcl::Thread background-execution rewrite to make
 // the whole tool window interactive during the blend -- this was considered and
@@ -120,20 +117,62 @@ public:
 
    void on_progress( const std::string& stage, uint64_t done, uint64_t total ) override
    {
-      std::string msg = stage;
-      msg += ": ";
+      // Friendly stage names; fall back to the wire string verbatim.
+      String name;
+      if ( stage == "reproject" )    name = "Reprojecting";
+      else if ( stage == "analyze" ) name = "Analyzing";
+      else if ( stage == "blend" )   name = "Blending";
+      else                           name = String( stage.c_str() );
+
+      if ( name != m_stage )
+      {
+         // Commit the previous stage's line before starting a new one.
+         if ( !m_stage.IsEmpty() && m_lineLen > 0 )
+            CommitLine();
+         m_stage = name;
+         m_lastPercent = -1;
+         m_lineLen = 0;
+      }
+
       if ( total > 0 )
-         msg += std::to_string( 100 * done / total ) + "%";
+      {
+         int percent = int( 100*done/total );
+         if ( percent != m_lastPercent )
+         {
+            m_lastPercent = percent;
+            int fill = 24*percent/100;
+
+            // Visible glyphs, assembled separately from markup so the erase
+            // length can be counted exactly (tags/ANSI are zero-width).
+            IsoString name8 = IsoString( m_stage );
+            if ( name8.Length() < 13 )
+               name8.Append( ' ', 13 - name8.Length() );
+            IsoString bar;
+            bar.Append( '#', fill );
+            bar.Append( '-', 24 - fill );
+            IsoString pct = IsoString().Format( "%3d%%", percent );
+
+            String line = "<b>" + String( name8 ) + "</b> "
+                          "\x1b[38;2;42;149;171m[" + String( bar ) + "]\x1b[39m " + String( pct );
+            int visible = int( name8.Length() ) + 1 + 1 + 24 + 1 + 1 + int( pct.Length() );
+
+            Redraw( line, visible );
+            if ( percent == 100 )
+               CommitLine();
+         }
+      }
       else
-         msg += std::to_string( done );
+      {
+         IsoString name8 = IsoString( m_stage );
+         if ( name8.Length() < 13 )
+            name8.Append( ' ', 13 - name8.Length() );
+         IsoString count = IsoString().Format( "%llu", (unsigned long long)done );
+         Redraw( "<b>" + String( name8 ) + "</b> " + String( count ),
+                 int( name8.Length() ) + 1 + int( count.Length() ) );
+      }
 
-      String s( msg.c_str() );
-      m_console.WriteLn( s );
-      if ( TheMmmBlendInterface != nullptr )
-         TheMmmBlendInterface->SetProgressText( s );
-
-      // Deliver any pending interface events (e.g. a Cancel click) and surface
-      // a Console abort request; both drive the same cancellation path.
+      // Deliver pending GUI events and honor the Console's own abort button --
+      // this is the (only) cancellation path.
       Module->ProcessEvents();
       if ( m_console.AbortRequested() )
       {
@@ -144,8 +183,48 @@ public:
    }
 
 private:
+
    Console m_console;
+   String  m_stage;
+   int     m_lastPercent = -1;
+   int     m_lineLen = 0;   // visible glyphs currently on the in-progress line
+
+   // Erase the previously drawn glyphs with backspaces (the console's <bsp>
+   // deletes a glyph; <bol>+write inserts, so \r cannot be used), then draw.
+   // Invariant: between Redraw calls of a stage, this class owns the current
+   // console line; any other Console write in that window would be partially
+   // erased by the next call's backspaces.
+   void Redraw( const String& line, int visible )
+   {
+      String s = "<end>";
+      if ( m_lineLen > 0 )
+         s.Append( String( '\b', size_type( m_lineLen ) ) );
+      s += line;
+      m_console.Write( s );
+      m_lineLen = visible;
+   }
+
+   void CommitLine()
+   {
+      m_console.WriteLn();
+      m_lineLen = 0;
+   }
 };
+
+// Shameless branding at the start of every run: teal Astrometrical chevron +
+// name/version/tagline. ASCII only; ANSI truecolor for the teal.
+void WriteBanner()
+{
+   const String teal  = "\x1b[38;2;42;149;171m";
+   const String reset = "\x1b[39m";
+   Console c;
+   c.WriteLn( "<end><cbr>" );
+   c.WriteLn( teal + "     /\\" + reset );
+   c.WriteLn( teal + "    /  \\" + reset + "     <b>Mega Merge Mosaic</b> version " MMM_VERSION_STRING );
+   c.WriteLn( teal + "   / /\\ \\" + reset + "    Big mosaics, no big deal." );
+   c.WriteLn( teal + "  /_/  \\_\\" + reset + "   (c) 2026 Astrometrical | https://astrometrical.com" );
+   c.WriteLn();
+}
 
 // A PanelSource the worker never calls: Files mode reads panels off disk itself
 // (PROTOCOL.md section 11), so no BandRequest is ever issued.
@@ -177,7 +256,7 @@ String ModuleDirectory()
          return File::ExtractDrive( path ) + File::ExtractDirectory( path );
       }
    }
-   throw Error( "MosaicMerge: could not determine the module path via GetModuleFileNameW()." );
+   throw Error( "MegaMergeMosaic: could not determine the module path via GetModuleFileNameW()." );
 #else
    Dl_info info;
    if ( dladdr( reinterpret_cast<void*>( &run_blend ), &info ) != 0 && info.dli_fname != nullptr )
@@ -185,7 +264,7 @@ String ModuleDirectory()
       String path( info.dli_fname );
       return File::ExtractDrive( path ) + File::ExtractDirectory( path );
    }
-   throw Error( "MosaicMerge: could not determine the module path via dladdr()." );
+   throw Error( "MegaMergeMosaic: could not determine the module path via dladdr()." );
 #endif
 }
 
@@ -198,13 +277,13 @@ std::string ResolveWorkerPath()
 #ifdef _WIN32
    String worker = dir + "mmm-ipc-worker.exe";
    if ( !File::Exists( worker ) )
-      throw Error( "MosaicMerge: worker binary not found next to the module: " + worker +
+      throw Error( "MegaMergeMosaic: worker binary not found next to the module: " + worker +
                    "\nBuild it with `cargo build --release -p mmm-ipc-worker` and copy "
                    "`mmm-ipc-worker.exe` beside mmm-pxm.dll." );
 #else
    String worker = dir + "mmm-ipc-worker";
    if ( !File::Exists( worker ) )
-      throw Error( "MosaicMerge: worker binary not found next to the module: " + worker +
+      throw Error( "MegaMergeMosaic: worker binary not found next to the module: " + worker +
                    "\nBuild it with `cargo build --release -p mmm-ipc-worker` and copy "
                    "`mmm-ipc-worker` beside mmm-pxm.so." );
 #endif
@@ -234,22 +313,14 @@ const char* BlendModeWireString( pcl_enum v )
 }
 
 // Builds the BlendParamsWire object (PROTOCOL.md section 6) from the parameters.
-// Enforces the finite-float precondition on feather_px (the only float here).
 json BuildParams( const Params& in )
 {
-   if ( !std::isfinite( in.feather ) )
-      throw Error( "MosaicMerge: feather value is not finite." );
-
    json p;
    p["feather_px"]    = double( in.feather );
-   p["downsample"]    = uint32_t( in.downsample );
+   p["downsample"]    = uint32_t( 1 );   // parameter removed from UI; wire field is mandatory
    p["band_rows"]     = uint32_t( in.bandRows );
    p["mode"]          = BlendModeWireString( in.blendMode );
-   if ( in.roiEnabled )
-      p["roi"] = json::array( { uint64_t( uint32_t( in.roi[0] ) ), uint64_t( uint32_t( in.roi[1] ) ),
-                                uint64_t( uint32_t( in.roi[2] ) ), uint64_t( uint32_t( in.roi[3] ) ) } );
-   else
-      p["roi"] = nullptr;
+   p["roi"]           = nullptr;         // ROI removed from UI; wire field is mandatory
    p["defect_veto"]   = bool( in.defectVeto );
    if ( in.flattenEnabled )
       p["flatten"] = uint32_t( in.flatten );
@@ -271,13 +342,35 @@ std::string MakeShmName()
           + "-" + std::to_string( s_runCounter.fetch_add( 1 ) );
 }
 
-// Enable/disable the interface Cancel button around a run (best-effort; the
-// interface may not be open).
-void SetRunningUI( bool running )
+// Best-effort recursive removal of an auto-created temp session directory.
+// Only ever invoked on paths this module generated under the system temp dir;
+// user-specified session directories are never touched.
+void RemoveSessionDir( const std::string& dirUtf8 )
 {
-   if ( TheMmmBlendInterface != nullptr )
-      TheMmmBlendInterface->SetBlendRunning( running );
+   try
+   {
+      std::error_code ec;
+      std::filesystem::remove_all(
+         std::filesystem::path( reinterpret_cast<const char8_t*>( dirUtf8.c_str() ) ), ec );
+      // ec deliberately ignored: cleanup is best-effort (spec: item 5).
+   }
+   catch ( ... )
+   {
+      // Never let cleanup failure mask the run's real outcome.
+   }
 }
+
+// RAII: delete the auto temp session dir on every exit path of run_blend.
+struct AutoSessionDirGuard
+{
+   std::string dir;
+   bool        active = false;
+   ~AutoSessionDirGuard()
+   {
+      if ( active )
+         RemoveSessionDir( dir );
+   }
+};
 
 // Drives one fully-assembled job to completion and shows the output window on
 // success. Throws on any fault or cancellation, leaving no window shown.
@@ -297,7 +390,6 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    mmm::Host host( std::move( cfg ), source, collector, &prog );
    prog.host = &host;
    s_activeHost.store( &host );
-   SetRunningUI( true );
 
    try
    {
@@ -306,7 +398,6 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    catch ( ... )
    {
       s_activeHost.store( nullptr );
-      SetRunningUI( false );
       // Discard any partially-built (hidden, never-shown) output window so no
       // partial result lingers (spec section 9).
       if ( !collector.Window().IsNull() )
@@ -315,7 +406,6 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    }
 
    s_activeHost.store( nullptr );
-   SetRunningUI( false );
 
    if ( host.cancelled() )
    {
@@ -330,7 +420,7 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    // A run that completed (Done) without ever streaming a Begin/band leaves no
    // window -- surface that as a clean error rather than Show()ing a null window.
    if ( collector.Window().IsNull() )
-      throw Error( "MosaicMerge: the worker completed without producing an output image." );
+      throw Error( "MegaMergeMosaic: the worker completed without producing an output image." );
    collector.Window().Show();
 }
 
@@ -344,7 +434,7 @@ void RunViews( const Params& in, const std::string& worker_path )
    {
       View v = View::ViewById( id );
       if ( v.IsNull() )
-         throw Error( "MosaicMerge: input view not found: " + id );
+         throw Error( "MegaMergeMosaic: input view not found: " + id );
       views.Add( v );
    }
 
@@ -366,9 +456,9 @@ void RunViews( const Params& in, const std::string& worker_path )
       {
          const ImageVariant img = views[i].Image();
          if ( !img )
-            throw Error( "MosaicMerge: input view carries no image: " + views[i].FullId() );
+            throw Error( "MegaMergeMosaic: input view carries no image: " + views[i].FullId() );
          if ( img.IsComplexSample() )
-            throw Error( "MosaicMerge: complex images are not supported: " + views[i].FullId() );
+            throw Error( "MegaMergeMosaic: complex images are not supported: " + views[i].FullId() );
          const uint64_t w = uint64_t( img.Width() );
          const uint64_t h = uint64_t( img.Height() );
          const uint64_t c = uint64_t( img.NumberOfChannels() );
@@ -393,7 +483,7 @@ void RunViews( const Params& in, const std::string& worker_path )
       if ( solved )
          for ( size_type i = 0; i < views.Length(); ++i )
             if ( !views[i].Window().HasAstrometricSolution() )
-               throw Error( "MosaicMerge: solved mode requires an astrometric solution on every "
+               throw Error( "MegaMergeMosaic: solved mode requires an astrometric solution on every "
                             "view; this one has none: " + views[i].FullId() );
 
       const uint64_t ch        = cs[0];
@@ -444,7 +534,7 @@ void RunViews( const Params& in, const std::string& worker_path )
       else
       {
          if ( !uniform )
-            throw Error( "MosaicMerge: aligned mode requires all views to share the same "
+            throw Error( "MegaMergeMosaic: aligned mode requires all views to share the same "
                          "dimensions; use solved mode for unregistered panels." );
          init_body["mode"]   = "Aligned";
          init_body["canvas"] = { ws[0], hs[0], ch };
@@ -491,7 +581,7 @@ void RunFiles( const Params& in, const std::string& worker_path )
       FileFormatInstance file( format );
       ImageDescriptionArray images;
       if ( !file.Open( images, path ) || images.IsEmpty() )
-         throw Error( "MosaicMerge: cannot read image file: " + path );
+         throw Error( "MegaMergeMosaic: cannot read image file: " + path );
       const ImageInfo& info = images[0].info;
 
       // Read this file's astrometric solution, if the format carries one.
@@ -588,17 +678,17 @@ void RunFiles( const Params& in, const std::string& worker_path )
 
 void run_blend( MmmBlendInstance& in )
 {
+   WriteBanner();
+
    // 1. Validate: non-empty and a single input type (spec section 10.1).
    const bool haveViews = !in.p_viewIds.IsEmpty();
    const bool haveFiles = !in.p_filePaths.IsEmpty();
    if ( !haveViews && !haveFiles )
-      throw Error( "MosaicMerge: no input selected. Add at least two views or files." );
+      throw Error( "MegaMergeMosaic: no input selected. Add at least two views or files." );
    if ( haveViews && haveFiles )
-      throw Error( "MosaicMerge: mixed input. Select either views or files, not both." );
+      throw Error( "MegaMergeMosaic: mixed input. Select either views or files, not both." );
    if ( ( haveViews && in.p_viewIds.Length() < 2 ) || ( haveFiles && in.p_filePaths.Length() < 2 ) )
-      throw Error( "MosaicMerge: need at least two views or files to blend." );
-   if ( in.p_sessionDir.IsEmpty() )
-      throw Error( "MosaicMerge: select a session directory (the worker caches analysis there)." );
+      throw Error( "MegaMergeMosaic: need at least two views or files to blend." );
 
    const std::string worker_path = ResolveWorkerPath();
 
@@ -613,26 +703,40 @@ void run_blend( MmmBlendInstance& in )
    p.blendMode      = in.p_blendMode;
    p.flatten        = in.p_flatten;
    p.flattenEnabled = in.p_flattenEnabled;
-   p.roi[0]         = in.p_roi[0];
-   p.roi[1]         = in.p_roi[1];
-   p.roi[2]         = in.p_roi[2];
-   p.roi[3]         = in.p_roi[3];
-   p.roiEnabled     = in.p_roiEnabled;
-   p.downsample     = in.p_downsample;
    p.defectVeto     = in.p_defectVeto;
    p.surfaceOrder   = in.p_surfaceOrder;
    p.bandRows       = in.p_bandRows;
+
+   // Empty session dir (the default): run out of a fresh directory under the
+   // system temp dir and remove it afterwards, success or failure. A
+   // user-specified directory is used as-is and preserved (its cache makes
+   // re-runs with the same inputs resume completed analysis stages).
+   AutoSessionDirGuard sessionGuard;
+   if ( p.sessionDir.empty() )
+   {
+      String t = File::SystemTempDirectory();
+      if ( !t.EndsWith( '/' ) )
+         t += '/';
+      t += "mmm-session-" +
+           String( (unsigned long)
+#ifdef _WIN32
+                   ::GetCurrentProcessId()
+#else
+                   ::getpid()
+#endif
+                 ) + "-" + String( (unsigned long long) s_runCounter.fetch_add( 1 ) );
+      p.sessionDir      = std::string( t.ToUTF8().c_str() );
+      // Defend against a stale same-named dir left behind by a failed prior
+      // cleanup (e.g. after a module reload) being silently reused as cache.
+      RemoveSessionDir( p.sessionDir );
+      sessionGuard.dir    = p.sessionDir;
+      sessionGuard.active = true;
+   }
 
    if ( haveViews )
       RunViews( p, worker_path );
    else
       RunFiles( p, worker_path );
-}
-
-void request_cancel()
-{
-   if ( mmm::Host* h = s_activeHost.load() )
-      h->cancel();
 }
 
 // ----------------------------------------------------------------------------
