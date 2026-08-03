@@ -36,6 +36,7 @@
 #include "ImageWindowCollector.h"
 #include "MmmParameters.h"
 #include "MmmProcess.h"
+#include "MmmVersion.h"
 #include "ViewPanelSource.h"
 #include "mmm_host.h"
 #include "third_party/json.hpp"
@@ -125,10 +126,11 @@ public:
       if ( name != m_stage )
       {
          // Commit the previous stage's line before starting a new one.
-         if ( !m_stage.IsEmpty() )
-            m_console.WriteLn();
+         if ( !m_stage.IsEmpty() && m_lineLen > 0 )
+            CommitLine();
          m_stage = name;
          m_lastPercent = -1;
+         m_lineLen = 0;
       }
 
       if ( total > 0 )
@@ -137,21 +139,36 @@ public:
          if ( percent != m_lastPercent )
          {
             m_lastPercent = percent;
-            // 24-char bar in Astrometrical teal; \r rewrites the line in place.
             int fill = 24*percent/100;
-            String bar;
-            for ( int i = 0; i < 24; ++i )
-               bar += ( i < fill ) ? "#" : "-";
-            m_console.Write( String().Format(
-               "<end>\r<b>%-13s</b> \x1b[38;2;42;149;171m[%s]\x1b[39m %3d%%",
-               IsoString( m_stage ).c_str(), IsoString( bar ).c_str(), percent ) );
+
+            // Visible glyphs, assembled separately from markup so the erase
+            // length can be counted exactly (tags/ANSI are zero-width).
+            IsoString name8 = IsoString( m_stage );
+            if ( name8.Length() < 13 )
+               name8.Append( ' ', 13 - name8.Length() );
+            IsoString bar;
+            bar.Append( '#', fill );
+            bar.Append( '-', 24 - fill );
+            IsoString pct = IsoString().Format( "%3d%%", percent );
+
+            String line = "<b>" + String( name8 ) + "</b> "
+                          "\x1b[38;2;42;149;171m[" + String( bar ) + "]\x1b[39m " + String( pct );
+            int visible = int( name8.Length() ) + 1 + 1 + 24 + 1 + 1 + int( pct.Length() );
+
+            Redraw( line, visible );
             if ( percent == 100 )
-               m_console.WriteLn();
+               CommitLine();
          }
       }
       else
-         m_console.Write( String().Format( "<end>\r<b>%-13s</b> %llu",
-                                           IsoString( m_stage ).c_str(), (unsigned long long)done ) );
+      {
+         IsoString name8 = IsoString( m_stage );
+         if ( name8.Length() < 13 )
+            name8.Append( ' ', 13 - name8.Length() );
+         IsoString count = IsoString().Format( "%llu", (unsigned long long)done );
+         Redraw( "<b>" + String( name8 ) + "</b> " + String( count ),
+                 int( name8.Length() ) + 1 + int( count.Length() ) );
+      }
 
       // Deliver pending GUI events and honor the Console's own abort button --
       // this is the (only) cancellation path.
@@ -165,10 +182,45 @@ public:
    }
 
 private:
+
    Console m_console;
    String  m_stage;
    int     m_lastPercent = -1;
+   int     m_lineLen = 0;   // visible glyphs currently on the in-progress line
+
+   // Erase the previously drawn glyphs with backspaces (the console's <bsp>
+   // deletes a glyph; <bol>+write inserts, so \r cannot be used), then draw.
+   void Redraw( const String& line, int visible )
+   {
+      String s = "<end>";
+      if ( m_lineLen > 0 )
+         s.Append( String( '\b', size_type( m_lineLen ) ) );
+      s += line;
+      m_console.Write( s );
+      m_lineLen = visible;
+   }
+
+   void CommitLine()
+   {
+      m_console.WriteLn();
+      m_lineLen = 0;
+   }
 };
+
+// Shameless branding at the start of every run: teal Astrometrical chevron +
+// name/version/tagline. ASCII only; ANSI truecolor for the teal.
+void WriteBanner()
+{
+   const String teal  = "\x1b[38;2;42;149;171m";
+   const String reset = "\x1b[39m";
+   Console c;
+   c.WriteLn( "<end><cbr>" );
+   c.WriteLn( teal + "     /\\" + reset );
+   c.WriteLn( teal + "    /  \\" + reset + "     <b>Mega Merge Mosaic</b> version " MMM_VERSION_STRING );
+   c.WriteLn( teal + "   / /\\ \\" + reset + "    Big mosaics, no big deal." );
+   c.WriteLn( teal + "  /_/  \\_\\" + reset + "   (c) 2026 Astrometrical | https://astrometrical.com" );
+   c.WriteLn();
+}
 
 // A PanelSource the worker never calls: Files mode reads panels off disk itself
 // (PROTOCOL.md section 11), so no BandRequest is ever issued.
@@ -592,6 +644,8 @@ void RunFiles( const Params& in, const std::string& worker_path )
 
 void run_blend( MmmBlendInstance& in )
 {
+   WriteBanner();
+
    // 1. Validate: non-empty and a single input type (spec section 10.1).
    const bool haveViews = !in.p_viewIds.IsEmpty();
    const bool haveFiles = !in.p_filePaths.IsEmpty();
