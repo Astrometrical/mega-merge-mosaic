@@ -131,6 +131,11 @@ private:
       HorizontalSizer Flatten_Sizer;
       CheckBox        FlattenEnabled_CheckBox;
       SpinBox         FlattenOrder_SpinBox;
+
+      // --- Advanced section ---------------------------------------------------
+      SectionBar      Advanced_SectionBar;
+      Control         Advanced_Control;
+      VerticalSizer   Advanced_Sizer;
    };
 
    GUIData* GUI = nullptr;

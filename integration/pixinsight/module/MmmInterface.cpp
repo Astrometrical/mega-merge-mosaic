@@ -249,8 +249,11 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    SessionDir_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    SessionDir_Edit.OnEditCompleted( (Edit::edit_event_handler)&MmmBlendInterface::e_SessionDirEditCompleted, w );
-   SessionDir_Edit.SetToolTip( "<p>Directory where analysis is cached (a *.mmm-session folder). "
-      "Re-running with the same session directory reuses completed stages.</p>" );
+   SessionDir_Edit.SetToolTip( "<p>Optional working directory for the analysis cache "
+      "(a *.mmm-session folder).</p>"
+      "<p>Leave empty (default) to use a temporary directory that is removed automatically "
+      "when the run finishes. Set a directory to keep the cache: re-running with the same "
+      "directory and inputs resumes completed analysis stages.</p>" );
 
    SessionDir_ToolButton.SetIcon( Bitmap( w.ScaledResource( ":/browser/select-file.png" ) ) );
    SessionDir_ToolButton.SetScaledFixedSize( 20, 20 );
@@ -375,12 +378,10 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Flatten_Sizer.AddStretch();
 
    Parameters_Sizer.SetSpacing( 4 );
-   Parameters_Sizer.Add( SessionDir_Sizer );
    Parameters_Sizer.Add( InputSelect_Sizer );
    Parameters_Sizer.Add( BlendMode_Sizer );
    Parameters_Sizer.Add( Feather_NumericControl );
    Parameters_Sizer.Add( SurfaceOrder_Sizer );
-   Parameters_Sizer.Add( BandRows_Sizer );
    Parameters_Sizer.Add( DefectVeto_Sizer );
    Parameters_Sizer.Add( Flatten_Sizer );
    Parameters_Control.SetSizer( Parameters_Sizer );
@@ -388,6 +389,18 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Parameters_SectionBar.SetTitle( "Parameters" );
    Parameters_SectionBar.SetSection( Parameters_Control );
    Parameters_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
+
+   //
+   // Advanced section (collapsed by default).
+   //
+   Advanced_Sizer.SetSpacing( 4 );
+   Advanced_Sizer.Add( SessionDir_Sizer );
+   Advanced_Sizer.Add( BandRows_Sizer );
+   Advanced_Control.SetSizer( Advanced_Sizer );
+
+   Advanced_SectionBar.SetTitle( "Advanced" );
+   Advanced_SectionBar.SetSection( Advanced_Control );
+   Advanced_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
 
    //
    // Top-level layout.
@@ -399,8 +412,15 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Global_Sizer.Add( TargetFrames_Control );
    Global_Sizer.Add( Parameters_SectionBar );
    Global_Sizer.Add( Parameters_Control );
+   Global_Sizer.Add( Advanced_SectionBar );
+   Global_Sizer.Add( Advanced_Control );
 
    w.SetSizer( Global_Sizer );
+
+   // Start collapsed: HideSection() keeps the bar's own collapse/arrow state
+   // in sync (unlike calling Control::Hide() on the section directly).
+   Advanced_SectionBar.HideSection();
+
    w.EnsureLayoutUpdated();
    w.AdjustToContents();
 }

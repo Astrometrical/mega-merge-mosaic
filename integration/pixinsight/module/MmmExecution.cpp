@@ -16,6 +16,7 @@
 #endif
 
 #include <atomic>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -338,6 +339,36 @@ std::string MakeShmName()
           + "-" + std::to_string( s_runCounter.fetch_add( 1 ) );
 }
 
+// Best-effort recursive removal of an auto-created temp session directory.
+// Only ever invoked on paths this module generated under the system temp dir;
+// user-specified session directories are never touched.
+void RemoveSessionDir( const std::string& dirUtf8 )
+{
+   try
+   {
+      std::error_code ec;
+      std::filesystem::remove_all(
+         std::filesystem::path( reinterpret_cast<const char8_t*>( dirUtf8.c_str() ) ), ec );
+      // ec deliberately ignored: cleanup is best-effort (spec: item 5).
+   }
+   catch ( ... )
+   {
+      // Never let cleanup failure mask the run's real outcome.
+   }
+}
+
+// RAII: delete the auto temp session dir on every exit path of run_blend.
+struct AutoSessionDirGuard
+{
+   std::string dir;
+   bool        active = false;
+   ~AutoSessionDirGuard()
+   {
+      if ( active )
+         RemoveSessionDir( dir );
+   }
+};
+
 // Drives one fully-assembled job to completion and shows the output window on
 // success. Throws on any fault or cancellation, leaving no window shown.
 void DriveHost( const std::string& worker_path, json init_body, const std::string& shm_name,
@@ -655,8 +686,6 @@ void run_blend( MmmBlendInstance& in )
       throw Error( "MegaMergeMosaic: mixed input. Select either views or files, not both." );
    if ( ( haveViews && in.p_viewIds.Length() < 2 ) || ( haveFiles && in.p_filePaths.Length() < 2 ) )
       throw Error( "MegaMergeMosaic: need at least two views or files to blend." );
-   if ( in.p_sessionDir.IsEmpty() )
-      throw Error( "MegaMergeMosaic: select a session directory (the worker caches analysis there)." );
 
    const std::string worker_path = ResolveWorkerPath();
 
@@ -674,6 +703,29 @@ void run_blend( MmmBlendInstance& in )
    p.defectVeto     = in.p_defectVeto;
    p.surfaceOrder   = in.p_surfaceOrder;
    p.bandRows       = in.p_bandRows;
+
+   // Empty session dir (the default): run out of a fresh directory under the
+   // system temp dir and remove it afterwards, success or failure. A
+   // user-specified directory is used as-is and preserved (its cache makes
+   // re-runs with the same inputs resume completed analysis stages).
+   AutoSessionDirGuard sessionGuard;
+   if ( p.sessionDir.empty() )
+   {
+      String t = File::SystemTempDirectory();
+      if ( !t.EndsWith( '/' ) )
+         t += '/';
+      t += "mmm-session-" +
+           String( (unsigned long)
+#ifdef _WIN32
+                   ::GetCurrentProcessId()
+#else
+                   ::getpid()
+#endif
+                 ) + "-" + String( (unsigned long long) s_runCounter.fetch_add( 1 ) );
+      p.sessionDir      = std::string( t.ToUTF8().c_str() );
+      sessionGuard.dir    = p.sessionDir;
+      sessionGuard.active = true;
+   }
 
    if ( haveViews )
       RunViews( p, worker_path );
