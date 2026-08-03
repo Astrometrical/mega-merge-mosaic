@@ -27,8 +27,10 @@
 #include <pcl/ProcessInterface.h>
 #include <pcl/PushButton.h>
 #include <pcl/RadioButton.h>
+#include <pcl/SectionBar.h>
 #include <pcl/Sizer.h>
 #include <pcl/SpinBox.h>
+#include <pcl/ToolButton.h>
 #include <pcl/TreeBox.h>
 
 #include "MmmProcess.h"
@@ -77,56 +79,55 @@ private:
 
       VerticalSizer   Global_Sizer;
 
-      // --- Input source: Views vs Files toggle -------------------------------
-      GroupBox        InputSource_GroupBox;
-      VerticalSizer   InputSource_Sizer;
+      // --- Header notice: logo + title/tagline/copyright ---------------------
+      Control         Notice_Control;
+      HorizontalSizer Notice_Sizer;
+      Control         Logo_Control;          // paints the chevron bitmap
+      VerticalSizer   NoticeText_Sizer;
+      Label           Title_Label;
+      Label           Tagline_Label;
+      Label           Copyright_Label;
+      Bitmap          Logo_Bitmap;           // rendered from MMM_CHEVRON_SVG
+
+      // --- Target Frames section --------------------------------------------
+      SectionBar      TargetFrames_SectionBar;
+      Control         TargetFrames_Control;
+      VerticalSizer   TargetFrames_Sizer;
       HorizontalSizer InputMode_Sizer;
       RadioButton     ViewsMode_RadioButton;
       RadioButton     FilesMode_RadioButton;
-
-      VerticalSizer   Views_Sizer;
       TreeBox         Views_TreeBox;
       HorizontalSizer ViewButtons_Sizer;
       PushButton      AddViews_PushButton;
       PushButton      RemoveView_PushButton;
-
-      VerticalSizer   Files_Sizer;
       TreeBox         Files_TreeBox;
       HorizontalSizer FileButtons_Sizer;
       PushButton      AddFiles_PushButton;
       PushButton      RemoveFile_PushButton;
 
-      // --- Session directory --------------------------------------------------
+      // --- Parameters section ------------------------------------------------
+      SectionBar      Parameters_SectionBar;
+      Control         Parameters_Control;
+      VerticalSizer   Parameters_Sizer;
       HorizontalSizer SessionDir_Sizer;
       Label           SessionDir_Label;
       Edit            SessionDir_Edit;
-      PushButton      SessionDir_PushButton;
-
-      // --- Input override ------------------------------------------------------
+      ToolButton      SessionDir_ToolButton;
       HorizontalSizer InputSelect_Sizer;
       Label           InputSelect_Label;
       ComboBox        InputSelect_ComboBox;
-
-      // --- Blend parameters -----------------------------------------------------
-      GroupBox        BlendParams_GroupBox;
-      VerticalSizer   BlendParams_Sizer;
-
       HorizontalSizer BlendMode_Sizer;
       Label           BlendMode_Label;
       ComboBox        BlendMode_ComboBox;
-
       NumericControl  Feather_NumericControl;
-
       HorizontalSizer SurfaceOrder_Sizer;
       Label           SurfaceOrder_Label;
       SpinBox         SurfaceOrder_SpinBox;
-
       HorizontalSizer BandRows_Sizer;
       Label           BandRows_Label;
       SpinBox         BandRows_SpinBox;
-
+      HorizontalSizer DefectVeto_Sizer;
       CheckBox        DefectVeto_CheckBox;
-
       HorizontalSizer Flatten_Sizer;
       CheckBox        FlattenEnabled_CheckBox;
       SpinBox         FlattenOrder_SpinBox;
@@ -171,6 +172,11 @@ private:
    void e_DefectVetoClick( Button& sender, bool checked );
    void e_FlattenEnabledClick( Button& sender, bool checked );
    void e_FlattenOrderValueUpdated( SpinBox& sender, int value );
+
+   void e_ToggleSection( SectionBar& sender, Control& section, bool start );
+   void e_NoticeMouseRelease( Control& sender, const pcl::Point& pos,
+                              int button, unsigned buttons, unsigned modifiers );
+   void e_LogoPaint( Control& sender, const pcl::Rect& updateRect );
 };
 
 /*!

@@ -19,10 +19,15 @@
 #include "MmmInterface.h"
 #include "MmmExecution.h"
 #include "MmmIcon.h"
+#include "MmmVersion.h"
 
 #include <pcl/Array.h>
+#include <pcl/Cursor.h>
+#include <pcl/ExternalProcess.h>
 #include <pcl/FileDialog.h>
+#include <pcl/Graphics.h>
 #include <pcl/MultiViewSelectionDialog.h>
+#include <pcl/StringList.h>
 #include <pcl/View.h>
 
 namespace pcl
@@ -127,7 +132,37 @@ IsoString MmmBlendInterface::IconImageSVG() const
 MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 {
    //
-   // Input source: Views / Files toggle + the two list widgets.
+   // Header notice: chevron logo + title / tagline / copyright, in the style
+   // of the MosaicByCoordinates script header.
+   //
+   Logo_Bitmap = Bitmap( MMM_CHEVRON_SVG, sizeof( MMM_CHEVRON_SVG ) - 1, "SVG" );
+
+   Logo_Control.SetScaledFixedSize( 40, 40 );
+   Logo_Control.OnPaint( (Control::paint_event_handler)&MmmBlendInterface::e_LogoPaint, w );
+
+   Title_Label.SetText( "Mega Merge Mosaic version " MMM_VERSION_STRING );
+   Title_Label.SetStyleSheet( w.ScaledStyleSheet( "QLabel { font-weight: bold; }" ) );
+
+   Tagline_Label.SetText( "Big mosaics, no big deal." );
+
+   Copyright_Label.SetText( "Copyright (c) 2026 Astrometrical | astrometrical.com" );
+   Copyright_Label.SetToolTip( "<p>Visit https://astrometrical.com</p>" );
+   Copyright_Label.SetCursor( StdCursor::PointingHand );
+   Copyright_Label.OnMouseRelease( (Control::mouse_button_event_handler)&MmmBlendInterface::e_NoticeMouseRelease, w );
+
+   NoticeText_Sizer.SetSpacing( 2 );
+   NoticeText_Sizer.Add( Title_Label );
+   NoticeText_Sizer.Add( Tagline_Label );
+   NoticeText_Sizer.Add( Copyright_Label );
+
+   Notice_Sizer.SetMargin( 6 );
+   Notice_Sizer.SetSpacing( 8 );
+   Notice_Sizer.Add( Logo_Control );
+   Notice_Sizer.Add( NoticeText_Sizer, 100 );
+   Notice_Control.SetSizer( Notice_Sizer );
+
+   //
+   // Target Frames section.
    //
    ViewsMode_RadioButton.SetText( "Views" );
    ViewsMode_RadioButton.SetChecked();
@@ -144,9 +179,9 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Views_TreeBox.SetNumberOfColumns( 1 );
    Views_TreeBox.SetHeaderText( 0, "View Id" );
    Views_TreeBox.EnableMultipleSelections();
-   Views_TreeBox.SetScaledMinHeight( 100 );
+   Views_TreeBox.SetScaledMinSize( 400, 120 );
 
-   AddViews_PushButton.SetText( "Add Views…" );
+   AddViews_PushButton.SetText( "Add Views..." );
    AddViews_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_AddViewsClick, w );
 
    RemoveView_PushButton.SetText( "Remove" );
@@ -157,16 +192,12 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    ViewButtons_Sizer.Add( RemoveView_PushButton );
    ViewButtons_Sizer.AddStretch();
 
-   Views_Sizer.SetSpacing( 4 );
-   Views_Sizer.Add( Views_TreeBox );
-   Views_Sizer.Add( ViewButtons_Sizer );
-
    Files_TreeBox.SetNumberOfColumns( 1 );
    Files_TreeBox.SetHeaderText( 0, "File Path" );
    Files_TreeBox.EnableMultipleSelections();
-   Files_TreeBox.SetScaledMinHeight( 100 );
+   Files_TreeBox.SetScaledMinSize( 400, 120 );
 
-   AddFiles_PushButton.SetText( "Add Files…" );
+   AddFiles_PushButton.SetText( "Add Files..." );
    AddFiles_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_AddFilesClick, w );
 
    RemoveFile_PushButton.SetText( "Remove" );
@@ -177,32 +208,33 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    FileButtons_Sizer.Add( RemoveFile_PushButton );
    FileButtons_Sizer.AddStretch();
 
-   Files_Sizer.SetSpacing( 4 );
-   Files_Sizer.Add( Files_TreeBox );
-   Files_Sizer.Add( FileButtons_Sizer );
+   TargetFrames_Sizer.SetSpacing( 4 );
+   TargetFrames_Sizer.Add( InputMode_Sizer );
+   TargetFrames_Sizer.Add( Views_TreeBox );
+   TargetFrames_Sizer.Add( ViewButtons_Sizer );
+   TargetFrames_Sizer.Add( Files_TreeBox );
+   TargetFrames_Sizer.Add( FileButtons_Sizer );
+   TargetFrames_Control.SetSizer( TargetFrames_Sizer );
 
-   InputSource_Sizer.SetSpacing( 6 );
-   InputSource_Sizer.Add( InputMode_Sizer );
-   InputSource_Sizer.Add( Views_Sizer );
-   InputSource_Sizer.Add( Files_Sizer );
-
-   InputSource_GroupBox.SetTitle( "Input Source" );
-   InputSource_GroupBox.SetSizer( InputSource_Sizer );
+   TargetFrames_SectionBar.SetTitle( "Target Frames" );
+   TargetFrames_SectionBar.SetSection( TargetFrames_Control );
+   TargetFrames_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
 
    //
-   // Session directory.
+   // Parameters section.
    //
    SessionDir_Label.SetText( "Session directory:" );
 
    SessionDir_Edit.OnEditCompleted( (Edit::edit_event_handler)&MmmBlendInterface::e_SessionDirEditCompleted, w );
 
-   SessionDir_PushButton.SetText( "…" );
-   SessionDir_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SessionDirBrowseClick, w );
+   SessionDir_ToolButton.SetIcon( Bitmap( w.ScaledResource( ":/browser/select-file.png" ) ) );
+   SessionDir_ToolButton.SetScaledFixedSize( 20, 20 );
+   SessionDir_ToolButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SessionDirBrowseClick, w );
 
-   SessionDir_Sizer.SetSpacing( 6 );
+   SessionDir_Sizer.SetSpacing( 4 );
    SessionDir_Sizer.Add( SessionDir_Label );
    SessionDir_Sizer.Add( SessionDir_Edit, 100 );
-   SessionDir_Sizer.Add( SessionDir_PushButton );
+   SessionDir_Sizer.Add( SessionDir_ToolButton );
 
    //
    // Input override (advanced): Auto / Aligned / Solved.
@@ -242,7 +274,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Feather_NumericControl.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_FeatherValueUpdated, w );
 
    SurfaceOrder_Label.SetText( "Surface fit order:" );
-   SurfaceOrder_SpinBox.SetRange( 0, 8 );
+   SurfaceOrder_SpinBox.SetRange( 0, 2 );
    SurfaceOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_SurfaceOrderValueUpdated, w );
 
    SurfaceOrder_Sizer.SetSpacing( 6 );
@@ -262,10 +294,13 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    DefectVeto_CheckBox.SetText( "Cross-panel defect veto" );
    DefectVeto_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_DefectVetoClick, w );
 
+   DefectVeto_Sizer.Add( DefectVeto_CheckBox );
+   DefectVeto_Sizer.AddStretch();
+
    FlattenEnabled_CheckBox.SetText( "Flatten background, order:" );
    FlattenEnabled_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_FlattenEnabledClick, w );
 
-   FlattenOrder_SpinBox.SetRange( 0, 8 );
+   FlattenOrder_SpinBox.SetRange( 1, 2 );
    FlattenOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_FlattenOrderValueUpdated, w );
 
    Flatten_Sizer.SetSpacing( 6 );
@@ -273,29 +308,92 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Flatten_Sizer.Add( FlattenOrder_SpinBox );
    Flatten_Sizer.AddStretch();
 
-   BlendParams_Sizer.SetSpacing( 6 );
-   BlendParams_Sizer.Add( BlendMode_Sizer );
-   BlendParams_Sizer.Add( Feather_NumericControl );
-   BlendParams_Sizer.Add( SurfaceOrder_Sizer );
-   BlendParams_Sizer.Add( BandRows_Sizer );
-   BlendParams_Sizer.Add( DefectVeto_CheckBox );
-   BlendParams_Sizer.Add( Flatten_Sizer );
+   Parameters_Sizer.SetSpacing( 4 );
+   Parameters_Sizer.Add( SessionDir_Sizer );
+   Parameters_Sizer.Add( InputSelect_Sizer );
+   Parameters_Sizer.Add( BlendMode_Sizer );
+   Parameters_Sizer.Add( Feather_NumericControl );
+   Parameters_Sizer.Add( SurfaceOrder_Sizer );
+   Parameters_Sizer.Add( BandRows_Sizer );
+   Parameters_Sizer.Add( DefectVeto_Sizer );
+   Parameters_Sizer.Add( Flatten_Sizer );
+   Parameters_Control.SetSizer( Parameters_Sizer );
 
-   BlendParams_GroupBox.SetTitle( "Blend Parameters" );
-   BlendParams_GroupBox.SetSizer( BlendParams_Sizer );
+   Parameters_SectionBar.SetTitle( "Parameters" );
+   Parameters_SectionBar.SetSection( Parameters_Control );
+   Parameters_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
 
    //
    // Top-level layout.
    //
    Global_Sizer.SetMargin( 8 );
-   Global_Sizer.SetSpacing( 8 );
-   Global_Sizer.Add( InputSource_GroupBox );
-   Global_Sizer.Add( SessionDir_Sizer );
-   Global_Sizer.Add( InputSelect_Sizer );
-   Global_Sizer.Add( BlendParams_GroupBox );
+   Global_Sizer.SetSpacing( 6 );
+   Global_Sizer.Add( Notice_Control );
+   Global_Sizer.Add( TargetFrames_SectionBar );
+   Global_Sizer.Add( TargetFrames_Control );
+   Global_Sizer.Add( Parameters_SectionBar );
+   Global_Sizer.Add( Parameters_Control );
 
    w.SetSizer( Global_Sizer );
+   w.EnsureLayoutUpdated();
    w.AdjustToContents();
+}
+
+// ----------------------------------------------------------------------------
+// Header notice: logo paint + copyright link.
+// ----------------------------------------------------------------------------
+
+void MmmBlendInterface::e_LogoPaint( Control& sender, const pcl::Rect& )
+{
+   Graphics g( sender );
+   if ( !GUI->Logo_Bitmap.IsNull() )
+      g.DrawScaledBitmap( sender.BoundsRect(), GUI->Logo_Bitmap );
+}
+
+void MmmBlendInterface::e_NoticeMouseRelease( Control&, const pcl::Point&, int button, unsigned, unsigned )
+{
+   if ( button != MouseButton::Left )
+      return;
+   try
+   {
+#ifdef _WIN32
+      ExternalProcess::StartProgram( "cmd.exe", StringList() << "/c" << "start" << "https://astrometrical.com" );
+#elif defined( __APPLE__ )
+      ExternalProcess::StartProgram( "open", StringList() << "https://astrometrical.com" );
+#else
+      ExternalProcess::StartProgram( "xdg-open", StringList() << "https://astrometrical.com" );
+#endif
+   }
+   catch ( ... )
+   {
+      // Non-fatal: the URL is visible in the label text anyway.
+   }
+}
+
+// ----------------------------------------------------------------------------
+// SectionBar toggle: fix tree box heights while animating, restore afterwards,
+// and let the window shrink when a section closes.
+// ----------------------------------------------------------------------------
+
+void MmmBlendInterface::e_ToggleSection( SectionBar&, Control& section, bool start )
+{
+   if ( start )
+   {
+      GUI->Views_TreeBox.SetFixedHeight();
+      GUI->Files_TreeBox.SetFixedHeight();
+   }
+   else
+   {
+      GUI->Views_TreeBox.SetScaledMinHeight( 120 );
+      GUI->Views_TreeBox.SetMaxHeight( int_max );
+      GUI->Files_TreeBox.SetScaledMinHeight( 120 );
+      GUI->Files_TreeBox.SetMaxHeight( int_max );
+      if ( GUI->TargetFrames_Control.IsVisible() )
+         SetVariableHeight();
+      else
+         SetFixedHeight();
+      AdjustToContents();
+   }
 }
 
 // ----------------------------------------------------------------------------
@@ -329,13 +427,18 @@ void MmmBlendInterface::UpdateControls()
 
 void MmmBlendInterface::UpdateInputModeControls()
 {
-   GUI->Views_TreeBox.Enable( m_viewsMode );
-   GUI->AddViews_PushButton.Enable( m_viewsMode );
-   GUI->RemoveView_PushButton.Enable( m_viewsMode );
+   // Show only the active side's list; hiding (not disabling) matches the
+   // reference tools and keeps the window compact.
+   GUI->Views_TreeBox.SetVisible( m_viewsMode );
+   GUI->AddViews_PushButton.SetVisible( m_viewsMode );
+   GUI->RemoveView_PushButton.SetVisible( m_viewsMode );
 
-   GUI->Files_TreeBox.Enable( !m_viewsMode );
-   GUI->AddFiles_PushButton.Enable( !m_viewsMode );
-   GUI->RemoveFile_PushButton.Enable( !m_viewsMode );
+   GUI->Files_TreeBox.SetVisible( !m_viewsMode );
+   GUI->AddFiles_PushButton.SetVisible( !m_viewsMode );
+   GUI->RemoveFile_PushButton.SetVisible( !m_viewsMode );
+
+   EnsureLayoutUpdated();
+   AdjustToContents();
 }
 
 void MmmBlendInterface::UpdateFlattenControls()
