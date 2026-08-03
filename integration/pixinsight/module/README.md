@@ -197,6 +197,20 @@ There is no signed update repository yet (spec §12) — install the freshly bui
 A module signed with your local identity loads on your licensed machine(s); this
 is the whole dev-distribution story for now.
 
+### Process documentation
+
+The integrated documentation page lives in
+[`../doc/tools/MegaMergeMosaic/`](../doc/tools/MegaMergeMosaic/). Install it so
+the tool window's Browse Documentation button works:
+
+```sh
+sudo mkdir -p /opt/PixInsight/doc/tools/MegaMergeMosaic
+sudo cp ../doc/tools/MegaMergeMosaic/MegaMergeMosaic.html /opt/PixInsight/doc/tools/MegaMergeMosaic/
+```
+
+The distribution package (relocating to the Astrometrical website repo — see
+[`../repo/README.md`](../repo/README.md)) should ship this file the same way.
+
 ## Manual smoke test
 
 The module is PCL/PixInsight code, so its behavior can only be verified
