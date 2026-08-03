@@ -18,6 +18,7 @@
 
 #include "MmmInterface.h"
 #include "MmmExecution.h"
+#include "MmmIcon.h"
 
 #include <pcl/Array.h>
 #include <pcl/FileDialog.h>
@@ -112,6 +113,11 @@ bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*
 
    dynamic = false;
    return true;
+}
+
+IsoString MmmBlendInterface::IconImageSVG() const
+{
+   return MMM_PROCESS_ICON_SVG;
 }
 
 // ----------------------------------------------------------------------------

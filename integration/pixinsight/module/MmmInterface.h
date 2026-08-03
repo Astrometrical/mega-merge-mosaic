@@ -62,6 +62,7 @@ public:
    bool                   ImportProcess( const ProcessImplementation& ) override;
    bool                   Launch( const MetaProcess&, const ProcessImplementation*,
                                   bool& dynamic, unsigned& flags ) override;
+   IsoString              IconImageSVG() const override;
 
    // Task 5 run-state hooks, called from the ExecuteGlobal orchestration
    // (MmmExecution.cpp). Both are no-ops if the control tree is not built yet.

@@ -2,6 +2,7 @@
 
 #include "MmmProcess.h"
 #include "MmmExecution.h"
+#include "MmmIcon.h"
 #include "MmmInterface.h"
 #include "MmmParameters.h"
 
@@ -76,6 +77,11 @@ bool MmmBlendProcess::PrefersGlobalExecution() const
 ProcessInterface* MmmBlendProcess::DefaultInterface() const
 {
    return TheMmmBlendInterface;
+}
+
+IsoString MmmBlendProcess::IconImageSVG() const
+{
+   return MMM_PROCESS_ICON_SVG;
 }
 
 // ----------------------------------------------------------------------------

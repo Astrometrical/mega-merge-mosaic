@@ -47,6 +47,7 @@ public:
    bool                   CanProcessViews() const override;
    bool                   PrefersGlobalExecution() const override;
    ProcessInterface*      DefaultInterface() const override;
+   IsoString              IconImageSVG() const override;
 };
 
 /*!
