@@ -230,20 +230,10 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    BlendMode_Sizer.Add( BlendMode_ComboBox );
    BlendMode_Sizer.AddStretch();
 
-   Feather_NumericControl.label.SetText( "Feather (px):" );
-   Feather_NumericControl.SetReal();
-   Feather_NumericControl.SetPrecision( 2 );
-   Feather_NumericControl.SetRange( 0, 100000 );
+   Feather_NumericControl.label.SetText( "Feather:" );
+   Feather_NumericControl.SetInteger();
+   Feather_NumericControl.SetRange( 1, 1024 );
    Feather_NumericControl.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_FeatherValueUpdated, w );
-
-   Downsample_Label.SetText( "Downsample:" );
-   Downsample_SpinBox.SetRange( 1, 64 );
-   Downsample_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_DownsampleValueUpdated, w );
-
-   Downsample_Sizer.SetSpacing( 6 );
-   Downsample_Sizer.Add( Downsample_Label );
-   Downsample_Sizer.Add( Downsample_SpinBox );
-   Downsample_Sizer.AddStretch();
 
    SurfaceOrder_Label.SetText( "Surface fit order:" );
    SurfaceOrder_SpinBox.SetRange( 0, 8 );
@@ -277,48 +267,13 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Flatten_Sizer.Add( FlattenOrder_SpinBox );
    Flatten_Sizer.AddStretch();
 
-   RoiEnabled_CheckBox.SetText( "Region of interest" );
-   RoiEnabled_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_RoiEnabledClick, w );
-
-   RoiX0_NumericEdit.label.SetText( "x0:" );
-   RoiX0_NumericEdit.SetInteger();
-   RoiX0_NumericEdit.SetRange( 0, int32_max );
-   RoiX0_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiY0_NumericEdit.label.SetText( "y0:" );
-   RoiY0_NumericEdit.SetInteger();
-   RoiY0_NumericEdit.SetRange( 0, int32_max );
-   RoiY0_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiX1_NumericEdit.label.SetText( "x1:" );
-   RoiX1_NumericEdit.SetInteger();
-   RoiX1_NumericEdit.SetRange( 0, int32_max );
-   RoiX1_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiY1_NumericEdit.label.SetText( "y1:" );
-   RoiY1_NumericEdit.SetInteger();
-   RoiY1_NumericEdit.SetRange( 0, int32_max );
-   RoiY1_NumericEdit.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_RoiValueUpdated, w );
-
-   RoiFields_Sizer.SetSpacing( 6 );
-   RoiFields_Sizer.Add( RoiX0_NumericEdit );
-   RoiFields_Sizer.Add( RoiY0_NumericEdit );
-   RoiFields_Sizer.Add( RoiX1_NumericEdit );
-   RoiFields_Sizer.Add( RoiY1_NumericEdit );
-
-   Roi_Sizer.SetSpacing( 4 );
-   Roi_Sizer.Add( RoiEnabled_CheckBox );
-   Roi_Sizer.Add( RoiFields_Sizer );
-
    BlendParams_Sizer.SetSpacing( 6 );
    BlendParams_Sizer.Add( BlendMode_Sizer );
    BlendParams_Sizer.Add( Feather_NumericControl );
-   BlendParams_Sizer.Add( Downsample_Sizer );
    BlendParams_Sizer.Add( SurfaceOrder_Sizer );
    BlendParams_Sizer.Add( BandRows_Sizer );
    BlendParams_Sizer.Add( DefectVeto_CheckBox );
    BlendParams_Sizer.Add( Flatten_Sizer );
-   BlendParams_Sizer.Add( Roi_Sizer );
 
    BlendParams_GroupBox.SetTitle( "Blend Parameters" );
    BlendParams_GroupBox.SetSizer( BlendParams_Sizer );
@@ -372,7 +327,6 @@ void MmmBlendInterface::UpdateControls()
    GUI->BlendMode_ComboBox.SetCurrentItem( m_instance.p_blendMode );
 
    GUI->Feather_NumericControl.SetValue( m_instance.p_feather );
-   GUI->Downsample_SpinBox.SetValue( m_instance.p_downsample );
    GUI->SurfaceOrder_SpinBox.SetValue( m_instance.p_surfaceOrder );
    GUI->BandRows_SpinBox.SetValue( m_instance.p_bandRows );
 
@@ -381,13 +335,6 @@ void MmmBlendInterface::UpdateControls()
    GUI->FlattenEnabled_CheckBox.SetChecked( m_instance.p_flattenEnabled );
    GUI->FlattenOrder_SpinBox.SetValue( m_instance.p_flatten );
    UpdateFlattenControls();
-
-   GUI->RoiEnabled_CheckBox.SetChecked( m_instance.p_roiEnabled );
-   GUI->RoiX0_NumericEdit.SetValue( m_instance.p_roi[0] );
-   GUI->RoiY0_NumericEdit.SetValue( m_instance.p_roi[1] );
-   GUI->RoiX1_NumericEdit.SetValue( m_instance.p_roi[2] );
-   GUI->RoiY1_NumericEdit.SetValue( m_instance.p_roi[3] );
-   UpdateRoiControls();
 }
 
 void MmmBlendInterface::UpdateInputModeControls()
@@ -404,15 +351,6 @@ void MmmBlendInterface::UpdateInputModeControls()
 void MmmBlendInterface::UpdateFlattenControls()
 {
    GUI->FlattenOrder_SpinBox.Enable( m_instance.p_flattenEnabled );
-}
-
-void MmmBlendInterface::UpdateRoiControls()
-{
-   bool e = m_instance.p_roiEnabled;
-   GUI->RoiX0_NumericEdit.Enable( e );
-   GUI->RoiY0_NumericEdit.Enable( e );
-   GUI->RoiX1_NumericEdit.Enable( e );
-   GUI->RoiY1_NumericEdit.Enable( e );
 }
 
 void MmmBlendInterface::PopulateViewsTreeBox()
@@ -584,12 +522,7 @@ void MmmBlendInterface::e_BlendModeItemSelected( ComboBox&, int itemIndex )
 
 void MmmBlendInterface::e_FeatherValueUpdated( NumericEdit&, double value )
 {
-   m_instance.p_feather = float( value );
-}
-
-void MmmBlendInterface::e_DownsampleValueUpdated( SpinBox&, int value )
-{
-   m_instance.p_downsample = int32( value );
+   m_instance.p_feather = int32( value );
 }
 
 void MmmBlendInterface::e_SurfaceOrderValueUpdated( SpinBox&, int value )
@@ -616,25 +549,6 @@ void MmmBlendInterface::e_FlattenEnabledClick( Button&, bool checked )
 void MmmBlendInterface::e_FlattenOrderValueUpdated( SpinBox&, int value )
 {
    m_instance.p_flatten = int32( value );
-}
-
-void MmmBlendInterface::e_RoiEnabledClick( Button&, bool checked )
-{
-   m_instance.p_roiEnabled = checked;
-   UpdateRoiControls();
-}
-
-void MmmBlendInterface::e_RoiValueUpdated( NumericEdit& sender, double value )
-{
-   int32 v = int32( value );
-   if ( &sender == &GUI->RoiX0_NumericEdit )
-      m_instance.p_roi[0] = v;
-   else if ( &sender == &GUI->RoiY0_NumericEdit )
-      m_instance.p_roi[1] = v;
-   else if ( &sender == &GUI->RoiX1_NumericEdit )
-      m_instance.p_roi[2] = v;
-   else if ( &sender == &GUI->RoiY1_NumericEdit )
-      m_instance.p_roi[3] = v;
 }
 
 void MmmBlendInterface::e_CancelClick( Button&, bool )

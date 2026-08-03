@@ -94,13 +94,10 @@ private:
    Array<String> p_filePaths;       // filePaths table rows (file paths)
    pcl_enum      p_inputSelect;     // Auto / Aligned / Solved
    String        p_sessionDir;      // *.mmm-session directory
-   float         p_feather;         // feather ramp length, canvas px
+   int32         p_feather;         // feather ramp length, canvas px
    pcl_enum      p_blendMode;       // Feather / TwoBand / Pyramid
    int32         p_flatten;         // background-flatten polynomial order
    pcl_bool      p_flattenEnabled;  // whether flatten is applied
-   int32         p_roi[ 4 ];        // ROI [x0,y0,x1,y1], full-res canvas coords
-   pcl_bool      p_roiEnabled;      // whether the ROI is applied
-   int32         p_downsample;      // 1 = full res, 8 = L8 preview
    pcl_bool      p_defectVeto;      // cross-panel defect veto
    int32         p_surfaceOrder;    // analyze surface-fit order
    int32         p_bandRows;        // output band granularity, rows

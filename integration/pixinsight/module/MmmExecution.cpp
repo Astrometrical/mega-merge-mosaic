@@ -69,13 +69,10 @@ struct Params
    Array<String> filePaths;
    pcl_enum      inputSelect;
    std::string   sessionDir;
-   float         feather;
+   int32         feather;
    pcl_enum      blendMode;
    int32         flatten;
    bool          flattenEnabled;
-   int32         roi[ 4 ];
-   bool          roiEnabled;
-   int32         downsample;
    bool          defectVeto;
    int32         surfaceOrder;
    int32         bandRows;
@@ -234,22 +231,14 @@ const char* BlendModeWireString( pcl_enum v )
 }
 
 // Builds the BlendParamsWire object (PROTOCOL.md section 6) from the parameters.
-// Enforces the finite-float precondition on feather_px (the only float here).
 json BuildParams( const Params& in )
 {
-   if ( !std::isfinite( in.feather ) )
-      throw Error( "MosaicMerge: feather value is not finite." );
-
    json p;
    p["feather_px"]    = double( in.feather );
-   p["downsample"]    = uint32_t( in.downsample );
+   p["downsample"]    = uint32_t( 1 );   // parameter removed from UI; wire field is mandatory
    p["band_rows"]     = uint32_t( in.bandRows );
    p["mode"]          = BlendModeWireString( in.blendMode );
-   if ( in.roiEnabled )
-      p["roi"] = json::array( { uint64_t( uint32_t( in.roi[0] ) ), uint64_t( uint32_t( in.roi[1] ) ),
-                                uint64_t( uint32_t( in.roi[2] ) ), uint64_t( uint32_t( in.roi[3] ) ) } );
-   else
-      p["roi"] = nullptr;
+   p["roi"]           = nullptr;         // ROI removed from UI; wire field is mandatory
    p["defect_veto"]   = bool( in.defectVeto );
    if ( in.flattenEnabled )
       p["flatten"] = uint32_t( in.flatten );
@@ -613,12 +602,6 @@ void run_blend( MmmBlendInstance& in )
    p.blendMode      = in.p_blendMode;
    p.flatten        = in.p_flatten;
    p.flattenEnabled = in.p_flattenEnabled;
-   p.roi[0]         = in.p_roi[0];
-   p.roi[1]         = in.p_roi[1];
-   p.roi[2]         = in.p_roi[2];
-   p.roi[3]         = in.p_roi[3];
-   p.roiEnabled     = in.p_roiEnabled;
-   p.downsample     = in.p_downsample;
    p.defectVeto     = in.p_defectVeto;
    p.surfaceOrder   = in.p_surfaceOrder;
    p.bandRows       = in.p_bandRows;

@@ -120,10 +120,6 @@ private:
 
       NumericControl  Feather_NumericControl;
 
-      HorizontalSizer Downsample_Sizer;
-      Label           Downsample_Label;
-      SpinBox         Downsample_SpinBox;
-
       HorizontalSizer SurfaceOrder_Sizer;
       Label           SurfaceOrder_Label;
       SpinBox         SurfaceOrder_SpinBox;
@@ -137,14 +133,6 @@ private:
       HorizontalSizer Flatten_Sizer;
       CheckBox        FlattenEnabled_CheckBox;
       SpinBox         FlattenOrder_SpinBox;
-
-      VerticalSizer   Roi_Sizer;
-      CheckBox        RoiEnabled_CheckBox;
-      HorizontalSizer RoiFields_Sizer;
-      NumericEdit     RoiX0_NumericEdit;
-      NumericEdit     RoiY0_NumericEdit;
-      NumericEdit     RoiX1_NumericEdit;
-      NumericEdit     RoiY1_NumericEdit;
 
       // --- Progress / cancel ------------------------------------------------------
       GroupBox        Progress_GroupBox;
@@ -168,7 +156,6 @@ private:
    void UpdateControls();
    void UpdateInputModeControls();
    void UpdateFlattenControls();
-   void UpdateRoiControls();
    void PopulateViewsTreeBox();
    void PopulateFilesTreeBox();
 
@@ -187,16 +174,12 @@ private:
    void e_BlendModeItemSelected( ComboBox& sender, int itemIndex );
 
    void e_FeatherValueUpdated( NumericEdit& sender, double value );
-   void e_DownsampleValueUpdated( SpinBox& sender, int value );
    void e_SurfaceOrderValueUpdated( SpinBox& sender, int value );
    void e_BandRowsValueUpdated( SpinBox& sender, int value );
 
    void e_DefectVetoClick( Button& sender, bool checked );
    void e_FlattenEnabledClick( Button& sender, bool checked );
    void e_FlattenOrderValueUpdated( SpinBox& sender, int value );
-
-   void e_RoiEnabledClick( Button& sender, bool checked );
-   void e_RoiValueUpdated( NumericEdit& sender, double value );
 
    void e_CancelClick( Button& sender, bool checked );
 };

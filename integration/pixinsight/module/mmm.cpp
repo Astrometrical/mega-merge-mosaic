@@ -95,12 +95,6 @@ PCL_MODULE_EXPORT pcl::int32 InstallPixInsightModule( pcl::int32 mode )
       TheMmmBlendModeParameter     = new MmmBlendModeParameter( TheMmmBlendProcess );
       TheMmmFlattenParameter       = new MmmFlattenParameter( TheMmmBlendProcess );
       TheMmmFlattenEnabledParameter = new MmmFlattenEnabledParameter( TheMmmBlendProcess );
-      TheMmmRoiX0Parameter         = new MmmRoiX0Parameter( TheMmmBlendProcess );
-      TheMmmRoiY0Parameter         = new MmmRoiY0Parameter( TheMmmBlendProcess );
-      TheMmmRoiX1Parameter         = new MmmRoiX1Parameter( TheMmmBlendProcess );
-      TheMmmRoiY1Parameter         = new MmmRoiY1Parameter( TheMmmBlendProcess );
-      TheMmmRoiEnabledParameter    = new MmmRoiEnabledParameter( TheMmmBlendProcess );
-      TheMmmDownsampleParameter    = new MmmDownsampleParameter( TheMmmBlendProcess );
       TheMmmDefectVetoParameter    = new MmmDefectVetoParameter( TheMmmBlendProcess );
       TheMmmSurfaceOrderParameter  = new MmmSurfaceOrderParameter( TheMmmBlendProcess );
       TheMmmBandRowsParameter      = new MmmBandRowsParameter( TheMmmBlendProcess );
