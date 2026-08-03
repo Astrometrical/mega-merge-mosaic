@@ -1,10 +1,11 @@
-// MmmProcess.cpp -- implementation of the trivial MergeMosaic process/instance.
+// MmmProcess.cpp -- implementation of the trivial MegaMergeMosaic process/instance.
 
 #include "MmmProcess.h"
 #include "MmmExecution.h"
 #include "MmmIcon.h"
 #include "MmmInterface.h"
 #include "MmmParameters.h"
+#include "MmmVersion.h"
 
 #include <exception>
 
@@ -43,7 +44,7 @@ IsoString MmmBlendProcess::Categories() const
 
 uint32 MmmBlendProcess::Version() const
 {
-   return 0x100;   // 1.0.0
+   return ( MMM_VERSION_MAJOR << 8 ) | ( MMM_VERSION_MINOR << 4 ) | MMM_VERSION_REVISION;
 }
 
 String MmmBlendProcess::Description() const

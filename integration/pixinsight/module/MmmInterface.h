@@ -1,4 +1,4 @@
-// MmmInterface.h -- MergeMosaic ProcessInterface (Task 3: full control tree).
+// MmmInterface.h -- MegaMergeMosaic ProcessInterface (Task 3: full control tree).
 //
 // MmmBlendInterface is a static (non-dynamic), global-context, instance-
 // generating ProcessInterface: it owns a private MmmBlendInstance (m_instance)
@@ -18,10 +18,10 @@
 #ifndef __MmmInterface_h
 #define __MmmInterface_h
 
+#include <pcl/Bitmap.h>
 #include <pcl/CheckBox.h>
 #include <pcl/ComboBox.h>
 #include <pcl/Edit.h>
-#include <pcl/GroupBox.h>
 #include <pcl/Label.h>
 #include <pcl/NumericControl.h>
 #include <pcl/ProcessInterface.h>
@@ -65,7 +65,6 @@ public:
    bool                   Launch( const MetaProcess&, const ProcessImplementation*,
                                   bool& dynamic, unsigned& flags ) override;
    IsoString              IconImageSVG() const override;
-
 
 private:
 
@@ -180,7 +179,7 @@ private:
 };
 
 /*!
- * \brief The MergeMosaic interface singleton.
+ * \brief The MegaMergeMosaic interface singleton.
  *
  * Instantiated once by InstallPixInsightModule(); non-owning global handle.
  */

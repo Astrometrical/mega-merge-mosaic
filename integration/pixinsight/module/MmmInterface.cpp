@@ -1,4 +1,4 @@
-// MmmInterface.cpp -- MergeMosaic ProcessInterface implementation (Task 3).
+// MmmInterface.cpp -- MegaMergeMosaic ProcessInterface implementation (Task 3).
 //
 // Builds the real control tree (deferred-init GUIData, per PCL_API_REFERENCE.md
 // section 4) and wires every control to the interface's private working
@@ -343,7 +343,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
       "in overlap regions by cross-checking panels during the detail blend.</p>" );
 
    DefectVeto_Sizer.SetSpacing( 4 );
-   DefectVeto_Sizer.AddSpacing( labelWidth1 + 4 );
+   DefectVeto_Sizer.AddUnscaledSpacing( labelWidth1 + w.LogicalPixelsToPhysical( 4 ) );
    DefectVeto_Sizer.Add( DefectVeto_CheckBox );
    DefectVeto_Sizer.AddStretch();
 
@@ -358,7 +358,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    FlattenOrder_SpinBox.SetToolTip( "<p>Background-flatten polynomial order: 1 = plane, 2 = quadratic.</p>" );
 
    Flatten_Sizer.SetSpacing( 4 );
-   Flatten_Sizer.AddSpacing( labelWidth1 + 4 );
+   Flatten_Sizer.AddUnscaledSpacing( labelWidth1 + w.LogicalPixelsToPhysical( 4 ) );
    Flatten_Sizer.Add( FlattenEnabled_CheckBox );
    Flatten_Sizer.Add( FlattenOrder_SpinBox );
    Flatten_Sizer.AddStretch();
@@ -412,7 +412,7 @@ void MmmBlendInterface::e_NoticeMouseRelease( Control&, const pcl::Point&, int b
    try
    {
 #ifdef _WIN32
-      ExternalProcess::StartProgram( "cmd.exe", StringList() << "/c" << "start" << "https://astrometrical.com" );
+      ExternalProcess::StartProgram( "cmd.exe", StringList() << "/c" << "start" << "" << "https://astrometrical.com" );
 #elif defined( __APPLE__ )
       ExternalProcess::StartProgram( "open", StringList() << "https://astrometrical.com" );
 #else

@@ -1,7 +1,7 @@
-# mmm-pxm — MergeMosaic PixInsight module
+# mmm-pxm — MegaMergeMosaic PixInsight module
 
 The PCL `Process`/`ProcessInterface` wrapper around the [`../host`](../host)
-transport library: a thin **Mosaic → MosaicMerge** process that drives
+transport library: a thin **Mosaic → MegaMergeMosaic** process that drives
 `mmm-ipc-worker` over shared memory from inside PixInsight, using the same
 byte-exact analyze/blend pipeline as the `mmm` CLI. It is PixInsight-only code
 (depends on `libPCL-pxi.a` and PCL headers); the transport it wraps
@@ -93,7 +93,7 @@ cargo build --release -p mmm-ipc-worker
 cp target/release/mmm-ipc-worker integration/pixinsight/module/
 ```
 
-If the worker binary is missing, `MosaicMerge` reports a clear PixInsight
+If the worker binary is missing, `MegaMergeMosaic` reports a clear PixInsight
 error at execute time rather than failing silently or hanging.
 
 ## macOS and Windows builds
@@ -191,7 +191,7 @@ There is no signed update repository yet (spec §12) — install the freshly bui
 2. In PixInsight: **Process → Modules → Install Modules…**
 3. Point it at `integration/pixinsight/module/`, or select `mmm-pxm.so` directly.
 4. Restart PixInsight if prompted.
-5. Confirm **MosaicMerge** now appears under the **Mosaic** category in the
+5. Confirm **MegaMergeMosaic** now appears under the **Mosaic** category in the
    Process menu.
 
 A module signed with your local identity loads on your licensed machine(s); this
@@ -219,9 +219,9 @@ used during development (see `.superpowers/sdd/2026-07-28-pixinsight-plan2b-pcl-
 for the full narrative); repeat it after any module rebuild before trusting a
 run:
 
-1. **Install** as above; confirm MosaicMerge appears under Mosaic.
+1. **Install** as above; confirm MegaMergeMosaic appears under Mosaic.
 2. **Aligned views** — open ≥2 registered full-canvas panels
-   (MosaicByCoordinates output) as views. Launch MosaicMerge, **Add Views…**,
+   (MosaicByCoordinates output) as views. Launch MegaMergeMosaic, **Add Views…**,
    pick a session directory, **Input = Auto**, Apply → a new blended
    `ImageWindow` appears; the Console shows analyze/blend progress
    percentages.
@@ -269,7 +269,7 @@ one on macOS, so the equivalent macOS check is deferred entirely — see
 3. **Install**: same as "Installing into PixInsight (dev flow)" above —
    Process → Modules → Install Modules… on the folder containing
    `mmm-pxm.dll` + `mmm-pxm.xsgn` + `mmm-ipc-worker.exe`, restart if prompted.
-4. **Confirm**: MosaicMerge appears under the Mosaic category and runs —
+4. **Confirm**: MegaMergeMosaic appears under the Mosaic category and runs —
    ideally repeat the same checklist as the Linux "Manual smoke test" above
    (aligned/solved/files modes, fault isolation, cancel).
 

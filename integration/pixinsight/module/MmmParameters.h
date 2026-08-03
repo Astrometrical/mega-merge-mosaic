@@ -1,7 +1,7 @@
 // MmmParameters.h -- MetaParameter singletons for MmmBlendProcess (Task 2).
 //
 // Each class below is a formal, per-process metadata description of one
-// scriptable/serializable parameter of the MergeMosaic blend process. They
+// scriptable/serializable parameter of the MegaMergeMosaic blend process. They
 // carry NO per-instance value: actual values live in MmmBlendInstance as
 // ordinary C++ members and are exposed to the core through the five
 // LockParameter/AllocateParameter/ParameterLength/... hooks, dispatched by

@@ -1,4 +1,4 @@
-// MmmExecution.h -- ExecuteGlobal orchestration for the MergeMosaic blend (Task 5).
+// MmmExecution.h -- ExecuteGlobal orchestration for the MegaMergeMosaic blend (Task 5).
 //
 // run_blend() implements spec section 10.1's execution flow: validate the
 // selection, resolve the effective JobMode, build the ordered PanelDescs and

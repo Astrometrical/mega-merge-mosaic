@@ -1,4 +1,4 @@
-// MmmProcess.h -- MergeMosaic global-context process + instance (Task 1: trivial skeleton).
+// MmmProcess.h -- MegaMergeMosaic global-context process + instance (Task 1: trivial skeleton).
 //
 // MmmBlendProcess is a pure global-context MetaProcess (no target view); its
 // instance, MmmBlendInstance, currently executes as a no-op (ExecuteGlobal()
@@ -25,7 +25,7 @@ namespace pcl
 
 /*!
  * \class MmmBlendProcess
- * \brief Meta-object for the MergeMosaic global-context blend process.
+ * \brief Meta-object for the MegaMergeMosaic global-context blend process.
  *
  * Registers itself under the module singleton on construction (MetaObject
  * parent = pcl::Module). Global-only: CanProcessViews() is false and
@@ -51,7 +51,7 @@ public:
 };
 
 /*!
- * \brief The MergeMosaic process meta-object singleton.
+ * \brief The MegaMergeMosaic process meta-object singleton.
  *
  * Instantiated once by InstallPixInsightModule(); non-owning global handle used
  * by the interface and instance code.

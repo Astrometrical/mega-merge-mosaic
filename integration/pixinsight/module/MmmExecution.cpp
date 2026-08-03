@@ -16,7 +16,6 @@
 #endif
 
 #include <atomic>
-#include <cmath>
 #include <string>
 #include <vector>
 

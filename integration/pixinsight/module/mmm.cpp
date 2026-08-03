@@ -1,4 +1,4 @@
-// mmm.cpp -- MergeMosaic PixInsight module (MmmModule) + installation entry point.
+// mmm.cpp -- MegaMergeMosaic PixInsight module (MmmModule) + installation entry point.
 //
 // Per PCL_API_REFERENCE.md section 1: the three module entry points have C
 // linkage and are free functions, not members of MetaModule. PixInsight's own
@@ -25,7 +25,7 @@ namespace pcl
 
 /*!
  * \class MmmModule
- * \brief The MergeMosaic module meta-object (tree root).
+ * \brief The MegaMergeMosaic module meta-object (tree root).
  */
 class MmmModule : public MetaModule
 {
