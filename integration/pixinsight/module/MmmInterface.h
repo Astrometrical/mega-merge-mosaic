@@ -62,6 +62,7 @@ public:
    InterfaceFeatures      Features() const override;
    ProcessImplementation* NewProcess() const override;
    bool                   ImportProcess( const ProcessImplementation& ) override;
+   void                   ResetInstance() override;
    bool                   Launch( const MetaProcess&, const ProcessImplementation*,
                                   bool& dynamic, unsigned& flags ) override;
    IsoString              IconImageSVG() const override;

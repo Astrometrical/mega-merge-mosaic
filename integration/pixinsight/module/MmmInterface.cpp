@@ -101,6 +101,14 @@ bool MmmBlendInterface::ImportProcess( const ProcessImplementation& p )
    return true;
 }
 
+void MmmBlendInterface::ResetInstance()
+{
+   // The control bar's Reset button. Import a default-constructed instance;
+   // ImportProcess() re-derives the Views/Files mode and refreshes controls.
+   MmmBlendInstance defaultInstance( TheMmmBlendProcess );
+   ImportProcess( defaultInstance );
+}
+
 bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*,
                                  bool& dynamic, unsigned& /*flags*/ )
 {
@@ -131,7 +139,7 @@ IsoString MmmBlendInterface::IconImageSVG() const
 
 MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 {
-   int labelWidth1 = w.Font().Width( String( "Flatten background, order:" ) + 'M' );
+   int labelWidth1 = w.Font().Width( String( "Panel registration method:" ) + 'M' );
    int editWidth1  = w.Font().Width( String( '0', 8 ) );
 
    //
@@ -258,20 +266,21 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    // Input override (advanced): Auto / Aligned / Solved.
    // Element order MUST match MmmInputSelectParameter (Auto=0/Aligned=1/Solved=2).
    //
-   InputSelect_Label.SetText( "Input:" );
+   InputSelect_Label.SetText( "Panel registration method:" );
    InputSelect_Label.SetFixedWidth( labelWidth1 );
    InputSelect_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    InputSelect_ComboBox.AddItem( "Auto" );
-   InputSelect_ComboBox.AddItem( "Aligned" );
-   InputSelect_ComboBox.AddItem( "Solved" );
+   InputSelect_ComboBox.AddItem( "Pre-aligned (MosaicByCoordinates)" );
+   InputSelect_ComboBox.AddItem( "Align by astrometric solution" );
    InputSelect_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_InputSelectItemSelected, w );
    InputSelect_ComboBox.SetMinWidth( editWidth1*2 );
-   InputSelect_ComboBox.SetToolTip( "<p>How the input panels are interpreted:</p>"
-      "<p><b>Auto</b> - panels with identical dimensions are treated as registered full-canvas panels; "
-      "otherwise they are treated as plate-solved panels and reprojected.</p>"
-      "<p><b>Aligned</b> - force registered full-canvas panels (all inputs must share the same dimensions).</p>"
-      "<p><b>Solved</b> - force reprojection from each panel's astrometric solution.</p>" );
+   InputSelect_ComboBox.SetToolTip( "<p>How panels are placed on the output canvas:</p>"
+      "<p><b>Auto</b> - detect the correct mode automatically from the inputs.</p>"
+      "<p><b>Pre-aligned (MosaicByCoordinates)</b> - panels are registered full-canvas frames "
+      "sharing the same dimensions (e.g. MosaicByCoordinates output); blend them directly.</p>"
+      "<p><b>Align by astrometric solution</b> - reproject each panel onto a common frame "
+      "using its astrometric solution (every panel must be plate-solved).</p>" );
 
    InputSelect_Sizer.SetSpacing( 4 );
    InputSelect_Sizer.Add( InputSelect_Label );
@@ -309,14 +318,15 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Feather_NumericControl.SetToolTip( "<p>Feather ramp length in canvas pixels (1-1024). "
       "Larger values give smoother low-frequency transitions across panel overlaps.</p>" );
 
-   SurfaceOrder_Label.SetText( "Surface fit order:" );
+   SurfaceOrder_Label.SetText( "Gradient fit order:" );
    SurfaceOrder_Label.SetFixedWidth( labelWidth1 );
    SurfaceOrder_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
    SurfaceOrder_SpinBox.SetRange( 0, 2 );
    SurfaceOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_SurfaceOrderValueUpdated, w );
    SurfaceOrder_SpinBox.SetFixedWidth( editWidth1 );
-   SurfaceOrder_SpinBox.SetToolTip( "<p>Polynomial order (0-2) of the per-panel surface fit used to match "
-      "panel backgrounds: 0 = constant offset, 1 = plane, 2 = quadratic (default).</p>" );
+   SurfaceOrder_SpinBox.SetToolTip( "<p>Polynomial order (0-2) of the per-panel gradient fit used "
+      "to match panel backgrounds before blending: 0 = constant offset, 1 = plane, "
+      "2 = quadratic (default).</p>" );
 
    SurfaceOrder_Sizer.SetSpacing( 4 );
    SurfaceOrder_Sizer.Add( SurfaceOrder_Label );
@@ -347,15 +357,16 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    DefectVeto_Sizer.Add( DefectVeto_CheckBox );
    DefectVeto_Sizer.AddStretch();
 
-   FlattenEnabled_CheckBox.SetText( "Flatten background, order:" );
+   FlattenEnabled_CheckBox.SetText( "Gradient removal, order:" );
    FlattenEnabled_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_FlattenEnabledClick, w );
-   FlattenEnabled_CheckBox.SetToolTip( "<p>Remove a global background gradient from the merged result, "
-      "fitting a polynomial of the chosen order (1 or 2). The central background level is preserved.</p>" );
+   FlattenEnabled_CheckBox.SetToolTip( "<p>Remove the residual global background gradient from the "
+      "merged result, fitting a polynomial of the chosen order. The central background level "
+      "is preserved.</p>" );
 
    FlattenOrder_SpinBox.SetRange( 1, 2 );
    FlattenOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_FlattenOrderValueUpdated, w );
    FlattenOrder_SpinBox.SetFixedWidth( editWidth1 );
-   FlattenOrder_SpinBox.SetToolTip( "<p>Background-flatten polynomial order: 1 = plane, 2 = quadratic.</p>" );
+   FlattenOrder_SpinBox.SetToolTip( "<p>Gradient removal polynomial order: 1 = plane, 2 = quadratic.</p>" );
 
    Flatten_Sizer.SetSpacing( 4 );
    Flatten_Sizer.AddUnscaledSpacing( labelWidth1 + w.LogicalPixelsToPhysical( 4 ) );
