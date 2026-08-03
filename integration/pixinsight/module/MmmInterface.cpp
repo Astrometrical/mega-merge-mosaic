@@ -131,6 +131,9 @@ IsoString MmmBlendInterface::IconImageSVG() const
 
 MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 {
+   int labelWidth1 = w.Font().Width( String( "Flatten background, order:" ) + 'M' );
+   int editWidth1  = w.Font().Width( String( '0', 8 ) );
+
    //
    // Header notice: chevron logo + title / tagline / copyright, in the style
    // of the MosaicByCoordinates script header.
@@ -167,9 +170,11 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    ViewsMode_RadioButton.SetText( "Views" );
    ViewsMode_RadioButton.SetChecked();
    ViewsMode_RadioButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ModeClick, w );
+   ViewsMode_RadioButton.SetToolTip( "<p>Blend image views that are open in the current PixInsight workspace.</p>" );
 
    FilesMode_RadioButton.SetText( "Files" );
    FilesMode_RadioButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ModeClick, w );
+   FilesMode_RadioButton.SetToolTip( "<p>Blend image files read directly from disk, without opening them as views.</p>" );
 
    InputMode_Sizer.SetSpacing( 8 );
    InputMode_Sizer.Add( ViewsMode_RadioButton );
@@ -180,12 +185,16 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Views_TreeBox.SetHeaderText( 0, "View Id" );
    Views_TreeBox.EnableMultipleSelections();
    Views_TreeBox.SetScaledMinSize( 400, 120 );
+   Views_TreeBox.SetToolTip( "<p>The mosaic panels to merge. All panels must belong to the same mosaic: "
+      "registered full-canvas panels (e.g. MosaicByCoordinates output) or plate-solved panels.</p>" );
 
    AddViews_PushButton.SetText( "Add Views..." );
    AddViews_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_AddViewsClick, w );
+   AddViews_PushButton.SetToolTip( "<p>Add open views as mosaic panels.</p>" );
 
    RemoveView_PushButton.SetText( "Remove" );
    RemoveView_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_RemoveViewClick, w );
+   RemoveView_PushButton.SetToolTip( "<p>Remove the selected views from the list.</p>" );
 
    ViewButtons_Sizer.SetSpacing( 6 );
    ViewButtons_Sizer.Add( AddViews_PushButton );
@@ -196,12 +205,16 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Files_TreeBox.SetHeaderText( 0, "File Path" );
    Files_TreeBox.EnableMultipleSelections();
    Files_TreeBox.SetScaledMinSize( 400, 120 );
+   Files_TreeBox.SetToolTip( "<p>The mosaic panel files to merge. All panels must belong to the same mosaic: "
+      "registered full-canvas panels (e.g. MosaicByCoordinates output) or plate-solved panels.</p>" );
 
    AddFiles_PushButton.SetText( "Add Files..." );
    AddFiles_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_AddFilesClick, w );
+   AddFiles_PushButton.SetToolTip( "<p>Add image files as mosaic panels.</p>" );
 
    RemoveFile_PushButton.SetText( "Remove" );
    RemoveFile_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_RemoveFileClick, w );
+   RemoveFile_PushButton.SetToolTip( "<p>Remove the selected files from the list.</p>" );
 
    FileButtons_Sizer.SetSpacing( 6 );
    FileButtons_Sizer.Add( AddFiles_PushButton );
@@ -224,12 +237,17 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    // Parameters section.
    //
    SessionDir_Label.SetText( "Session directory:" );
+   SessionDir_Label.SetFixedWidth( labelWidth1 );
+   SessionDir_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    SessionDir_Edit.OnEditCompleted( (Edit::edit_event_handler)&MmmBlendInterface::e_SessionDirEditCompleted, w );
+   SessionDir_Edit.SetToolTip( "<p>Directory where analysis is cached (a *.mmm-session folder). "
+      "Re-running with the same session directory reuses completed stages.</p>" );
 
    SessionDir_ToolButton.SetIcon( Bitmap( w.ScaledResource( ":/browser/select-file.png" ) ) );
    SessionDir_ToolButton.SetScaledFixedSize( 20, 20 );
    SessionDir_ToolButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SessionDirBrowseClick, w );
+   SessionDir_ToolButton.SetToolTip( "<p>Select the session directory.</p>" );
 
    SessionDir_Sizer.SetSpacing( 4 );
    SessionDir_Sizer.Add( SessionDir_Label );
@@ -241,13 +259,21 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    // Element order MUST match MmmInputSelectParameter (Auto=0/Aligned=1/Solved=2).
    //
    InputSelect_Label.SetText( "Input:" );
+   InputSelect_Label.SetFixedWidth( labelWidth1 );
+   InputSelect_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    InputSelect_ComboBox.AddItem( "Auto" );
    InputSelect_ComboBox.AddItem( "Aligned" );
    InputSelect_ComboBox.AddItem( "Solved" );
    InputSelect_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_InputSelectItemSelected, w );
+   InputSelect_ComboBox.SetMinWidth( editWidth1*2 );
+   InputSelect_ComboBox.SetToolTip( "<p>How the input panels are interpreted:</p>"
+      "<p><b>Auto</b> — panels with identical dimensions are treated as registered full-canvas panels; "
+      "otherwise they are treated as plate-solved panels and reprojected.</p>"
+      "<p><b>Aligned</b> — force registered full-canvas panels (all inputs must share the same dimensions).</p>"
+      "<p><b>Solved</b> — force reprojection from each panel's astrometric solution.</p>" );
 
-   InputSelect_Sizer.SetSpacing( 6 );
+   InputSelect_Sizer.SetSpacing( 4 );
    InputSelect_Sizer.Add( InputSelect_Label );
    InputSelect_Sizer.Add( InputSelect_ComboBox );
    InputSelect_Sizer.AddStretch();
@@ -256,54 +282,83 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    // Blend parameters.
    //
    BlendMode_Label.SetText( "Blend mode:" );
+   BlendMode_Label.SetFixedWidth( labelWidth1 );
+   BlendMode_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
 
    // Element order MUST match MmmBlendModeParameter (Feather=0/TwoBand=1/Pyramid=2).
    BlendMode_ComboBox.AddItem( "Feather" );
    BlendMode_ComboBox.AddItem( "TwoBand" );
    BlendMode_ComboBox.AddItem( "Pyramid" );
    BlendMode_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_BlendModeItemSelected, w );
+   BlendMode_ComboBox.SetMinWidth( editWidth1*2 );
+   BlendMode_ComboBox.SetToolTip( "<p><b>Feather</b> — weighted-average ramp across the overlap.</p>"
+      "<p><b>TwoBand</b> — low frequencies feathered, high frequencies seam-cut.</p>"
+      "<p><b>Pyramid</b> — full multiband blend; best quality (default).</p>" );
 
-   BlendMode_Sizer.SetSpacing( 6 );
+   BlendMode_Sizer.SetSpacing( 4 );
    BlendMode_Sizer.Add( BlendMode_Label );
    BlendMode_Sizer.Add( BlendMode_ComboBox );
    BlendMode_Sizer.AddStretch();
 
    Feather_NumericControl.label.SetText( "Feather:" );
+   Feather_NumericControl.label.SetFixedWidth( labelWidth1 );
+   Feather_NumericControl.edit.SetFixedWidth( editWidth1 );
    Feather_NumericControl.SetInteger();
    Feather_NumericControl.SetRange( 1, 1024 );
    Feather_NumericControl.OnValueUpdated( (NumericEdit::value_event_handler)&MmmBlendInterface::e_FeatherValueUpdated, w );
+   Feather_NumericControl.SetToolTip( "<p>Feather ramp length in canvas pixels (1-1024). "
+      "Larger values give smoother low-frequency transitions across panel overlaps.</p>" );
 
    SurfaceOrder_Label.SetText( "Surface fit order:" );
+   SurfaceOrder_Label.SetFixedWidth( labelWidth1 );
+   SurfaceOrder_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
    SurfaceOrder_SpinBox.SetRange( 0, 2 );
    SurfaceOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_SurfaceOrderValueUpdated, w );
+   SurfaceOrder_SpinBox.SetFixedWidth( editWidth1 );
+   SurfaceOrder_SpinBox.SetToolTip( "<p>Polynomial order (0-2) of the per-panel surface fit used to match "
+      "panel backgrounds: 0 = constant offset, 1 = plane, 2 = quadratic (default).</p>" );
 
-   SurfaceOrder_Sizer.SetSpacing( 6 );
+   SurfaceOrder_Sizer.SetSpacing( 4 );
    SurfaceOrder_Sizer.Add( SurfaceOrder_Label );
    SurfaceOrder_Sizer.Add( SurfaceOrder_SpinBox );
    SurfaceOrder_Sizer.AddStretch();
 
    BandRows_Label.SetText( "Band rows:" );
+   BandRows_Label.SetFixedWidth( labelWidth1 );
+   BandRows_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
    BandRows_SpinBox.SetRange( 1, 65536 );
    BandRows_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_BandRowsValueUpdated, w );
+   BandRows_SpinBox.SetFixedWidth( editWidth1 );
+   BandRows_SpinBox.SetToolTip( "<p>Output rows per streamed band. Advanced: affects streaming granularity "
+      "and peak memory only; the default (256) is fine for most images.</p>" );
 
-   BandRows_Sizer.SetSpacing( 6 );
+   BandRows_Sizer.SetSpacing( 4 );
    BandRows_Sizer.Add( BandRows_Label );
    BandRows_Sizer.Add( BandRows_SpinBox );
    BandRows_Sizer.AddStretch();
 
    DefectVeto_CheckBox.SetText( "Cross-panel defect veto" );
    DefectVeto_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_DefectVetoClick, w );
+   DefectVeto_CheckBox.SetToolTip( "<p>Reject single-panel defects (satellite trails, stacking edge artifacts) "
+      "in overlap regions by cross-checking panels during the detail blend.</p>" );
 
+   DefectVeto_Sizer.SetSpacing( 4 );
+   DefectVeto_Sizer.AddSpacing( labelWidth1 + 4 );
    DefectVeto_Sizer.Add( DefectVeto_CheckBox );
    DefectVeto_Sizer.AddStretch();
 
    FlattenEnabled_CheckBox.SetText( "Flatten background, order:" );
    FlattenEnabled_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_FlattenEnabledClick, w );
+   FlattenEnabled_CheckBox.SetToolTip( "<p>Remove a global background gradient from the merged result, "
+      "fitting a polynomial of the chosen order (1 or 2). The central background level is preserved.</p>" );
 
    FlattenOrder_SpinBox.SetRange( 1, 2 );
    FlattenOrder_SpinBox.OnValueUpdated( (SpinBox::value_event_handler)&MmmBlendInterface::e_FlattenOrderValueUpdated, w );
+   FlattenOrder_SpinBox.SetFixedWidth( editWidth1 );
+   FlattenOrder_SpinBox.SetToolTip( "<p>Background-flatten polynomial order: 1 = plane, 2 = quadratic.</p>" );
 
-   Flatten_Sizer.SetSpacing( 6 );
+   Flatten_Sizer.SetSpacing( 4 );
+   Flatten_Sizer.AddSpacing( labelWidth1 + 4 );
    Flatten_Sizer.Add( FlattenEnabled_CheckBox );
    Flatten_Sizer.Add( FlattenOrder_SpinBox );
    Flatten_Sizer.AddStretch();
