@@ -268,10 +268,10 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    InputSelect_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_InputSelectItemSelected, w );
    InputSelect_ComboBox.SetMinWidth( editWidth1*2 );
    InputSelect_ComboBox.SetToolTip( "<p>How the input panels are interpreted:</p>"
-      "<p><b>Auto</b> — panels with identical dimensions are treated as registered full-canvas panels; "
+      "<p><b>Auto</b> - panels with identical dimensions are treated as registered full-canvas panels; "
       "otherwise they are treated as plate-solved panels and reprojected.</p>"
-      "<p><b>Aligned</b> — force registered full-canvas panels (all inputs must share the same dimensions).</p>"
-      "<p><b>Solved</b> — force reprojection from each panel's astrometric solution.</p>" );
+      "<p><b>Aligned</b> - force registered full-canvas panels (all inputs must share the same dimensions).</p>"
+      "<p><b>Solved</b> - force reprojection from each panel's astrometric solution.</p>" );
 
    InputSelect_Sizer.SetSpacing( 4 );
    InputSelect_Sizer.Add( InputSelect_Label );
@@ -291,9 +291,9 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    BlendMode_ComboBox.AddItem( "Pyramid" );
    BlendMode_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_BlendModeItemSelected, w );
    BlendMode_ComboBox.SetMinWidth( editWidth1*2 );
-   BlendMode_ComboBox.SetToolTip( "<p><b>Feather</b> — weighted-average ramp across the overlap.</p>"
-      "<p><b>TwoBand</b> — low frequencies feathered, high frequencies seam-cut.</p>"
-      "<p><b>Pyramid</b> — full multiband blend; best quality (default).</p>" );
+   BlendMode_ComboBox.SetToolTip( "<p><b>Feather</b> - weighted-average ramp across the overlap.</p>"
+      "<p><b>TwoBand</b> - low frequencies feathered, high frequencies seam-cut.</p>"
+      "<p><b>Pyramid</b> - full multiband blend; best quality (default).</p>" );
 
    BlendMode_Sizer.SetSpacing( 4 );
    BlendMode_Sizer.Add( BlendMode_Label );
