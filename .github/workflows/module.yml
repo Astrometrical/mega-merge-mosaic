@@ -89,6 +89,16 @@ jobs:
           bash integration/pixinsight/repo/test/test-gen-package.sh
           bash integration/pixinsight/repo/test/test-gen-updates-xri.sh
 
+      - name: Write bundle provenance
+        shell: bash
+        run: printf 'sha=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > bundle-info.txt
+
+      # bundle-info.txt is a second upload root on purpose: upload-artifact
+      # stores files relative to the least common ancestor of the matched
+      # paths, so a lone stage/bin/** root would flatten the payload to the
+      # artifact root. The extra root pins the ancestor at the workspace root,
+      # preserving stage/bin/... — the bundle-contract layout the consumer
+      # (Astrometrical website repo) expects.
       - name: Upload unsigned module + repo artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -96,6 +106,7 @@ jobs:
           path: |
             stage/bin/**
             repo-out/**
+            bundle-info.txt
           if-no-files-found: error
 
   windows:
@@ -159,11 +170,19 @@ jobs:
         shell: pwsh
         run: integration/pixinsight/ci/build-module-windows.ps1 -Pcl "$PWD/pcl-ci" -Stage "$PWD/stage"
 
+      - name: Write bundle provenance
+        shell: bash
+        run: printf 'sha=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > bundle-info.txt
+
+      # Second upload root pins the least-common-ancestor at the workspace
+      # root so stage/bin/... survives in the artifact (see the linux job).
       - name: Upload unsigned module artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mmm-pxm-windows-x64
-          path: stage/bin/**
+          path: |
+            stage/bin/**
+            bundle-info.txt
           if-no-files-found: error
 
   macos:
@@ -219,9 +238,17 @@ jobs:
           cmake --build integration/pixinsight/host/ci-build
           ctest --test-dir integration/pixinsight/host/ci-build --output-on-failure
 
+      - name: Write bundle provenance
+        shell: bash
+        run: printf 'sha=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > bundle-info.txt
+
+      # Second upload root pins the least-common-ancestor at the workspace
+      # root so stage/bin/... survives in the artifact (see the linux job).
       - name: Upload unsigned module artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mmm-pxm-macos-arm64
-          path: stage/bin/**
+          path: |
+            stage/bin/**
+            bundle-info.txt
           if-no-files-found: error
