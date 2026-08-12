@@ -26,9 +26,11 @@ mosaic this takes seconds, not minutes ([numbers below](#performance)).
 The existing options each fall short somewhere. GradientMergeMosaic averages
 overlap regions, so sub-pixel misregistration pinches and doubles stars, and
 gradient mismatches in signal-dominated overlaps can "dig holes" in
-nebulosity. PhotometricMosaic produces excellent results but needs
-per-overlap manual tuning and is slow on large mosaics. General panorama
-stitchers assume stretched, nonlinear images.
+nebulosity. PhotometricMosaic produces excellent results but joins one
+pair of images at a time — an N-panel mosaic means N−1 sequential merges
+(panels into rows, rows into the mosaic), each with its own manual tuning,
+so a decent-sized mosaic takes hours. General panorama stitchers assume
+stretched, nonlinear images.
 
 `mmm` exploits the structure of the astro-mosaic problem — panels share one
 projection and each covers a small fraction of the canvas — so all expensive
