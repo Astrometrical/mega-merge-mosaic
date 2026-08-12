@@ -233,8 +233,12 @@ HANDLE spawn_worker_win(const std::string& path, const std::vector<std::string>&
   ZeroMemory(&pi, sizeof pi);
 
   std::wstring cmd = build_command_line_w(path, args, probe);
+  // CREATE_NO_WINDOW: the worker is a console app but the host may be a GUI
+  // process (PixInsight); without this flag Windows pops a visible console
+  // window for every worker launch. The child still gets an (invisible)
+  // console, so its std handles keep working.
   BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
-                           TRUE /*inherit handles*/, 0, nullptr, nullptr, &si, &pi);
+                           TRUE /*inherit handles*/, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
   if (!ok) {
     throw HostError("CreateProcessW(" + path + ") failed: " + last_error());
   }
