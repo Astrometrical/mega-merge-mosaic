@@ -337,6 +337,23 @@ pub fn write_seam_map(
     Ok(())
 }
 
+/// Compute the owner map and write the seam/ownership map PNG (see
+/// [`write_seam_map`]) as `seam_map.png` inside the session directory,
+/// returning its path. This is the post-blend convenience entry point used
+/// by the IPC worker; `feather_px` should match the blend's.
+pub fn write_session_seam_map(
+    session: &Session,
+    graph: &OverlapGraph,
+    phot: &Photometry,
+    surfaces: Option<&Surfaces>,
+    feather_px: f32,
+) -> Result<std::path::PathBuf> {
+    let (_, owner) = load_owner_map(session, graph, phot, surfaces, feather_px)?;
+    let path = session.dir.join("seam_map.png");
+    write_seam_map(session, graph, phot, surfaces, &owner, feather_px, &path)?;
+    Ok(path)
+}
+
 /// Draw `id` in 3×5 bitmap digits (scaled), centered on `(cx, cy)`, white on
 /// a 1-px dark outline. Out-of-bounds pixels are clipped.
 fn draw_label(buf: &mut [u8], w: usize, h: usize, cx: i64, cy: i64, id: usize, scale: usize) {
@@ -557,6 +574,47 @@ mod tests {
         let info = reader.next_frame(&mut buf).unwrap();
         assert_eq!((info.width, info.height), (14, 7));
         assert_eq!(info.color_type, png::ColorType::Rgb);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The session-level convenience wrapper (the worker's post-blend hook)
+    /// computes the owner map itself and drops `seam_map.png` into the
+    /// session directory.
+    #[test]
+    fn session_seam_map_lands_in_session_dir() {
+        let dir = tmpdir("session-map");
+        let (w, h) = (128u64, 64u64);
+        let mut frame = vec![0f32; (w * h) as usize];
+        for y in 8..56 {
+            for x in 8..80 {
+                frame[(y * w + x) as usize] = 0.2;
+            }
+        }
+        let a = dir.join("a.xisf");
+        write_xisf(&a, w, h, 1, &frame).unwrap();
+        frame.fill(0.0);
+        for y in 16..64 {
+            for x in 48..120 {
+                frame[(y * w + x) as usize] = 0.4;
+            }
+        }
+        let b = dir.join("b.xisf");
+        write_xisf(&b, w, h, 1, &frame).unwrap();
+
+        let session = analyze(&[a, b], &dir.join("s.mmm-session")).unwrap();
+        let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+        let phot = Photometry {
+            edge_fits: vec![],
+            gains: vec![vec![1.0, 1.0]],
+            offsets: vec![vec![0.0, 0.0]],
+        };
+
+        let path = write_session_seam_map(&session, &graph, &phot, None, 16.0).unwrap();
+        assert_eq!(path, session.dir.join("seam_map.png"));
+        let decoder = png::Decoder::new(File::open(&path).unwrap());
+        let reader = decoder.read_info().unwrap();
+        assert_eq!(reader.info().color_type, png::ColorType::Rgb);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

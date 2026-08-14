@@ -68,6 +68,7 @@ fn run() -> mmm_core::Result<()> {
     let session_dir = PathBuf::from(&init.session_dir);
     let params = init.params.to_params();
     let surface_order = init.params.surface_order;
+    let seam_map = init.params.seam_map;
     let mode = init.mode.clone();
 
     // `std::io::stdin()` is a handle onto the same global buffered stdin the
@@ -128,6 +129,19 @@ fn run() -> mmm_core::Result<()> {
             &source,
             &mut sink,
         )?;
+
+        // Optional post-blend diagnostic: the seam/ownership map PNG, built
+        // entirely from the session's cached L8 analysis artifacts (no panel
+        // re-reads), dropped into the session dir for the host to pick up.
+        if seam_map {
+            mmm_core::diag::write_session_seam_map(
+                &session,
+                &graph,
+                &phot,
+                surfaces.as_ref(),
+                params.feather_px,
+            )?;
+        }
 
         // Sends the final `Done`; `ShmRowSink::finish` is deliberately a
         // no-op (see its doc comment), so this is the one and only

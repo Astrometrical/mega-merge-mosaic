@@ -231,6 +231,12 @@ pub struct BlendParamsWire {
     /// Surface-fit polynomial order for the analyze stage; not consumed by
     /// [`Self::to_params`].
     pub surface_order: Option<u32>,
+    /// Write a seam/ownership map PNG (`seam_map.png`) into the session
+    /// directory after a successful blend. Not part of [`BlendParams`];
+    /// consumed by the worker's post-blend step. Defaults to `false` so
+    /// params JSON from hosts that predate this field still parses.
+    #[serde(default)]
+    pub seam_map: bool,
 }
 
 impl Default for BlendParamsWire {
@@ -244,6 +250,7 @@ impl Default for BlendParamsWire {
             defect_veto: true,
             flatten: None,
             surface_order: Some(2),
+            seam_map: false,
         }
     }
 }
@@ -686,6 +693,32 @@ mod tests {
             serde_json::to_string(&InputSelectWire::Auto).unwrap(),
             "\"Auto\""
         );
+    }
+
+    #[test]
+    fn blend_params_seam_map_defaults_off_and_round_trips() {
+        // Params JSON from a host that predates seam_map (no key) must still
+        // parse, with the seam map off.
+        let legacy = serde_json::json!({
+            "feather_px": 256.0,
+            "downsample": 1,
+            "band_rows": 256,
+            "mode": "pyramid",
+            "roi": null,
+            "defect_veto": true,
+            "flatten": null,
+            "surface_order": 2
+        });
+        let p: BlendParamsWire = serde_json::from_value(legacy).unwrap();
+        assert!(!p.seam_map);
+
+        let on = BlendParamsWire {
+            seam_map: true,
+            ..Default::default()
+        };
+        let back: BlendParamsWire =
+            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.seam_map);
     }
 
     #[test]

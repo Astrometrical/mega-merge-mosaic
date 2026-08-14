@@ -203,6 +203,7 @@ fn worker_blend_is_byte_identical_to_file_blend() {
             defect_veto: params.defect_veto,
             flatten: params.flatten,
             surface_order: Some(2),
+            seam_map: false,
         },
     };
 
@@ -440,6 +441,7 @@ fn aligned_two_panel_job(
             defect_veto: true,
             flatten: None,
             surface_order: Some(2),
+            seam_map: false,
         },
     };
     (job, shm, panel_pixels)
@@ -841,6 +843,7 @@ fn solved_mode_reprojection_matches_file() {
                 defect_veto: params.defect_veto,
                 flatten: params.flatten,
                 surface_order: Some(2),
+                seam_map: false,
             },
         };
 
@@ -930,6 +933,7 @@ fn probe_frame_prints_choose_frame_geometry() {
             defect_veto: true,
             flatten: None,
             surface_order: Some(2),
+            seam_map: false,
         },
     };
     let json = serde_json::to_string(&job).unwrap();

@@ -128,6 +128,8 @@ private:
       SpinBox         BandRows_SpinBox;
       HorizontalSizer DefectVeto_Sizer;
       CheckBox        DefectVeto_CheckBox;
+      HorizontalSizer SeamMap_Sizer;
+      CheckBox        SeamMap_CheckBox;
       HorizontalSizer Flatten_Sizer;
       CheckBox        FlattenEnabled_CheckBox;
       SpinBox         FlattenOrder_SpinBox;
@@ -175,6 +177,7 @@ private:
    void e_BandRowsValueUpdated( SpinBox& sender, int value );
 
    void e_DefectVetoClick( Button& sender, bool checked );
+   void e_SeamMapClick( Button& sender, bool checked );
    void e_FlattenEnabledClick( Button& sender, bool checked );
    void e_FlattenOrderValueUpdated( SpinBox& sender, int value );
 

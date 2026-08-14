@@ -168,6 +168,16 @@ unaffected panel(s).</td>
 </tr>
 
 <tr>
+<td class="name">Seam map</td>
+<td>When enabled (default), a second output image named
+<code>seam_map</code> is produced alongside the merged mosaic: an
+autostretched preview with each panel's owned region subtly tinted, seam
+lines drawn dark, and panel numbers drawn at the center of each region.
+Useful for checking where the seams were placed and which panel
+contributed each part of the mosaic.</td>
+</tr>
+
+<tr>
 <td class="name">Gradient removal</td>
 <td>Optional global gradient removal applied to the final merged result,
 order 1 or 2. Disabled by default. The central level of the image is
@@ -213,7 +223,9 @@ more processing steps.</td>
   <li>To cancel a running instance, use the Process Console's
   <b>Pause/Abort</b> button.</li>
   <li>On completion, a new image window containing the merged mosaic is
-  created; the source panels are left unmodified.</li>
+  created; the source panels are left unmodified. If <b>Seam map</b> is
+  enabled, a second window showing the seam/ownership map is created as
+  well.</li>
 </ul>
 
 <p class="footer">Copyright &copy; 2026 Astrometrical &mdash; <a href="https://astrometrical.com">astrometrical.com</a></p>

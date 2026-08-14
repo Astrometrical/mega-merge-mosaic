@@ -54,6 +54,11 @@ struct ProgressCallback {
     (void)done;
     (void)total;
   }
+  /// Called repeatedly (roughly every `Host::kIdleWaitMs`) whenever the
+  /// worker pipe is quiet -- no frame has arrived yet -- so a GUI host can
+  /// pump its event queue and stay responsive during long worker reads.
+  /// Runs on the same thread as `Host::run()`; default is a no-op.
+  virtual void on_idle() {}
 };
 
 /// Everything needed to start one run. `init` is the full `{"Init":{...}}`
@@ -116,6 +121,12 @@ class Host {
   /// Throws `HostError` on a nonzero exit or unparseable output.
   static void probe_frame(const std::string& worker_path, const nlohmann::json& init_obj,
                           uint64_t& w, uint64_t& h, uint64_t& ch);
+
+  /// Longest stretch (ms) `run()` waits on a quiet worker pipe between
+  /// `ProgressCallback::on_idle()` calls. When frames are flowing the wait
+  /// returns as soon as data is available, so this bounds GUI-event latency
+  /// without slowing the serve loop.
+  static constexpr int kIdleWaitMs = 50;
 
  private:
   // Writes a fully-framed byte buffer (tag+len+payload already prepended) to

@@ -246,7 +246,8 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
     "roi": null,
     "defect_veto": true,
     "flatten": null,
-    "surface_order": 2
+    "surface_order": 2,
+    "seam_map": false
   }
 }}
 ```
@@ -314,6 +315,7 @@ names):
 | `defect_veto` | bool | cross-panel defect veto in two-band/pyramid detail stage |
 | `flatten` | u32 or `null` | opt-in global background flatten polynomial order; `null` = off |
 | `surface_order` | u32 or `null` | surface-fit polynomial order for the analyze stage (not part of `BlendParams` itself) |
+| `seam_map` | bool | after a successful blend, the worker writes the seam/ownership map PNG to `<session_dir>/seam_map.png` (built from the session's cached L8 artifacts; no panel re-reads) **before** sending `Done`. The host may read that file once `Done` arrives — and must do so before deleting a temporary session dir. `#[serde(default)]`: absent means `false`, so pre-field hosts are unaffected |
 
 **Finite-float precondition.** Before writing an `Init` frame, the sender
 must ensure every float reachable from the payload is finite: JSON has no

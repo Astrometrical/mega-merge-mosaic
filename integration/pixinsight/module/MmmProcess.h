@@ -101,6 +101,7 @@ private:
    int32         p_flatten;         // background-flatten polynomial order
    pcl_bool      p_flattenEnabled;  // whether flatten is applied
    pcl_bool      p_defectVeto;      // cross-panel defect veto
+   pcl_bool      p_seamMap;         // produce the seam/ownership map output
    int32         p_surfaceOrder;    // analyze surface-fit order
    int32         p_bandRows;        // output band granularity, rows
 

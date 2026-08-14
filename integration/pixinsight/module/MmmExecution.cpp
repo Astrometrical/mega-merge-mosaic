@@ -26,6 +26,7 @@
 #include <pcl/File.h>
 #include <pcl/FileFormat.h>
 #include <pcl/FileFormatInstance.h>
+#include <pcl/Image.h>
 #include <pcl/ImageDescription.h>
 #include <pcl/ImageVariant.h>
 #include <pcl/ImageWindow.h>
@@ -74,6 +75,7 @@ struct Params
    int32         flatten;
    bool          flattenEnabled;
    bool          defectVeto;
+   bool          seamMap;
    int32         surfaceOrder;
    int32         bandRows;
 };
@@ -110,6 +112,13 @@ constexpr uint32_t kOutputSlots = 2;
 // PROTOCOL.md section 6) and a clean Cancel (ProcessAborted, not a modal error)
 // are the fixes that make this synchronous model feel responsive; revisit this
 // note before reopening the background-thread idea.
+//
+// on_idle(): the Host additionally invokes this whenever the worker pipe has
+// been quiet for ~Host::kIdleWaitMs (no frame arrived), so the event queue
+// keeps getting pumped even during long silent stretches -- e.g. while the
+// worker reads multi-GB panel files and emits no Progress frames. Without it
+// the GUI thread parks in a blocking pipe read and Windows greys the window
+// as "not responding" after ~5 s of unpumped events.
 class ConsoleProgress : public mmm::ProgressCallback
 {
 public:
@@ -173,6 +182,21 @@ public:
 
       // Deliver pending GUI events and honor the Console's own abort button --
       // this is the (only) cancellation path.
+      PumpEventsAndPollAbort();
+   }
+
+   void on_idle() override
+   {
+      // Quiet pipe (see the class comment): keep the GUI responsive and the
+      // abort button live while the worker is busy but silent. Called at
+      // most every Host::kIdleWaitMs, so no extra throttling is needed.
+      PumpEventsAndPollAbort();
+   }
+
+private:
+
+   void PumpEventsAndPollAbort()
+   {
       Module->ProcessEvents();
       if ( m_console.AbortRequested() )
       {
@@ -181,8 +205,6 @@ public:
             host->cancel();
       }
    }
-
-private:
 
    Console m_console;
    String  m_stage;
@@ -322,6 +344,7 @@ json BuildParams( const Params& in )
    p["mode"]          = BlendModeWireString( in.blendMode );
    p["roi"]           = nullptr;         // ROI removed from UI; wire field is mandatory
    p["defect_veto"]   = bool( in.defectVeto );
+   p["seam_map"]      = bool( in.seamMap );
    if ( in.flattenEnabled )
       p["flatten"] = uint32_t( in.flatten );
    else
@@ -371,6 +394,52 @@ struct AutoSessionDirGuard
          RemoveSessionDir( dir );
    }
 };
+
+// Loads the worker-written seam/ownership map (<sessionDir>/seam_map.png,
+// PROTOCOL.md section 6) and shows it as a new 8-bit "seam_map" image window.
+// Called after a successful run, BEFORE AutoSessionDirGuard removes a temp
+// session dir. Best-effort: a missing or unreadable file warns on the console
+// but never fails the completed blend.
+void ShowSeamMap( const std::string& sessionDirUtf8 )
+{
+   Console console;
+   try
+   {
+      String path = IsoString( (sessionDirUtf8 + "/seam_map.png").c_str() ).UTF8ToUTF16();
+      if ( !File::Exists( path ) )
+      {
+         console.WarningLn( "<end><cbr>** MegaMergeMosaic: seam map was requested but the worker "
+                            "did not produce it: " + path );
+         return;
+      }
+
+      FileFormat         format( ".png", true /*toRead*/, false /*toWrite*/ );
+      FileFormatInstance file( format );
+      ImageDescriptionArray images;
+      if ( !file.Open( images, path ) || images.IsEmpty() )
+         throw Error( "cannot open " + path );
+      UInt8Image img;
+      if ( !file.ReadImage( img ) )
+         throw Error( "cannot read " + path );
+      file.Close();
+
+      ImageWindow window( img.Width(), img.Height(), img.NumberOfChannels(),
+                          8 /*bitsPerSample*/, false /*floatSample*/,
+                          img.NumberOfChannels() >= 3 /*color*/,
+                          true /*initialProcessing*/, "seam_map" );
+      View view = window.MainView();
+      view.LockForWrite( false /*notify*/ );
+      ImageVariant image = view.Image();
+      static_cast<UInt8Image&>( *image ).Assign( img );
+      view.UnlockForWrite( false /*notify*/ );
+      window.Show();
+   }
+   catch ( ... )
+   {
+      // The mosaic itself completed; a broken diagnostic must not undo that.
+      console.WarningLn( "<end><cbr>** MegaMergeMosaic: could not load the seam map image." );
+   }
+}
 
 // Drives one fully-assembled job to completion and shows the output window on
 // success. Throws on any fault or cancellation, leaving no window shown.
@@ -704,6 +773,7 @@ void run_blend( MmmBlendInstance& in )
    p.flatten        = in.p_flatten;
    p.flattenEnabled = in.p_flattenEnabled;
    p.defectVeto     = in.p_defectVeto;
+   p.seamMap        = in.p_seamMap;
    p.surfaceOrder   = in.p_surfaceOrder;
    p.bandRows       = in.p_bandRows;
 
@@ -737,6 +807,12 @@ void run_blend( MmmBlendInstance& in )
       RunViews( p, worker_path );
    else
       RunFiles( p, worker_path );
+
+   // The run succeeded; surface the requested seam map while the session dir
+   // (and the PNG the worker wrote into it) still exists -- sessionGuard
+   // removes a temp dir when this function returns.
+   if ( p.seamMap )
+      ShowSeamMap( p.sessionDir );
 }
 
 // ----------------------------------------------------------------------------

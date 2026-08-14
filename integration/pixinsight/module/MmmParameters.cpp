@@ -23,6 +23,7 @@ MmmBlendModeParameter*     TheMmmBlendModeParameter     = nullptr;
 MmmFlattenParameter*       TheMmmFlattenParameter       = nullptr;
 MmmFlattenEnabledParameter* TheMmmFlattenEnabledParameter = nullptr;
 MmmDefectVetoParameter*    TheMmmDefectVetoParameter    = nullptr;
+MmmSeamMapParameter*       TheMmmSeamMapParameter       = nullptr;
 MmmSurfaceOrderParameter*  TheMmmSurfaceOrderParameter  = nullptr;
 MmmBandRowsParameter*      TheMmmBandRowsParameter      = nullptr;
 

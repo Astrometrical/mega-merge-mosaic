@@ -327,6 +327,15 @@ void Host::run() {
     }
 
     for (;;) {
+      // While the pipe is quiet, keep the observer's on_idle() ticking (a GUI
+      // host pumps its event queue there) instead of parking in a blind
+      // blocking read. When frames are flowing, os_wait_readable returns
+      // immediately with data available, so the serve loop is not slowed.
+      if (prog_ != nullptr) {
+        while (os_wait_readable(stdout_fd, kIdleWaitMs) == 0) {
+          prog_->on_idle();
+        }
+      }
       WorkerFrame wf;
       bool got = read_worker_frame(stdout_fd, wf);
       if (!got) {

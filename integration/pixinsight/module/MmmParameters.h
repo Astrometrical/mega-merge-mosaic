@@ -27,6 +27,7 @@
 //   (roi removed from UI; wire field is mandatory -> params.roi = null)
 //   (downsample removed from UI; wire field is mandatory -> params.downsample = 1)
 //   defectVeto         -> params.defect_veto
+//   seamMap            -> params.seam_map
 //   surfaceOrder       -> params.surface_order
 //   bandRows           -> params.band_rows
 
@@ -255,6 +256,25 @@ public:
 };
 
 extern MmmDefectVetoParameter* TheMmmDefectVetoParameter;
+
+// ----------------------------------------------------------------------------
+// seamMap: post-blend seam/ownership map output (params.seam_map).
+// ----------------------------------------------------------------------------
+
+/*!
+ * \brief Boolean parameter: produce the seam/ownership map as a second
+ * output image (params.seam_map).
+ */
+class MmmSeamMapParameter : public MetaBoolean
+{
+public:
+
+   MmmSeamMapParameter( MetaProcess* P ) : MetaBoolean( P ) {}
+   IsoString Id() const override { return "seamMap"; }
+   bool DefaultValue() const override { return true; }
+};
+
+extern MmmSeamMapParameter* TheMmmSeamMapParameter;
 
 // ----------------------------------------------------------------------------
 // surfaceOrder: surface-fit polynomial order for the analyze stage.

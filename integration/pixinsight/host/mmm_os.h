@@ -48,8 +48,29 @@ inline long os_write(os_handle h, const void* buf, size_t n) {
 inline void os_close(os_handle h) {
     if (h && h != os_invalid_handle) CloseHandle(h);
 }
+
+/// Waits up to `timeout_ms` for `h` (a pipe read end) to have data (or EOF /
+/// error) available for a non-blocking-ish `os_read`. Returns 1 when a read
+/// would make progress, 0 on timeout. Anonymous pipe handles cannot be waited
+/// on directly on Windows, so this polls `PeekNamedPipe` (which does work on
+/// anonymous pipes) in short sleeps; a broken pipe reports 1 so the caller's
+/// read observes the EOF.
+inline int os_wait_readable(os_handle h, int timeout_ms) {
+    for (int waited = 0;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr))
+            return 1;  // broken/closed pipe: let the read surface EOF/error
+        if (avail > 0) return 1;
+        if (waited >= timeout_ms) return 0;
+        DWORD slice = (DWORD)((timeout_ms - waited) < 10 ? (timeout_ms - waited) : 10);
+        Sleep(slice);
+        waited += (int)slice;
+    }
+}
 }  // namespace mmm
 #else
+  #include <cerrno>
+  #include <poll.h>
   #include <unistd.h>
 namespace mmm {
 /// Platform handle type: a POSIX file descriptor.
@@ -63,5 +84,22 @@ inline long os_read(os_handle h, void* buf, size_t n) { return (long)::read(h, b
 inline long os_write(os_handle h, const void* buf, size_t n) { return (long)::write(h, buf, n); }
 /// Close a descriptor, tolerating the invalid sentinel.
 inline void os_close(os_handle h) { if (h >= 0) ::close(h); }
+
+/// Waits up to `timeout_ms` for `h` to be readable (data, EOF, or error).
+/// Returns 1 when a read would make progress, 0 on timeout. A `poll()` error
+/// (other than EINTR, which retries) reports 1 so the caller's read surfaces
+/// the real errno.
+inline int os_wait_readable(os_handle h, int timeout_ms) {
+    struct pollfd pfd;
+    pfd.fd = h;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    for (;;) {
+        int r = ::poll(&pfd, 1, timeout_ms);
+        if (r > 0) return 1;   // readable, EOF (POLLHUP), or error (POLLERR)
+        if (r == 0) return 0;  // timeout
+        if (errno != EINTR) return 1;  // let the read surface the error
+    }
+}
 }  // namespace mmm
 #endif

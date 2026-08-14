@@ -95,6 +95,7 @@ MmmBlendInstance::MmmBlendInstance( const MetaProcess* m )
    , p_flatten( int32( TheMmmFlattenParameter->DefaultValue() ) )
    , p_flattenEnabled( TheMmmFlattenEnabledParameter->DefaultValue() )
    , p_defectVeto( TheMmmDefectVetoParameter->DefaultValue() )
+   , p_seamMap( TheMmmSeamMapParameter->DefaultValue() )
    , p_surfaceOrder( int32( TheMmmSurfaceOrderParameter->DefaultValue() ) )
    , p_bandRows( int32( TheMmmBandRowsParameter->DefaultValue() ) )
 {
@@ -122,6 +123,7 @@ void MmmBlendInstance::Assign( const ProcessImplementation& p )
       p_flatten       = x->p_flatten;
       p_flattenEnabled = x->p_flattenEnabled;
       p_defectVeto    = x->p_defectVeto;
+      p_seamMap       = x->p_seamMap;
       p_surfaceOrder  = x->p_surfaceOrder;
       p_bandRows      = x->p_bandRows;
    }
@@ -186,6 +188,7 @@ void* MmmBlendInstance::LockParameter( const MetaParameter* p, size_type tableRo
    if ( p == TheMmmFlattenParameter )       return &p_flatten;
    if ( p == TheMmmFlattenEnabledParameter ) return &p_flattenEnabled;
    if ( p == TheMmmDefectVetoParameter )    return &p_defectVeto;
+   if ( p == TheMmmSeamMapParameter )       return &p_seamMap;
    if ( p == TheMmmSurfaceOrderParameter )  return &p_surfaceOrder;
    if ( p == TheMmmBandRowsParameter )      return &p_bandRows;
 

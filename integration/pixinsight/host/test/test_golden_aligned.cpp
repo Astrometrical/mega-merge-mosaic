@@ -124,6 +124,9 @@ int main(int argc, char** argv) {
   json aligned_init = files_init;
   aligned_init["mode"] = "Aligned";
   aligned_init["session_dir"] = fixtures + "/aligned_" + std::to_string(pid) + ".mmm-session";
+  // This run opts into the post-blend seam map (the files run leaves the
+  // field unset, exercising the wire default = off).
+  aligned_init["params"]["seam_map"] = true;
   const std::string aligned_shm = "/mmm-golden-aligned-" + std::to_string(pid);
   aligned_init["shm_name"] = aligned_shm;
   RunResult got_run = run_job(worker_path, aligned_init, layout, aligned_shm, mem);
@@ -163,6 +166,17 @@ int main(int argc, char** argv) {
                  static_cast<double>(got[first_mismatch]));
   }
   CHECK(first_mismatch == got.size());
+
+  // Seam map: written into the session dir of the run that asked for it
+  // (params.seam_map = true), absent for the run that did not.
+  {
+    std::ifstream want(aligned_init["session_dir"].get<std::string>() + "/seam_map.png",
+                       std::ios::binary);
+    CHECK(want.good());
+    std::ifstream none(files_init["session_dir"].get<std::string>() + "/seam_map.png",
+                       std::ios::binary);
+    CHECK(!none.good());
+  }
 
   std::printf("test_golden_aligned OK: %zu elements byte-identical (range [%.6g, %.6g])\n",
               got.size(), static_cast<double>(lo), static_cast<double>(hi));

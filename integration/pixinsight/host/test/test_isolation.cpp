@@ -283,6 +283,69 @@ void test_cancel_midrun_stops_promptly(const std::string& worker_path) {
   std::fprintf(stderr, "test_cancel_midrun_stops_promptly: OK\n");
 }
 
+// ---------------------------------------------------------------------------
+// Idle case: while the worker pipe is silent (no frames at all), Host::run()
+// must keep invoking ProgressCallback::on_idle() instead of parking in a
+// blind blocking read -- this is what lets the PixInsight module pump its GUI
+// event queue (and honor Cancel) during long worker reads. The "worker" here
+// is a real process that sleeps ~0.4s writing nothing, then exits; the run
+// ends in the usual exit-before-Done HostError, by which time on_idle() must
+// have fired repeatedly.
+// ---------------------------------------------------------------------------
+struct IdleCountingProgress : mmm::ProgressCallback {
+  std::atomic<int> idles{0};
+  void on_progress(const std::string&, uint64_t, uint64_t) override {}
+  void on_idle() override { idles.fetch_add(1); }
+};
+
+void test_idle_callback_fires_while_pipe_quiet() {
+  std::fprintf(stderr, "test_idle_callback_fires_while_pipe_quiet: starting\n");
+  const uint64_t w = 32, h = 32, ch = 1;
+  const uint32_t band_rows = 8;
+  const uint64_t slot_bytes = w * ch * band_rows * 4;
+  mmm::SlotLayout layout{slot_bytes, 4, 2};
+
+  std::string session_dir = unique_tmp_dir("idle");
+  std::string shm_name = "/mmm-isolation-idle-" + std::to_string(mmm_test_getpid());
+
+  mmm::HostConfig cfg;
+  // A real process that stays silent for ~0.4s (never reads Init, writes no
+  // frame), then exits: a stand-in for a worker busy reading big panels.
+#ifdef _WIN32
+  cfg.worker_path = "C:\\Windows\\System32\\cmd.exe";
+  cfg.worker_args = {"/c", "ping", "-n", "2", "127.0.0.1", ">", "NUL"};
+#else
+  cfg.worker_path = "/bin/sh";
+  cfg.worker_args = {"-c", "sleep 0.4"};
+#endif
+  cfg.layout = layout;
+  cfg.shm_name = shm_name;
+  cfg.init = json{{"Init", make_init(w, h, ch, band_rows, slot_bytes, layout, shm_name, session_dir)}};
+
+  AssertNeverCollector collector;
+  mmm_test::NeverSource never;
+  IdleCountingProgress prog;
+  mmm::Host host(std::move(cfg), never, collector, &prog);
+
+  bool threw_host_error = false;
+  try {
+    host.run();
+  } catch (const mmm::HostError& e) {
+    threw_host_error = true;
+    std::fprintf(stderr, "  got expected HostError: %s\n", e.what());
+  }
+
+  CHECK(threw_host_error);        // Silent exit still ends as exit-before-Done.
+  // ~0.4s of silence with a <=100ms idle interval must yield several idles;
+  // >= 2 keeps the bound loose against scheduler jitter.
+  std::fprintf(stderr, "  on_idle() fired %d times\n", prog.idles.load());
+  CHECK(prog.idles.load() >= 2);
+
+  std::error_code ec;
+  std::filesystem::remove_all(session_dir, ec);
+  std::fprintf(stderr, "test_idle_callback_fires_while_pipe_quiet: OK\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -293,6 +356,7 @@ int main(int argc, char** argv) {
 
   test_crash_worker_exits_without_done();
   test_cancel_midrun_stops_promptly(worker_path);
+  test_idle_callback_fires_while_pipe_quiet();
 
   std::printf("test_isolation OK: crash -> HostError (no partial output); "
               "cancel -> cancelled()==true (no output, worker reaped)\n");

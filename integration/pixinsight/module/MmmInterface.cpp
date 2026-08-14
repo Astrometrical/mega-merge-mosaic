@@ -360,6 +360,18 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    DefectVeto_Sizer.Add( DefectVeto_CheckBox );
    DefectVeto_Sizer.AddStretch();
 
+   SeamMap_CheckBox.SetText( "Seam map" );
+   SeamMap_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SeamMapClick, w );
+   SeamMap_CheckBox.SetToolTip( "<p>Produce the seam/ownership map as a second output image: "
+      "an autostretched preview of the blended mosaic with each panel's owned region tinted, "
+      "seams drawn dark, and panel numbers at the region centers. Useful for checking where "
+      "the seams were placed and which panel contributed each region.</p>" );
+
+   SeamMap_Sizer.SetSpacing( 4 );
+   SeamMap_Sizer.AddUnscaledSpacing( labelWidth1 + w.LogicalPixelsToPhysical( 4 ) );
+   SeamMap_Sizer.Add( SeamMap_CheckBox );
+   SeamMap_Sizer.AddStretch();
+
    FlattenEnabled_CheckBox.SetText( "Gradient removal, order:" );
    FlattenEnabled_CheckBox.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_FlattenEnabledClick, w );
    FlattenEnabled_CheckBox.SetToolTip( "<p>Remove the residual global background gradient from the "
@@ -383,6 +395,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Parameters_Sizer.Add( Feather_NumericControl );
    Parameters_Sizer.Add( SurfaceOrder_Sizer );
    Parameters_Sizer.Add( DefectVeto_Sizer );
+   Parameters_Sizer.Add( SeamMap_Sizer );
    Parameters_Sizer.Add( Flatten_Sizer );
    Parameters_Control.SetSizer( Parameters_Sizer );
 
@@ -417,9 +430,15 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 
    w.SetSizer( Global_Sizer );
 
-   // Start collapsed: HideSection() keeps the bar's own collapse/arrow state
-   // in sync (unlike calling Control::Hide() on the section directly).
-   Advanced_SectionBar.HideSection();
+   // Start collapsed. Control::Hide() on the section control -- the standard
+   // PCL module idiom -- NOT SectionBar::HideSection(): SetSectionVisible()
+   // early-outs when the section already reports IsVisible() == false, which
+   // is always the case here because the window has never been shown, so
+   // HideSection() at construction time is a silent no-op and the section
+   // would come up expanded. The bar's arrow starts in the collapsed state
+   // (SetSection() samples IsVisible() pre-show) and its OnShow/OnHide
+   // tracking keeps it in sync from then on.
+   Advanced_Control.Hide();
 
    w.EnsureLayoutUpdated();
    w.AdjustToContents();
@@ -505,6 +524,7 @@ void MmmBlendInterface::UpdateControls()
    GUI->BandRows_SpinBox.SetValue( m_instance.p_bandRows );
 
    GUI->DefectVeto_CheckBox.SetChecked( m_instance.p_defectVeto );
+   GUI->SeamMap_CheckBox.SetChecked( m_instance.p_seamMap );
 
    GUI->FlattenEnabled_CheckBox.SetChecked( m_instance.p_flattenEnabled );
    GUI->FlattenOrder_SpinBox.SetValue( m_instance.p_flatten );
@@ -717,6 +737,11 @@ void MmmBlendInterface::e_BandRowsValueUpdated( SpinBox&, int value )
 void MmmBlendInterface::e_DefectVetoClick( Button&, bool checked )
 {
    m_instance.p_defectVeto = checked;
+}
+
+void MmmBlendInterface::e_SeamMapClick( Button&, bool checked )
+{
+   m_instance.p_seamMap = checked;
 }
 
 void MmmBlendInterface::e_FlattenEnabledClick( Button&, bool checked )
