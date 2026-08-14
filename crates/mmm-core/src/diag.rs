@@ -337,21 +337,134 @@ pub fn write_seam_map(
     Ok(())
 }
 
-/// Compute the owner map and write the seam/ownership map PNG (see
-/// [`write_seam_map`]) as `seam_map.png` inside the session directory,
-/// returning its path. This is the post-blend convenience entry point used
-/// by the IPC worker; `feather_px` should match the blend's.
-pub fn write_session_seam_map(
+/// End-of-run mosaic statistics, written as `summary.json` into the session
+/// directory by [`write_session_reports`] so a host can present a closing
+/// summary without recomputing anything.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct MosaicSummary {
+    /// Number of input panels.
+    pub panels: usize,
+    /// Full-resolution output dimensions `[width, height, channels]` — the
+    /// blend's data bounding box, not the full canvas.
+    pub output: [u64; 3],
+    /// `output` width × height in megapixels.
+    pub megapixels: f64,
+    /// Fraction of the output bounding box covered by at least one panel,
+    /// measured on the L8 owner grid.
+    pub covered_frac: f64,
+    /// Number of overlap edges in the session's overlap graph.
+    pub overlap_edges: usize,
+    /// Median over edges of `overlap cells / smaller panel's covered cells`.
+    pub median_overlap_frac: f64,
+    /// Median over edges of the corrected seam step (see [`seam_deltas`]);
+    /// `0` when there are no measurable edges.
+    pub seam_delta_median: f64,
+    /// Maximum over edges of the corrected seam step.
+    pub seam_delta_max: f64,
+}
+
+/// Median of an unsorted slice; `0` when empty.
+fn median(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// The IPC worker's post-blend hook: computes the owner map once, writes the
+/// seam/ownership map PNG (`seam_map.png`, see [`write_seam_map`]) when
+/// `seam_map` is set, always writes `summary.json`, and returns the summary
+/// stats. `feather_px` should match the blend's.
+pub fn write_session_reports(
     session: &Session,
     graph: &OverlapGraph,
     phot: &Photometry,
     surfaces: Option<&Surfaces>,
     feather_px: f32,
-) -> Result<std::path::PathBuf> {
-    let (_, owner) = load_owner_map(session, graph, phot, surfaces, feather_px)?;
-    let path = session.dir.join("seam_map.png");
-    write_seam_map(session, graph, phot, surfaces, &owner, feather_px, &path)?;
-    Ok(path)
+    seam_map: bool,
+) -> Result<MosaicSummary> {
+    let (summaries, owner) = load_owner_map(session, graph, phot, surfaces, feather_px)?;
+    if seam_map {
+        write_seam_map(
+            session,
+            graph,
+            phot,
+            surfaces,
+            &owner,
+            feather_px,
+            &session.dir.join("seam_map.png"),
+        )?;
+    }
+
+    // Output geometry: the same data bounding box the blend streamed.
+    let params = BlendParams {
+        feather_px,
+        ..Default::default()
+    };
+    let bbox = output_bbox(session, &params)?;
+    let (w, h) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+    let ch = session.canvas.2;
+
+    // Covered fraction of the output bbox, on the L8 owner grid (a cell is
+    // covered iff some panel owns it).
+    let w8 = owner.w8 as usize;
+    let (gx0, gy0) = (
+        (bbox[0] / BLOCK as u64) as usize,
+        (bbox[1] / BLOCK as u64) as usize,
+    );
+    let (gx1, gy1) = (
+        (bbox[2].div_ceil(BLOCK as u64) as usize).min(w8),
+        (bbox[3].div_ceil(BLOCK as u64) as usize).min(owner.h8 as usize),
+    );
+    let mut covered = 0u64;
+    for y in gy0..gy1 {
+        for x in gx0..gx1 {
+            if owner.owner[y * w8 + x] != u16::MAX {
+                covered += 1;
+            }
+        }
+    }
+    let crop_cells = ((gx1 - gx0) * (gy1 - gy0)).max(1) as f64;
+
+    // Overlap fraction per edge: overlap cells relative to the smaller
+    // panel's fully-covered cell count (the same coverage == 1.0 criterion
+    // OverlapGraph::build counts with).
+    let covered_cells: Vec<u64> = summaries
+        .iter()
+        .map(|s| s.coverage.iter().filter(|&&c| c == 1.0).count() as u64)
+        .collect();
+    let overlap_fracs: Vec<f64> = graph
+        .edges
+        .iter()
+        .map(|e| e.n_cells as f64 / covered_cells[e.a].min(covered_cells[e.b]).max(1) as f64)
+        .collect();
+
+    let deltas = seam_deltas(&summaries, &owner, phot, surfaces, session.canvas);
+    let delta_values: Vec<f64> = deltas.values().map(|d| d.delta).collect();
+    let seam_delta_max = delta_values.iter().copied().fold(0.0f64, f64::max);
+
+    let summary = MosaicSummary {
+        panels: session.panels.len(),
+        output: [w, h, ch],
+        megapixels: (w * h) as f64 / 1e6,
+        covered_frac: covered as f64 / crop_cells,
+        overlap_edges: graph.edges.len(),
+        median_overlap_frac: median(overlap_fracs),
+        seam_delta_median: median(delta_values),
+        seam_delta_max,
+    };
+
+    let path = session.dir.join("summary.json");
+    let js = serde_json::to_string_pretty(&summary)
+        .map_err(|e| Error::format(&path, format!("summary JSON: {e}")))?;
+    std::fs::write(&path, js).map_err(|e| Error::io(&path, e))?;
+    Ok(summary)
 }
 
 /// Draw `id` in 3×5 bitmap digits (scaled), centered on `(cx, cy)`, white on
@@ -578,11 +691,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The session-level convenience wrapper (the worker's post-blend hook)
-    /// computes the owner map itself and drops `seam_map.png` into the
-    /// session directory.
+    /// The session-level post-blend hook (the worker's) computes the owner
+    /// map once, drops `seam_map.png` (when asked) plus `summary.json` into
+    /// the session directory, and returns the summary stats.
     #[test]
-    fn session_seam_map_lands_in_session_dir() {
+    fn session_reports_land_in_session_dir() {
         let dir = tmpdir("session-map");
         let (w, h) = (128u64, 64u64);
         let mut frame = vec![0f32; (w * h) as usize];
@@ -610,11 +723,47 @@ mod tests {
             offsets: vec![vec![0.0, 0.0]],
         };
 
-        let path = write_session_seam_map(&session, &graph, &phot, None, 16.0).unwrap();
-        assert_eq!(path, session.dir.join("seam_map.png"));
-        let decoder = png::Decoder::new(File::open(&path).unwrap());
+        let summary = write_session_reports(&session, &graph, &phot, None, 16.0, true).unwrap();
+
+        let png_path = session.dir.join("seam_map.png");
+        let decoder = png::Decoder::new(File::open(&png_path).unwrap());
         let reader = decoder.read_info().unwrap();
         assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+
+        // summary.json exists and round-trips to the returned stats.
+        let js = std::fs::read_to_string(session.dir.join("summary.json")).unwrap();
+        let loaded: MosaicSummary = serde_json::from_str(&js).unwrap();
+        assert_eq!(loaded.panels, summary.panels);
+        assert_eq!(loaded.output, summary.output);
+
+        // Panel A covers [8,80)x[8,56), B covers [48,120)x[16,64):
+        // union bbox [8,120)x[8,64) → 112 x 56, 1 channel, one overlap edge.
+        assert_eq!(summary.panels, 2);
+        assert_eq!(summary.output, [112, 56, 1]);
+        assert!((summary.megapixels - 112.0 * 56.0 / 1e6).abs() < 1e-12);
+        assert_eq!(summary.overlap_edges, 1);
+        assert!(
+            summary.median_overlap_frac > 0.0 && summary.median_overlap_frac < 1.0,
+            "overlap frac: {}",
+            summary.median_overlap_frac
+        );
+        assert!(
+            summary.covered_frac > 0.7 && summary.covered_frac <= 1.0,
+            "covered frac: {}",
+            summary.covered_frac
+        );
+        // Uncorrected 0.2-vs-0.4 panels leave a real seam step.
+        assert!(summary.seam_delta_median > 0.0);
+        assert!(summary.seam_delta_max >= summary.seam_delta_median);
+
+        // seam_map = false skips the PNG but still writes the summary.
+        let dir2 = dir.join("no-map.mmm-session");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let session2 = analyze(&[dir.join("a.xisf"), dir.join("b.xisf")], &dir2).unwrap();
+        let graph2 = OverlapGraph::load(&session2.overlap_graph_path()).unwrap();
+        write_session_reports(&session2, &graph2, &phot, None, 16.0, false).unwrap();
+        assert!(!session2.dir.join("seam_map.png").exists());
+        assert!(session2.dir.join("summary.json").exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

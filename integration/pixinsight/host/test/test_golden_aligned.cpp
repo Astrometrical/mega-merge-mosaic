@@ -106,8 +106,15 @@ int main(int argc, char** argv) {
   const std::string files_shm = "/mmm-golden-files-" + std::to_string(pid);
   files_init["shm_name"] = files_shm;
   NeverSource never;
-  RunResult golden_run = run_job(worker_path, files_init, layout, files_shm, never);
+  mmm_test::StageRecorder files_stages;
+  RunResult golden_run = run_job(worker_path, files_init, layout, files_shm, never, &files_stages);
   const std::vector<float>& golden = golden_run.data;
+
+  // Files mode must report analyze progress (per-panel, forwarded from the
+  // file-based analyze pipeline) in addition to the blend's own frames --
+  // this is what gives Files-mode runs the same console bars as Views mode.
+  CHECK(files_stages.stages.count("analyze") == 1);
+  CHECK(files_stages.stages.count("blend") == 1);
 
   // ---- Run 2: Aligned-mode. Our MemSource serves panelN.bin over shm. ----
   MemSource mem;
@@ -176,6 +183,19 @@ int main(int argc, char** argv) {
     std::ifstream none(files_init["session_dir"].get<std::string>() + "/seam_map.png",
                        std::ios::binary);
     CHECK(!none.good());
+  }
+
+  // Mosaic summary: written unconditionally into every run's session dir,
+  // with stats matching the job (panel count, non-empty output geometry).
+  for (const json* init : {&aligned_init, &files_init}) {
+    std::string spath = init->at("session_dir").get<std::string>() + "/summary.json";
+    json summary = json::parse(read_bytes(spath));
+    CHECK(summary.at("panels").get<size_t>() == n_panels);
+    CHECK(summary.at("output")[0].get<uint64_t>() == golden_run.w);
+    CHECK(summary.at("output")[1].get<uint64_t>() == golden_run.h);
+    CHECK(summary.at("output")[2].get<uint64_t>() == golden_run.ch);
+    CHECK(summary.at("overlap_edges").get<size_t>() >= 1);
+    CHECK(summary.at("covered_frac").get<double>() > 0.0);
   }
 
   std::printf("test_golden_aligned OK: %zu elements byte-identical (range [%.6g, %.6g])\n",

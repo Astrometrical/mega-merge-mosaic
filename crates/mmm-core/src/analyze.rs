@@ -113,12 +113,32 @@ pub fn analyze_input(
     surface_order: Option<u32>,
     input: InputSelect,
 ) -> Result<Session> {
+    analyze_input_progress(paths, session_dir, surface_order, input, None)
+}
+
+/// Coarse per-panel progress observer for the file-based analyze pipeline:
+/// `(stage, done, total)` with stage `"reproject"` (solved input only) or
+/// `"analyze"`. Must be `Sync` — the scan stage invokes it from parallel
+/// workers. Matches the stage vocabulary of the IPC `Progress` frames so a
+/// host can render both paths identically.
+pub type AnalyzeProgress<'a> = &'a (dyn Fn(&str, u64, u64) + Sync);
+
+/// [`analyze_input`] with an optional progress observer (module docs on
+/// [`AnalyzeProgress`]). The IPC worker uses this in Files mode to forward
+/// per-panel progress to the host; `analyze_input` itself passes `None`.
+pub fn analyze_input_progress(
+    paths: &[PathBuf],
+    session_dir: &Path,
+    surface_order: Option<u32>,
+    input: InputSelect,
+    progress: Option<AnalyzeProgress>,
+) -> Result<Session> {
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
     }
     match input {
-        InputSelect::Aligned => analyze_aligned(paths, session_dir, surface_order, false),
-        InputSelect::Solved => analyze_solved(paths, session_dir, surface_order),
+        InputSelect::Aligned => analyze_aligned(paths, session_dir, surface_order, false, progress),
+        InputSelect::Solved => analyze_solved(paths, session_dir, surface_order, progress),
         InputSelect::Auto => {
             // Cheap signal first: header geometries only.
             let mut geoms = Vec::with_capacity(paths.len());
@@ -127,11 +147,18 @@ pub fn analyze_input(
                 geoms.push((x.width(), x.height(), x.channels()));
             }
             if paths.len() >= 2 && geoms.iter().all(|&g| g == geoms[0]) {
-                analyze_aligned(paths, session_dir, surface_order, true)
+                analyze_aligned(paths, session_dir, surface_order, true, progress)
             } else {
-                analyze_solved(paths, session_dir, surface_order)
+                analyze_solved(paths, session_dir, surface_order, progress)
             }
         }
+    }
+}
+
+/// Reports `done`/`total` for a stage through an optional observer.
+fn report(progress: Option<AnalyzeProgress>, stage: &str, done: u64, total: u64) {
+    if let Some(p) = progress {
+        p(stage, done, total);
     }
 }
 
@@ -143,13 +170,21 @@ fn analyze_aligned(
     session_dir: &Path,
     surface_order: Option<u32>,
     auto: bool,
+    progress: Option<AnalyzeProgress>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
+    report(progress, "analyze", 0, paths.len() as u64);
+    let scanned = std::sync::atomic::AtomicU64::new(0);
     let scans: Vec<PanelScan> = paths
         .par_iter()
         .enumerate()
-        .map(|(id, path)| scan_panel(id, path))
+        .map(|(id, path)| {
+            let scan = scan_panel(id, path)?;
+            let done = scanned.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            report(progress, "analyze", done, paths.len() as u64);
+            Ok(scan)
+        })
         .collect::<Result<_>>()?;
 
     let canvas = scans[0].canvas;
@@ -181,7 +216,7 @@ fn analyze_aligned(
              raw panels (--input aligned overrides)",
             ALIGNED_MAX_COVERAGE * 100.0
         );
-        return analyze_solved(paths, session_dir, surface_order);
+        return analyze_solved(paths, session_dir, surface_order, progress);
     }
 
     session.canvas = canvas;
@@ -194,6 +229,7 @@ fn analyze_solved(
     paths: &[PathBuf],
     session_dir: &Path,
     surface_order: Option<u32>,
+    progress: Option<AnalyzeProgress>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
@@ -253,11 +289,13 @@ fn analyze_solved(
     // over panels — reproject_panel is already rayon-parallel over output
     // rows, and one panel's working set at a time keeps memory bounded.
     let t_align = Instant::now();
+    report(progress, "reproject", 0, panels.len() as u64);
     let mut aligned = Vec::with_capacity(panels.len());
     for (id, (panel, model)) in panels.iter().enumerate() {
         let t = Instant::now();
         let out_dir = session.dir.join("panels").join(id.to_string());
         let ap = reproject_panel(panel, model, &frame, &out_dir)?;
+        report(progress, "reproject", (id as u64) + 1, panels.len() as u64);
         tracing::info!(
             "aligned panel {}/{}: bbox [{},{})x[{},{}) in {:.2}s",
             id + 1,
@@ -279,6 +317,8 @@ fn analyze_solved(
     drop(panels); // source mmaps no longer needed
 
     // Scan the caches exactly like aligned frames, through PanelReader.
+    report(progress, "analyze", 0, aligned.len() as u64);
+    let scanned = std::sync::atomic::AtomicU64::new(0);
     let scans: Vec<PanelScan> = aligned
         .par_iter()
         .enumerate()
@@ -295,7 +335,10 @@ fn analyze_solved(
                 storage: PanelStorage::CroppedCache { bbox: ap.bbox },
             };
             let reader = PanelReader::open(&meta, canvas)?;
-            scan_reader(meta, reader)
+            let scan = scan_reader(meta, reader)?;
+            let done = scanned.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            report(progress, "analyze", done, aligned.len() as u64);
+            Ok(scan)
         })
         .collect::<Result<_>>()?;
 
@@ -763,8 +806,8 @@ mod tests {
         planar: Vec<Vec<f32>>,
     }
 
-    fn synth_two_full_canvas_panels() -> TwoPanels {
-        let dir = tmpdir("two");
+    fn synth_two_full_canvas_panels(tag: &str) -> TwoPanels {
+        let dir = tmpdir(tag);
         let (w, h, ch) = (32u64, 24u64, 3u64);
         let make = |lo: u64, hi: u64, base: f32| -> Vec<f32> {
             let mut planes = vec![0f32; (w * h * ch) as usize];
@@ -797,7 +840,7 @@ mod tests {
     /// photometry solve.
     #[test]
     fn ipc_aligned_analyze_matches_file_analyze() {
-        let f = synth_two_full_canvas_panels();
+        let f = synth_two_full_canvas_panels("two");
         let ref_dir = f.dir.join("ref.mmm-session");
         let ref_sess = analyze_opts(&f.paths, &ref_dir, Some(2)).unwrap();
 
@@ -822,6 +865,45 @@ mod tests {
             std::fs::read(ref_sess.photometry_path()).unwrap(),
             std::fs::read(ipc_sess.photometry_path()).unwrap()
         );
+
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// The file-based analyze path reports coarse per-panel progress through
+    /// the optional observer (the IPC worker forwards it as Progress frames
+    /// so Files-mode runs get the same console bars as Views-mode runs).
+    #[test]
+    fn file_analyze_reports_progress() {
+        let f = synth_two_full_canvas_panels("progress");
+        let dir = f.dir.join("prog.mmm-session");
+
+        let events = std::sync::Mutex::new(Vec::<(String, u64, u64)>::new());
+        let observer = |stage: &str, done: u64, total: u64| {
+            events
+                .lock()
+                .unwrap()
+                .push((stage.to_string(), done, total));
+        };
+        analyze_input_progress(
+            &f.paths,
+            &dir,
+            Some(2),
+            InputSelect::Aligned,
+            Some(&observer),
+        )
+        .unwrap();
+
+        let events = events.into_inner().unwrap();
+        assert!(!events.is_empty(), "no progress reported");
+        // Aligned inputs scan panels: only the "analyze" stage, ending
+        // complete at done == total == panel count.
+        assert!(events.iter().all(|(s, _, _)| s == "analyze"));
+        let &(_, done, total) = events.last().unwrap();
+        assert_eq!((done, total), (2, 2));
+
+        // The plain entry point still works without an observer.
+        let quiet = f.dir.join("quiet.mmm-session");
+        analyze_input(&f.paths, &quiet, Some(2), InputSelect::Aligned).unwrap();
 
         std::fs::remove_dir_all(&f.dir).unwrap();
     }

@@ -441,6 +441,47 @@ void ShowSeamMap( const std::string& sessionDirUtf8 )
    }
 }
 
+// Prints the worker's end-of-run mosaic summary (<sessionDir>/summary.json,
+// PROTOCOL.md section 6) as a compact console block. Best-effort like
+// ShowSeamMap: a missing or malformed file never fails the completed blend
+// (an older worker simply doesn't write one).
+void PrintSummary( const std::string& sessionDirUtf8 )
+{
+   Console console;
+   try
+   {
+      String path = IsoString( (sessionDirUtf8 + "/summary.json").c_str() ).UTF8ToUTF16();
+      if ( !File::Exists( path ) )
+         return;
+      IsoString text = File::ReadTextFile( path );
+      json s = json::parse( text.c_str() );
+
+      const uint64_t w  = s.at( "output" )[0].get<uint64_t>();
+      const uint64_t h  = s.at( "output" )[1].get<uint64_t>();
+      const uint64_t ch = s.at( "output" )[2].get<uint64_t>();
+      const char* color = ( ch >= 3 ) ? "RGB" : "grayscale";
+
+      console.WriteLn( "<end><cbr><br><b>Mosaic summary</b>" );
+      console.WriteLn( String( IsoString().Format( "  panels          %zu",
+         size_t( s.at( "panels" ).get<uint64_t>() ) ) ) );
+      console.WriteLn( String( IsoString().Format( "  output          %llu x %llu px, %s (%.1f MP)",
+         (unsigned long long)w, (unsigned long long)h, color,
+         s.at( "megapixels" ).get<double>() ) ) );
+      console.WriteLn( String( IsoString().Format( "  coverage        %.1f%% of the output area",
+         100.0*s.at( "covered_frac" ).get<double>() ) ) );
+      console.WriteLn( String( IsoString().Format( "  overlap edges   %zu, median overlap %.1f%% of panel",
+         size_t( s.at( "overlap_edges" ).get<uint64_t>() ),
+         100.0*s.at( "median_overlap_frac" ).get<double>() ) ) );
+      console.WriteLn( String( IsoString().Format( "  seam step       median %.4g, max %.4g",
+         s.at( "seam_delta_median" ).get<double>(),
+         s.at( "seam_delta_max" ).get<double>() ) ) );
+   }
+   catch ( ... )
+   {
+      console.WarningLn( "<end><cbr>** MegaMergeMosaic: could not read the mosaic summary." );
+   }
+}
+
 // Drives one fully-assembled job to completion and shows the output window on
 // success. Throws on any fault or cancellation, leaving no window shown.
 void DriveHost( const std::string& worker_path, json init_body, const std::string& shm_name,
@@ -649,7 +690,11 @@ void RunFiles( const Params& in, const std::string& worker_path )
       FileFormat         format( File::ExtractExtension( path ), true /*toRead*/, false /*toWrite*/ );
       FileFormatInstance file( format );
       ImageDescriptionArray images;
-      if ( !file.Open( images, path ) || images.IsEmpty() )
+      // "verbosity 0": suppress the format driver's per-image console chatter
+      // ("Loading image ...", property counts) during this metadata-only pass
+      // -- with 10+ multi-image files it drowns the banner and progress bars.
+      // Formats without the hint ignore it.
+      if ( !file.Open( images, path, "verbosity 0" ) || images.IsEmpty() )
          throw Error( "MegaMergeMosaic: cannot read image file: " + path );
       const ImageInfo& info = images[0].info;
 
@@ -808,11 +853,13 @@ void run_blend( MmmBlendInstance& in )
    else
       RunFiles( p, worker_path );
 
-   // The run succeeded; surface the requested seam map while the session dir
-   // (and the PNG the worker wrote into it) still exists -- sessionGuard
-   // removes a temp dir when this function returns.
+   // The run succeeded; surface the requested seam map and the end-of-run
+   // summary while the session dir (and the files the worker wrote into it)
+   // still exists -- sessionGuard removes a temp dir when this function
+   // returns.
    if ( p.seamMap )
       ShowSeamMap( p.sessionDir );
+   PrintSummary( p.sessionDir );
 }
 
 // ----------------------------------------------------------------------------

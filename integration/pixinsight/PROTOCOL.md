@@ -317,6 +317,21 @@ names):
 | `surface_order` | u32 or `null` | surface-fit polynomial order for the analyze stage (not part of `BlendParams` itself) |
 | `seam_map` | bool | after a successful blend, the worker writes the seam/ownership map PNG to `<session_dir>/seam_map.png` (built from the session's cached L8 artifacts; no panel re-reads) **before** sending `Done`. The host may read that file once `Done` arrives — and must do so before deleting a temporary session dir. `#[serde(default)]`: absent means `false`, so pre-field hosts are unaffected |
 
+**Post-blend session reports.** Alongside the optional seam map above, the
+worker unconditionally writes `<session_dir>/summary.json` before `Done`: the
+serialized `mmm_core::diag::MosaicSummary` (panel count, output
+`[width, height, channels]` and megapixels, covered fraction of the output
+bounding box, overlap-edge count, median overlap fraction, median/max
+corrected seam step). Same lifetime rule as the seam map: read it after
+`Done`, before deleting a temporary session dir. Hosts must tolerate the file
+being absent (older worker).
+
+**Files-mode progress.** In `Files` mode the worker forwards the file-based
+analyze pipeline's coarse per-panel progress as `Progress` frames — stage
+`"reproject"` (solved input only) and `"analyze"`, `done`/`total` in panels —
+so a host renders the same stage bars in every job mode. (`Aligned`/`Solved`
+IPC modes already emitted these stages with their own granularity.)
+
 **Finite-float precondition.** Before writing an `Init` frame, the sender
 must ensure every float reachable from the payload is finite: JSON has no
 representation for NaN/Infinity, and a naive JSON encoder will silently

@@ -5,7 +5,9 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use mmm_core::analyze::{analyze_input, analyze_ipc_aligned, analyze_ipc_solved, solved_frame};
+use mmm_core::analyze::{
+    analyze_input_progress, analyze_ipc_aligned, analyze_ipc_solved, solved_frame,
+};
 use mmm_core::blend::blend_with_source;
 use mmm_core::ipc::IPC_PROTOCOL_VERSION;
 use mmm_core::ipc::client::HostLink;
@@ -102,11 +104,19 @@ fn run() -> mmm_core::Result<()> {
                 input_select,
             } => {
                 let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-                analyze_input(
+                // Forward the file-based pipeline's per-panel progress as
+                // Progress frames so Files-mode runs get the same
+                // reproject/analyze console bars as Views-mode runs.
+                let progress_link = link.clone();
+                let progress = |stage: &str, done: u64, total: u64| {
+                    progress_link.send_progress(stage, done, total)
+                };
+                analyze_input_progress(
                     &paths,
                     &session_dir,
                     surface_order,
                     input_select.to_input_select(),
+                    Some(&progress),
                 )?
             }
         };
@@ -130,18 +140,18 @@ fn run() -> mmm_core::Result<()> {
             &mut sink,
         )?;
 
-        // Optional post-blend diagnostic: the seam/ownership map PNG, built
-        // entirely from the session's cached L8 analysis artifacts (no panel
-        // re-reads), dropped into the session dir for the host to pick up.
-        if seam_map {
-            mmm_core::diag::write_session_seam_map(
-                &session,
-                &graph,
-                &phot,
-                surfaces.as_ref(),
-                params.feather_px,
-            )?;
-        }
+        // Post-blend reports, built entirely from the session's cached L8
+        // analysis artifacts (no panel re-reads) and dropped into the session
+        // dir for the host to pick up: always `summary.json` (end-of-run
+        // mosaic stats), plus the seam/ownership map PNG when requested.
+        mmm_core::diag::write_session_reports(
+            &session,
+            &graph,
+            &phot,
+            surfaces.as_ref(),
+            params.feather_px,
+            seam_map,
+        )?;
 
         // Sends the final `Done`; `ShmRowSink::finish` is deliberately a
         // no-op (see its doc comment), so this is the one and only

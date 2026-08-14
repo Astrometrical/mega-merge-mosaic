@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -92,9 +93,10 @@ struct RunResult {
 };
 
 // Runs one job to completion and returns the collected mosaic + geometry.
+// `prog` optionally observes Progress frames (e.g. StageRecorder below).
 inline RunResult run_job(const std::string& worker_path, const json& init_body,
                         const mmm::SlotLayout& layout, const std::string& shm_name,
-                        mmm::PanelSource& src) {
+                        mmm::PanelSource& src, mmm::ProgressCallback* prog = nullptr) {
   mmm::HostConfig cfg;
   cfg.worker_path = worker_path;
   cfg.layout = layout;
@@ -102,10 +104,18 @@ inline RunResult run_job(const std::string& worker_path, const json& init_body,
   cfg.init = json{{"Init", init_body}};
 
   BufCollector out;
-  mmm::Host host(std::move(cfg), src, out);
+  mmm::Host host(std::move(cfg), src, out, prog);
   host.run();
   CHECK(!host.cancelled());
   return RunResult{std::move(out.data), out.W, out.H, out.C};
 }
+
+// Records which Progress stages the worker announced.
+struct StageRecorder : mmm::ProgressCallback {
+  std::set<std::string> stages;
+  void on_progress(const std::string& stage, uint64_t, uint64_t) override {
+    stages.insert(stage);
+  }
+};
 
 }  // namespace mmm_test
