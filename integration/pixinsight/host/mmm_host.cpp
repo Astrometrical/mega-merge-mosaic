@@ -86,15 +86,16 @@ void append_win_arg(std::wstring& cmd, const std::wstring& arg) {
 
 // Builds a mutable UTF-16 command line for CreateProcessW (which may modify the
 // buffer in place, so callers pass `cmd.data()`):
-//   "<worker>" <arg0> <arg1> ... [--probe-frame]
+//   "<worker>" <arg0> <arg1> ... [<extra_flag>]
 // The worker exe is ALWAYS quoted so a spaced install path
 // (e.g. C:\Program Files\PixInsight\bin\mmm-ipc-worker.exe) resolves correctly
 // and the `C:\Program.exe` local-hijack misparse is avoided. Additional args
 // come from HostConfig::worker_args (production leaves it empty; tests use it to
-// spawn a real quick-exit process such as cmd.exe /c exit 1). `--probe-frame`
-// is appended in probe mode.
+// spawn a real quick-exit process such as cmd.exe /c exit 1). A non-empty
+// `extra_flag` (e.g. "--probe-frame", "--probe-panels") is appended last.
 std::wstring build_command_line_w(const std::string& worker_path,
-                                  const std::vector<std::string>& args, bool probe) {
+                                  const std::vector<std::string>& args,
+                                  const std::string& extra_flag) {
   std::wstring cmd;
   cmd += L'"';
   cmd += widen(worker_path);
@@ -103,7 +104,10 @@ std::wstring build_command_line_w(const std::string& worker_path,
     cmd += L' ';
     append_win_arg(cmd, widen(a));
   }
-  if (probe) cmd += L" --probe-frame";
+  if (!extra_flag.empty()) {
+    cmd += L' ';
+    append_win_arg(cmd, widen(extra_flag));
+  }
   return cmd;
 }
 #endif
@@ -189,19 +193,25 @@ struct Pipe {
 };
 
 #ifndef _WIN32
-// Spawns `path` with `argv`, redirecting the child's stdin to `child_stdin_rd`
-// and stdout to `child_stdout_wr` (stderr inherited). The four raw pipe fds
-// are closed in the child after the dup2s so no descriptor leaks across exec.
+// Spawns `path` with `argv`, redirecting the child's stdin to `child_stdin_rd`,
+// stdout to `child_stdout_wr`, and (when `child_stderr_wr >= 0`) stderr to
+// `child_stderr_wr`; stderr is inherited otherwise. The raw pipe fds -- the
+// dup2 sources and every parent-retained end in `parent_ends` -- are closed in
+// the child after the dup2s so no descriptor leaks across exec.
 pid_t spawn_worker(const std::string& path, char* const argv[], int child_stdin_rd,
-                   int child_stdout_wr, int close_a, int close_b) {
+                   int child_stdout_wr, int child_stderr_wr,
+                   const std::vector<int>& parent_ends) {
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_adddup2(&fa, child_stdin_rd, STDIN_FILENO);
   posix_spawn_file_actions_adddup2(&fa, child_stdout_wr, STDOUT_FILENO);
+  if (child_stderr_wr >= 0) posix_spawn_file_actions_adddup2(&fa, child_stderr_wr, STDERR_FILENO);
   posix_spawn_file_actions_addclose(&fa, child_stdin_rd);
   posix_spawn_file_actions_addclose(&fa, child_stdout_wr);
-  if (close_a >= 0) posix_spawn_file_actions_addclose(&fa, close_a);
-  if (close_b >= 0) posix_spawn_file_actions_addclose(&fa, close_b);
+  if (child_stderr_wr >= 0) posix_spawn_file_actions_addclose(&fa, child_stderr_wr);
+  for (int fd : parent_ends) {
+    if (fd >= 0) posix_spawn_file_actions_addclose(&fa, fd);
+  }
 
   pid_t pid = -1;
   int rc = posix_spawn(&pid, path.c_str(), &fa, nullptr, argv, environ);
@@ -213,26 +223,30 @@ pid_t spawn_worker(const std::string& path, char* const argv[], int child_stdin_
 }
 #else
 // Windows spawn: CreateProcessW with STARTF_USESTDHANDLES wiring the child's
-// stdin to `child_stdin_rd` and stdout to `child_stdout_wr` (stderr inherited
-// from the host). `bInheritHandles = TRUE` is required for STARTF_USESTDHANDLES
-// to take effect; the caller must have already made the parent-retained pipe
-// ends non-inheritable so the child does not keep them open (which would
-// prevent EOF). Returns the child process HANDLE (caller closes it after
-// reaping).
-HANDLE spawn_worker_win(const std::string& path, const std::vector<std::string>& args, bool probe,
-                        os_handle child_stdin_rd, os_handle child_stdout_wr) {
+// stdin to `child_stdin_rd`, stdout to `child_stdout_wr`, and stderr to
+// `child_stderr_wr` when given (host stderr inherited otherwise).
+// `bInheritHandles = TRUE` is required for STARTF_USESTDHANDLES to take
+// effect; the caller must have already made the parent-retained pipe ends
+// non-inheritable so the child does not keep them open (which would prevent
+// EOF). Returns the child process HANDLE (caller closes it after reaping).
+HANDLE spawn_worker_win(const std::string& path, const std::vector<std::string>& args,
+                        const std::string& extra_flag, os_handle child_stdin_rd,
+                        os_handle child_stdout_wr,
+                        os_handle child_stderr_wr = os_invalid_handle) {
   STARTUPINFOW si;
   ZeroMemory(&si, sizeof si);
   si.cb = sizeof si;
   si.dwFlags = STARTF_USESTDHANDLES;
   si.hStdInput = child_stdin_rd;    // child reads its stdin
   si.hStdOutput = child_stdout_wr;  // child writes its stdout
-  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);  // inherit host stderr
+  si.hStdError = (child_stderr_wr != os_invalid_handle)
+                     ? child_stderr_wr                    // capture into a pipe
+                     : GetStdHandle(STD_ERROR_HANDLE);    // inherit host stderr
 
   PROCESS_INFORMATION pi;
   ZeroMemory(&pi, sizeof pi);
 
-  std::wstring cmd = build_command_line_w(path, args, probe);
+  std::wstring cmd = build_command_line_w(path, args, extra_flag);
   // CREATE_NO_WINDOW: the worker is a console app but the host may be a GUI
   // process (PixInsight); without this flag Windows pops a visible console
   // window for every worker launch. The child still gets an (invisible)
@@ -246,6 +260,133 @@ HANDLE spawn_worker_win(const std::string& path, const std::vector<std::string>&
   return pi.hProcess;
 }
 #endif
+
+// Spawns `worker_path <flag>`, writes `payload` to its stdin (the probe modes
+// read stdin to EOF before writing anything, so a full blocking write cannot
+// deadlock against a full output pipe), closes stdin, then drains stdout AND
+// stderr concurrently with the same pumped wait loop Host::run uses
+// (os_wait_readable2 + prog->on_idle() roughly every Host::kIdleWaitMs).
+// Reaps the child on every path. Returns captured stdout on exit 0. Throws
+// HostCancelled when prog->want_cancel() fires during the drain (child killed
+// first); throws HostError on a nonzero exit, with the trimmed captured
+// stderr in the message (fallback text when stderr is empty).
+std::string run_probe_process(const std::string& worker_path, const std::string& flag,
+                              const std::string& payload, ProgressCallback* prog) {
+  Pipe in_pipe;   // host writes -> worker stdin
+  Pipe out_pipe;  // worker stdout -> host
+  Pipe err_pipe;  // worker stderr -> host (captured for error messages)
+
+#ifdef _WIN32
+  SetHandleInformation(in_pipe.fd[1], HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(out_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(err_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
+  HANDLE child = spawn_worker_win(worker_path, /*args=*/{}, flag, in_pipe.fd[0], out_pipe.fd[1],
+                                  err_pipe.fd[1]);
+#else
+  std::string arg0 = worker_path;
+  std::string arg1 = flag;
+  char* argv[] = {arg0.data(), arg1.data(), nullptr};
+  pid_t pid = spawn_worker(worker_path, argv, in_pipe.fd[0], out_pipe.fd[1], err_pipe.fd[1],
+                           {in_pipe.fd[1], out_pipe.fd[0], err_pipe.fd[0]});
+#endif
+  in_pipe.close_read();
+  out_pipe.close_write();
+  err_pipe.close_write();
+
+  // Mirrors probe_frame's historical fault-isolation guard: any throw between
+  // spawn and reap must still kill+reap the child so a failing probe never
+  // leaks a zombie; `reaped` ensures the happy path waits exactly once.
+  bool reaped = false;
+#ifndef _WIN32
+  int status = 0;
+#else
+  DWORD code = 0;
+#endif
+  auto kill_and_reap = [&]() {
+#ifdef _WIN32
+    TerminateProcess(child, 1);
+    WaitForSingleObject(child, INFINITE);
+    CloseHandle(child);
+#else
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+#endif
+    reaped = true;
+  };
+
+  std::string out;
+  std::string err;
+  try {
+    full_write_fd(in_pipe.fd[1], reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+    in_pipe.close_write();
+
+    bool out_open = true;
+    bool err_open = true;
+    char buf[4096];
+    while (out_open || err_open) {
+      int r = os_wait_readable2(out_open ? out_pipe.fd[0] : os_invalid_handle,
+                                err_open ? err_pipe.fd[0] : os_invalid_handle, Host::kIdleWaitMs);
+      if (r == 0) {
+        if (prog != nullptr) {
+          prog->on_idle();
+          if (prog->want_cancel()) {
+            kill_and_reap();
+            throw HostCancelled{};
+          }
+        }
+        continue;
+      }
+      if ((r & 1) && out_open) {
+        long n = os_read(out_pipe.fd[0], buf, sizeof buf);
+        if (n > 0) {
+          out.append(buf, static_cast<size_t>(n));
+        } else {
+#ifndef _WIN32
+          if (!(n < 0 && errno == EINTR)) out_open = false;
+#else
+          out_open = false;
+#endif
+        }
+      }
+      if ((r & 2) && err_open) {
+        long n = os_read(err_pipe.fd[0], buf, sizeof buf);
+        if (n > 0) {
+          err.append(buf, static_cast<size_t>(n));
+        } else {
+#ifndef _WIN32
+          if (!(n < 0 && errno == EINTR)) err_open = false;
+#else
+          err_open = false;
+#endif
+        }
+      }
+    }
+
+#ifdef _WIN32
+    WaitForSingleObject(child, INFINITE);
+    GetExitCodeProcess(child, &code);
+    CloseHandle(child);
+    reaped = true;
+    const bool failed = (code != 0);
+#else
+    ::waitpid(pid, &status, 0);
+    reaped = true;
+    const bool failed = !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+#endif
+    if (failed) {
+      while (!err.empty() &&
+             (err.back() == '\n' || err.back() == '\r' || err.back() == ' ')) {
+        err.pop_back();
+      }
+      throw HostError("worker " + flag + " failed: " +
+                      (err.empty() ? std::string("exited abnormally") : err));
+    }
+  } catch (...) {
+    if (!reaped) kill_and_reap();
+    throw;
+  }
+  return out;
+}
 
 }  // namespace
 
@@ -288,7 +429,7 @@ void Host::run() {
   // ends non-inheritable so the child does not hold copies (breaks EOF).
   SetHandleInformation(in_pipe.fd[1], HANDLE_FLAG_INHERIT, 0);
   SetHandleInformation(out_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
-  HANDLE child = spawn_worker_win(cfg_.worker_path, cfg_.worker_args, /*probe=*/false,
+  HANDLE child = spawn_worker_win(cfg_.worker_path, cfg_.worker_args, /*extra_flag=*/"",
                                   in_pipe.fd[0], out_pipe.fd[1]);
 #else
   // argv[0] is the exact exe path (no quoting needed for exec); any extra
@@ -302,7 +443,7 @@ void Host::run() {
   for (std::string& s : argv_store) argv.push_back(s.data());
   argv.push_back(nullptr);
   pid_t pid = spawn_worker(cfg_.worker_path, argv.data(), in_pipe.fd[0], out_pipe.fd[1],
-                           in_pipe.fd[1], out_pipe.fd[0]);
+                           /*child_stderr_wr=*/-1, {in_pipe.fd[1], out_pipe.fd[0]});
 #endif
 
   // The child holds its own copies of stdin-rd / stdout-wr now; close our
@@ -478,96 +619,46 @@ void Host::run() {
 }
 
 void Host::probe_frame(const std::string& worker_path, const nlohmann::json& init_obj, uint64_t& w,
-                       uint64_t& h, uint64_t& ch) {
-  Pipe in_pipe;
-  Pipe out_pipe;
-
-#ifdef _WIN32
-  SetHandleInformation(in_pipe.fd[1], HANDLE_FLAG_INHERIT, 0);
-  SetHandleInformation(out_pipe.fd[0], HANDLE_FLAG_INHERIT, 0);
-  HANDLE child = spawn_worker_win(worker_path, /*args=*/{}, /*probe=*/true, in_pipe.fd[0],
-                                  out_pipe.fd[1]);
-#else
-  std::string arg0 = worker_path;
-  std::string arg1 = "--probe-frame";
-  char* argv[] = {arg0.data(), arg1.data(), nullptr};
-
-  pid_t pid = spawn_worker(worker_path, argv, in_pipe.fd[0], out_pipe.fd[1], in_pipe.fd[1],
-                           out_pipe.fd[0]);
-#endif
-  in_pipe.close_read();
-  out_pipe.close_write();
-
-  // From here on the child is spawned but not yet reaped: any throw (stdin
-  // write EPIPE if the worker dies during startup, stdout drain, or parse)
-  // must still kill+reap it, mirroring run()'s fault-isolation guard, so a
-  // failing probe never leaks a zombie. `reaped` ensures the happy path waits
-  // exactly once.
-  bool reaped = false;
-#ifndef _WIN32
-  int status = 0;
-#else
-  DWORD code = 0;
-#endif
-  try {
-    // Write the probe JSON, then close stdin so the worker sees EOF.
-    std::string payload = init_obj.dump();
-    full_write_fd(in_pipe.fd[1], reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
-    in_pipe.close_write();
-
-    // Read all of stdout.
-    std::string out;
-    {
-      char buf[4096];
-      for (;;) {
-        long r = os_read(out_pipe.fd[0], buf, sizeof(buf));
-        if (r < 0) {
-#ifndef _WIN32
-          if (errno == EINTR) continue;
-#endif
-          break;
-        }
-        if (r == 0) break;
-        out.append(buf, static_cast<size_t>(r));
-      }
-    }
-    out_pipe.close_read();
-
-#ifdef _WIN32
-    WaitForSingleObject(child, INFINITE);
-    GetExitCodeProcess(child, &code);
-    CloseHandle(child);
-    reaped = true;
-    if (code != 0) {
-      throw HostError("probe-frame: worker exited abnormally");
-    }
-#else
-    ::waitpid(pid, &status, 0);
-    reaped = true;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      throw HostError("probe-frame: worker exited abnormally");
-    }
-#endif
-    unsigned long long pw = 0, ph = 0, pch = 0;
-    if (std::sscanf(out.c_str(), "%llu %llu %llu", &pw, &ph, &pch) != 3) {
-      throw HostError("probe-frame: could not parse \"w h ch\" from worker output: " + out);
-    }
-    w = pw;
-    h = ph;
-    ch = pch;
-  } catch (...) {
-    if (!reaped) {
-#ifdef _WIN32
-      TerminateProcess(child, 1);
-      WaitForSingleObject(child, INFINITE);
-      CloseHandle(child);
-#else
-      ::kill(pid, SIGKILL);
-      ::waitpid(pid, &status, 0);
-#endif
-    }
-    throw;
+                       uint64_t& h, uint64_t& ch, ProgressCallback* prog) {
+  const std::string out = run_probe_process(worker_path, "--probe-frame", init_obj.dump(), prog);
+  unsigned long long pw = 0, ph = 0, pch = 0;
+  if (std::sscanf(out.c_str(), "%llu %llu %llu", &pw, &ph, &pch) != 3) {
+    throw HostError("probe-frame: could not parse \"w h ch\" from worker output: " + out);
   }
+  w = pw;
+  h = ph;
+  ch = pch;
+}
+
+PanelProbeResult Host::probe_panels(const std::string& worker_path,
+                                    const std::vector<std::string>& paths_utf8,
+                                    const std::string& input_select, ProgressCallback* prog) {
+  nlohmann::json req;
+  req["paths"] = paths_utf8;
+  req["input_select"] = input_select;
+  const std::string out = run_probe_process(worker_path, "--probe-panels", req.dump(), prog);
+
+  PanelProbeResult res;
+  try {
+    nlohmann::json reply = nlohmann::json::parse(out);
+    for (const auto& p : reply.at("panels")) {
+      ProbedPanel pp;
+      pp.width = p.at("width").get<uint64_t>();
+      pp.height = p.at("height").get<uint64_t>();
+      pp.channels = p.at("channels").get<uint64_t>();
+      res.panels.push_back(pp);
+    }
+    const auto& frame = reply.at("frame");
+    if (!frame.is_null()) {
+      res.has_frame = true;
+      res.frame_w = frame.at(0).get<uint64_t>();
+      res.frame_h = frame.at(1).get<uint64_t>();
+      res.frame_ch = frame.at(2).get<uint64_t>();
+    }
+  } catch (const nlohmann::json::exception& e) {
+    throw HostError(std::string("probe-panels: could not parse worker reply: ") + e.what());
+  }
+  return res;
 }
 
 }  // namespace mmm

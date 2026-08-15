@@ -77,6 +77,14 @@ target_link_libraries(test_golden_solved PRIVATE mmm_host)
 add_dependencies(test_golden_solved gen_fixtures build_worker)
 add_test(NAME test_golden_solved COMMAND test_golden_solved ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
 
+# Files-mode metadata probe test: drives the real worker's --probe-panels
+# through Host::probe_panels against both fixture sets and checks frame
+# parity with Host::probe_frame plus stderr capture on a missing file.
+add_executable(test_probe_panels test/test_probe_panels.cpp)
+target_link_libraries(test_probe_panels PRIVATE mmm_host)
+add_dependencies(test_probe_panels gen_fixtures build_worker)
+add_test(NAME test_probe_panels COMMAND test_probe_panels ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
+
 # Fault-isolation tests (Task 9): worker crash (exit-without-Done via
 # /bin/false) and mid-run cancel(), both against the real Host driver. No
 # fixtures needed -- panels are synthesized in-memory.

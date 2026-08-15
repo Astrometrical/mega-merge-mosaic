@@ -67,6 +67,33 @@ inline int os_wait_readable(os_handle h, int timeout_ms) {
         waited += (int)slice;
     }
 }
+
+/// Two-pipe variant of `os_wait_readable`: waits up to `timeout_ms` for
+/// either read end to have data (or EOF/error) available. Returns a bitmask
+/// -- bit 0 set when `h1` is readable, bit 1 for `h2` -- or 0 on timeout.
+/// Either handle may be `os_invalid_handle` to be ignored (both invalid
+/// returns 0 immediately). Same `PeekNamedPipe`-poll mechanism as the
+/// single-pipe wait; a broken pipe reports readable so the caller's read
+/// observes the EOF.
+inline int os_wait_readable2(os_handle h1, os_handle h2, int timeout_ms) {
+    if (h1 == os_invalid_handle && h2 == os_invalid_handle) return 0;
+    for (int waited = 0;;) {
+        int mask = 0;
+        if (h1 != os_invalid_handle) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(h1, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) mask |= 1;
+        }
+        if (h2 != os_invalid_handle) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(h2, nullptr, 0, nullptr, &avail, nullptr) || avail > 0) mask |= 2;
+        }
+        if (mask != 0) return mask;
+        if (waited >= timeout_ms) return 0;
+        DWORD slice = (DWORD)((timeout_ms - waited) < 10 ? (timeout_ms - waited) : 10);
+        Sleep(slice);
+        waited += (int)slice;
+    }
+}
 }  // namespace mmm
 #else
   #include <cerrno>
@@ -99,6 +126,45 @@ inline int os_wait_readable(os_handle h, int timeout_ms) {
         if (r > 0) return 1;   // readable, EOF (POLLHUP), or error (POLLERR)
         if (r == 0) return 0;  // timeout
         if (errno != EINTR) return 1;  // let the read surface the error
+    }
+}
+
+/// Two-pipe variant of `os_wait_readable`: waits up to `timeout_ms` for
+/// either read end to have data (or EOF/error) available. Returns a bitmask
+/// -- bit 0 set when `h1` is readable, bit 1 for `h2` -- or 0 on timeout.
+/// Either handle may be `os_invalid_handle` to be ignored (both invalid
+/// returns 0 immediately). A `poll()` error (other than EINTR, which
+/// retries) reports both live handles readable so the caller's reads
+/// surface the real errno.
+inline int os_wait_readable2(os_handle h1, os_handle h2, int timeout_ms) {
+    struct pollfd pfds[2];
+    int n = 0;
+    int idx1 = -1, idx2 = -1;
+    if (h1 != os_invalid_handle) {
+        pfds[n].fd = h1;
+        pfds[n].events = POLLIN;
+        pfds[n].revents = 0;
+        idx1 = n++;
+    }
+    if (h2 != os_invalid_handle) {
+        pfds[n].fd = h2;
+        pfds[n].events = POLLIN;
+        pfds[n].revents = 0;
+        idx2 = n++;
+    }
+    if (n == 0) return 0;
+    for (;;) {
+        int r = ::poll(pfds, (nfds_t)n, timeout_ms);
+        if (r > 0) {
+            int mask = 0;
+            if (idx1 >= 0 && pfds[idx1].revents != 0) mask |= 1;
+            if (idx2 >= 0 && pfds[idx2].revents != 0) mask |= 2;
+            return mask;
+        }
+        if (r == 0) return 0;          // timeout
+        if (errno != EINTR) {          // let the reads surface the error
+            return (idx1 >= 0 ? 1 : 0) | (idx2 >= 0 ? 2 : 0);
+        }
     }
 }
 }  // namespace mmm

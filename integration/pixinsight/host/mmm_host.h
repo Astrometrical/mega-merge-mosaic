@@ -59,6 +59,35 @@ struct ProgressCallback {
   /// pump its event queue and stay responsive during long worker reads.
   /// Runs on the same thread as `Host::run()`; default is a no-op.
   virtual void on_idle() {}
+  /// Polled by the probe helpers (`Host::probe_frame`/`Host::probe_panels`)
+  /// after each `on_idle()`: return true to abort the probe -- the child is
+  /// killed and `HostCancelled` is thrown. `Host::run()` ignores this (its
+  /// cancellation path is `Host::cancel()`). Default: never cancel.
+  virtual bool want_cancel() { return false; }
+};
+
+/// Thrown by `Host::probe_frame`/`Host::probe_panels` when the
+/// `ProgressCallback` reported `want_cancel()`: a deliberate user stop,
+/// distinct from a `HostError` fault. Carries no message.
+struct HostCancelled {};
+
+/// One panel's header geometry from `Host::probe_panels`.
+struct ProbedPanel {
+  uint64_t width = 0;     ///< Panel width in pixels.
+  uint64_t height = 0;    ///< Panel height in pixels.
+  uint64_t channels = 0;  ///< Channel count.
+};
+
+/// Result of `Host::probe_panels` (PROTOCOL.md Section 11, `--probe-panels`).
+struct PanelProbeResult {
+  /// Per-panel header geometry, in input-path order.
+  std::vector<ProbedPanel> panels;
+  /// True iff the job can resolve to solved mode (the worker reported a
+  /// non-null frame); the `frame_*` fields are meaningful only then.
+  bool has_frame = false;
+  uint64_t frame_w = 0;   ///< Solved mosaic frame width (pixels).
+  uint64_t frame_h = 0;   ///< Solved mosaic frame height (pixels).
+  uint64_t frame_ch = 0;  ///< Solved mosaic frame channel count.
 };
 
 /// Everything needed to start one run. `init` is the full `{"Init":{...}}`
@@ -118,9 +147,29 @@ class Host {
   /// Solved-mode helper: spawn `worker_path --probe-frame`, write `init_obj`
   /// (an `InitJob`-shaped JSON object -- NOT wrapped in `{"Init":...}`) to
   /// its stdin, and parse the `"w h ch"` line it prints. Static, no shm.
-  /// Throws `HostError` on a nonzero exit or unparseable output.
+  /// While the worker runs, `prog` (optional) receives `on_idle()` roughly
+  /// every `kIdleWaitMs` so a GUI host stays pumped; `prog->want_cancel()`
+  /// aborts the probe with `HostCancelled`. Throws `HostError` on a nonzero
+  /// exit (with the worker's captured stderr in the message) or unparseable
+  /// output.
   static void probe_frame(const std::string& worker_path, const nlohmann::json& init_obj,
-                          uint64_t& w, uint64_t& h, uint64_t& ch);
+                          uint64_t& w, uint64_t& h, uint64_t& ch,
+                          ProgressCallback* prog = nullptr);
+
+  /// Files-mode metadata probe (PROTOCOL.md Section 11): spawn
+  /// `worker_path --probe-panels`, send the panel `paths_utf8` (absolute,
+  /// UTF-8) and `input_select` (`"Auto"`/`"Aligned"`/`"Solved"`, the
+  /// `JobMode::Files` wire strings), and return each panel's header geometry
+  /// plus the solved mosaic frame when the job can resolve to solved mode.
+  /// The worker reads only file headers (never pixel data), in parallel, in
+  /// its own process -- the calling GUI thread just pumps `prog->on_idle()`
+  /// while it waits, exactly like `probe_frame`. Throws `HostError` on any
+  /// fault (worker stderr captured into the message, so a corrupt panel is
+  /// named) and `HostCancelled` on `prog->want_cancel()`.
+  static PanelProbeResult probe_panels(const std::string& worker_path,
+                                       const std::vector<std::string>& paths_utf8,
+                                       const std::string& input_select,
+                                       ProgressCallback* prog = nullptr);
 
   /// Longest stretch (ms) `run()` waits on a quiet worker pipe between
   /// `ProgressCallback::on_idle()` calls. When frames are flowing the wait
