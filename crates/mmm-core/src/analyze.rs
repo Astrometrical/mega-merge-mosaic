@@ -49,7 +49,7 @@ use crate::astrometry::WcsModel;
 use crate::formats::XisfProperty;
 use crate::formats::xisf::XisfPanel;
 use crate::ipc::client::HostLink;
-use crate::ipc::protocol::PanelDesc;
+use crate::ipc::protocol::{PanelDesc, PanelProbeGeom, PanelProbeReply};
 use crate::overlap::OverlapGraph;
 use crate::panel_reader::{PanelReader, PanelStorage};
 use crate::session::{InputKind, PanelMeta, Session};
@@ -423,6 +423,60 @@ pub fn solved_frame(
     }
     let frame = choose_frame(&models);
     Ok((models, frame, ch))
+}
+
+/// Files-mode metadata probe (PROTOCOL.md §11, `--probe-panels`): read each
+/// panel's header — geometry plus astrometric properties, never pixel data —
+/// and report per-panel geometry along with the solved mosaic frame when the
+/// job can resolve to solved mode. Lets a GUI host size shm slots for a
+/// Files-mode run without opening any panel file on its own thread.
+///
+/// `frame` follows the same rule the PixInsight host previously implemented
+/// itself: `input` = [`InputSelect::Aligned`] never probes a frame;
+/// [`InputSelect::Solved`] requires every panel to solve (erroring
+/// otherwise, with the same message the analyze stage would produce);
+/// [`InputSelect::Auto`] degrades to `None` when any panel lacks a usable
+/// solution. Header reads run in parallel.
+pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeReply> {
+    if paths.is_empty() {
+        return Err(Error::compute("probe-panels: no input panels given"));
+    }
+    let descs: Vec<PanelDesc> = paths
+        .par_iter()
+        .enumerate()
+        .map(|(id, path)| {
+            let x = XisfPanel::open(path)?;
+            Ok(PanelDesc {
+                panel_id: id as u32,
+                width: x.width(),
+                height: x.height(),
+                channels: x.channels(),
+                properties: x.header().properties.clone(),
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let panels = descs
+        .iter()
+        .map(|d| PanelProbeGeom {
+            width: d.width,
+            height: d.height,
+            channels: d.channels,
+        })
+        .collect();
+
+    let frame = match input {
+        InputSelect::Aligned => None,
+        InputSelect::Solved => {
+            let (_, frame, ch) = solved_frame(&descs).map_err(Error::compute)?;
+            Some([frame.width, frame.height, ch])
+        }
+        InputSelect::Auto => solved_frame(&descs)
+            .ok()
+            .map(|(_, frame, ch)| [frame.width, frame.height, ch]),
+    };
+
+    Ok(PanelProbeReply { panels, frame })
 }
 
 /// The aligned path over panels streamed from an IPC host: mirrors

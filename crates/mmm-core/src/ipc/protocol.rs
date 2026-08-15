@@ -206,6 +206,41 @@ pub struct PanelDesc {
     pub properties: Vec<XisfProperty>,
 }
 
+/// Request read by `mmm-ipc-worker --probe-panels` from stdin: a bare JSON
+/// object (unframed, like `--probe-frame`). See PROTOCOL.md §11.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PanelProbeRequest {
+    /// Panel file paths, one per panel, in `panels` order.
+    pub paths: Vec<String>,
+    /// Aligned-vs-solved override, as in [`JobMode::Files`]. Defaults to
+    /// `Auto` when omitted.
+    #[serde(default)]
+    pub input_select: InputSelectWire,
+}
+
+/// One panel's header geometry in a [`PanelProbeReply`].
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PanelProbeGeom {
+    /// Panel width in pixels.
+    pub width: u64,
+    /// Panel height in pixels.
+    pub height: u64,
+    /// Channel count.
+    pub channels: u64,
+}
+
+/// Reply printed by `--probe-panels` on stdout as one bare JSON object.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PanelProbeReply {
+    /// Per-panel header geometry, in request `paths` order.
+    pub panels: Vec<PanelProbeGeom>,
+    /// `Some([w, h, ch])` — the worker's `choose_frame` result — when the
+    /// job can resolve to solved mode (`input_select` is not `Aligned` and
+    /// every panel carries a usable astrometric solution); `None` otherwise.
+    /// Hosts size output slots by `max(max panel width, frame width)`.
+    pub frame: Option<[u64; 3]>,
+}
+
 /// Wire form of [`BlendParams`]: plain data so it serializes with serde.
 /// `mode` travels as a string (see [`Self::to_params`]) so the wire format
 /// is stable across a `BlendMode` variant reorder; `surface_order` is not
