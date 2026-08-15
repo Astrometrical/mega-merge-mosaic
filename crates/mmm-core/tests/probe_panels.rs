@@ -1,7 +1,7 @@
 //! Tests for [`mmm_core::analyze::probe_panels`] — the Files-mode metadata
 //! probe the IPC worker exposes as `--probe-panels` (PROTOCOL.md §11).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mmm_core::analyze::{InputSelect, probe_panels, solved_frame};
 use mmm_core::formats::xisf::XisfPanel;
@@ -16,7 +16,7 @@ fn tmpdir(tag: &str) -> PathBuf {
 
 /// Two small plate-solved raw panels (mirrors the ipc-worker end-to-end
 /// fixture shape: overlapping footprints, differing geometries).
-fn write_solved(dir: &PathBuf) -> Vec<PathBuf> {
+fn write_solved(dir: &Path) -> Vec<PathBuf> {
     let scale_deg = 1.0e-3_f64;
     let mut paths = Vec::new();
     for (k, (w, h, crval)) in [
@@ -93,7 +93,7 @@ fn unsolved_panels_have_no_frame_in_auto_and_fail_in_solved() {
     let mut paths = Vec::new();
     for k in 0..2u64 {
         let path = dir.join(format!("plain_{k}.xisf"));
-        write_xisf(&path, 8, 6, 1, &vec![0.25f32; 48]).unwrap();
+        write_xisf(&path, 8, 6, 1, &[0.25f32; 48]).unwrap();
         paths.push(path);
     }
 
@@ -119,7 +119,7 @@ fn unsolved_panels_have_no_frame_in_auto_and_fail_in_solved() {
 fn missing_file_errors_with_path() {
     let dir = tmpdir("missing");
     let good = dir.join("good.xisf");
-    write_xisf(&good, 4, 4, 1, &vec![0.1f32; 16]).unwrap();
+    write_xisf(&good, 4, 4, 1, &[0.1f32; 16]).unwrap();
     let bad = dir.join("nope.xisf");
     let err = probe_panels(&[good, bad.clone()], InputSelect::Auto).unwrap_err();
     assert!(err.to_string().contains("nope.xisf"), "got: {err}");

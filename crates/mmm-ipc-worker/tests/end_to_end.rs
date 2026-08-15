@@ -1032,10 +1032,7 @@ fn probe_panels_reports_geometry_and_frame() {
         ),
         (headers[0].0, headers[0].1, headers[0].2)
     );
-    assert_eq!(
-        reply.frame,
-        Some([frame.width, frame.height, headers[0].2])
-    );
+    assert_eq!(reply.frame, Some([frame.width, frame.height, headers[0].2]));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
