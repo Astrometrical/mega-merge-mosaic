@@ -119,6 +119,13 @@ constexpr uint32_t kOutputSlots = 2;
 // worker reads multi-GB panel files and emits no Progress frames. Without it
 // the GUI thread parks in a blocking pipe read and Windows greys the window
 // as "not responding" after ~5 s of unpumped events.
+//
+// The probe phases are pumped the same way: Host::probe_frame and
+// Host::probe_panels take this observer too, and honor want_cancel() by
+// killing the probe child (surfaced as mmm::HostCancelled -> ProcessAborted).
+// Files mode in particular never opens a panel file on this thread -- the
+// worker's --probe-panels does the whole metadata pass (header-only,
+// parallel) in its own process, so even an 80-panel scan leaves the UI live.
 class ConsoleProgress : public mmm::ProgressCallback
 {
 public:
@@ -193,6 +200,15 @@ public:
       PumpEventsAndPollAbort();
    }
 
+   bool want_cancel() override
+   {
+      // Polled by the Host probe helpers (probe_frame/probe_panels) after
+      // each on_idle(): during a probe there is no live Host to cancel(), so
+      // the abort is delivered by killing the probe child instead
+      // (HostCancelled, which the Run* callers map to ProcessAborted).
+      return m_abortSeen;
+   }
+
 private:
 
    void PumpEventsAndPollAbort()
@@ -200,6 +216,7 @@ private:
       Module->ProcessEvents();
       if ( m_console.AbortRequested() )
       {
+         m_abortSeen = true;
          m_console.Abort();
          if ( host != nullptr )
             host->cancel();
@@ -210,6 +227,7 @@ private:
    String  m_stage;
    int     m_lastPercent = -1;
    int     m_lineLen = 0;   // visible glyphs currently on the in-progress line
+   bool    m_abortSeen = false;   // sticky: Console abort observed this run
 
    // Erase the previously drawn glyphs with backspaces (the console's <bsp>
    // deletes a glyph; <bol>+write inserts, so \r cannot be used), then draw.
@@ -484,8 +502,11 @@ void PrintSummary( const std::string& sessionDirUtf8 )
 
 // Drives one fully-assembled job to completion and shows the output window on
 // success. Throws on any fault or cancellation, leaving no window shown.
+// `prog` is caller-owned (RunViews/RunFiles construct it before their probe
+// phase, so the same abort state spans probe and run; the caller has already
+// called Console().EnableAbort()).
 void DriveHost( const std::string& worker_path, json init_body, const std::string& shm_name,
-                const mmm::SlotLayout& layout, mmm::PanelSource& source )
+                const mmm::SlotLayout& layout, mmm::PanelSource& source, ConsoleProgress& prog )
 {
    mmm::HostConfig cfg;
    cfg.worker_path = worker_path;
@@ -494,9 +515,7 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    cfg.init        = json{ { "Init", std::move( init_body ) } };
 
    ImageWindowCollector collector;
-   ConsoleProgress      prog;
 
-   Console().EnableAbort();
    mmm::Host host( std::move( cfg ), source, collector, &prog );
    prog.host = &host;
    s_activeHost.store( &host );
@@ -538,6 +557,11 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
 
 void RunViews( const Params& in, const std::string& worker_path )
 {
+   // Progress/abort observer shared by the probe phase and the run itself
+   // (want_cancel is sticky across both).
+   Console().EnableAbort();
+   ConsoleProgress prog;
+
    // Resolve every stored view id to a live view.
    Array<View> views;
    for ( const String& id : in.viewIds )
@@ -637,7 +661,14 @@ void RunViews( const Params& in, const std::string& worker_path )
          init_body["canvas"] = { uint64_t( 0 ), uint64_t( 0 ), ch };
 
          uint64_t fw = 0, fh = 0, fch = 0;
-         mmm::Host::probe_frame( worker_path, init_body, fw, fh, fch );
+         try
+         {
+            mmm::Host::probe_frame( worker_path, init_body, fw, fh, fch, &prog );
+         }
+         catch ( const mmm::HostCancelled& )
+         {
+            throw ProcessAborted();
+         }
          const uint64_t width = ( fw > max_panel_w ) ? fw : max_panel_w;
          slot_bytes = width * ch * band_rows * 4;
       }
@@ -657,7 +688,7 @@ void RunViews( const Params& in, const std::string& worker_path )
 
       mmm::SlotLayout layout{ slot_bytes, kInputSlots, kOutputSlots };
       ViewPanelSource source( views );
-      DriveHost( worker_path, std::move( init_body ), shm_name, layout, source );
+      DriveHost( worker_path, std::move( init_body ), shm_name, layout, source, prog );
    }
    catch ( ... )
    {
@@ -674,59 +705,57 @@ void RunViews( const Params& in, const std::string& worker_path )
 
 void RunFiles( const Params& in, const std::string& worker_path )
 {
-   // Read each file's geometry AND astrometric properties (no pixel load). The
-   // run itself sends empty PanelDesc.properties -- the worker re-derives the
-   // solution from the files it reads (PROTOCOL.md section 11) -- but we keep the
-   // read properties to size the output slot safely (see the probe below).
-   json     panels        = json::array();   // the run panels (empty properties)
-   json     probe_panels  = json::array();   // the same panels WITH properties, for --probe-frame
-   json     file_paths    = json::array();
-   uint64_t max_w         = 0;
-   uint64_t ch0           = 0;
-   uint32_t pid           = 0;
-   bool     allHaveSolution = true;
+   // Progress/abort observer shared by the probe phase and the run itself
+   // (want_cancel is sticky across both).
+   Console console;
+   console.EnableAbort();
+   ConsoleProgress prog;
+
+   // Delegate the metadata pass to the worker (PROTOCOL.md section 11,
+   // --probe-panels): header-only parallel reads in a child process while this
+   // GUI thread pumps events via prog.on_idle() -- the module never opens a
+   // panel file itself, so a run over dozens of multi-GB panels cannot freeze
+   // the UI, and the Console abort works even during the scan. The reply also
+   // carries the solved mosaic frame (the worker's own choose_frame) exactly
+   // when the run can resolve to solved mode, replacing the separate
+   // host-side property read + --probe-frame round trip.
+   std::vector<std::string> paths_utf8;
+   paths_utf8.reserve( size_t( in.filePaths.Length() ) );
    for ( const String& path : in.filePaths )
+      paths_utf8.push_back( std::string( path.ToUTF8().c_str() ) );
+
+   console.Write( String().Format( "<end><cbr>Reading metadata of %u panel files... ",
+                                   unsigned( paths_utf8.size() ) ) );
+   mmm::PanelProbeResult probe;
+   try
    {
-      FileFormat         format( File::ExtractExtension( path ), true /*toRead*/, false /*toWrite*/ );
-      FileFormatInstance file( format );
-      ImageDescriptionArray images;
-      // "verbosity 0": suppress the format driver's per-image console chatter
-      // ("Loading image ...", property counts) during this metadata-only pass
-      // -- with 10+ multi-image files it drowns the banner and progress bars.
-      // Formats without the hint ignore it.
-      if ( !file.Open( images, path, "verbosity 0" ) || images.IsEmpty() )
-         throw Error( "MegaMergeMosaic: cannot read image file: " + path );
-      const ImageInfo& info = images[0].info;
-
-      // Read this file's astrometric solution, if the format carries one.
-      json props = json::array();
-      if ( format.CanStoreImageProperties() )
-         props = extract_astrometry_props( file.ReadImageProperties() );
-      if ( props.empty() )
-         allHaveSolution = false;
-
-      json pd;
-      pd["panel_id"] = pid;
-      pd["width"]    = uint64_t( info.width );
-      pd["height"]   = uint64_t( info.height );
-      pd["channels"] = uint64_t( info.numberOfChannels );
-
-      json ppd            = pd;
-      pd["properties"]    = json::array();
-      ppd["properties"]   = std::move( props );
-      panels.push_back( std::move( pd ) );
-      probe_panels.push_back( std::move( ppd ) );
-      file_paths.push_back( std::string( path.ToUTF8().c_str() ) );
-
-      if ( uint64_t( info.width ) > max_w )
-         max_w = uint64_t( info.width );
-      if ( pid == 0 )
-         ch0 = uint64_t( info.numberOfChannels );
-
-      file.Close();
-      ++pid;
+      probe = mmm::Host::probe_panels( worker_path, paths_utf8,
+                                       InputSelectWireString( in.inputSelect ), &prog );
    }
+   catch ( const mmm::HostCancelled& )
+   {
+      throw ProcessAborted();
+   }
+   console.WriteLn( "done." );
 
+   json     panels     = json::array();   // the run panels (empty properties)
+   json     file_paths = json::array();
+   uint64_t max_w      = 0;
+   for ( size_t i = 0; i < probe.panels.size(); ++i )
+   {
+      const mmm::ProbedPanel& p = probe.panels[i];
+      json pd;
+      pd["panel_id"]   = uint32_t( i );
+      pd["width"]      = p.width;
+      pd["height"]     = p.height;
+      pd["channels"]   = p.channels;
+      pd["properties"] = json::array();
+      panels.push_back( std::move( pd ) );
+      file_paths.push_back( paths_utf8[i] );
+      if ( p.width > max_w )
+         max_w = p.width;
+   }
+   const uint64_t ch0       = probe.panels[0].channels;
    const uint64_t band_rows = uint64_t( uint32_t( in.bandRows ) );
 
    // Output-slot sizing. The output band width is the width of the frame the
@@ -734,35 +763,16 @@ void RunFiles( const Params& in, const std::string& worker_path )
    // (PROTOCOL.md section 11):
    //   * SOLVED  -- the worker reprojects onto its own choose_frame, whose width
    //     can EXCEED every input file's width. Sizing by input width alone would
-   //     silently overrun the output slot (section 7 hazard). So when the run can
-   //     resolve to solved (input_select Solved or Auto) AND every file carries a
-   //     plate solution, probe the worker for the frame width -- exactly as
-   //     test_golden_solved.cpp sizes its Files(Solved) run -- and take the max.
+   //     silently overrun the output slot (section 7 hazard). The probe reports
+   //     that frame (has_frame) exactly when the run can resolve to solved
+   //     (input_select Solved or Auto, and every file carries a plate
+   //     solution); take the max.
    //   * ALIGNED -- the output canvas width == the (shared) file width, so the
    //     widest input file is exact. This covers input_select Aligned, and Auto
-   //     with registered (no-solution) files.
-   const bool canSolve = ( in.inputSelect == MmmInputSelectParameter::Solved ) ||
-                         ( in.inputSelect == MmmInputSelectParameter::Auto );
+   //     with registered (no-solution) files -- the probe reports no frame.
    uint64_t width = max_w;
-   if ( canSolve && allHaveSolution )
-   {
-      json probe_init;
-      probe_init["protocol_version"] = 2;
-      probe_init["shm_name"]         = "";
-      probe_init["slot_bytes"]       = 0;
-      probe_init["input_slots"]      = 0;
-      probe_init["output_slots"]     = 0;
-      probe_init["canvas"]           = { uint64_t( 0 ), uint64_t( 0 ), ch0 };
-      probe_init["panels"]           = std::move( probe_panels );
-      probe_init["mode"]             = "Solved";
-      probe_init["session_dir"]      = "";
-      probe_init["params"]           = BuildParams( in );
-
-      uint64_t fw = 0, fh = 0, fch = 0;
-      mmm::Host::probe_frame( worker_path, probe_init, fw, fh, fch );
-      if ( fw > width )
-         width = fw;
-   }
+   if ( probe.has_frame && probe.frame_w > width )
+      width = probe.frame_w;
    const uint64_t slot_bytes = width * ch0 * band_rows * 4;
 
    json init_body;
@@ -783,7 +793,7 @@ void RunFiles( const Params& in, const std::string& worker_path )
 
    mmm::SlotLayout layout{ slot_bytes, kInputSlots, kOutputSlots };
    NullPanelSource source;
-   DriveHost( worker_path, std::move( init_body ), shm_name, layout, source );
+   DriveHost( worker_path, std::move( init_body ), shm_name, layout, source, prog );
 }
 
 } // namespace
