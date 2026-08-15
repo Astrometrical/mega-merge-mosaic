@@ -966,3 +966,76 @@ fn probe_frame_prints_choose_frame_geometry() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `--probe-panels`: paths in, per-panel geometry + solved frame out —
+/// the metadata pass a Files-mode PixInsight host runs instead of opening
+/// panels itself (PROTOCOL.md §11).
+#[test]
+fn probe_panels_reports_geometry_and_frame() {
+    use std::io::Write;
+    let dir = tmpdir("probe-panels");
+    let (paths, _planars) = write_two_solved_panels(&dir);
+
+    // Expected frame, computed exactly as the worker will.
+    let headers: Vec<(u64, u64, u64, Vec<mmm_core::formats::XisfProperty>)> = paths
+        .iter()
+        .map(|p| {
+            let xp = XisfPanel::open(p).unwrap();
+            (
+                xp.width(),
+                xp.height(),
+                xp.channels(),
+                xp.header().properties.clone(),
+            )
+        })
+        .collect();
+    let models: Vec<WcsModel> = headers
+        .iter()
+        .map(|(w, h, _, props)| WcsModel::from_properties(props, *w, *h).unwrap())
+        .collect();
+    let frame = choose_frame(&models);
+
+    let req = serde_json::json!({
+        "paths": paths.iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>(),
+        "input_select": "Auto",
+    });
+
+    let exe = env!("CARGO_BIN_EXE_mmm-ipc-worker");
+    let mut child = std::process::Command::new(exe)
+        .arg("--probe-panels")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(req.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "probe exited nonzero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let reply: mmm_core::ipc::protocol::PanelProbeReply =
+        serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply.panels.len(), 2);
+    assert_eq!(
+        (
+            reply.panels[0].width,
+            reply.panels[0].height,
+            reply.panels[0].channels
+        ),
+        (headers[0].0, headers[0].1, headers[0].2)
+    );
+    assert_eq!(
+        reply.frame,
+        Some([frame.width, frame.height, headers[0].2])
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

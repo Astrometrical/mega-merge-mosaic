@@ -19,8 +19,15 @@ use mmm_core::photometry::Photometry;
 use mmm_core::surfaces::Surfaces;
 
 fn main() {
-    let probe = std::env::args().any(|a| a == "--probe-frame");
-    let result = if probe { probe_frame() } else { run() };
+    let probe_frame_mode = std::env::args().any(|a| a == "--probe-frame");
+    let probe_panels_mode = std::env::args().any(|a| a == "--probe-panels");
+    let result = if probe_frame_mode {
+        probe_frame()
+    } else if probe_panels_mode {
+        probe_panels()
+    } else {
+        run()
+    };
     if let Err(e) = result {
         let _ = writeln!(std::io::stderr(), "mmm-ipc-worker: {e}");
         std::process::exit(1);
@@ -47,6 +54,26 @@ fn probe_frame() -> mmm_core::Result<()> {
     writeln!(std::io::stdout(), "{} {} {}", frame.width, frame.height, ch)
         .map_err(|e| mmm_core::Error::compute(format!("probe-frame: writing stdout: {e}")))?;
     Ok(())
+}
+
+/// `--probe-panels`: read a `PanelProbeRequest` JSON object on stdin (a bare
+/// object, unframed like `--probe-frame`), open each panel's header via
+/// [`mmm_core::analyze::probe_panels`] (parallel, header-only — no pixel
+/// reads), and print the `PanelProbeReply` JSON on stdout. The Files-mode
+/// metadata pass a GUI host delegates to this process so its own thread
+/// never touches the panel files (PROTOCOL.md §11).
+fn probe_panels() -> mmm_core::Result<()> {
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .map_err(|e| mmm_core::Error::compute(format!("reading probe JSON from stdin: {e}")))?;
+    let req: mmm_core::ipc::protocol::PanelProbeRequest = serde_json::from_str(&buf)
+        .map_err(|e| mmm_core::Error::compute(format!("parsing PanelProbeRequest JSON: {e}")))?;
+    let paths: Vec<PathBuf> = req.paths.iter().map(PathBuf::from).collect();
+    let reply = mmm_core::analyze::probe_panels(&paths, req.input_select.to_input_select())?;
+    let text = serde_json::to_string(&reply)
+        .map_err(|e| mmm_core::Error::compute(format!("encoding PanelProbeReply: {e}")))?;
+    writeln!(std::io::stdout(), "{text}")
+        .map_err(|e| mmm_core::Error::compute(format!("probe-panels: writing stdout: {e}")))
 }
 
 /// Reads the one `HostMsg::Init` frame off stdin, drives analyze then blend
