@@ -52,6 +52,22 @@ std::wstring win_object_name(const std::string& name) {
 }
 #endif
 
+// Portable shm-name validation, enforced on EVERY platform so a name works
+// everywhere or nowhere: POSIX requires the single leading '/'; macOS
+// additionally caps names at 31 chars (PSHMNAMLEN) and fails longer ones
+// with a bare EINVAL — enforcing that limit here turns it into this clear
+// message on the developer's platform instead of a macOS-only CI crash.
+void validate_shm_name(const std::string& name) {
+  constexpr size_t kMaxLen = 31;  // macOS PSHMNAMLEN
+  if (name.size() < 2 || name[0] != '/' || name.find('/', 1) != std::string::npos ||
+      name.size() > kMaxLen) {
+    throw std::runtime_error(
+        "shm name \"" + name + "\" is invalid: it must start with '/', contain no " +
+        "other slashes, and be at most " + std::to_string(kMaxLen) +
+        " characters (the macOS PSHMNAMLEN limit, enforced on every platform)");
+  }
+}
+
 }  // namespace
 
 ShmSegment::ShmSegment(std::string name, uint8_t* base, uint64_t size,
@@ -61,11 +77,15 @@ ShmSegment::ShmSegment(std::string name, uint8_t* base, uint64_t size,
 #ifndef _WIN32
 
 ShmSegment ShmSegment::create(const std::string& name, uint64_t total_bytes) {
-  // Defensively unlink a stale segment left behind by a crashed prior run;
-  // ENOENT (nothing to clean up) is expected and not an error.
-  if (shm_unlink(name.c_str()) != 0 && errno != ENOENT) {
-    throw_errno("shm_unlink(" + name + ") failed while clearing a stale segment");
-  }
+  validate_shm_name(name);
+
+  // Best-effort cleanup of a stale segment left behind by a crashed prior
+  // run: ENOENT (nothing to clean up) is the normal case, and any other
+  // failure is deliberately ignored too — the shm_open right below reports
+  // the real, actionable error for this name, whereas throwing from this
+  // cleanup once turned a macOS name-length EINVAL into a bare
+  // "shm_unlink ... Invalid argument" crash.
+  (void)shm_unlink(name.c_str());
 
   int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   if (fd < 0) {
@@ -138,6 +158,10 @@ ShmSegment& ShmSegment::operator=(ShmSegment&& other) noexcept {
 #else  // _WIN32
 
 ShmSegment ShmSegment::create(const std::string& name, uint64_t total_bytes) {
+  // Windows file mappings have no PSHMNAMLEN limit, but the guard runs here
+  // too so a name is valid on every platform or none.
+  validate_shm_name(name);
+
   std::wstring wname = win_object_name(name);
   ULARGE_INTEGER sz;
   sz.QuadPart = total_bytes;

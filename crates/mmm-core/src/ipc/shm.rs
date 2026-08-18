@@ -58,6 +58,26 @@ pub struct ShmSegment {
     map: memmap2::MmapMut,
 }
 
+/// Portable shm-name validation, enforced by [`ShmSegment::create`] on every
+/// platform so a name works everywhere or nowhere: POSIX requires the single
+/// leading `/`; macOS additionally caps names at 31 characters (`PSHMNAMLEN`)
+/// and fails longer ones with a bare `EINVAL` — enforcing the limit here
+/// turns that into a clear message on the developer's platform instead of a
+/// macOS-only CI failure. Mirrors `validate_shm_name` in the C++ host
+/// (`mmm_shm.cpp`).
+#[cfg(any(unix, windows))]
+fn validate_shm_name(name: &str) -> Result<()> {
+    const MAX_LEN: usize = 31; // macOS PSHMNAMLEN
+    if name.len() < 2 || !name.starts_with('/') || name[1..].contains('/') || name.len() > MAX_LEN {
+        return Err(Error::compute(format!(
+            "shm name {name:?} is invalid: it must start with '/', contain no other \
+             slashes, and be at most {MAX_LEN} characters (the macOS PSHMNAMLEN \
+             limit, enforced on every platform)"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 impl ShmSegment {
     /// Create a new shared-memory segment named `name`, sized
@@ -69,24 +89,23 @@ impl ShmSegment {
     ///
     /// macOS limits POSIX shm object names to 31 characters (`PSHMNAMLEN`),
     /// including the leading `/`; `shm_open`/`shm_unlink` fail with `EINVAL`
-    /// beyond that. Keep `name` short. The production name generator
+    /// beyond that. [`validate_shm_name`] enforces the limit on every
+    /// platform up front, so a long ad hoc test name fails with a clear
+    /// message rather than only on macOS. The production name generator
     /// (`MakeShmName` in the C++ host) already produces short names
-    /// (`/mmm-pxm-<pid>-<ctr>`, ~20 chars); this only bites long ad hoc test
-    /// names.
+    /// (`/mmm-pxm-<pid>-<ctr>`, ~20 chars).
     pub fn create(name: &str, total_bytes: u64) -> Result<ShmSegment> {
-        use nix::errno::Errno;
         use nix::fcntl::OFlag;
         use nix::sys::mman::{shm_open, shm_unlink};
         use nix::sys::stat::Mode;
 
-        match shm_unlink(name) {
-            Ok(()) | Err(Errno::ENOENT) => {}
-            Err(e) => {
-                return Err(Error::compute(format!(
-                    "shm_unlink({name}) failed while clearing a stale segment: {e}"
-                )));
-            }
-        }
+        validate_shm_name(name)?;
+
+        // Best-effort cleanup of a stale segment left behind by a crashed
+        // prior run: ENOENT is the normal case, and any other failure is
+        // deliberately ignored too — the shm_open below reports the real,
+        // actionable error for this name.
+        let _ = shm_unlink(name);
 
         let fd = shm_open(
             name,
@@ -360,6 +379,9 @@ impl ShmSegment {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
         };
+        // Windows file mappings have no PSHMNAMLEN limit, but the guard
+        // runs here too so a name is valid on every platform or none.
+        validate_shm_name(name)?;
         let wname = win_object_name(name);
         // A job with 0 input slots and 0 output slots (a degenerate
         // test-only case; see `ipc::client::tests`) yields `total_bytes ==
@@ -682,5 +704,24 @@ mod tests {
         let name = format!("/mmm-shm-test-zero-{}", std::process::id());
         let host = ShmSegment::create(&name, 0).unwrap();
         assert_eq!(host.slice(0, 0), &[] as &[f32]);
+    }
+
+    /// Names must be portable across every platform we ship: leading '/'
+    /// only, and at most 31 chars — the macOS PSHMNAMLEN limit, enforced
+    /// everywhere so a too-long name fails with this clear message on the
+    /// developer's platform instead of a bare EINVAL only on macOS CI.
+    #[test]
+    fn create_rejects_unportable_names() {
+        for name in [
+            "/mmm-this-name-is-well-over-thirty-one-chars",
+            "no-leading-slash",
+            "/mmm/embedded/slashes",
+        ] {
+            let err = ShmSegment::create(name, 4096).unwrap_err();
+            assert!(
+                err.to_string().contains("shm name"),
+                "{name} not refused clearly: {err}"
+            );
+        }
     }
 }

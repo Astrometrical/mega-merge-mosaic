@@ -146,7 +146,7 @@ int main(int argc, char** argv) {
   files_init["session_dir"] = fixtures + "/solved_files_" + std::to_string(pid) + ".mmm-session";
   files_init["params"] = params;
 
-  const std::string files_shm = "/mmm-golden-solved-files-" + std::to_string(pid);
+  const std::string files_shm = "/mmm-gsolved-files-" + std::to_string(pid);
   files_init["shm_name"] = files_shm;
   NeverSource never;
   RunResult golden_run = run_job(worker_path, files_init, layout, files_shm, never);

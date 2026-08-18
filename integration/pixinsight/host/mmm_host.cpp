@@ -446,7 +446,18 @@ void Host::run() {
 
   // RAII: the segment is released when `shm` leaves scope on ANY path (POSIX
   // unlinks; Windows drops its handle -- the mapping vanishes on last close).
-  ShmSegment shm = ShmSegment::create(cfg_.shm_name, cfg_.layout.total_bytes());
+  // The create failure is converted here because it runs before the serve
+  // loop's own try block: run()'s contract is "throws HostError on any
+  // fault", never a raw std::runtime_error.
+  ShmSegment shm = [&] {
+    try {
+      return ShmSegment::create(cfg_.shm_name, cfg_.layout.total_bytes());
+    } catch (const HostError&) {
+      throw;
+    } catch (const std::exception& e) {
+      throw HostError(e.what());
+    }
+  }();
 
   Pipe in_pipe;   // host writes in_pipe[1] -> worker stdin (in_pipe[0])
   Pipe out_pipe;  // worker stdout (out_pipe[1]) -> host reads out_pipe[0]

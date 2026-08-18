@@ -79,8 +79,12 @@ Outcome run_scenario(const std::string& rogue_path, const std::string& scenario,
                      std::vector<uint64_t> canvas) {
   const uint64_t slot_bytes = 32 * 1 * 8 * 4;
   mmm::SlotLayout layout{slot_bytes, 4, 2};
-  const std::string shm_name =
-      "/mmm-validation-" + scenario + "-" + std::to_string(mmm_test_getpid());
+  // Short per-scenario shm name: macOS caps POSIX shm names at 31 chars
+  // (PSHMNAMLEN), so the scenario string must NOT be embedded -- a counter
+  // keeps runs distinct. "/mmmv<n>-<pid>" stays well under the limit.
+  static int scenario_counter = 0;
+  const std::string shm_name = "/mmmv" + std::to_string(scenario_counter++) + "-" +
+                               std::to_string(mmm_test_getpid());
 
   json panels = json::array();
   for (uint32_t id = 0; id < 2; id++) {
@@ -216,6 +220,56 @@ int main(int argc, char** argv) {
     Outcome out = run_scenario(rogue, "request_overflows_slot", {32, 32, 1});
     expect_refused(out, "exceeds the slot");
     CHECK(out.fills == 0);
+  }
+
+  // --- Shm setup failures honor the HostError contract ----------------------
+  // ShmSegment::create runs before Host::run's serve loop, but its failure
+  // must still surface as HostError per the documented contract ("throws
+  // HostError on any fault"), never a raw std::runtime_error. The name here
+  // is over the 31-char macOS PSHMNAMLEN limit, which ShmSegment::create
+  // refuses portably.
+  {
+    mmm::HostConfig cfg;
+    cfg.worker_path = rogue;
+    cfg.worker_args = {"valid"};
+    cfg.layout = mmm::SlotLayout{1024, 4, 2};
+    cfg.shm_name = "/mmm-shm-name-well-over-thirty-one-chars";
+    json pd;
+    pd["panel_id"] = 0;
+    pd["width"] = 32;
+    pd["height"] = 32;
+    pd["channels"] = 1;
+    pd["properties"] = json::array();
+    json init;
+    init["shm_name"] = cfg.shm_name;
+    init["slot_bytes"] = 1024;
+    init["input_slots"] = 4;
+    init["output_slots"] = 2;
+    init["canvas"] = {32, 32, 1};
+    init["panels"] = json::array({pd});
+    init["mode"] = "Aligned";
+    init["session_dir"] = "";
+    init["params"] = mmm_test::make_params(8, 8.0);
+    cfg.init = json{{"Init", init}};
+
+    CountingSource src;
+    CountingCollector col;
+    mmm::Host host(std::move(cfg), src, col);
+    bool host_error = false;
+    std::string msg;
+    try {
+      host.run();
+    } catch (const mmm::HostError& e) {
+      host_error = true;
+      msg = e.what();
+    } catch (const std::exception& e) {
+      msg = std::string("WRONG TYPE: ") + e.what();
+    }
+    std::fprintf(stderr, "  %-22s -> %s\n", "bad_shm_name",
+                 host_error ? ("HostError: " + msg).c_str() : msg.c_str());
+    CHECK(host_error);
+    CHECK(msg.find("shm name") != std::string::npos);
+    CHECK(!col.began);
   }
 
   std::printf("test_validation OK: rogue Begin/OutputBand/BandRequest values "
