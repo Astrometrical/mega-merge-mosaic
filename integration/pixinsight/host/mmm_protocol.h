@@ -16,6 +16,22 @@
 
 namespace mmm {
 
+/// Wire-protocol version this host speaks, mirroring
+/// `crates/mmm-core/src/ipc/mod.rs` `IPC_PROTOCOL_VERSION`. `Host` stamps it
+/// into every `Init` it sends (overriding any value the caller put there);
+/// the worker aborts on a mismatch.
+inline constexpr uint32_t kProtocolVersion = 3;
+
+/// Exact release version of the `mmm-ipc-worker` binary this host library
+/// was built to drive (the worker's `CARGO_PKG_VERSION`). `Host` stamps it
+/// into every `Init` and probe request; the worker refuses the job on any
+/// mismatch, so a skewed module/worker pair (e.g. a stale worker binary
+/// left behind by a partial update) fails with a clear message instead of
+/// risking silently divergent band semantics. Kept in exact sync with the
+/// workspace `Cargo.toml` version and the module's `MMM_VERSION_STRING` --
+/// enforced by `crates/mmm-ipc-worker/tests/version_sync.rs`.
+inline constexpr const char* kExpectedWorkerVersion = "1.3.1";
+
 /// Tags for frames the worker writes to its stdout (worker -> host). `Invalid`
 /// is never sent on the wire (real worker tags are 1-6); it exists only as a
 /// safe default for a default-constructed `WorkerFrame` so an unfilled frame

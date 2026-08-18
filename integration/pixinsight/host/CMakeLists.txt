@@ -92,3 +92,12 @@ add_executable(test_isolation test/test_isolation.cpp)
 target_link_libraries(test_isolation PRIVATE mmm_host)
 add_dependencies(test_isolation build_worker)
 add_test(NAME test_isolation COMMAND test_isolation ${MMM_WORKER})
+
+# Wire-value validation tests: Host::run() must refuse out-of-range
+# Begin/OutputBand/BandRequest values from a misbehaving worker (played by
+# the scripted rogue_worker binary) with a clean HostError before any memcpy.
+add_executable(rogue_worker test/rogue_worker.cpp)
+add_executable(test_validation test/test_validation.cpp)
+target_link_libraries(test_validation PRIVATE mmm_host)
+add_dependencies(test_validation rogue_worker)
+add_test(NAME test_validation COMMAND test_validation $<TARGET_FILE:rogue_worker>)

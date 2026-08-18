@@ -742,6 +742,7 @@ fn blend_full(
     let inv_cw = 1.0f32 / session.canvas.0 as f32;
     let inv_ch = 1.0f64 / session.canvas.1 as f64;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
+    let mut nonfinite = 0u64;
 
     for y0 in (0..out_h).step_by(band_rows) {
         let rows_here = band_rows.min(out_h - y0);
@@ -812,8 +813,10 @@ fn blend_full(
 
         let bs = &mut band[..nch * rows_here * out_w];
         assemble_band(bs, &rows_out, out_w, nch);
+        nonfinite += zero_non_finite(bs);
         sink.band(y0 as u64, bs)?;
     }
+    warn_non_finite(nonfinite);
     sink.finish()?;
     tracing::info!(total_s = t0.elapsed().as_secs_f64(), "blend full-res done");
     Ok(())
@@ -1098,6 +1101,7 @@ fn blend_twoband_impl(
     let inv_ch = 1.0f64 / session.canvas.1 as f64;
     let defect_veto = params.defect_veto;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
+    let mut nonfinite = 0u64;
 
     for y0 in (0..out_h).step_by(band_rows) {
         let rows_here = band_rows.min(out_h - y0);
@@ -1308,8 +1312,10 @@ fn blend_twoband_impl(
 
         let bs = &mut band[..nch * rows_here * out_w];
         assemble_band(bs, &rows_out, out_w, nch);
+        nonfinite += zero_non_finite(bs);
         sink.band(y0 as u64, bs)?;
     }
+    warn_non_finite(nonfinite);
     sink.finish()?;
     tracing::info!(total_s = t0.elapsed().as_secs_f64(), "blend two-band done");
     Ok(())
@@ -1350,6 +1356,7 @@ fn blend_l8(
     let inv_cw = 1.0f64 / session.canvas.0 as f64;
     let inv_ch = 1.0f64 / session.canvas.1 as f64;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
+    let mut nonfinite = 0u64;
 
     for y0 in (0..out_h).step_by(band_rows) {
         let rows_here = band_rows.min(out_h - y0);
@@ -1393,11 +1400,43 @@ fn blend_l8(
 
         let bs = &mut band[..nch * rows_here * out_w];
         assemble_band(bs, &rows_out, out_w, nch);
+        nonfinite += zero_non_finite(bs);
         sink.band(y0 as u64, bs)?;
     }
+    warn_non_finite(nonfinite);
     sink.finish()?;
     tracing::info!(total_s = t0.elapsed().as_secs_f64(), "blend from L8 done");
     Ok(())
+}
+
+/// Zero every non-finite sample in `band`, returning how many were hit.
+///
+/// The blend guarantees its sinks all-finite bands: NaN/Inf in the *input*
+/// (some stackers emit NaN for rejected pixels; NaN is nonzero, so such
+/// pixels count as covered) propagates through the weighted blend math into
+/// the output, and a downstream consumer — the PixInsight module's output
+/// window in particular — must never receive it. Non-finite samples become
+/// 0.0, the no-data sentinel.
+fn zero_non_finite(band: &mut [f32]) -> u64 {
+    let mut n = 0u64;
+    for v in band.iter_mut() {
+        if !v.is_finite() {
+            *v = 0.0;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Log-once companion to [`zero_non_finite`]: warn at end of a blend that
+/// zeroed any non-finite samples; silent for the common all-finite case.
+fn warn_non_finite(count: u64) {
+    if count > 0 {
+        tracing::warn!(
+            count,
+            "non-finite output samples zeroed (do the input panels contain NaN/Inf pixels?)"
+        );
+    }
 }
 
 /// Divide accumulated `w·v` by `Σw` where covered; uncovered stays 0.

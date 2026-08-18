@@ -189,6 +189,7 @@ impl MockHost {
             .collect();
         InitJob {
             protocol_version: IPC_PROTOCOL_VERSION,
+            worker_version: env!("CARGO_PKG_VERSION").to_string(),
             shm_name: format!("/mmm-test-{}-{}", std::process::id(), unique_id()),
             slot_bytes,
             input_slots,

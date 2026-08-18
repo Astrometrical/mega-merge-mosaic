@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "mmm"
-version = "0.1.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "mmm-core"
-version = "0.1.0"
+version = "1.3.1"
 dependencies = [
  "bytemuck",
  "libc",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "mmm-ipc-worker"
-version = "0.1.0"
+version = "1.3.1"
 dependencies = [
  "mmm-core",
  "serde_json",

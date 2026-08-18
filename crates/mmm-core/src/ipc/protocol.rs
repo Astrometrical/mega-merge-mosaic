@@ -210,6 +210,11 @@ pub struct PanelDesc {
 /// object (unframed, like `--probe-frame`). See PROTOCOL.md §11.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct PanelProbeRequest {
+    /// Exact release version of the worker binary the host expects, as in
+    /// [`InitJob::worker_version`]. Checked first so a skewed module/worker
+    /// pair fails at the probe — the very first worker contact of a run —
+    /// with a clear message.
+    pub worker_version: String,
     /// Panel file paths, one per panel, in `panels` order.
     pub paths: Vec<String>,
     /// Aligned-vs-solved override, as in [`JobMode::Files`]. Defaults to
@@ -319,6 +324,13 @@ pub struct InitJob {
     /// Wire-protocol version; the worker aborts on a mismatch with
     /// [`crate::ipc::IPC_PROTOCOL_VERSION`].
     pub protocol_version: u32,
+    /// Exact release version of the `mmm-ipc-worker` binary the host expects
+    /// (its `CARGO_PKG_VERSION`). The worker refuses the job on any
+    /// mismatch: the module and worker ship as one package, and a skewed
+    /// pair — e.g. a stale worker binary left behind by a partial update —
+    /// could agree on the wire protocol yet disagree on its semantics, which
+    /// the host has no way to detect once bands start flowing.
+    pub worker_version: String,
     /// Name of the shared-memory segment carrying band slots.
     pub shm_name: String,
     /// Size in bytes of one band slot.
@@ -616,6 +628,7 @@ mod tests {
     fn init_job_json_round_trips() {
         let job = InitJob {
             protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+            worker_version: env!("CARGO_PKG_VERSION").to_string(),
             shm_name: "/mmm-test".into(),
             slot_bytes: 1 << 20,
             input_slots: 8,
@@ -644,6 +657,7 @@ mod tests {
     fn sample_init_job() -> InitJob {
         InitJob {
             protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+            worker_version: env!("CARGO_PKG_VERSION").to_string(),
             shm_name: "/mmm-test".into(),
             slot_bytes: 1 << 20,
             input_slots: 1,

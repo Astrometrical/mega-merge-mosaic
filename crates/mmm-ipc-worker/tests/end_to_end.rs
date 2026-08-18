@@ -186,6 +186,7 @@ fn worker_blend_is_byte_identical_to_file_blend() {
     let worker_session_dir = dir.join("worker.mmm-session");
     let job = InitJob {
         protocol_version: IPC_PROTOCOL_VERSION,
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
         shm_name: shm_name.clone(),
         slot_bytes,
         input_slots: layout.input_slots,
@@ -421,6 +422,7 @@ fn aligned_two_panel_job(
         .collect();
     let job = InitJob {
         protocol_version: IPC_PROTOCOL_VERSION,
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
         shm_name,
         slot_bytes,
         input_slots: layout.input_slots,
@@ -824,6 +826,7 @@ fn solved_mode_reprojection_matches_file() {
         let worker_session_dir = dir.join("worker.mmm-session");
         let job = InitJob {
             protocol_version: IPC_PROTOCOL_VERSION,
+            worker_version: env!("CARGO_PKG_VERSION").to_string(),
             shm_name: shm_name.clone(),
             slot_bytes,
             input_slots: layout.input_slots,
@@ -916,6 +919,7 @@ fn probe_frame_prints_choose_frame_geometry() {
         .collect();
     let job = InitJob {
         protocol_version: IPC_PROTOCOL_VERSION,
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
         shm_name: String::new(),
         slot_bytes: 0,
         input_slots: 0,
@@ -996,6 +1000,7 @@ fn probe_panels_reports_geometry_and_frame() {
     let frame = choose_frame(&models);
 
     let req = serde_json::json!({
+        "worker_version": env!("CARGO_PKG_VERSION"),
         "paths": paths.iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>(),
         "input_select": "Auto",
     });
@@ -1035,4 +1040,74 @@ fn probe_panels_reports_geometry_and_frame() {
     assert_eq!(reply.frame, Some([frame.width, frame.height, headers[0].2]));
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A host whose `worker_version` does not exactly match this worker binary's
+/// own version must be refused up front — with a proper `Error` frame on
+/// stdout (so a GUI host surfaces a clear message instead of a generic
+/// exit-before-Done error) and a nonzero exit. Guards against a skewed
+/// module/worker pair after a partial update: same wire protocol, different
+/// release, silently different semantics.
+#[test]
+fn version_mismatch_is_refused_with_an_error_frame() {
+    with_watchdog(Duration::from_secs(30), || {
+        let dir = tmpdir("vermismatch");
+        let job = InitJob {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            worker_version: "0.0.0-mismatch".to_string(),
+            shm_name: "/mmm-e2e-never-opened".to_string(),
+            slot_bytes: 4096,
+            input_slots: 1,
+            output_slots: 1,
+            canvas: [8, 8, 1],
+            panels: vec![PanelDesc {
+                panel_id: 0,
+                width: 8,
+                height: 8,
+                channels: 1,
+                properties: vec![],
+            }],
+            mode: JobMode::Aligned,
+            session_dir: dir.join("s.mmm-session").to_string_lossy().into_owned(),
+            params: BlendParamsWire::default(),
+        };
+
+        let exe = env!("CARGO_BIN_EXE_mmm-ipc-worker");
+        let mut child = Command::new(exe)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mmm-ipc-worker");
+        let mut child_stdin = child.stdin.take().expect("child stdin");
+        let mut child_stdout = child.stdout.take().expect("child stdout");
+        write_frame(&mut child_stdin, &HostMsg::Init(job)).expect("write Init");
+        drop(child_stdin);
+
+        // The one and only frame must be Error, naming both versions.
+        let frame = read_worker_frame(&mut child_stdout)
+            .expect("read worker frame")
+            .expect("worker closed stdout without any frame");
+        match frame {
+            WorkerMsg::Error { message } => {
+                assert!(
+                    message.contains("0.0.0-mismatch")
+                        && message.contains(env!("CARGO_PKG_VERSION")),
+                    "error must name both the expected and the actual worker \
+                     version, got: {message}"
+                );
+            }
+            other => panic!("expected an Error frame, got {other:?}"),
+        }
+        assert!(
+            read_worker_frame(&mut child_stdout)
+                .expect("read worker frame")
+                .is_none(),
+            "no further frames may follow the version-mismatch Error"
+        );
+
+        let status = child.wait().expect("wait on worker");
+        assert!(!status.success(), "a refused run must exit nonzero");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }

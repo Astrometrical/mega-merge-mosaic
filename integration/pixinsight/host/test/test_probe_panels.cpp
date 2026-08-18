@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
   // Expected frame via the existing probe_frame path (panels + spliced
   // properties, mode Solved) -- exactly as test_golden_solved sizes its run.
   json probe_init;
-  probe_init["protocol_version"] = 2;
+  // protocol_version + worker_version are stamped by Host (run/probe) itself.
   probe_init["shm_name"] = "";
   probe_init["slot_bytes"] = 0;
   probe_init["input_slots"] = 0;

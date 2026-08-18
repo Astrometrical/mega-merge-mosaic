@@ -11,7 +11,7 @@ use mmm_core::analyze::{
 use mmm_core::blend::blend_with_source;
 use mmm_core::ipc::IPC_PROTOCOL_VERSION;
 use mmm_core::ipc::client::HostLink;
-use mmm_core::ipc::protocol::{HostMsg, JobMode, read_host_frame};
+use mmm_core::ipc::protocol::{HostMsg, JobMode, WorkerMsg, read_host_frame, write_frame};
 use mmm_core::ipc::sink::ShmRowSink;
 use mmm_core::ipc::source::IpcSource;
 use mmm_core::overlap::OverlapGraph;
@@ -34,6 +34,37 @@ fn main() {
     }
 }
 
+/// This binary's own release version — what a host's `worker_version` field
+/// must equal exactly for a job or probe to be accepted.
+const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The error for a host/worker release-version mismatch: the module and the
+/// worker ship as one package, so a skew means a broken install (e.g. a
+/// stale worker binary a partial update left behind).
+fn version_mismatch_error(expected: &str) -> mmm_core::Error {
+    mmm_core::Error::compute(format!(
+        "version mismatch: the host module expects mmm-ipc-worker {expected}, but this \
+         worker is {WORKER_VERSION} — reinstall Mega Merge Mosaic so the module and \
+         worker binary come from the same package"
+    ))
+}
+
+/// Refuse a run before the transport starts: emit a proper `Error` frame on
+/// stdout (so the host surfaces the message instead of a generic
+/// exit-before-Done fault) and return the same message as this process's
+/// fatal error for the stderr/exit-code path.
+fn refuse(err: mmm_core::Error) -> mmm_core::Error {
+    let mut out = std::io::stdout();
+    let _ = write_frame(
+        &mut out,
+        &WorkerMsg::Error {
+            message: err.to_string(),
+        },
+    );
+    let _ = out.flush();
+    err
+}
+
 /// `--probe-frame`: read an `InitJob`-shaped JSON object on stdin, build the
 /// WCS models from each panel's `properties` via
 /// [`mmm_core::analyze::solved_frame`], and print `"{w} {h} {ch}"`. Lets a
@@ -47,6 +78,9 @@ fn probe_frame() -> mmm_core::Result<()> {
         .map_err(|e| mmm_core::Error::compute(format!("reading probe JSON from stdin: {e}")))?;
     let job: mmm_core::ipc::protocol::InitJob = serde_json::from_str(&buf)
         .map_err(|e| mmm_core::Error::compute(format!("parsing probe InitJob JSON: {e}")))?;
+    if job.worker_version != WORKER_VERSION {
+        return Err(version_mismatch_error(&job.worker_version));
+    }
     if job.panels.is_empty() {
         return Err(mmm_core::Error::compute("probe-frame: no panels"));
     }
@@ -68,6 +102,9 @@ fn probe_panels() -> mmm_core::Result<()> {
         .map_err(|e| mmm_core::Error::compute(format!("reading probe JSON from stdin: {e}")))?;
     let req: mmm_core::ipc::protocol::PanelProbeRequest = serde_json::from_str(&buf)
         .map_err(|e| mmm_core::Error::compute(format!("parsing PanelProbeRequest JSON: {e}")))?;
+    if req.worker_version != WORKER_VERSION {
+        return Err(version_mismatch_error(&req.worker_version));
+    }
     let paths: Vec<PathBuf> = req.paths.iter().map(PathBuf::from).collect();
     let reply = mmm_core::analyze::probe_panels(&paths, req.input_select.to_input_select())?;
     let text = serde_json::to_string(&reply)
@@ -89,7 +126,15 @@ fn run() -> mmm_core::Result<()> {
         _ => return Err(mmm_core::Error::compute("expected Init as the first frame")),
     };
     if init.protocol_version != IPC_PROTOCOL_VERSION {
-        return Err(mmm_core::Error::compute("protocol version mismatch"));
+        return Err(refuse(mmm_core::Error::compute(format!(
+            "protocol version mismatch: the host sent {}, this worker speaks \
+             {IPC_PROTOCOL_VERSION} — reinstall Mega Merge Mosaic so the module and \
+             worker binary come from the same package",
+            init.protocol_version
+        ))));
+    }
+    if init.worker_version != WORKER_VERSION {
+        return Err(refuse(version_mismatch_error(&init.worker_version)));
     }
 
     // Capture what's needed before `init` is moved into `HostLink::start`.

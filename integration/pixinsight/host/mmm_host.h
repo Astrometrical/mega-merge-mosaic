@@ -192,7 +192,12 @@ class Host {
   std::atomic<bool> cancel_requested_{false};
   std::atomic<bool> cancelled_{false};
 
+  // Begin-frame state for wire-value validation (see the serve loop): the
+  // worker's announced output geometry, and whether Begin has arrived at all.
+  // OutputBand ranges are checked against these before any memcpy.
+  bool begun_ = false;
   uint64_t out_w_ = 0;
+  uint64_t out_h_ = 0;
   uint64_t out_ch_ = 0;
 };
 

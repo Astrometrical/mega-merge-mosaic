@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
   // segment; a wrong choice here (e.g. using only max_panel_w) would corrupt
   // whichever side is larger and fail the byte-identity compare below. ----
   json probe_init;
-  probe_init["protocol_version"] = 2;
+  // protocol_version + worker_version are stamped by Host (run/probe) itself.
   probe_init["shm_name"] = "";
   probe_init["slot_bytes"] = 0;
   probe_init["input_slots"] = 0;
@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
     files_paths.push_back(fixtures + "/solved" + std::to_string(i) + ".xisf");
   }
   json files_init;
-  files_init["protocol_version"] = 2;
+  // protocol_version + worker_version are stamped by Host (run/probe) itself.
   files_init["shm_name"] = "";  // filled below
   files_init["slot_bytes"] = slot_bytes;
   files_init["input_slots"] = layout.input_slots;
@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
   }
 
   json solved_init;
-  solved_init["protocol_version"] = 2;
+  // protocol_version + worker_version are stamped by Host (run/probe) itself.
   solved_init["shm_name"] = "";  // filled below
   solved_init["slot_bytes"] = slot_bytes;
   solved_init["input_slots"] = layout.input_slots;

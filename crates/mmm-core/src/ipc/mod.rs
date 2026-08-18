@@ -36,4 +36,4 @@ pub mod testkit {
 
 /// Wire-protocol version exchanged in the init handshake; a mismatch aborts
 /// the run rather than risking a misinterpretation of later frames.
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+pub const IPC_PROTOCOL_VERSION: u32 = 3;

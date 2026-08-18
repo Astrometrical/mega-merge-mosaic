@@ -221,7 +221,8 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 
 ```jsonc
 {"Init": {
-  "protocol_version": 2,
+  "protocol_version": 3,
+  "worker_version": "1.3.1",
   "shm_name": "/mmm-<unique>",
   "slot_bytes": 1048576,
   "input_slots": 8,
@@ -252,9 +253,18 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 }}
 ```
 
-`InitJob.protocol_version` must equal `2` (this document's version); a host
-built against a stale `1`-era copy of this file will be rejected outright by
-the worker rather than risk misinterpreting a frame under the wrong layout.
+`InitJob.protocol_version` must equal `3` (this document's version); a host
+built against a stale copy of this file will be rejected outright by the
+worker rather than risk misinterpreting a frame under the wrong layout.
+`InitJob.worker_version` must equal the worker binary's own release version
+(its `CARGO_PKG_VERSION`) **exactly**: the module and worker ship as one
+package, and a skewed pair — e.g. a stale worker binary left behind by a
+partial update — could agree on the wire protocol yet disagree on its
+semantics, which the host cannot detect once bands start flowing. The C++
+`mmm::Host` stamps both fields into every `Init` it sends (overriding
+whatever the caller put there); on either mismatch the worker emits a proper
+`Error` frame (so a GUI host shows the message rather than a generic
+exit-before-`Done` fault) and exits nonzero.
 
 Field-by-field (all field names are exactly as they appear in JSON — no
 `camelCase` conversion, these are serde's default snake_case-as-written
@@ -262,7 +272,8 @@ names):
 
 | field | type | notes |
 |---|---|---|
-| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `2`, `crates/mmm-core/src/ipc/mod.rs`); the worker aborts on mismatch |
+| `protocol_version` | u32 | must equal `IPC_PROTOCOL_VERSION` (currently `3`, `crates/mmm-core/src/ipc/mod.rs`); the worker refuses on mismatch (Error frame + nonzero exit) |
+| `worker_version` | string | must equal the worker binary's `CARGO_PKG_VERSION` exactly; the worker refuses on mismatch. Stamped by `mmm::Host` from `kExpectedWorkerVersion` (`mmm_protocol.h`), kept in sync with the workspace `Cargo.toml` version by `crates/mmm-ipc-worker/tests/version_sync.rs` |
 | `shm_name` | string | name of the shm segment the host already created |
 | `slot_bytes` | u64 | size in bytes of **one** slot — size for the largest band ever transferred (input or output) |
 | `input_slots` | u32 | number of input slots in the segment |
@@ -520,12 +531,29 @@ its own writes to the worker's stdin.
 
 ## 10. Init/version, cancel, and EOF/crash semantics
 
-- **Version check.** `Init.protocol_version` must equal the worker's
-  compiled-in `IPC_PROTOCOL_VERSION` (`crates/mmm-core/src/ipc/mod.rs`,
-  currently `2`). A mismatch is fatal: the worker refuses the job outright
-  rather than risk misinterpreting later frames under an incompatible
-  layout. Bump this constant (and this document) on any wire-incompatible
-  change. (`2` added `JobMode::Files`'s `input_select` field — see §11.)
+- **Protocol version check.** `Init.protocol_version` must equal the
+  worker's compiled-in `IPC_PROTOCOL_VERSION`
+  (`crates/mmm-core/src/ipc/mod.rs`, currently `3`). A mismatch is fatal:
+  the worker refuses the job outright rather than risk misinterpreting
+  later frames under an incompatible layout. Bump this constant (and this
+  document) on any wire-incompatible change. (`2` added
+  `JobMode::Files`'s `input_select` field — see §11; `3` added the
+  release-version handshake below.)
+- **Release version handshake.** `Init.worker_version` (and
+  `worker_version` in the `--probe-panels` request, §11; `--probe-frame`
+  reads it from its `InitJob`-shaped stdin object) must equal the worker
+  binary's own `CARGO_PKG_VERSION` **exactly**. The module and worker ship
+  as one package; two releases can share a wire protocol yet differ in
+  semantics the host cannot check once bands flow, so a skewed pair — e.g.
+  a stale worker binary left behind by a partial update — is refused with a
+  clear "reinstall" message. On refusal the worker emits a proper `Error`
+  frame (a probe prints to stderr instead) and exits nonzero. The C++
+  `mmm::Host` stamps `protocol_version` and `worker_version` into every
+  `Init`/probe request itself, from `kProtocolVersion` /
+  `kExpectedWorkerVersion` (`mmm_protocol.h`); the sync between
+  `kExpectedWorkerVersion`, the workspace `Cargo.toml` version, and the
+  module's `MMM_VERSION_STRING` is enforced by
+  `crates/mmm-ipc-worker/tests/version_sync.rs`.
 - **Cancel.** The host may send `Cancel` (tag 131) at any point after
   `Init`. This is **fail-fast**: every pending band/output request and any
   new one immediately errors out (`"cancelled"`), so an in-flight
@@ -617,9 +645,11 @@ must not open the panel files on its own (GUI) thread just to size
 `slot_bytes` and build the `panels` array — with dozens of multi-GB files
 that pass alone can freeze the host for minutes. Instead it invokes
 `mmm-ipc-worker --probe-panels`: write a bare JSON object
-`{"paths": ["/abs/panel1.xisf", ...], "input_select": "Auto"}` on stdin
-(unframed; `input_select` as in `JobMode::Files`, defaulting to `"Auto"`
-when omitted) and read back one JSON object on stdout:
+`{"worker_version": "1.3.1", "paths": ["/abs/panel1.xisf", ...],
+"input_select": "Auto"}` on stdin (unframed; `worker_version` as in §10's
+release-version handshake — stamped by `mmm::Host::probe_panels`, checked
+before anything else; `input_select` as in `JobMode::Files`, defaulting to
+`"Auto"` when omitted) and read back one JSON object on stdout:
 `{"panels": [{"width": W, "height": H, "channels": C}, ...],
 "frame": [FW, FH, FCH] | null}`. `panels` is in `paths` order; `frame` is
 the worker's own `choose_frame` result and is non-null exactly when the job
@@ -641,3 +671,34 @@ layout math **must** update this document in the same change — a C++ Plan-2
 implementation built against a stale copy will fail in ways that are hard to
 diagnose from the Rust side alone (wrong tag ⇒ "unknown tag" error; wrong
 binary offset ⇒ garbage geometry with no type error at all).
+
+## 13. Host-side wire-value validation
+
+Every worker-supplied wire value that parameterizes a host-side `memcpy`
+is range-checked by the C++ `mmm::Host` serve loop **before** the copy runs
+(`mmm_host.cpp`; proven by `test/test_validation.cpp` driving the scripted
+`rogue_worker`). Without these checks a misbehaving worker — version skew,
+memory corruption, a plain bug — would make the host write past the output
+image's channel planes or past the shm mapping: silent heap corruption
+inside the embedding application (PixInsight) that detonates long after the
+run. A violation throws `HostError`, which kills and reaps the worker and
+surfaces a clean error; it is never "repaired" host-side.
+
+- **`Begin`**: refused if a `Begin` was already seen; if any dimension is
+  zero; if any dimension exceeds `int32` max (the PCL collector narrows to
+  `int`); if `ch` differs from the Init canvas's channel count; or — when
+  the Init canvas is known (aligned mode; solved sends `w = h = 0`) — if
+  `w`/`h` exceed the canvas (the output is a crop of it, never larger).
+- **`OutputBand`**: refused before `Begin`; if `slot_id >= output_slots`;
+  if `rows == 0` or `[y0, y0 + rows)` runs past the `Begin` height; or if
+  `rows × begin_w × begin_ch × 4` exceeds `slot_bytes`.
+- **`BandRequest`**: refused (thrown) if `slot_id >= input_slots` or the
+  requested band exceeds `slot_bytes` — both would move a fill outside the
+  shm mapping. A request that is merely out of the panel's row range (or
+  names an unknown `panel_id`, or has `y1 < y0`) is answered with
+  `BandReply.status = 1` without consulting the `PanelSource` at all, per
+  the §5 error contract — the worker unwinds cleanly.
+
+The Rust reference host (`testhost.rs`) predates these checks and remains
+permissive by design (it is a test double); the semantics above are the
+contract for any production host embedding a GUI application.

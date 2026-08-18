@@ -1192,3 +1192,77 @@ fn rejects_unsupported_downsample() {
     assert!(blend(&session, &phot, None, &graph, &params, &mut sink).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Non-finite samples must never reach the sink. Some stacking tools emit
+/// NaN for rejected pixels, and NaN is nonzero, so such a pixel counts as
+/// *covered* and its NaN/Inf propagates through the weighted blend math
+/// straight into the output band. A downstream consumer (the PixInsight
+/// module's output window) must never see it — PixInsight can crash
+/// unpredictably on non-finite pixel data — so blended bands are swept and
+/// non-finite samples zeroed (the no-data sentinel) at the sink boundary.
+///
+/// The panels are analyzed clean and poisoned afterwards (the blender
+/// re-reads the files), keeping the poison out of the analysis stages —
+/// this test pins the *sink* guarantee, which must hold no matter how a
+/// non-finite value got into the blend math.
+#[test]
+fn non_finite_input_samples_are_zeroed_in_output() {
+    let dir = tmpdir("nonfinite");
+    let (w, h) = (128u64, 64u64);
+    let mut frame = vec![0f32; (w * h) as usize];
+    let fill = |frame: &mut [f32], v: f32, x0: u64, y0: u64, x1: u64, y1: u64| {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                frame[(y * w + x) as usize] = v;
+            }
+        }
+    };
+    // Same layout as make_panels: A = 0.2, B = 0.4.
+    fill(&mut frame, 0.2, 8, 8, 80, 56);
+    let a = dir.join("a.xisf");
+    write_xisf(&a, w, h, 1, &frame).unwrap();
+
+    let mut frame_b = vec![0f32; (w * h) as usize];
+    fill(&mut frame_b, 0.4, 48, 16, 120, 64);
+    let b = dir.join("b.xisf");
+    write_xisf(&b, w, h, 1, &frame_b).unwrap();
+
+    let session = analyze(&[a.clone(), b.clone()], &dir.join("s.mmm-session")).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+
+    // Poison the panels in place (same geometry, same coverage — NaN/Inf are
+    // nonzero): A interior NaN, A overlap +Inf, B interior -Inf.
+    frame[(32 * w + 24) as usize] = f32::NAN;
+    frame[(36 * w + 64) as usize] = f32::INFINITY;
+    write_xisf(&a, w, h, 1, &frame).unwrap();
+    frame_b[(40 * w + 104) as usize] = f32::NEG_INFINITY;
+    write_xisf(&b, w, h, 1, &frame_b).unwrap();
+    let phot = identity_phot(2, 1);
+    let params = BlendParams {
+        feather_px: 16.0,
+        downsample: 1,
+        band_rows: 16,
+        mode: BlendMode::Feather,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+    };
+    let mut sink = MemSink::new();
+    blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
+
+    assert!(
+        sink.data.iter().all(|v| v.is_finite()),
+        "non-finite samples leaked into the output"
+    );
+
+    // Canvas (x, y) → output (x−8, y−8); union bbox is unchanged from
+    // make_panels. The poisoned pixels come out as the 0.0 no-data sentinel;
+    // clean neighbours are untouched.
+    let at = |x: u64, y: u64| sink.at(0, (x - 8) as usize, (y - 8) as usize);
+    assert_eq!(at(24, 32), 0.0, "NaN pixel not zeroed");
+    assert_eq!(at(64, 36), 0.0, "+Inf pixel not zeroed");
+    assert_eq!(at(104, 40), 0.0, "-Inf pixel not zeroed");
+    assert!((at(25, 32) - 0.2).abs() < 1e-6, "clean neighbour disturbed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

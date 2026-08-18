@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     files_paths.push_back(fixtures + "/panel" + std::to_string(i) + ".xisf");
   }
   json files_init;
-  files_init["protocol_version"] = 2;
+  // protocol_version + worker_version are stamped by Host (run/probe) itself.
   files_init["shm_name"] = "";  // filled below
   files_init["slot_bytes"] = slot_bytes;
   files_init["input_slots"] = layout.input_slots;

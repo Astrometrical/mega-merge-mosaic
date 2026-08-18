@@ -117,7 +117,7 @@ json make_init(uint64_t w, uint64_t h, uint64_t ch, uint32_t band_rows, uint64_t
     panels.push_back(pd);
   }
   json init;
-  init["protocol_version"] = 2;
+  // protocol_version + worker_version are stamped by Host (run/probe) itself.
   init["shm_name"] = shm_name;
   init["slot_bytes"] = slot_bytes;
   init["input_slots"] = layout.input_slots;

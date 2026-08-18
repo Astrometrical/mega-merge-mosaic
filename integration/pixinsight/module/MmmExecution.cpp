@@ -642,7 +642,7 @@ void RunViews( const Params& in, const std::string& worker_path )
 
       // Init body sans slot sizing (filled below).
       json init_body;
-      init_body["protocol_version"] = 2;
+      // protocol_version + worker_version are stamped by mmm::Host (run and probes).
       init_body["shm_name"]         = "";
       init_body["slot_bytes"]       = 0;
       init_body["input_slots"]      = kInputSlots;
@@ -776,7 +776,7 @@ void RunFiles( const Params& in, const std::string& worker_path )
    const uint64_t slot_bytes = width * ch0 * band_rows * 4;
 
    json init_body;
-   init_body["protocol_version"] = 2;
+   // protocol_version + worker_version are stamped by mmm::Host (run and probes).
    init_body["slot_bytes"]       = slot_bytes;
    init_body["input_slots"]      = kInputSlots;
    init_body["output_slots"]     = kOutputSlots;
