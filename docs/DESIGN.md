@@ -347,12 +347,17 @@ default auto). 132 tests, clippy clean.
   bicubically — no thin-plate-spline evaluation. Cross-frame star chain on
   real data validated the whole model at 0.034 px median (all verified layout
   facts live in the module docs).
-- **Frame + reprojection** (`align.rs`): fresh north-up TAN frame (spherical
-  mean center, median scale, union footprint + 16 px margin); Lanczos-3
-  reprojection with a hard full-support-or-zero rim into mmap-able session
-  caches; `PanelReader` gives the scan and blender storage-agnostic row
-  access. Aligned-input artifacts and blends stayed byte-identical through
-  the refactor (hash regression guard).
+- **Frame + reprojection** (`align.rs`): fresh TAN frame (spherical mean
+  center, median scale, union footprint + 16 px margin) whose rotation is
+  the axial mean of the tiles' own rotations (doubled-angle mean, so
+  meridian-flipped panels agree) — a camera rotated away from north gets a
+  canvas hugging the tiles instead of an axis-aligned box with black
+  corners; axis-aligned tiles compute rotation exactly 0 = the historical
+  north-up frame, bit-identical. Lanczos-3 reprojection with a hard
+  full-support-or-zero rim into mmap-able session caches; `PanelReader`
+  gives the scan and blender storage-agnostic row access. Aligned-input
+  artifacts and blends stayed byte-identical through the refactor (hash
+  regression guard).
 - **Auto-detect** (binding rule): same geometry AND ≥ 2 panels AND every
   panel's covered fraction < 50% → aligned; otherwise solved, where every
   input must yield a model (per-file error naming the missing properties).

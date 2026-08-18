@@ -194,6 +194,7 @@ mod tests {
             scale_deg: 4.4e-4,
             width: 640,
             height: 480,
+            rotation_deg: 0.0,
         });
         session.align_secs = Some(1.5);
         session.save().unwrap();

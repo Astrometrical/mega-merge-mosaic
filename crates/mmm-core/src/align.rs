@@ -5,16 +5,21 @@
 //!
 //! ## Frame convention
 //!
-//! [`MosaicFrame`] is a TAN (gnomonic) frame, north-up, expressed in the same
-//! internal top-down convention as every [`LinearWcs`] this crate handles:
-//! rows are stored top-down and the linear matrix applies to top-down
-//! PixInsight image coordinates. Its matrix is `diag(-scale, +scale)` in that
-//! frame — byte-for-byte the convention of a real MosaicByCoordinates canvas
-//! (see `astrometry.rs` module docs: the Orion canvas stores exactly
+//! [`MosaicFrame`] is a TAN (gnomonic) frame expressed in the same internal
+//! top-down convention as every [`LinearWcs`] this crate handles: rows are
+//! stored top-down and the linear matrix applies to top-down PixInsight
+//! image coordinates. At rotation 0 its matrix is `diag(-scale, +scale)` in
+//! that frame — byte-for-byte the convention of a real MosaicByCoordinates
+//! canvas (see `astrometry.rs` module docs: the Orion canvas stores exactly
 //! `[[-s, 0], [0, s]]` applied to top-down coordinates, with the reference
-//! image coordinate at the canvas center `(w/2, h/2)`). Displayed top-down
-//! the canvas is therefore south-up; the bottom-up reflection to standard
-//! FITS cards is [`crate::astrometry::wcs_cards`]'s job, unchanged.
+//! image coordinate at the canvas center `(w/2, h/2)`). A nonzero
+//! [`MosaicFrame::rotation_deg`] — chosen by [`choose_frame`] as the axial
+//! mean of the tiles' own rotations — turns the canvas axes with the tiles
+//! (`CD = diag(-s, s) · R(-rot)`) so a camera rotated away from north gets
+//! a tight canvas instead of an axis-aligned box with black corners.
+//! Displayed top-down the canvas is (at rotation 0) south-up; the bottom-up
+//! reflection to standard FITS cards is [`crate::astrometry::wcs_cards`]'s
+//! job, unchanged.
 //!
 //! ## Content placement (the half-pixel law)
 //!
@@ -69,10 +74,15 @@ const EDGE_SAMPLES: usize = 16;
 /// covers interpolation spread and curvature between boundary samples.
 const BBOX_PAD: i64 = 3;
 
-/// The mosaic reference frame: TAN, north-up, `CD = diag(-scale, +scale)` in
+/// The mosaic reference frame: TAN, `CD = diag(-scale, +scale) · R(-rot)` in
 /// the internal top-down convention (standard-frame semantics after the
 /// writer's bottom-up reflection), reference point at the canvas center.
-/// Serializable so solved-input sessions persist it in `session.json`.
+/// `rotation_deg = 0` is exactly the historical north-up frame; a nonzero
+/// rotation lets [`choose_frame`] align the canvas axes with rotated tiles
+/// so the output fits them tightly instead of boxing a rotated mosaic with
+/// big black corners. Serializable so solved-input sessions persist it in
+/// `session.json` (`rotation_deg` defaults to 0 for sessions written before
+/// the field existed).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MosaicFrame {
     /// Reference sky coordinates [RA, Dec] at the canvas center, degrees.
@@ -83,6 +93,11 @@ pub struct MosaicFrame {
     pub width: u64,
     /// Canvas height in pixels.
     pub height: u64,
+    /// Canvas rotation, degrees: the angle the frame's pixel axes are turned
+    /// (in the ξη tangent plane) relative to north-up. Axial — meaningful
+    /// modulo 180° — and normalized by [`choose_frame`] to `(-90, 90]`.
+    #[serde(default)]
+    pub rotation_deg: f64,
 }
 
 impl MosaicFrame {
@@ -91,13 +106,23 @@ impl MosaicFrame {
     /// coordinate `(w/2, h/2)`, i.e. FITS `(w/2 + 0.5, h/2 + 0.5)` — exactly
     /// how MosaicByCoordinates writes its canvases.
     pub fn linear_wcs(&self) -> LinearWcs {
+        let s = self.scale_deg;
+        // rotation 0 keeps the exact historical diag(-s, s) bits (no -0.0
+        // off-diagonals from sin(0)), so pre-rotation sessions and
+        // axis-aligned datasets are byte-identical.
+        let cd = if self.rotation_deg == 0.0 {
+            [[-s, 0.0], [0.0, s]]
+        } else {
+            let (sin, cos) = self.rotation_deg.to_radians().sin_cos();
+            [[-s * cos, -s * sin], [-s * sin, s * cos]]
+        };
         LinearWcs {
             crval: self.crval,
             crpix: [
                 self.width as f64 / 2.0 + 0.5,
                 self.height as f64 / 2.0 + 0.5,
             ],
-            cd: [[-self.scale_deg, 0.0], [0.0, self.scale_deg]],
+            cd,
             ctype: ["RA---TAN".to_string(), "DEC--TAN".to_string()],
             radesys: "ICRS".to_string(),
         }
@@ -129,7 +154,10 @@ fn boundary_samples(w: f64, h: f64) -> Vec<(f64, f64)> {
 
 /// Choose the mosaic reference frame for a set of solved panels:
 /// center = spherical mean of the panel centers, scale = median panel scale
-/// (`√|det CD|`), canvas = union of the panels' reprojected footprints plus
+/// (`√|det CD|`), rotation = axial mean of the panels' rotations from
+/// north-up (so a camera rotated away from north gets a canvas hugging the
+/// tiles instead of their axis-aligned bounding box with black corners),
+/// canvas = union of the panels' reprojected footprints plus
 /// [`FRAME_MARGIN_PX`] on every side. The frame's `crval` is recentered on
 /// the union bbox so that the reference pixel is the canvas center *and* the
 /// margin is symmetric.
@@ -137,6 +165,22 @@ fn boundary_samples(w: f64, h: f64) -> Vec<(f64, f64)> {
 /// Panics if `models` is empty.
 pub fn choose_frame(models: &[WcsModel]) -> MosaicFrame {
     assert!(!models.is_empty(), "choose_frame needs at least one model");
+
+    // Axial (mod-180) mean of the panels' rotations from north-up, via the
+    // doubled-angle circular mean: meridian-flipped panels (180 apart — the
+    // same orientation axially) reinforce instead of cancelling. Each
+    // panel's angle is read off where its CD maps the +x pixel axis
+    // (north-up maps it to 180 in the tangent plane); parity (det sign)
+    // does not enter. Axis-aligned panels yield exactly 0.0 (atan2 of exact
+    // zeros), so north-up datasets keep bit-identical frames.
+    let (mut sin2, mut cos2) = (0.0f64, 0.0f64);
+    for m in models {
+        let cd = m.linear.cd;
+        let theta = cd[1][0].atan2(cd[0][0]) - std::f64::consts::PI;
+        sin2 += (2.0 * theta).sin();
+        cos2 += (2.0 * theta).cos();
+    }
+    let rotation_deg = (0.5 * sin2.atan2(cos2)).to_degrees();
 
     // Spherical mean of the panel centers (unit-vector average).
     let mut v = [0.0f64; 3];
@@ -175,6 +219,7 @@ pub fn choose_frame(models: &[WcsModel]) -> MosaicFrame {
         scale_deg: scale,
         width: 0,
         height: 0,
+        rotation_deg,
     }
     .linear_wcs();
     let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
@@ -199,6 +244,7 @@ pub fn choose_frame(models: &[WcsModel]) -> MosaicFrame {
         scale_deg: scale,
         width,
         height,
+        rotation_deg,
     }
 }
 
@@ -616,6 +662,7 @@ mod tests {
             scale_deg: S,
             width: 40,
             height: 32,
+            rotation_deg: 0.0,
         };
         // u = ox + (refimg_x − W/2 − 0.5): refimg_x = 20.5 − 8 → u = ox − 8;
         // v = oy + (refimg_y − H/2 − 0.5): refimg_y = 16.5 + 20 → v = oy + 20.
@@ -691,6 +738,7 @@ mod tests {
             scale_deg: S,
             width: 40,
             height: 36,
+            rotation_deg: 0.0,
         };
         // Matrix s·[[0,1],[1,0]]: ξ = s·dy, η = s·dx (axis swap, det < 0 —
         // the standard astro mirror). Composing with the frame:
@@ -748,6 +796,7 @@ mod tests {
             scale_deg: S,
             width: sw as u64,
             height: sh as u64,
+            rotation_deg: 0.0,
         };
         // Model identical to the frame's own solution.
         let model = linear_model(
@@ -795,6 +844,7 @@ mod tests {
             scale_deg: S,
             width: 40,
             height: 32,
+            rotation_deg: 0.0,
         };
         // Panel 10° away on the sky: footprint misses the canvas entirely.
         let far = linear_model([40.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 32, 24);
@@ -868,5 +918,142 @@ mod tests {
         assert!(bw.abs_diff(3317) < 350, "bbox width {bw}");
         assert!(bh.abs_diff(4967) < 350, "bbox height {bh}");
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// CD matrix of a panel whose content is rotated `deg` from north-up at
+    /// scale `s` (astro parity, det = -s^2): x-axis maps to angle 180+deg in
+    /// the tangent plane, y-axis to 90+deg.
+    fn rotated_cd(s: f64, deg: f64) -> [[f64; 2]; 2] {
+        let (sin, cos) = deg.to_radians().sin_cos();
+        [[-s * cos, -s * sin], [-s * sin, s * cos]]
+    }
+
+    /// A camera rotated well away from north must yield a frame whose canvas
+    /// hugs the tile, not the tile's axis-aligned (north-up) bounding box:
+    /// for a single 100x80 panel at 30 deg the north-up box would be
+    /// ~127x123 before margins; the rotated frame is 100x80 + margins.
+    #[test]
+    fn choose_frame_fits_rotated_tiles_tightly() {
+        let m = linear_model([10.0, 0.0], [50.0, 40.0], rotated_cd(S, 30.0), 100, 80);
+        let frame = choose_frame(&[m]);
+        let (max_w, max_h) = (100 + 2 * FRAME_MARGIN_PX + 2, 80 + 2 * FRAME_MARGIN_PX + 2);
+        assert!(
+            frame.width <= max_w && frame.height <= max_h,
+            "frame {}x{} is not tight around a 100x80 tile rotated 30 deg \
+             (expected <= {max_w}x{max_h}); rotation_deg = {}",
+            frame.width,
+            frame.height,
+            frame.rotation_deg
+        );
+        assert!(
+            frame.rotation_deg.abs() > 1.0,
+            "frame did not adopt the tiles' rotation: {}",
+            frame.rotation_deg
+        );
+    }
+
+    /// Meridian-flipped halves of a mosaic differ by ~180 deg of rotation;
+    /// axially that is the SAME orientation, and the frame must adopt it
+    /// rather than let the two halves cancel to a (loose) north-up mean.
+    #[test]
+    fn choose_frame_meridian_flipped_tiles_agree() {
+        let a = linear_model([10.0, 0.0], [50.0, 40.0], rotated_cd(S, 20.0), 100, 80);
+        let b = linear_model([10.0, 0.0], [50.0, 40.0], rotated_cd(S, 200.0), 100, 80);
+        let frame = choose_frame(&[a, b]);
+        // Co-centered congruent tiles: the union is one 100x80 rect at 20 deg
+        // (a 200 deg tile is the same rect upside down).
+        let (max_w, max_h) = (100 + 2 * FRAME_MARGIN_PX + 2, 80 + 2 * FRAME_MARGIN_PX + 2);
+        assert!(
+            frame.width <= max_w && frame.height <= max_h,
+            "meridian-flipped pair not fit tightly: frame {}x{}, rotation {}",
+            frame.width,
+            frame.height,
+            frame.rotation_deg
+        );
+        assert!(
+            (-90.0..=90.0).contains(&frame.rotation_deg),
+            "rotation not normalized to (-90, 90]: {}",
+            frame.rotation_deg
+        );
+    }
+
+    /// Sessions written before `rotation_deg` existed must load as the
+    /// historical north-up frame.
+    #[test]
+    fn mosaic_frame_rotation_defaults_to_zero() {
+        let f: MosaicFrame = serde_json::from_str(
+            r#"{"crval":[84.2,-3.2],"scale_deg":4.4e-4,"width":640,"height":480}"#,
+        )
+        .unwrap();
+        assert_eq!(f.rotation_deg, 0.0);
+        assert_eq!(f.linear_wcs().cd, [[-4.4e-4, 0.0], [0.0, 4.4e-4]]);
+    }
+
+    /// End-to-end convention pin: a constant-1.0 panel rotated 30 deg,
+    /// reprojected into the frame `choose_frame` picks for it, must fill the
+    /// frame's interior — including near all four corners, which stay empty
+    /// (no-data zero) if the frame/panel rotation composition is wrong in
+    /// sign or side (the content would then sit rotated by 2x30 deg inside
+    /// the canvas).
+    #[test]
+    fn reproject_rotated_panel_fills_rotated_frame() {
+        let dir = tmpdir("rotfill");
+        let (sw, sh) = (64usize, 48usize);
+        let planes = vec![1.0f32; sw * sh];
+        let path = dir.join("src.xisf");
+        write_xisf(&path, sw as u64, sh as u64, 1, &planes).unwrap();
+        let panel = XisfPanel::open(&path).unwrap();
+
+        let model = linear_model(
+            [30.0, 0.0],
+            [sw as f64 / 2.0, sh as f64 / 2.0],
+            rotated_cd(S, 30.0),
+            sw as u64,
+            sh as u64,
+        );
+        let frame = choose_frame(std::slice::from_ref(&model));
+        let ap = reproject_panel(&panel, &model, &frame, &dir.join("out")).unwrap();
+
+        let meta = PanelMeta {
+            id: 0,
+            path: ap.path.clone(),
+            source: None,
+            bbox: ap.bbox,
+            nonzero_frac: 0.0,
+            ch_min: vec![],
+            ch_max: vec![],
+            ch_mean: vec![],
+            storage: PanelStorage::CroppedCache { bbox: ap.bbox },
+        };
+        let r = PanelReader::open(&meta, (frame.width, frame.height, 1)).unwrap();
+
+        // The content rect is the canvas minus the frame margin; stay a
+        // further 6 px inside it (Lanczos support inset + boundary-sample
+        // slack) and expect ~1.0 at all four corners and the center.
+        let inset = FRAME_MARGIN_PX + 6;
+        let (x0, y0) = (inset, inset);
+        let (x1, y1) = (frame.width - inset - 1, frame.height - inset - 1);
+        for (px, py) in [
+            (x0, y0),
+            (x1, y0),
+            (x0, y1),
+            (x1, y1),
+            (frame.width / 2, frame.height / 2),
+        ] {
+            let (rx0, row) = r
+                .row(0, py)
+                .unwrap_or_else(|| panic!("row {py} outside cache bbox {:?}", ap.bbox));
+            let v = row.get((px - rx0) as usize).copied().unwrap_or(0.0);
+            assert!(
+                (v - 1.0).abs() < 1e-4,
+                "({px},{py}) = {v}, expected ~1.0 -- rotated content is not \
+                 filling the rotated frame (bbox {:?}, frame {}x{} rot {})",
+                ap.bbox,
+                frame.width,
+                frame.height,
+                frame.rotation_deg
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
