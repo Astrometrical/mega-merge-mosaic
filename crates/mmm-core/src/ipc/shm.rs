@@ -594,9 +594,14 @@ impl ShmSegment {
 mod win_tests {
     use super::*;
 
+    // Names here follow the portable rule `validate_shm_name` enforces on
+    // every platform (leading '/', no other slashes, <= 31 chars) even
+    // though Windows itself doesn't care — `win_object_name` strips the
+    // slash when building the `Local\...` mapping name.
+
     #[test]
     fn create_write_attach_read_same_bytes() {
-        let name = format!("mmm-shm-wtest-{}", std::process::id());
+        let name = format!("/mmm-wt-{}", std::process::id());
         let total = 4096u64;
         let host = ShmSegment::create(&name, total).unwrap();
         host.slice_mut(0, 4).copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
@@ -607,14 +612,14 @@ mod win_tests {
     #[test]
     #[should_panic(expected = "not a multiple of")]
     fn slice_mut_panics_on_misaligned_offset() {
-        let name = format!("mmm-shm-wtest-align-{}", std::process::id());
+        let name = format!("/mmm-wt-align-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         let _ = host.slice_mut(1, 1);
     }
 
     #[test]
     fn slice_roundtrip_at_aligned_offset() {
-        let name = format!("mmm-shm-wtest-ok-{}", std::process::id());
+        let name = format!("/mmm-wt-ok-{}", std::process::id());
         let host = ShmSegment::create(&name, 4096).unwrap();
         host.slice_mut(4, 2).copy_from_slice(&[5.0, 6.0]);
         assert_eq!(host.slice(4, 2), &[5.0, 6.0]);
@@ -626,7 +631,7 @@ mod win_tests {
         // `CreateFileMappingW` rejects a zero-size mapping, so `create`
         // clamps its OS allocation to a minimum of 1 byte. The segment
         // still reports (and enforces) a logical size of 0.
-        let name = format!("mmm-shm-wtest-zero-{}", std::process::id());
+        let name = format!("/mmm-wt-zero-{}", std::process::id());
         let host = ShmSegment::create(&name, 0).unwrap();
         assert_eq!(host.slice(0, 0), &[] as &[f32]);
     }
