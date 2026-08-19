@@ -248,7 +248,8 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
     "defect_veto": true,
     "flatten": null,
     "surface_order": 2,
-    "seam_map": false
+    "seam_map": false,
+    "gain": "fit"
   }
 }}
 ```
@@ -327,6 +328,7 @@ names):
 | `flatten` | u32 or `null` | opt-in global background flatten polynomial order; `null` = off |
 | `surface_order` | u32 or `null` | surface-fit polynomial order for the analyze stage (not part of `BlendParams` itself) |
 | `seam_map` | bool | after a successful blend, the worker writes the seam/ownership map PNG to `<session_dir>/seam_map.png` (built from the session's cached L8 artifacts; no panel re-reads) **before** sending `Done`. The host may read that file once `Done` arrives — and must do so before deleting a temporary session dir. `#[serde(default)]`: absent means `false`, so pre-field hosts are unaffected |
+| `gain` | string | photometric gain handling for the analyze stage: `"fit"` (measure per-panel gains from overlap edges — the default) or `"unity"` (pin every gain at 1, solve offsets only; for photometrically homogeneous same-rig/same-exposure mosaics). `#[serde(default)]`: absent means `"fit"`, so pre-field hosts are unaffected; unrecognized values map to `"fit"` |
 
 **Post-blend session reports.** Alongside the optional seam map above, the
 worker unconditionally writes `<session_dir>/summary.json` before `Done`: the

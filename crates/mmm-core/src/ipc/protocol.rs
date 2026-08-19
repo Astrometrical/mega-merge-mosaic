@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blend::{BlendMode, BlendParams};
 use crate::formats::{PropertyValue, XisfProperty};
+use crate::photometry::GainMode;
 
 /// Worker→host: asks the host to fill a shared-memory slot with rows
 /// `[y0, y1)` of panel `panel_id`.
@@ -277,6 +278,18 @@ pub struct BlendParamsWire {
     /// params JSON from hosts that predate this field still parses.
     #[serde(default)]
     pub seam_map: bool,
+    /// Photometric gain handling for the analyze stage: `"fit"` or
+    /// `"unity"`. Not part of [`BlendParams`]; consumed by the worker via
+    /// [`Self::gain_mode`]. Defaults to `"fit"` so params JSON from hosts
+    /// that predate this field still parses.
+    #[serde(default = "default_gain")]
+    pub gain: String,
+}
+
+/// Serde default for [`BlendParamsWire::gain`]: params JSON from hosts that
+/// predate the field still parses, and means the default fit solve.
+fn default_gain() -> String {
+    "fit".to_string()
 }
 
 impl Default for BlendParamsWire {
@@ -291,6 +304,7 @@ impl Default for BlendParamsWire {
             flatten: None,
             surface_order: Some(2),
             seam_map: false,
+            gain: "fit".to_string(),
         }
     }
 }
@@ -314,6 +328,16 @@ impl BlendParamsWire {
             roi: self.roi,
             defect_veto: self.defect_veto,
             flatten: self.flatten,
+        }
+    }
+
+    /// Maps the wire `gain` string to a [`GainMode`]: `"unity"` selects
+    /// [`GainMode::Unity`]; `"fit"` and any unrecognized value map to
+    /// [`GainMode::Fit`] (lenient like `mode`'s unrecognized → pyramid).
+    pub fn gain_mode(&self) -> GainMode {
+        match self.gain.as_str() {
+            "unity" => GainMode::Unity,
+            _ => GainMode::Fit,
         }
     }
 }
@@ -768,6 +792,42 @@ mod tests {
         let back: BlendParamsWire =
             serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
         assert!(back.seam_map);
+    }
+
+    #[test]
+    fn blend_params_gain_defaults_fit_and_maps() {
+        use crate::photometry::GainMode;
+        // Params JSON from a host that predates the gain field (no key) must
+        // still parse, selecting the default fit solve.
+        let legacy = serde_json::json!({
+            "feather_px": 256.0,
+            "downsample": 1,
+            "band_rows": 256,
+            "mode": "pyramid",
+            "roi": null,
+            "defect_veto": true,
+            "flatten": null,
+            "surface_order": 2
+        });
+        let p: BlendParamsWire = serde_json::from_value(legacy).unwrap();
+        assert_eq!(p.gain, "fit");
+        assert_eq!(p.gain_mode(), GainMode::Fit);
+
+        let unity = BlendParamsWire {
+            gain: "unity".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unity.gain_mode(), GainMode::Unity);
+        let back: BlendParamsWire =
+            serde_json::from_str(&serde_json::to_string(&unity).unwrap()).unwrap();
+        assert_eq!(back.gain_mode(), GainMode::Unity);
+
+        // Unrecognized strings degrade to fit (mirrors mode -> "pyramid").
+        let odd = BlendParamsWire {
+            gain: "warp".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(odd.gain_mode(), GainMode::Fit);
     }
 
     #[test]
