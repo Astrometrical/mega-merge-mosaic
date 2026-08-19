@@ -30,7 +30,7 @@ inline constexpr uint32_t kProtocolVersion = 3;
 /// risking silently divergent band semantics. Kept in exact sync with the
 /// workspace `Cargo.toml` version and the module's `MMM_VERSION_STRING` --
 /// enforced by `crates/mmm-ipc-worker/tests/version_sync.rs`.
-inline constexpr const char* kExpectedWorkerVersion = "1.3.1";
+inline constexpr const char* kExpectedWorkerVersion = "1.4.0";
 
 /// Tags for frames the worker writes to its stdout (worker -> host). `Invalid`
 /// is never sent on the wire (real worker tags are 1-6); it exists only as a
