@@ -103,6 +103,7 @@ private:
    pcl_bool      p_defectVeto;      // cross-panel defect veto
    pcl_bool      p_seamMap;         // produce the seam/ownership map output
    int32         p_surfaceOrder;    // analyze surface-fit order
+   pcl_enum      p_gainMode;        // Fit / Unity (analyze photometric gains)
    int32         p_bandRows;        // output band granularity, rows
 
    friend class MmmBlendProcess;

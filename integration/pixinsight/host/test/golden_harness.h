@@ -81,6 +81,7 @@ inline json make_params(uint32_t band_rows, double feather_px) {
   p["defect_veto"] = true;
   p["flatten"] = nullptr;
   p["surface_order"] = 2;
+  p["gain"] = "fit";
   return p;
 }
 

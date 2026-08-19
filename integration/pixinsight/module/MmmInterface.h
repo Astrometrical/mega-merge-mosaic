@@ -123,6 +123,9 @@ private:
       HorizontalSizer SurfaceOrder_Sizer;
       Label           SurfaceOrder_Label;
       SpinBox         SurfaceOrder_SpinBox;
+      HorizontalSizer GainMode_Sizer;
+      Label           GainMode_Label;
+      ComboBox        GainMode_ComboBox;
       HorizontalSizer BandRows_Sizer;
       Label           BandRows_Label;
       SpinBox         BandRows_SpinBox;
@@ -174,6 +177,7 @@ private:
 
    void e_FeatherValueUpdated( NumericEdit& sender, double value );
    void e_SurfaceOrderValueUpdated( SpinBox& sender, int value );
+   void e_GainModeItemSelected( ComboBox& sender, int itemIndex );
    void e_BandRowsValueUpdated( SpinBox& sender, int value );
 
    void e_DefectVetoClick( Button& sender, bool checked );

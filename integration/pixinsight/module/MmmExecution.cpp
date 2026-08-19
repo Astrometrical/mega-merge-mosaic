@@ -77,6 +77,7 @@ struct Params
    bool          defectVeto;
    bool          seamMap;
    int32         surfaceOrder;
+   pcl_enum      gainMode;
    int32         bandRows;
 };
 
@@ -352,6 +353,16 @@ const char* BlendModeWireString( pcl_enum v )
    }
 }
 
+// Wire string for the gain-mode enum (PROTOCOL.md section 6 BlendParamsWire).
+const char* GainModeWireString( pcl_enum v )
+{
+   switch ( v )
+   {
+   case MmmGainModeParameter::Unity: return "unity";
+   default:                          return "fit";
+   }
+}
+
 // Builds the BlendParamsWire object (PROTOCOL.md section 6) from the parameters.
 json BuildParams( const Params& in )
 {
@@ -368,6 +379,7 @@ json BuildParams( const Params& in )
    else
       p["flatten"] = nullptr;
    p["surface_order"] = uint32_t( in.surfaceOrder );
+   p["gain"]          = GainModeWireString( in.gainMode );
    return p;
 }
 
@@ -830,6 +842,7 @@ void run_blend( MmmBlendInstance& in )
    p.defectVeto     = in.p_defectVeto;
    p.seamMap        = in.p_seamMap;
    p.surfaceOrder   = in.p_surfaceOrder;
+   p.gainMode       = in.p_gainMode;
    p.bandRows       = in.p_bandRows;
 
    // Empty session dir (the default): run out of a fresh directory under the

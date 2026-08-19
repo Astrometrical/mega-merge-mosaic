@@ -25,6 +25,7 @@ MmmFlattenEnabledParameter* TheMmmFlattenEnabledParameter = nullptr;
 MmmDefectVetoParameter*    TheMmmDefectVetoParameter    = nullptr;
 MmmSeamMapParameter*       TheMmmSeamMapParameter       = nullptr;
 MmmSurfaceOrderParameter*  TheMmmSurfaceOrderParameter  = nullptr;
+MmmGainModeParameter*      TheMmmGainModeParameter      = nullptr;
 MmmBandRowsParameter*      TheMmmBandRowsParameter      = nullptr;
 
 // ----------------------------------------------------------------------------

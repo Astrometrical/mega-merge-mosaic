@@ -29,6 +29,7 @@
 //   defectVeto         -> params.defect_veto
 //   seamMap            -> params.seam_map
 //   surfaceOrder       -> params.surface_order
+//   gainMode           -> params.gain ("fit"/"unity")
 //   bandRows           -> params.band_rows
 
 #ifndef __MmmParameters_h
@@ -295,6 +296,37 @@ public:
 };
 
 extern MmmSurfaceOrderParameter* TheMmmSurfaceOrderParameter;
+
+// ----------------------------------------------------------------------------
+// gainMode: photometric gain handling for the analyze stage (params.gain).
+// Element ORDER matters for wire serialization; values equal indices.
+// ----------------------------------------------------------------------------
+
+/*!
+ * \brief Enumeration: photometric gain handling (Fit/Unity).
+ */
+class MmmGainModeParameter : public MetaEnumeration
+{
+public:
+
+   enum { Fit, Unity, NumberOfItems, Default = Fit };
+
+   MmmGainModeParameter( MetaProcess* P ) : MetaEnumeration( P ) {}
+   IsoString Id() const override { return "gainMode"; }
+   size_type NumberOfElements() const override { return NumberOfItems; }
+   IsoString ElementId( size_type i ) const override
+   {
+      switch ( i )
+      {
+      case Unity: return "Unity";
+      default:    return "Fit";
+      }
+   }
+   int ElementValue( size_type i ) const override { return int( i ); }
+   size_type DefaultValueIndex() const override { return Default; }
+};
+
+extern MmmGainModeParameter* TheMmmGainModeParameter;
 
 // ----------------------------------------------------------------------------
 // bandRows: output rows per delivered band (params.band_rows), advanced.

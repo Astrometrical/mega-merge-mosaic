@@ -336,6 +336,27 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    SurfaceOrder_Sizer.Add( SurfaceOrder_SpinBox );
    SurfaceOrder_Sizer.AddStretch();
 
+   GainMode_Label.SetText( "Gain mode:" );
+   GainMode_Label.SetFixedWidth( labelWidth1 );
+   GainMode_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
+
+   // Element order MUST match MmmGainModeParameter (Fit=0/Unity=1).
+   GainMode_ComboBox.AddItem( "Fit" );
+   GainMode_ComboBox.AddItem( "Unity" );
+   GainMode_ComboBox.OnItemSelected( (ComboBox::item_event_handler)&MmmBlendInterface::e_GainModeItemSelected, w );
+   GainMode_ComboBox.SetMinWidth( editWidth1*2 );
+   GainMode_ComboBox.SetToolTip( "<p>How the photometric solve treats per-panel brightness gains.</p>"
+      "<p><b>Fit</b> (default) - measure a gain factor for each panel from the overlap regions, "
+      "correcting real transparency and exposure differences between panels.</p>"
+      "<p><b>Unity</b> - force every gain to 1 and match panels with offsets only. Choose this for "
+      "mosaics known to be photometrically homogeneous (same rig, exposure and filter, stable "
+      "skies), where a fitted gain could only chase noise.</p>" );
+
+   GainMode_Sizer.SetSpacing( 4 );
+   GainMode_Sizer.Add( GainMode_Label );
+   GainMode_Sizer.Add( GainMode_ComboBox );
+   GainMode_Sizer.AddStretch();
+
    BandRows_Label.SetText( "Band rows:" );
    BandRows_Label.SetFixedWidth( labelWidth1 );
    BandRows_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
@@ -394,6 +415,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Parameters_Sizer.Add( BlendMode_Sizer );
    Parameters_Sizer.Add( Feather_NumericControl );
    Parameters_Sizer.Add( SurfaceOrder_Sizer );
+   Parameters_Sizer.Add( GainMode_Sizer );
    Parameters_Sizer.Add( DefectVeto_Sizer );
    Parameters_Sizer.Add( SeamMap_Sizer );
    Parameters_Sizer.Add( Flatten_Sizer );
@@ -521,6 +543,7 @@ void MmmBlendInterface::UpdateControls()
 
    GUI->Feather_NumericControl.SetValue( m_instance.p_feather );
    GUI->SurfaceOrder_SpinBox.SetValue( m_instance.p_surfaceOrder );
+   GUI->GainMode_ComboBox.SetCurrentItem( m_instance.p_gainMode );
    GUI->BandRows_SpinBox.SetValue( m_instance.p_bandRows );
 
    GUI->DefectVeto_CheckBox.SetChecked( m_instance.p_defectVeto );
@@ -727,6 +750,11 @@ void MmmBlendInterface::e_FeatherValueUpdated( NumericEdit&, double value )
 void MmmBlendInterface::e_SurfaceOrderValueUpdated( SpinBox&, int value )
 {
    m_instance.p_surfaceOrder = int32( value );
+}
+
+void MmmBlendInterface::e_GainModeItemSelected( ComboBox&, int itemIndex )
+{
+   m_instance.p_gainMode = pcl_enum( itemIndex );
 }
 
 void MmmBlendInterface::e_BandRowsValueUpdated( SpinBox&, int value )

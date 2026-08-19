@@ -97,6 +97,7 @@ MmmBlendInstance::MmmBlendInstance( const MetaProcess* m )
    , p_defectVeto( TheMmmDefectVetoParameter->DefaultValue() )
    , p_seamMap( TheMmmSeamMapParameter->DefaultValue() )
    , p_surfaceOrder( int32( TheMmmSurfaceOrderParameter->DefaultValue() ) )
+   , p_gainMode( TheMmmGainModeParameter->ElementValue( TheMmmGainModeParameter->DefaultValueIndex() ) )
    , p_bandRows( int32( TheMmmBandRowsParameter->DefaultValue() ) )
 {
 }
@@ -125,6 +126,7 @@ void MmmBlendInstance::Assign( const ProcessImplementation& p )
       p_defectVeto    = x->p_defectVeto;
       p_seamMap       = x->p_seamMap;
       p_surfaceOrder  = x->p_surfaceOrder;
+      p_gainMode      = x->p_gainMode;
       p_bandRows      = x->p_bandRows;
    }
 }
@@ -190,6 +192,7 @@ void* MmmBlendInstance::LockParameter( const MetaParameter* p, size_type tableRo
    if ( p == TheMmmDefectVetoParameter )    return &p_defectVeto;
    if ( p == TheMmmSeamMapParameter )       return &p_seamMap;
    if ( p == TheMmmSurfaceOrderParameter )  return &p_surfaceOrder;
+   if ( p == TheMmmGainModeParameter )      return &p_gainMode;
    if ( p == TheMmmBandRowsParameter )      return &p_bandRows;
 
    return nullptr;
