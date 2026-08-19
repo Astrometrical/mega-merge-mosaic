@@ -17,14 +17,14 @@
 use std::path::{Path, PathBuf};
 
 use mmm_core::Result;
-use mmm_core::analyze::{InputSelect, analyze, analyze_input, analyze_opts};
+use mmm_core::analyze::{InputSelect, analyze, analyze_gain, analyze_input, analyze_opts};
 use mmm_core::astrometry::LinearWcs;
 use mmm_core::blend::{BlendMode, BlendParams, RowSink, blend, union_bbox};
 use mmm_core::formats::xisf::XisfPanel;
 use mmm_core::linalg::solve_dense;
 use mmm_core::overlap::OverlapGraph;
-use mmm_core::photometry::Photometry;
-use mmm_core::session::InputKind;
+use mmm_core::photometry::{GainMode, Photometry};
+use mmm_core::session::{InputKind, Session};
 use mmm_core::surfaces::Surfaces;
 use mmm_core::synth::{SynthSpec, SynthWcs, generate, write_xisf, write_xisf_solved};
 
@@ -311,6 +311,71 @@ fn remove_global_field(residual: &mut [f32], mask: &[bool], w: usize, h: usize) 
 /// order-2 field — the unavoidable gauge freedom (adding the same smooth
 /// field to every panel changes nothing the data can see). Raw residuals are
 /// additionally bounded to catch runaway corrections.
+#[test]
+fn unity_gain_mode_threads_through_analyze() {
+    // `analyze` with GainMode::Unity must persist unity gains in
+    // photometry.json, record the mode in session.json, and fit surfaces on
+    // top of the unity corrections.
+    let dir = tempdir("unitymode");
+    let spec = SynthSpec {
+        canvas: (512, 384),
+        channels: 1,
+        grid: (2, 2),
+        overlap_frac: 0.25,
+        n_stars: 40,
+        noise_sigma: 0.002,
+        panel_gain_range: (1.0, 1.0),
+        panel_offset_range: (-0.01, 0.02),
+        panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
+        panel_shift: vec![],
+        panel_spike_angle: vec![],
+        panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
+        seed: 5,
+    };
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+
+    let session = analyze_gain(
+        &res.panel_paths,
+        &dir.join("s.mmm-session"),
+        Some(2),
+        GainMode::Unity,
+    )
+    .unwrap();
+    assert_eq!(session.gain_mode, GainMode::Unity);
+    let reopened = Session::open(&dir.join("s.mmm-session")).unwrap();
+    assert_eq!(
+        reopened.gain_mode,
+        GainMode::Unity,
+        "gain mode round-trips through session.json"
+    );
+
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    assert!(
+        phot.gains[0].iter().all(|&g| g == 1.0),
+        "unity mode pins every gain at 1: {:?}",
+        phot.gains[0]
+    );
+    // Offsets recover the applied level differences up to the gauge.
+    let reference = (0..res.applied.len())
+        .find(|&p| phot.offsets[0][p] == 0.0)
+        .expect("a gauge panel");
+    let (_, ref_o) = res.applied[reference];
+    for (p, &(_, o)) in res.applied.iter().enumerate() {
+        let expect = ref_o as f64 - o as f64;
+        assert!(
+            (phot.offsets[0][p] - expect).abs() < 2e-3,
+            "panel {p}: offset {} vs applied-difference {expect}",
+            phot.offsets[0][p]
+        );
+    }
+    assert!(session.surfaces_path().exists(), "surfaces fitted on top");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn full_pipeline_with_gradients_recovers_ground_truth() {
     let dir = tempdir("gradients");
@@ -1164,20 +1229,20 @@ fn feather_and_twoband_outputs_are_bit_stable() {
     let feather = run(BlendMode::Feather);
     let twoband = run(BlendMode::TwoBand);
     eprintln!("feather hash {feather:#018x}, twoband hash {twoband:#018x}");
+    // Recaptured for the photometric-solve rework (gain-collapse fix): the
+    // per-edge fit became a detrended symmetric (Deming) fit with an
+    // identifiability guard, and the global solve now chains fitted lines
+    // (cell-count-weighted gain ratios + mean-level rows) instead of raw
+    // second moments — gains/offsets shift by ~1e-3 on this spec, moving
+    // every output byte. Previous values: feather 0x4e5d_7ebe_25f4_b6e9
+    // (dark-moat recapture; phase-3 capture 0x536f_0323_8796_27da before
+    // that), twoband 0xa1a7_7370_c8d8_e7b7.
     assert_eq!(
-        feather, 0x4e5d_7ebe_25f4_b6e9,
+        feather, 0x8762_daa0_68ed_e1a4,
         "Feather output changed — must stay bit-identical"
     );
-    // Recaptured for the dark-moat fix
-    // (`blend::tests::bright_star_halo_leaves_no_dark_moat`): the detail mix
-    // gained a ±32 px coverage-rim fade that keeps ramped transitions
-    // continuous where an ownership boundary rides a panel rim — that fade
-    // is what moves this spec's output (its mask components are all compact,
-    // so the accompanying full-mask base revert is a no-op here; the
-    // previous value 0x536f_0323_8796_27da was the phase-3 capture, which
-    // had survived both the pyramid work and the staircase fix).
     assert_eq!(
-        twoband, 0xa1a7_7370_c8d8_e7b7,
+        twoband, 0xf626_d1ed_2fd6_afee,
         "TwoBand output changed — must stay bit-identical"
     );
 

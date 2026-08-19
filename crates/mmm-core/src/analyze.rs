@@ -52,6 +52,7 @@ use crate::ipc::client::HostLink;
 use crate::ipc::protocol::{PanelDesc, PanelProbeGeom, PanelProbeReply};
 use crate::overlap::OverlapGraph;
 use crate::panel_reader::{PanelReader, PanelStorage};
+use crate::photometry::GainMode;
 use crate::session::{InputKind, PanelMeta, Session};
 use crate::summary::{BLOCK, L8Summary};
 use crate::{Error, Result};
@@ -116,6 +117,25 @@ pub fn analyze_input(
     analyze_input_progress(paths, session_dir, surface_order, input, None)
 }
 
+/// [`analyze_input`] with an explicit photometric [`GainMode`] and
+/// auto-detected input kind. `GainMode::Unity` pins every panel gain at 1 and
+/// solves offsets only — for photometrically homogeneous mosaics.
+pub fn analyze_gain(
+    paths: &[PathBuf],
+    session_dir: &Path,
+    surface_order: Option<u32>,
+    gain: GainMode,
+) -> Result<Session> {
+    analyze_full(
+        paths,
+        session_dir,
+        surface_order,
+        gain,
+        InputSelect::Auto,
+        None,
+    )
+}
+
 /// Coarse per-panel progress observer for the file-based analyze pipeline:
 /// `(stage, done, total)` with stage `"reproject"` (solved input only) or
 /// `"analyze"`. Must be `Sync` — the scan stage invokes it from parallel
@@ -133,12 +153,34 @@ pub fn analyze_input_progress(
     input: InputSelect,
     progress: Option<AnalyzeProgress>,
 ) -> Result<Session> {
+    analyze_full(
+        paths,
+        session_dir,
+        surface_order,
+        GainMode::Fit,
+        input,
+        progress,
+    )
+}
+
+/// The full-parameter analyze entry point: [`analyze_input_progress`] plus an
+/// explicit photometric [`GainMode`].
+pub fn analyze_full(
+    paths: &[PathBuf],
+    session_dir: &Path,
+    surface_order: Option<u32>,
+    gain: GainMode,
+    input: InputSelect,
+    progress: Option<AnalyzeProgress>,
+) -> Result<Session> {
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
     }
     match input {
-        InputSelect::Aligned => analyze_aligned(paths, session_dir, surface_order, false, progress),
-        InputSelect::Solved => analyze_solved(paths, session_dir, surface_order, progress),
+        InputSelect::Aligned => {
+            analyze_aligned(paths, session_dir, surface_order, gain, false, progress)
+        }
+        InputSelect::Solved => analyze_solved(paths, session_dir, surface_order, gain, progress),
         InputSelect::Auto => {
             // Cheap signal first: header geometries only.
             let mut geoms = Vec::with_capacity(paths.len());
@@ -147,9 +189,9 @@ pub fn analyze_input_progress(
                 geoms.push((x.width(), x.height(), x.channels()));
             }
             if paths.len() >= 2 && geoms.iter().all(|&g| g == geoms[0]) {
-                analyze_aligned(paths, session_dir, surface_order, true, progress)
+                analyze_aligned(paths, session_dir, surface_order, gain, true, progress)
             } else {
-                analyze_solved(paths, session_dir, surface_order, progress)
+                analyze_solved(paths, session_dir, surface_order, gain, progress)
             }
         }
     }
@@ -169,6 +211,7 @@ fn analyze_aligned(
     paths: &[PathBuf],
     session_dir: &Path,
     surface_order: Option<u32>,
+    gain: GainMode,
     auto: bool,
     progress: Option<AnalyzeProgress>,
 ) -> Result<Session> {
@@ -216,11 +259,11 @@ fn analyze_aligned(
              raw panels (--input aligned overrides)",
             ALIGNED_MAX_COVERAGE * 100.0
         );
-        return analyze_solved(paths, session_dir, surface_order, progress);
+        return analyze_solved(paths, session_dir, surface_order, gain, progress);
     }
 
     session.canvas = canvas;
-    finish_session(session, scans, surface_order)
+    finish_session(session, scans, surface_order, gain)
 }
 
 /// The solved path: astrometric models → mosaic frame → reprojection caches →
@@ -229,6 +272,7 @@ fn analyze_solved(
     paths: &[PathBuf],
     session_dir: &Path,
     surface_order: Option<u32>,
+    gain: GainMode,
     progress: Option<AnalyzeProgress>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
@@ -346,7 +390,7 @@ fn analyze_solved(
     session.input = InputKind::Solved;
     session.frame = Some(frame);
     session.align_secs = Some(align_secs);
-    finish_session(session, scans, surface_order)
+    finish_session(session, scans, surface_order, gain)
 }
 
 /// Explain why a panel's properties yield no [`WcsModel`], for the solved
@@ -527,7 +571,7 @@ pub fn analyze_ipc_aligned(
         .collect::<Result<_>>()?;
 
     session.canvas = canvas;
-    finish_session(session, scans, surface_order)
+    finish_session(session, scans, surface_order, GainMode::Fit)
 }
 
 /// The solved path over raw panels streamed from an IPC host: mirrors
@@ -627,7 +671,7 @@ pub fn analyze_ipc_solved(
     session.input = InputKind::Solved;
     session.frame = Some(frame);
     session.align_secs = Some(align_secs);
-    finish_session(session, scans, surface_order)
+    finish_session(session, scans, surface_order, GainMode::Fit)
 }
 
 /// Shared tail of both paths: persist summaries, build/save the overlap
@@ -636,6 +680,7 @@ fn finish_session(
     mut session: Session,
     scans: Vec<PanelScan>,
     surface_order: Option<u32>,
+    gain: GainMode,
 ) -> Result<Session> {
     let canvas = session.canvas;
     scans.par_iter().try_for_each(|scan| -> Result<()> {
@@ -657,7 +702,8 @@ fn finish_session(
     std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     graph.save(&graph_path)?;
 
-    let phot = crate::photometry::solve(&summaries, &graph)?;
+    session.gain_mode = gain;
+    let phot = crate::photometry::solve(&summaries, &graph, gain)?;
     phot.save(&session.photometry_path())?;
 
     match surface_order {

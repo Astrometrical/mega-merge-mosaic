@@ -61,6 +61,12 @@ enum Command {
         /// frames), solved (unaligned panels with astrometric solutions)
         #[arg(long, default_value = "auto")]
         input: String,
+
+        /// Photometric gain handling: fit (measure per-panel gains from
+        /// overlaps), unity (pin every gain at 1, match levels with offsets
+        /// only — for same-rig/same-exposure mosaics)
+        #[arg(long, default_value = "fit")]
+        gain: String,
     },
 
     /// Report analysis results: the overlap-graph edge table
@@ -167,7 +173,8 @@ fn main() -> anyhow::Result<()> {
             session,
             surface,
             input,
-        } => analyze_cmd(&panels, &session, &surface, &input),
+            gain,
+        } => analyze_cmd(&panels, &session, &surface, &input, &gain),
         Command::Report { session, seam_png } => report(&session, seam_png.as_deref()),
         Command::Blend {
             session,
@@ -227,6 +234,7 @@ fn analyze_cmd(
     session: &std::path::Path,
     surface: &str,
     input: &str,
+    gain: &str,
 ) -> anyhow::Result<()> {
     tracing::info!(?session, n_panels = panels.len(), "analyze requested");
     let surface_order = match surface {
@@ -242,8 +250,13 @@ fn analyze_cmd(
         "solved" => mmm_core::analyze::InputSelect::Solved,
         other => anyhow::bail!("--input must be auto, aligned or solved (got {other})"),
     };
+    let gain = match gain {
+        "fit" => mmm_core::photometry::GainMode::Fit,
+        "unity" => mmm_core::photometry::GainMode::Unity,
+        other => anyhow::bail!("--gain must be fit or unity (got {other})"),
+    };
     let t0 = std::time::Instant::now();
-    let s = mmm_core::analyze::analyze_input(panels, session, surface_order, input)?;
+    let s = mmm_core::analyze::analyze_full(panels, session, surface_order, gain, input, None)?;
     match (&s.frame, s.align_secs) {
         (Some(f), align_secs) => println!(
             "input: solved panels — {} reprojected onto a fresh {}x{} frame \
@@ -585,7 +598,7 @@ fn report(session_dir: &std::path::Path, seam_png: Option<&std::path::Path>) -> 
     }
 
     match &phot {
-        Some(phot) => report_photometry(phot, &name),
+        Some(phot) => report_photometry(phot, session.gain_mode, &name),
         None => println!("\nno photometry results (re-run `mmm analyze`)"),
     }
 
@@ -634,7 +647,11 @@ fn report_surfaces(surf: &mmm_core::surfaces::Surfaces, name: &dyn Fn(usize) -> 
     }
 }
 
-fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usize) -> String) {
+fn report_photometry(
+    phot: &mmm_core::photometry::Photometry,
+    gain_mode: mmm_core::photometry::GainMode,
+    name: &dyn Fn(usize) -> String,
+) {
     let channels = phot.gains.len();
 
     // Per-channel median rms for the suspect-edge flag.
@@ -657,7 +674,10 @@ fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usiz
         })
         .collect();
 
-    println!("\nphotometric edge fits (I_b ≈ gain·I_a + offset; ⚠ = rms > 3× channel median):");
+    println!(
+        "\nphotometric edge fits (I_b ≈ gain·I_a + offset; gain '-' = level-only, \
+         not enough shared structure to measure a gain; ⚠ = rms > 3× channel median):"
+    );
     println!(
         "{:>3}-{:<3} {:>2} {:>9} {:>10} {:>10} {:>7}",
         "a", "b", "ch", "gain", "offset", "rms", "n"
@@ -669,14 +689,23 @@ fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usiz
         } else {
             ""
         };
+        let gain_col = if f.gain_identifiable {
+            format!("{:>9.4}", f.gain)
+        } else {
+            format!("{:>9}", "-")
+        };
         println!(
-            "{:>3}-{:<3} {:>2} {:>9.4} {:>10.6} {:>10.3e} {:>7}{}",
-            f.a, f.b, f.channel, f.gain, f.offset, f.rms, f.n, flag
+            "{:>3}-{:<3} {:>2} {} {:>10.6} {:>10.3e} {:>7}{}",
+            f.a, f.b, f.channel, gain_col, f.offset, f.rms, f.n, flag
         );
     }
 
     let n_panels = phot.gains.first().map(|g| g.len()).unwrap_or(0);
-    println!("\nper-panel corrections (I' = g·I + o), per channel:");
+    let mode_note = match gain_mode {
+        mmm_core::photometry::GainMode::Fit => "",
+        mmm_core::photometry::GainMode::Unity => "; gain mode: unity (offsets only)",
+    };
+    println!("\nper-panel corrections (I' = g·I + o), per channel{mode_note}:");
     let mut header = format!("{:>3} ", "id");
     for c in 0..channels {
         header.push_str(&format!(" {:>8}{c} {:>10}{c}", "g", "o"));
@@ -691,6 +720,17 @@ fn report_photometry(phot: &mmm_core::photometry::Photometry, name: &dyn Fn(usiz
             ));
         }
         println!("{row}  {}", name(p));
+    }
+
+    let extreme: Vec<usize> = (0..n_panels)
+        .filter(|&p| (0..channels).any(|c| !(0.5..=2.0).contains(&phot.gains[c][p])))
+        .collect();
+    if !extreme.is_empty() {
+        println!(
+            "⚠ solved gains outside [0.5, 2] on panel(s) {extreme:?} — the overlaps may not \
+             constrain gains on this data; for same-rig/same-exposure mosaics consider \
+             re-running analyze with --gain unity"
+        );
     }
 }
 

@@ -56,16 +56,44 @@ to nearest uncovered block, in coarse units).
 ### Photometric solve
 
 Per edge (i,j), per channel, on L8 means over blocks fully covered by *both*
-panels: robust linear fit `y ≈ a·x + b` via 3 rounds of least squares with
-2.5σ residual clipping. (Binning is linear, so gains fit on binned data are
-unbiased.) Keep sufficient statistics per edge: `n, Σx, Σy, Σxx, Σyy, Σxy`
-(post-clip).
+panels: 3 rounds of ordinary least squares with 2.5σ residual clipping reject
+outliers, then the reported line comes from a **detrended symmetric fit**
+(reworked 2026-08-19, the gain-collapse fix — see below): each side's own
+best-fit plane over the overlap is subtracted, so the slope is measured on
+non-planar shared structure (stars, nebulosity texture) and smooth gradients
+— shared or per-panel — cannot alias into it; the slope estimator is Deming
+(equal noise variances), immune to the errors-in-variables attenuation that
+biases y-on-x OLS toward 0 when signal variance ≈ noise variance. An
+**identifiability guard** (detrended correlation r ≥ 0.5) catches overlaps
+that cannot support a gain measurement — pure noise and one-sided structure
+both measure r ≈ 0 — and reverts them to `gain = 1` + mean-level match,
+flagged `gain_identifiable: false` (report shows `-`).
 
-Global adjustment: find per-panel `(g_i, o_i)` minimizing
-`Σ_e Σ_p ((g_i·x + o_i) − (g_j·y + o_j))²` — expands exactly in the per-edge
-sufficient statistics → sparse 2N×2N normal equations, solved dense (N ≤ a few
-hundred) with LU. Gauge: fix `g=1, o=0` for the largest panel in each connected
-component. Per channel independently.
+Global adjustment, per channel, decoupled: **gains** are node potentials in
+log space (`λ_a − λ_b = ln gain` per identifiable edge, weighted by relative
+cell count), solved to an **L1 objective via IRLS** — on a potential problem
+L1 concentrates loop inconsistency onto the fewest edges, so a slope
+contaminated by structure only one panel sees (residual vignetting, a
+reflection) is outvoted by the loop-consistent majority instead of dragging
+its neighbourhood; a weak ridge pulls unconstrained gains to 1, and the
+largest panel of each component is gauged `g=1, o=0`. **Offsets** then follow
+linearly from the corrected mean-level constraints (graph Laplacian). Never
+chain raw second moments through the global solve — their noise terms
+re-introduce the attenuation bias.
+
+`--gain fit|unity` (analyze): `unity` pins every gain at 1 and solves offsets
+only, for mosaics known photometrically homogeneous; recorded in
+`session.json` and shown by `report`, which also warns when solved gains
+leave [0.5, 2].
+
+History (2026-08-19, RickJay 25-panel Ha Barnard's Loop set): the original
+solve — per-edge OLS chained as raw moments — collapsed gains to 0.009–0.16
+because the faint-background overlaps are noise-dominated (EIV attenuation
+per edge, compounded multiplicatively across the 5×5 grid from one gauge
+panel), crushing every non-gauge panel's signal. The rework recovers gains
+0.87–1.5 on that set, and star-flux checks confirmed the surviving spread is
+*real* per-panel transparency variation (up to ~2.4×), correctly compensated.
+Orion aligned set: gains and output visually unchanged.
 
 ### Blend (POC: feather)
 
@@ -158,6 +186,7 @@ double mid-scale structure.
 ```
 mmm info <files…> [--stats]
 mmm analyze <panels…> --session S [--surface off|0|1|2] [--input auto|aligned|solved]
+            [--gain fit|unity]
 mmm report --session S [--seam-png P]   # graph + fit/seam tables, ⚠ on outliers
 mmm blend --session S -o out.fits [--downsample 1|8] [--feather PX]
           [--mode pyramid|twoband|feather] [--png P] [--roi x,y,w,h]

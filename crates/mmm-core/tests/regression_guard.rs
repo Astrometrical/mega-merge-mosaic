@@ -87,9 +87,19 @@ const SUMMARY_HASHES: [u64; 4] = [
     0xd2f3_b0ce_f095_70a1,
 ];
 const GRAPH_HASH: u64 = 0x27e6_9998_d3cc_c51c;
-const PHOTOMETRY_HASH: u64 = 0x65a5_2f09_d3a9_7e4c;
-const SURFACES_HASH: u64 = 0x49cc_d828_e18f_3455;
-const BLEND_FEATHER_HASH: u64 = 0x2e65_c7ff_0be0_c3de;
+/// Photometry, surfaces and both blends recaptured for the photometric-solve
+/// rework (gain-collapse fix): the per-edge fit became a detrended symmetric
+/// (Deming) fit with a correlation identifiability guard (plus the new
+/// `gain_identifiable` field in photometry.json), and the global solve became
+/// a robust L1 (IRLS) log-gain potential solve over cell-count-weighted
+/// gain-ratio rows, offsets following linearly — raw second moments are no
+/// longer chained. Scan artifacts (META/SUMMARY/GRAPH) remain byte-identical
+/// to the original 0e9dbf6 capture. Previous values: photometry
+/// 0x65a5_2f09_d3a9_7e4c, surfaces 0x49cc_d828_e18f_3455, feather
+/// 0x2e65_c7ff_0be0_c3de.
+const PHOTOMETRY_HASH: u64 = 0xafa1_fed4_7c07_4ea8;
+const SURFACES_HASH: u64 = 0x0987_e407_21c0_9291;
+const BLEND_FEATHER_HASH: u64 = 0x107f_46aa_73a4_e0c8;
 /// Recaptured twice, deliberately:
 /// - M42-staircase fix (`seam::split_mask_components`): this spec's dense
 ///   star field floods into filled mask components that classify as
@@ -111,7 +121,10 @@ const BLEND_FEATHER_HASH: u64 = 0x2e65_c7ff_0be0_c3de;
 ///   panel's deep single-coverage zone (previous value:
 ///   0x514b_6e63_ed0d_f737). Base values change only near coverage edges
 ///   and in bled zones; Feather stays byte-identical.
-const BLEND_PYRAMID_HASH: u64 = 0x1860_7b7e_788f_918d;
+/// - Photometric-solve rework (see PHOTOMETRY_HASH above): gains/offsets
+///   shift on this spec, moving every blended byte (previous value:
+///   0x1860_7b7e_788f_918d).
+const BLEND_PYRAMID_HASH: u64 = 0xd416_4a6b_faa5_b9d8;
 
 #[test]
 fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {

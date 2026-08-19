@@ -89,7 +89,7 @@ impl ShmSegment {
     ///
     /// macOS limits POSIX shm object names to 31 characters (`PSHMNAMLEN`),
     /// including the leading `/`; `shm_open`/`shm_unlink` fail with `EINVAL`
-    /// beyond that. [`validate_shm_name`] enforces the limit on every
+    /// beyond that. `validate_shm_name` enforces the limit on every
     /// platform up front, so a long ad hoc test name fails with a clear
     /// message rather than only on macOS. The production name generator
     /// (`MakeShmName` in the C++ host) already produces short names

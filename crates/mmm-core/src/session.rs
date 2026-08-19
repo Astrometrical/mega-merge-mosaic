@@ -81,6 +81,10 @@ pub struct Session {
     /// frames' own (passthrough) solution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<MosaicFrame>,
+    /// Gain mode of the photometric solve that produced this session's
+    /// corrections (default: fit; sessions from before the field read as fit).
+    #[serde(default)]
+    pub gain_mode: crate::photometry::GainMode,
     /// Wall-clock seconds of the align (reprojection) stage of the analyze
     /// run that produced this value; not persisted.
     #[serde(skip)]
@@ -97,6 +101,7 @@ impl Session {
             panels: Vec::new(),
             input: InputKind::Aligned,
             frame: None,
+            gain_mode: crate::photometry::GainMode::default(),
             align_secs: None,
         })
     }
