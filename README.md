@@ -133,11 +133,18 @@ summaries, overlap graph, photometric solve, residual surfaces.
 | `-s, --session <DIR>` | `mosaic.mmm-session` | Session directory for cached analysis (created if missing) |
 | `--surface off\|0\|1\|2` | `2` | Residual surface correction order: off, constant, plane, quadratic |
 | `--input auto\|aligned\|solved` | `auto` | Input kind: auto-detect, registered full-canvas frames, or unaligned plate-solved panels |
+| `--gain fit\|unity` | `fit` | Photometric gain handling: `fit` measures per-panel gains from the overlaps and corrects real transparency/exposure differences; `unity` pins every gain at 1 and solves offsets only (same-rig/same-exposure mosaics) |
 
 ### `mmm report [options]`
 
 Print the overlap-graph edge table, per-edge photometric fits, seam Δ per
 edge, and residual-surface magnitudes, with ⚠ flags on outliers.
+In the photometric table a gain shown as `-` means that overlap had too
+little shared structure to support a gain measurement (the pair is matched
+by level only), and a closing ⚠ warning lists any panels whose solved gains
+fall outside [0.5, 2] — on same-rig/same-exposure data that usually means
+the overlaps cannot constrain gains, and re-running `mmm analyze` with
+`--gain unity` is the fix.
 
 | Flag | Default | Meaning |
 |---|---|---|

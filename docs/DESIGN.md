@@ -84,7 +84,10 @@ re-introduce the attenuation bias.
 `--gain fit|unity` (analyze): `unity` pins every gain at 1 and solves offsets
 only, for mosaics known photometrically homogeneous; recorded in
 `session.json` and shown by `report`, which also warns when solved gains
-leave [0.5, 2].
+leave [0.5, 2]. On the PixInsight wire it travels as `BlendParamsWire.gain`
+(`"fit"`/`"unity"`, serde-default `"fit"` so pre-field hosts keep working);
+the module exposes it as the **Gain mode** control (PROTOCOL.md §6 is the
+authoritative reference).
 
 History (2026-08-19, RickJay 25-panel Ha Barnard's Loop set): the original
 solve — per-edge OLS chained as raw moments — collapsed gains to 0.009–0.16

@@ -160,6 +160,22 @@ a panel to be matched.</td>
 </tr>
 
 <tr>
+<td class="name">Gain mode</td>
+<td>How the photometric solve treats per-panel brightness gains.
+<b>Fit</b> (default) measures a gain factor for each panel from the
+overlap regions, correcting real transparency and exposure differences
+between panels &mdash; on one 25-panel narrowband survey this recovered
+genuine per-panel transparency variation of up to ~2.4&times;.
+<b>Unity</b> forces every gain to 1 and matches panels with offsets only;
+choose it for mosaics known to be photometrically homogeneous (same rig,
+exposure and filter, shot under stable skies), where a fitted gain could
+only chase noise. The <code>mmm report</code> CLI command shows the
+fitted per-panel corrections, prints <code>-</code> for overlaps without
+enough shared structure to measure a gain, and flags
+(<code>&#9888;</code>) solved gains outside [0.5,&nbsp;2].</td>
+</tr>
+
+<tr>
 <td class="name">Cross-panel defect veto</td>
 <td>When enabled (default), defects visible in only one of the
 overlapping panels &mdash; such as satellite trails or cosmic-ray hits
