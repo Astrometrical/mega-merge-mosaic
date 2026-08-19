@@ -65,6 +65,14 @@ pub struct SynthSpec {
     /// Apply `panel_shift` to the blob centers too (not only stars) —
     /// simulates misregistration of extended mid-scale structure.
     pub shift_blobs: bool,
+    /// Optional giant textured core `(x, y, radius_px, amplitude)` added to
+    /// the truth sky — a deterministic stand-in for a bright nebular core
+    /// (M42): a dense cluster of compact Gaussians (σ = radius/8, spacing
+    /// ~σ) under a broad envelope, so the whole region carries cell-scale
+    /// detail energy and the star/structure mask floods across it. Placed in
+    /// unshifted canvas coordinates, identical in every panel. `None` is
+    /// byte-identical to a spec without a core.
+    pub core: Option<(f64, f64, f64, f64)>,
     /// Single-panel defects `(panel, x, y, length_px, amplitude)`: a bright
     /// 1-px-wide *horizontal* line segment starting at `(x, y)` (length 1 =
     /// cosmic ray, longer = a satellite-trail piece), added to all channels
@@ -263,6 +271,45 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
         plane
     }
     let star_plane = render_stars(&stars, w, h, 0.0, 0.0);
+    // The giant core mimics a saturated nebular core (M42): a *flat*
+    // saturated plateau (detail-free, so the detail-energy star mask leaves
+    // it unmasked — an enclosed pocket) surrounded by a wide annulus of
+    // compact Gaussian clumps whose cell-scale detail floods the mask across
+    // the whole ring. This is the geometry behind the real-data base-fill
+    // flood: the plateau pocket acts as a trusted fill source inside an
+    // otherwise masked complex.
+    let core_plane = spec.core.map(|(cx, cy, radius, amp)| {
+        let sigma = 8.0f64.min(radius / 12.0).max(2.0);
+        let step = sigma * 1.25;
+        let n = (radius / step).ceil() as i64;
+        let (r_in, skirt) = (0.25 * radius, 0.08 * radius);
+        let mut clumps = Vec::new();
+        for gy in -n..=n {
+            for gx in -n..=n {
+                // Offset alternate rows for a hex-ish packing.
+                let x = cx + (gx as f64 + 0.5 * (gy.rem_euclid(2)) as f64) * step;
+                let y = cy + gy as f64 * step * 0.87;
+                let r2 = ((x - cx) * (x - cx) + (y - cy) * (y - cy)) / (radius * radius);
+                if r2 > 1.0 || r2 < (r_in / radius) * (r_in / radius) {
+                    continue;
+                }
+                clumps.push((x, y, amp * (-2.0 * r2).exp(), sigma));
+            }
+        }
+        let mut plane = render_stars(&clumps, w, h, 0.0, 0.0);
+        // Flat plateau with a short linear skirt (the skirt's cliff carries
+        // detail and is masked; the flat interior is not).
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
+                if r < r_in + skirt {
+                    let t = ((r_in + skirt - r) / skirt).min(1.0);
+                    plane[(y * w + x) as usize] += (amp * t) as f32;
+                }
+            }
+        }
+        plane
+    });
 
     /// Render 4-armed diffraction spikes for the brightest stars: arms at
     /// `angle + k·π/2`, length [`SPIKE_LEN_PER_AMP`] × amplitude, Gaussian
@@ -348,7 +395,8 @@ pub fn generate(spec: &SynthSpec, dir: &Path) -> Result<SynthResult> {
                 let noise = spec.noise_sigma * rng.next_gaussian() as f32;
                 let sp = truth_spikes.as_ref().map_or(0.0, |p| p[i]);
                 let bl = blob_plane.as_ref().map_or(0.0, |p| p[i]);
-                let v = background(x, y, c, w, h) + star_plane[i] + sp + bl + noise;
+                let co = core_plane.as_ref().map_or(0.0, |p| p[i]);
+                let v = background(x, y, c, w, h) + star_plane[i] + sp + bl + co + noise;
                 out[i] = v.max(VALUE_FLOOR);
             }
         }
@@ -666,6 +714,7 @@ mod tests {
             panel_defects: vec![],
             mid_blobs: 0,
             shift_blobs: false,
+            core: None,
             seed: 42,
         }
     }
@@ -1019,6 +1068,7 @@ mod tests {
             panel_defects: vec![],
             mid_blobs: 0,
             shift_blobs: false,
+            core: None,
             seed: 42,
         };
         let dir_plain = tmpdir("spikes-plain");
@@ -1138,6 +1188,7 @@ mod tests {
             panel_spike_angle: vec![],
             mid_blobs: 0,
             shift_blobs: false,
+            core: None,
             panel_defects: vec![],
             seed: 42,
         };

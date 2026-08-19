@@ -128,6 +128,7 @@ fn full_pipeline_recovers_ground_truth() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -333,6 +334,7 @@ fn unity_gain_mode_threads_through_analyze() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 5,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -395,6 +397,7 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -543,6 +546,7 @@ fn surface_off_bypasses_cleanly() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 3,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -603,6 +607,7 @@ fn full_pipeline_twoband_recovers_ground_truth() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -704,6 +709,7 @@ fn twoband_single_panel_reconstructs_input() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 7,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -822,6 +828,7 @@ fn twoband_never_averages_misregistered_stars() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 1234,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -966,6 +973,7 @@ fn pyramid_reduces_midfrequency_ghosting() {
         panel_spike_angle: vec![],
         mid_blobs: 20,
         shift_blobs: true,
+        core: None,
         panel_defects: vec![],
         seed: 37,
     };
@@ -1204,6 +1212,7 @@ fn feather_and_twoband_outputs_are_bit_stable() {
         panel_defects: vec![(1, 300, 150, 4, 0.03)],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 77,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -1269,6 +1278,7 @@ fn global_gradient_spec() -> SynthSpec {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 21,
     }
 }
@@ -1829,6 +1839,7 @@ fn auto_detects_input_kind() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 11,
     };
     let res = generate(&spec, &dir.join("aligned-panels")).unwrap();
@@ -2342,6 +2353,7 @@ fn pyramid_deep_single_coverage_matches_panel() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 42,
     };
     let feather = 256.0f32; // real-data config: 5 pyramid levels

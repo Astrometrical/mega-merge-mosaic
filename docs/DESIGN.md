@@ -169,6 +169,25 @@ for comparison. The benefit case: panels with differing PSF (seeing/focus)
 or few-pixel misregistration, where the feathered base would soften or
 double mid-scale structure.
 
+### Masked-base detail reference (2026-08-19)
+
+RickJay real data (25-panel Ha, ~450 px overlap bands) exposed a pyramid/
+twoband failure at M42: the saturated core sits on a 4-panel corner whose
+overlap is entirely bright structure, ownership boundaries are forced through
+the masked complex, and the output printed giant over/undershoot blocks with
+detail stripped. Root causes and fix — three mechanisms in `blend.rs`, spec in
+[the design doc](superpowers/specs/2026-08-19-masked-base-detail-reference-design.md):
+the onion fill is two-phase (local passes any brightness, long-range passes
+background-level only — a detail-flat saturated plateau evades the star mask
+and used to flood one panel's base with ~0.95 over tens of thousands of
+cells); the detail band references the *blended* base instead of each
+panel's own fill inside deep masked complexes plus a feather-scaled halo
+(shared switch plane `ref_t`; base sins cancel exactly there, output =
+ramp-mix of corrected panels, i.e. feather behaviour exactly where base
+content is fiction); star/blob-sized masks never trigger the switch, so all
+phase-3/4 guarantees and the pyramid's mid-frequency benefit are preserved
+(192 tests, ghost ratio unchanged, Feather byte-identical).
+
 ## Session directory
 
 ```

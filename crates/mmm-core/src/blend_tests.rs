@@ -433,6 +433,7 @@ fn twoband_spike_arms_match_one_panel() {
         // on one arm (thresh 0.0120).
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 9,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -624,6 +625,7 @@ fn twoband_defect_veto_suppresses_overlap_defects() {
         panel_defects: vec![trail, ray],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 11,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -745,6 +747,7 @@ fn defect_outside_overlap_is_untouched() {
         panel_defects: vec![defect],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 5,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
@@ -1263,6 +1266,144 @@ fn non_finite_input_samples_are_zeroed_in_output() {
     assert_eq!(at(64, 36), 0.0, "+Inf pixel not zeroed");
     assert_eq!(at(104, 40), 0.0, "-Inf pixel not zeroed");
     assert!((at(25, 32) - 0.2).abs() < 1e-6, "clean neighbour disturbed");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn masked_core_on_narrow_overlap_corner_reconstructs_cleanly() {
+    use crate::analyze::analyze_opts;
+    use crate::overlap::OverlapGraph;
+    use crate::synth::{SynthSpec, generate};
+
+    // A giant textured core (radius 120 px, the M42 stand-in) centred on the
+    // 4-corner junction of a 2×2 grid whose overlap bands (~60 px) it
+    // completely floods: ownership boundaries are forced through the
+    // structure-masked region, so every contributing panel's base there is
+    // onion-peel fill. Divergent per-panel gradients make those fills
+    // disagree — the historical failure printed the disagreement onto the
+    // output as L8-blocky over/undershoot (white square + black bar on the
+    // real data). The two-band/pyramid output must instead reconstruct the
+    // corrected panels: close to the feather blend everywhere in the core,
+    // with no undershoot below what feather produces.
+    let dir = tmpdir("maskedcore");
+    let noise = 0.002f32;
+    let spec = SynthSpec {
+        canvas: (1536, 1536),
+        channels: 1,
+        grid: (2, 2),
+        overlap_frac: 0.15,
+        n_stars: 60,
+        noise_sigma: noise,
+        panel_gain_range: (1.0, 1.0),
+        panel_offset_range: (-0.004, 0.006),
+        panel_gradient_range: (-0.006, 0.006),
+        global_gradient: (0.0, 0.0, 0.0),
+        panel_shift: vec![],
+        panel_spike_angle: vec![],
+        panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
+        core: Some((768.0, 768.0, 480.0, 0.9)),
+        seed: 21,
+    };
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+    let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), Some(2)).unwrap();
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+    let surf = crate::surfaces::Surfaces::load(&session.surfaces_path()).unwrap();
+
+    // Precondition — the geometry actually exercises the failure: within the
+    // core, cells are structure-masked and ownership is split between
+    // several panels (boundaries could not route around the mask).
+    let summaries: Vec<L8Summary> = session
+        .panels
+        .iter()
+        .map(|p| L8Summary::read(&session.summary_path(p.id)).unwrap())
+        .collect();
+    let masks: Vec<Vec<bool>> = summaries.iter().map(crate::seam::star_mask).collect();
+    let owner =
+        crate::seam::compute_owner_map(&summaries, &graph, &phot, None, session.canvas, 256.0);
+    let mut owners_in_core = std::collections::BTreeSet::new();
+    let mut masked_cells = 0usize;
+    let w8 = owner.w8 as usize;
+    for cy in 0..owner.h8 as usize {
+        for cx in 0..w8 {
+            let (px, py) = (cx as f64 * 8.0 + 4.0, cy as f64 * 8.0 + 4.0);
+            if (px - 768.0).hypot(py - 768.0) > 320.0 {
+                continue;
+            }
+            let o = owner.owner[cy * w8 + cx];
+            if o != u16::MAX {
+                owners_in_core.insert(o);
+                if masks[o as usize][cy * w8 + cx] {
+                    masked_cells += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        owners_in_core.len() >= 2,
+        "ownership must split inside the core (owners: {owners_in_core:?})"
+    );
+    assert!(
+        masked_cells >= 100,
+        "the core must be structure-masked where owned ({masked_cells} cells)"
+    );
+
+    let run = |mode: BlendMode| -> MemSink {
+        let params = BlendParams {
+            feather_px: 256.0,
+            downsample: 1,
+            band_rows: 64,
+            mode,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
+        sink
+    };
+    let fea = run(BlendMode::Feather);
+    let bbox = union_bbox(&session).unwrap();
+
+    for (mode, sink) in [
+        (BlendMode::TwoBand, run(BlendMode::TwoBand)),
+        (BlendMode::Pyramid, run(BlendMode::Pyramid)),
+    ] {
+        let mut diffs = Vec::new();
+        let mut worst_under = 0.0f32;
+        for y in 0..sink.h {
+            for x in 0..sink.w {
+                let (px, py) = ((x as u64 + bbox[0]) as f64, (y as u64 + bbox[1]) as f64);
+                if (px - 768.0).hypot(py - 768.0) > 480.0 {
+                    continue;
+                }
+                let f = fea.at(0, x, y);
+                let v = sink.at(0, x, y);
+                if !f.is_finite() || !v.is_finite() {
+                    continue;
+                }
+                diffs.push((v - f).abs());
+                worst_under = worst_under.max(f - v);
+            }
+        }
+        diffs.sort_by(f32::total_cmp);
+        let p99 = diffs[diffs.len() * 99 / 100];
+        // 5× noise: the residual lives in the reference-switch halo ramp,
+        // where partial pyramid semantics remain by design; the pre-fix
+        // artifact measured ~0.2 here (100× noise).
+        assert!(
+            p99 <= 5.0 * noise,
+            "{mode:?}: p99 |blend − feather| = {p99} over the core (bound {})",
+            5.0 * noise
+        );
+        assert!(
+            worst_under <= 10.0 * noise,
+            "{mode:?}: undershoot {worst_under} below the feather blend"
+        );
+    }
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

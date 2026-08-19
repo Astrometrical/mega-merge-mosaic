@@ -431,6 +431,7 @@ mod tests {
             panel_defects: vec![],
             mid_blobs: 0,
             shift_blobs: false,
+            core: None,
             seed: 7,
         }
     }

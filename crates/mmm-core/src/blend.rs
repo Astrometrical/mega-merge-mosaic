@@ -122,6 +122,16 @@ pub const STAR_LOCK_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 /// moat around the star (see `bright_star_halo_leaves_no_dark_moat`).
 pub const BASE_STAR_FACTOR: f32 = crate::seam::MASK_SEED_FACTOR;
 
+/// Long-range fill-propagation brightness guard, in background-MADs above
+/// the source-cell median (see `suppress_stars_in_base`). Generous — only
+/// far-outliers like saturated nebular plateaus are held back, never
+/// ordinary faint structure.
+const ANCHOR_MAD_K: f32 = 20.0;
+/// Onion-peel passes that may propagate any brightness (local fills for star
+/// blobs and rim bands); beyond this depth only background-level cells keep
+/// propagating.
+const FILL_LOCAL_LAYERS: usize = 8;
+
 /// Defect-veto trigger: in the TwoBand detail stage, |owner detail − other
 /// detail| beyond this factor × the cell's detail RMS scale marks a
 /// single-panel defect. The scale is the *minimum* of the two compared
@@ -515,6 +525,29 @@ fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize, ma
         return; // nothing trustworthy to fill from: keep raw values
     }
 
+    // Per-channel brightness bound for *long-range* fill propagation:
+    // background robust stats over the sources. A saturated nebular plateau
+    // is detail-flat, so the detail-energy mask leaves it unmasked — genuine
+    // base content, which stays, and small masked patches beside it (stars
+    // on the structure) rightly fill from it. But letting far-above-
+    // background values propagate deep into a giant masked complex floods
+    // one panel's base with brightness its partners' fills do not carry
+    // (observed on real data: ~0.95 over tens of thousands of cells), so
+    // after the local passes only background-level cells keep propagating.
+    let bright_thr: Vec<f32> = (0..nch)
+        .map(|c| {
+            let mut vals: Vec<f32> = (0..cells)
+                .filter(|&i| source[i])
+                .map(|i| corr8[c * cells + i])
+                .collect();
+            let mid = vals.len() / 2;
+            let med = *vals.select_nth_unstable_by(mid, f32::total_cmp).1;
+            let mut devs: Vec<f32> = vals.iter().map(|&v| (v - med).abs()).collect();
+            let mad = *devs.select_nth_unstable_by(mid, f32::total_cmp).1;
+            med + ANCHOR_MAD_K * mad.max(1e-7)
+        })
+        .collect();
+
     // Cells the base sampling can reach: covered cells dilated by 2 (the
     // bilinear taps of a covered pixel stay within 1 cell of its own cell).
     // Only non-source cells in this zone need filling; the rest of the (96%
@@ -529,9 +562,20 @@ fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize, ma
     let mut avail = source.clone();
     let mut unfilled: Vec<usize> = (0..cells).filter(|&i| reach[i] && !source[i]).collect();
     let mut sums = vec![0.0f64; nch];
-    for _ in 0..256 {
+    for round in 0..256 {
         if unfilled.is_empty() {
             break;
+        }
+        // End of the local passes: star blobs and rim bands are filled from
+        // their immediate (possibly bright) surroundings by now; whatever
+        // remains is the deep interior of a giant masked complex, which must
+        // fill from background-level cells only.
+        if round == FILL_LOCAL_LAYERS {
+            for i in 0..cells {
+                if avail[i] && (0..nch).any(|c| corr8[c * cells + i] > bright_thr[c]) {
+                    avail[i] = false;
+                }
+            }
         }
         let mut next = Vec::with_capacity(unfilled.len());
         let mut newly = Vec::new();
@@ -567,6 +611,44 @@ fn suppress_stars_in_base(corr8: &mut [f32], summary: &L8Summary, nch: usize, ma
         }
         unfilled = next;
     }
+}
+
+/// Boolean plane with enclosed holes filled: false cells unreachable from
+/// the grid border through false cells become true. Used to extend the
+/// deep-mask zone of the detail-reference switch over enclosed pockets.
+fn fill_plane_holes(plane: &[bool], w: usize, h: usize) -> Vec<bool> {
+    let mut reach = vec![false; w * h];
+    let mut queue = std::collections::VecDeque::new();
+    let push = |i: usize, reach: &mut [bool], queue: &mut std::collections::VecDeque<usize>| {
+        if !plane[i] && !reach[i] {
+            reach[i] = true;
+            queue.push_back(i);
+        }
+    };
+    for x in 0..w {
+        push(x, &mut reach, &mut queue);
+        push((h - 1) * w + x, &mut reach, &mut queue);
+    }
+    for y in 0..h {
+        push(y * w, &mut reach, &mut queue);
+        push(y * w + w - 1, &mut reach, &mut queue);
+    }
+    while let Some(i) = queue.pop_front() {
+        let (x, y) = (i % w, i / w);
+        if x > 0 {
+            push(i - 1, &mut reach, &mut queue);
+        }
+        if x + 1 < w {
+            push(i + 1, &mut reach, &mut queue);
+        }
+        if y > 0 {
+            push(i - w, &mut reach, &mut queue);
+        }
+        if y + 1 < h {
+            push(i + w, &mut reach, &mut queue);
+        }
+    }
+    (0..w * h).map(|i| plane[i] || !reach[i]).collect()
 }
 
 /// Cells the bilinear base sampling can reach for a panel: covered cells
@@ -1069,6 +1151,57 @@ fn blend_twoband_impl(
     );
     let (ramps, hard) = detail_transition_maps(&owner, &compact, &structure);
     let flat = fit_flatten_opt(&summaries, &masks, phot, surfaces, session, params.flatten)?;
+    // Detail-reference switch plane (see `base_ref` in the pixel loop):
+    // shared by all panels, so no panel references genuine content where a
+    // partner references fill (a per-panel switch would print their
+    // disagreement at the boundary). The switch covers cells *deep* inside
+    // the union mask — beyond [`FILL_LOCAL_LAYERS`], where base content is
+    // long-range fill fiction rather than a local, cross-panel-consistent
+    // patch — plus a feather-scaled halo around such deep zones, where the
+    // blended base is smeared by that fiction at coarse pyramid levels.
+    // Star- and blob-sized masked patches never reach the depth threshold,
+    // so the pyramid's scale-matched base transitions survive everywhere
+    // genuine base content lives.
+    let ref_t: Vec<f32> = {
+        let union_mask: Vec<f32> = (0..w8s as usize * h8s as usize)
+            .map(|i| {
+                if masks.iter().any(|m| m[i]) {
+                    1.0f32
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        // Bridge thin unmasked channels (panel rim lines crossing a masked
+        // complex leave 1–2-cell gaps) before measuring depth, so they
+        // neither reset the depth nor let the hole-fill leak.
+        let (wu, hu) = (w8s as usize, h8s as usize);
+        let dilated: Vec<f32> = (0..wu * hu)
+            .map(|i| {
+                let (x, y) = (i % wu, i / wu);
+                let hit = (y.saturating_sub(2)..=(y + 2).min(hu - 1)).any(|yy| {
+                    (x.saturating_sub(2)..=(x + 2).min(wu - 1))
+                        .any(|xx| union_mask[yy * wu + xx] > 0.0)
+                });
+                if hit { 1.0f32 } else { 0.0 }
+            })
+            .collect();
+        let depth = distance_map(&dilated, w8s, h8s);
+        let deep: Vec<bool> = depth
+            .iter()
+            .map(|&d| d > (FILL_LOCAL_LAYERS + 2) as f32)
+            .collect();
+        // An unmasked pocket enclosed by a deep complex (a saturated plateau
+        // inside a nebular core) shares its fate: hole-fill the deep zone.
+        let deep = fill_plane_holes(&deep, w8s as usize, h8s as usize);
+        let shallow: Vec<f32> = deep.iter().map(|&d| if d { 0.0f32 } else { 1.0 }).collect();
+        let to_deep = distance_map(&shallow, w8s, h8s);
+        let halo = (params.feather_px / BLOCK as f32).clamp(4.0, 32.0);
+        to_deep
+            .iter()
+            .map(|&d| (1.0 - d / halo).clamp(0.0, 1.0))
+            .collect()
+    };
     let mut preps = prep_from_summaries(session, phot, surfaces, flat.as_ref(), summaries, &masks);
     for p in &mut preps {
         p.summary.detail = Vec::new(); // only needed for the maps above
@@ -1078,6 +1211,7 @@ fn blend_twoband_impl(
     // fallback). Everything else below is byte-for-byte the TwoBand path.
     let pyr_base = (params.mode == BlendMode::Pyramid)
         .then(|| pyramid_base_planes(&preps, &owner, nch, params.feather_px));
+
     let panels = open_readers(session, source)?;
 
     let bbox = output_bbox(session, params)?;
@@ -1155,6 +1289,7 @@ fn blend_twoband_impl(
                 let mut cov: Vec<(usize, f32, f32)> = Vec::with_capacity(prow.len());
                 let mut bases = vec![0.0f32; prow.len() * nch];
                 let mut base_acc = vec![0.0f32; nch];
+                let mut bref = vec![0.0f32; nch];
                 let mut det = vec![0.0f32; nch];
 
                 for x in bbox[0]..bbox[2] {
@@ -1204,6 +1339,46 @@ fn blend_twoband_impl(
                         let (rx0, row) = pr.rows[c];
                         row[xi - rx0] * p.gains[c] + p.offsets[c] + sa + xn * (sb + xn * sc)
                     };
+
+                    // The blended base value this pixel will receive.
+                    match &pyr_base {
+                        Some((planes, defined)) if defined[cell] => {
+                            let blc = bl_c.as_ref().expect("set for any covered pixel");
+                            for (c, plane) in planes.iter().enumerate() {
+                                bref[c] = blc.sample(plane);
+                            }
+                        }
+                        _ => {
+                            let inv_sw = 1.0 / sum_w;
+                            for (c, b) in bref.iter_mut().enumerate() {
+                                *b = base_acc[c] * inv_sw;
+                            }
+                        }
+                    }
+                    // A panel's detail reference: its own base plane — except
+                    // where the union base-exclusion mask covers the cell,
+                    // i.e. some panel's base content there is onion-peel fill
+                    // (or a distrusted pocket). Fill is fiction: per-panel
+                    // fills diverge over large masked complexes and a rogue
+                    // bright source can flood one panel's fill entirely
+                    // (observed on real data), and the *blended* base
+                    // inherits every such sin plus coarse-level
+                    // extrapolation. Referencing detail to the blended base
+                    // makes those sins cancel exactly: output = Σ rv·full —
+                    // the corrected panels themselves — wherever base content
+                    // is invented, while cells with genuine base content in
+                    // every panel keep the scale-matched pyramid transitions
+                    // untouched. The switch is shared by all panels (union
+                    // mask) and follows the bilinearly-sampled mask fraction,
+                    // so it is continuous and never pits one panel's genuine
+                    // content against another's fill.
+                    let t_ref = bl_c
+                        .as_ref()
+                        .expect("set for any covered pixel")
+                        .sample(&ref_t);
+                    let base_ref = |k: usize, c: usize, bref: &[f32]| -> f32 {
+                        t_ref * bref[c] + (1.0 - t_ref) * bases[k * nch + c]
+                    };
                     let fallback =
                         || -> usize { cov.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0 };
                     det.iter_mut().for_each(|v| *v = 0.0);
@@ -1216,7 +1391,7 @@ fn blend_twoband_impl(
                             .map(|&(k, _, _)| k)
                             .unwrap_or_else(fallback);
                         for (c, d) in det.iter_mut().enumerate() {
-                            *d = full(k, c) - bases[k * nch + c];
+                            *d = full(k, c) - base_ref(k, c, &bref);
                         }
                     } else {
                         let blc = bl_c.as_ref().expect("set for any covered pixel");
@@ -1241,7 +1416,7 @@ fn blend_twoband_impl(
                             }
                             rsum += rv;
                             for (c, d) in det.iter_mut().enumerate() {
-                                *d += rv * (full(k, c) - bases[k * nch + c]);
+                                *d += rv * (full(k, c) - base_ref(k, c, &bref));
                             }
                         }
                         if rsum > 0.0 {
@@ -1249,7 +1424,7 @@ fn blend_twoband_impl(
                         } else {
                             let k = fallback();
                             for (c, d) in det.iter_mut().enumerate() {
-                                *d = full(k, c) - bases[k * nch + c];
+                                *d = full(k, c) - base_ref(k, c, &bref);
                             }
                         }
                     }
@@ -1279,8 +1454,8 @@ fn blend_twoband_impl(
                                 let thresh = DEFECT_VETO_FACTOR
                                     * preps[po].vdet[cell].min(preps[pp].vdet[cell]);
                                 for (c, d) in det.iter_mut().enumerate() {
-                                    let d_o = full(ko, c) - bases[ko * nch + c];
-                                    let d_p = full(kp, c) - bases[kp * nch + c];
+                                    let d_o = full(ko, c) - base_ref(ko, c, &bref);
+                                    let d_p = full(kp, c) - base_ref(kp, c, &bref);
                                     if (d_o - d_p).abs() > thresh {
                                         *d = if d_o.abs() <= d_p.abs() { d_o } else { d_p };
                                     }
@@ -1289,21 +1464,8 @@ fn blend_twoband_impl(
                         }
                     }
 
-                    match &pyr_base {
-                        // Pyramid base: one bilinear sample of the merged
-                        // plane; the detail term is untouched.
-                        Some((planes, defined)) if defined[cell] => {
-                            let blc = bl_c.as_ref().expect("set for any covered pixel");
-                            for (c, plane) in planes.iter().enumerate() {
-                                out[c * out_w + o] = blc.sample(plane) + det[c];
-                            }
-                        }
-                        _ => {
-                            let inv_sw = 1.0 / sum_w;
-                            for c in 0..nch {
-                                out[c * out_w + o] = base_acc[c] * inv_sw + det[c];
-                            }
-                        }
+                    for c in 0..nch {
+                        out[c * out_w + o] = bref[c] + det[c];
                     }
                 }
                 out

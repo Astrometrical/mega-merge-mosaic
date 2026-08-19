@@ -35,6 +35,7 @@ fn analyze_recovers_applied_panel_transforms() {
         panel_defects: vec![],
         mid_blobs: 0,
         shift_blobs: false,
+        core: None,
         seed: 7,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();

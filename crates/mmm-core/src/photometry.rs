@@ -19,7 +19,7 @@
 //! the raw second moments, which would re-introduce the attenuation bias —
 //! in two decoupled stages: gains first, as a robust (L1 via IRLS) solve of
 //! the log-gain potential system over the overlap graph (see
-//! [`global_solve`] for why L1: loop consistency must outvote slopes
+//! `global_solve` for why L1: loop consistency must outvote slopes
 //! contaminated by structure only one panel sees), then offsets linearly
 //! from the corrected mean-level constraints with gains fixed. A weak ridge
 //! pulls gains toward 1 so panels reached only through unidentifiable edges

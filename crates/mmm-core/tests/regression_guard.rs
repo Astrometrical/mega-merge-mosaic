@@ -124,7 +124,16 @@ const BLEND_FEATHER_HASH: u64 = 0x107f_46aa_73a4_e0c8;
 /// - Photometric-solve rework (see PHOTOMETRY_HASH above): gains/offsets
 ///   shift on this spec, moving every blended byte (previous value:
 ///   0x1860_7b7e_788f_918d).
-const BLEND_PYRAMID_HASH: u64 = 0xd416_4a6b_faa5_b9d8;
+/// - Masked-base detail reference (M42 4-corner fix): deep inside (and in a
+///   feather-scaled halo around) masked complexes thicker than the fill's
+///   local layers, the detail band references the *blended* base instead of
+///   each panel's own fill — long-range fills are fiction and their
+///   disagreement used to print onto the output — and the onion fill's
+///   long-range passes propagate only background-level values. This spec's
+///   flooded mask components form such deep zones, moving the Pyramid
+///   output; Feather and TwoBand (and all analyze artifacts) remain
+///   byte-identical (previous value: 0xd416_4a6b_faa5_b9d8).
+const BLEND_PYRAMID_HASH: u64 = 0xa247_5289_0a4b_0861;
 
 #[test]
 fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {
@@ -151,6 +160,7 @@ fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {
         panel_defects: vec![(1, 300, 120, 12, 0.5)],
         mid_blobs: 6,
         shift_blobs: false,
+        core: None,
         seed: 42,
     };
     let res = generate(&spec, &dir.join("panels")).unwrap();
