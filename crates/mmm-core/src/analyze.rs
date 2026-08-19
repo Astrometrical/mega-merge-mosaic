@@ -529,11 +529,13 @@ pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeR
 /// pixel data is ever written to disk except the analyze artifacts
 /// themselves. Unlike the file path, this is an explicit entry point (no
 /// `--input auto` coverage re-dispatch): the host tells us the job mode.
+/// `gain` selects the photometric solve's gain handling (see [`GainMode`]).
 pub fn analyze_ipc_aligned(
     link: Arc<HostLink>,
     session_dir: &Path,
     band_rows: usize,
     surface_order: Option<u32>,
+    gain: GainMode,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
@@ -571,7 +573,7 @@ pub fn analyze_ipc_aligned(
         .collect::<Result<_>>()?;
 
     session.canvas = canvas;
-    finish_session(session, scans, surface_order, GainMode::Fit)
+    finish_session(session, scans, surface_order, gain)
 }
 
 /// The solved path over raw panels streamed from an IPC host: mirrors
@@ -579,11 +581,13 @@ pub fn analyze_ipc_aligned(
 /// [`crate::ipc::protocol::PanelDesc::properties`]) → mosaic frame →
 /// [`reproject_from_reader`] into `panels/<id>/aligned.bin` → the same
 /// scan/graph/photometry pipeline over the caches on disk.
+/// `gain` selects the photometric solve's gain handling (see [`GainMode`]).
 pub fn analyze_ipc_solved(
     link: Arc<HostLink>,
     session_dir: &Path,
     band_rows: usize,
     surface_order: Option<u32>,
+    gain: GainMode,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
@@ -671,7 +675,7 @@ pub fn analyze_ipc_solved(
     session.input = InputKind::Solved;
     session.frame = Some(frame);
     session.align_secs = Some(align_secs);
-    finish_session(session, scans, surface_order, GainMode::Fit)
+    finish_session(session, scans, surface_order, gain)
 }
 
 /// Shared tail of both paths: persist summaries, build/save the overlap
@@ -949,7 +953,8 @@ mod tests {
         let (host, r, wr) = MockHost::spawn(job.clone(), f.planar.clone());
         let link = HostLink::start(job, r, wr).unwrap();
         let ipc_dir = f.dir.join("ipc.mmm-session");
-        let ipc_sess = analyze_ipc_aligned(link.clone(), &ipc_dir, 32, Some(2)).unwrap();
+        let ipc_sess =
+            analyze_ipc_aligned(link.clone(), &ipc_dir, 32, Some(2), GainMode::Fit).unwrap();
         link.finish_ok().unwrap();
         host.join();
 

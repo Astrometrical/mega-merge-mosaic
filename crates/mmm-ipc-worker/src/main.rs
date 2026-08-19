@@ -5,9 +5,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use mmm_core::analyze::{
-    analyze_input_progress, analyze_ipc_aligned, analyze_ipc_solved, solved_frame,
-};
+use mmm_core::analyze::{analyze_full, analyze_ipc_aligned, analyze_ipc_solved, solved_frame};
 use mmm_core::blend::blend_with_source;
 use mmm_core::ipc::IPC_PROTOCOL_VERSION;
 use mmm_core::ipc::client::HostLink;
@@ -142,6 +140,7 @@ fn run() -> mmm_core::Result<()> {
     let session_dir = PathBuf::from(&init.session_dir);
     let params = init.params.to_params();
     let surface_order = init.params.surface_order;
+    let gain = init.params.gain_mode();
     let seam_map = init.params.seam_map;
     let mode = init.mode.clone();
 
@@ -166,10 +165,10 @@ fn run() -> mmm_core::Result<()> {
     let result: mmm_core::Result<()> = (|| {
         let session = match mode {
             JobMode::Aligned => {
-                analyze_ipc_aligned(link.clone(), &session_dir, band_rows, surface_order)?
+                analyze_ipc_aligned(link.clone(), &session_dir, band_rows, surface_order, gain)?
             }
             JobMode::Solved => {
-                analyze_ipc_solved(link.clone(), &session_dir, band_rows, surface_order)?
+                analyze_ipc_solved(link.clone(), &session_dir, band_rows, surface_order, gain)?
             }
             JobMode::Files {
                 paths,
@@ -183,10 +182,11 @@ fn run() -> mmm_core::Result<()> {
                 let progress = |stage: &str, done: u64, total: u64| {
                     progress_link.send_progress(stage, done, total)
                 };
-                analyze_input_progress(
+                analyze_full(
                     &paths,
                     &session_dir,
                     surface_order,
+                    gain,
                     input_select.to_input_select(),
                     Some(&progress),
                 )?

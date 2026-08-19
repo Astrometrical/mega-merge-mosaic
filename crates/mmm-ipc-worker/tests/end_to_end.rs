@@ -273,6 +273,93 @@ fn worker_blend_is_byte_identical_to_file_blend() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The wire `gain` field must reach the analyze stage: a `"unity"` job's
+/// session records `gain_mode: unity` and its photometry pins every gain
+/// at exactly 1.
+#[test]
+fn unity_gain_mode_reaches_the_worker_session() {
+    let dir = tmpdir("unitygain");
+    let (w, h, ch, _paths, planar) = synth_two_panels(&dir);
+    let band_rows_u32 = 16u32;
+
+    let slot_bytes = w * ch * band_rows_u32 as u64 * 4;
+    let layout = SlotLayout {
+        slot_bytes,
+        input_slots: 8,
+        output_slots: 2,
+    };
+    let shm_name = format!("/mmm-e2e-ug-{}", std::process::id());
+    let shm = ShmSegment::create(&shm_name, layout.total_bytes()).unwrap();
+
+    let panel_descs: Vec<PanelDesc> = (0..planar.len() as u32)
+        .map(|panel_id| PanelDesc {
+            panel_id,
+            width: w,
+            height: h,
+            channels: ch,
+            properties: vec![],
+        })
+        .collect();
+
+    let worker_session_dir = dir.join("worker.mmm-session");
+    let job = InitJob {
+        protocol_version: IPC_PROTOCOL_VERSION,
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
+        shm_name: shm_name.clone(),
+        slot_bytes,
+        input_slots: layout.input_slots,
+        output_slots: layout.output_slots,
+        canvas: [w, h, ch],
+        panels: panel_descs,
+        mode: JobMode::Aligned,
+        session_dir: worker_session_dir.to_string_lossy().into_owned(),
+        params: BlendParamsWire {
+            band_rows: band_rows_u32,
+            gain: "unity".to_string(),
+            ..Default::default()
+        },
+    };
+
+    let exe = env!("CARGO_BIN_EXE_mmm-ipc-worker");
+    let mut child = Command::new(exe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mmm-ipc-worker");
+    let mut child_stdin = child.stdin.take().expect("child stdin");
+    let child_stdout = child.stdout.take().expect("child stdout");
+    write_frame(&mut child_stdin, &HostMsg::Init(job.clone()))
+        .expect("write Init frame to child stdin");
+    let host = MockHost::serve_over(job, planar, shm, child_stdout, child_stdin);
+
+    let status = child.wait().expect("wait on mmm-ipc-worker");
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_string(&mut stderr);
+        }
+        panic!("mmm-ipc-worker exited with {status}: {stderr}");
+    }
+    host.join();
+
+    // The session must record the wire's gain mode…
+    let session_json = std::fs::read_to_string(worker_session_dir.join("session.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&session_json).unwrap();
+    assert_eq!(v["gain_mode"], "unity", "session.json: {session_json}");
+
+    // …and the solve must have pinned every gain at exactly 1.
+    let phot =
+        Photometry::load(&worker_session_dir.join("analysis").join("photometry.json")).unwrap();
+    for per_channel in &phot.gains {
+        for &g in per_channel {
+            assert_eq!(g, 1.0);
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Task 10: cancellation, worker-crash robustness, and the solved-mode e2e.
 // ---------------------------------------------------------------------------
