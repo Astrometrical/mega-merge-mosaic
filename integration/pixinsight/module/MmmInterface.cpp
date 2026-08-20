@@ -156,15 +156,43 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 
    Tagline_Label.SetText( "Big mosaics, no big deal." );
 
-   Copyright_Label.SetText( "Copyright (c) 2026 Astrometrical | astrometrical.com" );
-   Copyright_Label.SetToolTip( "<p>Visit https://astrometrical.com</p>" );
-   Copyright_Label.SetCursor( StdCursor::PointingHand );
-   Copyright_Label.OnMouseRelease( (Control::mouse_button_event_handler)&MmmBlendInterface::e_NoticeMouseRelease, w );
+   Copyright_Label.SetText( "Copyright (c) 2026 Astrometrical" );
+
+   // Hyperlink-styled labels: colored + underlined so they read as links,
+   // pointing-hand cursor, and a shared mouse-release handler that dispatches
+   // on the sender. The color works on both the dark (default) and light core
+   // themes.
+   auto makeLink = [&w]( Label& label, const String& text, const String& toolTip )
+   {
+      label.SetText( text );
+      label.SetToolTip( toolTip );
+      label.SetCursor( StdCursor::PointingHand );
+      label.SetStyleSheet( "QLabel { color: #4FA6FF; text-decoration: underline; }" );
+      label.OnMouseRelease( (Control::mouse_button_event_handler)&MmmBlendInterface::e_LinkMouseRelease, w );
+   };
+   makeLink( ShareLink_Label, "Share your mosaics on Astrometrical",
+             "<p>Visit https://astrometrical.com</p>" );
+   makeLink( ToolsLink_Label, "Astrometrical Tools",
+             "<p>Visit https://tools.astrometrical.com/</p>" );
+   makeLink( KofiLink_Label, "Buy me a coffee",
+             "<p>Support development: https://ko-fi.com/astrometrical</p>" );
+
+   LinkSep1_Label.SetText( u"\x00B7" ); // middle dot separator
+   LinkSep2_Label.SetText( u"\x00B7" );
+
+   Links_Sizer.SetSpacing( 6 );
+   Links_Sizer.Add( ShareLink_Label );
+   Links_Sizer.Add( LinkSep1_Label );
+   Links_Sizer.Add( ToolsLink_Label );
+   Links_Sizer.Add( LinkSep2_Label );
+   Links_Sizer.Add( KofiLink_Label );
+   Links_Sizer.AddStretch();
 
    NoticeText_Sizer.SetSpacing( 2 );
    NoticeText_Sizer.Add( Title_Label );
    NoticeText_Sizer.Add( Tagline_Label );
    NoticeText_Sizer.Add( Copyright_Label );
+   NoticeText_Sizer.Add( Links_Sizer );
 
    Notice_Sizer.SetMargin( 6 );
    Notice_Sizer.SetSpacing( 8 );
@@ -467,7 +495,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 }
 
 // ----------------------------------------------------------------------------
-// Header notice: logo paint + copyright link.
+// Header notice: logo paint + hyperlink labels.
 // ----------------------------------------------------------------------------
 
 void MmmBlendInterface::e_LogoPaint( Control& sender, const pcl::Rect& )
@@ -477,23 +505,34 @@ void MmmBlendInterface::e_LogoPaint( Control& sender, const pcl::Rect& )
       g.DrawScaledBitmap( sender.BoundsRect(), GUI->Logo_Bitmap );
 }
 
-void MmmBlendInterface::e_NoticeMouseRelease( Control&, const pcl::Point&, int button, unsigned, unsigned )
+void MmmBlendInterface::e_LinkMouseRelease( Control& sender, const pcl::Point&, int button, unsigned, unsigned )
 {
    if ( button != MouseButton::Left )
       return;
+
+   String url;
+   if ( &sender == &GUI->ShareLink_Label )
+      url = "https://astrometrical.com";
+   else if ( &sender == &GUI->ToolsLink_Label )
+      url = "https://tools.astrometrical.com/";
+   else if ( &sender == &GUI->KofiLink_Label )
+      url = "https://ko-fi.com/astrometrical";
+   else
+      return;
+
    try
    {
 #ifdef _WIN32
-      ExternalProcess::StartProgram( "cmd.exe", StringList() << "/c" << "start" << "" << "https://astrometrical.com" );
+      ExternalProcess::StartProgram( "cmd.exe", StringList() << "/c" << "start" << "" << url );
 #elif defined( __APPLE__ )
-      ExternalProcess::StartProgram( "open", StringList() << "https://astrometrical.com" );
+      ExternalProcess::StartProgram( "open", StringList() << url );
 #else
-      ExternalProcess::StartProgram( "xdg-open", StringList() << "https://astrometrical.com" );
+      ExternalProcess::StartProgram( "xdg-open", StringList() << url );
 #endif
    }
    catch ( ... )
    {
-      // Non-fatal: the URL is visible in the label text anyway.
+      // Non-fatal: each link's tooltip shows the full URL anyway.
    }
 }
 

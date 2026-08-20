@@ -87,6 +87,12 @@ private:
       Label           Title_Label;
       Label           Tagline_Label;
       Label           Copyright_Label;
+      HorizontalSizer Links_Sizer;
+      Label           ShareLink_Label;       // -> https://astrometrical.com
+      Label           LinkSep1_Label;
+      Label           ToolsLink_Label;       // -> https://tools.astrometrical.com/
+      Label           LinkSep2_Label;
+      Label           KofiLink_Label;        // -> https://ko-fi.com/astrometrical
       Bitmap          Logo_Bitmap;           // rendered from MMM_CHEVRON_SVG
 
       // --- Target Frames section --------------------------------------------
@@ -186,8 +192,8 @@ private:
    void e_FlattenOrderValueUpdated( SpinBox& sender, int value );
 
    void e_ToggleSection( SectionBar& sender, Control& section, bool start );
-   void e_NoticeMouseRelease( Control& sender, const pcl::Point& pos,
-                              int button, unsigned buttons, unsigned modifiers );
+   void e_LinkMouseRelease( Control& sender, const pcl::Point& pos,
+                            int button, unsigned buttons, unsigned modifiers );
    void e_LogoPaint( Control& sender, const pcl::Rect& updateRect );
 };
 
