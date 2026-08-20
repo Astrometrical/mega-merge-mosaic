@@ -59,7 +59,17 @@ Releases are driven entirely by git tags of the form `vX.Y.Z`.
 
 1. **(Optional) bump the version.** Edit `version` under `[workspace.package]`
    in the root `Cargo.toml`, run `cargo build` once so `Cargo.lock` picks it
-   up, and commit:
+   up, and bump the same number in the three files that must stay in exact
+   sync with it (enforced by `crates/mmm-ipc-worker/tests/version_sync.rs`,
+   so CI goes red if one is missed):
+
+   - `integration/pixinsight/module/MmmVersion.h` (`MMM_VERSION_*` and
+     `MMM_VERSION_STRING`)
+   - `integration/pixinsight/host/mmm_protocol.h` (`kExpectedWorkerVersion`)
+   - `integration/pixinsight/doc/tools/MegaMergeMosaic/MegaMergeMosaic.html`
+     (the "Version X.Y.Z" subtitle line)
+
+   Then commit:
 
    ```sh
    git commit -am "chore: bump version to 0.1.0"

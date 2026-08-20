@@ -9,6 +9,10 @@
 //! * the C++ host library's `kExpectedWorkerVersion`
 //!   (`integration/pixinsight/host/mmm_protocol.h`), which the host injects
 //!   into every Init and probe request.
+//!
+//! The module's user documentation states the release version too; it is not
+//! part of the handshake, but a stale number shipped to users is still a bug,
+//! so it is checked here as well.
 
 use std::path::PathBuf;
 
@@ -43,6 +47,18 @@ fn module_version_matches_worker_version() {
         env!("CARGO_PKG_VERSION"),
         "MmmVersion.h MMM_VERSION_STRING and the workspace Cargo.toml version \
          must be bumped together (the version handshake compares them)"
+    );
+}
+
+#[test]
+fn module_documentation_version_matches_worker_version() {
+    let html = repo_file("integration/pixinsight/doc/tools/MegaMergeMosaic/MegaMergeMosaic.html");
+    let needle = format!("Version {} &mdash;", env!("CARGO_PKG_VERSION"));
+    assert!(
+        html.contains(&needle),
+        "MegaMergeMosaic.html must state the current release version \
+         (expected the subtitle line to contain {needle:?}); bump the doc's \
+         version line together with Cargo.toml"
     );
 }
 

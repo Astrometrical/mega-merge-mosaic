@@ -37,6 +37,12 @@
     font-weight: bold;
     color: #303030;
   }
+  p.links {
+    margin-top: 0.6em;
+  }
+  p.links a {
+    color: #1a63c8;
+  }
   table.params {
     border-collapse: collapse;
     width: 100%;
@@ -80,9 +86,16 @@
 <body>
 
 <h1>MegaMergeMosaic</h1>
-<!-- keep in sync with MmmVersion.h -->
-<p class="subtitle">Version 1.0.0 &mdash; Category: Mosaic</p>
+<!-- version kept in sync with MmmVersion.h / Cargo.toml; enforced by
+     crates/mmm-ipc-worker/tests/version_sync.rs -->
+<p class="subtitle">Version 1.4.0 &mdash; Category: Mosaic</p>
 <p class="tagline">Big mosaics, no big deal.</p>
+
+<p class="links">
+  <a href="https://astrometrical.com">Share your mosaics on Astrometrical</a> &middot;
+  <a href="https://tools.astrometrical.com/">Astrometrical Tools</a> &middot;
+  <a href="https://ko-fi.com/astrometrical">Buy me a coffee</a>
+</p>
 
 <h2>Description</h2>
 
