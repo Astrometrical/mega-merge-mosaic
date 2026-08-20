@@ -1407,3 +1407,87 @@ fn masked_core_on_narrow_overlap_corner_reconstructs_cleanly() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn output_is_clamped_to_unit_range() {
+    use crate::analyze::analyze_opts;
+    use crate::overlap::OverlapGraph;
+    use crate::synth::{SynthSpec, generate};
+
+    // Saturated input pixels scaled by a gain > 1 (or, as here, truth content
+    // above 1.0) exceed 1.0 in the corrected output, which PixInsight's
+    // auto-STF then clips to black; Lanczos undershoot beside saturation
+    // cliffs and offset-corrected noise tails dip below 0. The blend output
+    // must be clamped to [0, 1] on every path.
+    let dir = tmpdir("clamp");
+    let spec = SynthSpec {
+        canvas: (512, 256),
+        channels: 1,
+        grid: (2, 1),
+        overlap_frac: 0.25,
+        n_stars: 20,
+        noise_sigma: 0.002,
+        panel_gain_range: (1.0, 1.0),
+        // A uniform applied pedestal: the correction subtracts it again, so
+        // the faint noise tail of the non-gauge panel goes negative.
+        panel_offset_range: (0.01, 0.01),
+        panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
+        panel_shift: vec![],
+        panel_spike_angle: vec![],
+        panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
+        // Over-unity core deep inside panel 0: corrected output would reach
+        // ~1.6 unclamped.
+        core: Some((100.0, 128.0, 40.0, 1.6)),
+        seed: 3,
+    };
+    let res = generate(&spec, &dir.join("panels")).unwrap();
+    let session = analyze_opts(&res.panel_paths, &dir.join("s.mmm-session"), Some(2)).unwrap();
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+    let surf = crate::surfaces::Surfaces::load(&session.surfaces_path()).unwrap();
+
+    for (mode, downsample) in [
+        (BlendMode::Pyramid, 1),
+        (BlendMode::Feather, 1),
+        (BlendMode::Pyramid, 8),
+    ] {
+        let params = BlendParams {
+            feather_px: 24.0,
+            downsample,
+            band_rows: 64,
+            mode,
+            roi: None,
+            defect_veto: true,
+            flatten: None,
+        };
+        let mut sink = MemSink::new();
+        blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
+        let mut over = 0u64;
+        let mut neg = 0u64;
+        let mut saturated = 0u64;
+        for &v in &sink.data {
+            assert!(v.is_finite());
+            if v > 1.0 {
+                over += 1;
+            }
+            if v < 0.0 {
+                neg += 1;
+            }
+            if v == 1.0 {
+                saturated += 1;
+            }
+        }
+        assert_eq!(over, 0, "{mode:?}/ds{downsample}: pixels above 1.0");
+        assert_eq!(neg, 0, "{mode:?}/ds{downsample}: pixels below 0.0");
+        assert!(
+            saturated > 0,
+            "{mode:?}/ds{downsample}: the over-unity core must clamp to exactly 1.0 \
+             (nothing reached the clamp — the spec no longer exercises it)"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

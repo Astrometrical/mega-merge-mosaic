@@ -825,6 +825,7 @@ fn blend_full(
     let inv_ch = 1.0f64 / session.canvas.1 as f64;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
     let mut nonfinite = 0u64;
+    let mut clamped = 0u64;
 
     for y0 in (0..out_h).step_by(band_rows) {
         let rows_here = band_rows.min(out_h - y0);
@@ -896,9 +897,10 @@ fn blend_full(
         let bs = &mut band[..nch * rows_here * out_w];
         assemble_band(bs, &rows_out, out_w, nch);
         nonfinite += zero_non_finite(bs);
+        clamped += clamp_unit(bs);
         sink.band(y0 as u64, bs)?;
     }
-    warn_non_finite(nonfinite);
+    warn_non_finite(nonfinite, clamped);
     sink.finish()?;
     tracing::info!(total_s = t0.elapsed().as_secs_f64(), "blend full-res done");
     Ok(())
@@ -1236,6 +1238,7 @@ fn blend_twoband_impl(
     let defect_veto = params.defect_veto;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
     let mut nonfinite = 0u64;
+    let mut clamped = 0u64;
 
     for y0 in (0..out_h).step_by(band_rows) {
         let rows_here = band_rows.min(out_h - y0);
@@ -1475,9 +1478,10 @@ fn blend_twoband_impl(
         let bs = &mut band[..nch * rows_here * out_w];
         assemble_band(bs, &rows_out, out_w, nch);
         nonfinite += zero_non_finite(bs);
+        clamped += clamp_unit(bs);
         sink.band(y0 as u64, bs)?;
     }
-    warn_non_finite(nonfinite);
+    warn_non_finite(nonfinite, clamped);
     sink.finish()?;
     tracing::info!(total_s = t0.elapsed().as_secs_f64(), "blend two-band done");
     Ok(())
@@ -1519,6 +1523,7 @@ fn blend_l8(
     let inv_ch = 1.0f64 / session.canvas.1 as f64;
     let mut band = vec![0.0f32; nch * band_rows * out_w];
     let mut nonfinite = 0u64;
+    let mut clamped = 0u64;
 
     for y0 in (0..out_h).step_by(band_rows) {
         let rows_here = band_rows.min(out_h - y0);
@@ -1563,9 +1568,10 @@ fn blend_l8(
         let bs = &mut band[..nch * rows_here * out_w];
         assemble_band(bs, &rows_out, out_w, nch);
         nonfinite += zero_non_finite(bs);
+        clamped += clamp_unit(bs);
         sink.band(y0 as u64, bs)?;
     }
-    warn_non_finite(nonfinite);
+    warn_non_finite(nonfinite, clamped);
     sink.finish()?;
     tracing::info!(total_s = t0.elapsed().as_secs_f64(), "blend from L8 done");
     Ok(())
@@ -1590,13 +1596,41 @@ fn zero_non_finite(band: &mut [f32]) -> u64 {
     n
 }
 
-/// Log-once companion to [`zero_non_finite`]: warn at end of a blend that
-/// zeroed any non-finite samples; silent for the common all-finite case.
-fn warn_non_finite(count: u64) {
-    if count > 0 {
+/// Clamp a band to the unit range, returning how many samples moved.
+/// Saturated input pixels (clipped at 1.0) owned by a gain > 1 panel scale
+/// above 1.0 under the photometric correction — the true flux there is
+/// unknowable, and out-of-range floats make PixInsight's auto-STF clip the
+/// region to black. Lanczos undershoot beside saturation cliffs and
+/// offset-corrected noise tails dip a little below 0. Both ends clamp.
+fn clamp_unit(band: &mut [f32]) -> u64 {
+    let mut n = 0u64;
+    for v in band.iter_mut() {
+        if *v > 1.0 {
+            *v = 1.0;
+            n += 1;
+        } else if *v < 0.0 {
+            *v = 0.0;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Log-once companion to [`zero_non_finite`]/[`clamp_unit`]: warn at end of
+/// a blend that zeroed any non-finite samples, note (info) how many samples
+/// were clamped into [0, 1]; silent for the common in-range case.
+fn warn_non_finite(nonfinite: u64, clamped: u64) {
+    if nonfinite > 0 {
         tracing::warn!(
-            count,
+            count = nonfinite,
             "non-finite output samples zeroed (do the input panels contain NaN/Inf pixels?)"
+        );
+    }
+    if clamped > 0 {
+        tracing::info!(
+            count = clamped,
+            "output samples clamped to [0, 1] (saturated pixels × gain > 1, and \
+             sub-zero noise/ringing tails)"
         );
     }
 }

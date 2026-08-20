@@ -99,7 +99,11 @@ const GRAPH_HASH: u64 = 0x27e6_9998_d3cc_c51c;
 /// 0x2e65_c7ff_0be0_c3de.
 const PHOTOMETRY_HASH: u64 = 0xafa1_fed4_7c07_4ea8;
 const SURFACES_HASH: u64 = 0x0987_e407_21c0_9291;
-const BLEND_FEATHER_HASH: u64 = 0x107f_46aa_73a4_e0c8;
+/// Both blends recaptured for the [0, 1] output clamp (out-of-range samples
+/// from this spec's defect/bright stars now clamp; analyze artifacts
+/// unchanged; previous values: feather 0x107f_46aa_73a4_e0c8, pyramid
+/// 0xa247_5289_0a4b_0861).
+const BLEND_FEATHER_HASH: u64 = 0xc3d6_5fa8_266b_c0cd;
 /// Recaptured twice, deliberately:
 /// - M42-staircase fix (`seam::split_mask_components`): this spec's dense
 ///   star field floods into filled mask components that classify as
@@ -133,7 +137,7 @@ const BLEND_FEATHER_HASH: u64 = 0x107f_46aa_73a4_e0c8;
 ///   flooded mask components form such deep zones, moving the Pyramid
 ///   output; Feather and TwoBand (and all analyze artifacts) remain
 ///   byte-identical (previous value: 0xd416_4a6b_faa5_b9d8).
-const BLEND_PYRAMID_HASH: u64 = 0xa247_5289_0a4b_0861;
+const BLEND_PYRAMID_HASH: u64 = 0x2393_cb56_692a_fd72;
 
 #[test]
 fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {

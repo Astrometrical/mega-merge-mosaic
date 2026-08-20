@@ -115,6 +115,16 @@ automatically (distance ≈ 0 ⇒ tiny weight).
 optional PNG output with an autostretch (median/MAD midtone transfer) for
 quick visual checks.
 
+Output is clamped to [0, 1] (2026-08-20): saturated input pixels (clipped at
+1.0) owned by a gain > 1 panel scale above 1.0 under the photometric
+correction — their true flux is unknowable, and out-of-range floats make
+PixInsight's auto-STF clip the region to black (user-reported on the RickJay
+M42 core; 1.5k such pixels mosaic-wide, every saturated star core owned by a
+g > 1 panel, values clustering exactly at the per-panel gains). Lanczos
+undershoot beside saturation cliffs and offset-corrected noise tails dip
+marginally below 0. Both ends clamp in the shared band sanitize step (all
+modes, full-res + L8 + IPC); the count is logged at info level.
+
 ### Phase 2 (in progress)
 
 **A. Residual surface correction.** After the global gain solve, per-panel

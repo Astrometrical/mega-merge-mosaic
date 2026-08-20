@@ -1246,12 +1246,15 @@ fn feather_and_twoband_outputs_are_bit_stable() {
     // every output byte. Previous values: feather 0x4e5d_7ebe_25f4_b6e9
     // (dark-moat recapture; phase-3 capture 0x536f_0323_8796_27da before
     // that), twoband 0xa1a7_7370_c8d8_e7b7.
+    // Recaptured again for the [0, 1] output clamp: this spec's defect and
+    // bright stars produce out-of-range samples that now clamp (previous
+    // values: feather 0x8762_daa0_68ed_e1a4, twoband 0xf626_d1ed_2fd6_afee).
     assert_eq!(
-        feather, 0x8762_daa0_68ed_e1a4,
+        feather, 0xd4e4_4dad_8639_b388,
         "Feather output changed — must stay bit-identical"
     );
     assert_eq!(
-        twoband, 0xf626_d1ed_2fd6_afee,
+        twoband, 0x59a2_b447_f20a_bdde,
         "TwoBand output changed — must stay bit-identical"
     );
 
@@ -2403,7 +2406,9 @@ fn pyramid_deep_single_coverage_matches_panel() {
     for y in zy0..zy1 {
         for x in zx0..zx1 {
             let merged = sink.at(0, (x - bbox[0]) as usize, (y - bbox[1]) as usize);
-            let input = data[(y * spec.canvas.0 + x) as usize] * g + o;
+            // The blend clamps its output to [0, 1]; the +0.1 offset pushes
+            // star cores past 1.0, so the reference must clamp identically.
+            let input = (data[(y * spec.canvas.0 + x) as usize] * g + o).clamp(0.0, 1.0);
             let d = (merged - input).abs();
             if d > max_diff {
                 max_diff = d;
