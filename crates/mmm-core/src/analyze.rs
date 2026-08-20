@@ -39,7 +39,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -218,14 +217,20 @@ fn analyze_aligned(
     let mut session = Session::create(session_dir)?;
 
     report(progress, "analyze", 0, paths.len() as u64);
-    let scanned = std::sync::atomic::AtomicU64::new(0);
+    // Claim + report under one lock: with a bare atomic claim a later
+    // completion could report before an earlier one, leaving a non-final
+    // count (e.g. 1/2 after 2/2) as the observer's last event.
+    let scanned = std::sync::Mutex::new(0u64);
     let scans: Vec<PanelScan> = paths
         .par_iter()
         .enumerate()
         .map(|(id, path)| {
             let scan = scan_panel(id, path)?;
-            let done = scanned.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            report(progress, "analyze", done, paths.len() as u64);
+            {
+                let mut done = scanned.lock().expect("progress lock poisoned");
+                *done += 1;
+                report(progress, "analyze", *done, paths.len() as u64);
+            }
             Ok(scan)
         })
         .collect::<Result<_>>()?;
@@ -362,7 +367,8 @@ fn analyze_solved(
 
     // Scan the caches exactly like aligned frames, through PanelReader.
     report(progress, "analyze", 0, aligned.len() as u64);
-    let scanned = std::sync::atomic::AtomicU64::new(0);
+    // Claim + report under one lock (see analyze_aligned's scan loop).
+    let scanned = std::sync::Mutex::new(0u64);
     let scans: Vec<PanelScan> = aligned
         .par_iter()
         .enumerate()
@@ -380,8 +386,11 @@ fn analyze_solved(
             };
             let reader = PanelReader::open(&meta, canvas)?;
             let scan = scan_reader(meta, reader)?;
-            let done = scanned.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            report(progress, "analyze", done, aligned.len() as u64);
+            {
+                let mut done = scanned.lock().expect("progress lock poisoned");
+                *done += 1;
+                report(progress, "analyze", *done, aligned.len() as u64);
+            }
             Ok(scan)
         })
         .collect::<Result<_>>()?;
@@ -546,7 +555,8 @@ pub fn analyze_ipc_aligned(
         return Err(Error::format(session_dir, "IPC job has no input panels"));
     }
 
-    let done = AtomicU64::new(0);
+    // Claim + report under one lock (see analyze_aligned's scan loop).
+    let done = std::sync::Mutex::new(0u64);
     let total = n_panels as u64;
     let scans: Vec<PanelScan> = (0..n_panels)
         .into_par_iter()
@@ -566,8 +576,11 @@ pub fn analyze_ipc_aligned(
                 },
             };
             let s = scan_reader(meta, reader)?;
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            link.send_progress("analyze", d, total);
+            {
+                let mut d = done.lock().expect("progress lock poisoned");
+                *d += 1;
+                link.send_progress("analyze", *d, total);
+            }
             Ok(s)
         })
         .collect::<Result<_>>()?;
@@ -646,7 +659,8 @@ pub fn analyze_ipc_solved(
     );
 
     // Scan the caches exactly like aligned frames, through PanelReader.
-    let done = AtomicU64::new(0);
+    // Claim + report under one lock (see analyze_aligned's scan loop).
+    let done = std::sync::Mutex::new(0u64);
     let total = aligned.len() as u64;
     let scans: Vec<PanelScan> = aligned
         .par_iter()
@@ -665,8 +679,11 @@ pub fn analyze_ipc_solved(
             };
             let reader = PanelReader::open(&meta, canvas)?;
             let s = scan_reader(meta, reader)?;
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            link.send_progress("analyze", d, total);
+            {
+                let mut d = done.lock().expect("progress lock poisoned");
+                *d += 1;
+                link.send_progress("analyze", *d, total);
+            }
             Ok(s)
         })
         .collect::<Result<_>>()?;
@@ -1009,6 +1026,44 @@ mod tests {
         // The plain entry point still works without an observer.
         let quiet = f.dir.join("quiet.mmm-session");
         analyze_input(&f.paths, &quiet, Some(2), InputSelect::Aligned).unwrap();
+
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// Progress events must arrive in claim order even when one panel's
+    /// observer call is slow: the count claim and the report happen under
+    /// one lock, so a worker that claimed `done = n` publishes it before
+    /// any later claim is reported. Regression test for an out-of-order
+    /// final event (1/2 arriving after 2/2) seen on a 2-core Windows CI
+    /// runner; the stall below widens that race window so an unserialized
+    /// claim+report pair fails here deterministically on any multicore box.
+    #[test]
+    fn file_analyze_progress_events_are_ordered() {
+        let f = synth_two_full_canvas_panels("progress_order");
+        let dir = f.dir.join("prog.mmm-session");
+
+        let events = std::sync::Mutex::new(Vec::<(u64, u64)>::new());
+        let observer = |_stage: &str, done: u64, total: u64| {
+            if done == 1 {
+                // Stall the first completion's report so a racing second
+                // completion would overtake it if claim+report were not
+                // one critical section.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            events.lock().unwrap().push((done, total));
+        };
+        analyze_input_progress(
+            &f.paths,
+            &dir,
+            Some(2),
+            InputSelect::Aligned,
+            Some(&observer),
+        )
+        .unwrap();
+
+        let events = events.into_inner().unwrap();
+        let dones: Vec<u64> = events.iter().map(|&(d, _)| d).collect();
+        assert_eq!(dones, vec![0, 1, 2], "events out of claim order");
 
         std::fs::remove_dir_all(&f.dir).unwrap();
     }
