@@ -44,4 +44,13 @@ WORKER="$REPO_ROOT/target/release/mmm-ipc-worker"
 mkdir -p "$STAGE/bin"
 cp -f "$SO" "$STAGE/bin/mmm-pxm.so"
 cp -f "$WORKER" "$STAGE/bin/mmm-ipc-worker"
+
+# Update tarballs overlay the PixInsight install root, so the documentation must
+# land in the archive as doc/tools/MegaMergeMosaic/... — stage it alongside bin/.
+DOC_SRC="$REPO_ROOT/integration/pixinsight/doc/tools/MegaMergeMosaic"
+[ -f "$DOC_SRC/MegaMergeMosaic.html" ] || { echo "module documentation missing at $DOC_SRC" >&2; exit 1; }
+mkdir -p "$STAGE/doc/tools/MegaMergeMosaic"
+cp -Rf "$DOC_SRC/." "$STAGE/doc/tools/MegaMergeMosaic/"
+
 echo "staged unsigned payload in $STAGE/bin: $(ls "$STAGE/bin")"
+echo "staged documentation in $STAGE/doc/tools/MegaMergeMosaic: $(ls "$STAGE/doc/tools/MegaMergeMosaic")"

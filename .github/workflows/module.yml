@@ -105,6 +105,7 @@ jobs:
           name: mmm-pxm-linux-x64
           path: |
             stage/bin/**
+            stage/doc/**
             repo-out/**
             bundle-info.txt
           if-no-files-found: error
@@ -182,6 +183,7 @@ jobs:
           name: mmm-pxm-windows-x64
           path: |
             stage/bin/**
+            stage/doc/**
             bundle-info.txt
           if-no-files-found: error
 
@@ -250,5 +252,6 @@ jobs:
           name: mmm-pxm-macos-arm64
           path: |
             stage/bin/**
+            stage/doc/**
             bundle-info.txt
           if-no-files-found: error

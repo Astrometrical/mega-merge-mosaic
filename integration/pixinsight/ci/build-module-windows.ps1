@@ -52,4 +52,14 @@ if (-not (Test-Path $worker)) { throw 'mmm-ipc-worker.exe not built' }
 New-Item -ItemType Directory -Force -Path (Join-Path $Stage 'bin') | Out-Null
 Copy-Item $dll.FullName (Join-Path $Stage 'bin/mmm-pxm.dll') -Force
 Copy-Item $worker (Join-Path $Stage 'bin/mmm-ipc-worker.exe') -Force
+
+# Update tarballs overlay the PixInsight install root, so the documentation must
+# land in the archive as doc/tools/MegaMergeMosaic/... — stage it alongside bin/.
+$docSrc = Join-Path $repo 'integration/pixinsight/doc/tools/MegaMergeMosaic'
+if (-not (Test-Path (Join-Path $docSrc 'MegaMergeMosaic.html'))) { throw "module documentation missing at $docSrc" }
+$docDst = Join-Path $Stage 'doc/tools/MegaMergeMosaic'
+New-Item -ItemType Directory -Force -Path $docDst | Out-Null
+Copy-Item (Join-Path $docSrc '*') $docDst -Recurse -Force
+
 Write-Host "staged unsigned payload in $Stage/bin: $((Get-ChildItem (Join-Path $Stage 'bin')).Name -join ', ')"
+Write-Host "staged documentation in $Stage/doc/tools/MegaMergeMosaic: $((Get-ChildItem $docDst).Name -join ', ')"
