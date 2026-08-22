@@ -1,7 +1,8 @@
 # Builds the PixInsight module (mmm-pxm) + mmm-ipc-worker against the pinned
-# open-source PCL, with NO PixInsight on the runner. All three targets --
-# Linux (x64), macOS (arm64), and Windows (x64) -- are live, required
-# build+test jobs.
+# open-source PCL, with NO PixInsight on the runner. All four targets --
+# Linux (x64), macOS (arm64 + x64), and Windows (x64) -- are live, required
+# build+test jobs. macOS needs both arches: pre-1.9.4 PixInsight is x64-only
+# on macOS (Rosetta on Apple Silicon), and Intel-Mac x64 builds still ship.
 name: Module
 
 on:
@@ -79,7 +80,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y libxml2-utils
           bash integration/pixinsight/repo/gen-package.sh linux x64 "$PWD/stage" "$PWD/repo-out"
           bash integration/pixinsight/repo/gen-updates-xri.sh \
-            "$(date -u +%Y%m%d)" "1.9.4:1.9.4" "MergeMosaic module" \
+            "$(date -u +%Y%m%d)" "1.9.0:1.9.9" "MergeMosaic module" \
             "$PWD/repo-out/updates.xri" "$PWD/repo-out/linux-x64.meta"
           xmllint --noout "$PWD/repo-out/updates.xri"
           echo "repository artifacts generated + validated (dormant: not published)"
@@ -188,8 +189,21 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: build+test (macos-arm64)
-    runs-on: macos-latest
+    name: build+test (macos-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # arm64: PixInsight 1.9.4+ native Apple Silicon cores.
+          - arch: arm64
+            runner: macos-latest
+          # x64: Intel Macs on any version, plus ALL 1.9.0-1.9.3 macOS cores —
+          # pre-1.9.4 PixInsight is x64-only on macOS (Rosetta on Apple
+          # Silicon), and an x64 core cannot load an arm64 dylib. Native
+          # Intel runner (macos-13 was retired) so tests run natively too.
+          - arch: x64
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -210,18 +224,18 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
+          key: pcl-${{ runner.os }}-${{ matrix.arch }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
 
       - name: Build PCL (on cache miss)
         if: steps.pcl-cache.outputs.cache-hit != 'true'
-        run: bash integration/pixinsight/ci/build-pcl-macos.sh --out "$PWD/pcl-ci"
+        run: bash integration/pixinsight/ci/build-pcl-macos.sh --out "$PWD/pcl-ci" --arch ${{ matrix.arch }}
 
       - name: Save libPCL-pxi.a cache (only after a successful build)
         if: steps.pcl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: pcl-ci
-          key: pcl-${{ runner.os }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
+          key: pcl-${{ runner.os }}-${{ matrix.arch }}-${{ steps.pcl.outputs.sha }}-${{ hashFiles('integration/pixinsight/ci/build-pcl-macos.sh') }}
 
       - name: Confirm PCL archive
         run: test -f "$PWD/pcl-ci/lib/libPCL-pxi.a"
@@ -229,7 +243,7 @@ jobs:
       - name: Build module + worker, stage payload
         run: |
           bash integration/pixinsight/ci/build-module-macos.sh \
-            --pcl "$PWD/pcl-ci" --stage "$PWD/stage"
+            --pcl "$PWD/pcl-ci" --stage "$PWD/stage" --arch ${{ matrix.arch }}
 
       - name: Rust tests (ipc crates)
         run: cargo test -p mmm-core -p mmm-ipc-worker
@@ -249,7 +263,7 @@ jobs:
       - name: Upload unsigned module artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mmm-pxm-macos-arm64
+          name: mmm-pxm-macos-${{ matrix.arch }}
           path: |
             stage/bin/**
             stage/doc/**

@@ -65,8 +65,12 @@ add_library(mmm-pxm SHARED
 # mmm-pxm.dll, no "lib" prefix (matches the .so/.dylib output name).
 set_target_properties(mmm-pxm PROPERTIES PREFIX "" OUTPUT_NAME "mmm-pxm" SUFFIX ".dll")
 
+# PCL headers as SYSTEM (MSVC /external:I): the pinned PCL (2.8.x, C++17-era)
+# warns from inside its own headers under C++20, which would trip the
+# warning-free gate in build-module-windows.ps1; our code stays under /W3.
+target_include_directories(mmm-pxm SYSTEM PRIVATE
+  ${PCL_PREFIX}/include)
 target_include_directories(mmm-pxm PRIVATE
-  ${PCL_PREFIX}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/../host
   ${CMAKE_CURRENT_SOURCE_DIR}/../host/third_party)
 

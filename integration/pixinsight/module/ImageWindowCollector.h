@@ -42,6 +42,14 @@ public:
    ImageWindowCollector() = default;
 
    /*!
+    * Destructor. Explicitly noexcept: the pinned PCL (2.8.x, PixInsight
+    * 1.9.0) declares UIObject::~UIObject() noexcept(false), which would
+    * otherwise loosen the implicit spec below the noexcept ~OutputCollector()
+    * base and fail to compile; 2.10.x headers made it noexcept anyway.
+    */
+   ~ImageWindowCollector() noexcept override = default;
+
+   /*!
     * Creates the output window for a \a w x \a h canvas with \a ch channels
     * (Float32, color iff ch >= 3). Called exactly once, before any band().
     */

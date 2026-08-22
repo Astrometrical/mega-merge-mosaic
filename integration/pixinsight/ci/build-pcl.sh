@@ -45,6 +45,18 @@ if [ -f "$VER_CPP" ]; then
   check_ver_fn Release "$PCL_VER_RELEASE" || echo "warning: Version.cpp release != $PCL_VER_RELEASE (source may have shifted)" >&2
 fi
 
+# HARD gate on the API version compiled into the module (unlike the soft
+# version check above). PCL_API_Version becomes the module's declared API
+# requirement; cores older than it refuse to load the module, so a pin bump
+# that raises it silently drops support for older PixInsight versions.
+API_HDR="include/pcl/api/APIInterface.h"
+grep -qE "^#define[[:space:]]+PCL_API_Version[[:space:]]+0x${PCL_API_VERSION_HEX}[[:space:]]*$" "$API_HDR" || {
+  echo "ERROR: PCL_API_Version at this pin != 0x${PCL_API_VERSION_HEX}:" >&2
+  grep 'define PCL_API_Version' "$API_HDR" >&2 || echo "  (no PCL_API_Version found in $API_HDR)" >&2
+  echo "Raising it drops older cores; update PCL_API_VERSION_HEX in pcl-pin.env only deliberately." >&2
+  exit 1
+}
+
 # Build only the static PCL library (the module links -lPCL-pxi and nothing else;
 # 3rdparty are header-only for this archive). CUDADevice.cpp compiles without the
 # CUDA toolkit in this PCL version. If a future pin breaks here on cuda.h, drop

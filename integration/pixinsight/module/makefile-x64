@@ -45,9 +45,28 @@ ifeq ($(UNAME_S),Darwin)
   # flags verbatim. macOS has no librt (shm_open etc. are in libc). The
   # three -Wno-* flags mirror PCL's own macosx/g++/makefile-arm64, which
   # needs them to stay warning-free under -Wall when compiling PCL headers
-  # with clang++; our module pulls those headers via plain -I (not
-  # -isystem), so the same warnings can fire here too.
-  PLATFORM_CXXFLAGS := -arch arm64 -mmacosx-version-min=14 -stdlib=libc++ \
+  # with clang++; PCL headers now come in via -isystem (see INCLUDES), but
+  # the -Wno-* flags stay for PCL macros expanded inside our own TUs.
+  #
+  # MMM_MACOS_ARCH selects the macOS slice: arm64 (default; PixInsight 1.9.4+
+  # native cores) or x64 (Intel Macs, plus ALL 1.9.0-1.9.3 macOS cores --
+  # pre-1.9.4 PixInsight is x64-only on macOS, running under Rosetta on Apple
+  # Silicon, and an x64 core cannot load an arm64 dylib). Arch flags mirror
+  # the pinned PCL's own macosx makefiles: x64 adds -msse4.2 and targets
+  # macOS 12 (the 1.9.0-era envelope per PCL 2.8.3's makefile-x64, and the
+  # older Intel machines are exactly the audience); arm64 targets macOS 14.
+  MMM_MACOS_ARCH ?= arm64
+  ifeq ($(MMM_MACOS_ARCH),x64)
+    MACOS_ARCH_FLAGS := -arch x86_64 -mmacosx-version-min=12 -msse4.2
+  else
+    MACOS_ARCH_FLAGS := -arch arm64 -mmacosx-version-min=14
+  endif
+  # The arch/min-version flags must also reach the LINK step (the dylib's
+  # LC_BUILD_VERSION minos is stamped at link time; without it the linker
+  # defaults to the host/SDK, silently raising the shipped minimum macOS).
+  # -msse4.2 is compile-only and harmless at link.
+  SHARED_FLAGS += $(MACOS_ARCH_FLAGS)
+  PLATFORM_CXXFLAGS := $(MACOS_ARCH_FLAGS) -stdlib=libc++ \
                         -D__PCL_MACOSX \
                         -Wno-missing-braces -Wno-nan-infinity-disabled -Wno-extern-c-compat
   # Apple's linker is strict about undefined symbols in a .dylib (unlike GNU
@@ -74,7 +93,11 @@ endif
 
 TARGET   = mmm-pxm.$(MODULE_EXT)
 
-INCLUDES = -I"$(PCLINCDIR)" -I"$(HOSTDIR)" -I"$(HOSTDIR)/third_party"
+# PCL headers via -isystem: the pinned PCL (2.8.x, C++17-era) emits C++20
+# deprecation warnings (e.g. [=] this-capture) from inside its own headers,
+# which would trip the CI warning-free gate; -isystem silences header-internal
+# warnings while our own code stays fully under -Wall.
+INCLUDES = -isystem "$(PCLINCDIR)" -I"$(HOSTDIR)" -I"$(HOSTDIR)/third_party"
 
 CXXFLAGS = -c -pipe -pthread -fPIC \
            -D_REENTRANT $(PLATFORM_CXXFLAGS) \

@@ -49,6 +49,17 @@ try {
     }
   }
 
+  # HARD gate on the API version compiled into the module (mirrors build-pcl.sh):
+  # PCL_API_Version becomes the module's declared API requirement, and cores
+  # older than it refuse to load the module.
+  $apiWant = $pin['PCL_API_VERSION_HEX']
+  if (-not $apiWant) { throw 'PCL_API_VERSION_HEX not found in pcl-pin.env' }
+  $apiHdr = Get-Content 'include/pcl/api/APIInterface.h' -Raw
+  if ($apiHdr -notmatch "(?m)^#define\s+PCL_API_Version\s+0x$apiWant\s*$") {
+    $got = ($apiHdr | Select-String 'define PCL_API_Version.*').Matches.Value
+    throw "PCL_API_Version at this pin != 0x$apiWant (got: $got). Raising it drops older cores; update PCL_API_VERSION_HEX in pcl-pin.env only deliberately."
+  }
+
   # Drop the pinned core project into the (upstream-absent) windows build dir.
   New-Item -ItemType Directory -Force -Path 'src/pcl/windows/vc17' | Out-Null
   Copy-Item (Join-Path $here 'win/PCL.vcxproj') 'src/pcl/windows/vc17/PCL.vcxproj' -Force

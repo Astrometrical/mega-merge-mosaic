@@ -10,7 +10,7 @@ for p in "linux x64" "windows x64" "macos x64"; do
     "$os" "$arch" 1 "$os" "$arch" > "$TMP/$os-$arch.meta"
 done
 
-bash "$GEN" 20260728 "1.9.4:1.9.4" "MergeMosaic module" "$TMP/updates.xri" \
+bash "$GEN" 20260728 "1.9.0:1.9.9" "MergeMosaic module" "$TMP/updates.xri" \
   "$TMP/linux-x64.meta" "$TMP/windows-x64.meta" "$TMP/macos-x64.meta"
 
 XRI="$TMP/updates.xri"
@@ -27,7 +27,7 @@ for os_attr in ('os="linux"','os="windows"','os="macosx"'):
 assert xml.count('type="module"') == 3, "expected 3 module packages"
 assert 'releaseDate="20260728"' in xml
 assert 'arch="x64"' in xml
-assert 'version="1.9.4:1.9.4"' in xml
+assert 'version="1.9.0:1.9.9"' in xml
 print("xri structure OK")
 PY
 echo "PASS: gen-updates-xri"

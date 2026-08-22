@@ -9,6 +9,14 @@ constructor/implementation bodies, not copied from a working module; the plan au
 sanity-check skeletons against the open-source PCL repo (gitlab.com/pixinsight/PCL) or any
 third-party module source if available, before relying on them verbatim.
 
+> **Build-pin caveat:** CI builds the module against PCL **2.8.3** (PixInsight
+> 1.9.0), pinned in `ci/pcl-pin.env`, so the module's declared
+> `PCL_API_Version` (0x0182) admits every 1.9.x core — see the policy comment
+> in the pin file. This document's file+line citations refer to PCL 2.10.4
+> headers; the entry-point/ABI facts below are stable across that span, but
+> verify any *new* API against the pinned 2.8.3 headers before using it in
+> the module.
+
 Target: Linux, one `mmm-pxm.so`, one global-context `MetaProcess`/`ProcessImplementation`, one
 `ProcessInterface`, no PJSR/JavaScript.
 

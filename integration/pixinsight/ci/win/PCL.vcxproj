@@ -11,7 +11,8 @@
 ######################################################################
 -->
 <!-- Lifted from the PixInsight 1.9.4 install's src/pcl/windows/vc17/. -->
-<!-- Matches PCL pin afea714e (2.10.4); open-source PCL build file. -->
+<!-- Trimmed to PCL pin f1f257d9 (2.8.3): ImageType.cpp + PlotManager.cpp -->
+<!-- removed (2.10.x additions absent at the pin); open-source PCL build file. -->
 <!-- See integration/pixinsight/ci/pcl-pin.env for the pinned commit. -->
 <Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
@@ -192,7 +193,6 @@
     <ClCompile Include="..\..\ImageColor.cpp"/>
     <ClCompile Include="..\..\ImageOp.cpp"/>
     <ClCompile Include="..\..\ImageStatistics.cpp"/>
-    <ClCompile Include="..\..\ImageType.cpp"/>
     <ClCompile Include="..\..\ImageVariant.cpp"/>
     <ClCompile Include="..\..\ImageView.cpp"/>
     <ClCompile Include="..\..\ImageWindow.cpp"/>
@@ -230,7 +230,6 @@
     <ClCompile Include="..\..\PSFScaleEstimator.cpp"/>
     <ClCompile Include="..\..\PSFSignalEstimator.cpp"/>
     <ClCompile Include="..\..\Pen.cpp"/>
-    <ClCompile Include="..\..\PlotManager.cpp"/>
     <ClCompile Include="..\..\PolarTransform.cpp"/>
     <ClCompile Include="..\..\Position.cpp"/>
     <ClCompile Include="..\..\PreviewSelectionDialog.cpp"/>
