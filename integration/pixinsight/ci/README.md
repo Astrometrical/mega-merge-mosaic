@@ -24,7 +24,8 @@ directory.
   core** (1.9.0), not the newest: `PCL_API_Version` from the pinned PCL is
   compiled into the module as its declared API requirement, and cores refuse
   modules declaring a newer API than their own (see the policy comment in
-  the pin file for the 1.9.x API history).
+  the pin file for the 1.9.x API history). Exception: `macos-arm64` builds
+  from its own `PCL_ARM64_*` pin — see "macOS: two arches, two pins" below.
 - `build-pcl.sh` / `build-pcl-macos.sh` / `build-pcl-windows.ps1` — fetch the
   pinned PCL commit, verify the SHA (hard gate), `PCL_API_Version` against
   `PCL_API_VERSION_HEX` (hard gate — a silent bump here is what locks old
@@ -88,20 +89,26 @@ specific filenames. At the current pin (`f1f257d9`, 2.8.3, with the trimmed
 project) this is a no-op; it exists to catch drift the next time the pin
 moves.
 
-## macOS arm64 makefiles (generated at build time)
+## macOS: two arches, two pins
 
-Pre-1.9.4 PCL trees are x64-only on macOS: no `makefile-arm64` for the core
-library or any of the six 3rdparty libs (upstream added the arm64 variants in
-PCL 2.10.3). `build-pcl-macos.sh` generates each missing `makefile-arm64`
-from the pin's own `makefile-x64` sibling with a mechanical transform
-(`-arch x86_64` → `-arch arm64`, drop `-msse4.2`, `x64` → `arm64` in paths).
-The transform was validated by reproducing all seven of PCL 2.10.4's real
-generator-produced arm64 makefiles byte-identically (modulo the generation
-timestamp comment) from their x64 siblings. Deriving from the pin's own x64
-files means the source lists always match the pinned tree by construction —
-no vendored build file and no drift guard needed on this platform. The
-`macos-x64` leg needs no generation at all: every pin ships the macOS
-`makefile-x64` files natively (`--arch x64` just uses them as-is).
+The two macOS legs build from **different PCL pins** (both in `pcl-pin.env`):
+
+- `macos-x64` uses the compatibility pin (2.8.3, API 0x0182) like Linux and
+  Windows, since macOS x64 cores span 1.9.0–1.9.4 (all 1.9.0–1.9.3 macOS
+  cores are x64 — Rosetta on Apple Silicon — plus Intel Macs on any version).
+- `macos-arm64` uses its own pin (`PCL_ARM64_SHA`, 2.10.4, API 0x0187).
+  This is forced, not a preference: pre-2.10.3 PCL **cannot compile for
+  arm64** — `pcl/Defs.h` hard-errors on non-x86 and `Atomic.h`/`Math.h` use
+  x86 inline asm unconditionally; arm64 support (code paths, makefiles, the
+  3rdparty arm64 driver) arrived with PixInsight 1.9.4, the first arm64
+  core. It is also harmless: an arm64 core older than 1.9.4 does not exist,
+  so declaring API 0x0187 excludes nobody on this arch.
+
+Each arch builds with its pin's own native makefiles (`makefile-x64` /
+`makefile-arm64`). One build-time patch: the 2.8.3 pin's vendored zlib
+`#define`s `fdopen` to `NULL` under `TARGET_OS_MAC`, which mangles the
+modern SDK's `_stdio.h` declaration; `build-pcl-macos.sh` seds the define
+out (a no-op at the arm64 pin, whose newer vendored zlib dropped it).
 
 ## shm-name normalization contract
 

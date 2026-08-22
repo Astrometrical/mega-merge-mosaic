@@ -142,8 +142,10 @@ impl L8Summary {
         }
         let read_plane = |off: usize, n: usize| -> Vec<f32> {
             bytes[off..off + n * 4]
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect()
         };
         let coverage = read_plane(16, cells);

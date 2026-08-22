@@ -4,7 +4,9 @@
 #   build-pcl-macos.sh --out <prefix-dir> [--work <clone-dir>] [--arch arm64|x64]
 # arm64 (default) serves PixInsight 1.9.4+ native cores; x64 serves Intel
 # Macs and every 1.9.0-1.9.3 macOS core (pre-1.9.4 PixInsight is x64-only on
-# macOS, running under Rosetta on Apple Silicon).
+# macOS, running under Rosetta on Apple Silicon). The two arches build from
+# DIFFERENT pins (see pcl-pin.env): arm64 needs PCL 2.10.x — older PCL has no
+# arm64 code paths at all — and every arm64 core accepts its API version.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +25,15 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$OUT" ] || { echo "--out is required" >&2; exit 2; }
 case "$ARCH" in arm64|x64) ;; *) echo "--arch must be arm64 or x64" >&2; exit 2 ;; esac
+
+# arm64 builds from its own pin (see the policy comment in pcl-pin.env).
+if [ "$ARCH" = arm64 ]; then
+  PCL_SHA="$PCL_ARM64_SHA"
+  PCL_VER_MAJOR="$PCL_ARM64_VER_MAJOR"
+  PCL_VER_MINOR="$PCL_ARM64_VER_MINOR"
+  PCL_VER_RELEASE="$PCL_ARM64_VER_RELEASE"
+  PCL_API_VERSION_HEX="$PCL_ARM64_API_VERSION_HEX"
+fi
 WORK="${WORK:-$(mktemp -d)}"
 mkdir -p "$OUT/lib" "$OUT/include" "$WORK"
 
@@ -54,31 +65,21 @@ grep -qE "^#define[[:space:]]+PCL_API_Version[[:space:]]+0x${PCL_API_VERSION_HEX
   exit 1
 }
 
-# Pre-1.9.4 PCL trees ship x64-only macOS makefiles (upstream added arm64
-# variants in PCL 2.10.3). The x64->arm64 delta in upstream's generated
-# makefiles is purely mechanical — verified by reproducing all seven of PCL
-# 2.10.4's real arm64 makefiles byte-identically (mod timestamp) from their
-# x64 siblings: '-arch x86_64' -> '-arch arm64', drop '-msse4.2', and
-# 'x64' -> 'arm64' in paths. Generate any missing arm64 makefile from the
-# pin's own x64 one, so source lists always match the pinned tree exactly.
-# (x64 builds always use the tree's own makefile-x64 — present at every pin.)
+# Each arch uses its own pin's native makefiles: makefile-x64 exists at every
+# pin; makefile-arm64 exists at the arm64 pin (2.10.3+ — older PCL has no
+# arm64 support at all, which is why arm64 builds from a separate pin).
 THIRDPARTY_LIBS=(cminpack lcms lz4 RFC6234 zlib zstd)
-gen_arm64_makefile() {
-  local dir="$1"
-  [ -f "$dir/makefile-arm64" ] && return 0
-  [ -f "$dir/makefile-x64" ] || { echo "expected $dir/makefile-x64 in PCL tree" >&2; exit 1; }
-  sed -e 's/-arch x86_64/-arch arm64/g' -e 's/ -msse4\.2//g' -e 's/x64/arm64/g' \
-    "$dir/makefile-x64" > "$dir/makefile-arm64"
-  mkdir -p "$dir/arm64/Release"
-}
-if [ "$ARCH" = arm64 ]; then
-  gen_arm64_makefile src/pcl/macosx/g++
-  for lib in "${THIRDPARTY_LIBS[@]}"; do
-    gen_arm64_makefile "src/3rdparty/$lib/macosx/g++"
-  done
-fi
 MK="src/pcl/macosx/g++/makefile-$ARCH"
-[ -f "$MK" ] || { echo "expected $MK in PCL tree" >&2; exit 1; }
+[ -f "$MK" ] || { echo "expected $MK in PCL tree (wrong pin for --arch $ARCH?)" >&2; exit 1; }
+
+# The 2.8.3 pin's vendored zlib (1.2.x era) #defines fdopen to NULL under
+# TARGET_OS_MAC — modern SDKs define that unconditionally, so the macro then
+# mangles the SDK's own _stdio.h fdopen declaration when gzguts.h includes
+# <stdio.h> ("expected identifier or '('"). Newer vendored zlib (arm64 pin)
+# dropped the define, making this sed a no-op there.
+/usr/bin/sed -i '' -E \
+  's@#([[:space:]]*)define fdopen\(fd,mode\) NULL(.*)@/* fdopen NULL define removed: mangles the SDK _stdio.h declaration */@' \
+  src/3rdparty/zlib/zutil.h
 
 # The upstream macosx makefiles hardcode an Xcode isysroot; retarget it to the
 # runner's installed SDK for robustness.

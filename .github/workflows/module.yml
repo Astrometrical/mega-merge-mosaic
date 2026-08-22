@@ -217,7 +217,9 @@ jobs:
         id: pcl
         run: |
           . integration/pixinsight/ci/pcl-pin.env
-          echo "sha=$PCL_SHA" >> "$GITHUB_OUTPUT"
+          sha="$PCL_SHA"
+          [ "${{ matrix.arch }}" = arm64 ] && sha="$PCL_ARM64_SHA"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Cache libPCL-pxi.a (keyed on PCL commit)
         id: pcl-cache
