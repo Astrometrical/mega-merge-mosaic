@@ -2026,8 +2026,10 @@ impl FitsImage {
     fn plane(&self, c: usize) -> Vec<f32> {
         let start = self.data_start + c * self.w * self.h * 4;
         self.mmap[start..start + self.w * self.h * 4]
-            .chunks_exact(4)
-            .map(|b| f32::from_be_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_be_bytes(*b))
             .collect()
     }
 
