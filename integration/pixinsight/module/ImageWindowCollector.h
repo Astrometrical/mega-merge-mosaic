@@ -14,11 +14,56 @@
 #define __MmmImageWindowCollector_h
 
 #include <pcl/ImageWindow.h>
+#include <pcl/View.h>
 
 #include "mmm_host.h"
 
 namespace pcl
 {
+
+/*!
+ * \class ViewWriteLockGuard
+ * \brief RAII read+write lock on a View for the duration of a pixel write.
+ *
+ * Takes the full View::Lock() -- the documented lock for code that MODIFIES
+ * a view's image. (View::LockForWrite() is the reader-side lock: it only
+ * keeps OTHER writers out while explicitly permitting concurrent core reads,
+ * and PCL's own View.h marks its UnlockForWrite() partner "undocumented
+ * (i.e., harmful)".) No GUI notifications are sent (notify = false), and the
+ * matching Unlock() is guaranteed on every exit path: an exception thrown
+ * while the view is locked must never leak a permanently locked -- hence
+ * unusable -- window into the core.
+ */
+class ViewWriteLockGuard
+{
+public:
+
+   /*! Locks \a view for read+write, without GUI notifications. */
+   explicit ViewWriteLockGuard( View& view )
+      : m_view( view )
+   {
+      m_view.Lock( false /*notify*/ );
+   }
+
+   /*! Releases the lock; an unlock failure is swallowed (never throws). */
+   ~ViewWriteLockGuard() noexcept
+   {
+      try
+      {
+         m_view.Unlock( false /*notify*/ );
+      }
+      catch ( ... )
+      {
+      }
+   }
+
+   ViewWriteLockGuard( const ViewWriteLockGuard& ) = delete;
+   ViewWriteLockGuard& operator=( const ViewWriteLockGuard& ) = delete;
+
+private:
+
+   View& m_view;
+};
 
 /*!
  * \class ImageWindowCollector
@@ -31,9 +76,10 @@ namespace pcl
  * width, and within a channel band rows are contiguous, so each channel is one
  * memcpy into ScanLine(y0,c) (PROTOCOL.md section 7).
  *
- * Locking: the freshly created window is locked for write around each band
- * (LockForWrite/UnlockForWrite, no GUI notify) and left unlocked afterwards, so
- * the caller can Show() it directly. The window is never shown by this class.
+ * Locking: the freshly created window is fully locked around each band
+ * (ViewWriteLockGuard: View::Lock()/Unlock(), no GUI notify) and left
+ * unlocked afterwards, so the caller can Show() it directly. The window is
+ * never shown by this class.
  */
 class ImageWindowCollector : public mmm::OutputCollector
 {

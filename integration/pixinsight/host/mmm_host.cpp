@@ -503,12 +503,25 @@ void Host::run() {
     cfg_.init["Init"]["protocol_version"] = kProtocolVersion;
     cfg_.init["Init"]["worker_version"] = kExpectedWorkerVersion;
 
-    // Send Init (fully framed by encode_init).
-    write_framed_locked(encode_init(cfg_.init));
+    // Send Init (fully framed by encode_init; an ENCODING fault -- e.g. a
+    // non-finite float in the payload -- is a real host-side error and still
+    // throws, so it stays outside the swallow below). A worker that died
+    // instantly (crashed at startup, blocked by antivirus) has already closed
+    // its stdin, so the WRITE itself can fail with a broken pipe; swallow
+    // exactly that and fall through to the reader loop, which observes
+    // immediate EOF and reports the actionable fault ("worker exited before
+    // Done" plus the exit status) instead of a raw "broken pipe" write error.
+    std::vector<uint8_t> init_framed = encode_init(cfg_.init);
+    try {
+      write_framed_locked(init_framed);
 
-    // If cancel() was requested before the worker existed, deliver it now.
-    if (cancel_requested_.load()) {
-      write_framed_locked(encode_cancel());
+      // If cancel() was requested before the worker existed, deliver it now.
+      if (cancel_requested_.load()) {
+        write_framed_locked(encode_cancel());
+      }
+    } catch (const HostError&) {
+      // Broken pipe / write error: the worker is gone; the reader loop and
+      // the exit-status path below surface the real fault.
     }
 
     for (;;) {
@@ -792,6 +805,15 @@ PanelProbeResult Host::probe_panels(const std::string& worker_path,
     }
   } catch (const nlohmann::json::exception& e) {
     throw HostError(std::string("probe-panels: could not parse worker reply: ") + e.what());
+  }
+  // Reply-count contract: exactly one panel per requested path, in order.
+  // Callers index panels and paths in lockstep (and read panels[0] for the
+  // channel count), so a short/long reply -- version skew, a truncated
+  // pipe, a worker bug -- must be refused here, not surface as out-of-range
+  // vector reads inside the embedding application.
+  if (res.panels.size() != paths_utf8.size()) {
+    throw HostError("probe-panels: worker reported " + std::to_string(res.panels.size()) +
+                    " panels for " + std::to_string(paths_utf8.size()) + " files");
   }
   return res;
 }

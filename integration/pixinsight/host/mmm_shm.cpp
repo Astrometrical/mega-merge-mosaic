@@ -172,6 +172,14 @@ ShmSegment ShmSegment::create(const std::string& name, uint64_t total_bytes) {
   if (h == nullptr) {
     throw std::runtime_error("CreateFileMappingW(" + name + ") failed: " + last_error());
   }
+  // A name collision returns the EXISTING mapping (success + this last
+  // error), whose size may differ from what this run computed -- refuse it
+  // instead of mapping someone else's segment. Mirrors POSIX O_CREAT|O_EXCL.
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    CloseHandle(h);
+    throw std::runtime_error("CreateFileMappingW(" + name +
+                             "): a mapping with this name already exists");
+  }
   void* base = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0,
                              static_cast<SIZE_T>(total_bytes));
   if (base == nullptr) {

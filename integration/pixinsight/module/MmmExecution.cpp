@@ -433,6 +433,12 @@ struct AutoSessionDirGuard
 void ShowSeamMap( const std::string& sessionDirUtf8 )
 {
    Console console;
+
+   // Declared outside the try so the failure path can Close() a window that
+   // was created but never shown -- otherwise it would linger in the core as
+   // a hidden orphan (and, before ViewWriteLockGuard, potentially a locked
+   // one, had the pixel copy thrown mid-lock).
+   ImageWindow window = ImageWindow::Null();
    try
    {
       String path = IsoString( (sessionDirUtf8 + "/seam_map.png").c_str() ).UTF8ToUTF16();
@@ -453,20 +459,23 @@ void ShowSeamMap( const std::string& sessionDirUtf8 )
          throw Error( "cannot read " + path );
       file.Close();
 
-      ImageWindow window( img.Width(), img.Height(), img.NumberOfChannels(),
-                          8 /*bitsPerSample*/, false /*floatSample*/,
-                          img.NumberOfChannels() >= 3 /*color*/,
-                          true /*initialProcessing*/, "seam_map" );
-      View view = window.MainView();
-      view.LockForWrite( false /*notify*/ );
-      ImageVariant image = view.Image();
-      static_cast<UInt8Image&>( *image ).Assign( img );
-      view.UnlockForWrite( false /*notify*/ );
+      window = ImageWindow( img.Width(), img.Height(), img.NumberOfChannels(),
+                            8 /*bitsPerSample*/, false /*floatSample*/,
+                            img.NumberOfChannels() >= 3 /*color*/,
+                            true /*initialProcessing*/, "seam_map" );
+      {
+         View view = window.MainView();
+         ViewWriteLockGuard lock( view );
+         ImageVariant image = view.Image();
+         static_cast<UInt8Image&>( *image ).Assign( img );
+      }
       window.Show();
    }
    catch ( ... )
    {
       // The mosaic itself completed; a broken diagnostic must not undo that.
+      if ( !window.IsNull() )
+         window.Close();
       console.WarningLn( "<end><cbr>** MegaMergeMosaic: could not load the seam map image." );
    }
 }

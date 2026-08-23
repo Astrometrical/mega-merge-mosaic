@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -96,6 +97,23 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string scenario = argv[1];
+
+  if (scenario == "--probe-panels") {
+    // Probe stand-in for test_validation's probe-reply scenarios. A real
+    // probe worker reads its stdin to EOF before writing anything
+    // (run_probe_process relies on that ordering); mirror it, then print the
+    // scripted reply from MMM_ROGUE_PROBE_REPLY. No default reply: the test
+    // always scripts exactly the JSON it wants the host to see.
+    drain_stdin_until_eof();
+    const char* reply = std::getenv("MMM_ROGUE_PROBE_REPLY");
+    if (reply == nullptr) {
+      std::fprintf(stderr, "rogue_worker: MMM_ROGUE_PROBE_REPLY not set\n");
+      return 2;
+    }
+    std::fputs(reply, stdout);
+    std::fflush(stdout);
+    return 0;
+  }
 
   if (scenario == "valid") {
     // Canvas 32x32x1; one in-range 8-row band, then Done.

@@ -222,7 +222,7 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 ```jsonc
 {"Init": {
   "protocol_version": 3,
-  "worker_version": "1.4.0",
+  "worker_version": "1.4.1",
   "shm_name": "/mmm-<unique>",
   "slot_bytes": 1048576,
   "input_slots": 8,
@@ -647,7 +647,7 @@ must not open the panel files on its own (GUI) thread just to size
 `slot_bytes` and build the `panels` array — with dozens of multi-GB files
 that pass alone can freeze the host for minutes. Instead it invokes
 `mmm-ipc-worker --probe-panels`: write a bare JSON object
-`{"worker_version": "1.4.0", "paths": ["/abs/panel1.xisf", ...],
+`{"worker_version": "1.4.1", "paths": ["/abs/panel1.xisf", ...],
 "input_select": "Auto"}` on stdin (unframed; `worker_version` as in §10's
 release-version handshake — stamped by `mmm::Host::probe_panels`, checked
 before anything else; `input_select` as in `JobMode::Files`, defaulting to
@@ -700,6 +700,11 @@ surfaces a clean error; it is never "repaired" host-side.
   names an unknown `panel_id`, or has `y1 < y0`) is answered with
   `BandReply.status = 1` without consulting the `PanelSource` at all, per
   the §5 error contract — the worker unwinds cleanly.
+- **`--probe-panels` reply** (§11): refused if the reply's `panels` count
+  differs from the number of requested paths — callers index panels and
+  paths in lockstep (and read `panels[0]` for the channel count), so a
+  short/long reply would drive out-of-range vector reads in the embedding
+  application.
 
 The Rust reference host (`testhost.rs`) predates these checks and remains
 permissive by design (it is a test double); the semantics above are the

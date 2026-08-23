@@ -143,6 +143,16 @@ void expect_refused(const Outcome& out, const char* needle) {
   CHECK(out.message.find(needle) != std::string::npos);
 }
 
+// Portable setenv for the rogue probe scenarios (the spawned child inherits
+// this process's environment on both POSIX and Windows).
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 1);
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -220,6 +230,55 @@ int main(int argc, char** argv) {
     Outcome out = run_scenario(rogue, "request_overflows_slot", {32, 32, 1});
     expect_refused(out, "exceeds the slot");
     CHECK(out.fills == 0);
+  }
+
+  // --- probe_panels reply-count validation ----------------------------------
+  // Host::probe_panels feeds RunFiles' per-panel indexing (panels[0],
+  // paths[i] in lockstep); a reply whose panel count differs from the number
+  // of requested paths would drive out-of-bounds vector reads inside the
+  // embedding application, so the count is validated at the transport
+  // boundary, mirroring the Section 13 wire checks.
+  {
+    set_env("MMM_ROGUE_PROBE_REPLY", R"({"panels":[],"frame":null})");
+    bool threw = false;
+    std::string msg;
+    try {
+      mmm::Host::probe_panels(rogue, {"a.xisf", "b.xisf"}, "Auto");
+    } catch (const mmm::HostError& e) {
+      threw = true;
+      msg = e.what();
+    }
+    CHECK(threw);
+    CHECK(msg.find("0 panels") != std::string::npos);
+    std::fprintf(stderr, "  %-22s -> refused: %s\n", "probe_reply_empty", msg.c_str());
+  }
+  {
+    set_env("MMM_ROGUE_PROBE_REPLY",
+            R"({"panels":[{"width":4,"height":4,"channels":1},)"
+            R"({"width":4,"height":4,"channels":1},)"
+            R"({"width":4,"height":4,"channels":1}],"frame":null})");
+    bool threw = false;
+    std::string msg;
+    try {
+      mmm::Host::probe_panels(rogue, {"a.xisf", "b.xisf"}, "Auto");
+    } catch (const mmm::HostError& e) {
+      threw = true;
+      msg = e.what();
+    }
+    CHECK(threw);
+    CHECK(msg.find("3 panels") != std::string::npos);
+    std::fprintf(stderr, "  %-22s -> refused: %s\n", "probe_reply_excess", msg.c_str());
+  }
+  {
+    // Control: a count-matching reply parses normally.
+    set_env("MMM_ROGUE_PROBE_REPLY",
+            R"({"panels":[{"width":4,"height":4,"channels":1},)"
+            R"({"width":8,"height":4,"channels":1}],"frame":null})");
+    mmm::PanelProbeResult res = mmm::Host::probe_panels(rogue, {"a.xisf", "b.xisf"}, "Auto");
+    CHECK(res.panels.size() == 2);
+    CHECK(res.panels[1].width == 8);
+    CHECK(!res.has_frame);
+    std::fprintf(stderr, "  %-22s -> ok\n", "probe_reply_matching");
   }
 
   // --- Shm setup failures honor the HostError contract ----------------------
