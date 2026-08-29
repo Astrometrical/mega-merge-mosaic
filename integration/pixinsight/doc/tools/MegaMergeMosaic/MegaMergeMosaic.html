@@ -88,7 +88,7 @@
 <h1>MegaMergeMosaic</h1>
 <!-- version kept in sync with MmmVersion.h / Cargo.toml; enforced by
      crates/mmm-ipc-worker/tests/version_sync.rs -->
-<p class="subtitle">Version 1.4.1 &mdash; Category: Mosaic</p>
+<p class="subtitle">Version 1.4.2 &mdash; Category: Mosaic</p>
 <p class="tagline">Big mosaics, no big deal.</p>
 
 <p class="links">
@@ -118,7 +118,10 @@ is visible in the output.</p>
 </ul>
 
 <p>Panels can be supplied either as open views in the current workspace or
-as files on disk, and every panel must belong to the same mosaic.</p>
+as files on disk, and every panel must belong to the same mosaic. All panels
+must also have the same number of channels: monochrome and colour images
+cannot be mixed in one run, and a mixed set is refused with a message naming
+the offending panels before any processing starts.</p>
 
 <h2>Parameters</h2>
 

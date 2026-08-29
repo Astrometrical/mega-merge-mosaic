@@ -287,3 +287,32 @@ fn analyze_no_inputs_errors() {
     assert!(analyze(&[], &dir.join("s.mmm-session")).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Mixing mono and colour panels is refused up front, whatever `--input`
+/// says, with a message naming both offending files — a real user hit this
+/// and got the auto-detect re-dispatch's "needs a plate solution" instead.
+#[test]
+fn mixed_mono_and_rgb_inputs_error() {
+    use mmm_core::analyze::{InputSelect, analyze_input};
+
+    let dir = tempdir("mixed-types");
+    let (w, h) = (32u64, 24u64);
+    let mono = dir.join("mono.xisf");
+    let rgb = dir.join("rgb.xisf");
+    write_xisf(&mono, w, h, 1, &vec![0.5f32; (w * h) as usize]);
+    write_xisf(&rgb, w, h, 3, &vec![0.5f32; (w * h * 3) as usize]);
+    let paths = vec![mono, rgb];
+
+    for input in [InputSelect::Auto, InputSelect::Aligned, InputSelect::Solved] {
+        let session_dir = dir.join(format!("{input:?}.mmm-session"));
+        let err = analyze_input(&paths, &session_dir, None, input)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same number of channels"), "{input:?}: {err}");
+        assert!(err.contains("mono.xisf"), "{input:?}: {err}");
+        assert!(err.contains("rgb.xisf"), "{input:?}: {err}");
+        assert!(!err.contains("astrometric"), "{input:?}: {err}");
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

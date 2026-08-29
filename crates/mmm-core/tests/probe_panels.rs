@@ -130,3 +130,25 @@ fn missing_file_errors_with_path() {
 fn empty_paths_error() {
     assert!(probe_panels(&[], InputSelect::Auto).is_err());
 }
+
+/// The Files-mode probe refuses a mono/colour mix before a run starts: the
+/// PixInsight host sizes its shm slots from `panels[0].channels`, so a mixed
+/// set must never reach the run stage.
+#[test]
+fn mixed_channel_panels_are_refused() {
+    let dir = tmpdir("mixed-types");
+    let mono = dir.join("mono.xisf");
+    let rgb = dir.join("rgb.xisf");
+    write_xisf(&mono, 8, 6, 1, &[0.1f32; 48]).unwrap();
+    write_xisf(&rgb, 8, 6, 3, &[0.1f32; 144]).unwrap();
+    let paths = vec![mono, rgb];
+
+    for input in [InputSelect::Auto, InputSelect::Aligned, InputSelect::Solved] {
+        let err = probe_panels(&paths, input).unwrap_err().to_string();
+        assert!(err.contains("same number of channels"), "{input:?}: {err}");
+        assert!(err.contains("mono.xisf"), "{input:?}: {err}");
+        assert!(err.contains("rgb.xisf"), "{input:?}: {err}");
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

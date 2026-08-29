@@ -87,6 +87,17 @@ struct Params
 constexpr uint32_t kInputSlots  = 8;
 constexpr uint32_t kOutputSlots = 2;
 
+// How an imager reads a channel count: "1 (mono)", "3 (RGB)", else the bare
+// number. Used by the mixed-input refusals below.
+String ChannelsDescription( uint64_t ch )
+{
+   if ( ch == 1 )
+      return String( "1 (mono)" );
+   if ( ch == 3 )
+      return String( "3 (RGB)" );
+   return String( IsoString().Format( "%llu", (unsigned long long)ch ) );
+}
+
 // --- Progress + cooperative abort ------------------------------------------
 //
 // The host invokes on_progress() synchronously on this (the ExecuteGlobal)
@@ -623,6 +634,19 @@ void RunViews( const Params& in, const std::string& worker_path )
          if ( i > 0 && ( w != ws[0] || h != hs[0] || c != cs[0] ) )
             uniform = false;
       }
+
+      // A mono/colour mix cannot be blended, in either mode: the Init canvas
+      // carries ONE channel count (cs[0]) that the worker addresses every
+      // panel with, and the shm slots are sized from it. Refuse here, naming
+      // both views -- otherwise Auto reads the differing geometries as
+      // unregistered panels and the run dies complaining about a missing
+      // astrometric solution.
+      for ( size_type i = 1; i < views.Length(); ++i )
+         if ( cs[i] != cs[0] )
+            throw Error( "MegaMergeMosaic: all input views must have the same number of channels, "
+                         "but " + views[0].FullId() + " has " + ChannelsDescription( cs[0] ) +
+                         " and " + views[i].FullId() + " has " + ChannelsDescription( cs[i] ) +
+                         "; mono and colour images cannot be mixed in one mosaic." );
 
       // Resolve the effective JobMode (spec section 10.1): the override wins;
       // Auto classifies by uniform-vs-differing geometry.

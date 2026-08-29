@@ -38,6 +38,16 @@ re-runnable; `blend` never re-analyzes.
 
 ### Analyze
 
+**Input precondition: one channel count for the whole set.** Everything
+downstream assumes it — the canvas carries a single `channels`, the IPC host
+sizes its shm slots from the first panel's, and the photometric solve is per
+channel across panels. A mono/colour mix is therefore refused up front, in
+every entry point (`analyze_full`, `probe_panels`, `analyze_ipc_aligned`,
+`solved_frame`), with a message naming the first input of each channel count;
+without that check the mix surfaced far from its cause — `--input auto` reads
+the differing geometries as unregistered panels and the run dies complaining
+about a missing plate solution.
+
 One streaming pass per panel (rayon across panels, I/O-bound):
 - **L8 summary**: canvas at 1/8 per 8×8 block, per panel: per-channel mean of
   covered pixels + coverage fraction (0..1). ~2.6 MP per panel for the test

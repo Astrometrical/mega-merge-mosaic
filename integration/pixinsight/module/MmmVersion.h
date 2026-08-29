@@ -11,9 +11,9 @@
 
 #define MMM_VERSION_MAJOR     1
 #define MMM_VERSION_MINOR     4
-#define MMM_VERSION_REVISION  1
+#define MMM_VERSION_REVISION  2
 #define MMM_VERSION_BUILD     1
 
-#define MMM_VERSION_STRING    "1.4.1"
+#define MMM_VERSION_STRING    "1.4.2"
 
 #endif   // __MmmVersion_h

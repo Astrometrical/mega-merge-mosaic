@@ -81,6 +81,55 @@ struct PanelScan {
     canvas: (u64, u64, u64),
 }
 
+/// How an imager reads a channel count: `1 (mono)`, `3 (RGB)`, else the bare
+/// number.
+fn describe_channels(ch: u64) -> String {
+    match ch {
+        1 => "1 (mono)".to_string(),
+        3 => "3 (RGB)".to_string(),
+        n => n.to_string(),
+    }
+}
+
+/// Verify that every input has the same channel count, given `(label,
+/// channels)` pairs in input order; returns the shared count.
+///
+/// Every stage downstream assumes one channel count for the whole set: the
+/// canvas carries a single `channels`, the IPC host sizes its shared-memory
+/// slots from the first panel's, and the photometric solve is per channel
+/// across panels. A mono/colour mix therefore has to be refused up front —
+/// otherwise it surfaces far away from its cause (auto-detection blaming a
+/// missing plate solution, or a band-size mismatch mid-scan).
+///
+/// The message names the first input of each distinct channel count.
+fn check_uniform_channels<I>(panels: I) -> std::result::Result<u64, String>
+where
+    I: IntoIterator<Item = (String, u64)>,
+{
+    // (channel count, first input with it) in first-seen order.
+    let mut groups: Vec<(u64, String)> = Vec::new();
+    for (label, ch) in panels {
+        if !groups.iter().any(|&(c, _)| c == ch) {
+            groups.push((ch, label));
+        }
+    }
+    match groups.as_slice() {
+        [] => Err("no input panels given".to_string()),
+        [(ch, _)] => Ok(*ch),
+        _ => {
+            let list: Vec<String> = groups
+                .iter()
+                .map(|(c, label)| format!("{label} has {}", describe_channels(*c)))
+                .collect();
+            Err(format!(
+                "input panels must all have the same number of channels, but {} — mono \
+                 and colour panels cannot be mixed in one mosaic; blend each set separately",
+                list.join(", ")
+            ))
+        }
+    }
+}
+
 /// Analyze `paths` into a session at `session_dir` with the default residual
 /// surface order (quadratic) on the aligned path. See [`analyze_opts`].
 pub fn analyze(paths: &[PathBuf], session_dir: &Path) -> Result<Session> {
@@ -174,6 +223,22 @@ pub fn analyze_full(
 ) -> Result<Session> {
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
+    }
+    // One channel count across the whole set, before anything dispatches on
+    // mode: a mono/colour mix otherwise surfaces far from its cause (Auto
+    // sees differing geometries, re-dispatches as solved, and blames a
+    // missing plate solution). Files that fail to open are skipped here so
+    // the stage below still reports them with its own richer message.
+    let opened: Vec<(String, u64)> = paths
+        .par_iter()
+        .filter_map(|p| {
+            XisfPanel::open(p)
+                .ok()
+                .map(|x| (p.display().to_string(), x.channels()))
+        })
+        .collect();
+    if let Err(reason) = check_uniform_channels(opened) {
+        return Err(Error::compute(reason));
     }
     match input {
         InputSelect::Aligned => {
@@ -310,17 +375,12 @@ fn analyze_solved(
             ),
         ));
     }
-    let ch = panels[0].0.channels();
-    if let Some((p, _)) = panels.iter().find(|(p, _)| p.channels() != ch) {
-        return Err(Error::format(
-            p.path(),
-            format!(
-                "panel has {} channels, expected {ch} like {}",
-                p.channels(),
-                paths[0].display()
-            ),
-        ));
-    }
+    let ch = check_uniform_channels(
+        panels
+            .iter()
+            .map(|(p, _)| (p.path().display().to_string(), p.channels())),
+    )
+    .map_err(Error::compute)?;
 
     let models: Vec<WcsModel> = panels.iter().map(|(_, m)| m.clone()).collect();
     let frame = choose_frame(&models);
@@ -467,13 +527,11 @@ pub fn solved_frame(
             errors.join("\n  ")
         ));
     }
-    let ch = panels[0].channels;
-    if let Some(p) = panels.iter().find(|p| p.channels != ch) {
-        return Err(format!(
-            "panel {} has {} channels, expected {ch} like panel {}",
-            p.panel_id, p.channels, panels[0].panel_id
-        ));
-    }
+    let ch = check_uniform_channels(
+        panels
+            .iter()
+            .map(|p| (format!("panel {}", p.panel_id), p.channels)),
+    )?;
     let frame = choose_frame(&models);
     Ok((models, frame, ch))
 }
@@ -508,6 +566,16 @@ pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeR
             })
         })
         .collect::<Result<_>>()?;
+
+    // Refuse a mono/colour mix at the probe — the first worker contact of a
+    // Files-mode run — so a host never sizes its shm slots from panels[0]
+    // for a set the run stage would reject anyway (PROTOCOL.md §11).
+    check_uniform_channels(
+        descs
+            .iter()
+            .map(|d| (paths[d.panel_id as usize].display().to_string(), d.channels)),
+    )
+    .map_err(Error::compute)?;
 
     let panels = descs
         .iter()
@@ -553,6 +621,19 @@ pub fn analyze_ipc_aligned(
     let n_panels = link.panels().len();
     if n_panels == 0 {
         return Err(Error::format(session_dir, "IPC job has no input panels"));
+    }
+    // Every panel is addressed with the canvas geometry (PanelReader::open_ipc),
+    // so a panel that disagrees with it — most often a mono view among colour
+    // ones — must be refused before the first band request.
+    for p in link.panels() {
+        if (p.width, p.height, p.channels) != canvas {
+            return Err(Error::compute(format!(
+                "panel {} is {}x{}x{} but the job canvas is {}x{}x{}: an aligned job's panels \
+                 must all match the canvas, including the number of channels — mono and colour \
+                 panels cannot be mixed in one mosaic",
+                p.panel_id, p.width, p.height, p.channels, canvas.0, canvas.1, canvas.2
+            )));
+        }
     }
 
     // Claim + report under one lock (see analyze_aligned's scan loop).
@@ -1066,5 +1147,34 @@ mod tests {
         assert_eq!(dones, vec![0, 1, 2], "events out of claim order");
 
         std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// An aligned IPC job whose panels disagree with the job canvas is
+    /// refused before any band is requested: the reader addresses every
+    /// panel with the canvas geometry, so a mono panel in a 3-channel job
+    /// otherwise fails deep in the scan with an internal band-size
+    /// complaint that names neither the panel nor the real cause.
+    #[test]
+    fn ipc_aligned_rejects_panel_geometry_mismatch() {
+        let (w, h, ch) = (16u64, 8u64, 3u64);
+        let mut job = MockHost::aligned_job(w, h, ch, 2, 4, w * ch * 8 * 4);
+        job.panels[1].channels = 1;
+        let pixels = vec![
+            vec![0.25f32; (w * h * ch) as usize],
+            vec![0.25f32; (w * h) as usize],
+        ];
+        let (host, r, wr) = MockHost::spawn(job.clone(), pixels);
+        let link = HostLink::start(job, r, wr).unwrap();
+        let dir = tmpdir("ipc-mismatch");
+
+        let err = analyze_ipc_aligned(link.clone(), &dir, 8, None, GainMode::Fit)
+            .unwrap_err()
+            .to_string();
+        link.finish_ok().unwrap();
+        host.join();
+
+        assert!(err.contains("channels"), "got: {err}");
+        assert!(err.contains("panel 1"), "got: {err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

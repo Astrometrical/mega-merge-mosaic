@@ -222,7 +222,7 @@ object. This applies to `WorkerMsg`, `HostMsg`, `JobMode`, and
 ```jsonc
 {"Init": {
   "protocol_version": 3,
-  "worker_version": "1.4.1",
+  "worker_version": "1.4.2",
   "shm_name": "/mmm-<unique>",
   "slot_bytes": 1048576,
   "input_slots": 8,
@@ -592,7 +592,10 @@ its own writes to the worker's stdin.
 - **`"Aligned"`** — panels are already registered to the shared canvas
   (e.g. PixInsight `MosaicByCoordinates` output, or any set of full-canvas
   in-memory views). Pixels are read as-is via the band-pull handshake
-  (§8.2); no reprojection.
+  (§8.2); no reprojection. Every `PanelDesc` must match `InitJob.canvas`
+  exactly, channel count included — the worker addresses each panel with the
+  canvas geometry, so it refuses an `Aligned` job whose panels disagree
+  (most often a mono view among colour ones) before requesting any band.
 - **`"Solved"`** — panels carry a PixInsight astrometric plate solution and
   have *not* been registered to a common canvas; the worker builds its own
   frame and reprojects each panel before blending (mmm's phase-5 path). The
@@ -647,7 +650,7 @@ must not open the panel files on its own (GUI) thread just to size
 `slot_bytes` and build the `panels` array — with dozens of multi-GB files
 that pass alone can freeze the host for minutes. Instead it invokes
 `mmm-ipc-worker --probe-panels`: write a bare JSON object
-`{"worker_version": "1.4.1", "paths": ["/abs/panel1.xisf", ...],
+`{"worker_version": "1.4.2", "paths": ["/abs/panel1.xisf", ...],
 "input_select": "Auto"}` on stdin (unframed; `worker_version` as in §10's
 release-version handshake — stamped by `mmm::Host::probe_panels`, checked
 before anything else; `input_select` as in `JobMode::Files`, defaulting to
@@ -658,7 +661,10 @@ the worker's own `choose_frame` result and is non-null exactly when the job
 can resolve to solved mode (`input_select` ≠ `"Aligned"` and every panel
 carries a usable astrometric solution) — with `input_select` `"Solved"` a
 panel without a solution makes the probe exit 1 with the analyze stage's
-error message instead. Header reads are parallel and header-only (never
+error message instead. The probe also refuses a set whose files do not all
+have the same channel count (exit 1, naming the first file of each count):
+the host sizes `slot_bytes` from `panels[0].channels`, so a mono/colour mix
+must never reach the run stage. Header reads are parallel and header-only (never
 pixel data). The host sizes `slot_bytes` from
 `max(max panel width, frame width) * ch * band_rows * 4`. Exit code 0 on
 success; on any error the worker writes a message to stderr and exits 1.
