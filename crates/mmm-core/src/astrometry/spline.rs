@@ -81,7 +81,7 @@ impl Kernel {
 }
 
 /// True for a finite, strictly positive value.
-fn positive(v: f64) -> bool {
+pub(crate) fn positive(v: f64) -> bool {
     v.is_finite() && v > 0.0
 }
 

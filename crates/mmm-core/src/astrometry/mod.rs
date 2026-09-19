@@ -122,6 +122,7 @@ use crate::formats::{FitsKeyword, XisfProperty};
 
 mod legacy;
 pub(crate) mod spline;
+pub(crate) mod standard;
 
 /// Value of the property with id `id`, if present.
 pub(crate) fn find_value<'a>(props: &'a [XisfProperty], id: &str) -> Option<&'a PropertyValue> {
