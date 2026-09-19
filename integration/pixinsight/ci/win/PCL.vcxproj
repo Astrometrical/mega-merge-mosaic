@@ -1,19 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Lifted from a licensed PixInsight 1.9.5 install (PCL 2.10.8, Makefile Generator v1.153); untrimmed: matches the pinned tree's 192 sources. See ci/README.md. -->
 <!--
 ######################################################################
-# PixInsight Makefile Generator Script v1.147
+# PixInsight Makefile Generator Script v1.153
 # Copyright (C) 2009-2026 Pleiades Astrophoto
 ######################################################################
-# Generated on .... 2026-06-21T15:46:34.103Z
+# Generated on .... 2026-09-16T21:04:22.995Z
 # Project id ...... PCL
 # Project type .... StaticLibrary
 # Platform ........ Windows/vc17
 ######################################################################
 -->
-<!-- Lifted from the PixInsight 1.9.4 install's src/pcl/windows/vc17/. -->
-<!-- Trimmed to PCL pin f1f257d9 (2.8.3): ImageType.cpp + PlotManager.cpp -->
-<!-- removed (2.10.x additions absent at the pin); open-source PCL build file. -->
-<!-- See integration/pixinsight/ci/pcl-pin.env for the pinned commit. -->
 <Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Release|x64">
@@ -26,7 +23,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <ProjectGuid>{7B0F21A9-EBDF-423A-8670-43625840B6F8}</ProjectGuid>
+    <ProjectGuid>{E1A3FAC1-5B1A-433F-AC74-A3091E22EFAF}</ProjectGuid>
     <RootNamespace>PixInsight</RootNamespace>
     <Keyword>Win32Proj</Keyword>
   </PropertyGroup>
@@ -190,9 +187,11 @@
     <ClCompile Include="..\..\HistogramTransformation.cpp"/>
     <ClCompile Include="..\..\ICCProfile.cpp"/>
     <ClCompile Include="..\..\ICCProfileTransformation.cpp"/>
+    <ClCompile Include="..\..\Image.cpp"/>
     <ClCompile Include="..\..\ImageColor.cpp"/>
     <ClCompile Include="..\..\ImageOp.cpp"/>
     <ClCompile Include="..\..\ImageStatistics.cpp"/>
+    <ClCompile Include="..\..\ImageType.cpp"/>
     <ClCompile Include="..\..\ImageVariant.cpp"/>
     <ClCompile Include="..\..\ImageView.cpp"/>
     <ClCompile Include="..\..\ImageWindow.cpp"/>
@@ -230,6 +229,7 @@
     <ClCompile Include="..\..\PSFScaleEstimator.cpp"/>
     <ClCompile Include="..\..\PSFSignalEstimator.cpp"/>
     <ClCompile Include="..\..\Pen.cpp"/>
+    <ClCompile Include="..\..\PlotManager.cpp"/>
     <ClCompile Include="..\..\PolarTransform.cpp"/>
     <ClCompile Include="..\..\Position.cpp"/>
     <ClCompile Include="..\..\PreviewSelectionDialog.cpp"/>
@@ -275,6 +275,7 @@
     <ClCompile Include="..\..\StandardStatus.cpp"/>
     <ClCompile Include="..\..\StarDatabaseFile.cpp"/>
     <ClCompile Include="..\..\StarDetector.cpp"/>
+    <ClCompile Include="..\..\Statistics.cpp"/>
     <ClCompile Include="..\..\StatusMonitor.cpp"/>
     <ClCompile Include="..\..\String.cpp"/>
     <ClCompile Include="..\..\SurfaceSimplifier.cpp"/>
@@ -307,6 +308,10 @@
     <ClCompile Include="..\..\XISFWriter.cpp"/>
     <ClCompile Include="..\..\XML.cpp"/>
     <ClCompile Include="..\..\XMLReference.cpp"/>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\FFTEngine.h"/>
+    <ClInclude Include="..\..\StatisticsEngine.h"/>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets"/>
   <ImportGroup Label="ExtensionTargets">

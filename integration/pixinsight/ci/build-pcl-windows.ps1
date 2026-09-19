@@ -1,6 +1,7 @@
 # Build PCL-pxi.lib from the pinned open-source PCL on Windows (msbuild/MSVC).
 # The upstream commit omits src/pcl/windows/vc17/PCL.vcxproj, so we drop the
-# repo-pinned, version-matched project into the fetched tree before building.
+# repo-pinned project (lifted from a licensed PixInsight 1.9.5 install, PCL
+# 2.10.8) into the fetched tree before building.
 #   build-pcl-windows.ps1 -Out <prefix-dir> [-Work <clone-dir>]
 [CmdletBinding()]
 param(

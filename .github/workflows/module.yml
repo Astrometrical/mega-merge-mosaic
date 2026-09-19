@@ -1,8 +1,8 @@
 # Builds the PixInsight module (mmm-pxm) + mmm-ipc-worker against the pinned
-# open-source PCL, with NO PixInsight on the runner. All four targets --
-# Linux (x64), macOS (arm64 + x64), and Windows (x64) -- are live, required
-# build+test jobs. macOS needs both arches: pre-1.9.4 PixInsight is x64-only
-# on macOS (Rosetta on Apple Silicon), and Intel-Mac x64 builds still ship.
+# open-source PCL (2.10.8 / PixInsight 1.9.5, one pin for every target), with
+# NO PixInsight on the runner. All four targets -- Linux (x64), macOS (arm64 +
+# x64), and Windows (x64) -- are live, required build+test jobs. macOS ships
+# both arches: arm64 for Apple Silicon, x64 for Intel Macs.
 name: Module
 
 on:
@@ -75,21 +75,6 @@ jobs:
           cmake --build integration/pixinsight/host/ci-build
           ctest --test-dir integration/pixinsight/host/ci-build --output-on-failure
 
-      - name: Generate + validate repository package and updates.xri (no publish)
-        run: |
-          sudo apt-get update && sudo apt-get install -y libxml2-utils
-          bash integration/pixinsight/repo/gen-package.sh linux x64 "$PWD/stage" "$PWD/repo-out"
-          bash integration/pixinsight/repo/gen-updates-xri.sh \
-            "$(date -u +%Y%m%d)" "1.9.0:1.9.9" "MergeMosaic module" \
-            "$PWD/repo-out/updates.xri" "$PWD/repo-out/linux-x64.meta"
-          xmllint --noout "$PWD/repo-out/updates.xri"
-          echo "repository artifacts generated + validated (dormant: not published)"
-
-      - name: Run repo generator tests
-        run: |
-          bash integration/pixinsight/repo/test/test-gen-package.sh
-          bash integration/pixinsight/repo/test/test-gen-updates-xri.sh
-
       - name: Write bundle provenance
         shell: bash
         run: printf 'sha=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > bundle-info.txt
@@ -100,14 +85,13 @@ jobs:
       # artifact root. The extra root pins the ancestor at the workspace root,
       # preserving stage/bin/... — the bundle-contract layout the consumer
       # (Astrometrical website repo) expects.
-      - name: Upload unsigned module + repo artifacts
+      - name: Upload unsigned module artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mmm-pxm-linux-x64
           path: |
             stage/bin/**
             stage/doc/**
-            repo-out/**
             bundle-info.txt
           if-no-files-found: error
 
@@ -195,13 +179,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # arm64: PixInsight 1.9.4+ native Apple Silicon cores.
+          # arm64: Apple Silicon cores.
           - arch: arm64
             runner: macos-latest
-          # x64: Intel Macs on any version, plus ALL 1.9.0-1.9.3 macOS cores —
-          # pre-1.9.4 PixInsight is x64-only on macOS (Rosetta on Apple
-          # Silicon), and an x64 core cannot load an arm64 dylib. Native
-          # Intel runner (macos-13 was retired) so tests run natively too.
+          # x64: Intel Macs. Native Intel runner (macos-13 was retired) so
+          # tests run natively too.
           - arch: x64
             runner: macos-15-intel
     steps:
@@ -217,9 +199,7 @@ jobs:
         id: pcl
         run: |
           . integration/pixinsight/ci/pcl-pin.env
-          sha="$PCL_SHA"
-          [ "${{ matrix.arch }}" = arm64 ] && sha="$PCL_ARM64_SHA"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "sha=$PCL_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Cache libPCL-pxi.a (keyed on PCL commit)
         id: pcl-cache
