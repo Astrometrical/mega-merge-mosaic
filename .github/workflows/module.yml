@@ -6,17 +6,23 @@
 name: Module
 
 on:
+  # The staged mmm-ipc-worker embeds all of mmm-core, so any core or
+  # dependency change alters what the module ships — not just the ipc crates.
   push:
     paths:
       - "integration/pixinsight/**"
-      - "crates/mmm-core/src/ipc/**"
+      - "crates/mmm-core/**"
       - "crates/mmm-ipc-worker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/module.yml"
   pull_request:
     paths:
       - "integration/pixinsight/**"
-      - "crates/mmm-core/src/ipc/**"
+      - "crates/mmm-core/**"
       - "crates/mmm-ipc-worker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/module.yml"
   workflow_dispatch:
 
