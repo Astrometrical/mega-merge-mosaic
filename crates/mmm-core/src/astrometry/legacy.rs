@@ -80,13 +80,7 @@ pub(super) fn model_from_legacy(
 ) -> Option<WcsModel> {
     let linear = linear_from_legacy(props)?;
     if !has_legacy_spline(props) {
-        return Some(WcsModel {
-            linear,
-            image_to_native: None,
-            native_to_image: None,
-            width,
-            height,
-        });
+        return Some(WcsModel::linear_only(linear, width, height));
     }
 
     // The grid math below is specific to the gnomonic tangent plane.
@@ -108,13 +102,13 @@ pub(super) fn model_from_legacy(
         return None;
     }
 
-    Some(WcsModel {
+    Some(WcsModel::with_grids(
         linear,
-        image_to_native: Some(image_to_native),
-        native_to_image: Some(native_to_image),
+        image_to_native,
+        native_to_image,
         width,
         height,
-    })
+    ))
 }
 
 /// Read one `PointGridInterpolation` direction (`ImageToNative` or

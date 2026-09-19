@@ -474,15 +474,25 @@ it regenerates a solution). Spec:
   splines: ThinPlateSpline / VariableOrder / Gaussian / Multiquadric /
   InverseMultiquadric / InverseQuadratic, Global + Local + Fallback terms
   with Wendland C2 weights), evaluated per the spec and PCL's reference
-  implementation, then sampled onto the existing `Grid2D` lookup grids (8 px
-  spacing) so `WcsModel` and the align stage are unchanged. Unavailable
+  implementation, then sampled onto the existing `Grid2D` lookup grids (16 px
+  spacing, lazily per direction on first use) so `WcsModel` and the align
+  stage are unchanged. Unavailable
   layers fall back per the spec (with a warning). PixInsight's private
   `PCL:AstrometricSolution:{Grid,Generation}:*` extras are ignored.
 - **Verified** on a 1.9.5-regenerated Orion raw panel (Global TPS, order 2,
   ~3.1k nodes per component, separate X/Y node sets): our sampled grid vs
   PixInsight's own grid cache agrees to < 0.001″ over the whole field;
-  standard vs the 1.9.4 legacy solution of the same panel agrees to ≤ 0.01″;
-  decode + sample takes ~0.8 s per 4898×3230 panel.
+  standard vs the 1.9.4 legacy solution of the same panel agrees to ≤ 0.07″
+  (all 12 panels). Cost: at the original 8 px spacing, eager sampling of both
+  grids took ~1 s per 4898×3230 panel and was repeated by every worker pass
+  (panel probe, frame probe, analyze) — 12 panels ≈ 15 s before the frame.
+  Now 16 px (worst deviation from PixInsight's 8 px cache 0.0023″) and lazy
+  per-direction sampling: decode-to-frame ≈ 2.4 s for 12 panels, inverse
+  grid ≈ 0.4 s per panel paid once in the align stage (11.5 s vs 6.8 s),
+  whole solved run 15.8 s vs 23.2 s. The lazy `OnceLock` init must never
+  run a nested rayon sampling from inside a rayon worker (work stealing
+  deadlock, seen live): `reproject_core` calls `WcsModel::ensure_grids()`
+  first, and an in-worker first use samples sequentially.
 - **Legacy files stay readable** (`astrometry/legacy.rs`); a file carrying a
   standard block is read through it exclusively.
 - **Build**: one PCL pin (2.10.8) for every arch; module requires PixInsight

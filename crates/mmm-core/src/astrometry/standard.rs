@@ -21,9 +21,13 @@ use crate::formats::{PropertyValue, XisfProperty};
 /// Prefix of every standard solution property.
 pub(crate) const STD_PREFIX: &str = "AstrometricSolution:";
 
-/// Grid spacing in image pixels for the image→projection sampling (PixInsight
-/// 1.9.4 used 8 px; the validation tolerances were tuned on that spacing).
-const IMAGE_DELTA_PX: f64 = 8.0;
+/// Grid spacing in image pixels for the image→projection sampling. PixInsight
+/// 1.9.5's own grid cache defaults to 16 px (1.9.4 files carried 8 px grids);
+/// the distortion field is smooth enough that bicubic interpolation on a
+/// 16 px lattice reproduces the model to well under 0.01″ (verified against
+/// PixInsight's 8 px cache on the real Orion panels), at a quarter of the
+/// spline evaluations.
+const IMAGE_DELTA_PX: f64 = 16.0;
 
 /// True when the standard block's required `Version` property is present.
 pub(crate) fn has_standard_block(props: &[XisfProperty]) -> bool {
@@ -521,21 +525,69 @@ pub(crate) fn parse_standard(props: &[XisfProperty]) -> Result<StandardSolution,
     })
 }
 
-/// Sample a solution's projective/spline directions onto lookup grids in the
-/// layout `Grid2D` expects. `None` when the solution has only layer 1 (or the
-/// linear scale is degenerate).
-pub(crate) fn sample_grids(
+/// Decode-time validation of a projective/spline solution against its own
+/// linear layer, evaluated directly on the model (a handful of evaluations;
+/// the grids are sampled lazily later). Mirrors `validate_grids`: the
+/// reference pixel must map to ≈ (0, 0) and back, and the image corners must
+/// agree with the linear solution within the distortion allowance. A
+/// linear-only solution has nothing to check.
+pub(crate) fn validate_model(sol: &StandardSolution, width: u64, height: u64) -> bool {
+    let (Some(i2p), Some(p2i)) = (&sol.image_to_projection, &sol.projection_to_image) else {
+        return true;
+    };
+    let refimg = [sol.linear.crpix[0] - 0.5, sol.linear.crpix[1] - 0.5];
+    let (xi, eta) = i2p.map(refimg[0], refimg[1]);
+    if !xi.is_finite() || !eta.is_finite() || xi.hypot(eta) > 0.01 {
+        return false;
+    }
+    let (ix, iy) = p2i.map(0.0, 0.0);
+    if !ix.is_finite() || !iy.is_finite() || (ix - refimg[0]).hypot(iy - refimg[1]) > 5.0 {
+        return false;
+    }
+    let (w, h) = (width as f64, height as f64);
+    let m = sol.linear.cd;
+    for (cx, cy) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+        let (gx, gy) = i2p.map(cx, cy);
+        let (dx, dy) = (cx - refimg[0], cy - refimg[1]);
+        let (lx, ly) = (m[0][0] * dx + m[0][1] * dy, m[1][0] * dx + m[1][1] * dy);
+        if !gx.is_finite() || !gy.is_finite() || (gx - lx).hypot(gy - ly) > 0.05 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sample the image → projection direction onto a lookup grid over the image
+/// bounds. `None` when the solution has only layer 1 (or a value is not
+/// finite).
+pub(crate) fn sample_image_to_native(
     sol: &StandardSolution,
     width: u64,
     height: u64,
-) -> Option<(Grid2D, Grid2D)> {
+    parallel: bool,
+) -> Option<Grid2D> {
+    let i2p = sol.image_to_projection.as_ref()?;
+    sample(
+        i2p,
+        [0.0, 0.0, width as f64, height as f64],
+        IMAGE_DELTA_PX,
+        parallel,
+    )
+}
+
+/// Sample the projection → image direction onto a lookup grid over the
+/// projection-plane bounding box of the mapped image corners and edge
+/// midpoints, padded by one cell. `None` when the solution has only layer 1
+/// (or the linear scale is degenerate, or a value is not finite).
+pub(crate) fn sample_native_to_image(
+    sol: &StandardSolution,
+    width: u64,
+    height: u64,
+    parallel: bool,
+) -> Option<Grid2D> {
     let i2p = sol.image_to_projection.as_ref()?;
     let p2i = sol.projection_to_image.as_ref()?;
     let (w, h) = (width as f64, height as f64);
-    let image_to_native = sample(i2p, [0.0, 0.0, w, h], IMAGE_DELTA_PX)?;
-
-    // Projection-plane domain: bounding box of the mapped image corners and
-    // edge midpoints, padded by one cell.
     let m = sol.linear.cd;
     let scale = (m[0][0] * m[1][1] - m[0][1] * m[1][0]).abs().sqrt();
     if !positive(scale) {
@@ -559,28 +611,48 @@ pub(crate) fn sample_grids(
         x1 = x1.max(xi);
         y1 = y1.max(eta);
     }
-    let native_to_image = sample(p2i, [x0 - delta, y0 - delta, x1 + delta, y1 + delta], delta)?;
-    Some((image_to_native, native_to_image))
+    sample(
+        p2i,
+        [x0 - delta, y0 - delta, x1 + delta, y1 + delta],
+        delta,
+        parallel,
+    )
 }
 
-fn sample(dir: &Direction, rect: [f64; 4], delta: f64) -> Option<Grid2D> {
+/// Sample one direction onto a grid. `parallel` uses the rayon pool (one
+/// row per task); callers that may already be running *inside* a rayon
+/// worker must pass `false` — a nested parallel sampling from a worker that
+/// other workers are blocked waiting on (lazy `OnceLock` init) lets the
+/// initializing thread steal one of those blocked jobs and deadlock.
+fn sample(dir: &Direction, rect: [f64; 4], delta: f64, parallel: bool) -> Option<Grid2D> {
     let cols = expected_nodes(rect[2] - rect[0], delta)?;
     let rows = expected_nodes(rect[3] - rect[1], delta)?;
     let n = rows as usize * cols as usize;
     let mut gx = vec![0.0; n];
     let mut gy = vec![0.0; n];
-    gx.par_chunks_mut(cols as usize)
-        .zip(gy.par_chunks_mut(cols as usize))
-        .enumerate()
-        .for_each(|(r, (rx, ry))| {
-            let y = rect[1] + r as f64 * delta;
-            for (c, (ox, oy)) in rx.iter_mut().zip(ry.iter_mut()).enumerate() {
-                let x = rect[0] + c as f64 * delta;
-                let (vx, vy) = dir.map(x, y);
-                *ox = vx;
-                *oy = vy;
-            }
-        });
+    let row = |r: usize, rx: &mut [f64], ry: &mut [f64]| {
+        let y = rect[1] + r as f64 * delta;
+        for (c, (ox, oy)) in rx.iter_mut().zip(ry.iter_mut()).enumerate() {
+            let x = rect[0] + c as f64 * delta;
+            let (vx, vy) = dir.map(x, y);
+            *ox = vx;
+            *oy = vy;
+        }
+    };
+    if parallel {
+        gx.par_chunks_mut(cols as usize)
+            .zip(gy.par_chunks_mut(cols as usize))
+            .enumerate()
+            .for_each(|(r, (rx, ry))| row(r, rx, ry));
+    } else {
+        for (r, (rx, ry)) in gx
+            .chunks_mut(cols as usize)
+            .zip(gy.chunks_mut(cols as usize))
+            .enumerate()
+        {
+            row(r, rx, ry);
+        }
+    }
     if gx.iter().chain(&gy).any(|v| !v.is_finite()) {
         return None;
     }
@@ -1211,18 +1283,20 @@ mod tests {
         layer3_global(&mut p, "ProjectionToImage", &inv);
         let sol = parse_standard(&p).unwrap();
         assert!(sol.notes.is_empty(), "{:?}", sol.notes);
-        let (i2n, n2i) = sample_grids(&sol, w, h).unwrap();
+        assert!(validate_model(&sol, w, h));
+        let i2n = sample_image_to_native(&sol, w, h, true).unwrap();
+        let n2i = sample_native_to_image(&sol, w, h, false).unwrap();
         assert_eq!(i2n.rect, [0.0, 0.0, 640.0, 480.0]);
-        assert_eq!(i2n.delta, 8.0);
+        assert_eq!(i2n.delta, 16.0);
         let d = sol.image_to_projection.as_ref().unwrap();
         for (x, y) in [(3.0, 5.0), (321.7, 239.1), (600.0, 470.0)] {
             let g = i2n.eval(x, y);
             let m = d.map(x, y);
             // Bicubic sampling error on a non-polynomial field: measured
-            // 7e-7 deg (2.6 mas) in a border cell, far below the 0.05″
-            // (14 mas) real-data verification target.
+            // 7e-7 deg (2.6 mas) in a border cell at 8 px, far below the
+            // 0.05″ (14 mas) real-data verification target.
             let d = (g.0 - m.0).abs().max((g.1 - m.1).abs());
-            assert!(d < 2e-6, "grid vs model at ({x},{y}): {d} deg");
+            assert!(d < 4e-6, "grid vs model at ({x},{y}): {d} deg");
         }
         assert!(crate::astrometry::validate_grids(
             &sol.linear,
@@ -1237,8 +1311,23 @@ mod tests {
     }
 
     #[test]
-    fn layer1_only_has_no_grids() {
+    fn layer1_only_has_no_grids_and_validates_trivially() {
         let sol = parse_standard(&base()).unwrap();
-        assert!(sample_grids(&sol, 100, 100).is_none());
+        assert!(validate_model(&sol, 100, 100));
+        assert!(sample_image_to_native(&sol, 100, 100, true).is_none());
+        assert!(sample_native_to_image(&sol, 100, 100, true).is_none());
+    }
+
+    #[test]
+    fn validate_model_refuses_a_projective_layer_inconsistent_with_the_linear_layer() {
+        // Projective layer rotated 90° relative to the linear matrix.
+        let mut p = base();
+        layer2(
+            &mut p,
+            affine_h([[0.0, S], [-S, 0.0]], [0.0, 0.0]),
+            affine_h([[0.0, -1.0 / S], [1.0 / S, 0.0]], [0.0, 0.0]),
+        );
+        let sol = parse_standard(&p).unwrap();
+        assert!(!validate_model(&sol, 4000, 3000));
     }
 }

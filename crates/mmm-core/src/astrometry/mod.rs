@@ -93,7 +93,7 @@
 //!   `(x0 + c·Δ, y0 + r·Δ)` with `Rect = [x0, y0, x1, y1]`; `GridX` is the
 //!   output x (native ξ, or image x), `GridY` the output y. Node counts are
 //!   `1 + ⌈extent/Δ⌉` per axis. Orion panel 1 (4904×3232): ImageToNative
-//!   Δ = 8 px, Rect = [0, 0, 4904, 3232] → 614 cols × 405 rows;
+//!   Δ = 8 px (1.9.4 files), Rect = [0, 0, 4904, 3232] → 614 cols × 405 rows;
 //!   NativeToImage Δ = 3.556e−3 deg, Rect ≈ [−0.733, −1.099, 0.733, 1.098]
 //!   deg → 414 cols × 620 rows. Panel 7 (4888×3221) → 612×404, confirming
 //!   per-panel dims. The layout is pinned by the corner consistency check —
@@ -129,6 +129,8 @@
 //! at (0, 0)), and grid corners must reproduce the linear solution within the
 //! distortion allowance. Any violation yields `None` — a panel is treated as
 //! unsolved rather than solved wrongly.
+
+use std::sync::{Arc, OnceLock};
 
 use crate::formats::PropertyValue;
 use crate::formats::{FitsKeyword, XisfProperty};
@@ -365,9 +367,31 @@ fn catmull_rom_weights(t: f64) -> [f64; 4] {
     ]
 }
 
+/// Where a model's distortion grids come from.
+#[derive(Debug, Clone)]
+enum Distortion {
+    /// Linear-only solution: no grids.
+    None,
+    /// Legacy files: PixInsight's precomputed grids, read from the file.
+    Grids {
+        image_to_native: Grid2D,
+        native_to_image: Grid2D,
+    },
+    /// Standard (XISF rev 1) solution: the decoded model, sampled onto a grid
+    /// lazily on first use of each direction. Probes that only map pixels to
+    /// sky (frame choice) never pay for the inverse grid; the align stage
+    /// samples both once. `None` inside the cell records a failed sampling.
+    Standard {
+        sol: Arc<standard::StandardSolution>,
+        image_to_native: OnceLock<Option<Grid2D>>,
+        native_to_image: OnceLock<Option<Grid2D>>,
+    },
+}
+
 /// Full astrometric model for one solved panel: the linear TAN solution plus,
-/// when the panel was solved with distortion correction, PixInsight's
-/// precomputed spline lookup grids for both directions.
+/// when the panel was solved with distortion correction, lookup grids for
+/// both directions of the distortion (read from a legacy file, or sampled
+/// from a decoded standard solution).
 ///
 /// All pixel coordinates on this type are **PixInsight image coordinates**:
 /// 0-based, top-down rows, pixel k spanning [k, k+1] (center at k + 0.5) —
@@ -377,10 +401,7 @@ fn catmull_rom_weights(t: f64) -> [f64; 4] {
 pub struct WcsModel {
     /// Always present: fallback for linear-only solutions and sanity anchor.
     pub linear: LinearWcs,
-    /// Pixel → native tangent-plane grid (present iff the solution is spline).
-    pub image_to_native: Option<Grid2D>,
-    /// Native tangent-plane → pixel grid (present iff the solution is spline).
-    pub native_to_image: Option<Grid2D>,
+    distortion: Distortion,
     /// Solved image width in pixels.
     pub width: u64,
     /// Solved image height in pixels.
@@ -388,16 +409,64 @@ pub struct WcsModel {
 }
 
 impl WcsModel {
+    /// A model with the linear solution only.
+    pub(crate) fn linear_only(linear: LinearWcs, width: u64, height: u64) -> WcsModel {
+        WcsModel {
+            linear,
+            distortion: Distortion::None,
+            width,
+            height,
+        }
+    }
+
+    /// A model over precomputed grids (legacy files).
+    pub(crate) fn with_grids(
+        linear: LinearWcs,
+        image_to_native: Grid2D,
+        native_to_image: Grid2D,
+        width: u64,
+        height: u64,
+    ) -> WcsModel {
+        WcsModel {
+            linear,
+            distortion: Distortion::Grids {
+                image_to_native,
+                native_to_image,
+            },
+            width,
+            height,
+        }
+    }
+
+    /// A model over a decoded standard solution; grids are sampled on demand.
+    pub(crate) fn with_standard(
+        sol: standard::StandardSolution,
+        width: u64,
+        height: u64,
+    ) -> WcsModel {
+        WcsModel {
+            linear: sol.linear.clone(),
+            distortion: Distortion::Standard {
+                sol: Arc::new(sol),
+                image_to_native: OnceLock::new(),
+                native_to_image: OnceLock::new(),
+            },
+            width,
+            height,
+        }
+    }
+
     /// Build the model from a panel's XISF properties and image geometry.
     ///
     /// A standard XISF rev 1 block (`AstrometricSolution:Version` present,
-    /// PixInsight ≥ 1.9.5) is decoded by `standard.rs` and its
-    /// projective/spline layers sampled onto grids; otherwise the legacy
+    /// PixInsight ≥ 1.9.5) is decoded by `standard.rs`, validated against
+    /// its own linear layer, and its projective/spline layers are sampled
+    /// onto grids on first use; otherwise the legacy
     /// `PCL:AstrometricSolution:*` block (≤ 1.9.4) is read by `legacy.rs`.
     /// Linear-only solutions yield a model without grids. A distortion
-    /// solution whose grids fail the layout validations described in the
-    /// module docs is refused (`None`) — never silently approximated by its
-    /// linear part. An unsupported standard major revision is `None` too.
+    /// solution that fails the layout validations described in the module
+    /// docs is refused (`None`) — never silently approximated by its linear
+    /// part. An unsupported standard major revision is `None` too.
     pub fn from_properties(props: &[XisfProperty], width: u64, height: u64) -> Option<WcsModel> {
         if !standard::has_standard_block(props) {
             return legacy::model_from_legacy(props, width, height);
@@ -412,37 +481,97 @@ impl WcsModel {
         for n in &sol.notes {
             tracing::warn!("astrometric solution: {n}");
         }
+        if sol.image_to_projection.is_none() {
+            return Some(WcsModel::linear_only(sol.linear, width, height));
+        }
         // The grid math is specific to the gnomonic tangent plane.
-        if sol.linear.ctype[0] != "RA---TAN" && sol.image_to_projection.is_some() {
+        if sol.linear.ctype[0] != "RA---TAN" {
             return None;
         }
-        match standard::sample_grids(&sol, width, height) {
-            None => Some(WcsModel {
-                linear: sol.linear,
-                image_to_native: None,
-                native_to_image: None,
-                width,
-                height,
-            }),
-            Some((i2n, n2i)) => {
-                if !validate_grids(&sol.linear, &i2n, &n2i, width, height) {
-                    return None;
-                }
-                Some(WcsModel {
-                    linear: sol.linear,
-                    image_to_native: Some(i2n),
-                    native_to_image: Some(n2i),
-                    width,
-                    height,
+        if !standard::validate_model(&sol, width, height) {
+            return None;
+        }
+        Some(WcsModel::with_standard(sol, width, height))
+    }
+
+    /// Sample both distortion grids now (a no-op for legacy and linear-only
+    /// models). Call this from a plain (non-rayon) thread before handing the
+    /// model to a parallel region: sampling then uses the whole rayon pool,
+    /// whereas a first use from inside a rayon worker samples sequentially
+    /// (see `standard::sample`) — correct, but single-threaded.
+    pub fn ensure_grids(&self) {
+        let _ = self.image_to_native();
+        let _ = self.native_to_image();
+    }
+
+    /// Pixel → native tangent-plane grid, if the solution has distortion
+    /// (sampled on first call for standard solutions).
+    pub fn image_to_native(&self) -> Option<&Grid2D> {
+        match &self.distortion {
+            Distortion::None => None,
+            Distortion::Grids {
+                image_to_native, ..
+            } => Some(image_to_native),
+            Distortion::Standard {
+                sol,
+                image_to_native,
+                ..
+            } => image_to_native
+                .get_or_init(|| {
+                    let g = standard::sample_image_to_native(
+                        sol,
+                        self.width,
+                        self.height,
+                        rayon::current_thread_index().is_none(),
+                    );
+                    if g.is_none() {
+                        tracing::warn!(
+                            "astrometric solution: sampling the image→projection grid failed; \
+                             using the linear solution"
+                        );
+                    }
+                    g
                 })
-            }
+                .as_ref(),
+        }
+    }
+
+    /// Native tangent-plane → pixel grid, if the solution has distortion
+    /// (sampled on first call for standard solutions).
+    pub fn native_to_image(&self) -> Option<&Grid2D> {
+        match &self.distortion {
+            Distortion::None => None,
+            Distortion::Grids {
+                native_to_image, ..
+            } => Some(native_to_image),
+            Distortion::Standard {
+                sol,
+                native_to_image,
+                ..
+            } => native_to_image
+                .get_or_init(|| {
+                    let g = standard::sample_native_to_image(
+                        sol,
+                        self.width,
+                        self.height,
+                        rayon::current_thread_index().is_none(),
+                    );
+                    if g.is_none() {
+                        tracing::warn!(
+                            "astrometric solution: sampling the projection→image grid failed; \
+                             using the linear solution"
+                        );
+                    }
+                    g
+                })
+                .as_ref(),
         }
     }
 
     /// Map a PixInsight image coordinate to (RA, Dec) in degrees, through the
     /// distortion grid when present.
     pub fn pixel_to_sky(&self, x: f64, y: f64) -> (f64, f64) {
-        match &self.image_to_native {
+        match self.image_to_native() {
             Some(g) => {
                 let (xi, eta) = g.eval(x, y);
                 tan_deproject(self.linear.crval, xi, eta)
@@ -458,7 +587,7 @@ impl WcsModel {
     /// of margin — beyond that the extrapolation is not trustworthy.
     pub fn sky_to_pixel(&self, ra: f64, dec: f64) -> Option<(f64, f64)> {
         let (xi, eta) = tan_project_checked(self.linear.crval, ra, dec)?;
-        match &self.native_to_image {
+        match self.native_to_image() {
             Some(g) => {
                 let m = g.delta;
                 if xi < g.rect[0] - m
@@ -477,9 +606,27 @@ impl WcsModel {
         }
     }
 
-    /// True when the solution carries (and the model uses) distortion grids.
+    /// True when the solution carries (and the model uses) a distortion
+    /// model or grids.
     pub fn is_spline(&self) -> bool {
-        self.image_to_native.is_some()
+        !matches!(self.distortion, Distortion::None)
+    }
+
+    /// Which lazily sampled grids exist yet: `(image_to_native, native_to_image)`.
+    #[cfg(test)]
+    fn grids_sampled(&self) -> (bool, bool) {
+        match &self.distortion {
+            Distortion::Standard {
+                image_to_native,
+                native_to_image,
+                ..
+            } => (
+                image_to_native.get().is_some(),
+                native_to_image.get().is_some(),
+            ),
+            Distortion::Grids { .. } => (true, true),
+            Distortion::None => (false, false),
+        }
     }
 }
 
@@ -1391,6 +1538,72 @@ mod tests {
     }
 
     #[test]
+    fn standard_grids_are_sampled_lazily_per_direction() {
+        use crate::astrometry::standard::fixtures::{layer1, layer2};
+        const S: f64 = 1e-3;
+        let (rx, ry) = (50.0, 40.0);
+        let mut props = layer1([10.0, 20.0], [rx, ry], [[-S, 0.0], [0.0, S]]);
+        layer2(
+            &mut props,
+            [[-S, 0.0, rx * S], [0.0, S, -ry * S], [0.0, 0.0, 1.0]],
+            [[-1.0 / S, 0.0, rx], [0.0, 1.0 / S, ry], [0.0, 0.0, 1.0]],
+        );
+        let m = WcsModel::from_properties(&props, 100, 80).unwrap();
+        assert!(m.is_spline());
+        assert_eq!(
+            m.grids_sampled(),
+            (false, false),
+            "nothing sampled at decode"
+        );
+        let _ = m.pixel_to_sky(1.0, 2.0);
+        assert_eq!(m.grids_sampled(), (true, false), "forward only");
+        let _ = m.sky_to_pixel(10.0, 20.0);
+        assert_eq!(m.grids_sampled(), (true, true));
+        // Legacy grids are present from the start.
+        let lm = WcsModel::from_properties(&orion_props(), 100, 100).unwrap();
+        assert_eq!(
+            lm.grids_sampled(),
+            (false, false),
+            "linear-only legacy: no grids"
+        );
+    }
+
+    /// Regression: the first use of a lazily sampled grid from inside rayon
+    /// workers (many blocked on the same cell while the initializer runs)
+    /// used to deadlock via work stealing. Runs in a helper thread so a
+    /// regression fails by timeout instead of hanging the suite.
+    #[test]
+    fn lazy_sampling_from_inside_rayon_workers_completes() {
+        use crate::astrometry::standard::fixtures::{layer1, layer2};
+        use rayon::prelude::*;
+        const S: f64 = 1e-3;
+        let (rx, ry) = (400.0, 300.0);
+        let mut props = layer1([10.0, 20.0], [rx, ry], [[-S, 0.0], [0.0, S]]);
+        layer2(
+            &mut props,
+            [[-S, 0.0, rx * S], [0.0, S, -ry * S], [0.0, 0.0, 1.0]],
+            [[-1.0 / S, 0.0, rx], [0.0, 1.0 / S, ry], [0.0, 0.0, 1.0]],
+        );
+        let (tx, rx_done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let m = WcsModel::from_properties(&props, 800, 600).unwrap();
+            let n: usize = (0..512usize)
+                .into_par_iter()
+                .map(|i| {
+                    let p = m.sky_to_pixel(10.0 + i as f64 * 1e-5, 20.0).unwrap();
+                    let s = m.pixel_to_sky(p.0, p.1);
+                    usize::from((s.0 - 10.0 - i as f64 * 1e-5).abs() < 1e-6)
+                })
+                .sum();
+            tx.send(n).unwrap();
+        });
+        let n = rx_done
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("lazy sampling inside rayon workers deadlocked");
+        assert_eq!(n, 512);
+    }
+
+    #[test]
     fn model_without_solution_is_none() {
         assert!(WcsModel::from_properties(&[], 100, 100).is_none());
     }
@@ -1466,7 +1679,7 @@ mod tests {
             let delta = get("Delta").as_f64().unwrap();
             let (rows, cols, gx) = get("GridX").as_f64_mat().unwrap();
             let (_, _, gy) = get("GridY").as_f64_mat().unwrap();
-            let ours = model.image_to_native.as_ref().unwrap();
+            let ours = model.image_to_native().unwrap();
             let mut worst = 0.0f64;
             for r in (0..rows as usize).step_by(7) {
                 for c in (0..cols as usize).step_by(7) {
@@ -1558,10 +1771,10 @@ mod tests {
                 "panel {n}: {}x{} grids i2n {}x{} n2i {}x{}",
                 panel.width(),
                 panel.height(),
-                model.image_to_native.as_ref().unwrap().cols,
-                model.image_to_native.as_ref().unwrap().rows,
-                model.native_to_image.as_ref().unwrap().cols,
-                model.native_to_image.as_ref().unwrap().rows,
+                model.image_to_native().unwrap().cols,
+                model.image_to_native().unwrap().rows,
+                model.native_to_image().unwrap().cols,
+                model.native_to_image().unwrap().rows,
             );
         }
     }

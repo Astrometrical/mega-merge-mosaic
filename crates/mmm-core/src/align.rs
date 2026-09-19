@@ -357,6 +357,10 @@ fn reproject_core(
     frame: &MosaicFrame,
     out_dir: &Path,
 ) -> Result<AlignedPanel> {
+    // Sample the standard-solution grids on the pool *before* the parallel
+    // row loop below (a first use from inside the loop would sample
+    // sequentially; see `WcsModel::ensure_grids`).
+    model.ensure_grids();
     if (model.width, model.height) != (sw as u64, sh as u64) {
         return Err(Error::format(
             err_path,
