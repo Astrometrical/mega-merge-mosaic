@@ -152,3 +152,36 @@ fn mixed_channel_panels_are_refused() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn standard_rev1_solved_panels_probe_like_legacy_ones() {
+    use mmm_core::synth::write_xisf_solved_standard;
+    let dir = tmpdir("solved-standard");
+    let scale_deg = 1.0e-3_f64;
+    let (w, h) = (64u64, 48u64);
+    let planes = vec![0.5f32; (w * h) as usize];
+    let wcs = SynthWcs {
+        crval: [10.0, 0.0],
+        refimg: [32.0, 24.0],
+        cd: [[-scale_deg, 0.0], [0.0, scale_deg]],
+    };
+    let legacy = dir.join("legacy.xisf");
+    let standard = dir.join("standard.xisf");
+    write_xisf_solved(&legacy, w, h, 1, &planes, &wcs).unwrap();
+    write_xisf_solved_standard(&standard, w, h, 1, &planes, &wcs).unwrap();
+    let ids: Vec<String> = XisfPanel::open(&standard)
+        .unwrap()
+        .header()
+        .properties
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    assert!(ids.iter().any(|i| i == "AstrometricSolution:Version"));
+    assert!(!ids.iter().any(|i| i.starts_with("PCL:")));
+    let a = probe_panels(&[legacy], InputSelect::Auto).unwrap();
+    let b = probe_panels(&[standard], InputSelect::Auto).unwrap();
+    assert!(a.frame.is_some());
+    assert_eq!(a.frame, b.frame, "same solution, same frame");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

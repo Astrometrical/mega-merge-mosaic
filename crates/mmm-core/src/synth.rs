@@ -625,6 +625,26 @@ fn wcs_property_xml(wcs: &SynthWcs) -> String {
     )
 }
 
+/// `<Property>` elements for a linear Gnomonic solution in the XISF 1.0
+/// revision 1 standard form (`AstrometricSolution:*`, what PixInsight ≥ 1.9.5
+/// writes) — layer 1 only.
+fn standard_wcs_property_xml(wcs: &SynthWcs) -> String {
+    let cd = [wcs.cd[0][0], wcs.cd[0][1], wcs.cd[1][0], wcs.cd[1][1]];
+    format!(
+        concat!(
+            r#"<Property id="AstrometricSolution:Version" type="String">1.0</Property>"#,
+            r#"<Property id="AstrometricSolution:ProjectionSystem" type="String">Gnomonic</Property>"#,
+            r#"<Property id="AstrometricSolution:ReferenceCelestialCoordinates" type="F64Vector" length="2" location="inline:base64">{crval}</Property>"#,
+            r#"<Property id="AstrometricSolution:ReferenceImageCoordinates" type="F64Vector" length="2" location="inline:base64">{refimg}</Property>"#,
+            r#"<Property id="AstrometricSolution:LinearTransformationMatrix" type="F64Matrix" rows="2" columns="2" location="inline:base64">{cd}</Property>"#,
+            r#"<Property id="AstrometricSolution:CelestialReferenceSystem" type="String">ICRS</Property>"#,
+        ),
+        crval = b64_f64s(&wcs.crval),
+        refimg = b64_f64s(&wcs.refimg),
+        cd = b64_f64s(&cd),
+    )
+}
+
 /// Minimal monolithic XISF writer (Float32, planar, little-endian,
 /// uncompressed attachment at offset 4096). Round-trips through
 /// [`crate::formats::xisf::XisfPanel`].
@@ -633,8 +653,10 @@ pub fn write_xisf(path: &Path, w: u64, h: u64, ch: u64, planes: &[f32]) -> Resul
 }
 
 /// [`write_xisf`] plus a linear astrometric solution as inline-base64 XISF
-/// `<Property>` elements — a synthetic stand-in for a plate-solved raw panel
-/// (`analyze --input solved` consumes these).
+/// `<Property>` elements in the legacy (PixInsight ≤ 1.9.4)
+/// `PCL:AstrometricSolution:*` form — a synthetic stand-in for a plate-solved
+/// raw panel (`analyze --input solved` consumes these). See
+/// [`write_xisf_solved_standard`] for the ≥ 1.9.5 form; both stay readable.
 pub fn write_xisf_solved(
     path: &Path,
     w: u64,
@@ -644,6 +666,19 @@ pub fn write_xisf_solved(
     wcs: &SynthWcs,
 ) -> Result<()> {
     write_xisf_impl(path, w, h, ch, planes, &wcs_property_xml(wcs))
+}
+
+/// [`write_xisf`] plus a linear astrometric solution in the XISF 1.0
+/// revision 1 standard form (`AstrometricSolution:*`, PixInsight ≥ 1.9.5).
+pub fn write_xisf_solved_standard(
+    path: &Path,
+    w: u64,
+    h: u64,
+    ch: u64,
+    planes: &[f32],
+    wcs: &SynthWcs,
+) -> Result<()> {
+    write_xisf_impl(path, w, h, ch, planes, &standard_wcs_property_xml(wcs))
 }
 
 fn write_xisf_impl(
