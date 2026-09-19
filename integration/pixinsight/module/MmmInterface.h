@@ -96,8 +96,13 @@ private:
       Bitmap          Logo_Bitmap;           // rendered from MMM_CHEVRON_SVG
 
       // --- Target Frames section --------------------------------------------
-      SectionBar      TargetFrames_SectionBar;
+      // Declaration order matters for every Control/SectionBar pair below:
+      // ~SectionBar calls through its section (Control::OnShow/OnHide on the
+      // section's handle), and members are destroyed in reverse declaration
+      // order, so each section Control MUST be declared BEFORE the SectionBar
+      // that SetSection()s it. Enforced by host/test/test_sectionbar_order.
       Control         TargetFrames_Control;
+      SectionBar      TargetFrames_SectionBar;
       VerticalSizer   TargetFrames_Sizer;
       HorizontalSizer InputMode_Sizer;
       RadioButton     ViewsMode_RadioButton;
@@ -112,8 +117,8 @@ private:
       PushButton      RemoveFile_PushButton;
 
       // --- Parameters section ------------------------------------------------
-      SectionBar      Parameters_SectionBar;
       Control         Parameters_Control;
+      SectionBar      Parameters_SectionBar;
       VerticalSizer   Parameters_Sizer;
       HorizontalSizer SessionDir_Sizer;
       Label           SessionDir_Label;
@@ -144,8 +149,8 @@ private:
       SpinBox         FlattenOrder_SpinBox;
 
       // --- Advanced section ---------------------------------------------------
-      SectionBar      Advanced_SectionBar;
       Control         Advanced_Control;
+      SectionBar      Advanced_SectionBar;
       VerticalSizer   Advanced_Sizer;
    };
 

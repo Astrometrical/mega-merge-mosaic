@@ -46,6 +46,15 @@ MmmBlendInterface::MmmBlendInterface()
    TheMmmBlendInterface = this;
 }
 
+// NOTE: this destructor is unreachable in practice. The interface is `new`ed
+// in InstallPixInsightModule and owned by pcl::Module's MetaObject child
+// list; nothing in PCL (GlobalContextDispatcher::OnUnload only saves
+// geometry/settings) or in this module ever deletes pcl::Module, and the
+// core tears the process down with the heap intact. ~GUIData is nonetheless
+// kept safe to run: every section Control is declared before its SectionBar
+// (see the note in MmmInterface.h) so ~SectionBar never calls through a
+// destroyed control -- the pattern that aborted PixInsight in mpp, where the
+// dialog was a stack object.
 MmmBlendInterface::~MmmBlendInterface()
 {
    delete GUI;

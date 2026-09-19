@@ -101,3 +101,18 @@ add_executable(test_validation test/test_validation.cpp)
 target_link_libraries(test_validation PRIVATE mmm_host)
 add_dependencies(test_validation rogue_worker)
 add_test(NAME test_validation COMMAND test_validation $<TARGET_FILE:rogue_worker>)
+
+# test_sectionbar_order -- a source-text invariant check, not a link test: it
+# needs no mmm_host and no PCL. pcl::SectionBar's destructor calls through the
+# Control that SetSection() gave it, so a SectionBar declared before its
+# section is destroyed after it and calls a destroyed control -- an
+# APIFunctionError escaping a noexcept destructor, i.e. std::terminate. That
+# shipped once in the sibling mpp project and aborted PixInsight on every
+# TIFF save. The module has no runtime test harness, so this reads the two
+# interface sources as text -- the only automated guard available for a
+# module-side invariant.
+add_executable(test_sectionbar_order test/test_sectionbar_order.cpp)
+add_test(NAME test_sectionbar_order
+         COMMAND test_sectionbar_order
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../module/MmmInterface.h
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../module/MmmInterface.cpp)
