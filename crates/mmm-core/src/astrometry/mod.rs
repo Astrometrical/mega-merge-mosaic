@@ -117,7 +117,77 @@
 //! distortion allowance. Any violation yields `None` — a panel is treated as
 //! unsolved rather than solved wrongly.
 
+use crate::formats::PropertyValue;
 use crate::formats::{FitsKeyword, XisfProperty};
+
+mod legacy;
+
+/// Value of the property with id `id`, if present.
+pub(crate) fn find_value<'a>(props: &'a [XisfProperty], id: &str) -> Option<&'a PropertyValue> {
+    props.iter().find(|p| p.id == id).map(|p| &p.value)
+}
+
+/// True when the native-frame properties are absent or carry the standard
+/// zenithal values (reference (0, 90), pole (180, 90)); a different frame
+/// would change the deprojection and is not implemented.
+pub(crate) fn std_native_frame_ok(props: &[XisfProperty], ref_id: &str, pole_id: &str) -> bool {
+    let ok = |id: &str, expect: [f64; 2]| match find_value(props, id) {
+        None => true,
+        Some(v) => v.as_f64_vec().is_some_and(|v| {
+            v.len() == 2 && (v[0] - expect[0]).abs() < 1e-9 && (v[1] - expect[1]).abs() < 1e-9
+        }),
+    };
+    ok(ref_id, [0.0, 90.0]) && ok(pole_id, [180.0, 90.0])
+}
+
+/// Layout validations shared by every grid source (empirically derived, see
+/// the module docs): the image→native grid must span the image bounds, both
+/// grids must agree at the reference point, and the grid corners must
+/// reproduce the linear solution within the distortion allowance. `linear`
+/// is the panel's linear solution; grids are in PixInsight image
+/// coordinates / tangent-plane degrees.
+pub(crate) fn validate_grids(
+    linear: &LinearWcs,
+    image_to_native: &Grid2D,
+    native_to_image: &Grid2D,
+    width: u64,
+    height: u64,
+) -> bool {
+    // refimg is the reference point in PixInsight image coordinates.
+    let refimg = [linear.crpix[0] - 0.5, linear.crpix[1] - 0.5];
+    let r = image_to_native.rect;
+    if r[0].abs() > 1.0
+        || r[1].abs() > 1.0
+        || (r[2] - width as f64).abs() > 1.0
+        || (r[3] - height as f64).abs() > 1.0
+    {
+        return false; // the grid domain must be the solved image bounds
+    }
+    // The spline is anchored at the reference point: grid(refimg) ≈ (0,0)
+    // native (measured 0.05″ on real data; 36″ allowance).
+    let (xi, eta) = image_to_native.eval(refimg[0], refimg[1]);
+    if xi.hypot(eta) > 0.01 {
+        return false;
+    }
+    // ... and the inverse grid returns the reference pixel from (0, 0).
+    let (ix, iy) = native_to_image.eval(0.0, 0.0);
+    if (ix - refimg[0]).hypot(iy - refimg[1]) > 5.0 {
+        return false;
+    }
+    // Grid corners must approximately reproduce the linear solution — the
+    // check that pins down row/column ordering (measured 0.6–1.7″ on real
+    // data; 180″ distortion allowance vs ~1 deg for a wrong layout).
+    let m = linear.cd;
+    for (cx, cy) in [(r[0], r[1]), (r[2], r[1]), (r[0], r[3]), (r[2], r[3])] {
+        let (gx, gy) = image_to_native.eval(cx, cy);
+        let (dx, dy) = (cx - refimg[0], cy - refimg[1]);
+        let (lx, ly) = (m[0][0] * dx + m[0][1] * dy, m[1][0] * dx + m[1][1] * dy);
+        if (gx - lx).hypot(gy - ly) > 0.05 {
+            return false;
+        }
+    }
+    true
+}
 
 /// A linear FITS WCS: `sky = project(crval, cd · (pixel − crpix))`, with
 /// `pixel` in FITS convention (1-based, pixel centers at integers, rows in
@@ -302,8 +372,6 @@ pub struct WcsModel {
     pub height: u64,
 }
 
-const SPLINE_PREFIX: &str = "PCL:AstrometricSolution:SplineWorldTransformation:";
-
 impl WcsModel {
     /// Build the model from a panel's XISF properties and image geometry.
     ///
@@ -313,83 +381,7 @@ impl WcsModel {
     /// described in the module docs; otherwise the whole solution is refused
     /// (`None`) — never silently approximated by its linear part.
     pub fn from_properties(props: &[XisfProperty], width: u64, height: u64) -> Option<WcsModel> {
-        let linear = wcs_from_properties(props)?;
-        if !props.iter().any(|p| p.id.starts_with(SPLINE_PREFIX)) {
-            return Some(WcsModel {
-                linear,
-                image_to_native: None,
-                native_to_image: None,
-                width,
-                height,
-            });
-        }
-
-        // The grid math below is specific to the gnomonic tangent plane.
-        if linear.ctype[0] != "RA---TAN" {
-            return None;
-        }
-        // Refuse a non-standard native frame — the deprojection would differ.
-        let std_native = |id: &str, expect: [f64; 2]| match props.iter().find(|p| p.id == id) {
-            None => true, // absent: the standard zenithal values are implied
-            Some(p) => p.value.as_f64_vec().is_some_and(|v| {
-                v.len() == 2 && (v[0] - expect[0]).abs() < 1e-9 && (v[1] - expect[1]).abs() < 1e-9
-            }),
-        };
-        if !std_native(
-            "PCL:AstrometricSolution:ReferenceNativeCoordinates",
-            [0.0, 90.0],
-        ) || !std_native(
-            "PCL:AstrometricSolution:CelestialPoleNativeCoordinates",
-            [180.0, 90.0],
-        ) {
-            return None;
-        }
-
-        let image_to_native = grid_from_properties(props, "ImageToNative")?;
-        let native_to_image = grid_from_properties(props, "NativeToImage")?;
-
-        // Layout validations (empirically derived; see module docs). refimg is
-        // the reference point in PixInsight image coordinates.
-        let refimg = [linear.crpix[0] - 0.5, linear.crpix[1] - 0.5];
-        let r = image_to_native.rect;
-        if r[0].abs() > 1.0
-            || r[1].abs() > 1.0
-            || (r[2] - width as f64).abs() > 1.0
-            || (r[3] - height as f64).abs() > 1.0
-        {
-            return None; // the grid domain must be the solved image bounds
-        }
-        // The spline is anchored at the reference point: grid(refimg) ≈ (0,0)
-        // native (measured 0.05″ on real data; 36″ allowance).
-        let (xi, eta) = image_to_native.eval(refimg[0], refimg[1]);
-        if xi.hypot(eta) > 0.01 {
-            return None;
-        }
-        // ... and the inverse grid returns the reference pixel from (0, 0).
-        let (ix, iy) = native_to_image.eval(0.0, 0.0);
-        if (ix - refimg[0]).hypot(iy - refimg[1]) > 5.0 {
-            return None;
-        }
-        // Grid corners must approximately reproduce the linear solution — the
-        // check that pins down row/column ordering (measured 0.6–1.7″ on real
-        // data; 180″ distortion allowance vs ~1 deg for a wrong layout).
-        let m = linear.cd;
-        for (cx, cy) in [(r[0], r[1]), (r[2], r[1]), (r[0], r[3]), (r[2], r[3])] {
-            let (gx, gy) = image_to_native.eval(cx, cy);
-            let (dx, dy) = (cx - refimg[0], cy - refimg[1]);
-            let (lx, ly) = (m[0][0] * dx + m[0][1] * dy, m[1][0] * dx + m[1][1] * dy);
-            if (gx - lx).hypot(gy - ly) > 0.05 {
-                return None;
-            }
-        }
-
-        Some(WcsModel {
-            linear,
-            image_to_native: Some(image_to_native),
-            native_to_image: Some(native_to_image),
-            width,
-            height,
-        })
+        legacy::model_from_legacy(props, width, height)
     }
 
     /// Map a PixInsight image coordinate to (RA, Dec) in degrees, through the
@@ -436,51 +428,9 @@ impl WcsModel {
     }
 }
 
-/// Read one `PointGridInterpolation` direction (`ImageToNative` or
-/// `NativeToImage`) into a [`Grid2D`], validating dimensional consistency.
-fn grid_from_properties(props: &[XisfProperty], dir: &str) -> Option<Grid2D> {
-    let get = |suffix: &str| {
-        let id = format!("{SPLINE_PREFIX}PointGridInterpolation:{dir}:{suffix}");
-        props.iter().find(|p| p.id == id).map(|p| &p.value)
-    };
-    let rect_v = get("Rect")?.as_f64_vec()?;
-    let delta = get("Delta")?.as_f64()?;
-    let (rows, cols, gx) = get("GridX")?.as_f64_mat()?;
-    let (ry, cy, gy) = get("GridY")?.as_f64_mat()?;
-    if rect_v.len() != 4
-        || !delta.is_finite()
-        || delta <= 0.0
-        || (rows, cols) != (ry, cy)
-        || rows < 2
-        || cols < 2
-    {
-        return None;
-    }
-    let rect = [rect_v[0], rect_v[1], rect_v[2], rect_v[3]];
-    let n = rows as usize * cols as usize;
-    if gx.len() != n || gy.len() != n {
-        return None; // empty data ⇒ unresolved attachment block
-    }
-    // Node counts must match Rect + Delta: 1 + ⌈extent/Δ⌉ per axis (PixInsight
-    // formula, verified across panels with both exact and fractional extents).
-    if expected_nodes(rect[2] - rect[0], delta) != Some(cols)
-        || expected_nodes(rect[3] - rect[1], delta) != Some(rows)
-    {
-        return None;
-    }
-    Some(Grid2D {
-        rect,
-        delta,
-        rows,
-        cols,
-        gx: gx.to_vec(),
-        gy: gy.to_vec(),
-    })
-}
-
 /// PixInsight node count for a grid axis: `1 + ⌈extent/Δ⌉`, with a tolerance
 /// for extents that are floating-point-exact multiples of `Δ`.
-fn expected_nodes(extent: f64, delta: f64) -> Option<u32> {
+pub(crate) fn expected_nodes(extent: f64, delta: f64) -> Option<u32> {
     if !extent.is_finite() || extent <= 0.0 {
         return None;
     }
@@ -499,44 +449,11 @@ fn expected_nodes(extent: f64, delta: f64) -> Option<u32> {
 /// coordinates, linear transformation matrix) is missing or malformed, or if
 /// the projection system is one we cannot express as a FITS CTYPE code.
 pub fn wcs_from_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
-    let find = |id: &str| props.iter().find(|p| p.id == id).map(|p| &p.value);
-
-    let crval = find("PCL:AstrometricSolution:ReferenceCelestialCoordinates")?.as_f64_vec()?;
-    let refimg = find("PCL:AstrometricSolution:ReferenceImageCoordinates")?.as_f64_vec()?;
-    let (rows, cols, m) =
-        find("PCL:AstrometricSolution:LinearTransformationMatrix")?.as_f64_mat()?;
-    if crval.len() != 2 || refimg.len() != 2 || (rows, cols) != (2, 2) {
-        return None;
-    }
-
-    // Missing projection property defaults to Gnomonic — the only projection
-    // MosaicByCoordinates produces; an explicit unknown one refuses (better no
-    // WCS than a wrong CTYPE).
-    let proj =
-        find("PCL:AstrometricSolution:ProjectionSystem").map_or(Some("Gnomonic"), |v| v.as_str());
-    let code = projection_code(proj?)?;
-
-    let radesys = find("Observation:CelestialReferenceSystem")
-        .and_then(|v| v.as_str())
-        .unwrap_or("ICRS")
-        .to_string();
-
-    Some(LinearWcs {
-        crval: [crval[0], crval[1]],
-        // PixInsight image coords (pixel centers at k + 0.5, 0-based) →
-        // FITS pixel coords (centers at integers, 1-based): +0.5 both axes.
-        crpix: [refimg[0] + 0.5, refimg[1] + 0.5],
-        cd: [[m[0], m[1]], [m[2], m[3]]],
-        ctype: [
-            format!("{:-<5}{code}", "RA"),
-            format!("{:-<5}{code}", "DEC"),
-        ],
-        radesys,
-    })
+    legacy::linear_from_legacy(props)
 }
 
 /// PixInsight projection-system name → 3-letter FITS projection code.
-fn projection_code(name: &str) -> Option<&'static str> {
+pub(crate) fn projection_code(name: &str) -> Option<&'static str> {
     Some(match name {
         "Gnomonic" => "TAN",
         "Stereographic" => "STG",
