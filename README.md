@@ -224,8 +224,12 @@ just scales accordingly — see the 2× drizzle row in the performance table.
 - **Linear data** is expected end-to-end; zero is the no-data sentinel
   (registered panels must keep their hard zero padding).
 - **Unaligned mode** needs each panel to carry a PixInsight astrometric
-  solution (`PCL:AstrometricSolution:*` properties, PixInsight ≥ 1.9.4
-  verified; spline distortion grids are used when present).
+  solution: the XISF 1.0 revision 1 `AstrometricSolution:*` block
+  (PixInsight ≥ 1.9.5; spline distortion models are evaluated) or the legacy
+  `PCL:AstrometricSolution:*` block (≤ 1.9.4; distortion grids are used when
+  present). Old and new files can be mixed freely.
+- **PixInsight module:** requires PixInsight ≥ 1.9.5. Module v1.4.2 remains
+  available for PixInsight 1.9.0–1.9.4 and is not updated.
 - Channels are matched independently (per-channel photometry for OSC/RGB);
   seams are shared across channels so colour fringing cannot occur. RGB is
   the tested path.

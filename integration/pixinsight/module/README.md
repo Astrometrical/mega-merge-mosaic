@@ -8,6 +8,9 @@ byte-exact analyze/blend pipeline as the `mmm` CLI. It is PixInsight-only code
 (`host/`) has no PCL dependency and is tested independently (see
 `../host/README.md`).
 
+**Requires PixInsight ≥ 1.9.5** (built against PCL 2.10.8, declared API
+0x0188). Older cores: use module v1.4.2, which is frozen and not updated.
+
 All three platforms **build and test in CI** (`.github/workflows/module.yml`:
 `linux-x64`, `macos-arm64`, `windows-x64` — see
 [`../ci/README.md`](../ci/README.md)). The **development flow below** (build
@@ -208,8 +211,9 @@ sudo mkdir -p /opt/PixInsight/doc/tools/MegaMergeMosaic
 sudo cp ../doc/tools/MegaMergeMosaic/MegaMergeMosaic.html /opt/PixInsight/doc/tools/MegaMergeMosaic/
 ```
 
-The distribution package (relocating to the Astrometrical website repo — see
-[`../repo/README.md`](../repo/README.md)) should ship this file the same way.
+The distribution package is assembled by the Astrometrical tools website from
+the CI artifacts (`stage/bin/**`, `stage/doc/**`); it ships this file the same
+way.
 
 ## Manual smoke test
 

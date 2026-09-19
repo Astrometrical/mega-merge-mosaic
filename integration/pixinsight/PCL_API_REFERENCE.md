@@ -1,7 +1,8 @@
 # PCL C++ API Reference — for mmm-pxm (PixInsight native module)
 
 Researched against the local PixInsight install: headers at `/opt/PixInsight/include/pcl/`
-(PCL 2.10.4, released 2026-06-21), sources at `/opt/PixInsight/src/pcl/`. All signatures below
+(originally PCL 2.10.4, released 2026-06-21; the build pin is now PCL 2.10.8 / PixInsight
+1.9.5, see below), sources at `/opt/PixInsight/src/pcl/`. All signatures below
 are copied or closely paraphrased from those files with file+line citations. **No complete
 example module (`.cpp`) exists anywhere under `/opt/PixInsight`** — only the PCL library itself.
 Every code skeleton below is therefore *synthesized* from the header doc comments and confirmed
@@ -9,15 +10,11 @@ constructor/implementation bodies, not copied from a working module; the plan au
 sanity-check skeletons against the open-source PCL repo (gitlab.com/pixinsight/PCL) or any
 third-party module source if available, before relying on them verbatim.
 
-> **Build-pin caveat:** CI builds the module against PCL **2.8.3** (PixInsight
-> 1.9.0), pinned in `ci/pcl-pin.env`, so the module's declared
-> `PCL_API_Version` (0x0182) admits every 1.9.x core — see the policy comment
-> in the pin file. (Exception: the macos-arm64 leg builds against 2.10.4,
-> the first arm64-capable PCL; every arm64 core is ≥ 1.9.4.) This document's
-> file+line citations refer to PCL 2.10.4 headers; the entry-point/ABI facts
-> below are stable across that span, but any *new* API must be verified
-> against the pinned 2.8.3 headers before use in the module — 2.8.3 is what
-> most targets compile against.
+> **Build pin:** CI builds the module against PCL **2.10.8** (PixInsight 1.9.5), pinned in
+> `ci/pcl-pin.env`, for every target. The module's declared `PCL_API_Version` (0x0188)
+> requires a ≥ 1.9.5 core by design; v1.4.2 remains the module for 1.9.0–1.9.4. Line
+> citations below were taken against 2.10.4 headers and may be off by a few lines at 2.10.8;
+> the entry-point/ABI facts are unchanged.
 
 Target: Linux, one `mmm-pxm.so`, one global-context `MetaProcess`/`ProcessImplementation`, one
 `ProcessInterface`, no PJSR/JavaScript.
@@ -991,7 +988,40 @@ you do **not** need `AstrometricMetadata` at all to forward it — filter by id 
 `Property` objects straight through (see below). `AstrometricMetadata` is only needed if you must
 recompute/re-derive a solution, or regenerate a canonical serialization via `ToProperties()`.
 
-### The exact `PCL:AstrometricSolution:*` property id list
+### XISF rev 1 standard ids (PixInsight ≥ 1.9.5)
+
+PCL 2.10.8 writes the XISF 1.0 revision 1 standard block and **deletes the legacy
+`PCL:AstrometricSolution:*` ids** when a solution is regenerated
+(`AstrometricMetadata::UpdateProperties` → `RemoveSolutionProperties`, which matches both
+`PropertyPrefix()` = `"AstrometricSolution:"` and `LegacyPropertyPrefix()` =
+`"PCL:AstrometricSolution:"`). What a 1.9.5-solved view carries:
+
+```
+AstrometricSolution:Version                       String "1.0"
+AstrometricSolution:ProjectionSystem              String (Gnomonic, …)
+AstrometricSolution:ReferenceCelestialCoordinates F64Vector[2]
+AstrometricSolution:ReferenceImageCoordinates     F64Vector[2]
+AstrometricSolution:ReferenceNativeCoordinates    F64Vector[2]
+AstrometricSolution:CelestialPoleNativeCoordinates F64Vector[2]
+AstrometricSolution:LinearTransformationMatrix    F64Matrix 2×2
+AstrometricSolution:CelestialReferenceSystem      String (ICRS/GCRS)
+AstrometricSolution:{CreationTime,Catalog,CreatorApplication,CreatorModule,CreatorOS}
+AstrometricSolution:ProjectiveTransformation:{ImageToProjection,ProjectionToImage}  F64Matrix 3×3
+AstrometricSolution:DistortionModel:<dir>:{BasisFunction,Order,Polynomial,Terms}
+AstrometricSolution:DistortionModel:<dir>:Global:{X,Y}:{Normalization,Nodes,Coefficients,ShapeParameter}
+AstrometricSolution:DistortionModel:<dir>:Local:{Center,Radius}, Local:{X,Y}:{Normalization,NodeOffsets,Nodes,Coefficients,ShapeParameter}
+AstrometricSolution:DistortionModel:<dir>:Fallback:Threshold, Fallback:{X,Y}:…
+AstrometricSolution:ControlPoints:{Celestial,Image,Rejected}, AstrometricSolution:Weights
+PCL:AstrometricSolution:Generation:*   (private solver parameters — not part of the model)
+PCL:AstrometricSolution:Grid:*         (private evaluation cache; multi-MB matrices)
+```
+
+`AstrometryProps.cpp` forwards the `AstrometricSolution:` and `PCL:AstrometricSolution:`
+families (minus the private `Grid:`/`Generation:` extras) plus
+`Observation:CelestialReferenceSystem`; the worker (`mmm-core::astrometry::standard`)
+evaluates the model. The list below is what ≤ 1.9.4 wrote; it remains readable.
+
+### The exact legacy `PCL:AstrometricSolution:*` property id list (≤ 1.9.4)
 
 Confirmed from three duplicated doc-comment blocks in `AstrometricMetadata.h` (1019-1062,
 959-996, 1144-1198), cross-checked against literal string usage in `AstrometricMetadata.cpp`:

@@ -297,9 +297,12 @@ All four phase-2 tasks landed (75 tests, clippy clean). Real-data numbers,
   Trade-off to watch: single-panel defects (cosmic rays, satellite trails)
   in overlaps are no longer averaged down — the owner shows them at full
   strength.
-- **WCS**: PixInsight 1.9.4 stores the solution in `PCL:AstrometricSolution:*`
-  properties (inline base64 f64 vectors/matrices, not attachments); pure
-  linear Gnomonic → exact TAN cards, center error 0.0″, crop-shift invariant.
+- **WCS**: PixInsight ≥ 1.9.5 stores the solution as the XISF rev 1
+  `AstrometricSolution:*` block (layers: linear, projective 3×3, RBF spline
+  distortion), which `astrometry/standard.rs` decodes and samples onto lookup
+  grids; ≤ 1.9.4 stored `PCL:AstrometricSolution:*` with precomputed grids
+  (`astrometry/legacy.rs`, inline base64 f64 vectors/matrices). Pure linear
+  Gnomonic → exact TAN cards, center error 0.0″, crop-shift invariant.
   Downsampled previews get no WCS (CD would need rescaling — refusing to lie).
 
 ## Phase 3 results (2026-07-25)
@@ -457,6 +460,35 @@ default auto). 132 tests, clippy clean.
   (no root to drop caches); first partially-cold run measured align 11.0 s,
   and the 24 GB of source reads bound a fully cold align well under the 60 s
   target at the measured ≥ 0.9 GB/s scan rate.
+
+## PixInsight 1.9.5 / XISF revision 1 (2026-09-19)
+
+PixInsight 1.9.5 (PCL 2.10.8, API 0x0188) adopts XISF 1.0 revision 1, whose
+standard `AstrometricSolution:*` block replaces the legacy
+`PCL:AstrometricSolution:*` properties (the core deletes the legacy ids when
+it regenerates a solution). Spec:
+[2026-09-19-pixinsight-1-9-5-xisf-rev1-design.md](superpowers/specs/2026-09-19-pixinsight-1-9-5-xisf-rev1-design.md).
+
+- **Decoder** (`astrometry/standard.rs`, `astrometry/spline.rs`): layer 1
+  (projection), layer 2 (projective 3×3 both ways), layer 3 (RBF surface
+  splines: ThinPlateSpline / VariableOrder / Gaussian / Multiquadric /
+  InverseMultiquadric / InverseQuadratic, Global + Local + Fallback terms
+  with Wendland C2 weights), evaluated per the spec and PCL's reference
+  implementation, then sampled onto the existing `Grid2D` lookup grids (8 px
+  spacing) so `WcsModel` and the align stage are unchanged. Unavailable
+  layers fall back per the spec (with a warning). PixInsight's private
+  `PCL:AstrometricSolution:{Grid,Generation}:*` extras are ignored.
+- **Verified** on a 1.9.5-regenerated Orion raw panel (Global TPS, order 2,
+  ~3.1k nodes per component, separate X/Y node sets): our sampled grid vs
+  PixInsight's own grid cache agrees to < 0.001″ over the whole field;
+  standard vs the 1.9.4 legacy solution of the same panel agrees to ≤ 0.01″;
+  decode + sample takes ~0.8 s per 4898×3230 panel.
+- **Legacy files stay readable** (`astrometry/legacy.rs`); a file carrying a
+  standard block is read through it exclusively.
+- **Build**: one PCL pin (2.10.8) for every arch; module requires PixInsight
+  ≥ 1.9.5 by design (v1.4.2 stays available for 1.9.0–1.9.4). The in-repo
+  update-repository packaging scripts were removed (the tools website owns
+  distribution).
 
 ## Performance notes
 
