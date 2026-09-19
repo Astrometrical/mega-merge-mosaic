@@ -299,7 +299,7 @@ names):
 
 | field | type | notes |
 |---|---|---|
-| `id` | string | property identifier, e.g. `PCL:AstrometricSolution:ReferenceCelestialCoordinates` |
+| `id` | string | property identifier, e.g. `AstrometricSolution:ReferenceCelestialCoordinates` (XISF rev 1, PixInsight ≥ 1.9.5) or `PCL:AstrometricSolution:ReferenceCelestialCoordinates` (legacy, ≤ 1.9.4) |
 | `type_` | string | **literally `type_`, with the trailing underscore** — this is a plain struct field with no serde rename, not a JSON `type` key |
 | `value` | `PropertyValue` | see below |
 | `location` | `[u64, u64]` or `null` | byte offset + size of an attachment-located block, when present; a 2-element JSON array (Rust tuple), not an object |
@@ -603,7 +603,11 @@ its own writes to the worker's stdin.
   would otherwise write into a `.xisf` header, carried verbatim in each
   panel's `PanelDesc.properties` (§6) — the worker's WCS model is built
   directly from those properties, so the host does not need to understand
-  or reduce them, only pass them through. Pixels for a solved panel are
+  or reduce them, only pass them through. Both the XISF rev 1 standard
+  `AstrometricSolution:*` block (PixInsight ≥ 1.9.5) and the legacy
+  `PCL:AstrometricSolution:*` block (≤ 1.9.4) are forwarded (minus
+  PixInsight's private `PCL:AstrometricSolution:{Grid,Generation}:*`
+  extras); the worker decides which it is reading. Pixels for a solved panel are
   still pulled over the same band-pull handshake as `Aligned`; the
   reprojection happens worker-side into its own on-disk session cache
   before blending begins.

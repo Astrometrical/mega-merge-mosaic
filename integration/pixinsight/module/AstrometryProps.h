@@ -1,8 +1,10 @@
 // AstrometryProps.h -- extract a solved panel's plate solution as worker JSON (Task 4).
 //
 // A PixInsight astrometric solution lives in a view's properties under the
-// "PCL:AstrometricSolution:" id prefix (PCL_API_REFERENCE.md section 6). For a
-// Solved-mode IPC job the host forwards those raw properties verbatim in each
+// "AstrometricSolution:" id prefix (XISF 1.0 rev 1 standard block, PixInsight
+// >= 1.9.5) or the legacy "PCL:AstrometricSolution:" prefix (<= 1.9.4; see
+// PCL_API_REFERENCE.md section 6). For a Solved-mode IPC job the host forwards
+// those raw properties verbatim in each
 // PanelDesc.properties (PROTOCOL.md sections 6 & 11); the worker rebuilds its
 // WCS model directly from them (mmm_core::astrometry). This helper serializes
 // them into the exact serde JSON shape the worker parses: an array of
@@ -25,10 +27,12 @@ namespace pcl
 {
 
 /*!
- * \brief Serializes the "PCL:AstrometricSolution:*" entries of a PropertyArray
- * as the worker's XisfProperty JSON array.
+ * \brief Serializes the astrometric-solution entries of a PropertyArray as the
+ * worker's XisfProperty JSON array.
  *
- * Keeps ids beginning "PCL:AstrometricSolution:" and maps each pcl::Variant
+ * Keeps ids beginning "AstrometricSolution:" (standard) or
+ * "PCL:AstrometricSolution:" (legacy, minus the private Grid:/Generation:
+ * extras) plus "Observation:CelestialReferenceSystem", and maps each pcl::Variant
  * value to the matching PropertyValue JSON variant (vector -> F64Vec, matrix ->
  * F64Mat, string/time -> Str, float -> F64, integer/bool -> I64). type_ is set
  * to the XISF type name; location is always null (properties are read in

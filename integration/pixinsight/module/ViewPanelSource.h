@@ -62,13 +62,7 @@ public:
     */
    explicit ViewPanelSource( const Array<View>& views );
 
-   /*!
-    * Destructor. Explicitly noexcept for the same reason as
-    * ImageWindowCollector: the pinned PCL 2.8.x declares UIObject (and thus
-    * View) destructors noexcept(false), which must not loosen the implicit
-    * spec below the noexcept ~PanelSource() base.
-    */
-   ~ViewPanelSource() noexcept override = default;
+   ~ViewPanelSource() override = default;
 
    /*!
     * Fills rows [\a y0, \a y1) of every channel of panel \a panel_id into

@@ -48,13 +48,10 @@ ifeq ($(UNAME_S),Darwin)
   # with clang++; PCL headers now come in via -isystem (see INCLUDES), but
   # the -Wno-* flags stay for PCL macros expanded inside our own TUs.
   #
-  # MMM_MACOS_ARCH selects the macOS slice: arm64 (default; PixInsight 1.9.4+
-  # native cores) or x64 (Intel Macs, plus ALL 1.9.0-1.9.3 macOS cores --
-  # pre-1.9.4 PixInsight is x64-only on macOS, running under Rosetta on Apple
-  # Silicon, and an x64 core cannot load an arm64 dylib). Arch flags mirror
-  # the pinned PCL's own macosx makefiles: x64 adds -msse4.2 and targets
-  # macOS 12 (the 1.9.0-era envelope per PCL 2.8.3's makefile-x64, and the
-  # older Intel machines are exactly the audience); arm64 targets macOS 14.
+  # MMM_MACOS_ARCH selects the macOS slice: arm64 (default; Apple Silicon
+  # cores) or x64 (Intel Macs). PixInsight >= 1.9.5 is the minimum supported
+  # core on every arch. Arch flags mirror PCL 2.10.8's own macosx makefiles:
+  # x64 adds -msse4.2 and targets macOS 12; arm64 targets macOS 14.
   MMM_MACOS_ARCH ?= arm64
   ifeq ($(MMM_MACOS_ARCH),x64)
     MACOS_ARCH_FLAGS := -arch x86_64 -mmacosx-version-min=12 -msse4.2
@@ -93,10 +90,8 @@ endif
 
 TARGET   = mmm-pxm.$(MODULE_EXT)
 
-# PCL headers via -isystem: the pinned PCL (2.8.x, C++17-era) emits C++20
-# deprecation warnings (e.g. [=] this-capture) from inside its own headers,
-# which would trip the CI warning-free gate; -isystem silences header-internal
-# warnings while our own code stays fully under -Wall.
+# PCL headers via -isystem so header-internal diagnostics never trip the CI
+# warning-free gate; our own code stays fully under -Wall.
 INCLUDES = -isystem "$(PCLINCDIR)" -I"$(HOSTDIR)" -I"$(HOSTDIR)/third_party"
 
 CXXFLAGS = -c -pipe -pthread -fPIC \

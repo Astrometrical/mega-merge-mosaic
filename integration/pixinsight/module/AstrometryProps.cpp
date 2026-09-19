@@ -156,7 +156,16 @@ nlohmann::json extract_astrometry_props( const PropertyArray& properties )
    for ( const Property& p : properties )
    {
       const IsoString& id = p.Id();
-      if ( !id.StartsWith( "PCL:AstrometricSolution:" ) )
+      // XISF rev 1 standard block (PixInsight >= 1.9.5) and the legacy block
+      // (<= 1.9.4; old data stays in circulation). The worker never reads
+      // PixInsight's private evaluation cache / solver parameters, and the
+      // Grid:* matrices are megabytes each, so they are dropped here.
+      const bool standard = id.StartsWith( "AstrometricSolution:" );
+      const bool legacy   = id.StartsWith( "PCL:AstrometricSolution:" )
+                         && !id.StartsWith( "PCL:AstrometricSolution:Grid:" )
+                         && !id.StartsWith( "PCL:AstrometricSolution:Generation:" );
+      const bool refsys   = id == "Observation:CelestialReferenceSystem";
+      if ( !standard && !legacy && !refsys )
          continue;
 
       std::string type_;
