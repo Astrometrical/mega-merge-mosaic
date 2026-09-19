@@ -13,7 +13,10 @@ architecture, verified facts about the input data, and the algorithm choices.
 - `test_data/` — gitignored multi-GB real panels:
   - `orion_mosaic/` — 12 registered full-canvas panels (9255×18310×3 Float32
     XISF, ~2 GB each); panels 3,4,7,8 cover M42
-  - `orion_mosaic_raw_panels/` — the same stacks before registration (own WCS)
+  - `orion_mosaic_raw_panels/` — the same stacks before registration (own WCS,
+    legacy 1.9.4 `PCL:AstrometricSolution:*` block)
+  - `orion_mosaic_raw_panels_195/` — the raw panels re-saved by PixInsight
+    1.9.5 (XISF rev 1 `AstrometricSolution:*` standard block)
   - `Orion_Mosaic_Plan.jpg` — panel layout diagram
 
 ## Commands
