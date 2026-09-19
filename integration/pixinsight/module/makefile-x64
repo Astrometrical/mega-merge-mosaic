@@ -50,20 +50,25 @@ ifeq ($(UNAME_S),Darwin)
   #
   # MMM_MACOS_ARCH selects the macOS slice: arm64 (default; Apple Silicon
   # cores) or x64 (Intel Macs). PixInsight >= 1.9.5 is the minimum supported
-  # core on every arch. Arch flags mirror PCL 2.10.8's own macosx makefiles:
-  # x64 adds -msse4.2 and targets macOS 12; arm64 targets macOS 14.
+  # core on every arch. Arch flags mirror PCL 2.10.8's own macosx makefiles
+  # (src/pcl/macosx/g++/makefile-{x64,arm64}): both target macOS 14, and x64
+  # is AVX2/FMA (-D__PCL_AVX2 -D__PCL_FMA -mavx2 -mfma) like the Linux build.
+  # The deployment target must match PCL's: linking -mmacosx-version-min=12
+  # against objects built for 14 makes ld warn per object, which the CI
+  # warning-free gate treats as failure (seen live on the first 2.10.8 run).
   MMM_MACOS_ARCH ?= arm64
   ifeq ($(MMM_MACOS_ARCH),x64)
-    MACOS_ARCH_FLAGS := -arch x86_64 -mmacosx-version-min=12 -msse4.2
+    MACOS_ARCH_FLAGS := -arch x86_64 -mmacosx-version-min=14
+    MACOS_ARCH_CXXFLAGS := -D__PCL_AVX2 -D__PCL_FMA -mavx2 -mfma
   else
     MACOS_ARCH_FLAGS := -arch arm64 -mmacosx-version-min=14
+    MACOS_ARCH_CXXFLAGS :=
   endif
   # The arch/min-version flags must also reach the LINK step (the dylib's
   # LC_BUILD_VERSION minos is stamped at link time; without it the linker
   # defaults to the host/SDK, silently raising the shipped minimum macOS).
-  # -msse4.2 is compile-only and harmless at link.
   SHARED_FLAGS += $(MACOS_ARCH_FLAGS)
-  PLATFORM_CXXFLAGS := $(MACOS_ARCH_FLAGS) -stdlib=libc++ \
+  PLATFORM_CXXFLAGS := $(MACOS_ARCH_FLAGS) $(MACOS_ARCH_CXXFLAGS) -stdlib=libc++ \
                         -D__PCL_MACOSX \
                         -Wno-missing-braces -Wno-nan-infinity-disabled -Wno-extern-c-compat
   # Apple's linker is strict about undefined symbols in a .dylib (unlike GNU
