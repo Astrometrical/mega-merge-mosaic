@@ -1426,6 +1426,78 @@ mod tests {
         (panel, model)
     }
 
+    fn raw_panel_195_path(n: u32) -> std::path::PathBuf {
+        test_data(&format!(
+            "orion_mosaic_raw_panels_195/masterLight_BIN-1_4944x3284_EXPOSURE-30.00s_FILTER-NoFilter_RGB_PANEL-{n}_autocrop.xisf"
+        ))
+    }
+
+    /// The decoded standard model must agree with PixInsight's own grid cache
+    /// (`PCL:AstrometricSolution:Grid:*`, present in these regenerated files)
+    /// and with the legacy 1.9.4 model of the same panel. Runs over every
+    /// regenerated panel present (at least one must exist).
+    #[test]
+    #[ignore = "needs multi-GB test_data/orion_mosaic_raw_panels_195 (gitignored); run manually"]
+    fn real_195_standard_model_matches_pixinsight_grid_cache_and_legacy() {
+        let mut seen = 0;
+        for n in 1..=12 {
+            let path = raw_panel_195_path(n);
+            if !path.exists() {
+                continue;
+            }
+            seen += 1;
+            let panel = XisfPanel::open(&path).unwrap();
+            let h = panel.header();
+            assert!(standard::has_standard_block(&h.properties));
+            let t = std::time::Instant::now();
+            let model = WcsModel::from_properties(&h.properties, h.width, h.height)
+                .expect("standard model");
+            eprintln!("panel {n}: decoded + sampled in {:.2?}", t.elapsed());
+            assert!(model.is_spline());
+            // PixInsight's cache, read ad hoc (never in product code).
+            let get = |s: &str| {
+                find_value(
+                    &h.properties,
+                    &format!("PCL:AstrometricSolution:Grid:ImageToProjection:{s}"),
+                )
+                .unwrap()
+            };
+            let rect = get("Rect").as_f64_vec().unwrap();
+            let delta = get("Delta").as_f64().unwrap();
+            let (rows, cols, gx) = get("GridX").as_f64_mat().unwrap();
+            let (_, _, gy) = get("GridY").as_f64_mat().unwrap();
+            let ours = model.image_to_native.as_ref().unwrap();
+            let mut worst = 0.0f64;
+            for r in (0..rows as usize).step_by(7) {
+                for c in (0..cols as usize).step_by(7) {
+                    let (x, y) = (rect[0] + c as f64 * delta, rect[1] + r as f64 * delta);
+                    let a = ours.eval(x, y);
+                    let b = (gx[r * cols as usize + c], gy[r * cols as usize + c]);
+                    worst = worst.max((a.0 - b.0).hypot(a.1 - b.1) * 3600.0);
+                }
+            }
+            eprintln!("panel {n}: worst |ours − PI cache| = {worst:.4}\"");
+            assert!(
+                worst < 0.05,
+                "panel {n}: {worst}\" vs PixInsight grid cache"
+            );
+            // Same sky for the same pixel as the 1.9.4 legacy solution.
+            let legacy_path = raw_panel_path(n);
+            if legacy_path.exists() {
+                let (lp, lm) = open_raw_model(n);
+                assert_eq!((lp.width(), lp.height()), (panel.width(), panel.height()));
+                for (x, y) in [(100.0, 100.0), (2449.0, 1615.0), (4800.0, 3200.0)] {
+                    let a = model.pixel_to_sky(x, y);
+                    let b = lm.pixel_to_sky(x, y);
+                    let sep = arcsec_apart(a, b);
+                    eprintln!("panel {n} at ({x},{y}): standard vs legacy {sep:.4}\"");
+                    assert!(sep < 0.2, "panel {n} at ({x},{y}): {sep}\"");
+                }
+            }
+        }
+        assert!(seen > 0, "no regenerated panels found");
+    }
+
     /// Small-angle angular separation in arcseconds.
     fn arcsec_apart(a: (f64, f64), b: (f64, f64)) -> f64 {
         let dra = ((a.0 - b.0 + 180.0).rem_euclid(360.0) - 180.0) * a.1.to_radians().cos();
