@@ -601,6 +601,13 @@ fn b64_f64s(vals: &[f64]) -> String {
     base64_encode(&bytes)
 }
 
+/// Test-only re-export of the base64 encoder for fixture builders in other
+/// modules.
+#[cfg(test)]
+pub(crate) fn base64_encode_for_tests(bytes: &[u8]) -> String {
+    base64_encode(bytes)
+}
+
 /// `<Property>` elements for a linear Gnomonic astrometric solution — the
 /// exact ids/types/encodings `astrometry::wcs_from_properties` requires.
 fn wcs_property_xml(wcs: &SynthWcs) -> String {

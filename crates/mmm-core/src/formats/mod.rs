@@ -40,7 +40,7 @@ pub struct XisfProperty {
 
 /// Decoded value of an XISF property.
 ///
-/// Attachment-located `F64Vector`/`F64Matrix` properties parse with empty
+/// Attachment-located numeric vector/matrix properties parse with empty
 /// `data` (dimensions from the header attributes); `XisfPanel::open` resolves
 /// them from the file. `Unread` marks types we do not decode.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -52,9 +52,12 @@ pub enum PropertyValue {
     F64(f64),
     /// Integer scalar (all `Int*`/`UInt*` widths, and `Boolean` as 0/1).
     I64(i64),
-    /// `F64Vector` data, in header order.
+    /// Vector data of any XISF numeric vector type (`F64Vector`, `I32Vector`,
+    /// `F32Vector`, …), converted to f64 in header order; the property's
+    /// `type_` records the original type. Integers are exact up to 2^53.
     F64Vec(Vec<f64>),
-    /// `F64Matrix` data, row-major.
+    /// Matrix data of any XISF numeric matrix type, converted to f64,
+    /// row-major; `type_` records the original type.
     F64Mat {
         /// Number of matrix rows.
         rows: u32,
