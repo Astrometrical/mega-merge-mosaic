@@ -465,6 +465,16 @@ fn analyze_solved(
 /// Explain why a panel's properties yield no [`WcsModel`], for the solved
 /// path's per-file error listing.
 fn describe_unsolved(props: &[XisfProperty]) -> String {
+    use crate::astrometry::standard::{has_standard_block, parse_standard};
+    if has_standard_block(props) {
+        return match parse_standard(props) {
+            Err(e) => format!("standard astrometric solution unusable: {e}"),
+            Ok(_) => "standard astrometric solution decoded but its sampled grids failed \
+                      validation (non-gnomonic projection, or a model inconsistent with \
+                      its own linear solution)"
+                .to_string(),
+        };
+    }
     const REQUIRED: [&str; 3] = [
         "PCL:AstrometricSolution:ReferenceCelestialCoordinates",
         "PCL:AstrometricSolution:ReferenceImageCoordinates",
@@ -475,15 +485,20 @@ fn describe_unsolved(props: &[XisfProperty]) -> String {
         .filter(|id| !props.iter().any(|p| p.id == *id))
         .collect();
     if !missing.is_empty() {
-        format!("missing astrometric properties: {}", missing.join(", "))
+        format!(
+            "no astrometric solution (neither AstrometricSolution:Version nor the legacy \
+             ids; missing: {})",
+            missing.join(", ")
+        )
     } else if props.iter().any(|p| {
         p.id.starts_with("PCL:AstrometricSolution:SplineWorldTransformation:")
     }) {
-        "spline solution present but its interpolation grids are missing or failed validation"
+        "legacy spline solution present but its interpolation grids are missing or failed \
+         validation"
             .to_string()
     } else {
-        "astrometric solution properties are present but invalid (unsupported projection or \
-         malformed values)"
+        "legacy astrometric solution properties are present but invalid (unsupported \
+         projection or malformed values)"
             .to_string()
     }
 }

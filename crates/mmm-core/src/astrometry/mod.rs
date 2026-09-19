@@ -1,10 +1,23 @@
-//! Linear WCS extraction from PixInsight XISF astrometric-solution properties.
+//! WCS extraction from PixInsight XISF astrometric-solution properties.
 //!
 //! PixInsight (ImageSolver / MosaicByCoordinates) stores plate solutions as
-//! XISF `<Property>` elements, not FITS keywords. Verified against a real
-//! MosaicByCoordinates output panel (PixInsight 1.9.4, 2026-07), which carries:
+//! XISF `<Property>` elements, not FITS keywords, in one of two formats:
 //!
-//! | Property id                                             | type      | content |
+//! - **XISF 1.0 revision 1 standard block** (`AstrometricSolution:*`,
+//!   PixInsight ≥ 1.9.5): linear projection layer, projective 3×3 layer and
+//!   an RBF spline distortion model, decoded by `standard.rs` (splines in
+//!   `spline.rs`) and sampled onto the same lookup grids the legacy path
+//!   reads. A file with a standard block is read exclusively through it.
+//! - **Legacy block** (`PCL:AstrometricSolution:*`, ≤ 1.9.4): linear
+//!   solution plus PixInsight's precomputed `SplineWorldTransformation`
+//!   grids, read by `legacy.rs`. Old data stays in circulation, so this is
+//!   kept indefinitely.
+//!
+//! Both share the conventions below. The legacy ids were verified against a
+//! real MosaicByCoordinates output panel (PixInsight 1.9.4, 2026-07); the
+//! standard ids drop the `PCL:` prefix and are otherwise the same layer 1:
+//!
+//! | Legacy (≤ 1.9.4) property id                            | type      | content |
 //! |---------------------------------------------------------|-----------|---------|
 //! | `PCL:AstrometricSolution:ReferenceCelestialCoordinates` | F64Vector | `[RA, Dec]` of the reference point, degrees |
 //! | `PCL:AstrometricSolution:ReferenceImageCoordinates`     | F64Vector | reference point in PixInsight image coordinates (0-based, pixel k spans `[k, k+1]`, y grows downward) |
@@ -377,13 +390,53 @@ pub struct WcsModel {
 impl WcsModel {
     /// Build the model from a panel's XISF properties and image geometry.
     ///
-    /// Linear-only solutions yield a model without grids. If any
-    /// `SplineWorldTransformation` property is present, both interpolation
-    /// grids must be present, well-formed, and pass the layout validations
-    /// described in the module docs; otherwise the whole solution is refused
-    /// (`None`) — never silently approximated by its linear part.
+    /// A standard XISF rev 1 block (`AstrometricSolution:Version` present,
+    /// PixInsight ≥ 1.9.5) is decoded by `standard.rs` and its
+    /// projective/spline layers sampled onto grids; otherwise the legacy
+    /// `PCL:AstrometricSolution:*` block (≤ 1.9.4) is read by `legacy.rs`.
+    /// Linear-only solutions yield a model without grids. A distortion
+    /// solution whose grids fail the layout validations described in the
+    /// module docs is refused (`None`) — never silently approximated by its
+    /// linear part. An unsupported standard major revision is `None` too.
     pub fn from_properties(props: &[XisfProperty], width: u64, height: u64) -> Option<WcsModel> {
-        legacy::model_from_legacy(props, width, height)
+        if !standard::has_standard_block(props) {
+            return legacy::model_from_legacy(props, width, height);
+        }
+        let sol = match standard::parse_standard(props) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("standard astrometric solution rejected: {e}");
+                return None;
+            }
+        };
+        for n in &sol.notes {
+            tracing::warn!("astrometric solution: {n}");
+        }
+        // The grid math is specific to the gnomonic tangent plane.
+        if sol.linear.ctype[0] != "RA---TAN" && sol.image_to_projection.is_some() {
+            return None;
+        }
+        match standard::sample_grids(&sol, width, height) {
+            None => Some(WcsModel {
+                linear: sol.linear,
+                image_to_native: None,
+                native_to_image: None,
+                width,
+                height,
+            }),
+            Some((i2n, n2i)) => {
+                if !validate_grids(&sol.linear, &i2n, &n2i, width, height) {
+                    return None;
+                }
+                Some(WcsModel {
+                    linear: sol.linear,
+                    image_to_native: Some(i2n),
+                    native_to_image: Some(n2i),
+                    width,
+                    height,
+                })
+            }
+        }
     }
 
     /// Map a PixInsight image coordinate to (RA, Dec) in degrees, through the
@@ -451,6 +504,9 @@ pub(crate) fn expected_nodes(extent: f64, delta: f64) -> Option<u32> {
 /// coordinates, linear transformation matrix) is missing or malformed, or if
 /// the projection system is one we cannot express as a FITS CTYPE code.
 pub fn wcs_from_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
+    if standard::has_standard_block(props) {
+        return standard::linear_from_standard(props).ok();
+    }
     legacy::linear_from_legacy(props)
 }
 
@@ -1285,6 +1341,53 @@ mod tests {
             WcsModel::from_properties(&base, 2 * w, h).is_none(),
             "geometry mismatch"
         );
+    }
+
+    #[test]
+    fn standard_block_takes_precedence_over_legacy_ids() {
+        use crate::astrometry::standard::fixtures::layer1;
+        let mut props = orion_props(); // legacy ids
+        props.extend(layer1(
+            [10.0, 20.0],
+            [5.0, 6.0],
+            [[-1e-3, 0.0], [0.0, 1e-3]],
+        ));
+        let w = wcs_from_properties(&props).unwrap();
+        assert_eq!(w.crval, [10.0, 20.0]);
+        let m = WcsModel::from_properties(&props, 100, 100).unwrap();
+        assert_eq!(m.linear.crval, [10.0, 20.0]);
+        assert!(!m.is_spline());
+    }
+
+    #[test]
+    fn unsupported_standard_major_version_yields_none_even_with_legacy_ids() {
+        let mut props = orion_props();
+        props.push(prop(
+            "AstrometricSolution:Version",
+            "String",
+            PropertyValue::Str("2.0".into()),
+        ));
+        assert!(wcs_from_properties(&props).is_none());
+        assert!(WcsModel::from_properties(&props, 100, 100).is_none());
+    }
+
+    #[test]
+    fn standard_projective_only_solution_yields_a_grid_model() {
+        use crate::astrometry::standard::fixtures::{layer1, layer2};
+        const S: f64 = 1e-3;
+        let (rx, ry) = (50.0, 40.0);
+        let mut props = layer1([10.0, 20.0], [rx, ry], [[-S, 0.0], [0.0, S]]);
+        layer2(
+            &mut props,
+            [[-S, 0.0, rx * S], [0.0, S, -ry * S], [0.0, 0.0, 1.0]],
+            [[-1.0 / S, 0.0, rx], [0.0, 1.0 / S, ry], [0.0, 0.0, 1.0]],
+        );
+        let m = WcsModel::from_properties(&props, 100, 80).unwrap();
+        assert!(m.is_spline());
+        let (ra, dec) = m.pixel_to_sky(rx, ry);
+        assert!((ra - 10.0).abs() < 1e-9 && (dec - 20.0).abs() < 1e-9);
+        let back = m.sky_to_pixel(ra, dec).unwrap();
+        assert!((back.0 - rx).abs() < 1e-6 && (back.1 - ry).abs() < 1e-6);
     }
 
     #[test]

@@ -316,3 +316,32 @@ fn mixed_mono_and_rgb_inputs_error() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn unsolved_reason_names_the_standard_layer() {
+    use mmm_core::analyze::solved_frame;
+    use mmm_core::formats::{PropertyValue, XisfProperty};
+    use mmm_core::ipc::protocol::PanelDesc;
+    let prop = |id: &str, v: &str| XisfProperty {
+        id: id.into(),
+        type_: "String".into(),
+        value: PropertyValue::Str(v.into()),
+        location: None,
+    };
+    let props = vec![
+        prop("AstrometricSolution:Version", "1.0"),
+        prop("AstrometricSolution:ProjectionSystem", "Gnomonic"),
+    ];
+    let panels = vec![PanelDesc {
+        panel_id: 0,
+        width: 10,
+        height: 10,
+        channels: 1,
+        properties: props,
+    }];
+    let err = solved_frame(&panels).unwrap_err();
+    assert!(
+        err.contains("AstrometricSolution:ReferenceCelestialCoordinates"),
+        "{err}"
+    );
+}
