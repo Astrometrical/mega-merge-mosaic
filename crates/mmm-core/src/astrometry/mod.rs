@@ -752,6 +752,46 @@ pub fn wcs_from_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
     legacy::linear_from_legacy(props)
 }
 
+/// Explain why a panel's XISF properties yield no [`WcsModel`], for per-file
+/// error listings.
+pub fn describe_unsolved(props: &[XisfProperty]) -> String {
+    if standard::has_standard_block(props) {
+        return match standard::parse_standard(props) {
+            Err(e) => format!("standard astrometric solution unusable: {e}"),
+            Ok(_) => "standard astrometric solution decoded but its sampled grids failed \
+                      validation (non-gnomonic projection, or a model inconsistent with \
+                      its own linear solution)"
+                .to_string(),
+        };
+    }
+    const REQUIRED: [&str; 3] = [
+        "PCL:AstrometricSolution:ReferenceCelestialCoordinates",
+        "PCL:AstrometricSolution:ReferenceImageCoordinates",
+        "PCL:AstrometricSolution:LinearTransformationMatrix",
+    ];
+    let missing: Vec<&str> = REQUIRED
+        .into_iter()
+        .filter(|id| !props.iter().any(|p| p.id == *id))
+        .collect();
+    if !missing.is_empty() {
+        format!(
+            "no astrometric solution (neither AstrometricSolution:Version nor the legacy \
+             ids; missing: {})",
+            missing.join(", ")
+        )
+    } else if props.iter().any(|p| {
+        p.id.starts_with("PCL:AstrometricSolution:SplineWorldTransformation:")
+    }) {
+        "legacy spline solution present but its interpolation grids are missing or failed \
+         validation"
+            .to_string()
+    } else {
+        "legacy astrometric solution properties are present but invalid (unsupported \
+         projection or malformed values)"
+            .to_string()
+    }
+}
+
 /// PixInsight projection-system name → 3-letter FITS projection code.
 pub(crate) fn projection_code(name: &str) -> Option<&'static str> {
     Some(match name {

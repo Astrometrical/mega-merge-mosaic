@@ -41,6 +41,7 @@ pub struct XisfHeader {
 }
 
 /// A memory-mapped, read-only XISF panel exposing planar f32 channel data.
+#[derive(Debug)]
 pub struct XisfPanel {
     path: PathBuf,
     mmap: Mmap,

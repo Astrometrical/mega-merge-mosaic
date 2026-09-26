@@ -44,8 +44,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::align::{MosaicFrame, choose_frame, reproject_from_reader, reproject_panel};
-use crate::astrometry::WcsModel;
-use crate::formats::XisfProperty;
+use crate::astrometry::{WcsModel, describe_unsolved};
 use crate::formats::xisf::XisfPanel;
 use crate::ipc::client::HostLink;
 use crate::ipc::protocol::{PanelDesc, PanelProbeGeom, PanelProbeReply};
@@ -460,47 +459,6 @@ fn analyze_solved(
     session.frame = Some(frame);
     session.align_secs = Some(align_secs);
     finish_session(session, scans, surface_order, gain)
-}
-
-/// Explain why a panel's properties yield no [`WcsModel`], for the solved
-/// path's per-file error listing.
-fn describe_unsolved(props: &[XisfProperty]) -> String {
-    use crate::astrometry::standard::{has_standard_block, parse_standard};
-    if has_standard_block(props) {
-        return match parse_standard(props) {
-            Err(e) => format!("standard astrometric solution unusable: {e}"),
-            Ok(_) => "standard astrometric solution decoded but its sampled grids failed \
-                      validation (non-gnomonic projection, or a model inconsistent with \
-                      its own linear solution)"
-                .to_string(),
-        };
-    }
-    const REQUIRED: [&str; 3] = [
-        "PCL:AstrometricSolution:ReferenceCelestialCoordinates",
-        "PCL:AstrometricSolution:ReferenceImageCoordinates",
-        "PCL:AstrometricSolution:LinearTransformationMatrix",
-    ];
-    let missing: Vec<&str> = REQUIRED
-        .into_iter()
-        .filter(|id| !props.iter().any(|p| p.id == *id))
-        .collect();
-    if !missing.is_empty() {
-        format!(
-            "no astrometric solution (neither AstrometricSolution:Version nor the legacy \
-             ids; missing: {})",
-            missing.join(", ")
-        )
-    } else if props.iter().any(|p| {
-        p.id.starts_with("PCL:AstrometricSolution:SplineWorldTransformation:")
-    }) {
-        "legacy spline solution present but its interpolation grids are missing or failed \
-         validation"
-            .to_string()
-    } else {
-        "legacy astrometric solution properties are present but invalid (unsupported \
-         projection or malformed values)"
-            .to_string()
-    }
 }
 
 /// Builds every panel's [`WcsModel`] from its carried `properties`, checks
