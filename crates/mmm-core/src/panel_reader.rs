@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::band_cache::BandCache;
 use crate::formats::fits::FitsPanel;
 use crate::formats::xisf::XisfPanel;
+use crate::formats::{FileFormat, sniff_format};
 use crate::ipc::client::HostLink;
 use crate::ipc::reader::IpcBacking;
 use crate::session::PanelMeta;
@@ -198,23 +199,21 @@ impl PanelReader {
 
     /// Open a plain full-canvas panel file of either format directly (no
     /// session metadata): the canvas geometry is the file's own. The format
-    /// is sniffed from the file's magic bytes, never its extension. Used by
-    /// the analyze scan, which runs before any [`PanelMeta`] exists.
+    /// is sniffed from the file's magic bytes (`sniff_format`), never its
+    /// extension. Used by the analyze scan, which runs before any
+    /// [`PanelMeta`] exists.
     pub fn open_file(path: &Path) -> Result<PanelReader> {
-        let mut magic = [0u8; 8];
-        {
-            use std::io::Read;
-            let mut f = File::open(path).map_err(|e| Error::io(path, e))?;
-            let _ = f.read(&mut magic).map_err(|e| Error::io(path, e))?;
-        }
-        if &magic == b"XISF0100" {
-            let x = XisfPanel::open(path)?;
-            let canvas = (x.width(), x.height(), x.channels());
-            Ok(full_canvas(Backing::Xisf(x), canvas))
-        } else {
-            let x = FitsPanel::open(path)?;
-            let canvas = (x.width(), x.height(), x.channels());
-            Ok(full_canvas(Backing::Fits(FitsBacking::new(x)), canvas))
+        match sniff_format(path)? {
+            FileFormat::Xisf => {
+                let x = XisfPanel::open(path)?;
+                let canvas = (x.width(), x.height(), x.channels());
+                Ok(full_canvas(Backing::Xisf(x), canvas))
+            }
+            FileFormat::Fits => {
+                let x = FitsPanel::open(path)?;
+                let canvas = (x.width(), x.height(), x.channels());
+                Ok(full_canvas(Backing::Fits(FitsBacking::new(x)), canvas))
+            }
         }
     }
 

@@ -14,6 +14,50 @@ use crate::{Error, Result};
 use fits::FitsPanel;
 use xisf::XisfPanel;
 
+/// Format identified from a file's first 8 bytes by [`sniff_format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileFormat {
+    /// `XISF0100` signature.
+    Xisf,
+    /// A FITS `SIMPLE` primary-header card.
+    Fits,
+}
+
+/// Identify a panel file's format from its first 8 bytes — the XISF
+/// `XISF0100` signature, or the FITS `SIMPLE` card's 8-byte keyword field
+/// (`SIMPLE` padded with spaces) — never from the file extension.
+///
+/// A short read (file under 8 bytes, including empty) is tolerated: it
+/// cannot match either signature, so it falls straight through to the
+/// "neither" error below rather than propagating an I/O error. A file
+/// matching neither signature errors naming exactly that, rather than being
+/// handed to the FITS reader and surfacing an unrelated FITS-specific
+/// complaint (e.g. "no END card") for what may not be a FITS file at all.
+///
+/// Shared by [`InputPanel::open`] and
+/// [`crate::panel_reader::PanelReader::open_file`] so both name the same
+/// failure for a file that is neither.
+pub(crate) fn sniff_format(path: &Path) -> Result<FileFormat> {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    let mut f = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    match f.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(Error::io(path, e)),
+    }
+    if magic == *b"XISF0100" {
+        Ok(FileFormat::Xisf)
+    } else if magic == *b"SIMPLE  " {
+        Ok(FileFormat::Fits)
+    } else {
+        Err(Error::format(
+            path,
+            "not an XISF or FITS file (no XISF0100 signature or SIMPLE card)",
+        ))
+    }
+}
+
 /// A panel file of either supported format, opened for metadata access.
 /// Pixel rows are read through [`crate::panel_reader::PanelReader`]
 /// (`open_file`, or `open` with [`Self::storage`]); the XISF variant also
@@ -27,23 +71,12 @@ pub enum InputPanel {
 }
 
 impl InputPanel {
-    /// Open a panel, detecting the format from its magic bytes (`XISF0100`
-    /// vs a FITS `SIMPLE` card) — never from the file extension.
+    /// Open a panel, detecting the format from its magic bytes
+    /// (`sniff_format`) — never from the file extension.
     pub fn open(path: &Path) -> Result<InputPanel> {
-        use std::io::Read;
-        let mut magic = [0u8; 8];
-        let mut f = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
-        let is_xisf = match f.read_exact(&mut magic) {
-            Ok(()) => magic == *b"XISF0100",
-            // Shorter than the magic itself: definitely not XISF, and lets
-            // the FITS branch below produce its own (more specific) error.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
-            Err(e) => return Err(Error::io(path, e)),
-        };
-        if is_xisf {
-            Ok(InputPanel::Xisf(XisfPanel::open(path)?))
-        } else {
-            Ok(InputPanel::Fits(FitsPanel::open(path)?))
+        match sniff_format(path)? {
+            FileFormat::Xisf => Ok(InputPanel::Xisf(XisfPanel::open(path)?)),
+            FileFormat::Fits => Ok(InputPanel::Fits(FitsPanel::open(path)?)),
         }
     }
 
@@ -361,16 +394,20 @@ mod tests {
             crate::panel_reader::PanelStorage::FullCanvasXisf
         );
         assert!(px.as_xisf().is_some() && pf.as_xisf().is_none());
-        // A file that is neither magic falls to the FITS branch (never
-        // sniffed by extension) and its error names the offending SIMPLE
-        // card. A short file (< 8 bytes) would fail the magic sniff itself,
-        // so this is padded to one full 80-byte header card — "END" alone,
-        // which is not a "SIMPLE" card — reaching FitsPanel's own message
-        // rather than the unrelated "no END card" case a shorter/plainer
-        // junk file would hit first.
-        std::fs::write(dir.join("junk"), format!("{:<80}", "END").as_bytes()).unwrap();
+        // A file matching neither magic is reported as an unrecognized
+        // format by `sniff_format` itself, before either reader ever opens
+        // it — not as a FITS- or XISF-specific complaint (e.g. FitsPanel's
+        // "no END card in the primary header", which a plain text file like
+        // this would otherwise hit first).
+        std::fs::write(dir.join("junk"), b"hello world, not an image at all").unwrap();
         let e = InputPanel::open(&dir.join("junk")).unwrap_err().to_string();
-        assert!(e.contains("SIMPLE"), "{e}");
+        assert!(e.contains("not an XISF or FITS file"), "{e}");
+        // Same for an empty file (too short even for the magic read).
+        std::fs::write(dir.join("empty"), b"").unwrap();
+        let e = InputPanel::open(&dir.join("empty"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not an XISF or FITS file"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
