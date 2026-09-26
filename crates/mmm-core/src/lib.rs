@@ -26,7 +26,8 @@
 //! - [`output`] — ready-made sinks: streaming FITS, autostretched PNG
 //!   preview, and a [`output::Tee`] to feed both in one pass.
 //! - [`diag`] — seam/ownership diagnostics for reporting UIs.
-//! - [`formats`] + [`panel_reader`] — input access: the XISF reader and the
+//! - [`formats`] + [`panel_reader`] — input access: the XISF and FITS readers
+//!   behind the format-agnostic [`formats::InputPanel`], and the
 //!   storage-agnostic row reader the pipeline consumes.
 //! - [`astrometry`] + [`align`] — WCS extraction/emission and the solved-panel
 //!   reprojection path.

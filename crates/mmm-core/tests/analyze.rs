@@ -345,3 +345,49 @@ fn unsolved_reason_names_the_standard_layer() {
         "{err}"
     );
 }
+
+/// Aligned FITS panels analyze exactly like XISF ones: one shared canvas,
+/// content bboxes in top-down canvas rows, and a session that records the
+/// FITS backing so it reopens and reads the same rows back.
+#[test]
+fn aligned_fits_panels_analyze_like_xisf() {
+    use mmm_core::analyze::{InputSelect, analyze_input};
+    use mmm_core::panel_reader::PanelStorage;
+    use mmm_core::session::InputKind;
+    use mmm_core::synth::write_fits;
+    let dir = tempdir("fits");
+    let (w, h) = (64u64, 48u64);
+    // Two overlapping windows on a shared canvas, zeros elsewhere.
+    let mut paths = Vec::new();
+    for (k, x_lo) in [(0u64, 0u64), (1, 24)] {
+        let mut planes = vec![0f32; (w * h) as usize];
+        for y in 8..40u64 {
+            for x in x_lo..x_lo + 40 {
+                planes[(y * w + x) as usize] = 0.2 + 0.001 * (x + y) as f32 + 0.01 * k as f32;
+            }
+        }
+        let p = dir.join(format!("a{k}.fits"));
+        write_fits(&p, w, h, 1, &planes, -32, &[]).unwrap();
+        paths.push(p);
+    }
+    let session_dir = dir.join("s.mmm-session");
+    let session = analyze_input(&paths, &session_dir, Some(0), InputSelect::Auto).unwrap();
+    assert_eq!(session.input, InputKind::Aligned);
+    assert_eq!(session.canvas, (w, h, 1));
+    assert_eq!(session.panels[0].storage, PanelStorage::FullCanvasFits);
+    assert_eq!(
+        session.panels[0].bbox,
+        [0, 8, 40, 40],
+        "bbox in top-down canvas rows"
+    );
+    assert_eq!(session.panels[1].bbox, [24, 8, 64, 40]);
+    // The session reopens and reads the same rows back.
+    let reopened = Session::open(&session_dir).unwrap();
+    let r =
+        mmm_core::panel_reader::PanelReader::open(&reopened.panels[1], reopened.canvas).unwrap();
+    let (x0, row) = r.row(0, 20).unwrap();
+    assert_eq!(x0, 0);
+    assert_eq!(row[23], 0.0);
+    assert!((row[24] - (0.2 + 0.001 * 44.0 + 0.01)).abs() < 1e-6);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

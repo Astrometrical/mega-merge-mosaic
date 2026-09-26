@@ -185,3 +185,64 @@ fn standard_rev1_solved_panels_probe_like_legacy_ones() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// FITS panels probe exactly like XISF ones: geometry from the primary
+/// header, a solved frame from the standard WCS cards, and the same
+/// mono/colour refusal.
+#[test]
+fn fits_panels_probe_like_xisf() {
+    use mmm_core::formats::FitsKeyword;
+    use mmm_core::synth::write_fits;
+    let dir = tmpdir("fits");
+    let kw = |n: &str, v: &str| FitsKeyword {
+        name: n.into(),
+        value: v.into(),
+        comment: String::new(),
+    };
+    let (w, h) = (120u64, 90u64);
+    let mut paths = Vec::new();
+    for k in 0..2u64 {
+        let planes = vec![0.4f32; (w * h) as usize];
+        let cards = vec![
+            kw("CTYPE1", "'RA---TAN'"),
+            kw("CTYPE2", "'DEC--TAN'"),
+            kw("CRVAL1", &format!("{}", 80.0 + 0.05 * k as f64)),
+            kw("CRVAL2", "-5.0"),
+            kw("CRPIX1", "60.5"),
+            kw("CRPIX2", "45.5"),
+            kw("CD1_1", "-1.0E-3"),
+            kw("CD1_2", "0"),
+            kw("CD2_1", "0"),
+            kw("CD2_2", "1.0E-3"),
+        ];
+        let p = dir.join(format!("p{k}.fits"));
+        write_fits(&p, w, h, 1, &planes, 16, &cards).unwrap();
+        paths.push(p);
+    }
+    let reply = probe_panels(&paths, InputSelect::Auto).unwrap();
+    assert_eq!(reply.panels.len(), 2);
+    assert_eq!(
+        (
+            reply.panels[0].width,
+            reply.panels[0].height,
+            reply.panels[0].channels
+        ),
+        (w, h, 1)
+    );
+    let frame = reply.frame.expect("solved FITS panels yield a frame");
+    assert!(frame[0] >= w && frame[1] >= h && frame[2] == 1, "{frame:?}");
+    // Aligned select never reports a frame; a mono/colour mix is refused.
+    assert!(
+        probe_panels(&paths, InputSelect::Aligned)
+            .unwrap()
+            .frame
+            .is_none()
+    );
+    let rgb = dir.join("rgb.fits");
+    write_fits(&rgb, w, h, 3, &vec![0.4f32; (w * h * 3) as usize], -32, &[]).unwrap();
+    let e = probe_panels(&[paths[0].clone(), rgb], InputSelect::Auto)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("channel"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

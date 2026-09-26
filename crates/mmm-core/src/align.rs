@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::astrometry::{LinearWcs, WcsModel};
-use crate::formats::xisf::XisfPanel;
+use crate::formats::InputPanel;
 use crate::panel_reader::PanelReader;
 use crate::{Error, Result};
 
@@ -269,36 +269,47 @@ fn lanczos3(t: f64) -> f64 {
 /// Rayon-parallel over output rows; the mapping is evaluated exactly per
 /// pixel. Errors when the panel's footprint misses the canvas entirely.
 ///
-/// The whole-plane source access is an mmap'd zero-copy gather from `panel`;
-/// see [`reproject_from_reader`] for the IPC-served equivalent, which
-/// materializes the same planes from a [`PanelReader`] first and then shares
-/// this function's resampling core (`reproject_core`).
+/// XISF panels gather their source planes as an mmap'd zero-copy slice each;
+/// other formats stream through [`reproject_from_reader`], which materializes
+/// the same planes from a [`PanelReader`] first and then shares this
+/// function's resampling core (`reproject_core`). The same core also serves
+/// IPC-served panels through that function.
 pub fn reproject_panel(
-    panel: &XisfPanel,
+    panel: &InputPanel,
     model: &WcsModel,
     frame: &MosaicFrame,
     out_dir: &Path,
 ) -> Result<AlignedPanel> {
-    let (sw, sh) = (panel.width() as usize, panel.height() as usize);
-    let nch = panel.channels() as usize;
-    let planes: Vec<&[f32]> = (0..nch as u64).map(|c| panel.channel(c)).collect();
-    reproject_core(&planes, sw, sh, nch, panel.path(), model, frame, out_dir)
+    match panel.as_xisf() {
+        Some(x) => {
+            let (sw, sh) = (x.width() as usize, x.height() as usize);
+            let nch = x.channels() as usize;
+            let planes: Vec<&[f32]> = (0..nch as u64).map(|c| x.channel(c)).collect();
+            reproject_core(&planes, sw, sh, nch, x.path(), model, frame, out_dir)
+        }
+        None => {
+            let reader = PanelReader::open_file(panel.path())?;
+            reproject_from_reader(&reader, model, frame, out_dir)
+        }
+    }
 }
 
-/// Reproject one raw panel served over IPC (any [`PanelReader`], addressed by
-/// its own raw geometry via [`PanelReader::canvas`]) onto the mosaic frame,
-/// exactly like [`reproject_panel`] but without an mmap to gather planes
-/// from.
+/// Reproject one raw panel read through any [`PanelReader`] (addressed by its
+/// own raw geometry via [`PanelReader::canvas`]) onto the mosaic frame,
+/// exactly like [`reproject_panel`] but without whole-plane mmap slices to
+/// gather from — the IPC-served path, and the file path for every format
+/// but XISF.
 ///
 /// The reader's rows are pulled sequentially (`y` outer, channel inner —
 /// efficient for a band-cached IPC backing) into owned per-channel planes:
 /// this materializes one raw panel's pixel data in memory, bounded — one
 /// panel at a time, matching [`crate::analyze::analyze_ipc_solved`]'s
-/// sequential-per-panel design, the same as the file path's `XisfPanel` mmap
-/// footprint. `reproject_core` then runs identically to the file path.
+/// sequential-per-panel design, the same as the XISF path's mmap footprint.
+/// `reproject_core` then runs identically to the zero-copy path.
 ///
-/// There is no source file for an IPC panel, so error messages that would
-/// otherwise cite the source path cite `out_dir` instead.
+/// A reader does not name a source file (an IPC panel has none), so error
+/// messages that would otherwise cite the source path cite `out_dir`
+/// instead.
 pub fn reproject_from_reader(
     reader: &PanelReader,
     model: &WcsModel,
@@ -308,14 +319,15 @@ pub fn reproject_from_reader(
     let (cw, ch_h, cch) = reader.canvas();
     let (sw, sh, nch) = (cw as usize, ch_h as usize, cch as usize);
     let mut planes = vec![vec![0f32; sw * sh]; nch];
-    // A `None` row inside these bounds can only come from a `request_band`
-    // transport failure (the loop bounds exactly match `reader.canvas()`),
-    // whose real, actionable reason is latched in the reader — so a `None`
-    // breaks out (both loops, via `complete`/labeled break) to check
-    // `backing_error()` below rather than returning inline with a generic
-    // message that would shadow it (the same pattern `scan_reader` uses for
-    // the same reason). Never fall through to `reproject_core` on a break —
-    // that would resample a half-materialized panel.
+    // A `None` row inside these bounds can only come from a backing failure —
+    // a failed IPC band request or FITS band decode (the loop bounds exactly
+    // match `reader.canvas()`) — whose real, actionable reason is latched in
+    // the reader, so a `None` breaks out (both loops, via `complete`/labeled
+    // break) to check `backing_error()` below rather than returning inline
+    // with a generic message that would shadow it (the same pattern
+    // `scan_reader` uses for the same reason). Never fall through to
+    // `reproject_core` on a break — that would resample a half-materialized
+    // panel.
     let mut complete = true;
     'rows: for y in 0..sh {
         for (c, plane) in planes.iter_mut().enumerate() {
@@ -323,7 +335,7 @@ pub fn reproject_from_reader(
                 complete = false;
                 break 'rows;
             };
-            debug_assert_eq!(x0, 0, "an IPC panel always covers its own full canvas");
+            debug_assert_eq!(x0, 0, "a raw panel always covers its own full canvas");
             plane[y * sw..y * sw + sw].copy_from_slice(row);
         }
     }
@@ -332,9 +344,9 @@ pub fn reproject_from_reader(
     }
     if !complete {
         // Unreachable in practice (see above): a `None` row with no latched
-        // transport error. Fail loudly rather than resample partial data.
+        // backing error. Fail loudly rather than resample partial data.
         return Err(Error::compute(
-            "ipc reader returned no row during reprojection and no transport error was latched",
+            "reader returned no row during reprojection and no backing error was latched",
         ));
     }
     let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
@@ -345,7 +357,7 @@ pub fn reproject_from_reader(
 /// [`reproject_from_reader`]: everything after the source planes are in hand
 /// (whole per-channel `sw × sh` planes) — the bbox forward-map, the
 /// per-output-pixel Lanczos loop, and the cache write. `err_path` is used
-/// only for error messages (there is no real file behind an IPC panel).
+/// only for error messages (a reader-fed panel may have no file behind it).
 #[allow(clippy::too_many_arguments)] // pure extraction of reproject_panel's tail; see the doc above
 fn reproject_core(
     planes: &[&[f32]],
@@ -637,7 +649,7 @@ mod tests {
         0.1 + c as f32 * 0.5 + x as f32 * 0.01 + y as f32 * 0.002
     }
 
-    fn write_pattern_panel(dir: &Path, w: usize, h: usize, ch: usize) -> XisfPanel {
+    fn write_pattern_panel(dir: &Path, w: usize, h: usize, ch: usize) -> InputPanel {
         let mut planes = vec![0.0f32; ch * w * h];
         for c in 0..ch {
             for y in 0..h {
@@ -648,7 +660,7 @@ mod tests {
         }
         let path = dir.join("src.xisf");
         write_xisf(&path, w as u64, h as u64, ch as u64, &planes).unwrap();
-        XisfPanel::open(&path).unwrap()
+        InputPanel::open(&path).unwrap()
     }
 
     /// Pure-translation reprojection: frame and model share crval and matrix;
@@ -879,9 +891,9 @@ mod tests {
         let t0 = std::time::Instant::now();
         let models: Vec<WcsModel> = (1..=12)
             .map(|n| {
-                let p = XisfPanel::open(&path(n)).unwrap();
-                let h = p.header();
-                WcsModel::from_properties(&h.properties, h.width, h.height)
+                InputPanel::open(&path(n))
+                    .unwrap()
+                    .wcs_model()
                     .expect("raw panel must solve")
             })
             .collect();
@@ -907,7 +919,7 @@ mod tests {
         );
 
         let out = std::env::temp_dir().join(format!("mmm-align-real-{}", std::process::id()));
-        let panel = XisfPanel::open(&path(1)).unwrap();
+        let panel = InputPanel::open(&path(1)).unwrap();
         let t1 = std::time::Instant::now();
         let ap = reproject_panel(&panel, &models[0], &frame, &out).unwrap();
         let dt = t1.elapsed().as_secs_f64();
@@ -1006,7 +1018,7 @@ mod tests {
         let planes = vec![1.0f32; sw * sh];
         let path = dir.join("src.xisf");
         write_xisf(&path, sw as u64, sh as u64, 1, &planes).unwrap();
-        let panel = XisfPanel::open(&path).unwrap();
+        let panel = InputPanel::open(&path).unwrap();
 
         let model = linear_model(
             [30.0, 0.0],

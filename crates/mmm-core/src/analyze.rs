@@ -45,7 +45,7 @@ use rayon::prelude::*;
 
 use crate::align::{MosaicFrame, choose_frame, reproject_from_reader, reproject_panel};
 use crate::astrometry::{WcsModel, describe_unsolved};
-use crate::formats::xisf::XisfPanel;
+use crate::formats::InputPanel;
 use crate::ipc::client::HostLink;
 use crate::ipc::protocol::{PanelDesc, PanelProbeGeom, PanelProbeReply};
 use crate::overlap::OverlapGraph;
@@ -231,7 +231,7 @@ pub fn analyze_full(
     let opened: Vec<(String, u64)> = paths
         .par_iter()
         .filter_map(|p| {
-            XisfPanel::open(p)
+            InputPanel::open(p)
                 .ok()
                 .map(|x| (p.display().to_string(), x.channels()))
         })
@@ -248,7 +248,7 @@ pub fn analyze_full(
             // Cheap signal first: header geometries only.
             let mut geoms = Vec::with_capacity(paths.len());
             for path in paths {
-                let x = XisfPanel::open(path)?;
+                let x = InputPanel::open(path)?;
                 geoms.push((x.width(), x.height(), x.channels()));
             }
             if paths.len() >= 2 && geoms.iter().all(|&g| g == geoms[0]) {
@@ -347,21 +347,14 @@ fn analyze_solved(
     let mut session = Session::create(session_dir)?;
 
     // Every input must yield a model; report all unusable files at once.
-    let mut panels: Vec<(XisfPanel, WcsModel)> = Vec::with_capacity(paths.len());
+    let mut panels: Vec<(InputPanel, WcsModel)> = Vec::with_capacity(paths.len());
     let mut errors: Vec<String> = Vec::new();
     for path in paths {
-        match XisfPanel::open(path) {
-            Ok(p) => {
-                let h = p.header();
-                match WcsModel::from_properties(&h.properties, h.width, h.height) {
-                    Some(m) => panels.push((p, m)),
-                    None => errors.push(format!(
-                        "{}: {}",
-                        path.display(),
-                        describe_unsolved(&h.properties)
-                    )),
-                }
-            }
+        match InputPanel::open(path) {
+            Ok(p) => match p.wcs_model() {
+                Ok(m) => panels.push((p, m)),
+                Err(reason) => errors.push(format!("{}: {reason}", path.display())),
+            },
             Err(e) => errors.push(e.to_string()),
         }
     }
@@ -481,18 +474,37 @@ fn analyze_solved(
 pub fn solved_frame(
     panels: &[PanelDesc],
 ) -> std::result::Result<(Vec<WcsModel>, MosaicFrame, u64), String> {
-    // Every panel must yield a model; report all unusable panels at once.
-    let mut models: Vec<WcsModel> = Vec::with_capacity(panels.len());
+    frame_from_models(panels.iter().map(|p| {
+        (
+            format!("panel {}", p.panel_id),
+            p.channels,
+            WcsModel::from_properties(&p.properties, p.width, p.height)
+                .ok_or_else(|| describe_unsolved(&p.properties)),
+        )
+    }))
+}
+
+/// The mosaic frame over per-panel `(label, channels, model)` triples: every
+/// panel that yielded no model is aggregated into one message (one line each,
+/// named by `label`), channel uniformity is checked, and the frame is chosen
+/// from the models.
+///
+/// Shared by [`solved_frame`], whose models come from XISF properties carried
+/// over the wire, and [`probe_panels`], whose models come from opened panel
+/// files of either format.
+fn frame_from_models<I>(panels: I) -> std::result::Result<(Vec<WcsModel>, MosaicFrame, u64), String>
+where
+    I: IntoIterator<Item = (String, u64, std::result::Result<WcsModel, String>)>,
+{
+    let mut models: Vec<WcsModel> = Vec::new();
+    let mut channels: Vec<(String, u64)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for p in panels {
-        match WcsModel::from_properties(&p.properties, p.width, p.height) {
-            Some(m) => models.push(m),
-            None => errors.push(format!(
-                "panel {}: {}",
-                p.panel_id,
-                describe_unsolved(&p.properties)
-            )),
+    for (label, ch, model) in panels {
+        match model {
+            Ok(m) => models.push(m),
+            Err(reason) => errors.push(format!("{label}: {reason}")),
         }
+        channels.push((label, ch));
     }
     if !errors.is_empty() {
         return Err(format!(
@@ -500,19 +512,15 @@ pub fn solved_frame(
             errors.join("\n  ")
         ));
     }
-    let ch = check_uniform_channels(
-        panels
-            .iter()
-            .map(|p| (format!("panel {}", p.panel_id), p.channels)),
-    )?;
+    let ch = check_uniform_channels(channels)?;
     let frame = choose_frame(&models);
     Ok((models, frame, ch))
 }
 
 /// Files-mode metadata probe (PROTOCOL.md §11, `--probe-panels`): read each
-/// panel's header — geometry plus astrometric properties, never pixel data —
-/// and report per-panel geometry along with the solved mosaic frame when the
-/// job can resolve to solved mode. Lets a GUI host size shm slots for a
+/// panel's header — geometry plus its astrometric solution (XISF properties
+/// or FITS WCS cards), never pixel data — and report per-panel geometry along
+/// with the solved mosaic frame when the job can resolve to solved mode. Lets a GUI host size shm slots for a
 /// Files-mode run without opening any panel file on its own thread.
 ///
 /// `frame` follows the same rule the PixInsight host previously implemented
@@ -525,18 +533,23 @@ pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeR
     if paths.is_empty() {
         return Err(Error::compute("probe-panels: no input panels given"));
     }
-    let descs: Vec<PanelDesc> = paths
+    // Header-only opens, in parallel: the geometry the reply carries plus
+    // each panel's astrometric model — read from XISF properties or FITS WCS
+    // cards, whichever the file carries — for the frame below. (The wire
+    // `PanelDesc` path cannot serve here: a FITS panel's solution is not in
+    // XISF properties, which `solved_frame` is limited to.)
+    let probed: Vec<(PanelProbeGeom, std::result::Result<WcsModel, String>)> = paths
         .par_iter()
-        .enumerate()
-        .map(|(id, path)| {
-            let x = XisfPanel::open(path)?;
-            Ok(PanelDesc {
-                panel_id: id as u32,
-                width: x.width(),
-                height: x.height(),
-                channels: x.channels(),
-                properties: x.header().properties.clone(),
-            })
+        .map(|path| {
+            let x = InputPanel::open(path)?;
+            Ok((
+                PanelProbeGeom {
+                    width: x.width(),
+                    height: x.height(),
+                    channels: x.channels(),
+                },
+                x.wcs_model(),
+            ))
         })
         .collect::<Result<_>>()?;
 
@@ -544,28 +557,30 @@ pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeR
     // Files-mode run — so a host never sizes its shm slots from panels[0]
     // for a set the run stage would reject anyway (PROTOCOL.md §11).
     check_uniform_channels(
-        descs
+        probed
             .iter()
-            .map(|d| (paths[d.panel_id as usize].display().to_string(), d.channels)),
+            .zip(paths)
+            .map(|((g, _), path)| (path.display().to_string(), g.channels)),
     )
     .map_err(Error::compute)?;
 
-    let panels = descs
-        .iter()
-        .map(|d| PanelProbeGeom {
-            width: d.width,
-            height: d.height,
-            channels: d.channels,
-        })
-        .collect();
+    let panels: Vec<PanelProbeGeom> = probed.iter().map(|(g, _)| *g).collect();
 
+    let solved = || {
+        frame_from_models(
+            probed
+                .iter()
+                .zip(paths)
+                .map(|((g, m), path)| (path.display().to_string(), g.channels, m.clone())),
+        )
+    };
     let frame = match input {
         InputSelect::Aligned => None,
         InputSelect::Solved => {
-            let (_, frame, ch) = solved_frame(&descs).map_err(Error::compute)?;
+            let (_, frame, ch) = solved().map_err(Error::compute)?;
             Some([frame.width, frame.height, ch])
         }
-        InputSelect::Auto => solved_frame(&descs)
+        InputSelect::Auto => solved()
             .ok()
             .map(|(_, frame, ch)| [frame.width, frame.height, ch]),
     };
@@ -799,6 +814,10 @@ fn finish_session(
 
 /// Single streaming pass over one aligned full-canvas panel.
 fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
+    // The storage kind is the input file's own format, so a session written
+    // here reopens through the matching backing (`PanelReader::open`); both
+    // opens below are header-only mmaps.
+    let storage = InputPanel::open(path)?.storage();
     let panel = PanelReader::open_file(path)?;
     let meta = PanelMeta {
         id,
@@ -809,7 +828,7 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
         ch_min: vec![],
         ch_max: vec![],
         ch_mean: vec![],
-        storage: PanelStorage::FullCanvasXisf,
+        storage,
     };
     scan_reader(meta, panel)
 }
