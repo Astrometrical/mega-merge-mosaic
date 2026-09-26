@@ -135,6 +135,7 @@ use std::sync::{Arc, OnceLock};
 use crate::formats::PropertyValue;
 use crate::formats::{FitsKeyword, XisfProperty};
 
+pub mod fits_wcs;
 mod legacy;
 pub(crate) mod spline;
 pub(crate) mod standard;
@@ -244,6 +245,18 @@ impl LinearWcs {
         let dx = (self.cd[1][1] * xi - self.cd[0][1] * eta) / det;
         let dy = (self.cd[0][0] * eta - self.cd[1][0] * xi) / det;
         (self.crpix[0] + dx, self.crpix[1] + dy)
+    }
+
+    /// The same solution expressed for the vertically mirrored row order
+    /// (`H` rows): `CRPIX2' = H + 1 − CRPIX2`, second matrix column negated.
+    /// Converts a standard bottom-up FITS WCS into mmm's top-down frame and
+    /// back (it is its own inverse). See the FITS-input design spec.
+    pub fn reflect_rows(&self, height: u64) -> LinearWcs {
+        let mut r = self.clone();
+        r.crpix[1] = height as f64 + 1.0 - self.crpix[1];
+        r.cd[0][1] = -self.cd[0][1];
+        r.cd[1][1] = -self.cd[1][1];
+        r
     }
 }
 
