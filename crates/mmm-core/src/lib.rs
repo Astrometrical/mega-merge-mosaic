@@ -44,6 +44,7 @@
 pub mod align;
 pub mod analyze;
 pub mod astrometry;
+pub(crate) mod band_cache;
 pub mod blend;
 pub mod diag;
 pub mod error;

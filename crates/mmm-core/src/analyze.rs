@@ -841,7 +841,7 @@ fn finish_session(
 
 /// Single streaming pass over one aligned full-canvas panel.
 fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
-    let panel = PanelReader::open_xisf(path)?;
+    let panel = PanelReader::open_file(path)?;
     let meta = PanelMeta {
         id,
         path: path.to_path_buf(),
@@ -985,10 +985,11 @@ fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
             }
         })
         .collect();
-    // Surface a mid-scan IPC transport failure as a proper `Err` instead of a
-    // silently-wrong summary; a no-op for Xisf/Cache backings, which always
-    // report `None` here — so the file path stays byte-identical.
-    if let Some(e) = panel.ipc_error() {
+    // Surface a mid-scan producer failure (IPC transport or FITS decode) as
+    // a proper `Err` instead of a silently-wrong summary; a no-op for
+    // Xisf/Cache backings, which always report `None` here — so the file
+    // path stays byte-identical.
+    if let Some(e) = panel.backing_error() {
         return Err(e);
     }
 

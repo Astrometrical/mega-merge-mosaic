@@ -15,11 +15,17 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
+use crate::band_cache::BandCache;
+use crate::formats::fits::FitsPanel;
 use crate::formats::xisf::XisfPanel;
 use crate::ipc::client::HostLink;
 use crate::ipc::reader::IpcBacking;
 use crate::session::PanelMeta;
 use crate::{Error, Result};
+
+/// Rows per decoded FITS band: a per-thread buffer of `FITS_BAND_ROWS ×
+/// width × channels` f32s (see `FitsBacking` below).
+pub const FITS_BAND_ROWS: usize = 64;
 
 /// How a panel's pixel data is stored on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -39,6 +45,10 @@ pub enum PanelStorage {
         /// Canvas placement of the cache, `[x0, y0, x1, y1]` exclusive.
         bbox: [u64; 4],
     },
+    /// A full-canvas FITS frame (primary HDU): geometry equals the session
+    /// canvas; rows are decoded on demand through the shared band cache,
+    /// with the file's row order flipped to top-down when needed.
+    FullCanvasFits,
     /// Pixels served on demand from the IPC host, never a file on disk —
     /// see [`crate::ipc::reader::IpcBacking`]. Not written into persisted
     /// session metadata for real runs: an IPC job's panels are read once
@@ -54,6 +64,39 @@ enum Backing {
     Xisf(XisfPanel),
     Cache(Mmap),
     Ipc(IpcBacking),
+    Fits(FitsBacking),
+}
+
+/// FITS rows decoded band-wise into the shared per-thread cache (see
+/// `crate::band_cache::BandCache`).
+struct FitsBacking {
+    panel: FitsPanel,
+    cache: BandCache,
+}
+
+impl FitsBacking {
+    /// Wraps an already-opened `panel` with a band cache sized to its own
+    /// geometry.
+    fn new(panel: FitsPanel) -> FitsBacking {
+        let canvas = (panel.width(), panel.height(), panel.channels());
+        FitsBacking {
+            cache: BandCache::new(canvas, FITS_BAND_ROWS),
+            panel,
+        }
+    }
+
+    /// One channel row of the panel, decoding a fresh band on a cache miss.
+    fn row(&self, c: u64, y: u64) -> Option<(u64, &[f32])> {
+        self.cache.row(c, y, |y0, y1, buf| {
+            let (w, ch) = (self.panel.width() as usize, self.panel.channels());
+            let bh = (y1 - y0) as usize;
+            for k in 0..ch {
+                let plane = &mut buf[k as usize * bh * w..(k as usize + 1) * bh * w];
+                self.panel.decode_rows(k, y0, bh, plane);
+            }
+            Ok(())
+        })
+    }
 }
 
 /// A memory-mapped panel reader presenting rows in canvas coordinates.
@@ -92,6 +135,28 @@ impl PanelReader {
                 }
                 Ok(PanelReader {
                     backing: Backing::Xisf(x),
+                    bbox: [0, 0, canvas.0, canvas.1],
+                    canvas,
+                })
+            }
+            PanelStorage::FullCanvasFits => {
+                let x = FitsPanel::open(&meta.path)?;
+                if (x.width(), x.height(), x.channels()) != canvas {
+                    return Err(Error::format(
+                        &meta.path,
+                        format!(
+                            "panel geometry {}x{}x{} does not match session canvas {}x{}x{}",
+                            x.width(),
+                            x.height(),
+                            x.channels(),
+                            canvas.0,
+                            canvas.1,
+                            canvas.2
+                        ),
+                    ));
+                }
+                Ok(PanelReader {
+                    backing: Backing::Fits(FitsBacking::new(x)),
                     bbox: [0, 0, canvas.0, canvas.1],
                     canvas,
                 })
@@ -135,17 +200,34 @@ impl PanelReader {
         }
     }
 
-    /// Open a plain full-canvas XISF file directly (no session metadata);
-    /// the canvas geometry is the file's own. Used by the analyze scan, which
-    /// runs before any [`PanelMeta`] exists.
-    pub fn open_xisf(path: &Path) -> Result<PanelReader> {
-        let x = XisfPanel::open(path)?;
-        let canvas = (x.width(), x.height(), x.channels());
-        Ok(PanelReader {
-            backing: Backing::Xisf(x),
-            bbox: [0, 0, canvas.0, canvas.1],
-            canvas,
-        })
+    /// Open a plain full-canvas panel file of either format directly (no
+    /// session metadata): the canvas geometry is the file's own. The format
+    /// is sniffed from the file's magic bytes, never its extension. Used by
+    /// the analyze scan, which runs before any [`PanelMeta`] exists.
+    pub fn open_file(path: &Path) -> Result<PanelReader> {
+        let mut magic = [0u8; 8];
+        {
+            use std::io::Read;
+            let mut f = File::open(path).map_err(|e| Error::io(path, e))?;
+            let _ = f.read(&mut magic).map_err(|e| Error::io(path, e))?;
+        }
+        if &magic == b"XISF0100" {
+            let x = XisfPanel::open(path)?;
+            let canvas = (x.width(), x.height(), x.channels());
+            Ok(PanelReader {
+                backing: Backing::Xisf(x),
+                bbox: [0, 0, canvas.0, canvas.1],
+                canvas,
+            })
+        } else {
+            let x = FitsPanel::open(path)?;
+            let canvas = (x.width(), x.height(), x.channels());
+            Ok(PanelReader {
+                backing: Backing::Fits(FitsBacking::new(x)),
+                bbox: [0, 0, canvas.0, canvas.1],
+                canvas,
+            })
+        }
     }
 
     /// Open a panel served over IPC by `link`: rows are pulled from the host
@@ -167,13 +249,15 @@ impl PanelReader {
         }
     }
 
-    /// The first transport error latched while reading an IPC-backed panel,
-    /// if any; always `None` for non-IPC backings. Callers check this after
-    /// a scan/blend stage completes, since [`Self::row`] can't surface a
+    /// The first producer error latched while reading a band-cached (IPC- or
+    /// FITS-backed) panel, if any; always `None` for backings that can't
+    /// fail after `open` (mmap'd XISF/cache). Callers check this after a
+    /// scan/blend stage completes, since [`Self::row`] can't surface a
     /// [`Result`] through its `Option` signature.
-    pub fn ipc_error(&self) -> Option<Error> {
+    pub fn backing_error(&self) -> Option<Error> {
         match &self.backing {
             Backing::Ipc(ipc) => ipc.ipc_error(),
+            Backing::Fits(f) => f.cache.error(),
             Backing::Xisf(_) | Backing::Cache(_) => None,
         }
     }
@@ -206,6 +290,7 @@ impl PanelReader {
                 Some((x0, &plane[start..start + bw]))
             }
             Backing::Ipc(ipc) => ipc.row(c, canvas_y),
+            Backing::Fits(f) => f.row(c, canvas_y),
         }
     }
 
@@ -222,6 +307,7 @@ impl PanelReader {
                 // No mmap to advise; bands are already fetched sequentially
                 // through the per-thread cache in `IpcBacking`.
             }
+            Backing::Fits(f) => f.panel.advise_sequential(),
         }
     }
 }
@@ -278,8 +364,8 @@ mod tests {
         // Geometry mismatch against the session canvas is refused.
         assert!(PanelReader::open(&m, (w + 1, h, ch)).is_err());
 
-        // open_xisf infers the canvas from the file.
-        let r2 = PanelReader::open_xisf(&path).unwrap();
+        // open_file infers the format and canvas from the file.
+        let r2 = PanelReader::open_file(&path).unwrap();
         assert_eq!(r2.canvas(), (w, h, ch));
         assert_eq!(r2.row(1, 2).unwrap().1, src.row(1, 2));
 
@@ -354,6 +440,79 @@ mod tests {
         );
         assert!(PanelReader::open(&empty, canvas).is_err(), "empty bbox");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fits_backing_rows_match_decode_rows_and_flip() {
+        use crate::formats::fits::FitsPanel;
+        use crate::synth::write_fits;
+        let dir = tmpdir("fits");
+        let (w, h, ch) = (7u64, 150u64, 2u64); // > 2 bands of 64 rows, last band short
+        let planes: Vec<f32> = (0..w * h * ch)
+            .map(|i| (i % 251) as f32 / 251.0 + 0.001)
+            .collect();
+        let path = dir.join("p.fits");
+        write_fits(&path, w, h, ch, &planes, 16, &[]).unwrap();
+        let src = FitsPanel::open(&path).unwrap();
+        let m = meta(path.clone(), PanelStorage::FullCanvasFits);
+        let r = PanelReader::open(&m, (w, h, ch)).unwrap();
+        assert_eq!(r.bbox(), [0, 0, w, h]);
+        r.advise_sequential();
+        let mut expect = vec![0f32; w as usize];
+        for y in [0u64, 1, 63, 64, 65, 127, 128, 149] {
+            for c in 0..ch {
+                src.decode_rows(c, y, 1, &mut expect);
+                let (x0, row) = r.row(c, y).expect("in range");
+                assert_eq!(x0, 0);
+                assert_eq!(row, &expect[..], "c{c} y{y}");
+            }
+        }
+        assert!(r.row(0, h).is_none());
+        assert!(r.backing_error().is_none());
+        // Geometry mismatch and open_file sniffing.
+        assert!(PanelReader::open(&m, (w + 1, h, ch)).is_err());
+        let r2 = PanelReader::open_file(&path).unwrap();
+        assert_eq!(r2.canvas(), (w, h, ch));
+        assert_eq!(r2.row(1, 70).unwrap().1, r.row(1, 70).unwrap().1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fits_backing_is_consistent_under_rayon() {
+        use crate::synth::write_fits;
+        use rayon::prelude::*;
+        let dir = tmpdir("fitspar");
+        let (w, h, ch) = (33u64, 300u64, 3u64);
+        let planes: Vec<f32> = (0..w * h * ch)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0 + 0.001)
+            .collect();
+        let path = dir.join("p.fits");
+        write_fits(&path, w, h, ch, &planes, -32, &[]).unwrap();
+        let r = PanelReader::open_file(&path).unwrap();
+        let sums: Vec<f64> = (0..h)
+            .into_par_iter()
+            .map(|y| {
+                (0..ch)
+                    .map(|c| {
+                        r.row(c, y)
+                            .unwrap()
+                            .1
+                            .iter()
+                            .map(|&v| v as f64)
+                            .sum::<f64>()
+                    })
+                    .sum()
+            })
+            .collect();
+        let (wu, hu) = (w as usize, h as usize);
+        for (y, s) in sums.iter().enumerate() {
+            let want: f64 = (0..ch as usize)
+                .flat_map(|c| planes[(c * hu + y) * wu..(c * hu + y + 1) * wu].iter())
+                .map(|&v| v as f64)
+                .sum();
+            assert!((s - want).abs() < 1e-3, "row {y}: {s} vs {want}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

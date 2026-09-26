@@ -312,7 +312,7 @@ pub fn reproject_from_reader(
     // transport failure (the loop bounds exactly match `reader.canvas()`),
     // whose real, actionable reason is latched in the reader — so a `None`
     // breaks out (both loops, via `complete`/labeled break) to check
-    // `ipc_error()` below rather than returning inline with a generic
+    // `backing_error()` below rather than returning inline with a generic
     // message that would shadow it (the same pattern `scan_reader` uses for
     // the same reason). Never fall through to `reproject_core` on a break —
     // that would resample a half-materialized panel.
@@ -327,7 +327,7 @@ pub fn reproject_from_reader(
             plane[y * sw..y * sw + sw].copy_from_slice(row);
         }
     }
-    if let Some(e) = reader.ipc_error() {
+    if let Some(e) = reader.backing_error() {
         return Err(e);
     }
     if !complete {

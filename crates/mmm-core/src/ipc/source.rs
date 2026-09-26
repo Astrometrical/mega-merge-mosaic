@@ -31,9 +31,9 @@ impl PanelSource for FileSource {
 /// An IPC-driven source: panels stored as [`PanelStorage::Ipc`] are pulled
 /// on demand from the host over `link`, `band_rows` canvas rows at a time.
 /// Panels still backed by a solved-mode reprojection cache on disk
-/// ([`PanelStorage::FullCanvasXisf`] / [`PanelStorage::CroppedCache`]) fall
-/// back to the ordinary file open — those legitimately live on disk even in
-/// an IPC run.
+/// ([`PanelStorage::FullCanvasXisf`] / [`PanelStorage::FullCanvasFits`] /
+/// [`PanelStorage::CroppedCache`]) fall back to the ordinary file open —
+/// those legitimately live on disk even in an IPC run.
 pub struct IpcSource {
     link: Arc<HostLink>,
     band_rows: usize,
@@ -56,9 +56,9 @@ impl PanelSource for IpcSource {
                 canvas,
                 self.band_rows,
             )),
-            PanelStorage::FullCanvasXisf | PanelStorage::CroppedCache { .. } => {
-                PanelReader::open(meta, canvas)
-            }
+            PanelStorage::FullCanvasXisf
+            | PanelStorage::FullCanvasFits
+            | PanelStorage::CroppedCache { .. } => PanelReader::open(meta, canvas),
         }
     }
 }
