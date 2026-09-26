@@ -315,7 +315,8 @@ fn panel_name(p: &mmm_core::session::PanelMeta) -> String {
 /// must not pass through to a solved-session output: its canvas is a fresh
 /// [`mmm_core::align::MosaicFrame`], and the correct cards are emitted from
 /// that frame instead. Non-geometric metadata (EXPTIME, INSTRUME, …) still
-/// passes through from panel 0.
+/// passes through from panel 0. astrometry.net's `IMAGEW`/`IMAGEH` describe
+/// the input panel's own pixel dimensions, not the blended output's.
 fn geometry_card(name: &str) -> bool {
     let n = name.trim().to_ascii_uppercase();
     matches!(
@@ -328,6 +329,8 @@ fn geometry_card(name: &str) -> bool {
             | "EPOCH"
             | "LONPOLE"
             | "LATPOLE"
+            | "IMAGEW"
+            | "IMAGEH"
     ) || [
         "CRVAL", "CRPIX", "CDELT", "CROTA", "CTYPE", "CUNIT", "CD1_", "CD2_", "PC1_", "PC2_",
         "PV1_", "PV2_", "A_", "B_", "AP_", "BP_",
@@ -819,4 +822,23 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
         println!("  stats scan: {:.2}s", t0.elapsed().as_secs_f64());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::geometry_card;
+
+    #[test]
+    fn geometry_card_drops_pointing_wcs_and_sip_and_imagewh() {
+        for name in [
+            "IMAGEW", "IMAGEH", "A_ORDER", "A_2_0", "AP_ORDER", "BP_1_1", "CRPIX1", "CD1_1",
+        ] {
+            assert!(geometry_card(name), "{name} should be a geometry card");
+        }
+        for name in [
+            "AIRMASS", "APTDIA", "BAYERPAT", "BZERO", "EXPTIME", "OBJECT",
+        ] {
+            assert!(!geometry_card(name), "{name} should not be a geometry card");
+        }
+    }
 }
