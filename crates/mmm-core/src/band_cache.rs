@@ -45,6 +45,16 @@ struct ThreadBand {
 ///   permitted — both cases can alias `current_thread_index() == None` (or
 ///   an index reused across pools) onto the same cell, which is a data
 ///   race. See the `unsafe impl Sync` below for the full argument.
+/// - The `fetch` closure passed to [`Self::row`] must not call `row` again
+///   on this same `BandCache` (directly, or transitively through whatever
+///   it closes over), and must not otherwise read `cells`. `row` holds an
+///   exclusive borrow of the calling thread's own cell for the duration of
+///   `fetch` (see [`Self::row`]'s doc and the `unsafe impl Sync`
+///   justification below); a reentrant call from `fetch` would run on the
+///   *same* thread and therefore compute the *same* `idx`, aliasing that
+///   live exclusive borrow with a fresh one (or a shared one) — undefined
+///   behavior that the thread-disjointness argument below does not cover,
+///   since it only rules out cross-thread aliasing.
 pub(crate) struct BandCache {
     /// Panel/canvas geometry `(width, height, channels)`.
     canvas: (u64, u64, u64),
@@ -78,6 +88,23 @@ pub(crate) struct BandCache {
 // access to `cells[idx']` (`idx != idx'`) made by another. That
 // per-thread disjointness is what `Sync` needs to be sound here (no
 // cross-thread data race, even though the type has no lock).
+//
+// That disjointness argument is ONLY about distinct threads computing
+// distinct `idx` values; it says nothing about two borrows the SAME thread
+// takes of its OWN cell, one nested inside the other. `row` takes an
+// exclusive borrow of `cells[idx]` for the span of the `fetch` call (see
+// below); if `fetch` itself called back into `row` on this same
+// `BandCache` from the same thread, that inner call would compute the same
+// `idx` and take its own borrow of `cells[idx]` while the outer exclusive
+// borrow is still live — an aliasing violation the type system cannot
+// catch (the outer borrow is already erased behind the `UnsafeCell`) and
+// that the per-thread disjointness argument does not rule out, because
+// both borrows come from the one thread it treats as a single, opaque
+// caller. This is why the type-level "Concurrent-use invariant" doc adds a
+// non-reentrancy bullet for `fetch`: soundness here also depends on every
+// `fetch` closure never reading `cells` — directly or by calling `row`
+// again — which is a caller obligation this `unsafe impl` cannot enforce
+// and must simply state.
 //
 // Within a single thread's own cell, `row` takes BOTH exclusive and shared
 // borrows of the `UnsafeCell`, at different points, and callers legitimately
@@ -148,6 +175,16 @@ impl BandCache {
     /// planar `channels × (y1 − y0) × width` region to fill). Returns `None`
     /// on a producer error — the error itself is latched, see
     /// [`Self::error`] — or if `canvas_y`/`c` is out of range.
+    ///
+    /// `fetch` must not call `row` again on this same `BandCache`, nor
+    /// otherwise read from it — this call already holds an exclusive borrow
+    /// of the calling thread's cell for `fetch`'s duration, and a reentrant
+    /// call from the same thread would alias that borrow (undefined
+    /// behavior; see the `unsafe impl Sync` justification above the type).
+    /// A future backing that implements `fetch` as a closure over something
+    /// more than a plain data source (an IPC link, a decoder) must uphold
+    /// this the same way `IpcBacking` and `FitsBacking` do today: `fetch`
+    /// touches only its own producer, never `self.cache`.
     pub(crate) fn row<F>(&self, c: u64, canvas_y: u64, fetch: F) -> Option<(u64, &[f32])>
     where
         F: FnOnce(u64, u64, &mut [f32]) -> Result<()>,

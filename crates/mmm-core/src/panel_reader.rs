@@ -99,6 +99,35 @@ impl FitsBacking {
     }
 }
 
+/// Validates that an already-opened full-canvas panel's own geometry
+/// (`width, height, channels`) matches the session `canvas`; shared by the
+/// `FullCanvasXisf` and `FullCanvasFits` arms of [`PanelReader::open`],
+/// which differ only in which reader they open.
+fn check_full_canvas(path: &Path, geom: (u64, u64, u64), canvas: (u64, u64, u64)) -> Result<()> {
+    if geom != canvas {
+        return Err(Error::format(
+            path,
+            format!(
+                "panel geometry {}x{}x{} does not match session canvas {}x{}x{}",
+                geom.0, geom.1, geom.2, canvas.0, canvas.1, canvas.2
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Builds a `PanelReader` whose storage bbox is the entire canvas — the
+/// common tail of every full-canvas open path: the `FullCanvasXisf` /
+/// `FullCanvasFits` arms of [`PanelReader::open`] and both format branches
+/// of [`PanelReader::open_file`].
+fn full_canvas(backing: Backing, canvas: (u64, u64, u64)) -> PanelReader {
+    PanelReader {
+        backing,
+        bbox: [0, 0, canvas.0, canvas.1],
+        canvas,
+    }
+}
+
 /// A memory-mapped panel reader presenting rows in canvas coordinates.
 pub struct PanelReader {
     backing: Backing,
@@ -113,53 +142,20 @@ impl PanelReader {
     /// Open a panel for reading against the session canvas geometry.
     ///
     /// Validates that the storage is consistent with `canvas`: a full-canvas
-    /// XISF must have exactly the canvas geometry; a cropped cache's bbox
-    /// must be non-empty, lie within the canvas, and match the file size.
+    /// XISF or FITS panel must have exactly the canvas geometry; a cropped
+    /// cache's bbox must be non-empty, lie within the canvas, and match the
+    /// file size.
     pub fn open(meta: &PanelMeta, canvas: (u64, u64, u64)) -> Result<PanelReader> {
         match meta.storage {
             PanelStorage::FullCanvasXisf => {
                 let x = XisfPanel::open(&meta.path)?;
-                if (x.width(), x.height(), x.channels()) != canvas {
-                    return Err(Error::format(
-                        &meta.path,
-                        format!(
-                            "panel geometry {}x{}x{} does not match session canvas {}x{}x{}",
-                            x.width(),
-                            x.height(),
-                            x.channels(),
-                            canvas.0,
-                            canvas.1,
-                            canvas.2
-                        ),
-                    ));
-                }
-                Ok(PanelReader {
-                    backing: Backing::Xisf(x),
-                    bbox: [0, 0, canvas.0, canvas.1],
-                    canvas,
-                })
+                check_full_canvas(&meta.path, (x.width(), x.height(), x.channels()), canvas)?;
+                Ok(full_canvas(Backing::Xisf(x), canvas))
             }
             PanelStorage::FullCanvasFits => {
                 let x = FitsPanel::open(&meta.path)?;
-                if (x.width(), x.height(), x.channels()) != canvas {
-                    return Err(Error::format(
-                        &meta.path,
-                        format!(
-                            "panel geometry {}x{}x{} does not match session canvas {}x{}x{}",
-                            x.width(),
-                            x.height(),
-                            x.channels(),
-                            canvas.0,
-                            canvas.1,
-                            canvas.2
-                        ),
-                    ));
-                }
-                Ok(PanelReader {
-                    backing: Backing::Fits(FitsBacking::new(x)),
-                    bbox: [0, 0, canvas.0, canvas.1],
-                    canvas,
-                })
+                check_full_canvas(&meta.path, (x.width(), x.height(), x.channels()), canvas)?;
+                Ok(full_canvas(Backing::Fits(FitsBacking::new(x)), canvas))
             }
             PanelStorage::CroppedCache { bbox } => {
                 let [x0, y0, x1, y1] = bbox;
@@ -214,19 +210,11 @@ impl PanelReader {
         if &magic == b"XISF0100" {
             let x = XisfPanel::open(path)?;
             let canvas = (x.width(), x.height(), x.channels());
-            Ok(PanelReader {
-                backing: Backing::Xisf(x),
-                bbox: [0, 0, canvas.0, canvas.1],
-                canvas,
-            })
+            Ok(full_canvas(Backing::Xisf(x), canvas))
         } else {
             let x = FitsPanel::open(path)?;
             let canvas = (x.width(), x.height(), x.channels());
-            Ok(PanelReader {
-                backing: Backing::Fits(FitsBacking::new(x)),
-                bbox: [0, 0, canvas.0, canvas.1],
-                canvas,
-            })
+            Ok(full_canvas(Backing::Fits(FitsBacking::new(x)), canvas))
         }
     }
 
