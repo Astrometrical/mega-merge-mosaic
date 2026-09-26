@@ -137,6 +137,7 @@ use crate::formats::{FitsKeyword, XisfProperty};
 
 pub mod fits_wcs;
 mod legacy;
+pub mod sip;
 pub(crate) mod spline;
 pub(crate) mod standard;
 
@@ -264,7 +265,7 @@ impl LinearWcs {
 /// everything in degrees. ξ grows toward east, η toward north — the standard
 /// zenithal native frame with `ReferenceNativeCoordinates` (0, 90) and
 /// `CelestialPoleNativeCoordinates` (180, 90).
-fn tan_deproject(crval: [f64; 2], xi_deg: f64, eta_deg: f64) -> (f64, f64) {
+pub(crate) fn tan_deproject(crval: [f64; 2], xi_deg: f64, eta_deg: f64) -> (f64, f64) {
     let (xi, eta) = (xi_deg.to_radians(), eta_deg.to_radians());
     let (a0, d0) = (crval[0].to_radians(), crval[1].to_radians());
     let den = d0.cos() - eta * d0.sin();
@@ -287,7 +288,7 @@ fn tan_project(crval: [f64; 2], ra: f64, dec: f64) -> (f64, f64, f64) {
 }
 
 /// [`tan_project`] with the hemisphere guard applied.
-fn tan_project_checked(crval: [f64; 2], ra: f64, dec: f64) -> Option<(f64, f64)> {
+pub(crate) fn tan_project_checked(crval: [f64; 2], ra: f64, dec: f64) -> Option<(f64, f64)> {
     let (xi, eta, den) = tan_project(crval, ra, dec);
     (den > 1e-9).then_some((xi, eta))
 }
@@ -399,6 +400,13 @@ enum Distortion {
         image_to_native: OnceLock<Option<Grid2D>>,
         native_to_image: OnceLock<Option<Grid2D>>,
     },
+    /// TAN-SIP FITS solution: the polynomials, sampled onto grids lazily
+    /// like `Standard`.
+    Sip {
+        sol: Arc<sip::SipSolution>,
+        image_to_native: OnceLock<Option<Grid2D>>,
+        native_to_image: OnceLock<Option<Grid2D>>,
+    },
 }
 
 /// Full astrometric model for one solved panel: the linear TAN solution plus,
@@ -460,6 +468,20 @@ impl WcsModel {
         WcsModel {
             linear: sol.linear.clone(),
             distortion: Distortion::Standard {
+                sol: Arc::new(sol),
+                image_to_native: OnceLock::new(),
+                native_to_image: OnceLock::new(),
+            },
+            width,
+            height,
+        }
+    }
+
+    /// A model over a parsed SIP solution; grids are sampled on demand.
+    pub(crate) fn with_sip(sol: sip::SipSolution, width: u64, height: u64) -> WcsModel {
+        WcsModel {
+            linear: sol.linear().clone(),
+            distortion: Distortion::Sip {
                 sol: Arc::new(sol),
                 image_to_native: OnceLock::new(),
                 native_to_image: OnceLock::new(),
@@ -546,6 +568,28 @@ impl WcsModel {
                     g
                 })
                 .as_ref(),
+            Distortion::Sip {
+                sol,
+                image_to_native,
+                ..
+            } => image_to_native
+                .get_or_init(|| {
+                    let s = sol.clone();
+                    let g = standard::sample_fn(
+                        move |x, y| s.image_to_native(x, y),
+                        [0.0, 0.0, self.width as f64, self.height as f64],
+                        standard::IMAGE_DELTA_PX,
+                        rayon::current_thread_index().is_none(),
+                    );
+                    if g.is_none() {
+                        tracing::warn!(
+                            "astrometric solution: sampling the image→projection grid failed; \
+                             using the linear solution"
+                        );
+                    }
+                    g
+                })
+                .as_ref(),
         }
     }
 
@@ -569,6 +613,38 @@ impl WcsModel {
                         self.height,
                         rayon::current_thread_index().is_none(),
                     );
+                    if g.is_none() {
+                        tracing::warn!(
+                            "astrometric solution: sampling the projection→image grid failed; \
+                             using the linear solution"
+                        );
+                    }
+                    g
+                })
+                .as_ref(),
+            Distortion::Sip {
+                sol,
+                native_to_image,
+                ..
+            } => native_to_image
+                .get_or_init(|| {
+                    let s = sol.clone();
+                    let g = standard::matrix_scale(self.linear.cd).and_then(|scale| {
+                        let delta = standard::IMAGE_DELTA_PX * scale;
+                        let rect = standard::native_rect(
+                            |x, y| s.image_to_native(x, y),
+                            self.width,
+                            self.height,
+                            delta,
+                        );
+                        let s2 = s.clone();
+                        standard::sample_fn(
+                            move |xi, eta| s2.native_to_image(xi, eta),
+                            rect,
+                            delta,
+                            rayon::current_thread_index().is_none(),
+                        )
+                    });
                     if g.is_none() {
                         tracing::warn!(
                             "astrometric solution: sampling the projection→image grid failed; \
@@ -620,7 +696,8 @@ impl WcsModel {
     }
 
     /// True when the solution carries (and the model uses) a distortion
-    /// model or grids.
+    /// model or grids — a PixInsight spline solution or a FITS SIP
+    /// polynomial.
     pub fn is_spline(&self) -> bool {
         !matches!(self.distortion, Distortion::None)
     }
@@ -630,6 +707,11 @@ impl WcsModel {
     fn grids_sampled(&self) -> (bool, bool) {
         match &self.distortion {
             Distortion::Standard {
+                image_to_native,
+                native_to_image,
+                ..
+            }
+            | Distortion::Sip {
                 image_to_native,
                 native_to_image,
                 ..
@@ -1613,6 +1695,61 @@ mod tests {
         let n = rx_done
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("lazy sampling inside rayon workers deadlocked");
+        assert_eq!(n, 512);
+    }
+
+    #[test]
+    fn sip_grids_are_sampled_lazily_and_survive_rayon_workers() {
+        use crate::formats::RowOrder;
+        let kw = |n: &str, v: &str| FitsKeyword {
+            name: n.into(),
+            value: v.into(),
+            comment: String::new(),
+        };
+        // 800×600 bottom-up panel, 3.6″/px, quadratic SIP.
+        let cards = vec![
+            kw("CTYPE1", "'RA---TAN-SIP'"),
+            kw("CTYPE2", "'DEC--TAN-SIP'"),
+            kw("CRVAL1", "10.0"),
+            kw("CRVAL2", "20.0"),
+            kw("CRPIX1", "400.5"),
+            kw("CRPIX2", "300.5"),
+            kw("CD1_1", "-1.0E-3"),
+            kw("CD1_2", "0.0"),
+            kw("CD2_1", "0.0"),
+            kw("CD2_2", "1.0E-3"),
+            kw("A_ORDER", "2"),
+            kw("B_ORDER", "2"),
+            kw("A_2_0", "1.0E-7"),
+            kw("B_1_1", "-1.0E-7"),
+        ];
+        let m = fits_wcs::model_from_keywords(&cards, 800, 600, RowOrder::BottomUp).unwrap();
+        assert!(m.is_spline());
+        assert_eq!(m.grids_sampled(), (false, false), "nothing sampled yet");
+        let _ = m.pixel_to_sky(1.0, 2.0);
+        assert_eq!(m.grids_sampled(), (true, false), "forward only");
+        let _ = m.sky_to_pixel(10.0, 20.0);
+        assert_eq!(m.grids_sampled(), (true, true));
+
+        // First use from inside rayon workers must not deadlock.
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+            let m = fits_wcs::model_from_keywords(&cards, 800, 600, RowOrder::BottomUp).unwrap();
+            let n: usize = (0..512usize)
+                .into_par_iter()
+                .map(|i| {
+                    let ra = 10.0 + i as f64 * 1e-5;
+                    let p = m.sky_to_pixel(ra, 20.0).unwrap();
+                    let s = m.pixel_to_sky(p.0, p.1);
+                    usize::from((s.0 - ra).abs() < 1e-6 && (s.1 - 20.0).abs() < 1e-6)
+                })
+                .sum();
+            tx.send(n).unwrap();
+        });
+        let n = done
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("lazy SIP sampling inside rayon workers deadlocked");
         assert_eq!(n, 512);
     }
 

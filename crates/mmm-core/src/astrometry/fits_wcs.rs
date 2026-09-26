@@ -5,7 +5,8 @@
 //! `CROTA2`. Refused (never approximated): other projections, `TPV`, and
 //! nonzero `PV` terms.
 
-use crate::astrometry::LinearWcs;
+use crate::astrometry::sip::SipSolution;
+use crate::astrometry::{LinearWcs, WcsModel};
 use crate::formats::{FitsKeyword, RowOrder, card_number, card_string};
 
 /// Projection code of a CTYPE value (`RA---TAN-SIP` → `TAN`), and whether
@@ -129,6 +130,32 @@ pub fn linear_for_panel(
         RowOrder::TopDown => w,
         RowOrder::BottomUp => w.reflect_rows(height),
     })
+}
+
+/// Full model for a FITS panel: the linear solution (reflected into the
+/// top-down frame for bottom-up files) plus SIP distortion when the header
+/// carries `A_ORDER`. `Err` explains why the header is unusable; a SIP
+/// solution that fails validation is refused rather than approximated.
+pub fn model_from_keywords(
+    cards: &[FitsKeyword],
+    width: u64,
+    height: u64,
+    row_order: RowOrder,
+) -> Result<WcsModel, String> {
+    let file_linear = linear_from_keywords(cards)?;
+    match SipSolution::parse(cards, &file_linear, row_order, height)? {
+        None => {
+            let linear = match row_order {
+                RowOrder::TopDown => file_linear,
+                RowOrder::BottomUp => file_linear.reflect_rows(height),
+            };
+            Ok(WcsModel::linear_only(linear, width, height))
+        }
+        Some(sip) => {
+            sip.validate(width, height)?;
+            Ok(WcsModel::with_sip(sip, width, height))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +294,44 @@ mod tests {
         let mut c = with_cd(base());
         c.retain(|k| k.name != "CRVAL2");
         assert!(linear_from_keywords(&c).unwrap_err().contains("CRVAL2"));
+    }
+
+    #[test]
+    fn model_from_keywords_uses_grids_for_sip_and_linear_otherwise() {
+        let lin = model_from_keywords(&with_cd(base()), 4880, 3235, RowOrder::BottomUp).unwrap();
+        assert!(!lin.is_spline());
+        let mut c = with_cd(base());
+        c.extend([
+            kw("A_ORDER", "2"),
+            kw("B_ORDER", "2"),
+            kw("A_2_0", "1.0E-7"),
+            kw("B_0_2", "1.0E-7"),
+        ]);
+        let m = model_from_keywords(&c, 4880, 3235, RowOrder::BottomUp).unwrap();
+        assert!(m.is_spline());
+        // Grid path and direct evaluation agree, and the inverse round-trips.
+        let s = SipSolution::parse(
+            &c,
+            &linear_from_keywords(&c).unwrap(),
+            RowOrder::BottomUp,
+            3235,
+        )
+        .unwrap()
+        .unwrap();
+        for (x, y) in [(10.0, 10.0), (4000.0, 3000.0), (2440.0, 1617.5)] {
+            let (ra, dec) = m.pixel_to_sky(x, y);
+            let (xi, eta) = s.image_to_native(x, y);
+            let (ra2, dec2) = crate::astrometry::tan_deproject(m.linear.crval, xi, eta);
+            assert!(
+                (ra - ra2).abs() < 1e-9 && (dec - dec2).abs() < 1e-9,
+                "grid vs direct at ({x},{y})"
+            );
+            let (bx, by) = m.sky_to_pixel(ra, dec).unwrap();
+            assert!(
+                (bx - x).abs() < 2e-3 && (by - y).abs() < 2e-3,
+                "round trip ({x},{y}) → ({bx},{by})"
+            );
+        }
     }
 
     #[test]

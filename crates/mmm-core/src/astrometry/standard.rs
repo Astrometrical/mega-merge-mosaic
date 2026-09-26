@@ -27,7 +27,7 @@ pub(crate) const STD_PREFIX: &str = "AstrometricSolution:";
 /// 16 px lattice reproduces the model to well under 0.01″ (verified against
 /// PixInsight's 8 px cache on the real Orion panels), at a quarter of the
 /// spline evaluations.
-const IMAGE_DELTA_PX: f64 = 16.0;
+pub(crate) const IMAGE_DELTA_PX: f64 = 16.0;
 
 /// True when the standard block's required `Version` property is present.
 pub(crate) fn has_standard_block(props: &[XisfProperty]) -> bool {
@@ -567,8 +567,8 @@ pub(crate) fn sample_image_to_native(
     parallel: bool,
 ) -> Option<Grid2D> {
     let i2p = sol.image_to_projection.as_ref()?;
-    sample(
-        i2p,
+    sample_fn(
+        |x, y| i2p.map(x, y),
         [0.0, 0.0, width as f64, height as f64],
         IMAGE_DELTA_PX,
         parallel,
@@ -587,13 +587,18 @@ pub(crate) fn sample_native_to_image(
 ) -> Option<Grid2D> {
     let i2p = sol.image_to_projection.as_ref()?;
     let p2i = sol.projection_to_image.as_ref()?;
+    let delta = IMAGE_DELTA_PX * matrix_scale(sol.linear.cd)?;
+    let rect = native_rect(|x, y| i2p.map(x, y), width, height, delta);
+    sample_fn(|xi, eta| p2i.map(xi, eta), rect, delta, parallel)
+}
+
+/// The native-plane rectangle covering the image's forward-mapped corners and
+/// edge midpoints, padded by one `delta`.
+pub(crate) fn native_rect<F>(forward: F, width: u64, height: u64, delta: f64) -> [f64; 4]
+where
+    F: Fn(f64, f64) -> (f64, f64),
+{
     let (w, h) = (width as f64, height as f64);
-    let m = sol.linear.cd;
-    let scale = (m[0][0] * m[1][1] - m[0][1] * m[1][0]).abs().sqrt();
-    if !positive(scale) {
-        return None;
-    }
-    let delta = IMAGE_DELTA_PX * scale;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for (x, y) in [
         (0.0, 0.0),
@@ -605,26 +610,33 @@ pub(crate) fn sample_native_to_image(
         (0.0, h / 2.0),
         (w, h / 2.0),
     ] {
-        let (xi, eta) = i2p.map(x, y);
+        let (xi, eta) = forward(x, y);
         x0 = x0.min(xi);
         y0 = y0.min(eta);
         x1 = x1.max(xi);
         y1 = y1.max(eta);
     }
-    sample(
-        p2i,
-        [x0 - delta, y0 - delta, x1 + delta, y1 + delta],
-        delta,
-        parallel,
-    )
+    [x0 - delta, y0 - delta, x1 + delta, y1 + delta]
 }
 
-/// Sample one direction onto a grid. `parallel` uses the rayon pool (one
-/// row per task); callers that may already be running *inside* a rayon
-/// worker must pass `false` — a nested parallel sampling from a worker that
-/// other workers are blocked waiting on (lazy `OnceLock` init) lets the
+/// Pixel scale (deg/px) of a matrix: `sqrt(|det|)`; `None` unless positive and
+/// finite.
+pub(crate) fn matrix_scale(m: [[f64; 2]; 2]) -> Option<f64> {
+    let s = (m[0][0] * m[1][1] - m[0][1] * m[1][0]).abs().sqrt();
+    positive(s).then_some(s)
+}
+
+/// Sample one 2-D map onto a grid. `parallel` uses the rayon pool (one row
+/// per task); callers that may already be running *inside* a rayon worker
+/// must pass `false` — a nested parallel sampling from a worker that other
+/// workers are blocked waiting on (lazy `OnceLock` init) lets the
 /// initializing thread steal one of those blocked jobs and deadlock.
-fn sample(dir: &Direction, rect: [f64; 4], delta: f64, parallel: bool) -> Option<Grid2D> {
+///
+/// `None` when the rectangle is degenerate or any sampled value is not finite.
+pub(crate) fn sample_fn<F>(f: F, rect: [f64; 4], delta: f64, parallel: bool) -> Option<Grid2D>
+where
+    F: Fn(f64, f64) -> (f64, f64) + Sync,
+{
     let cols = expected_nodes(rect[2] - rect[0], delta)?;
     let rows = expected_nodes(rect[3] - rect[1], delta)?;
     let n = rows as usize * cols as usize;
@@ -634,7 +646,7 @@ fn sample(dir: &Direction, rect: [f64; 4], delta: f64, parallel: bool) -> Option
         let y = rect[1] + r as f64 * delta;
         for (c, (ox, oy)) in rx.iter_mut().zip(ry.iter_mut()).enumerate() {
             let x = rect[0] + c as f64 * delta;
-            let (vx, vy) = dir.map(x, y);
+            let (vx, vy) = f(x, y);
             *ox = vx;
             *oy = vy;
         }
