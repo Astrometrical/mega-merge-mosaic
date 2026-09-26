@@ -536,4 +536,94 @@ mod tests {
         let e = s.validate(1000, 800).unwrap_err();
         assert!(e.contains("linear"), "{e}");
     }
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        width: u64,
+        height: u64,
+        cards: Vec<(String, String, String)>,
+        forward: Vec<[f64; 4]>,
+        inverse: Vec<[f64; 4]>,
+    }
+
+    fn oracle() -> Vec<Case> {
+        serde_json::from_str(include_str!("../../tests/fixtures/sip_oracle.json"))
+            .expect("fixture parses")
+    }
+
+    #[test]
+    fn matches_astropy_oracle_directly_and_through_grids() {
+        use crate::astrometry::fits_wcs::{linear_from_keywords, model_from_keywords};
+        use crate::astrometry::tan_deproject;
+        for case in oracle() {
+            let cards: Vec<FitsKeyword> = case
+                .cards
+                .iter()
+                .map(|(n, v, c)| FitsKeyword {
+                    name: n.clone(),
+                    value: v.clone(),
+                    comment: c.clone(),
+                })
+                .collect();
+            let ro = if cards
+                .iter()
+                .any(|k| k.name == "ROWORDER" && k.value.contains("TOP-DOWN"))
+            {
+                RowOrder::TopDown
+            } else {
+                RowOrder::BottomUp
+            };
+            let h = case.height;
+            let file_lin = linear_from_keywords(&cards).unwrap();
+            let sip = SipSolution::parse(&cards, &file_lin, ro, h)
+                .unwrap()
+                .expect("SIP present");
+            let model = model_from_keywords(&cards, case.width, h, ro).unwrap();
+            assert!(model.is_spline(), "{}", case.name);
+            let to_img = |i: f64, j: f64| -> (f64, f64) {
+                match ro {
+                    RowOrder::TopDown => (i - 0.5, j - 0.5),
+                    RowOrder::BottomUp => (i - 0.5, h as f64 - j + 0.5),
+                }
+            };
+            for &[i, j, ra, dec] in &case.forward {
+                let (x, y) = to_img(i, j);
+                let (xi, eta) = sip.image_to_native(x, y);
+                let (r1, d1) = tan_deproject(model.linear.crval, xi, eta);
+                let dra = ((r1 - ra + 180.0).rem_euclid(360.0) - 180.0) * dec.to_radians().cos();
+                assert!(
+                    dra.abs() < 1e-9 && (d1 - dec).abs() < 1e-9,
+                    "{} direct fwd at ({i},{j}): {dra:e} {:e}",
+                    case.name,
+                    d1 - dec
+                );
+                let (r2, d2) = model.pixel_to_sky(x, y);
+                let dra2 = ((r2 - ra + 180.0).rem_euclid(360.0) - 180.0) * dec.to_radians().cos();
+                assert!(
+                    dra2.abs() < 2e-7 && (d2 - dec).abs() < 2e-7,
+                    "{} grid fwd at ({i},{j}): {dra2:e} {:e}",
+                    case.name,
+                    d2 - dec
+                );
+            }
+            for &[ra, dec, i, j] in &case.inverse {
+                let (x, y) = to_img(i, j);
+                let (xi, eta) =
+                    crate::astrometry::tan_project_checked(model.linear.crval, ra, dec).unwrap();
+                let (bx, by) = sip.native_to_image(xi, eta);
+                assert!(
+                    (bx - x).abs() < 1e-4 && (by - y).abs() < 1e-4,
+                    "{} direct inv: ({bx},{by}) vs ({x},{y})",
+                    case.name
+                );
+                let (gx, gy) = model.sky_to_pixel(ra, dec).expect("inside native domain");
+                assert!(
+                    (gx - x).abs() < 5e-3 && (gy - y).abs() < 5e-3,
+                    "{} grid inv: ({gx},{gy}) vs ({x},{y})",
+                    case.name
+                );
+            }
+        }
+    }
 }
