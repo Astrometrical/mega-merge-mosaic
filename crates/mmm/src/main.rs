@@ -33,7 +33,7 @@ fn banner() -> String {
 enum Command {
     /// Print header metadata for panel files (and optionally quick pixel stats)
     Info {
-        /// Input panel files (XISF)
+        /// Input panel files (XISF or FITS)
         #[arg(required = true)]
         panels: Vec<std::path::PathBuf>,
 
@@ -44,7 +44,7 @@ enum Command {
 
     /// Analyze panels: build tiled cache, coverage masks, and the overlap graph
     Analyze {
-        /// Input panel files (XISF): pre-aligned full-canvas frames, or
+        /// Input panel files (XISF or FITS): pre-aligned full-canvas frames, or
         /// unaligned plate-solved panels (reprojected automatically)
         #[arg(required = true)]
         panels: Vec<std::path::PathBuf>,
@@ -330,7 +330,7 @@ fn geometry_card(name: &str) -> bool {
             | "LATPOLE"
     ) || [
         "CRVAL", "CRPIX", "CDELT", "CROTA", "CTYPE", "CUNIT", "CD1_", "CD2_", "PC1_", "PC2_",
-        "PV1_", "PV2_",
+        "PV1_", "PV2_", "A_", "B_", "AP_", "BP_",
     ]
     .iter()
     .any(|p| n.starts_with(p))
@@ -349,9 +349,9 @@ fn blend_cmd(
     flatten: Option<u32>,
     wcs_flip: bool,
 ) -> anyhow::Result<()> {
-    use mmm_core::astrometry::{wcs_cards, wcs_cards_flipped, wcs_from_properties};
+    use mmm_core::astrometry::{wcs_cards, wcs_cards_flipped};
     use mmm_core::blend::{BlendParams, blend, output_bbox};
-    use mmm_core::formats::xisf::XisfPanel;
+    use mmm_core::formats::InputPanel;
     use mmm_core::output::Tee;
     use mmm_core::output::fits::{FitsSink, keywords_for_output};
     use mmm_core::output::png::PngSink;
@@ -377,24 +377,30 @@ fn blend_cmd(
     // Panel-0 file for FITS keyword passthrough: for solved sessions the
     // panel path is the reprojection cache, so the original input is used.
     let p0 = &session.panels[0];
-    let ref_panel = XisfPanel::open(p0.source.as_ref().unwrap_or(&p0.path))?;
-    let mut keywords = keywords_for_output(&ref_panel.header().fits_keywords, crop);
-    if session.frame.is_some() {
+    let ref_panel = InputPanel::open(p0.source.as_ref().unwrap_or(&p0.path))?;
+    let mut keywords = keywords_for_output(ref_panel.fits_keywords(), crop);
+    if session.frame.is_some() || ref_panel.format_name() == "FITS" {
         // Solved session: the output canvas is a fresh frame — panel-0
-        // geometry/pointing cards would lie about it and are dropped.
+        // geometry/pointing cards would lie about it and are dropped. A
+        // bottom-up FITS reference panel's own CRPIX/CD cards would also
+        // pass through unreflected, so they are dropped too; fresh
+        // `wcs_cards` below (from `linear_wcs()`, already top-down) replace
+        // them.
         keywords.retain(|kw| !geometry_card(&kw.name));
     }
-    // Astrometric solution lives in XISF properties, not FITS keywords; attach
-    // real WCS cards at full resolution (downsampled previews would need a
-    // rescaled CD matrix — not worth lying about; skip them there). Solved
-    // sessions use the session's own mosaic frame, never panel-0 passthrough.
+    // Never pass the reference panel's own WCS cards through as-is (XISF
+    // keeps its solution in properties anyway, and a FITS one may be
+    // bottom-up); attach real WCS cards at full resolution instead, via
+    // `linear_wcs()` (downsampled previews would need a rescaled CD matrix
+    // — not worth lying about; skip them there). Solved sessions use the
+    // session's own mosaic frame, never panel-0 passthrough.
     if ds == 1 {
         let wcs = match &session.frame {
             Some(frame) => {
                 println!("wcs: session mosaic frame (solved input)");
                 Some(frame.linear_wcs())
             }
-            None => wcs_from_properties(&ref_panel.header().properties),
+            None => ref_panel.linear_wcs(),
         };
         match wcs {
             Some(wcs) => {
@@ -735,16 +741,28 @@ fn report_photometry(
 }
 
 fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
-    use mmm_core::formats::xisf::XisfPanel;
+    use mmm_core::formats::InputPanel;
+    use mmm_core::panel_reader::PanelReader;
 
-    let panel = XisfPanel::open(path)?;
-    let h = panel.header();
+    let panel = InputPanel::open(path)?;
     println!("{}", path.display());
-    println!(
-        "  geometry: {}x{} x{}ch  {:?}  data @ {} ({} bytes)",
-        h.width, h.height, h.channels, h.sample_format, h.data_offset, h.data_size
-    );
-    for kw in &h.fits_keywords {
+    match &panel {
+        InputPanel::Xisf(x) => {
+            let h = x.header();
+            println!(
+                "  XISF geometry: {}x{} x{}ch  {:?}  data @ {} ({} bytes)",
+                h.width, h.height, h.channels, h.sample_format, h.data_offset, h.data_size
+            );
+        }
+        InputPanel::Fits(f) => {
+            let h = f.header();
+            println!(
+                "  FITS geometry: {}x{} x{}ch  BITPIX {}  rows {:?}  data @ {}",
+                h.width, h.height, h.channels, h.bitpix, h.row_order, h.data_offset
+            );
+        }
+    }
+    for kw in panel.fits_keywords() {
         if matches!(
             kw.name.as_str(),
             "OBJECT" | "RA" | "DEC" | "INSTRUME" | "BAYERPAT" | "EXPTIME"
@@ -752,24 +770,39 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
             println!("  {:8} = {}", kw.name, kw.value);
         }
     }
-
+    match panel.wcs_model() {
+        Ok(m) => println!(
+            "  wcs: {} ({})",
+            if m.is_spline() {
+                "with distortion model"
+            } else {
+                "linear"
+            },
+            m.linear.ctype[0]
+        ),
+        Err(reason) => println!("  wcs: none ({reason})"),
+    }
     if stats {
-        panel.advise_sequential();
+        let reader = PanelReader::open_file(path)?;
+        reader.advise_sequential();
         let t0 = std::time::Instant::now();
-        for c in 0..panel.channels() {
-            let plane = panel.channel(c);
-            let (mut min, mut max, mut zeros, mut sum) =
-                (f32::INFINITY, f32::NEG_INFINITY, 0u64, 0f64);
-            for &v in plane {
-                if v == 0.0 {
-                    zeros += 1;
-                } else {
-                    min = min.min(v);
-                    max = max.max(v);
-                    sum += v as f64;
+        let (_, h, ch) = reader.canvas();
+        for c in 0..ch {
+            let (mut min, mut max, mut zeros, mut sum, mut n) =
+                (f32::INFINITY, f32::NEG_INFINITY, 0u64, 0f64, 0u64);
+            for y in 0..h {
+                let (_, row) = reader.row(c, y).expect("full-canvas rows");
+                n += row.len() as u64;
+                for &v in row {
+                    if v == 0.0 {
+                        zeros += 1;
+                    } else {
+                        min = min.min(v);
+                        max = max.max(v);
+                        sum += v as f64;
+                    }
                 }
             }
-            let n = plane.len() as u64;
             let nonzero = n - zeros;
             println!(
                 "  ch{c}: nonzero {:.1}%  min {:.6}  max {:.6}  mean {:.6}",
