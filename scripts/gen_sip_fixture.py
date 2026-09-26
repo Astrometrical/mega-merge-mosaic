@@ -97,26 +97,36 @@ to prove astropy applied the distortion"
     i = np.concatenate([[1, w, 1, w, hdr["CRPIX1"]], rng.uniform(1, w, 43)])
     j = np.concatenate([[1, 1, h, h, hdr["CRPIX2"]], rng.uniform(1, h, 43)])
     ra, dec = wcs.all_pix2world(i, j, 1)
-    # Jitter (ra, dec) to get a genuinely different inverse target, but keep
-    # the target pixel inside the solved domain: the four fixed corner
-    # points above sit exactly on the domain boundary, and the full jitter
-    # (~0.01 deg =~ 20-25 px at this plate scale) can push their inverse
-    # target tens of px past the edge, into the grid's border-extrapolation
-    # region where WcsModel::sky_to_pixel's Catmull-Rom grid is expected to
-    # be much less accurate than in the interior (see Grid2D::node). Shrink
-    # the jitter per-point until the inverse lands back in [1, w] x [1, h].
-    base_dra = rng.uniform(-0.01, 0.01, ra.size)
-    base_ddec = rng.uniform(-0.01, 0.01, dec.size)
-    ra2, dec2, i2, j2 = ra.copy(), dec.copy(), i.copy(), j.copy()
-    for k in range(ra.size):
-        for scale in (1.0, 0.5, 0.25, 0.1, 0.05, 0.02, 0.0):
-            cra, cdec = ra[k] + base_dra[k] * scale, dec[k] + base_ddec[k] * scale
-            ci2, cj2 = wcs.all_world2pix(
-                np.array([cra]), np.array([cdec]), 1, tolerance=1e-10, maxiter=100
-            )
-            if 1.0 <= ci2[0] <= w and 1.0 <= cj2[0] <= h:
-                ra2[k], dec2[k], i2[k], j2[k] = cra, cdec, ci2[0], cj2[0]
-                break
+    # Build each inverse sample by stepping the forward pixel INWARD, toward
+    # the image center, by 3-30 px, then re-projecting that interior pixel
+    # to sky with all_pix2world. This guarantees every inverse target is
+    # both distinct from its forward sample and inside [1, w] x [1, h] --
+    # unlike jittering (ra, dec) by a fixed sky offset and shrinking toward
+    # zero on failure, which (for the four fixed points that sit exactly on
+    # the domain boundary above) bottomed out at zero jitter and degenerated
+    # into a same-point round trip instead of an independent oracle sample,
+    # exactly at the domain-edge points meant to stress edge handling.
+    cx, cy = (1.0 + w) / 2.0, (1.0 + h) / 2.0
+    dx, dy = cx - i, cy - j
+    dist = np.hypot(dx, dy)
+    # A sample that happens to land exactly on the center (dist == 0) has no
+    # well-defined inward direction; give it an arbitrary fixed one instead.
+    at_center = dist < 1e-9
+    ux = np.where(at_center, 1.0, dx / np.where(dist == 0, 1.0, dist))
+    uy = np.where(at_center, 0.0, dy / np.where(dist == 0, 1.0, dist))
+    norm = np.hypot(ux, uy)
+    ux, uy = ux / norm, uy / norm
+    step = rng.uniform(3.0, 30.0, i.size)
+    ti, tj = i + step * ux, j + step * uy
+    ra2, dec2 = wcs.all_pix2world(ti, tj, 1)
+    i2, j2 = wcs.all_world2pix(ra2, dec2, 1, tolerance=1e-10, maxiter=100)
+    assert np.all((i2 >= 1.0) & (i2 <= w) & (j2 >= 1.0) & (j2 <= h)), (
+        f"{name}: an inverse target landed outside [1, {w}] x [1, {h}]"
+    )
+    same = (np.abs(i2 - i) < 1e-6) & (np.abs(j2 - j) < 1e-6)
+    assert not same.any(), (
+        f"{name}: {int(same.sum())} inverse sample(s) degenerated to their forward sample"
+    )
     cards = [[c.keyword, _card_value(c), c.comment] for c in hdr.cards]
     return {
         "name": name, "width": w, "height": h, "cards": cards,
