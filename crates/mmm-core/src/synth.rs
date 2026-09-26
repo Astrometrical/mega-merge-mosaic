@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::formats::FitsKeyword;
 use crate::{Error, Result};
 
 /// Specification of the synthetic mosaic to generate.
@@ -724,6 +725,112 @@ fn write_xisf_impl(
     bytes.resize(DATA_OFFSET, 0);
     for v in planes {
         bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(|e| Error::io(path, e))
+}
+
+/// Minimal FITS writer for tests: primary HDU, `NAXIS` 2 (one channel) or 3
+/// (planar), big-endian samples, rows stored bottom-up unless `extra_cards`
+/// carries `ROWORDER = 'TOP-DOWN'`. `planes` is top-down planar canvas data
+/// in `[0, 1]`; integer `bitpix` (8/16/32) quantizes to the full unsigned
+/// range with the conventional `BZERO` (0 / 32768 / 2147483648); −32/−64
+/// store the floats. Round-trips through [`crate::formats::fits::FitsPanel`].
+pub fn write_fits(
+    path: &Path,
+    w: u64,
+    h: u64,
+    ch: u64,
+    planes: &[f32],
+    bitpix: i32,
+    extra_cards: &[FitsKeyword],
+) -> Result<()> {
+    let n = (w * h * ch) as usize;
+    if planes.len() != n {
+        return Err(Error::format(
+            path,
+            format!(
+                "planes length {} does not match geometry {w}x{h}x{ch} ({n})",
+                planes.len()
+            ),
+        ));
+    }
+    let top_down = extra_cards
+        .iter()
+        .any(|k| k.name == "ROWORDER" && k.value.contains("TOP-DOWN"));
+    let card = |name: &str, value: &str| -> String {
+        let s = if value.starts_with('\'') {
+            format!("{name:<8}= {value}")
+        } else {
+            format!("{name:<8}= {value:>20}")
+        };
+        format!("{s:<80}")
+    };
+    let mut hdr = String::new();
+    hdr.push_str(&card("SIMPLE", "T"));
+    hdr.push_str(&card("BITPIX", &bitpix.to_string()));
+    hdr.push_str(&card("NAXIS", if ch == 1 { "2" } else { "3" }));
+    hdr.push_str(&card("NAXIS1", &w.to_string()));
+    hdr.push_str(&card("NAXIS2", &h.to_string()));
+    if ch != 1 {
+        hdr.push_str(&card("NAXIS3", &ch.to_string()));
+    }
+    let bzero: f64 = match bitpix {
+        16 => 32768.0,
+        32 => 2147483648.0,
+        _ => 0.0,
+    };
+    if bitpix > 0 {
+        hdr.push_str(&card("BZERO", &format!("{bzero}")));
+        hdr.push_str(&card("BSCALE", "1"));
+    }
+    for k in extra_cards {
+        if k.name == "COMMENT" || k.name == "HISTORY" {
+            hdr.push_str(&format!("{:<80}", format!("{} {}", k.name, k.comment)));
+        } else {
+            hdr.push_str(&card(&k.name, &k.value));
+        }
+    }
+    hdr.push_str(&format!("{:<80}", "END"));
+    while !hdr.len().is_multiple_of(2880) {
+        hdr.push(' ');
+    }
+    let mut bytes = hdr.into_bytes();
+    let (wu, hu) = (w as usize, h as usize);
+    let norm: f64 = match bitpix {
+        8 => 255.0,
+        16 => 65535.0,
+        32 => 4294967295.0,
+        _ => 1.0,
+    };
+    for c in 0..ch as usize {
+        for r_file in 0..hu {
+            let r_img = if top_down { r_file } else { hu - 1 - r_file };
+            let row = &planes[(c * hu + r_img) * wu..(c * hu + r_img + 1) * wu];
+            for &v in row {
+                match bitpix {
+                    8 => bytes.push((v as f64 * norm).round().clamp(0.0, 255.0) as u8),
+                    16 => bytes.extend(
+                        (((v as f64 * norm).round().clamp(0.0, 65535.0) - bzero) as i16)
+                            .to_be_bytes(),
+                    ),
+                    32 => bytes.extend(
+                        (((v as f64 * norm).round().clamp(0.0, 4294967295.0) - bzero) as i32)
+                            .to_be_bytes(),
+                    ),
+                    -32 => bytes.extend(v.to_be_bytes()),
+                    -64 => bytes.extend((v as f64).to_be_bytes()),
+                    other => {
+                        return Err(Error::format(
+                            path,
+                            format!("write_fits: unsupported BITPIX {other}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    while !bytes.len().is_multiple_of(2880) {
+        bytes.push(0);
     }
     std::fs::write(path, bytes).map_err(|e| Error::io(path, e))
 }
