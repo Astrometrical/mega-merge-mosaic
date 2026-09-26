@@ -39,8 +39,13 @@ pub fn linear_from_keywords(cards: &[FitsKeyword]) -> Result<LinearWcs, String> 
         return Err("TPV distortion is unsupported (re-solve with TAN-SIP)".into());
     }
     if code1 != "TAN" || code2 != "TAN" {
+        let (card, code) = if code1 != "TAN" {
+            ("CTYPE1", &code1)
+        } else {
+            ("CTYPE2", &code2)
+        };
         return Err(format!(
-            "unsupported projection '{code1}' (only the gnomonic TAN / TAN-SIP projection is supported)"
+            "{card} projection '{code}' is unsupported (only the gnomonic TAN / TAN-SIP projection is supported)"
         ));
     }
     if let Some(k) = cards.iter().find(|k| {
@@ -236,6 +241,12 @@ mod tests {
         c[0] = kw("CTYPE1", "'RA---SIN'");
         c[1] = kw("CTYPE2", "'DEC--SIN'");
         assert!(linear_from_keywords(&c).unwrap_err().contains("projection"));
+        let mut c = with_cd(base());
+        c[1] = kw("CTYPE2", "'DEC--SIN'");
+        let err = linear_from_keywords(&c).unwrap_err();
+        assert!(err.contains("SIN"), "{err}");
+        assert!(err.contains("CTYPE2"), "{err}");
+        assert!(!err.contains("'TAN'"), "{err}");
         let mut c = with_cd(base());
         c[0] = kw("CTYPE1", "'RA---TPV'");
         c[1] = kw("CTYPE2", "'DEC--TPV'");
