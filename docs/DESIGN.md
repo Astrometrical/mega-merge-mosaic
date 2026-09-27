@@ -515,8 +515,11 @@ Files path); spec:
   Extension HDUs, fpack, BITPIX 64 refused by name.
 - **Orientation**: `ROWORDER = 'TOP-DOWN'` files read verbatim; everything
   else (standard FITS) is flipped on read and the WCS reflected into the
-  top-down frame (`LinearWcs::reflect_rows`). PixInsight-authored bottom-up
-  FITS is unverified (PI may interpret cards in display space).
+  top-down frame (`LinearWcs::reflect_rows`). PixInsight-exported FITS
+  carries no astrometric solution at all (PixInsight dropped WCS keywords
+  from its FITS output some time ago; XISF is its only solved format), so a
+  PixInsight FITS can only be *aligned* input, never solved input — the
+  display-space card question from the mirror saga never arises for it.
 - **WCS** (`astrometry/fits_wcs.rs`): TAN / TAN-SIP only; CD, PC+CDELT, or
   CDELT+CROTA2. TPV/PV refused. **SIP** (`astrometry/sip.rs`): forward
   polynomials; AP/BP only seed a Newton inverse (exact either way);

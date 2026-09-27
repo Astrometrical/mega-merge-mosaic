@@ -53,10 +53,12 @@ The reflection of a linear WCS is the inverse of the existing
 `y' = y_img + 0.5 = H − j + 1`, `y' − CRPIX2' = −(j − CRPIX2)`, so the
 negated second column reproduces the file's `(ξ, η)` exactly.
 
-PixInsight-authored bottom-up FITS falls under the second bullet. PixInsight
-may interpret cards in display space (see the mirror saga in DESIGN.md), in
-which case its exported files would come out reflected. This is documented
-as unverified; PixInsight export was explicitly not a first-class producer.
+PixInsight-authored bottom-up FITS falls under the second bullet for its
+pixel rows. (Post-implementation note, 2026-09-27: PixInsight-exported FITS
+carries no astrometric solution — PixInsight dropped WCS keywords from its
+FITS output some time ago, making XISF its only solved format — so such
+files can only be aligned input; the display-space card concern from the
+mirror saga does not apply to them.)
 
 **Pixel values.** `phys = BZERO + BSCALE · raw` for every BITPIX. Integer
 data is then normalized to `[0, 1]` by dividing by `2^|BITPIX| − 1`, which
