@@ -219,9 +219,13 @@ just scales accordingly — see the 2× drizzle row in the performance table.
 
 ## Input requirements & limitations
 
-- **Input:** XISF only, uncompressed, Float32, monolithic (one file per
-  panel) — exactly what PixInsight writes by default. FITS and compressed
-  XISF input are not yet supported.
+- **Input:** XISF (uncompressed, Float32, monolithic — exactly what
+  PixInsight writes by default) or FITS (primary HDU, NAXIS 2 or planar 3,
+  BITPIX 8/16/32/−32/−64; standard bottom-up files are flipped on read and
+  their WCS, including SIP, is used for solved-mode alignment;
+  `ROWORDER = 'TOP-DOWN'` files are read verbatim). Not yet supported:
+  compressed XISF, tile-compressed FITS (`.fz`), image data in extension
+  HDUs, non-TAN projections, and TPV/PV distortion.
 - **Output:** 32-bit float FITS (plus autostretched 8-bit PNG previews).
 - **Linear data** is expected end-to-end; zero is the no-data sentinel
   (registered panels must keep their hard zero padding).
