@@ -835,9 +835,107 @@ pub fn write_fits(
     std::fs::write(path, bytes).map_err(|e| Error::io(path, e))
 }
 
+/// SIP polynomial terms for a synthetic FITS panel, in the file's own pixel
+/// frame (`(p, q, coefficient)` triples; `p + q ≤ order`).
+#[derive(Debug, Clone, Default)]
+pub struct SynthSip {
+    /// Polynomial order (`A_ORDER`/`B_ORDER`, and `AP_`/`BP_` when given).
+    pub order: usize,
+    /// Forward `A_p_q` terms.
+    pub a: Vec<(usize, usize, f64)>,
+    /// Forward `B_p_q` terms.
+    pub b: Vec<(usize, usize, f64)>,
+    /// Inverse `AP_p_q` terms (empty = not written).
+    pub ap: Vec<(usize, usize, f64)>,
+    /// Inverse `BP_p_q` terms (empty = not written).
+    pub bp: Vec<(usize, usize, f64)>,
+}
+
+/// The WCS (+SIP) cards [`write_fits_solved`] puts in a bottom-up file for a
+/// solution given in top-down image coordinates: `CRPIX` from
+/// [`SynthWcs::refimg`] (+0.5 for the FITS 1-based convention), with `CRPIX2`
+/// and the second `CD` column reflected over `h` rows so that reading the
+/// file back (and flipping it to top-down) recovers `wcs` exactly.
+///
+/// Returned rather than only written so tests can build the very model the
+/// pipeline will see via
+/// [`crate::astrometry::fits_wcs::model_from_keywords`].
+pub fn solved_fits_cards(wcs: &SynthWcs, h: u64, sip: Option<&SynthSip>) -> Vec<FitsKeyword> {
+    let kw = |n: &str, v: String| FitsKeyword {
+        name: n.into(),
+        value: v,
+        comment: String::new(),
+    };
+    let suffix = if sip.is_some() { "-SIP" } else { "" };
+    let mut cards = vec![
+        kw("CTYPE1", format!("'RA---TAN{suffix}'")),
+        kw("CTYPE2", format!("'DEC--TAN{suffix}'")),
+        kw("CRVAL1", format!("{:.12}", wcs.crval[0])),
+        kw("CRVAL2", format!("{:.12}", wcs.crval[1])),
+        kw("CRPIX1", format!("{:.6}", wcs.refimg[0] + 0.5)),
+        kw(
+            "CRPIX2",
+            format!("{:.6}", h as f64 + 1.0 - (wcs.refimg[1] + 0.5)),
+        ),
+        kw("CD1_1", format!("{:e}", wcs.cd[0][0])),
+        kw("CD1_2", format!("{:e}", -wcs.cd[0][1])),
+        kw("CD2_1", format!("{:e}", wcs.cd[1][0])),
+        kw("CD2_2", format!("{:e}", -wcs.cd[1][1])),
+        kw("RADESYS", "'ICRS'".into()),
+    ];
+    if let Some(s) = sip {
+        cards.push(kw("A_ORDER", s.order.to_string()));
+        cards.push(kw("B_ORDER", s.order.to_string()));
+        for (p, q, c) in &s.a {
+            cards.push(kw(&format!("A_{p}_{q}"), format!("{c:e}")));
+        }
+        for (p, q, c) in &s.b {
+            cards.push(kw(&format!("B_{p}_{q}"), format!("{c:e}")));
+        }
+        if !s.ap.is_empty() || !s.bp.is_empty() {
+            cards.push(kw("AP_ORDER", s.order.to_string()));
+            cards.push(kw("BP_ORDER", s.order.to_string()));
+            for (p, q, c) in &s.ap {
+                cards.push(kw(&format!("AP_{p}_{q}"), format!("{c:e}")));
+            }
+            for (p, q, c) in &s.bp {
+                cards.push(kw(&format!("BP_{p}_{q}"), format!("{c:e}")));
+            }
+        }
+    }
+    cards
+}
+
+/// [`write_fits`] plus a plate solution: a bottom-up FITS carrying the linear
+/// WCS of `wcs` (reflected into the file frame by [`solved_fits_cards`]) and
+/// optional SIP terms in the file's pixel frame. The FITS counterpart of
+/// [`write_xisf_solved`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_fits_solved(
+    path: &Path,
+    w: u64,
+    h: u64,
+    ch: u64,
+    planes: &[f32],
+    wcs: &SynthWcs,
+    sip: Option<&SynthSip>,
+    bitpix: i32,
+) -> Result<()> {
+    write_fits(
+        path,
+        w,
+        h,
+        ch,
+        planes,
+        bitpix,
+        &solved_fits_cards(wcs, h, sip),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::InputPanel;
     use crate::formats::xisf::XisfPanel;
 
     fn tmpdir(tag: &str) -> PathBuf {
@@ -940,6 +1038,73 @@ mod tests {
         // The reference image coordinate maps to the reference sky position.
         let (ra, dec) = model.pixel_to_sky(wcs.refimg[0], wcs.refimg[1]);
         assert!((ra - wcs.crval[0]).abs() < 1e-9 && (dec - wcs.crval[1]).abs() < 1e-9);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `write_fits_solved` must hide its bottom-up storage completely: the
+    /// reflection it applies to `CRPIX2` and the second `CD` column is undone
+    /// on read, so the panel's top-down linear solution is bit-for-bit the
+    /// [`SynthWcs`] it was given. The contract the FITS e2e tests build on.
+    #[test]
+    fn write_fits_solved_round_trips_top_down_solution() {
+        let dir = tmpdir("fits-solved");
+        let (w, h, ch) = (24u64, 16u64, 2u64);
+        let planes: Vec<f32> = (0..(w * h * ch)).map(|i| i as f32 * 0.001).collect();
+        // Non-diagonal matrix (rotation) so the column negation is pinned.
+        let wcs = SynthWcs {
+            crval: [84.25, -3.5],
+            refimg: [12.25, 8.75],
+            cd: [[-4.0e-4, 0.5e-4], [0.5e-4, 4.0e-4]],
+        };
+
+        let path = dir.join("solved.fits");
+        write_fits_solved(&path, w, h, ch, &planes, &wcs, None, -32).unwrap();
+        let panel = InputPanel::open(&path).unwrap();
+        assert_eq!(panel.format_name(), "FITS");
+        let lin = panel.linear_wcs().expect("a solved FITS has a linear WCS");
+        // The reflection cancels: image coords + 0.5 on both axes, CD verbatim.
+        assert_eq!(lin.crpix, [wcs.refimg[0] + 0.5, wcs.refimg[1] + 0.5]);
+        assert_eq!(lin.cd, wcs.cd);
+        assert_eq!(lin.crval, wcs.crval);
+        let model = panel.wcs_model().expect("model from the written cards");
+        assert_eq!(model.linear.crpix, lin.crpix);
+        let (ra, dec) = model.pixel_to_sky(wcs.refimg[0], wcs.refimg[1]);
+        assert!((ra - wcs.crval[0]).abs() < 1e-9 && (dec - wcs.crval[1]).abs() < 1e-9);
+
+        // With SIP the linear layer is unchanged and the model carries the
+        // distortion (the reference pixel still lands on CRVAL).
+        let sip = SynthSip {
+            order: 2,
+            a: vec![(2, 0, 1.5e-4), (1, 1, -2.0e-4), (0, 2, 1.0e-4)],
+            b: vec![(2, 0, -1.0e-4), (1, 1, 1.2e-4), (0, 2, 2.0e-4)],
+            ap: vec![(2, 0, -1.5e-4), (1, 1, 2.0e-4), (0, 2, -1.0e-4)],
+            bp: vec![(2, 0, 1.0e-4), (1, 1, -1.2e-4), (0, 2, -2.0e-4)],
+        };
+        let sip_path = dir.join("solved-sip.fits");
+        write_fits_solved(&sip_path, w, h, ch, &planes, &wcs, Some(&sip), -32).unwrap();
+        let panel = InputPanel::open(&sip_path).unwrap();
+        let sip_lin = panel.linear_wcs().expect("a solved FITS has a linear WCS");
+        assert_eq!(sip_lin.crpix, lin.crpix);
+        assert_eq!(sip_lin.cd, lin.cd);
+        let sip_model = panel
+            .wcs_model()
+            .expect("the SIP cards must form a valid model");
+        // The SIP model is evaluated through a grid sampled every 16 px, so
+        // the reference pixel lands on CRVAL to interpolation accuracy only.
+        let (ra, dec) = sip_model.pixel_to_sky(wcs.refimg[0], wcs.refimg[1]);
+        assert!(
+            (ra - wcs.crval[0]).abs() < 1e-5 && (dec - wcs.crval[1]).abs() < 1e-5,
+            "SIP reference pixel maps to ({ra}, {dec}), want {:?}",
+            wcs.crval
+        );
+        // SIP bends the corner away from the linear solution.
+        let (lra, ldec) = model.pixel_to_sky(0.5, 0.5);
+        let (sra, sdec) = sip_model.pixel_to_sky(0.5, 0.5);
+        assert!(
+            (sra - lra).abs() + (sdec - ldec).abs() > 1e-7,
+            "the SIP terms must move the corner"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

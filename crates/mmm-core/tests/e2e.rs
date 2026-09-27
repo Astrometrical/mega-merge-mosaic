@@ -18,15 +18,20 @@ use std::path::{Path, PathBuf};
 
 use mmm_core::Result;
 use mmm_core::analyze::{InputSelect, analyze, analyze_gain, analyze_input, analyze_opts};
-use mmm_core::astrometry::LinearWcs;
+use mmm_core::astrometry::{LinearWcs, WcsModel, fits_wcs};
 use mmm_core::blend::{BlendMode, BlendParams, RowSink, blend, union_bbox};
+use mmm_core::formats::RowOrder;
 use mmm_core::formats::xisf::XisfPanel;
 use mmm_core::linalg::solve_dense;
 use mmm_core::overlap::OverlapGraph;
+use mmm_core::panel_reader::PanelStorage;
 use mmm_core::photometry::{GainMode, Photometry};
 use mmm_core::session::{InputKind, Session};
 use mmm_core::surfaces::Surfaces;
-use mmm_core::synth::{SynthSpec, SynthWcs, generate, write_xisf, write_xisf_solved};
+use mmm_core::synth::{
+    SynthSip, SynthSpec, SynthWcs, generate, solved_fits_cards, write_fits_solved, write_xisf,
+    write_xisf_solved,
+};
 
 /// In-memory sink collecting the whole (small) blended output, planar.
 struct MemSink {
@@ -1619,9 +1624,64 @@ struct SolvedPanelSpec {
     offset: f32,
 }
 
+/// Which file format — and which astrometric model — a synthetic solved panel
+/// is written in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SolvedFormat {
+    /// A monolithic XISF carrying a linear `PCL:AstrometricSolution:*` block.
+    Xisf,
+    /// A bottom-up FITS carrying `CRVAL`/`CRPIX`/`CD` cards, plus order-2 SIP
+    /// distortion when `sip`.
+    Fits {
+        /// Write `A_`/`B_` (and `AP_`/`BP_`) SIP terms.
+        sip: bool,
+    },
+}
+
+impl SolvedFormat {
+    /// File extension the panel is written with.
+    fn ext(self) -> &'static str {
+        match self {
+            SolvedFormat::Xisf => "xisf",
+            SolvedFormat::Fits { .. } => "fits",
+        }
+    }
+}
+
+/// Order-2 SIP terms for panel `k`, in the file's own pixel frame, with an
+/// approximate inverse (the model's Newton polish makes the inverse exact
+/// regardless of how rough `AP_`/`BP_` are).
+///
+/// Scaled so the corners of the ~210×170 test panels move by 4–8 px (the
+/// writer prints the measured figure and asserts it is over 1 px): large
+/// enough that dropping or misreading the polynomial blows the RMSE bound,
+/// small enough to stay a plausible optical distortion and to pass the
+/// model's own consistency validation. The per-panel factor makes every
+/// panel's distortion different, so a panel-index mix-up shows up too.
+fn synth_sip(k: usize) -> SynthSip {
+    let s = 1.0 + 0.3 * k as f64;
+    SynthSip {
+        order: 2,
+        a: vec![(2, 0, 1.5e-4 * s), (1, 1, -2.0e-4 * s), (0, 2, 1.0e-4 * s)],
+        b: vec![(2, 0, -1.0e-4 * s), (1, 1, 1.2e-4 * s), (0, 2, 2.0e-4 * s)],
+        ap: vec![(2, 0, -1.5e-4 * s), (1, 1, 2.0e-4 * s), (0, 2, -1.0e-4 * s)],
+        bp: vec![(2, 0, 1.0e-4 * s), (1, 1, -1.2e-4 * s), (0, 2, -2.0e-4 * s)],
+    }
+}
+
 /// Render and write solved panels for `scene`: pixel (i, j) carries the exact
-/// analytic scene at the sky its own linear WCS assigns to span coordinate
-/// (i + 0.5, j + 0.5), times gain plus offset plus per-panel Gaussian noise.
+/// analytic scene at the sky its own solution assigns to the pixel's center,
+/// times gain plus offset plus per-panel Gaussian noise. `format(k)` picks
+/// panel `k`'s file format, so a set can mix XISF and FITS panels.
+///
+/// The sky of pixel (i, j) is taken from the very model the pipeline will
+/// build from the file: the linear XISF solution at FITS coordinate
+/// (i + 1, j + 1), or — for FITS — [`WcsModel::pixel_to_sky`] at image
+/// coordinate (i + 0.5, j + 0.5) of the model
+/// [`fits_wcs::model_from_keywords`] decodes from the written cards. The two
+/// formulas are the same placement law; the SIP-free FITS panels assert that
+/// they agree to 1e-12°.
+#[allow(clippy::too_many_arguments)] // a scene/geometry/photometry fixture builder
 fn write_solved_panels(
     dir: &Path,
     scene: &Scene,
@@ -1630,6 +1690,7 @@ fn write_solved_panels(
     scale_deg: f64,
     noise_sigma: f64,
     seed: u64,
+    format: &dyn Fn(usize) -> SolvedFormat,
 ) -> Vec<PathBuf> {
     std::fs::create_dir_all(dir).unwrap();
     let mut paths = Vec::new();
@@ -1650,6 +1711,67 @@ fn write_solved_panels(
             radesys: "ICRS".into(),
         };
         let (w, h) = (spec.w as usize, spec.h as usize);
+        let synth_wcs = SynthWcs {
+            crval: [cra, cdec],
+            refimg,
+            cd,
+        };
+        let fmt = format(k);
+        let sip = match fmt {
+            SolvedFormat::Fits { sip: true } => Some(synth_sip(k)),
+            _ => None,
+        };
+        // The FITS model, decoded from the very cards the file will carry.
+        let fits_model = |terms: Option<&SynthSip>| -> WcsModel {
+            let cards = solved_fits_cards(&synth_wcs, spec.h, terms);
+            fits_wcs::model_from_keywords(&cards, spec.w, spec.h, RowOrder::BottomUp)
+                .expect("the synthetic FITS cards must form a valid model")
+        };
+        let model: Option<WcsModel> = match fmt {
+            SolvedFormat::Xisf => None,
+            SolvedFormat::Fits { .. } => Some(fits_model(sip.as_ref())),
+        };
+        let corners = [
+            (0.0, 0.0),
+            (spec.w as f64 - 1.0, 0.0),
+            (0.0, spec.h as f64 - 1.0),
+            (spec.w as f64 - 1.0, spec.h as f64 - 1.0),
+        ];
+        if fmt == (SolvedFormat::Fits { sip: false }) {
+            // Both placement formulas are the same law: image coordinate
+            // (i + 0.5, j + 0.5) is FITS (i + 1, j + 1).
+            let m = model.as_ref().unwrap();
+            for (x, y) in corners {
+                let (fra, fdec) = m.pixel_to_sky(x + 0.5, y + 0.5);
+                let (lra, ldec) = lin.pixel_to_sky(x + 1.0, y + 1.0);
+                assert!(
+                    (fra - lra).abs() < 1e-12 && (fdec - ldec).abs() < 1e-12,
+                    "panel {k} at ({x}, {y}): FITS model ({fra}, {fdec}) disagrees with the \
+                     XISF formula ({lra}, {ldec})"
+                );
+            }
+        }
+        if let Some(s) = &sip {
+            // How far the SIP terms actually bend the corners — the margin
+            // that makes the RMSE bound a real test of the SIP path.
+            let linear_only = fits_model(None);
+            let m = model.as_ref().unwrap();
+            let mut max_px = 0.0f64;
+            for (x, y) in corners {
+                let (r1, d1) = m.pixel_to_sky(x + 0.5, y + 0.5);
+                let (r0, d0) = linear_only.pixel_to_sky(x + 0.5, y + 0.5);
+                let dra = (r1 - r0) * d0.to_radians().cos();
+                max_px = max_px.max(dra.hypot(d1 - d0) / scale_deg);
+            }
+            eprintln!(
+                "panel {k}: order-{} SIP displaces the corners by up to {max_px:.2} px",
+                s.order
+            );
+            assert!(
+                max_px > 1.0,
+                "panel {k}: SIP displacement {max_px:.3} px is too small to test anything"
+            );
+        }
         let mut rng = MiniRng::new(seed ^ (0xABCD << k));
         let mut planes = vec![0.0f32; channels * w * h];
         for j in 0..h {
@@ -1657,7 +1779,10 @@ fn write_solved_panels(
                 // Raw panels honor the span convention: array pixel (i, j)
                 // has its center at solution coordinate (i+0.5, j+0.5), i.e.
                 // FITS (i+1, j+1).
-                let (ra, dec) = lin.pixel_to_sky(i as f64 + 1.0, j as f64 + 1.0);
+                let (ra, dec) = match &model {
+                    None => lin.pixel_to_sky(i as f64 + 1.0, j as f64 + 1.0),
+                    Some(m) => m.pixel_to_sky(i as f64 + 0.5, j as f64 + 0.5),
+                };
                 let (u, v) = scene.wcs.sky_to_pixel(ra, dec);
                 for c in 0..channels {
                     let v0 = scene.at_uv(u, v, c) * spec.gain as f64
@@ -1667,34 +1792,55 @@ fn write_solved_panels(
                 }
             }
         }
-        let path = dir.join(format!("solved_{k:02}.xisf"));
-        write_xisf_solved(
-            &path,
-            spec.w,
-            spec.h,
-            channels as u64,
-            &planes,
-            &SynthWcs {
-                crval: [cra, cdec],
-                refimg,
-                cd,
-            },
-        )
-        .unwrap();
+        let path = dir.join(format!("solved_{k:02}.{}", fmt.ext()));
+        match fmt {
+            SolvedFormat::Xisf => {
+                write_xisf_solved(&path, spec.w, spec.h, channels as u64, &planes, &synth_wcs)
+                    .unwrap();
+            }
+            SolvedFormat::Fits { .. } => {
+                // BITPIX -32: raw floats, so no quantization enters the truth.
+                write_fits_solved(
+                    &path,
+                    spec.w,
+                    spec.h,
+                    channels as u64,
+                    &planes,
+                    &synth_wcs,
+                    sip.as_ref(),
+                    -32,
+                )
+                .unwrap();
+            }
+        }
         paths.push(path);
     }
     paths
 }
 
-/// Mandatory phase-5 test 1: solved-input e2e. A known analytic sky is cut
-/// into four panels at their own offset geometries with correct linear
-/// solutions including modest per-panel rotations; `analyze --input solved`
-/// chooses a frame, reprojects, and the blended mosaic must match the
-/// analytic truth within the phase-1 RMSE bound (2·noise_sigma, noiseless
-/// truth in the reference panel's photometric frame).
-#[test]
-fn solved_input_pipeline_recovers_ground_truth() {
-    let dir = tempdir("solved");
+/// Mandatory phase-5 test 1, parameterized over the input file format: a
+/// known analytic sky is cut into four panels at their own offset geometries
+/// with correct solutions including modest per-panel rotations;
+/// `analyze --input solved` chooses a frame, reprojects, and the blended
+/// mosaic must match the analytic truth within the phase-1 RMSE bound
+/// (2·noise_sigma, noiseless truth in the reference panel's photometric
+/// frame).
+///
+/// `format(k)` picks panel `k`'s container and distortion model, so the same
+/// gate runs over XISF, FITS, FITS+SIP and mixed sets; the only
+/// format-dependent assertion is on the recorded `source`/`storage`.
+///
+/// `gain_tol` bounds how far the composed (recovered ∘ applied) gains may
+/// drift apart. The scene's background spans only ~±20% within a panel, so
+/// the gain/offset fit takes most of its leverage from a few stars and
+/// scatters by up to ~1.5% per channel even on the uniform sets. Which panel
+/// carries the gauge and which overlaps pair up both move that scatter
+/// around, so a set whose gauge lands elsewhere can see ~2.5% on one channel
+/// with no format-dependent bias (measured: the mixed set's worst case is
+/// 2.6% on one channel only; the same mix with the formats swapped stays
+/// under 1.7%). Uniform sets hold 2%.
+fn run_solved_pipeline(tag: &str, gain_tol: f64, format: &dyn Fn(usize) -> SolvedFormat) {
+    let dir = tempdir(tag);
     const S: f64 = 1.0e-3; // 3.6″/px
     let noise_sigma = 0.002f64;
     let nch = 3usize;
@@ -1715,7 +1861,16 @@ fn solved_input_pipeline_recovers_ground_truth() {
                 offset: offsets[k],
             })
             .collect();
-    let paths = write_solved_panels(&dir.join("panels"), &scene, &specs, nch, S, noise_sigma, 7);
+    let paths = write_solved_panels(
+        &dir.join("panels"),
+        &scene,
+        &specs,
+        nch,
+        S,
+        noise_sigma,
+        7,
+        format,
+    );
 
     let session = analyze_input(
         &paths,
@@ -1732,9 +1887,22 @@ fn solved_input_pipeline_recovers_ground_truth() {
     assert_eq!(session.canvas, (frame.width, frame.height, nch as u64));
     assert!((frame.scale_deg - S).abs() < 1e-12, "median scale");
     for p in &session.panels {
+        let src = p
+            .source
+            .as_ref()
+            .expect("reprojected panels record their source file");
         assert!(
-            p.source.is_some(),
-            "reprojected panels record their source file"
+            matches!(p.storage, PanelStorage::CroppedCache { .. }),
+            "panel {} must be served from a reprojection cache, got {:?}",
+            p.id,
+            p.storage
+        );
+        let want = format(p.id).ext();
+        assert_eq!(
+            src.extension().and_then(|e| e.to_str()),
+            Some(want),
+            "panel {} source {src:?} must be the .{want} input",
+            p.id
         );
     }
 
@@ -1770,8 +1938,9 @@ fn solved_input_pipeline_recovers_ground_truth() {
         for p in 0..n_panels {
             let gain_err = (compose_gain(p) / ref_gain - 1.0).abs();
             assert!(
-                gain_err <= 0.02,
-                "ch {c} panel {p}: composed gain off by {gain_err:.4} (>2%)"
+                gain_err <= gain_tol,
+                "{tag} ch {c} panel {p}: composed gain off by {gain_err:.4} \
+                 (tolerance {gain_tol:.3})"
             );
         }
     }
@@ -1808,14 +1977,57 @@ fn solved_input_pipeline_recovers_ground_truth() {
         assert!(n > 10_000, "interior region unexpectedly small: {n} px");
         let rmse = (sum_sq / n as f64).sqrt();
         let bound = 2.0 * noise_sigma;
-        eprintln!("solved e2e ch {c}: RMSE {rmse:.3e} vs bound {bound:.3e} over {n} interior px");
+        eprintln!("{tag} e2e ch {c}: RMSE {rmse:.3e} vs bound {bound:.3e} over {n} interior px");
         assert!(
             rmse < bound,
-            "ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}"
+            "{tag} ch {c}: RMSE {rmse:.6} exceeds bound {bound:.6}"
         );
     }
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The solved-input gate over PixInsight-style XISF panels.
+#[test]
+fn solved_input_pipeline_recovers_ground_truth() {
+    run_solved_pipeline("solved", 0.02, &|_| SolvedFormat::Xisf);
+}
+
+/// The solved-input gate over bottom-up FITS panels carrying TAN-SIP
+/// solutions: the row flip, the `CD`/`CRPIX` reflection and the SIP
+/// polynomial all have to be right, or the panels land pixels apart and the
+/// RMSE blows the bound.
+#[test]
+fn solved_fits_sip_pipeline_recovers_ground_truth() {
+    run_solved_pipeline("solved-fits-sip", 0.02, &|_| SolvedFormat::Fits {
+        sip: true,
+    });
+}
+
+/// The solved-input gate over bottom-up FITS panels with plain linear
+/// solutions — isolates the row-order/reflection handling from SIP.
+#[test]
+fn solved_fits_linear_pipeline_recovers_ground_truth() {
+    run_solved_pipeline("solved-fits-lin", 0.02, &|_| SolvedFormat::Fits {
+        sip: false,
+    });
+}
+
+/// One mosaic, two containers: panels 0 and 2 as XISF with PixInsight
+/// properties, panels 1 and 3 as bottom-up FITS with TAN-SIP cards. Format is
+/// per file, so a mixed set must blend exactly as well as a uniform one — the
+/// RMSE bound is the same. Only the gain tolerance is wider (3%), for
+/// gain-fit scatter under this set's gauge choice rather than any format
+/// effect (see [`run_solved_pipeline`]).
+#[test]
+fn mixed_xisf_and_fits_panels_blend_together() {
+    run_solved_pipeline("solved-mixed", 0.03, &|k| {
+        if k % 2 == 0 {
+            SolvedFormat::Xisf
+        } else {
+            SolvedFormat::Fits { sip: true }
+        }
+    });
 }
 
 /// Mandatory phase-5 test 2: auto-detection picks the right mode on both
@@ -1882,7 +2094,9 @@ fn auto_detects_input_kind() {
             offset: 0.002,
         },
     ];
-    let paths = write_solved_panels(&dir.join("mixed"), &scene, &mixed, 1, S, 0.001, 3);
+    let paths = write_solved_panels(&dir.join("mixed"), &scene, &mixed, 1, S, 0.001, 3, &|_| {
+        SolvedFormat::Xisf
+    });
     let session =
         analyze_input(&paths, &dir.join("b.mmm-session"), None, InputSelect::Auto).unwrap();
     assert_eq!(
@@ -1912,7 +2126,9 @@ fn auto_detects_input_kind() {
             offset: 0.001,
         },
     ];
-    let paths = write_solved_panels(&dir.join("same"), &scene, &same, 1, S, 0.001, 4);
+    let paths = write_solved_panels(&dir.join("same"), &scene, &same, 1, S, 0.001, 4, &|_| {
+        SolvedFormat::Xisf
+    });
     let session =
         analyze_input(&paths, &dir.join("c.mmm-session"), None, InputSelect::Auto).unwrap();
     assert_eq!(
