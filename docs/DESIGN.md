@@ -510,7 +510,8 @@ Files path); spec:
 - **Reader** (`formats/fits.rs`): primary HDU, NAXIS 2/3 planar, BITPIX
   8/16/32/−32/−64; rows decoded on demand into the per-thread band cache
   (`band_cache.rs`, shared with the IPC backing). Integer data normalized to
-  [0, 1] by the type range after BZERO/BSCALE; NaN/Inf/negative/BLANK → 0.
+  [0, 1] by the type range after BZERO/BSCALE; NaN/Inf/BLANK → 0; negative
+  integer samples → 0; float samples keep their sign.
   Extension HDUs, fpack, BITPIX 64 refused by name.
 - **Orientation**: `ROWORDER = 'TOP-DOWN'` files read verbatim; everything
   else (standard FITS) is flipped on read and the WCS reflected into the
@@ -520,10 +521,22 @@ Files path); spec:
   CDELT+CROTA2. TPV/PV refused. **SIP** (`astrometry/sip.rs`): forward
   polynomials; AP/BP only seed a Newton inverse (exact either way);
   validated like the standard solution; sampled onto the same 16 px grids.
-  Verified against astropy on four synthetic headers to < 1e-9° forward /
-  1e-4 px inverse (`tests/fixtures/sip_oracle.json`).
+  Verified against astropy on four synthetic headers
+  (`tests/fixtures/sip_oracle.json`): < 1e-9° / 1e-4 px on direct
+  evaluation, 2e-7° / 5e-3 px through the sampled grids.
+- **Refusals**: FK4 `RADESYS`, `EQUINOX` ≠ 2000, `LONPOLE` ≠ 180, non-`deg`
+  `CUNIT`, and a present-but-unparseable `*_ORDER` are errors, never
+  approximated.
 - **Output**: SIP cards never pass through; aligned FITS sessions emit
-  fresh linear cards from the reflected WCS.
+  fresh linear cards from the reflected WCS (input SIP is not propagated —
+  the output carries only the linear WCS). BLANK, DATAMIN/DATAMAX and
+  CHECKSUM/DATASUM are dropped from the passthrough.
+- **Memory**: a solved-mode FITS panel is materialized once in anonymous
+  memory by `reproject_from_reader` (same footprint as the XISF mmap path,
+  ~195 MB for a 4944×3284×3 Orion raw panel). In aligned mode the band cache
+  allocates cells lazily: `cells_touched × 16 × width × channels × 4` bytes
+  per open panel — ≤ 16 × 1.78 MB ≈ 28 MB for a 9255-wide RGB Orion panel
+  at 16 threads (was ~121 MB eagerly at 64 rows).
 - **Real data** (2026-09-27, `scripts/nova_solve_panels.py` +
   `compare_mosaics.py`): raw Orion panels 3/4/7/8 solved privately by
   nova.astrometry.net (tweak_order 3, all first try; `A_ORDER` 3, SIP corner
