@@ -246,7 +246,9 @@ impl FitsPanel {
     /// Decode `n` canvas rows of channel `c` starting at top-down canvas row
     /// `canvas_y0` into `out` (`n * width` values, rows contiguous): the
     /// flip rule, byte order, BZERO/BSCALE, integer normalization, and the
-    /// zero sentinel for NaN/Inf/negative/BLANK samples are all applied.
+    /// zero sentinel for NaN/Inf/BLANK samples are all applied. Negative
+    /// integer (BITPIX > 0) samples also become 0; floating samples keep
+    /// their sign, taken as-is after BZERO/BSCALE.
     pub fn decode_rows(&self, c: u64, canvas_y0: u64, n: usize, out: &mut [f32]) {
         let h = &self.header;
         let w = h.width as usize;
@@ -292,11 +294,8 @@ impl FitsPanel {
                 } else {
                     (h.bzero + h.bscale * raw) / norm
                 };
-                *d = if v.is_finite() && v > 0.0 {
-                    v as f32
-                } else {
-                    0.0
-                };
+                let keep = if h.bitpix < 0 { v != 0.0 } else { v > 0.0 };
+                *d = if v.is_finite() && keep { v as f32 } else { 0.0 };
             }
         }
     }
@@ -414,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn nan_inf_negative_and_blank_become_zero() {
+    fn nan_inf_blank_and_negative_integers_become_zero() {
         let dir = tmpdir("nan");
         let (w, h) = (4u64, 1u64);
         let path = dir.join("f.fits");
@@ -429,7 +428,35 @@ mod tests {
         )
         .unwrap();
         let p = FitsPanel::open(&path).unwrap();
-        assert_eq!(read_all(&p), vec![0.0, 0.0, 0.0, 0.5]);
+        // Float samples keep their sign (background-subtracted noise is
+        // data, not a hole); only NaN/Inf become the sentinel.
+        assert_eq!(read_all(&p), vec![0.0, 0.0, -0.5, 0.5]);
+        // Integer data clamps a negative physical value to 0: a hand-written
+        // BITPIX 16 file with no BZERO (so phys = raw) and raw -100.
+        let path = dir.join("neg16.fits");
+        let mut hdr = String::new();
+        for c in [
+            "SIMPLE  =                    T",
+            "BITPIX  =                   16",
+            "NAXIS   =                    2",
+            "NAXIS1  =                    2",
+            "NAXIS2  =                    1",
+            "END",
+        ] {
+            hdr.push_str(&format!("{c:<80}"));
+        }
+        while !hdr.len().is_multiple_of(BLOCK) {
+            hdr.push(' ');
+        }
+        let mut bytes = hdr.into_bytes();
+        bytes.extend_from_slice(&(-100i16).to_be_bytes());
+        bytes.extend_from_slice(&1000i16.to_be_bytes());
+        bytes.resize(bytes.len().next_multiple_of(BLOCK), 0);
+        std::fs::write(&path, bytes).unwrap();
+        let p = FitsPanel::open(&path).unwrap();
+        let got = read_all(&p);
+        assert_eq!(got[0], 0.0, "negative integer sample clamps to 0");
+        assert!((got[1] - 1000.0 / 65535.0).abs() < 1e-7, "{}", got[1]);
         // BLANK on integer data: write raw 16-bit with BZERO 32768; raw value
         // -32768 (phys 0) is also declared BLANK — both map to 0 anyway, so
         // declare BLANK = 0 raw (phys 32768 → 0.5) and check it vanishes.
