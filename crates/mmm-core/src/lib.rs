@@ -28,7 +28,9 @@
 //! - [`diag`] — seam/ownership diagnostics for reporting UIs.
 //! - [`formats`] + [`panel_reader`] — input access: the XISF and FITS readers
 //!   behind the format-agnostic [`formats::InputPanel`], and the
-//!   storage-agnostic row reader the pipeline consumes.
+//!   storage-agnostic row reader the pipeline consumes. For band-cached
+//!   readers (IPC, FITS) a row slice is valid only until the same thread's
+//!   next `row` call lands in a different band — hold one band's rows at a time.
 //! - [`astrometry`] + [`align`] — WCS extraction/emission and the solved-panel
 //!   reprojection path.
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests

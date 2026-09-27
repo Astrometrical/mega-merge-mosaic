@@ -13,13 +13,20 @@ use crate::{Error, Result};
 /// One calling thread's cached band: rows `[y0, y0 + rows_in_band)` of the
 /// panel, planar (`channels` planes, each `rows_in_band * width` f32s), or
 /// `valid = false` if nothing has been fetched into `buf` yet.
+///
+/// `buf` starts empty and is sized to the cache's full band capacity on the
+/// first fetch that lands in this cell, so a cell only costs memory once
+/// its thread actually reads from the panel (a blend touches few of the
+/// pool's cells per panel). The resize happens under the same exclusive
+/// borrow that fills the buffer — see the `unsafe impl Sync` justification.
 struct ThreadBand {
     /// First canvas row covered by `buf`, meaningful only if `valid`.
     y0: u64,
     /// Whether `buf` currently holds a fetched band (vs. never-yet-filled).
     valid: bool,
-    /// Planar pixel data for the cached band; reused in place across bands
-    /// (only the length actually written is meaningful).
+    /// Planar pixel data for the cached band; empty until this cell's first
+    /// fetch, then `cap` f32s reused in place across bands (only the length
+    /// actually written is meaningful).
     buf: Vec<f32>,
 }
 
@@ -60,6 +67,9 @@ pub(crate) struct BandCache {
     canvas: (u64, u64, u64),
     /// Rows per fetched band (the last band of the panel may be shorter).
     band_rows: usize,
+    /// Full band buffer length in f32s (`channels * band_rows * width`),
+    /// allocated per cell lazily on that cell's first fetch.
+    cap: usize,
     /// One cache slot per rayon worker thread, plus one fallback slot
     /// (index `cells.len() - 1`) for calls made outside any rayon pool. See
     /// the `unsafe impl Sync` below for why indexing by thread makes this
@@ -124,6 +134,14 @@ pub(crate) struct BandCache {
 //   lets one thread hold every channel's slice of a row at once — because
 //   none of them overlaps the transient `&mut` from a miss, which by
 //   construction happens-before all of them are created.
+// - Lazy allocation: a cell's `buf` is empty until its first miss, and it
+//   is resized to `cap` under that SAME miss-path `&mut` — before `fetch`
+//   fills it, inside the block that ends before any slice is derived. A
+//   miss is only ever taken when the cell holds no band the caller may
+//   still be reading (the first call on this thread has nothing to
+//   invalidate; later misses follow the rule above), so reallocating the
+//   `Vec` there never dangles a live slice. After the first fill `buf`
+//   keeps its length and is only overwritten in place.
 // - So on a given thread, the sequence is always: (optional) exclusive
 //   borrow to fetch → drop it → shared borrow(s) to read, repeated per call;
 //   never exclusive-concurrent-with-shared or exclusive-concurrent-with-
@@ -145,8 +163,9 @@ unsafe impl Sync for BandCache {}
 
 impl BandCache {
     /// Builds a cache over `canvas` (`width, height, channels`) that fetches
-    /// `band_rows`-row bands on demand; sized cell buffers hold `channels *
-    /// band_rows * width` f32s each.
+    /// `band_rows`-row bands on demand. Each per-thread cell's buffer
+    /// (`channels * band_rows * width` f32s) is allocated lazily on that
+    /// cell's first fetch, so construction allocates no pixel memory.
     pub(crate) fn new(canvas: (u64, u64, u64), band_rows: usize) -> BandCache {
         let (w, _h, ch) = canvas;
         let cap = ch as usize * band_rows * w as usize;
@@ -156,13 +175,14 @@ impl BandCache {
                 UnsafeCell::new(ThreadBand {
                     y0: 0,
                     valid: false,
-                    buf: vec![0f32; cap],
+                    buf: Vec::new(),
                 })
             })
             .collect();
         BandCache {
             canvas,
             band_rows,
+            cap,
             cells,
             error: Mutex::new(None),
         }
@@ -175,6 +195,15 @@ impl BandCache {
     /// planar `channels × (y1 − y0) × width` region to fill). Returns `None`
     /// on a producer error — the error itself is latched, see
     /// [`Self::error`] — or if `canvas_y`/`c` is out of range.
+    ///
+    /// Slice validity:
+    ///
+    /// - A returned slice is valid only until the next `row` call on the
+    ///   same thread that lands in a different band: that call refills this
+    ///   thread's cell in place, overwriting (or, on the cell's first fill,
+    ///   allocating) the buffer the slice points into. Hold at most the rows
+    ///   of one band at a time — the pipeline's readers collect one row's
+    ///   channels and drop them before moving on.
     ///
     /// `fetch` must not call `row` again on this same `BandCache`, nor
     /// otherwise read from it — this call already holds an exclusive borrow
@@ -247,6 +276,11 @@ impl BandCache {
             let w_usize = w as usize;
             let ch_usize = ch as usize;
             let want = ch_usize * bh * w_usize;
+            // Lazy first-use allocation, under this same exclusive borrow
+            // (see the `unsafe impl Sync` justification).
+            if band.buf.len() < self.cap {
+                band.buf.resize(self.cap, 0.0);
+            }
             if let Err(e) = fetch(by0, by1, &mut band.buf[..want]) {
                 self.latch_error(e);
                 band.valid = false;
@@ -278,6 +312,17 @@ impl BandCache {
         let plane_start = c as usize * bh * w_usize;
         let row_start = plane_start + ly * w_usize;
         Some((0, &band.buf[row_start..row_start + w_usize]))
+    }
+
+    /// Number of cells whose band buffer has been allocated (test-only
+    /// probe for the lazy-allocation contract).
+    #[cfg(test)]
+    pub(crate) fn allocated_cells(&self) -> usize {
+        self.cells
+            .iter()
+            // SAFETY: test-only; called with no concurrent `row` callers.
+            .filter(|c| !unsafe { &*c.get() }.buf.is_empty())
+            .count()
     }
 
     /// Latches the first producer error seen by any thread; later errors

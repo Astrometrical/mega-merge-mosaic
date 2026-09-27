@@ -25,8 +25,11 @@ use crate::session::PanelMeta;
 use crate::{Error, Result};
 
 /// Rows per decoded FITS band: a per-thread buffer of `FITS_BAND_ROWS ×
-/// width × channels` f32s (see `FitsBacking` below).
-pub const FITS_BAND_ROWS: usize = 64;
+/// width × channels` f32s, allocated on the thread's first read (see
+/// `FitsBacking` below). Small because FITS decode has no per-call round
+/// trip to amortize (unlike IPC); 16 rows matches `blend`'s per-thread
+/// slice of a 256-row band.
+pub const FITS_BAND_ROWS: usize = 16;
 
 /// How a panel's pixel data is stored on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -262,6 +265,12 @@ impl PanelReader {
     /// One channel row clipped to the panel's x extent: `(x0, slice)` in
     /// canvas coordinates — `slice[i]` is canvas pixel `x0 + i`. Canvas rows
     /// outside the storage bbox return `None`.
+    ///
+    /// For band-cached backings (IPC, FITS), a returned slice is valid only
+    /// until the next `row` call on the same thread that lands in a
+    /// different band; hold at most the rows of one band at a time — the
+    /// pipeline's readers collect one row's channels and drop them before
+    /// moving on.
     pub fn row(&self, c: u64, canvas_y: u64) -> Option<(u64, &[f32])> {
         let [x0, y0, x1, y1] = self.bbox;
         if canvas_y < y0 || canvas_y >= y1 {
@@ -462,6 +471,33 @@ mod tests {
         let r2 = PanelReader::open_file(&path).unwrap();
         assert_eq!(r2.canvas(), (w, h, ch));
         assert_eq!(r2.row(1, 70).unwrap().1, r.row(1, 70).unwrap().1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fits_band_cache_allocates_only_touched_cells() {
+        use crate::synth::write_fits;
+        let dir = tmpdir("fitslazy");
+        let (w, h, ch) = (9u64, 40u64, 3u64);
+        let planes: Vec<f32> = (0..w * h * ch).map(|i| i as f32 + 1.0).collect();
+        let path = dir.join("p.fits");
+        write_fits(&path, w, h, ch, &planes, -32, &[]).unwrap();
+        let r = PanelReader::open_file(&path).unwrap();
+        let Backing::Fits(f) = &r.backing else {
+            panic!("FITS file must open with a FITS backing");
+        };
+        assert_eq!(f.cache.allocated_cells(), 0, "no cell allocated at open");
+        // Read rows across several bands on the calling (non-pool) thread only.
+        for y in 0..h {
+            for c in 0..ch {
+                assert!(r.row(c, y).is_some());
+            }
+        }
+        assert_eq!(
+            f.cache.allocated_cells(),
+            1,
+            "only the calling thread's cell holds a buffer"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
