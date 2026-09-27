@@ -2,8 +2,9 @@
 //!
 //! Supported: `CTYPE` `RA---TAN` / `RA---TAN-SIP` (either axis order),
 //! `CRVAL`, `CRPIX`, and the matrix as `CD`, `PC × CDELT`, or `CDELT` with
-//! `CROTA2`. Refused (never approximated): other projections, `TPV`, and
-//! nonzero `PV` terms.
+//! `CROTA2`. Refused (never approximated): other projections, `TPV`,
+//! nonzero `PV` terms, FK4 frames, a non-2000 `EQUINOX`, a non-180°
+//! `LONPOLE`, and non-degree `CUNIT`s.
 
 use crate::astrometry::sip::SipSolution;
 use crate::astrometry::{LinearWcs, WcsModel};
@@ -20,6 +21,58 @@ fn ctype_parts(v: &str) -> Option<(bool, String)> {
     }
     let code = v[5..8].to_string();
     Some((is_ra, code))
+}
+
+/// Refuses the frame/unit cards mmm would otherwise silently approximate:
+/// FK4 frames (no B1950 → J2000 conversion is performed), an `EQUINOX` other
+/// than 2000, a `LONPOLE` other than the TAN default of 180°, and axis units
+/// other than degrees. `Err` names the offending card.
+fn refuse_frame_and_units(cards: &[FitsKeyword]) -> Result<(), String> {
+    let raw = |n: &str| {
+        cards
+            .iter()
+            .find(|k| k.name.eq_ignore_ascii_case(n))
+            .map(|k| k.value.trim().to_string())
+    };
+    if let Some(r) = card_string(cards, "RADESYS") {
+        let r = r.trim().to_ascii_uppercase();
+        if r == "FK4" || r == "FK4-NO-E" {
+            return Err(format!(
+                "RADESYS '{r}' is unsupported (no B1950 frame conversion; only ICRS/FK5 J2000)"
+            ));
+        }
+    }
+    if let Some(v) = raw("EQUINOX") {
+        match card_number(cards, "EQUINOX") {
+            Some(e) if (e - 2000.0).abs() <= 1e-6 => {}
+            _ => {
+                return Err(format!(
+                    "EQUINOX = {v} is unsupported (only J2000 coordinates are accepted)"
+                ));
+            }
+        }
+    }
+    if let Some(v) = raw("LONPOLE") {
+        match card_number(cards, "LONPOLE") {
+            Some(l) if (l - 180.0).abs() <= 1e-9 => {}
+            _ => {
+                return Err(format!(
+                    "LONPOLE = {v} is unsupported (only the TAN default of 180 is accepted)"
+                ));
+            }
+        }
+    }
+    for n in ["CUNIT1", "CUNIT2"] {
+        if let Some(v) = raw(n) {
+            let unit = card_string(cards, n).unwrap_or_else(|| v.clone());
+            if !unit.trim().eq_ignore_ascii_case("deg") {
+                return Err(format!(
+                    "{n} = {v} is unsupported (only 'deg' axis units are accepted)"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The linear WCS exactly as the header states it (file pixel frame,
@@ -58,6 +111,7 @@ pub fn linear_from_keywords(cards: &[FitsKeyword]) -> Result<LinearWcs, String> 
             k.name.split('_').next().unwrap_or("PV")
         ));
     }
+    refuse_frame_and_units(cards)?;
     let num = |n: &str| card_number(cards, n).ok_or_else(|| format!("{n} missing"));
     let crval = [num("CRVAL1")?, num("CRVAL2")?];
     let crpix = [num("CRPIX1")?, num("CRPIX2")?];
@@ -294,6 +348,33 @@ mod tests {
         let mut c = with_cd(base());
         c.retain(|k| k.name != "CRVAL2");
         assert!(linear_from_keywords(&c).unwrap_err().contains("CRVAL2"));
+    }
+
+    #[test]
+    fn refuses_non_j2000_frames_lonpole_and_non_degree_units() {
+        let refuse = |extra: Vec<FitsKeyword>, card: &str| {
+            let mut c = with_cd(base());
+            c.extend(extra);
+            let e = linear_from_keywords(&c).unwrap_err();
+            assert!(e.contains(card), "expected {card} in: {e}");
+        };
+        refuse(vec![kw("RADESYS", "'FK4'")], "RADESYS");
+        refuse(vec![kw("RADESYS", "'FK4-NO-E'")], "RADESYS");
+        refuse(vec![kw("EQUINOX", "1950.0")], "EQUINOX");
+        refuse(vec![kw("EQUINOX", "'J2000'")], "EQUINOX");
+        refuse(vec![kw("LONPOLE", "0.0")], "LONPOLE");
+        refuse(vec![kw("CUNIT1", "'arcsec'")], "CUNIT1");
+        refuse(vec![kw("CUNIT2", "'rad     '")], "CUNIT2");
+        // Accepted: the values these cards take for a plain J2000 TAN solution.
+        let mut c = with_cd(base());
+        c.extend([
+            kw("RADESYS", "'FK5'"),
+            kw("EQUINOX", "2000.0"),
+            kw("LONPOLE", "180.0"),
+            kw("CUNIT1", "'deg     '"),
+            kw("CUNIT2", "'DEG'"),
+        ]);
+        assert_eq!(linear_from_keywords(&c).unwrap().radesys, "FK5");
     }
 
     #[test]

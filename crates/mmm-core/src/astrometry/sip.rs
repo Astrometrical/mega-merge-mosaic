@@ -115,20 +115,29 @@ pub struct SipSolution {
 impl SipSolution {
     /// Parse the SIP cards accompanying `file_linear` (the header's own,
     /// unreflected linear solution). `Ok(None)` when the header carries no
-    /// `A_ORDER`; `Err` on malformed or oversized polynomials.
+    /// `A_ORDER`; `Err` on an unparseable or out-of-range `*_ORDER` card and
+    /// on malformed or oversized polynomials.
     pub fn parse(
         cards: &[FitsKeyword],
         file_linear: &LinearWcs,
         row_order: RowOrder,
         height: u64,
     ) -> Result<Option<SipSolution>, String> {
+        // Absent → `None`; present but not a non-negative integer ≤
+        // MAX_ORDER (including unparseable text such as a quoted `'2'`) →
+        // `Err`, never a silent fall-back to the linear model.
         let order_of = |name: &str| -> Result<Option<usize>, String> {
+            let Some(card) = cards.iter().find(|k| k.name.eq_ignore_ascii_case(name)) else {
+                return Ok(None);
+            };
             match card_number(cards, name) {
-                None => Ok(None),
                 Some(v) if v >= 0.0 && v.fract() == 0.0 && (v as usize) <= MAX_ORDER => {
                     Ok(Some(v as usize))
                 }
-                Some(v) => Err(format!("{name} = {v} is not an order in 0..={MAX_ORDER}")),
+                _ => Err(format!(
+                    "{name} = {:?} is not an integer order in 0..={MAX_ORDER}",
+                    card.value.trim()
+                )),
             }
         };
         let Some(a_order) = order_of("A_ORDER")? else {
@@ -524,6 +533,22 @@ mod tests {
         assert!(bx.is_nan() && by.is_nan(), "({bx},{by})");
         // ... and such a model never reaches the grid sampler.
         assert!(s.validate(1000, 800).is_err());
+    }
+
+    #[test]
+    fn unparseable_order_is_refused_not_linearized() {
+        // A present-but-unparseable A_ORDER must not silently yield a linear
+        // model (the "never approximate by the linear part" policy).
+        let mut c = cards(false);
+        c[0] = kw("A_ORDER", "'2'");
+        let e = SipSolution::parse(&c, &file_linear(), RowOrder::BottomUp, 800).unwrap_err();
+        assert!(e.contains("A_ORDER"), "{e}");
+        // Same for the inverse orders.
+        let mut c = cards(true);
+        c.retain(|k| k.name != "AP_ORDER");
+        c.push(kw("AP_ORDER", "two"));
+        let e = SipSolution::parse(&c, &file_linear(), RowOrder::BottomUp, 800).unwrap_err();
+        assert!(e.contains("AP_ORDER"), "{e}");
     }
 
     #[test]
