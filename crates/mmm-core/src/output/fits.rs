@@ -179,8 +179,10 @@ impl RowSink for FitsSink {
 
 /// Filter panel-0 keywords for the output header: drop structural cards
 /// (SIMPLE/BITPIX/NAXIS*/EXTEND/BSCALE/BZERO, plus END and ROWORDER — the sink
-/// emits its own), and shift CRPIX1/CRPIX2 by minus the crop origin so the
-/// canvas WCS stays valid on the cropped output.
+/// emits its own) and data-describing cards that no longer hold for the
+/// float output (BLANK, DATAMIN/DATAMAX, CHECKSUM/DATASUM), and shift
+/// CRPIX1/CRPIX2 by minus the crop origin so the canvas WCS stays valid on
+/// the cropped output.
 pub fn keywords_for_output(src: &[FitsKeyword], crop: (u64, u64)) -> Vec<FitsKeyword> {
     src.iter()
         .filter_map(|kw| {
@@ -188,7 +190,20 @@ pub fn keywords_for_output(src: &[FitsKeyword], crop: (u64, u64)) -> Vec<FitsKey
             if name.starts_with("NAXIS")
                 || matches!(
                     name.as_str(),
-                    "SIMPLE" | "BITPIX" | "EXTEND" | "BSCALE" | "BZERO" | "END" | "ROWORDER"
+                    "SIMPLE"
+                        | "BITPIX"
+                        | "EXTEND"
+                        | "BSCALE"
+                        | "BZERO"
+                        | "END"
+                        | "ROWORDER"
+                        // Illegal on float output / stale after normalization /
+                        // would fail verification of the rewritten data.
+                        | "BLANK"
+                        | "DATAMIN"
+                        | "DATAMAX"
+                        | "CHECKSUM"
+                        | "DATASUM"
                 )
             {
                 return None;
@@ -339,6 +354,11 @@ mod tests {
             kw("BSCALE", "1.0"),
             kw("BZERO", "0.0"),
             kw("ROWORDER", "'TOP-DOWN'"),
+            kw("BLANK", "-32768"),
+            kw("DATAMIN", "0.0"),
+            kw("DATAMAX", "65535.0"),
+            kw("CHECKSUM", "'9aAAC89A9aAAC89A'"),
+            kw("DATASUM", "'1234567890'"),
             kw("CRPIX1", "4.6275000000e+03"),
             kw("CRPIX2", "9155"),
             kw("OBJECT", "'M42'"),
@@ -348,7 +368,7 @@ mod tests {
 
         for gone in [
             "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "EXTEND", "BSCALE", "BZERO",
-            "ROWORDER",
+            "ROWORDER", "BLANK", "DATAMIN", "DATAMAX", "CHECKSUM", "DATASUM",
         ] {
             assert!(out.iter().all(|k| k.name != gone), "{gone} must be dropped");
         }
