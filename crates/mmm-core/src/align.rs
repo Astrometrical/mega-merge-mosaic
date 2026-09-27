@@ -289,7 +289,7 @@ pub fn reproject_panel(
         }
         None => {
             let reader = PanelReader::open_file(panel.path())?;
-            reproject_from_reader(&reader, model, frame, out_dir)
+            reproject_from_reader(&reader, Some(panel.path()), model, frame, out_dir)
         }
     }
 }
@@ -307,11 +307,13 @@ pub fn reproject_panel(
 /// sequential-per-panel design, the same as the XISF path's mmap footprint.
 /// `reproject_core` then runs identically to the zero-copy path.
 ///
-/// A reader does not name a source file (an IPC panel has none), so error
-/// messages that would otherwise cite the source path cite `out_dir`
-/// instead.
+/// A reader does not name a source file, so the caller passes it as
+/// `source` (the panel's file for the FITS path) for error messages to
+/// cite; an IPC panel has none and passes `None`, in which case they cite
+/// `out_dir` instead.
 pub fn reproject_from_reader(
     reader: &PanelReader,
+    source: Option<&Path>,
     model: &WcsModel,
     frame: &MosaicFrame,
     out_dir: &Path,
@@ -350,14 +352,16 @@ pub fn reproject_from_reader(
         ));
     }
     let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
-    reproject_core(&refs, sw, sh, nch, out_dir, model, frame, out_dir)
+    let err_path = source.unwrap_or(out_dir);
+    reproject_core(&refs, sw, sh, nch, err_path, model, frame, out_dir)
 }
 
 /// The resampling core shared by [`reproject_panel`] and
 /// [`reproject_from_reader`]: everything after the source planes are in hand
 /// (whole per-channel `sw × sh` planes) — the bbox forward-map, the
 /// per-output-pixel Lanczos loop, and the cache write. `err_path` is used
-/// only for error messages (a reader-fed panel may have no file behind it).
+/// only for error messages: the source file when there is one, else the
+/// output directory (an IPC-served panel has no file behind it).
 #[allow(clippy::too_many_arguments)] // pure extraction of reproject_panel's tail; see the doc above
 fn reproject_core(
     planes: &[&[f32]],
@@ -868,6 +872,43 @@ mod tests {
         // Solved geometry differing from the pixel geometry is refused.
         let wrong = linear_model([30.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 64, 24);
         assert!(reproject_panel(&panel, &wrong, &frame, &dir.join("out")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fits_reproject_errors_name_the_source_file() {
+        let dir = tmpdir("fitserr");
+        let (w, h) = (32u64, 24u64);
+        let planes = vec![0.5f32; (w * h) as usize];
+        let src = dir.join("src.fits");
+        crate::synth::write_fits(&src, w, h, 1, &planes, -32, &[]).unwrap();
+        let panel = InputPanel::open(&src).unwrap();
+        let frame = MosaicFrame {
+            crval: [30.0, 0.0],
+            scale_deg: S,
+            width: 40,
+            height: 32,
+            rotation_deg: 0.0,
+        };
+        let out = dir.join("out");
+        let wrong = linear_model([30.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 64, 24);
+        let e = reproject_panel(&panel, &wrong, &frame, &out)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not match panel"), "{e}");
+        assert!(
+            e.contains("src.fits"),
+            "error must cite the source file: {e}"
+        );
+        let far = linear_model([40.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 32, 24);
+        let e = reproject_panel(&panel, &far, &frame, &out)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not intersect"), "{e}");
+        assert!(
+            e.contains("src.fits"),
+            "error must cite the source file: {e}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -706,7 +706,7 @@ pub fn analyze_ipc_solved(
             (p.width, p.height, p.channels),
             band_rows,
         );
-        let ap = reproject_from_reader(&reader, model, &frame, &out_dir)?;
+        let ap = reproject_from_reader(&reader, None, model, &frame, &out_dir)?;
         tracing::info!(
             "aligned panel {}/{}: bbox [{},{})x[{},{}) in {:.2}s",
             id + 1,
