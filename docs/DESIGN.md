@@ -524,7 +524,32 @@ Files path); spec:
   1e-4 px inverse (`tests/fixtures/sip_oracle.json`).
 - **Output**: SIP cards never pass through; aligned FITS sessions emit
   fresh linear cards from the reflected WCS.
-- **Real data**: (filled in by Task 11)
+- **Real data** (2026-09-27, `scripts/nova_solve_panels.py` +
+  `scripts/compare_mosaics.py`): raw Orion panels 3, 4, 7, 8 (M42) → 16-bit
+  luminance uploads → nova.astrometry.net (private, `tweak_order` 3; all
+  four solved first try, jobs 16958313/16958316/16958325/16958277) → RGB
+  float32 bottom-up FITS (no ROWORDER) with nova's TAN-SIP cards. `mmm info`:
+  `rows BottomUp`, `wcs: with distortion model`. Per-panel `A_ORDER` 3; max
+  SIP corner displacement 2.4 / 9.1 / 21.1 / 5.9 px (panels 3/4/7/8 — 7's
+  order-3 fit extrapolates hard). Same pipeline on the PixInsight-solved XISF
+  originals as reference. Analyze 5.0 s / 5.1 s wall (FITS / XISF), blend
+  full-res + PNG 8.1 s / 6.2 s wall (6.1 s internal each); max RSS analyze
+  1.21 / 1.01 GB, blend 2.14 / 2.15 GB — the FITS band cache costs nothing
+  visible. PNGs: identical framing and orientation (no mirror), clean seams,
+  round single stars. Catalogue stars vs each output's WCS (brightest pixel,
+  saturated cores eroded): θ² Ori A 1.71 / 1.28 px, ι Ori 0.74 / 1.39 px,
+  42 Ori 0.97 / 0.75 px (FITS / XISF); θ¹ Ori C not graded (its clipped
+  plateau merges θ¹ A/B/D, ~4 px bias in both). Run-to-run over ~3.3k
+  stars: median 0.44 px, no constant offset (so no reflection / half-pixel
+  error); the p90 of 2–4 px sits in panel 7's corners, i.e. nova's order-3
+  SIP, which is less accurate than PixInsight's spline solution. Channel 0
+  on a 64 px lattice: median |Δ|/ref 0.99 %, p99 |Δ| 6.2e-4, but the RMS
+  relative difference is **21 %** (brief's gate: < 5 %) because five lattice
+  points on bright-star wings, displaced 1–2 px between the two astrometric
+  solutions, carry 92 % of the squared difference; without the worst 1 % of
+  points it is 0.58 %. Verdict: the FITS/SIP path is correct; the RMS gate
+  as written measures the solutions' star-wing misregistration, not the
+  pipeline.
 
 ## Performance notes
 
