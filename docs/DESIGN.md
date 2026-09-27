@@ -170,8 +170,9 @@ approximated by their linear part (documented limitation).
 **D. ROI blending.** `--roi x,y,w,h` restricts the output canvas (fast
 problem-area iteration at full res).
 
-Deferred to phase 3: FITS *input*, compressed XISF ingest, full Laplacian
-pyramid (if two-band proves insufficient), wgpu GPU path, GUI.
+Deferred to phase 3: compressed XISF ingest, full Laplacian pyramid (if
+two-band proves insufficient), wgpu GPU path, GUI (FITS input landed
+2026-09-26, below).
 
 ### Phase 4 (in progress): pyramid base
 
@@ -499,6 +500,31 @@ it regenerates a solution). Spec:
   ≥ 1.9.5 by design (v1.4.2 stays available for 1.9.0–1.9.4). The in-repo
   update-repository packaging scripts were removed (the tools website owns
   distribution).
+
+## FITS input (2026-09-26)
+
+FITS panels are a peer input format everywhere (CLI and the PixInsight
+Files path); spec:
+[2026-09-26-fits-input-sip-design.md](superpowers/specs/2026-09-26-fits-input-sip-design.md).
+
+- **Reader** (`formats/fits.rs`): primary HDU, NAXIS 2/3 planar, BITPIX
+  8/16/32/−32/−64; rows decoded on demand into the per-thread band cache
+  (`band_cache.rs`, shared with the IPC backing). Integer data normalized to
+  [0, 1] by the type range after BZERO/BSCALE; NaN/Inf/negative/BLANK → 0.
+  Extension HDUs, fpack, BITPIX 64 refused by name.
+- **Orientation**: `ROWORDER = 'TOP-DOWN'` files read verbatim; everything
+  else (standard FITS) is flipped on read and the WCS reflected into the
+  top-down frame (`LinearWcs::reflect_rows`). PixInsight-authored bottom-up
+  FITS is unverified (PI may interpret cards in display space).
+- **WCS** (`astrometry/fits_wcs.rs`): TAN / TAN-SIP only; CD, PC+CDELT, or
+  CDELT+CROTA2. TPV/PV refused. **SIP** (`astrometry/sip.rs`): forward
+  polynomials; AP/BP only seed a Newton inverse (exact either way);
+  validated like the standard solution; sampled onto the same 16 px grids.
+  Verified against astropy on four synthetic headers to < 1e-9° forward /
+  1e-4 px inverse (`tests/fixtures/sip_oracle.json`).
+- **Output**: SIP cards never pass through; aligned FITS sessions emit
+  fresh linear cards from the reflected WCS.
+- **Real data**: (filled in by Task 11)
 
 ## Performance notes
 

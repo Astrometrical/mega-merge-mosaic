@@ -660,18 +660,20 @@ release-version handshake — stamped by `mmm::Host::probe_panels`, checked
 before anything else; `input_select` as in `JobMode::Files`, defaulting to
 `"Auto"` when omitted) and read back one JSON object on stdout:
 `{"panels": [{"width": W, "height": H, "channels": C}, ...],
-"frame": [FW, FH, FCH] | null}`. `panels` is in `paths` order; `frame` is
-the worker's own `choose_frame` result and is non-null exactly when the job
-can resolve to solved mode (`input_select` ≠ `"Aligned"` and every panel
-carries a usable astrometric solution) — with `input_select` `"Solved"` a
-panel without a solution makes the probe exit 1 with the analyze stage's
-error message instead. The probe also refuses a set whose files do not all
-have the same channel count (exit 1, naming the first file of each count):
-the host sizes `slot_bytes` from `panels[0].channels`, so a mono/colour mix
-must never reach the run stage. Header reads are parallel and header-only (never
-pixel data). The host sizes `slot_bytes` from
-`max(max panel width, frame width) * ch * band_rows * 4`. Exit code 0 on
-success; on any error the worker writes a message to stderr and exits 1.
+"frame": [FW, FH, FCH] | null}`. `panels` is in `paths` order. Paths may be
+XISF or FITS files (detected by content, not extension); FITS panels carry
+their plate solution as WCS/SIP cards, which the worker reads itself.
+`frame` is the worker's own `choose_frame` result and is non-null exactly
+when the job can resolve to solved mode (`input_select` ≠ `"Aligned"` and
+every panel carries a usable astrometric solution) — with `input_select`
+`"Solved"` a panel without a solution makes the probe exit 1 with the
+analyze stage's error message instead. The probe also refuses a set whose
+files do not all have the same channel count (exit 1, naming the first
+file of each count): the host sizes `slot_bytes` from `panels[0].channels`,
+so a mono/colour mix must never reach the run stage. Header reads are
+parallel and header-only (never pixel data). The host sizes `slot_bytes`
+from `max(max panel width, frame width) * ch * band_rows * 4`. Exit code 0
+on success; on any error the worker writes a message to stderr and exits 1.
 Wire structs: `PanelProbeRequest` / `PanelProbeReply` in `protocol.rs`.
 
 ## 12. Keeping this document accurate

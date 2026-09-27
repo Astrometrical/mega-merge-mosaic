@@ -255,7 +255,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
 
    AddFiles_PushButton.SetText( "Add Files..." );
    AddFiles_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_AddFilesClick, w );
-   AddFiles_PushButton.SetToolTip( "<p>Add image files as mosaic panels.</p>" );
+   AddFiles_PushButton.SetToolTip( "<p>Add image files (XISF or FITS) as mosaic panels.</p>" );
 
    RemoveFile_PushButton.SetText( "Remove" );
    RemoveFile_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_RemoveFileClick, w );

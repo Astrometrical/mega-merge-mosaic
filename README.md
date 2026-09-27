@@ -3,16 +3,17 @@
 Fast, standalone merging of astrophotography mosaic panels into a seamless
 mosaic — automatically, in seconds, and without pinched or doubled stars.
 
-`mmm` takes linear XISF panels — either the registered full-canvas frames
-produced by PixInsight's **MosaicByCoordinates**, or your raw plate-solved
-panel stacks directly — and produces a photometrically matched, seam-blended
-32-bit FITS mosaic with the astrometric solution carried into the output.
+`mmm` takes linear XISF or FITS panels — either the registered full-canvas
+frames produced by PixInsight's **MosaicByCoordinates**, or your raw
+plate-solved panel stacks directly — and produces a photometrically
+matched, seam-blended 32-bit FITS mosaic with the astrometric solution
+carried into the output.
 
 <!-- TODO: screenshot — full Orion 12-panel mosaic result, with a seam-map inset -->
 
 ```sh
 cargo build --release
-target/release/mmm analyze panels/*.xisf --session orion.mmm-session
+target/release/mmm analyze panels/*.xisf --session orion.mmm-session  # .xisf and .fits panels can be mixed
 target/release/mmm blend --session orion.mmm-session -o mosaic.fits
 ```
 
@@ -62,8 +63,9 @@ things that must never be averaged (stars) never are.
   real data.
 - **Diagnostics** — seam/ownership map PNG, per-edge seam Δ report, per-edge
   photometric fit table with outlier warnings.
-- **WCS in the output** — from the XISF astrometric solution (aligned input)
-  or the self-chosen mosaic frame (solved input), catalog-star verified.
+- **WCS in the output** — from the XISF astrometric solution or the FITS WCS
+  (aligned input) or the self-chosen mosaic frame (solved input),
+  catalog-star verified.
 - **Fast and out-of-core** — mmap + streaming row bands; canvas size is
   bounded by disk, not RAM. CPU-parallel via rayon.
 - **Validated** — 140 tests including synthetic ground-truth end-to-end runs
