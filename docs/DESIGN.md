@@ -533,9 +533,11 @@ Files path); spec:
   1.71 / 1.28 px, ι Ori 0.74 / 1.39, 42 Ori 0.97 / 0.75 (brief's 42 Ori
   coordinate was ~140 px off; θ¹ Ori C ungraded — clipped core merges θ¹ A/B/D).
   3.3k-star run-to-run median 0.44 px, no constant shift. Channel 0 raw RMS
-  21.0 % (5 of 13,963 lattice points on star wings = 92 % of squared diff —
-  nova order-3 SIP vs PI spline), trimmed RMS 0.58 %, median 0.99 %. PNGs:
-  same orientation, clean seams. **PASS** (trimmed gate).
+  21.0 % (5 of 13,963 lattice points on star wings = 92 % of squared diff,
+  shifted 1–2 px between the two solutions), trimmed RMS 0.58 %, median
+  0.99 %. Caveat: nova's order-3 SIP is less accurate than PixInsight's
+  spline solution (worst in panel 7's corners, run-to-run p90 2–4 px).
+  PNGs: same orientation, clean seams. **PASS** (trimmed gate).
 - Follow-up: the output FITS writer passes XISF keyword values with
   lowercase exponents (`2.0496e+03`) and writes `COMMENT =` cards; astropy
   flags both as non-standard.

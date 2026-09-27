@@ -13,7 +13,9 @@ reflects the WCS — the path a real astrometry.net-solved FITS takes.
 Re-runnable: panels whose OUT_DIR/PANEL-N.fits exists are skipped, and
 submission/job ids are kept in OUT_DIR/nova_jobs.json so an interrupted run
 resumes polling instead of re-uploading. A failed solve is retried once with
-scale_err 50 and no position hint.
+scale_err 50 and no position hint. A failed WCS download/write is retried on
+the next poll, up to MAX_DOWNLOAD_TRIES per run, without stopping the other
+panels; a rerun retries it again.
 
 Usage: python3 scripts/nova_solve_panels.py OUT_DIR PANEL.xisf [...]
 Requires: numpy, astropy, requests; the key in ~/.config/astrometry/apikey
@@ -32,6 +34,7 @@ from astropy.io import fits
 API = "https://nova.astrometry.net/api"
 WCS_URL = "https://nova.astrometry.net/wcs_file/{}"
 SKIP_CARDS = {"SIMPLE", "BITPIX", "EXTEND", "END", "COMMENT", "HISTORY", ""}
+MAX_DOWNLOAD_TRIES = 5  # per panel per run, for the solved WCS download + FITS write
 COPY_KEYWORDS = ("OBJECT", "EXPTIME", "INSTRUME", "TELESCOP", "FOCALLEN", "XPIXSZ", "YPIXSZ", "DATE-OBS", "FILTER")
 
 
@@ -155,6 +158,9 @@ def main():
         panels[name] = {"path": path, "out": out_path}
         st = state.setdefault(name, {"source": os.path.basename(path), "attempts": []})
         if st["attempts"] and st["attempts"][-1].get("status") not in ("failure",):
+            st["attempts"][-1]["download_errors"] = 0  # a rerun retries a failed WCS download
+            if st["attempts"][-1].get("status") == "download_failed":
+                st["attempts"][-1]["status"] = None
             print(f"panel {name}: resuming submission {st['attempts'][-1]['subid']}", flush=True)
             continue
         planes, kw = read_xisf(path)
@@ -187,14 +193,30 @@ def main():
                 print(f"panel {name}: poll error {e!r}, will retry", flush=True)
                 continue
             if status == "success":
-                wcs = requests.get(WCS_URL.format(att["job"]), timeout=120)
-                wcs.raise_for_status()
-                wcs_path = os.path.join(out_dir, f"wcs_{name}.fits")
-                with open(wcs_path, "wb") as fh:
-                    fh.write(wcs.content)
-                planes, kw = read_xisf(panels[name]["path"])
-                hdr = write_solved(panels[name]["out"], planes, kw, wcs_path)
-                del planes
+                # Download + write can fail transiently (HTTP error, truncated
+                # or corrupt wcs.fits); keep the panel pending so the next poll
+                # retries, up to MAX_DOWNLOAD_TRIES, instead of killing the batch.
+                try:
+                    wcs = requests.get(WCS_URL.format(att["job"]), timeout=120)
+                    wcs.raise_for_status()
+                    wcs_path = os.path.join(out_dir, f"wcs_{name}.fits")
+                    with open(wcs_path, "wb") as fh:
+                        fh.write(wcs.content)
+                    planes, kw = read_xisf(panels[name]["path"])
+                    hdr = write_solved(panels[name]["out"], planes, kw, wcs_path)
+                    del planes
+                except (requests.RequestException, ValueError, OSError, KeyError) as e:
+                    att["download_errors"] = att.get("download_errors", 0) + 1
+                    if att["download_errors"] >= MAX_DOWNLOAD_TRIES:
+                        att["status"] = "download_failed"
+                        pending.discard(name)
+                        print(f"panel {name}: solved (job {att['job']}) but WCS download/write failed"
+                              f" {att['download_errors']} times ({e!r}); giving up — rerun to retry", flush=True)
+                    else:
+                        print(f"panel {name}: WCS download/write failed ({e!r}), will retry"
+                              f" ({att['download_errors']}/{MAX_DOWNLOAD_TRIES})", flush=True)
+                    save_state(state_path, state)
+                    continue
                 att["status"] = "success"
                 save_state(state_path, state)
                 print(f"panel {name}: solved (job {att['job']}), CTYPE1={hdr['CTYPE1']} A_ORDER={hdr.get('A_ORDER')}",
