@@ -134,6 +134,72 @@ impl ReferenceFrame {
     }
 }
 
+/// Derive the shared reference frame from the headers of `paths` — every
+/// panel of every group — without scanning pixels.
+///
+/// Kind selection follows the cheap half of analyze's auto-detect rule:
+/// `aligned` when `input` forces it, or with `Auto` when there are ≥ 2 panels
+/// and every panel has the same `(width, height)`; otherwise `solved`, where
+/// every panel must yield a [`WcsModel`] and the frame is
+/// [`choose_frame`] over all of them. The coverage half of the rule (≥ 50 %
+/// covered re-dispatches to solved) needs a scan and is deliberately not
+/// applied: a same-geometry raw-panel set must pass `InputSelect::Solved`,
+/// exactly as analyze requires.
+///
+/// Channel counts may differ across `paths`; groups are checked for channel
+/// uniformity individually by analyze.
+pub fn derive(paths: &[PathBuf], input: InputSelect) -> Result<ReferenceFrame> {
+    if paths.is_empty() {
+        return Err(Error::compute("no input panels given"));
+    }
+    let opened: Vec<InputPanel> = paths
+        .iter()
+        .map(|p| InputPanel::open(p))
+        .collect::<Result<_>>()?;
+    let geoms: Vec<(u64, u64)> = opened.iter().map(|x| (x.width(), x.height())).collect();
+    let same_geometry = geoms.iter().all(|g| *g == geoms[0]);
+    let aligned = match input {
+        InputSelect::Aligned => true,
+        InputSelect::Solved => false,
+        InputSelect::Auto => paths.len() >= 2 && same_geometry,
+    };
+    if aligned {
+        if let Some(k) = geoms.iter().position(|g| *g != geoms[0]) {
+            return Err(Error::compute(format!(
+                "aligned input needs one canvas geometry, but {} is {}x{} and {} is {}x{}",
+                paths[0].display(),
+                geoms[0].0,
+                geoms[0].1,
+                paths[k].display(),
+                geoms[k].0,
+                geoms[k].1
+            )));
+        }
+        return Ok(ReferenceFrame::Aligned {
+            width: geoms[0].0,
+            height: geoms[0].1,
+            wcs: opened[0].linear_wcs(),
+        });
+    }
+    let mut models: Vec<WcsModel> = Vec::with_capacity(paths.len());
+    let mut errors: Vec<String> = Vec::new();
+    for (x, path) in opened.iter().zip(paths) {
+        match x.wcs_model() {
+            Ok(m) => models.push(m),
+            Err(reason) => errors.push(format!("{}: {reason}", path.display())),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(Error::compute(format!(
+            "solved input requires an astrometric solution in every panel:\n  {}",
+            errors.join("\n  ")
+        )));
+    }
+    Ok(ReferenceFrame::Solved {
+        frame: choose_frame(&models),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
