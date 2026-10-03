@@ -84,6 +84,13 @@ target_link_libraries(test_golden_groups PRIVATE mmm_host)
 add_dependencies(test_golden_groups gen_fixtures build_worker)
 add_test(NAME test_golden_groups COMMAND test_golden_groups ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
 
+# Group partitioning / window-id sanitisation / wildcard matching used by the
+# module's multi-filter UI and run loop. Header-only and PCL-free so it can be
+# tested here (the module has no runtime harness).
+add_executable(test_groups test/test_groups.cpp)
+target_include_directories(test_groups PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../module ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_groups COMMAND test_groups)
+
 # Files-mode metadata probe test: drives the real worker's --probe-panels
 # through Host::probe_panels against both fixture sets and checks frame
 # parity with Host::probe_frame plus stderr capture on a missing file.
