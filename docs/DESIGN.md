@@ -610,9 +610,16 @@ fractions of a pixel), and the blend crops to the union of content bboxes
 - **Aligned-input caveat for users**: filters registered separately get
   separate canvases; either align all against one common reference or feed
   the raw solved panels.
-- **PixInsight (later stage)**: `InitJob` gains optional `frame` and
-  `extent`; the worker passes them into the same entry points. Not in this
-  stage.
+- **PixInsight (stage 2, module 1.6.0)**: a flat `group` column on both
+  panel tables; a multi-group run derives one reference via
+  `--probe-reference` (views) or the `--probe-panels` reply (files), runs
+  one worker job per group with `InitJob.reference` (honoured by all three
+  job modes — the shm analyze paths gained the same reference parameter as
+  `analyze_full`), names windows `MegaMergeMosaic_<group>`, and prints group
+  headers; a single-group run is unchanged. Group helpers (partition,
+  sanitised ids, wildcard filter) are PCL-free in `MmmGroups.h` and tested
+  by the host CTest suite. Spec:
+  [PixInsight multi-filter groups](superpowers/specs/2026-10-03-pixinsight-multi-filter-groups-design.md).
 
 ## IPC transport (PixInsight)
 

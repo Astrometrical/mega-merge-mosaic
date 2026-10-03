@@ -284,6 +284,7 @@ names):
 | `mode` | `JobMode` | `"Aligned"`, `"Solved"`, or `{"Files": {"paths": [...], "input_select": "Auto"}}` — see §11 |
 | `session_dir` | string | filesystem directory the worker reads/writes cached analyze artifacts to (must be a real path the worker process can access, even in an otherwise in-memory run) |
 | `params` | `BlendParamsWire` | see below |
+| `reference` | `ReferenceFrame` or `null` | optional (default `null`, added in 1.6.0): a shared reference frame to adopt instead of deriving one — the same JSON as a `*.mmm-frame.json` (`kind` `"solved"`: `{"frame": {crval, scale_deg, width, height, rotation_deg}}`; `kind` `"aligned"`: `{width, height, wcs}`); honoured by all three modes, after which the worker's blend covers the whole frame so every job carrying the same value yields identically sized, co-registered output. The PixInsight module sends it once per group in a multi-filter run |
 
 `PanelDesc`:
 
@@ -540,7 +541,10 @@ its own writes to the worker's stdin.
   later frames under an incompatible layout. Bump this constant (and this
   document) on any wire-incompatible change. (`2` added
   `JobMode::Files`'s `input_select` field — see §11; `3` added the
-  release-version handshake below.)
+  release-version handshake below.) 1.6.0 added the optional `Init.reference`
+  field, the `filter`/`reference` fields of the `--probe-panels` reply and
+  the `--probe-reference` probe — all additive with defaults, so the
+  protocol version stays `3`.
 - **Release version handshake.** `Init.worker_version` (and
   `worker_version` in the `--probe-panels` request, §11; `--probe-frame`
   reads it from its `InitJob`-shaped stdin object) must equal the worker
@@ -659,7 +663,8 @@ that pass alone can freeze the host for minutes. Instead it invokes
 release-version handshake — stamped by `mmm::Host::probe_panels`, checked
 before anything else; `input_select` as in `JobMode::Files`, defaulting to
 `"Auto"` when omitted) and read back one JSON object on stdout:
-`{"panels": [{"width": W, "height": H, "channels": C}, ...],
+`{"panels": [{"width": W, "height": H, "channels": C, "filter": "Ha" | null}, ...],
+"reference": ReferenceFrame | null,
 "frame": [FW, FH, FCH] | null}`. `panels` is in `paths` order. Paths may be
 XISF or FITS files (detected by content, not extension); FITS panels carry
 their plate solution as WCS/SIP cards, which the worker reads itself.
@@ -674,7 +679,28 @@ so a mono/colour mix must never reach the run stage. Header reads are
 parallel and header-only (never pixel data). The host sizes `slot_bytes`
 from `max(max panel width, frame width) * ch * band_rows * 4`. Exit code 0
 on success; on any error the worker writes a message to stderr and exits 1.
+`filter` (1.6.0) is the panel's FILTER name — the FITS `FILTER` card, else the
+XISF `Instrument:Filter:Name` property — or `null`, for a host's "group by
+filter" UI. `reference` (1.6.0) is the `ReferenceFrame` `reference::derive`
+yields over the paths with the request's `input_select`, or `null` when the
+set is neither registered to one canvas nor all plate-solved (a forced
+`"Solved"` request fails instead, as for `frame`). Multi-group hosts put it
+in every group's `Init.reference`.
 Wire structs: `PanelProbeRequest` / `PanelProbeReply` in `protocol.rs`.
+
+**Reference probe (multi-filter views).** To derive the shared frame over
+in-memory views, a host invokes `mmm-ipc-worker --probe-reference`: write an
+`InitJob`-shaped JSON object (unframed, like `--probe-frame`) whose `panels`
+carry *every* group's descriptors with their astrometric `properties`, and
+whose `mode` supplies the registration override (`"Aligned"`/`"Solved"`
+force that kind; `{"Files": {"paths": [], "input_select": "Auto"}}`
+carries the `Auto`/`Aligned`/`Solved` select — its paths are ignored). The
+worker prints one line of JSON on stdout: the `ReferenceFrame`
+(`reference::derive_from_descs`, the same kind rule and frame choice as the
+file-based derive). Exit 0 on success; on any error (a panel without a
+solution under solved, an empty panel list) it writes the message to stderr
+and exits 1. The host sizes solved-mode output slots from the frame's
+`width` and sends the value as each group's `Init.reference`.
 
 ## 12. Keeping this document accurate
 

@@ -171,7 +171,7 @@ pub fn derive(paths: &[PathBuf], input: InputSelect) -> Result<ReferenceFrame> {
     derive_items(items, input)
 }
 
-/// [`derive`] over wire panel descriptors (a Views-mode host's `PanelDesc`s
+/// [`fn@derive`] over wire panel descriptors (a Views-mode host's `PanelDesc`s
 /// with the astrometric properties attached): the same kind rule and frame
 /// choice, so a frame derived from views equals one derived from the same
 /// panels saved to disk. Labels in errors are `panel <id>`.

@@ -10,10 +10,10 @@
 #define __MmmVersion_h
 
 #define MMM_VERSION_MAJOR     1
-#define MMM_VERSION_MINOR     5
+#define MMM_VERSION_MINOR     6
 #define MMM_VERSION_REVISION  0
 #define MMM_VERSION_BUILD     1
 
-#define MMM_VERSION_STRING    "1.5.0"
+#define MMM_VERSION_STRING    "1.6.0"
 
 #endif   // __MmmVersion_h

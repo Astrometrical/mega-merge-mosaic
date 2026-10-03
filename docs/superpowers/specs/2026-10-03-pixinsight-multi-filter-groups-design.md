@@ -1,6 +1,6 @@
 # PixInsight multi-filter groups (shared reference frame, stage 2)
 
-Status: approved design 2026-10-03, not yet implemented. Stage 1 (Rust core
+Status: implemented 2026-10-03 (module 1.6.0). Stage 1 (Rust core
 and CLI) is in
 [the shared reference frame spec](2026-10-03-shared-reference-frame-design.md)
 and merged. This stage brings the same capability to the PixInsight module
