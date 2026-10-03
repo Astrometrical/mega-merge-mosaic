@@ -819,3 +819,28 @@ fn filter_name_falls_back_to_xisf_property() {
     assert_eq!(InputPanel::open(&none).unwrap().filter_name(), None);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Review fix: a one-panel group (e.g. a single Ha frame) in Files mode under
+/// Auto must adopt an aligned reference whose canvas it matches, instead of
+/// being read as a solved raw panel because Auto needs two panels to call a
+/// set aligned.
+#[test]
+fn single_registered_panel_group_adopts_aligned_reference() {
+    let dir = tempdir("single-aligned");
+    let lrgb = write_aligned_group(&dir.join("L"), "l", STAR, 10, 20);
+    let reference = derive(&lrgb, InputSelect::Auto).unwrap();
+    assert!(matches!(reference, ReferenceFrame::Aligned { .. }));
+    let ha = dir.join("ha.xisf");
+    write_canvas_panel(&ha, STAR, [30, 40, 130, 160], 0.4);
+    let s = analyze(
+        &[ha],
+        &dir.join("ha.mmm-session"),
+        InputSelect::Auto,
+        Some(&reference),
+    )
+    .unwrap();
+    assert_eq!(s.input, InputKind::Aligned);
+    assert!(s.frame_imposed);
+    assert_eq!(s.canvas, (CANVAS.0, CANVAS.1, 1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

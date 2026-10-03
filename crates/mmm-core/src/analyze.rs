@@ -259,10 +259,15 @@ pub fn analyze_full(
             .filter_map(|p| InputPanel::open(p).ok())
             .map(|x| (x.width(), x.height()))
             .collect();
-        let same_geometry =
-            paths.len() >= 2 && geoms.len() == paths.len() && geoms.iter().all(|g| *g == geoms[0]);
+        let same_geometry = geoms.len() == paths.len() && geoms.iter().all(|g| *g == geoms[0]);
+        // Under Auto a set reads as aligned with ≥ 2 panels of one geometry,
+        // or as a single panel against an aligned reference (see the Auto
+        // dispatch below).
         let forced_aligned = input == InputSelect::Aligned;
-        let reads_aligned = forced_aligned || (input == InputSelect::Auto && same_geometry);
+        let reads_aligned = forced_aligned
+            || (input == InputSelect::Auto
+                && same_geometry
+                && (paths.len() >= 2 || matches!(r, ReferenceFrame::Aligned { .. })));
         match r {
             ReferenceFrame::Aligned { width, height, .. } if reads_aligned => {
                 if let Some(g) = geoms.first() {
@@ -296,7 +301,20 @@ pub fn analyze_full(
                 let x = InputPanel::open(path)?;
                 geoms.push((x.width(), x.height(), x.channels()));
             }
-            if paths.len() >= 2 && geoms.iter().all(|&g| g == geoms[0]) {
+            // A single panel is normally ambiguous (a raw panel or a
+            // registered canvas?), but under an aligned reference whose
+            // canvas it matches it is unambiguous: a one-panel group (one Ha
+            // frame joining an LRGB set) reads as aligned. The coverage rule
+            // in `analyze_aligned` still re-dispatches a raw panel.
+            let single_on_aligned_reference = paths.len() == 1
+                && matches!(
+                    reference,
+                    Some(ReferenceFrame::Aligned { width, height, .. })
+                        if (geoms[0].0, geoms[0].1) == (*width, *height)
+                );
+            if (paths.len() >= 2 && geoms.iter().all(|&g| g == geoms[0]))
+                || single_on_aligned_reference
+            {
                 analyze_aligned(
                     paths,
                     session_dir,
@@ -739,16 +757,30 @@ pub fn analyze_ipc_aligned(
         }
     }
 
-    // A reference whose canvas disagrees is knowable from the Init alone:
-    // refuse before the first band request (a registered set can be tens
-    // of GB).
-    if let Some(ReferenceFrame::Aligned { width, height, .. }) = reference
-        && (canvas.0, canvas.1) != (*width, *height)
-    {
-        let reason =
-            crate::reference::check_aligned((canvas.0, canvas.1), None, *width, *height, None)
-                .expect_err("geometry differs");
-        return Err(Error::format(session_dir, reason));
+    // Every reference check on this path is knowable from the Init alone
+    // (canvas geometry, panel-0 canvas WCS, reference kind): refuse before
+    // the first band request — a registered set can be tens of GB.
+    if let Some(r) = reference {
+        match r {
+            ReferenceFrame::Aligned { width, height, wcs } => {
+                let panel_wcs = link
+                    .panels()
+                    .first()
+                    .and_then(|p| crate::astrometry::wcs_from_properties(&p.properties));
+                crate::reference::check_aligned(
+                    (canvas.0, canvas.1),
+                    panel_wcs.as_ref(),
+                    *width,
+                    *height,
+                    wcs.as_ref(),
+                )
+                .map_err(|reason| Error::format(session_dir, reason))?;
+                session.frame_imposed = true;
+            }
+            ReferenceFrame::Solved { .. } => {
+                return Err(Error::format(session_dir, SOLVED_REFERENCE_ON_ALIGNED));
+            }
+        }
     }
 
     // Claim + report under one lock (see analyze_aligned's scan loop).
@@ -780,29 +812,6 @@ pub fn analyze_ipc_aligned(
             Ok(s)
         })
         .collect::<Result<_>>()?;
-
-    if let Some(r) = reference {
-        match r {
-            ReferenceFrame::Aligned { width, height, wcs } => {
-                let panel_wcs = link
-                    .panels()
-                    .first()
-                    .and_then(|p| crate::astrometry::wcs_from_properties(&p.properties));
-                crate::reference::check_aligned(
-                    (canvas.0, canvas.1),
-                    panel_wcs.as_ref(),
-                    *width,
-                    *height,
-                    wcs.as_ref(),
-                )
-                .map_err(|reason| Error::format(session_dir, reason))?;
-                session.frame_imposed = true;
-            }
-            ReferenceFrame::Solved { .. } => {
-                return Err(Error::format(session_dir, SOLVED_REFERENCE_ON_ALIGNED));
-            }
-        }
-    }
 
     session.canvas = canvas;
     finish_session(session, scans, surface_order, gain)
@@ -1578,5 +1587,78 @@ mod tests {
         v.as_object_mut().unwrap().remove("reference");
         let back: crate::ipc::protocol::InitJob = serde_json::from_value(v).unwrap();
         assert_eq!(back.reference, None);
+    }
+
+    /// Review fix: every header-knowable reference refusal on the IPC aligned
+    /// path (a displaced canvas WCS, not just a wrong size) happens before
+    /// the first band request. The mock host is given NO pixels, so any band
+    /// request panics its thread and `host.join()` fails.
+    #[test]
+    fn ipc_aligned_refuses_displaced_wcs_before_any_band() {
+        let dir = tmpdir("ipc-ref-wcs-early");
+        let (w, h) = (32u64, 24u64);
+        let s = 1.0e-3_f64;
+        let cd = [[-s, 0.0], [0.0, s]];
+        let wcs_of = |crval: [f64; 2], crpix: [f64; 2]| crate::astrometry::LinearWcs {
+            crval,
+            crpix,
+            cd,
+            ctype: ["RA---TAN".into(), "DEC--TAN".into()],
+            radesys: "ICRS".into(),
+        };
+        // Two registered canvases carrying one canvas WCS.
+        let mut descs = Vec::new();
+        for k in 0..2u32 {
+            let path = dir.join(format!("canvas_{k}.xisf"));
+            write_xisf_solved(
+                &path,
+                w,
+                h,
+                1,
+                &vec![0.2f32; (w * h) as usize],
+                &SynthWcs {
+                    crval: [10.0, 0.0],
+                    refimg: [w as f64 / 2.0, h as f64 / 2.0],
+                    cd,
+                },
+            )
+            .unwrap();
+            let props = XisfPanel::open(&path).unwrap().header().properties.clone();
+            descs.push(PanelDesc {
+                panel_id: k,
+                width: w,
+                height: h,
+                channels: 1,
+                properties: props,
+            });
+        }
+        // The reference's WCS puts the same sky 2 px to the right.
+        let reference = ReferenceFrame::Aligned {
+            width: w,
+            height: h,
+            wcs: Some(wcs_of(
+                [10.0, 0.0],
+                [w as f64 / 2.0 + 0.5 + 2.0, h as f64 / 2.0 + 0.5],
+            )),
+        };
+        let mut job = MockHost::aligned_job(w, h, 1, 2, 8, w * 8 * 4);
+        job.panels = descs;
+        job.reference = Some(reference.clone());
+        let (host, r, wr) = MockHost::spawn(job.clone(), vec![vec![], vec![]]);
+        let link = HostLink::start(job, r, wr).unwrap();
+        let err = analyze_ipc_aligned(
+            link.clone(),
+            &dir,
+            8,
+            Some(2),
+            GainMode::Fit,
+            Some(&reference),
+        )
+        .unwrap_err()
+        .to_string();
+        link.finish_ok().unwrap();
+        host.join();
+        assert!(err.contains("displaced up to 2.00 px"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

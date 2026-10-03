@@ -185,6 +185,10 @@ private:
    String     m_filterPattern;
    bool       m_filterHintShown = false;
    Array<int> m_visibleRows;
+   // Group by FILTER (Files mode) runs a pumped worker probe: this flag
+   // rejects re-entrant clicks delivered by that pump, and the whole
+   // interface is disabled for the probe's duration.
+   bool       m_probeInProgress = false;
 
    static constexpr const char* kFilterHint = "e.g. *_Ha*";
 

@@ -956,8 +956,28 @@ static String ViewFilterName( const String& viewId )
    return String();
 }
 
+// RAII: disables the interface (no clicks reach the live instance while a
+// pumped worker probe runs) and clears the re-entrancy flag on every exit.
+struct ProbeScopeGuard
+{
+   MmmBlendInterface& iface;
+   bool&              flag;
+   ProbeScopeGuard( MmmBlendInterface& i, bool& f ) : iface( i ), flag( f )
+   {
+      flag = true;
+      iface.Disable();
+   }
+   ~ProbeScopeGuard()
+   {
+      iface.Enable();
+      flag = false;
+   }
+};
+
 void MmmBlendInterface::e_GroupByFilterClick( Button&, bool )
 {
+   if ( m_probeInProgress )
+      return;   // a click delivered by the probe's own event pump
    Array<int> rows = TargetRows();
    Array<String>& items  = ActiveItems();
    Array<String>& groups = ActiveGroups();
@@ -984,14 +1004,23 @@ void MmmBlendInterface::e_GroupByFilterClick( Button&, bool )
       {
          try
          {
+            ProbeScopeGuard scope( *this, m_probeInProgress );
             Console().EnableAbort();
             mmm::PanelProbeResult probe = probe_filter_names( paths );
+            // The probe pumped the event queue; re-validate every row against
+            // the live arrays before writing (belt and braces beside the
+            // disabled interface).
             for ( size_type i = 0; i < rows.Length() && i < probe.panels.size(); ++i )
             {
+               const int row = rows[i];
+               if ( row < 0 || size_type( row ) >= groups.Length() || size_type( row ) >= items.Length() )
+                  continue;
+               if ( std::string( items[row].ToUTF8().c_str() ) != paths[i] )
+                  continue;
                if ( probe.panels[i].filter.empty() )
                   ++missing;
                else
-                  groups[rows[i]] = String( IsoString( probe.panels[i].filter.c_str() ).UTF8ToUTF16() );
+                  groups[row] = String( IsoString( probe.panels[i].filter.c_str() ).UTF8ToUTF16() );
             }
          }
          catch ( const mmm::HostCancelled& )

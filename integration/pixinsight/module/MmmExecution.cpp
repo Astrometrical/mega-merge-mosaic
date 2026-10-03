@@ -1002,6 +1002,27 @@ String DescribeReference( const json& ref )
    return s;
 }
 
+// Rewords an engine error for the module's own UI: the stage-1 registration
+// hints name CLI flags, and a nested "MegaMergeMosaic: " prefix is dropped
+// before the message is re-wrapped with the group name.
+String ModuleWording( String msg )
+{
+   const String prefix( "MegaMergeMosaic: " );
+   if ( msg.StartsWith( prefix ) )
+      msg.Delete( 0, prefix.Length() );
+   msg.ReplaceString( String( "pass `--input solved` if they are raw plate-solved panels, or derive an "
+                        "aligned reference from the registered canvases" ),
+                String( "set Panel registration method to Align by astrometric solution" ) );
+   msg.ReplaceString( String( "pass `--input aligned` if they are registered full-canvas frames, or "
+                        "derive a solved reference from the raw panels" ),
+                String( "set Panel registration method to Pre-aligned (MosaicByCoordinates)" ) );
+   msg.ReplaceString( String( "re-derive the frame over the full panel set with `mmm frame`, or exclude "
+                        "the panel" ),
+                String( "the shared frame is derived over every listed panel, so this should not "
+                        "happen; please report it" ) );
+   return msg;
+}
+
 std::string GroupNameList( const std::vector<mmm_groups::Group>& groups )
 {
    std::string out;
@@ -1189,11 +1210,13 @@ void run_blend( MmmBlendInstance& in )
       }
       catch ( const Error& e )
       {
-         throw Error( "MegaMergeMosaic: group " + U( mmm_groups::display_name( g.name ) ) + ": " + e.Message() );
+         throw Error( "MegaMergeMosaic: group " + U( mmm_groups::display_name( g.name ) ) + ": " +
+                      ModuleWording( e.Message() ) );
       }
       catch ( const std::exception& e )
       {
-         throw Error( "MegaMergeMosaic: group " + U( mmm_groups::display_name( g.name ) ) + ": " + String( e.what() ) );
+         throw Error( "MegaMergeMosaic: group " + U( mmm_groups::display_name( g.name ) ) + ": " +
+                      ModuleWording( String( e.what() ) ) );
       }
       if ( p.seamMap )
          ShowSeamMap( job.sessionDir, job.seamMapId );
