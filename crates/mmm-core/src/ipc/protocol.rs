@@ -374,6 +374,12 @@ pub struct InitJob {
     pub session_dir: String,
     /// Blend parameters for the run.
     pub params: BlendParamsWire,
+    /// Shared reference frame the job must adopt instead of deriving its own
+    /// (multi-filter runs: every group's job carries the same value). Same
+    /// JSON as a `*.mmm-frame.json` file. `None` (or absent — hosts that
+    /// predate the field) keeps today's behaviour.
+    #[serde(default)]
+    pub reference: Option<crate::reference::ReferenceFrame>,
 }
 
 /// Messages sent from `mmm-ipc-worker` to the host.
@@ -668,6 +674,7 @@ mod tests {
             }],
             mode: JobMode::Aligned,
             session_dir: "/tmp/x.mmm-session".into(),
+            reference: None,
             params: BlendParamsWire::default(),
         };
         let mut buf = Vec::new();
@@ -697,6 +704,7 @@ mod tests {
             }],
             mode: JobMode::Aligned,
             session_dir: "/tmp/x.mmm-session".into(),
+            reference: None,
             params: BlendParamsWire::default(),
         }
     }

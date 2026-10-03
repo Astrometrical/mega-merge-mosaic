@@ -143,6 +143,7 @@ fn run() -> mmm_core::Result<()> {
     let gain = init.params.gain_mode();
     let seam_map = init.params.seam_map;
     let mode = init.mode.clone();
+    let reference = init.reference.clone();
 
     // `std::io::stdin()` is a handle onto the same global buffered stdin the
     // `read_host_frame` call above just read the `Init` frame from, so a
@@ -164,12 +165,22 @@ fn run() -> mmm_core::Result<()> {
     // path unchanged.
     let result: mmm_core::Result<()> = (|| {
         let session = match mode {
-            JobMode::Aligned => {
-                analyze_ipc_aligned(link.clone(), &session_dir, band_rows, surface_order, gain)?
-            }
-            JobMode::Solved => {
-                analyze_ipc_solved(link.clone(), &session_dir, band_rows, surface_order, gain)?
-            }
+            JobMode::Aligned => analyze_ipc_aligned(
+                link.clone(),
+                &session_dir,
+                band_rows,
+                surface_order,
+                gain,
+                reference.as_ref(),
+            )?,
+            JobMode::Solved => analyze_ipc_solved(
+                link.clone(),
+                &session_dir,
+                band_rows,
+                surface_order,
+                gain,
+                reference.as_ref(),
+            )?,
             JobMode::Files {
                 paths,
                 input_select,
@@ -189,7 +200,7 @@ fn run() -> mmm_core::Result<()> {
                     gain,
                     input_select.to_input_select(),
                     Some(&progress),
-                    None,
+                    reference.as_ref(),
                 )?
             }
         };

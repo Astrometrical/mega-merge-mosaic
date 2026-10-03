@@ -554,6 +554,11 @@ impl HostLink {
         &self.init.panels
     }
 
+    /// The job's shared reference frame, if the host imposed one.
+    pub fn reference(&self) -> Option<&crate::reference::ReferenceFrame> {
+        self.init.reference.as_ref()
+    }
+
     /// How to read/align input panels for this job.
     pub fn mode(&self) -> &JobMode {
         &self.init.mode

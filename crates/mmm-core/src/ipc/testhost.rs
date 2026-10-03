@@ -199,6 +199,7 @@ impl MockHost {
             mode: JobMode::Aligned,
             session_dir: "/tmp/mmm-testhost.mmm-session".into(),
             params: BlendParamsWire::default(),
+            reference: None,
         }
     }
 

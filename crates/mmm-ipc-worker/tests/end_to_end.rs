@@ -196,6 +196,7 @@ fn worker_blend_is_byte_identical_to_file_blend() {
         panels: panel_descs,
         mode: JobMode::Aligned,
         session_dir: worker_session_dir.to_string_lossy().into_owned(),
+        reference: None,
         params: BlendParamsWire {
             feather_px: params.feather_px,
             downsample: params.downsample,
@@ -314,6 +315,7 @@ fn unity_gain_mode_reaches_the_worker_session() {
         panels: panel_descs,
         mode: JobMode::Aligned,
         session_dir: worker_session_dir.to_string_lossy().into_owned(),
+        reference: None,
         params: BlendParamsWire {
             band_rows: band_rows_u32,
             gain: "unity".to_string(),
@@ -535,6 +537,7 @@ fn aligned_two_panel_job(
             seam_map: false,
             gain: "fit".to_string(),
         },
+        reference: None,
     };
     (job, shm, panel_pixels)
 }
@@ -927,6 +930,7 @@ fn solved_mode_reprojection_matches_file() {
             panels: panel_descs,
             mode: JobMode::Solved,
             session_dir: worker_session_dir.to_string_lossy().into_owned(),
+            reference: None,
             params: BlendParamsWire {
                 feather_px: params.feather_px,
                 downsample: params.downsample,
@@ -1019,6 +1023,7 @@ fn probe_frame_prints_choose_frame_geometry() {
         panels,
         mode: JobMode::Solved,
         session_dir: String::new(),
+        reference: None,
         params: BlendParamsWire {
             feather_px: 0.0,
             downsample: 1,
@@ -1161,6 +1166,7 @@ fn version_mismatch_is_refused_with_an_error_frame() {
             }],
             mode: JobMode::Aligned,
             session_dir: dir.join("s.mmm-session").to_string_lossy().into_owned(),
+            reference: None,
             params: BlendParamsWire::default(),
         };
 

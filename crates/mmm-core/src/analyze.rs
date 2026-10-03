@@ -313,6 +313,11 @@ pub fn analyze_full(
     }
 }
 
+/// Kind-mismatch message: an aligned reference frame met solved input.
+const ALIGNED_REFERENCE_ON_SOLVED: &str = "the reference frame is an aligned canvas but these panels were read as solved raw \
+     panels: pass `--input aligned` if they are registered full-canvas frames, or derive a \
+     solved reference from the raw panels";
+
 /// Kind-mismatch message: a solved reference frame met aligned input.
 const SOLVED_REFERENCE_ON_ALIGNED: &str = "the reference frame is a solved mosaic frame but these panels were read as aligned \
      full-canvas frames: pass `--input solved` if they are raw plate-solved panels, or derive \
@@ -468,12 +473,7 @@ fn analyze_solved(
             frame.clone()
         }
         Some(ReferenceFrame::Aligned { .. }) => {
-            return Err(Error::format(
-                session_dir,
-                "the reference frame is an aligned canvas but these panels were read as solved \
-                 raw panels: pass `--input aligned` if they are registered full-canvas frames, \
-                 or derive a solved reference from the raw panels",
-            ));
+            return Err(Error::format(session_dir, ALIGNED_REFERENCE_ON_SOLVED));
         }
     };
     let canvas = (frame.width, frame.height, ch);
@@ -702,6 +702,7 @@ pub fn analyze_ipc_aligned(
     band_rows: usize,
     surface_order: Option<u32>,
     gain: GainMode,
+    reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
@@ -723,6 +724,18 @@ pub fn analyze_ipc_aligned(
                 p.panel_id, p.width, p.height, p.channels, canvas.0, canvas.1, canvas.2
             )));
         }
+    }
+
+    // A reference whose canvas disagrees is knowable from the Init alone:
+    // refuse before the first band request (a registered set can be tens
+    // of GB).
+    if let Some(ReferenceFrame::Aligned { width, height, .. }) = reference
+        && (canvas.0, canvas.1) != (*width, *height)
+    {
+        let reason =
+            crate::reference::check_aligned((canvas.0, canvas.1), None, *width, *height, None)
+                .expect_err("geometry differs");
+        return Err(Error::format(session_dir, reason));
     }
 
     // Claim + report under one lock (see analyze_aligned's scan loop).
@@ -755,6 +768,29 @@ pub fn analyze_ipc_aligned(
         })
         .collect::<Result<_>>()?;
 
+    if let Some(r) = reference {
+        match r {
+            ReferenceFrame::Aligned { width, height, wcs } => {
+                let panel_wcs = link
+                    .panels()
+                    .first()
+                    .and_then(|p| crate::astrometry::wcs_from_properties(&p.properties));
+                crate::reference::check_aligned(
+                    (canvas.0, canvas.1),
+                    panel_wcs.as_ref(),
+                    *width,
+                    *height,
+                    wcs.as_ref(),
+                )
+                .map_err(|reason| Error::format(session_dir, reason))?;
+                session.frame_imposed = true;
+            }
+            ReferenceFrame::Solved { .. } => {
+                return Err(Error::format(session_dir, SOLVED_REFERENCE_ON_ALIGNED));
+            }
+        }
+    }
+
     session.canvas = canvas;
     finish_session(session, scans, surface_order, gain)
 }
@@ -771,6 +807,7 @@ pub fn analyze_ipc_solved(
     band_rows: usize,
     surface_order: Option<u32>,
     gain: GainMode,
+    reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
@@ -779,8 +816,25 @@ pub fn analyze_ipc_solved(
         return Err(Error::format(session_dir, "IPC job has no input panels"));
     }
 
-    let (models, frame, ch) =
+    let (models, own_frame, ch) =
         solved_frame(panels).map_err(|reason| Error::format(session_dir, reason))?;
+    let frame = match reference {
+        None => own_frame,
+        Some(ReferenceFrame::Solved { frame }) => {
+            crate::reference::check_footprints(
+                panels
+                    .iter()
+                    .zip(models.iter())
+                    .map(|(p, m)| (format!("panel {}", p.panel_id), m)),
+                frame,
+            )
+            .map_err(|reason| Error::format(session_dir, reason))?;
+            frame.clone()
+        }
+        Some(ReferenceFrame::Aligned { .. }) => {
+            return Err(Error::format(session_dir, ALIGNED_REFERENCE_ON_SOLVED));
+        }
+    };
     let canvas = (frame.width, frame.height, ch);
     tracing::info!(
         "mosaic frame: {}x{} px, {:.3}\"/px, center RA {:.4} Dec {:+.4}",
@@ -861,6 +915,7 @@ pub fn analyze_ipc_solved(
     session.canvas = canvas;
     session.input = InputKind::Solved;
     session.frame = Some(frame);
+    session.frame_imposed = reference.is_some();
     session.align_secs = Some(align_secs);
     finish_session(session, scans, surface_order, gain)
 }
@@ -1081,9 +1136,12 @@ fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::xisf::XisfPanel;
     use crate::ipc::client::HostLink;
+    use crate::ipc::protocol::PanelDesc;
     use crate::ipc::testhost::MockHost;
-    use crate::synth::write_xisf;
+    use crate::reference::ReferenceFrame;
+    use crate::synth::{SynthWcs, write_xisf, write_xisf_solved};
 
     fn tmpdir(tag: &str) -> PathBuf {
         let dir =
@@ -1146,7 +1204,7 @@ mod tests {
         let link = HostLink::start(job, r, wr).unwrap();
         let ipc_dir = f.dir.join("ipc.mmm-session");
         let ipc_sess =
-            analyze_ipc_aligned(link.clone(), &ipc_dir, 32, Some(2), GainMode::Fit).unwrap();
+            analyze_ipc_aligned(link.clone(), &ipc_dir, 32, Some(2), GainMode::Fit, None).unwrap();
         link.finish_ok().unwrap();
         host.join();
 
@@ -1261,7 +1319,7 @@ mod tests {
         let link = HostLink::start(job, r, wr).unwrap();
         let dir = tmpdir("ipc-mismatch");
 
-        let err = analyze_ipc_aligned(link.clone(), &dir, 8, None, GainMode::Fit)
+        let err = analyze_ipc_aligned(link.clone(), &dir, 8, None, GainMode::Fit, None)
             .unwrap_err()
             .to_string();
         link.finish_ok().unwrap();
@@ -1270,5 +1328,242 @@ mod tests {
         assert!(err.contains("channels"), "got: {err}");
         assert!(err.contains("panel 1"), "got: {err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two raw solved mono panels (64×48 at RA 10°, 60×52 offset ~55 % east
+    /// and 8 px north, rotated 6°), as files plus planar pixels plus wire
+    /// descriptors carrying their solutions.
+    struct SolvedPair {
+        dir: PathBuf,
+        descs: Vec<PanelDesc>,
+        planar: Vec<Vec<f32>>,
+    }
+
+    fn synth_solved_pair(tag: &str) -> SolvedPair {
+        let dir = tmpdir(tag);
+        let s = 1.0e-3_f64;
+        let specs = [
+            (64u64, 48u64, [10.0f64, 0.0f64], 0.0f64),
+            (60, 52, [10.0 + 64.0 * s * 0.55, 8.0 * s], 6.0),
+        ];
+        let mut descs = Vec::new();
+        let mut planar = Vec::new();
+        for (k, (w, h, crval, rot)) in specs.iter().enumerate() {
+            let (sr, cr) = rot.to_radians().sin_cos();
+            let cd = [[-s * cr, -s * sr], [-s * sr, s * cr]];
+            let mut planes = vec![0f32; (w * h) as usize];
+            for j in 0..*h {
+                for i in 0..*w {
+                    planes[(j * w + i) as usize] =
+                        (((i * 7 + j * 13 + k as u64 * 41) % 97) as f32) / 97.0 + 0.01;
+                }
+            }
+            let path = dir.join(format!("solved_{k}.xisf"));
+            write_xisf_solved(
+                &path,
+                *w,
+                *h,
+                1,
+                &planes,
+                &SynthWcs {
+                    crval: *crval,
+                    refimg: [*w as f64 / 2.0, *h as f64 / 2.0],
+                    cd,
+                },
+            )
+            .unwrap();
+            let props = XisfPanel::open(&path).unwrap().header().properties.clone();
+            descs.push(PanelDesc {
+                panel_id: k as u32,
+                width: *w,
+                height: *h,
+                channels: 1,
+                properties: props,
+            });
+            planar.push(planes);
+        }
+        SolvedPair { dir, descs, planar }
+    }
+
+    fn solved_job(descs: &[PanelDesc], slot_width: u64) -> crate::ipc::protocol::InitJob {
+        let mut job = MockHost::aligned_job(0, 0, 1, 0, 8, slot_width * 8 * 4);
+        job.panels = descs.to_vec();
+        job.mode = crate::ipc::protocol::JobMode::Solved;
+        job
+    }
+
+    #[test]
+    fn ipc_solved_adopts_an_imposed_reference() {
+        let f = synth_solved_pair("ipc-ref-solved");
+        // A reference wider than the pair's own frame, as a second filter's
+        // panels shifted east would give.
+        let own = crate::reference::derive_from_descs(&f.descs, InputSelect::Solved).unwrap();
+        let ReferenceFrame::Solved { frame: own_frame } = &own else {
+            unreachable!()
+        };
+        let imposed = ReferenceFrame::Solved {
+            frame: MosaicFrame {
+                width: own_frame.width + 30,
+                ..own_frame.clone()
+            },
+        };
+        let mut job = solved_job(&f.descs, own_frame.width + 30);
+        job.reference = Some(imposed.clone());
+        let (host, r, wr) = MockHost::spawn(job.clone(), f.planar.clone());
+        let link = HostLink::start(job, r, wr).unwrap();
+        let dir = f.dir.join("ipc.mmm-session");
+        let sess = analyze_ipc_solved(
+            link.clone(),
+            &dir,
+            8,
+            Some(2),
+            GainMode::Fit,
+            Some(&imposed),
+        )
+        .unwrap();
+        link.finish_ok().unwrap();
+        host.join();
+        assert!(sess.frame_imposed);
+        assert_eq!(sess.canvas.0, own_frame.width + 30);
+        let ReferenceFrame::Solved { frame } = imposed else {
+            unreachable!()
+        };
+        assert_eq!(sess.frame, Some(frame));
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn ipc_solved_refuses_a_panel_outside_the_reference() {
+        let f = synth_solved_pair("ipc-ref-footprint");
+        let own = crate::reference::derive_from_descs(&f.descs, InputSelect::Solved).unwrap();
+        let ReferenceFrame::Solved { frame: own_frame } = &own else {
+            unreachable!()
+        };
+        // Narrower than the panels' union: a panel overhangs an edge.
+        let narrow = ReferenceFrame::Solved {
+            frame: MosaicFrame {
+                width: own_frame.width - 40,
+                ..own_frame.clone()
+            },
+        };
+        let mut job = solved_job(&f.descs, own_frame.width);
+        job.reference = Some(narrow.clone());
+        let (host, r, wr) = MockHost::spawn(job.clone(), f.planar.clone());
+        let link = HostLink::start(job, r, wr).unwrap();
+        let dir = f.dir.join("ipc.mmm-session");
+        let err = analyze_ipc_solved(link.clone(), &dir, 8, Some(2), GainMode::Fit, Some(&narrow))
+            .unwrap_err()
+            .to_string();
+        link.finish_ok().unwrap();
+        host.join();
+        assert!(err.contains("beyond the"), "{err}");
+        assert!(err.contains("panel 1") || err.contains("panel 0"), "{err}");
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn ipc_solved_refuses_an_aligned_reference() {
+        let f = synth_solved_pair("ipc-ref-kind");
+        let aligned = ReferenceFrame::Aligned {
+            width: 64,
+            height: 48,
+            wcs: None,
+        };
+        let mut job = solved_job(&f.descs, 128);
+        job.reference = Some(aligned.clone());
+        let (host, r, wr) = MockHost::spawn(job.clone(), f.planar.clone());
+        let link = HostLink::start(job, r, wr).unwrap();
+        let dir = f.dir.join("ipc.mmm-session");
+        let err = analyze_ipc_solved(
+            link.clone(),
+            &dir,
+            8,
+            Some(2),
+            GainMode::Fit,
+            Some(&aligned),
+        )
+        .unwrap_err()
+        .to_string();
+        link.finish_ok().unwrap();
+        host.join();
+        assert!(
+            err.contains("aligned canvas") && err.contains("--input aligned"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn ipc_aligned_adopts_reference_without_wcs() {
+        let f = synth_two_full_canvas_panels("ipc-ref-aligned");
+        let (w, h, ch) = (32u64, 24u64, 3u64);
+        let reference = ReferenceFrame::Aligned {
+            width: w,
+            height: h,
+            wcs: None,
+        };
+        let mut job = MockHost::aligned_job(w, h, ch, 2, 8, w * ch * 32 * 4);
+        job.reference = Some(reference.clone());
+        let (host, r, wr) = MockHost::spawn(job.clone(), f.planar.clone());
+        let link = HostLink::start(job, r, wr).unwrap();
+        let dir = f.dir.join("ipc.mmm-session");
+        let sess = analyze_ipc_aligned(
+            link.clone(),
+            &dir,
+            32,
+            Some(2),
+            GainMode::Fit,
+            Some(&reference),
+        )
+        .unwrap();
+        link.finish_ok().unwrap();
+        host.join();
+        assert!(sess.frame_imposed);
+        assert!(sess.frame.is_none());
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn ipc_aligned_refuses_a_mismatched_canvas_reference() {
+        let f = synth_two_full_canvas_panels("ipc-ref-aligned-size");
+        let (w, h, ch) = (32u64, 24u64, 3u64);
+        let reference = ReferenceFrame::Aligned {
+            width: w + 8,
+            height: h,
+            wcs: None,
+        };
+        let mut job = MockHost::aligned_job(w, h, ch, 2, 8, w * ch * 32 * 4);
+        job.reference = Some(reference.clone());
+        let (host, r, wr) = MockHost::spawn(job.clone(), f.planar.clone());
+        let link = HostLink::start(job, r, wr).unwrap();
+        let dir = f.dir.join("ipc.mmm-session");
+        let err = analyze_ipc_aligned(
+            link.clone(),
+            &dir,
+            32,
+            Some(2),
+            GainMode::Fit,
+            Some(&reference),
+        )
+        .unwrap_err()
+        .to_string();
+        link.finish_ok().unwrap();
+        host.join();
+        assert!(err.contains("does not match the reference frame"), "{err}");
+        assert!(
+            err.contains("align every group to one common reference"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    #[test]
+    fn init_job_without_reference_still_parses() {
+        let mut job = MockHost::aligned_job(4, 4, 1, 1, 1, 64);
+        job.reference = None;
+        let mut v = serde_json::to_value(&job).unwrap();
+        v.as_object_mut().unwrap().remove("reference");
+        let back: crate::ipc::protocol::InitJob = serde_json::from_value(v).unwrap();
+        assert_eq!(back.reference, None);
     }
 }
