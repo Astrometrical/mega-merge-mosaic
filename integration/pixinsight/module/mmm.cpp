@@ -94,8 +94,10 @@ PCL_MODULE_EXPORT pcl::int32 InstallPixInsightModule( pcl::int32 mode )
       using namespace pcl;
       TheMmmInputImagesParameter   = new MmmInputImagesParameter( TheMmmBlendProcess );
       TheMmmViewIdParameter        = new MmmViewIdParameter( TheMmmInputImagesParameter );
+      TheMmmViewGroupParameter     = new MmmViewGroupParameter( TheMmmInputImagesParameter );
       TheMmmFilePathsParameter     = new MmmFilePathsParameter( TheMmmBlendProcess );
       TheMmmPathParameter          = new MmmPathParameter( TheMmmFilePathsParameter );
+      TheMmmFileGroupParameter     = new MmmFileGroupParameter( TheMmmFilePathsParameter );
       TheMmmInputSelectParameter   = new MmmInputSelectParameter( TheMmmBlendProcess );
       TheMmmSessionDirParameter    = new MmmSessionDirParameter( TheMmmBlendProcess );
       TheMmmFeatherParameter       = new MmmFeatherParameter( TheMmmBlendProcess );

@@ -117,6 +117,8 @@ void MmmBlendInstance::Assign( const ProcessImplementation& p )
    {
       p_viewIds       = x->p_viewIds;
       p_filePaths     = x->p_filePaths;
+      p_viewGroups    = x->p_viewGroups;
+      p_fileGroups    = x->p_fileGroups;
       p_inputSelect   = x->p_inputSelect;
       p_sessionDir    = x->p_sessionDir;
       p_feather       = x->p_feather;
@@ -181,6 +183,10 @@ void* MmmBlendInstance::LockParameter( const MetaParameter* p, size_type tableRo
       return p_viewIds[tableRow].Begin();
    if ( p == TheMmmPathParameter )
       return p_filePaths[tableRow].Begin();
+   if ( p == TheMmmViewGroupParameter )
+      return p_viewGroups[tableRow].Begin();
+   if ( p == TheMmmFileGroupParameter )
+      return p_fileGroups[tableRow].Begin();
 
    // Scalars.
    if ( p == TheMmmInputSelectParameter )   return &p_inputSelect;
@@ -201,18 +207,29 @@ void* MmmBlendInstance::LockParameter( const MetaParameter* p, size_type tableRo
 bool MmmBlendInstance::AllocateParameter( size_type sizeOrLength, const MetaParameter* p, size_type tableRow )
 {
    // Tables: sizeOrLength is a ROW COUNT -> resize the backing Array<String>.
+   // Both columns of a table are resized together: an icon written before
+   // the group column existed never allocates it, so every row stays in the
+   // default group ("").
    if ( p == TheMmmInputImagesParameter )
    {
       p_viewIds.Clear();
+      p_viewGroups.Clear();
       if ( sizeOrLength > 0 )
+      {
          p_viewIds.Add( String(), sizeOrLength );
+         p_viewGroups.Add( String(), sizeOrLength );
+      }
       return true;
    }
    if ( p == TheMmmFilePathsParameter )
    {
       p_filePaths.Clear();
+      p_fileGroups.Clear();
       if ( sizeOrLength > 0 )
+      {
          p_filePaths.Add( String(), sizeOrLength );
+         p_fileGroups.Add( String(), sizeOrLength );
+      }
       return true;
    }
 
@@ -229,6 +246,20 @@ bool MmmBlendInstance::AllocateParameter( size_type sizeOrLength, const MetaPara
       p_filePaths[tableRow].Clear();
       if ( sizeOrLength > 0 )
          p_filePaths[tableRow].SetLength( sizeOrLength );
+      return true;
+   }
+   if ( p == TheMmmViewGroupParameter )
+   {
+      p_viewGroups[tableRow].Clear();
+      if ( sizeOrLength > 0 )
+         p_viewGroups[tableRow].SetLength( sizeOrLength );
+      return true;
+   }
+   if ( p == TheMmmFileGroupParameter )
+   {
+      p_fileGroups[tableRow].Clear();
+      if ( sizeOrLength > 0 )
+         p_fileGroups[tableRow].SetLength( sizeOrLength );
       return true;
    }
    if ( p == TheMmmSessionDirParameter )
@@ -255,6 +286,10 @@ size_type MmmBlendInstance::ParameterLength( const MetaParameter* p, size_type t
       return p_viewIds[tableRow].Length();
    if ( p == TheMmmPathParameter )
       return p_filePaths[tableRow].Length();
+   if ( p == TheMmmViewGroupParameter )
+      return p_viewGroups[tableRow].Length();
+   if ( p == TheMmmFileGroupParameter )
+      return p_fileGroups[tableRow].Length();
    if ( p == TheMmmSessionDirParameter )
       return p_sessionDir.Length();
 

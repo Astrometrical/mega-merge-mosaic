@@ -14,8 +14,10 @@ namespace pcl
 
 MmmInputImagesParameter*   TheMmmInputImagesParameter   = nullptr;
 MmmViewIdParameter*        TheMmmViewIdParameter        = nullptr;
+MmmViewGroupParameter*     TheMmmViewGroupParameter     = nullptr;
 MmmFilePathsParameter*     TheMmmFilePathsParameter     = nullptr;
 MmmPathParameter*          TheMmmPathParameter          = nullptr;
+MmmFileGroupParameter*     TheMmmFileGroupParameter     = nullptr;
 MmmInputSelectParameter*   TheMmmInputSelectParameter   = nullptr;
 MmmSessionDirParameter*    TheMmmSessionDirParameter    = nullptr;
 MmmFeatherParameter*       TheMmmFeatherParameter       = nullptr;

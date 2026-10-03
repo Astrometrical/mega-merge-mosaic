@@ -94,6 +94,8 @@ private:
    // columns index into them by tableRow.
    Array<String> p_viewIds;         // inputImages table rows (view ids)
    Array<String> p_filePaths;       // filePaths table rows (file paths)
+   Array<String> p_viewGroups;      // inputViews "group" column, parallel to p_viewIds
+   Array<String> p_fileGroups;      // filePaths "group" column, parallel to p_filePaths
    pcl_enum      p_inputSelect;     // Auto / Aligned / Solved
    String        p_sessionDir;      // *.mmm-session directory
    int32         p_feather;         // feather ramp length, canvas px

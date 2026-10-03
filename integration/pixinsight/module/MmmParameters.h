@@ -19,6 +19,10 @@
 // The parameter <-> wire mapping (spec 10.1, PROTOCOL.md 6 BlendParamsWire):
 //   inputImages/viewId -> InitJob.panels (view ids)
 //   filePaths/path     -> JobMode::Files.paths
+//   inputViews/group, filePaths/group -> one worker job per distinct group,
+//                         every job carrying the same InitJob.reference
+//                         ("" = the default group; a single-group run sends
+//                         no reference and is byte-identical to a 1.5 run)
 //   inputSelect        -> JobMode (views) / InputSelect (files)
 //   sessionDir         -> InitJob.session_dir
 //   feather            -> params.feather_px
@@ -72,6 +76,22 @@ public:
 
 extern MmmViewIdParameter* TheMmmViewIdParameter;
 
+/*!
+ * \brief The "group" string column of the inputViews table: the filter group
+ * a view belongs to ("" = the default group). Rows sharing a group are merged
+ * into one output; several groups share one reference frame (spec: PixInsight
+ * multi-filter groups).
+ */
+class MmmViewGroupParameter : public MetaString
+{
+public:
+
+   MmmViewGroupParameter( MetaTable* T ) : MetaString( T ) {}   // parent is the TABLE
+   IsoString Id() const override { return "group"; }
+};
+
+extern MmmViewGroupParameter* TheMmmViewGroupParameter;
+
 // ----------------------------------------------------------------------------
 // filePaths: table of input file paths, one MetaString column "path".
 // Mutually exclusive with inputImages (host enforces).
@@ -103,6 +123,20 @@ public:
 };
 
 extern MmmPathParameter* TheMmmPathParameter;
+
+/*!
+ * \brief The "group" string column of the filePaths table (see
+ * MmmViewGroupParameter).
+ */
+class MmmFileGroupParameter : public MetaString
+{
+public:
+
+   MmmFileGroupParameter( MetaTable* T ) : MetaString( T ) {}   // parent is the TABLE
+   IsoString Id() const override { return "group"; }
+};
+
+extern MmmFileGroupParameter* TheMmmFileGroupParameter;
 
 // ----------------------------------------------------------------------------
 // inputSelect: advanced Auto/Aligned/Solved override (default Auto). Element
