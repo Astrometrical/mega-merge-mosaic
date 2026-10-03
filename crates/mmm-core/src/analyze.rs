@@ -248,6 +248,34 @@ pub fn analyze_full(
     if let Err(reason) = check_uniform_channels(opened) {
         return Err(Error::compute(reason));
     }
+    // Header-knowable reference mismatches fail before any pixel scan — a
+    // registered set can be tens of GB: a canvas geometry that differs from
+    // an aligned reference, or a solved reference forced onto aligned input.
+    // (A solved reference under Auto with same-geometry panels is left to
+    // the scan: the ≥ 50 % coverage rule may still re-dispatch to solved.)
+    if let Some(r) = reference {
+        let geoms: Vec<(u64, u64)> = paths
+            .iter()
+            .filter_map(|p| InputPanel::open(p).ok())
+            .map(|x| (x.width(), x.height()))
+            .collect();
+        let same_geometry =
+            paths.len() >= 2 && geoms.len() == paths.len() && geoms.iter().all(|g| *g == geoms[0]);
+        let forced_aligned = input == InputSelect::Aligned;
+        let reads_aligned = forced_aligned || (input == InputSelect::Auto && same_geometry);
+        match r {
+            ReferenceFrame::Aligned { width, height, .. } if reads_aligned => {
+                if let Some(g) = geoms.first() {
+                    crate::reference::check_aligned(*g, None, *width, *height, None)
+                        .map_err(|reason| Error::format(session_dir, reason))?;
+                }
+            }
+            ReferenceFrame::Solved { .. } if forced_aligned => {
+                return Err(Error::format(session_dir, SOLVED_REFERENCE_ON_ALIGNED));
+            }
+            _ => {}
+        }
+    }
     match input {
         InputSelect::Aligned => analyze_aligned(
             paths,
@@ -284,6 +312,11 @@ pub fn analyze_full(
         }
     }
 }
+
+/// Kind-mismatch message: a solved reference frame met aligned input.
+const SOLVED_REFERENCE_ON_ALIGNED: &str = "the reference frame is a solved mosaic frame but these panels were read as aligned \
+     full-canvas frames: pass `--input solved` if they are raw plate-solved panels, or derive \
+     an aligned reference from the registered canvases";
 
 /// Reports `done`/`total` for a stage through an optional observer.
 fn report(progress: Option<AnalyzeProgress>, stage: &str, done: u64, total: u64) {
@@ -372,13 +405,7 @@ fn analyze_aligned(
                 session.frame_imposed = true;
             }
             ReferenceFrame::Solved { .. } => {
-                return Err(Error::format(
-                    session_dir,
-                    "the reference frame is a solved mosaic frame but these panels were read as \
-                     aligned full-canvas frames: pass `--input solved` if they are raw \
-                     plate-solved panels, or derive an aligned reference from the registered \
-                     canvases",
-                ));
+                return Err(Error::format(session_dir, SOLVED_REFERENCE_ON_ALIGNED));
             }
         }
     }

@@ -638,3 +638,58 @@ fn two_aligned_groups_share_the_full_canvas() {
     assert_eq!(out_b.at(0, 5, 5), 0.0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn header_knowable_mismatches_fail_before_any_scan() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempdir("fail-fast");
+    let a = write_aligned_group(&dir.join("A"), "a", STAR, 10, 20);
+    let scanned = AtomicU64::new(0);
+    let progress = |stage: &str, done: u64, _total: u64| {
+        if stage == "analyze" && done > 0 {
+            scanned.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+
+    // Wrong canvas geometry against an aligned reference: knowable from headers.
+    let smaller = ReferenceFrame::Aligned {
+        width: CANVAS.0 - 10,
+        height: CANVAS.1,
+        wcs: None,
+    };
+    let err = analyze_full(
+        &a,
+        &dir.join("x.mmm-session"),
+        Some(2),
+        GainMode::Fit,
+        InputSelect::Auto,
+        Some(&progress),
+        Some(&smaller),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("does not match the reference frame"), "{err}");
+    assert_eq!(
+        scanned.load(Ordering::Relaxed),
+        0,
+        "a header-knowable mismatch must fail before scanning pixels"
+    );
+
+    // A solved reference forced onto aligned input: knowable without a scan.
+    let raw = write_solved_group(&dir.join("raw"), "r", (0.0, 0.0), 150);
+    let solved_ref = derive(&raw, InputSelect::Solved).unwrap();
+    let err = analyze_full(
+        &a,
+        &dir.join("y.mmm-session"),
+        Some(2),
+        GainMode::Fit,
+        InputSelect::Aligned,
+        Some(&progress),
+        Some(&solved_ref),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("solved mosaic frame"), "{err}");
+    assert_eq!(scanned.load(Ordering::Relaxed), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
