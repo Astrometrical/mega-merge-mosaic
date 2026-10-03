@@ -72,11 +72,16 @@ are documented (`missing_docs`).
 
 Header-only; never scans pixels. Opens every panel with `InputPanel::open`
 (errors aggregated per file, as `analyze_solved` does today), then applies
-the cheap half of the existing auto-detect rule:
+the header-level auto-detect rule:
 
 - `aligned` when `--input aligned`, or `auto` with ≥ 2 panels whose
-  `(width, height)` all agree. Result: `Aligned { width, height, wcs }` with
-  `wcs` = `InputPanel::linear_wcs()` of the first panel.
+  `(width, height)` all agree **and whose canvas solutions agree** (every
+  panel's `linear_wcs()` within `ALIGNED_WCS_TOLERANCE_PX` of the first's;
+  registered canvases carry one identical canvas WCS, raw panels from one
+  camera each carry their own — amended 2026-10-04, see
+  `reference::same_geometry_reads_aligned`). Sets with no WCS at all, or
+  only some, keep the geometry rule. Result: `Aligned { width, height, wcs }`
+  with `wcs` = `InputPanel::linear_wcs()` of the first panel.
 - otherwise `solved`: every panel must yield a `WcsModel`
   (`InputPanel::wcs_model`), reusing the aggregated "solved input requires
   an astrometric solution in every panel" message; result:
@@ -85,8 +90,9 @@ the cheap half of the existing auto-detect rule:
 Channel counts may differ across the input (groups are checked
 individually by analyze). The coverage half of the auto rule (≥ 50 %
 covered re-dispatches to solved) needs a scan and is deliberately *not*
-applied here; a same-geometry raw-panel set must pass `--input solved`
-exactly as analyze requires it today.
+applied here; since the WCS tie-breaker it only matters for registered
+canvases without any WCS, and `analyze_full` applies the same header rule
+before its scan.
 
 Engine entry point: `reference::derive(paths: &[PathBuf], input:
 InputSelect) -> Result<ReferenceFrame>`. The CLI prints the frame summary
@@ -134,9 +140,9 @@ without a WCS and a frame without one pass on geometry alone.
 
 **Kind mismatch**: `Solved` frame but the set dispatches to aligned, or
 `Aligned` frame but the set dispatches to solved, is an error naming both
-kinds and suggesting `--input`. Auto-detect still runs first, so a `Solved`
-frame with same-geometry raw panels (≥ 50 % coverage) still works through
-the re-dispatch.
+kinds and suggesting `--input`. Auto-detect still runs first; same-geometry
+raw panels read as solved from their differing solutions (or, lacking any,
+through the ≥ 50 % coverage re-dispatch).
 
 **Session record**: `Session` gains `#[serde(default)] pub frame_imposed:
 bool`. Solved sessions keep storing the (now imposed) `MosaicFrame` in

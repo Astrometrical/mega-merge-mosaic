@@ -138,14 +138,16 @@ impl ReferenceFrame {
 /// Derive the shared reference frame from the headers of `paths` — every
 /// panel of every group — without scanning pixels.
 ///
-/// Kind selection follows the cheap half of analyze's auto-detect rule:
-/// `aligned` when `input` forces it, or with `Auto` when there are ≥ 2 panels
-/// and every panel has the same `(width, height)`; otherwise `solved`, where
-/// every panel must yield a [`WcsModel`] and the frame is
-/// [`choose_frame`] over all of them. The coverage half of the rule (≥ 50 %
+/// Kind selection is analyze's header-level auto-detect rule: `aligned`
+/// when `input` forces it, or with `Auto` when there are ≥ 2 panels of one
+/// `(width, height)` whose canvas solutions agree
+/// ([`same_geometry_reads_aligned`] — raw panels from one camera share a
+/// geometry but each carries its own solution, so they read as solved);
+/// otherwise `solved`, where every panel must yield a [`WcsModel`] and the
+/// frame is [`choose_frame`] over all of them. The coverage rule (≥ 50 %
 /// covered re-dispatches to solved) needs a scan and is deliberately not
-/// applied: a same-geometry raw-panel set must pass `InputSelect::Solved`,
-/// exactly as analyze requires.
+/// applied here; it remains analyze's backstop for registered canvases
+/// that carry no WCS at all.
 ///
 /// Channel counts may differ across `paths`; groups are checked for channel
 /// uniformity individually by analyze.
@@ -211,7 +213,12 @@ fn derive_items(items: Vec<DeriveItem>, input: InputSelect) -> Result<ReferenceF
     let aligned = match input {
         InputSelect::Aligned => true,
         InputSelect::Solved => false,
-        InputSelect::Auto => items.len() >= 2 && same_geometry,
+        InputSelect::Auto => {
+            items.len() >= 2 && same_geometry && {
+                let wcs: Vec<Option<LinearWcs>> = items.iter().map(|i| i.wcs.clone()).collect();
+                same_geometry_reads_aligned(&wcs, items[0].width, items[0].height)
+            }
+        }
     };
     if aligned {
         if let Some(k) = items
@@ -312,6 +319,49 @@ where
     ))
 }
 
+/// Largest displacement, in pixels, between two canvas solutions over the
+/// canvas corners and centre: a point mapped to the sky by `a` and back to
+/// pixels by `b`.
+fn wcs_displacement_px(a: &LinearWcs, b: &LinearWcs, width: u64, height: u64) -> f64 {
+    let (w, h) = (width as f64, height as f64);
+    let samples = [
+        (1.0, 1.0),
+        (w, 1.0),
+        (1.0, h),
+        (w, h),
+        ((w + 1.0) / 2.0, (h + 1.0) / 2.0),
+    ];
+    let mut worst = 0.0f64;
+    for (x, y) in samples {
+        let (ra, dec) = a.pixel_to_sky(x, y);
+        let (bx, by) = b.sky_to_pixel(ra, dec);
+        worst = worst.max((bx - x).hypot(by - y));
+    }
+    worst
+}
+
+/// The `Auto` tie-breaker for panels that all share one geometry: do their
+/// canvas solutions say they are registered canvases (aligned) or raw
+/// panels from one camera (solved)?
+///
+/// Registered canvases (MosaicByCoordinates output) carry one identical
+/// canvas WCS in every panel; raw panels each point somewhere else. So when
+/// every panel has a solution, the set reads as aligned iff every solution
+/// agrees with the first within [`ALIGNED_WCS_TOLERANCE_PX`]. With no
+/// solutions at all (PixInsight-exported FITS), or only some, there is no
+/// evidence either way and the geometry rule stands: aligned.
+pub fn same_geometry_reads_aligned(wcs: &[Option<LinearWcs>], width: u64, height: u64) -> bool {
+    let Some(Some(first)) = wcs.first() else {
+        return true;
+    };
+    if !wcs.iter().all(|w| w.is_some()) {
+        return true;
+    }
+    wcs.iter()
+        .flatten()
+        .all(|w| wcs_displacement_px(w, first, width, height) <= ALIGNED_WCS_TOLERANCE_PX)
+}
+
 /// Aligned-input check against an imposed frame: the group's `canvas`
 /// `(width, height)` must equal the reference's, and when both the group's
 /// first panel and the reference carry a canvas WCS, mapping the canvas
@@ -334,20 +384,7 @@ pub fn check_aligned(
         ));
     }
     if let (Some(p), Some(r)) = (panel_wcs, reference_wcs) {
-        let (w, h) = (width as f64, height as f64);
-        let samples = [
-            (1.0, 1.0),
-            (w, 1.0),
-            (1.0, h),
-            (w, h),
-            ((w + 1.0) / 2.0, (h + 1.0) / 2.0),
-        ];
-        let mut worst = 0.0f64;
-        for (x, y) in samples {
-            let (ra, dec) = p.pixel_to_sky(x, y);
-            let (rx, ry) = r.sky_to_pixel(ra, dec);
-            worst = worst.max((rx - x).hypot(ry - y));
-        }
+        let worst = wcs_displacement_px(p, r, width, height);
         if worst > ALIGNED_WCS_TOLERANCE_PX {
             return Err(format!(
                 "canvas WCS of this group is displaced up to {worst:.2} px from the reference \

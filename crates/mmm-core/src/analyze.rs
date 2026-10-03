@@ -44,7 +44,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::align::{MosaicFrame, choose_frame, reproject_from_reader, reproject_panel};
-use crate::astrometry::{WcsModel, describe_unsolved};
+use crate::astrometry::{LinearWcs, WcsModel, describe_unsolved};
 use crate::formats::InputPanel;
 use crate::ipc::client::HostLink;
 use crate::ipc::protocol::{PanelDesc, PanelProbeGeom, PanelProbeReply};
@@ -248,26 +248,49 @@ pub fn analyze_full(
     if let Err(reason) = check_uniform_channels(opened) {
         return Err(Error::compute(reason));
     }
+    // Header facts (geometry + canvas WCS) for the Auto rule and the
+    // reference pre-checks; header-only opens, so cheap even for 2 GB panels.
+    let facts: Vec<(u64, u64, Option<LinearWcs>)> =
+        if input == InputSelect::Auto || reference.is_some() {
+            let mut v = Vec::with_capacity(paths.len());
+            for path in paths {
+                let x = InputPanel::open(path)?;
+                v.push((x.width(), x.height(), x.linear_wcs()));
+            }
+            v
+        } else {
+            Vec::new()
+        };
+    let same_geometry =
+        !facts.is_empty() && facts.iter().all(|f| (f.0, f.1) == (facts[0].0, facts[0].1));
+    // Auto reads a set as aligned with ≥ 2 panels of one geometry whose
+    // canvas solutions agree (registered canvases; raw panels from one
+    // camera share a geometry but not a solution), or as a single panel
+    // against an aligned reference whose canvas it matches (a one-frame Ha
+    // group joining an LRGB set). The coverage rule in `analyze_aligned`
+    // remains a backstop for registered canvases without any WCS.
+    let auto_reads_aligned = input == InputSelect::Auto
+        && same_geometry
+        && if paths.len() >= 2 {
+            let wcs: Vec<Option<LinearWcs>> = facts.iter().map(|f| f.2.clone()).collect();
+            crate::reference::same_geometry_reads_aligned(&wcs, facts[0].0, facts[0].1)
+        } else {
+            matches!(
+                reference,
+                Some(ReferenceFrame::Aligned { width, height, .. })
+                    if (facts[0].0, facts[0].1) == (*width, *height)
+            )
+        };
+
     // Header-knowable reference mismatches fail before any pixel scan — a
     // registered set can be tens of GB: a canvas geometry that differs from
     // an aligned reference, or a solved reference forced onto aligned input.
     // (A solved reference under Auto with same-geometry panels is left to
     // the scan: the ≥ 50 % coverage rule may still re-dispatch to solved.)
     if let Some(r) = reference {
-        let geoms: Vec<(u64, u64)> = paths
-            .iter()
-            .filter_map(|p| InputPanel::open(p).ok())
-            .map(|x| (x.width(), x.height()))
-            .collect();
-        let same_geometry = geoms.len() == paths.len() && geoms.iter().all(|g| *g == geoms[0]);
-        // Under Auto a set reads as aligned with ≥ 2 panels of one geometry,
-        // or as a single panel against an aligned reference (see the Auto
-        // dispatch below).
+        let geoms: Vec<(u64, u64)> = facts.iter().map(|f| (f.0, f.1)).collect();
         let forced_aligned = input == InputSelect::Aligned;
-        let reads_aligned = forced_aligned
-            || (input == InputSelect::Auto
-                && same_geometry
-                && (paths.len() >= 2 || matches!(r, ReferenceFrame::Aligned { .. })));
+        let reads_aligned = forced_aligned || auto_reads_aligned;
         match r {
             ReferenceFrame::Aligned { width, height, .. } if reads_aligned => {
                 if let Some(g) = geoms.first() {
@@ -295,26 +318,7 @@ pub fn analyze_full(
             analyze_solved(paths, session_dir, surface_order, gain, progress, reference)
         }
         InputSelect::Auto => {
-            // Cheap signal first: header geometries only.
-            let mut geoms = Vec::with_capacity(paths.len());
-            for path in paths {
-                let x = InputPanel::open(path)?;
-                geoms.push((x.width(), x.height(), x.channels()));
-            }
-            // A single panel is normally ambiguous (a raw panel or a
-            // registered canvas?), but under an aligned reference whose
-            // canvas it matches it is unambiguous: a one-panel group (one Ha
-            // frame joining an LRGB set) reads as aligned. The coverage rule
-            // in `analyze_aligned` still re-dispatches a raw panel.
-            let single_on_aligned_reference = paths.len() == 1
-                && matches!(
-                    reference,
-                    Some(ReferenceFrame::Aligned { width, height, .. })
-                        if (geoms[0].0, geoms[0].1) == (*width, *height)
-                );
-            if (paths.len() >= 2 && geoms.iter().all(|&g| g == geoms[0]))
-                || single_on_aligned_reference
-            {
+            if auto_reads_aligned {
                 analyze_aligned(
                     paths,
                     session_dir,

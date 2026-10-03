@@ -439,14 +439,20 @@ default auto). 132 tests, clippy clean.
   gives the scan and blender storage-agnostic row access. Aligned-input
   artifacts and blends stayed byte-identical through the refactor (hash
   regression guard).
-- **Auto-detect** (binding rule): same geometry AND ≥ 2 panels AND every
-  panel's covered fraction < 50% → aligned; otherwise solved, where every
-  input must yield a model (per-file error naming the missing properties).
-  Geometry is checked from headers before any scan; the coverage rule is
-  applied after the aligned scan and re-dispatches to solved when violated.
-  `--input` overrides in both directions (needed for the rare undetectable
-  case of same-geometry raw panels with < 50% coverage, and for ≥ 50%-overlap
-  2-panel aligned mosaics).
+- **Auto-detect** (binding rule): same geometry AND ≥ 2 panels AND canvas
+  solutions agree AND every panel's covered fraction < 50% → aligned;
+  otherwise solved, where every input must yield a model (per-file error
+  naming the missing properties). Geometry and the solution tie-breaker
+  (`reference::same_geometry_reads_aligned`, amended 2026-10-04: registered
+  canvases carry one identical canvas WCS, raw panels from one camera each
+  carry their own; no WCS at all keeps the geometry rule) are checked from
+  headers before any scan, so same-size raw panels go straight to the solved
+  path; the coverage rule is applied after the aligned scan and re-dispatches
+  to solved when violated (registered canvases without a WCS). `--input`
+  overrides in both directions (needed for ≥ 50%-overlap 2-panel aligned
+  mosaics, and for same-size raw panels that carry no solution). The
+  PixInsight module's Views path classifies same-size views through the
+  worker's `--probe-reference` with the same rule.
 - **Output metadata**: solved sessions persist the fresh frame + input kind
   in `session.json`; `blend` emits the frame's WCS cards and filters the
   panel-0 geometry/pointing cards (RA/DEC/CRVAL…/CD…) from FITS-keyword
@@ -586,8 +592,8 @@ fractions of a pixel), and the blend crops to the union of content bboxes
   wraps a `MosaicFrame`; `aligned` wraps the canvas geometry plus the first
   panel's canvas WCS. No channel count — OSC and mono groups may share one.
   `reference::derive` is header-only over *every* panel of *every* group
-  (cheap half of the auto-detect rule; same-geometry raw panels still need
-  `--input solved`).
+  (the header-level auto-detect rule, including the canvas-WCS tie-breaker
+  for same-size panels).
 - **`analyze --frame F`** adopts the frame instead of choosing one. Solved
   input: footprint check — every panel's boundary samples must land inside
   the frame, else a hard error naming the panel, side and overshoot

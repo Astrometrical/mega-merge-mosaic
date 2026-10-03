@@ -181,10 +181,15 @@ fn derive_equal_geometries_is_aligned_with_canvas_wcs() {
 #[test]
 fn derive_honours_input_override_both_ways() {
     let dir = tempdir("derive-override");
-    // Same-geometry raw panels: auto reads them as aligned (documented), solved forces a frame.
+    // Same-geometry raw panels: their solutions differ, so auto reads them
+    // as solved; the aligned override still forces the canvas kind.
     let same = write_solved_group(&dir.join("same"), "s", (0.0, 0.0), 160);
     assert!(matches!(
         derive(&same, InputSelect::Auto).unwrap(),
+        ReferenceFrame::Solved { .. }
+    ));
+    assert!(matches!(
+        derive(&same, InputSelect::Aligned).unwrap(),
         ReferenceFrame::Aligned {
             width: 160,
             height: 120,
@@ -842,5 +847,79 @@ fn single_registered_panel_group_adopts_aligned_reference() {
     assert_eq!(s.input, InputKind::Aligned);
     assert!(s.frame_imposed);
     assert_eq!(s.canvas, (CANVAS.0, CANVAS.1, 1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Auto rule: same-geometry panels are told apart by their canvas WCS
+
+#[test]
+fn auto_reads_same_size_raw_panels_as_solved() {
+    let dir = tempdir("auto-raw");
+    // One camera: both raw panels 160×120, each with its own solution.
+    let raw = write_solved_group(&dir.join("raw"), "r", (0.0, 0.0), 160);
+    let from_files = derive(&raw, InputSelect::Auto).unwrap();
+    assert!(
+        matches!(from_files, ReferenceFrame::Solved { .. }),
+        "{from_files:?}"
+    );
+    let from_descs = derive_from_descs(&descs_for(&raw), InputSelect::Auto).unwrap();
+    assert_eq!(from_files, from_descs);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn auto_keeps_registered_canvases_aligned() {
+    let dir = tempdir("auto-registered");
+    // Registered canvases share one identical canvas WCS.
+    let reg = write_aligned_group(&dir.join("reg"), "g", STAR, 10, 20);
+    assert!(matches!(
+        derive(&reg, InputSelect::Auto).unwrap(),
+        ReferenceFrame::Aligned { wcs: Some(_), .. }
+    ));
+    // Registered canvases without any WCS (PixInsight-exported FITS style).
+    let a = dir.join("plain_a.xisf");
+    let b = dir.join("plain_b.xisf");
+    write_xisf(&a, 40, 30, 1, &[0.3f32; 1200]).unwrap();
+    write_xisf(&b, 40, 30, 1, &[0.2f32; 1200]).unwrap();
+    assert!(matches!(
+        derive(&[a, b], InputSelect::Auto).unwrap(),
+        ReferenceFrame::Aligned {
+            width: 40,
+            height: 30,
+            wcs: None
+        }
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn analyze_auto_dispatches_same_size_raw_panels_straight_to_solved() {
+    use std::sync::Mutex;
+    let dir = tempdir("auto-dispatch");
+    let raw = write_solved_group(&dir.join("raw"), "r", (0.0, 0.0), 160);
+    let stages = Mutex::new(Vec::<String>::new());
+    let progress = |stage: &str, done: u64, _total: u64| {
+        if done > 0 {
+            stages.lock().unwrap().push(stage.to_string());
+        }
+    };
+    let s = analyze_full(
+        &raw,
+        &dir.join("raw.mmm-session"),
+        Some(2),
+        GainMode::Fit,
+        InputSelect::Auto,
+        Some(&progress),
+        None,
+    )
+    .unwrap();
+    assert_eq!(s.input, InputKind::Solved);
+    let stages = stages.into_inner().unwrap();
+    assert_eq!(
+        stages.first().map(String::as_str),
+        Some("reproject"),
+        "no aligned scan may precede the solved path: {stages:?}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

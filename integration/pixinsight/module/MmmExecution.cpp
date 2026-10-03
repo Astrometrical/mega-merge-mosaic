@@ -670,6 +670,57 @@ void CollectGeometry( const Array<View>& views, Array<uint64_t>& ws, Array<uint6
    }
 }
 
+// An InitJob-shaped probe body over locked views: every view's geometry and
+// astrometric properties, with the registration override carried in `mode`
+// (the Files shape carries all three; its paths are ignored by the probe).
+json BuildViewsProbeInit( const Array<View>& views, const Array<uint64_t>& ws,
+                          const Array<uint64_t>& hs, const Array<uint64_t>& cs, const Params& in )
+{
+   json panels = json::array();
+   for ( size_type i = 0; i < views.Length(); ++i )
+   {
+      json pd;
+      pd["panel_id"]   = uint32_t( i );
+      pd["width"]      = ws[i];
+      pd["height"]     = hs[i];
+      pd["channels"]   = cs[i];
+      pd["properties"] = extract_astrometry_props( views[i] );
+      panels.push_back( std::move( pd ) );
+   }
+   json init_body;
+   init_body["shm_name"]     = "";
+   init_body["slot_bytes"]   = 0;
+   init_body["input_slots"]  = 0;
+   init_body["output_slots"] = 0;
+   init_body["canvas"]       = { uint64_t( 0 ), uint64_t( 0 ), cs[0] };
+   init_body["panels"]       = panels;
+   init_body["mode"]         = json{ { "Files",
+                                       { { "paths", json::array() },
+                                         { "input_select", InputSelectWireString( in.inputSelect ) } } } };
+   init_body["session_dir"]  = "";
+   init_body["params"]       = BuildParams( in );
+   return init_body;
+}
+
+// The Auto registration decision for same-size views, made by the worker
+// from the views' canvas solutions (--probe-reference): registered canvases
+// carry one identical canvas WCS, raw panels from one camera do not. True
+// when the worker classifies the set as solved.
+bool ProbedViewsAreSolved( const Array<View>& views, const Array<uint64_t>& ws,
+                           const Array<uint64_t>& hs, const Array<uint64_t>& cs,
+                           const Params& in, ConsoleProgress& prog, const std::string& worker_path )
+{
+   try
+   {
+      json ref = mmm::Host::probe_reference( worker_path, BuildViewsProbeInit( views, ws, hs, cs, in ), &prog );
+      return mmm::reference_kind( ref ) == "solved";
+   }
+   catch ( const mmm::HostCancelled& )
+   {
+      throw ProcessAborted();
+   }
+}
+
 // ---- Views path (Aligned / Solved) ----------------------------------------
 
 void RunViews( const Params& in, const std::string& worker_path, const GroupJob& group )
@@ -703,7 +754,9 @@ void RunViews( const Params& in, const std::string& worker_path, const GroupJob&
 
    // Resolve the effective JobMode (spec section 10.1). With a shared
    // reference its kind decides for every group; otherwise the override
-   // wins and Auto classifies by uniform-vs-differing geometry.
+   // wins, and Auto reads differing geometries as raw panels while
+   // same-size views are told apart by their canvas solutions (worker
+   // probe), exactly as the CLI and multi-group runs classify them.
    bool solved;
    if ( haveRef )
       solved = ( mmm::reference_kind( group.reference ) == "solved" );
@@ -712,7 +765,9 @@ void RunViews( const Params& in, const std::string& worker_path, const GroupJob&
       {
       case MmmInputSelectParameter::Aligned: solved = false;      break;
       case MmmInputSelectParameter::Solved:  solved = true;       break;
-      default:                               solved = !uniform;   break;
+      default:
+         solved = !uniform || ProbedViewsAreSolved( views, ws, hs, cs, in, prog, worker_path );
+         break;
       }
 
    // Solved mode requires each view to carry an astrometric solution.
@@ -924,35 +979,9 @@ json DeriveReferenceFromViews( const Params& in, ConsoleProgress& prog, const st
    bool uniform = true;
    CollectGeometry( views, ws, hs, cs, uniform );
 
-   json panels = json::array();
-   for ( size_type i = 0; i < views.Length(); ++i )
-   {
-      json pd;
-      pd["panel_id"]   = uint32_t( i );
-      pd["width"]      = ws[i];
-      pd["height"]     = hs[i];
-      pd["channels"]   = cs[i];
-      pd["properties"] = extract_astrometry_props( views[i] );
-      panels.push_back( std::move( pd ) );
-   }
-
-   json init_body;
-   init_body["shm_name"]     = "";
-   init_body["slot_bytes"]   = 0;
-   init_body["input_slots"]  = 0;
-   init_body["output_slots"] = 0;
-   init_body["canvas"]       = { uint64_t( 0 ), uint64_t( 0 ), cs[0] };
-   init_body["panels"]       = panels;
-   // The probe reads only the kind override from `mode`; the Files shape
-   // carries all three overrides uniformly (its paths are ignored).
-   init_body["mode"]         = json{ { "Files",
-                                       { { "paths", json::array() },
-                                         { "input_select", InputSelectWireString( in.inputSelect ) } } } };
-   init_body["session_dir"]  = "";
-   init_body["params"]       = BuildParams( in );
    try
    {
-      return mmm::Host::probe_reference( worker_path, init_body, &prog );
+      return mmm::Host::probe_reference( worker_path, BuildViewsProbeInit( views, ws, hs, cs, in ), &prog );
    }
    catch ( const mmm::HostCancelled& )
    {
