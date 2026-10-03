@@ -246,3 +246,66 @@ fn fits_panels_probe_like_xisf() {
     assert!(e.contains("channel"), "{e}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn probe_reports_filter_names_and_the_reference() {
+    use mmm_core::formats::FitsKeyword;
+    use mmm_core::reference::{ReferenceFrame, derive};
+    use mmm_core::synth::write_fits;
+    let dir = tmpdir("filter-ref");
+    let paths = write_solved(&dir);
+    let reply = probe_panels(&paths, InputSelect::Auto).unwrap();
+    assert!(reply.panels.iter().all(|p| p.filter.is_none()));
+    assert_eq!(
+        reply.reference,
+        Some(derive(&paths, InputSelect::Auto).unwrap())
+    );
+    assert!(matches!(
+        reply.reference,
+        Some(ReferenceFrame::Solved { .. })
+    ));
+
+    let ha = dir.join("ha.fits");
+    write_fits(
+        &ha,
+        8,
+        6,
+        1,
+        &[0.2f32; 48],
+        -32,
+        &[FitsKeyword {
+            name: "FILTER".into(),
+            value: "'Ha'".into(),
+            comment: String::new(),
+        }],
+    )
+    .unwrap();
+    let plain = dir.join("plain.fits");
+    write_fits(&plain, 8, 6, 1, &[0.2f32; 48], -32, &[]).unwrap();
+    let reply = probe_panels(&[ha, plain], InputSelect::Aligned).unwrap();
+    assert_eq!(reply.panels[0].filter.as_deref(), Some("Ha"));
+    assert_eq!(reply.panels[1].filter, None);
+    assert!(matches!(
+        reply.reference,
+        Some(ReferenceFrame::Aligned {
+            width: 8,
+            height: 6,
+            ..
+        })
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn probe_reference_is_none_when_underivable() {
+    let dir = tmpdir("no-ref");
+    let a = dir.join("a.xisf");
+    let b = dir.join("b.xisf");
+    write_xisf(&a, 10, 8, 1, &[0.1f32; 80]).unwrap();
+    write_xisf(&b, 12, 8, 1, &[0.1f32; 96]).unwrap();
+    // Mixed geometry, no solutions, Auto: neither aligned nor solvable.
+    let reply = probe_panels(&[a, b], InputSelect::Auto).unwrap();
+    assert_eq!(reply.frame, None);
+    assert_eq!(reply.reference, None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

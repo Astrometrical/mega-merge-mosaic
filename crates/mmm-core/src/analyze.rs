@@ -648,6 +648,7 @@ pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeR
                     width: x.width(),
                     height: x.height(),
                     channels: x.channels(),
+                    filter: x.filter_name(),
                 },
                 x.wcs_model(),
             ))
@@ -665,7 +666,7 @@ pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeR
     )
     .map_err(Error::compute)?;
 
-    let panels: Vec<PanelProbeGeom> = probed.iter().map(|(g, _)| *g).collect();
+    let panels: Vec<PanelProbeGeom> = probed.iter().map(|(g, _)| g.clone()).collect();
 
     let solved = || {
         frame_from_models(
@@ -686,7 +687,19 @@ pub fn probe_panels(paths: &[PathBuf], input: InputSelect) -> Result<PanelProbeR
             .map(|(_, frame, ch)| [frame.width, frame.height, ch]),
     };
 
-    Ok(PanelProbeReply { panels, frame })
+    // The shared reference frame for multi-group hosts: a forced solved set
+    // propagates its derive error (as `frame` does above); otherwise an
+    // underivable set simply reports none.
+    let reference = match input {
+        InputSelect::Solved => Some(crate::reference::derive(paths, input)?),
+        _ => crate::reference::derive(paths, input).ok(),
+    };
+
+    Ok(PanelProbeReply {
+        panels,
+        frame,
+        reference,
+    })
 }
 
 /// The aligned path over panels streamed from an IPC host: mirrors

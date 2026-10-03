@@ -1209,3 +1209,76 @@ fn version_mismatch_is_refused_with_an_error_frame() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// `--probe-reference` derives the shared frame from Views-style
+/// descriptors and prints it as the same JSON a `.mmm-frame.json` holds.
+#[test]
+fn probe_reference_prints_reference_frame_json() {
+    use std::io::Write;
+    let dir = tmpdir("probe-reference");
+    let (paths, _planars) = write_two_solved_panels(&dir);
+    let descs: Vec<PanelDesc> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let xp = XisfPanel::open(p).unwrap();
+            PanelDesc {
+                panel_id: i as u32,
+                width: xp.width(),
+                height: xp.height(),
+                channels: xp.channels(),
+                properties: xp.header().properties.clone(),
+            }
+        })
+        .collect();
+    let expected =
+        mmm_core::reference::derive_from_descs(&descs, mmm_core::analyze::InputSelect::Solved)
+            .unwrap();
+
+    let mut job = InitJob {
+        protocol_version: IPC_PROTOCOL_VERSION,
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
+        shm_name: String::new(),
+        slot_bytes: 0,
+        input_slots: 0,
+        output_slots: 0,
+        canvas: [0, 0, 1],
+        panels: descs,
+        mode: JobMode::Solved,
+        session_dir: String::new(),
+        params: BlendParamsWire::default(),
+        reference: None,
+    };
+    let exe = env!("CARGO_BIN_EXE_mmm-ipc-worker");
+    let run = |job: &InitJob| {
+        let mut child = std::process::Command::new(exe)
+            .arg("--probe-reference")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(serde_json::to_string(job).unwrap().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let out = run(&job);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got: mmm_core::reference::ReferenceFrame = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got, expected);
+
+    // A panel without a solution under Solved fails naming it on stderr.
+    job.panels[1].properties.clear();
+    let out = run(&job);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("panel 1"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

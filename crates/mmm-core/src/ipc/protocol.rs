@@ -225,7 +225,7 @@ pub struct PanelProbeRequest {
 }
 
 /// One panel's header geometry in a [`PanelProbeReply`].
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct PanelProbeGeom {
     /// Panel width in pixels.
     pub width: u64,
@@ -233,6 +233,11 @@ pub struct PanelProbeGeom {
     pub height: u64,
     /// Channel count.
     pub channels: u64,
+    /// The panel's filter name (FITS `FILTER` card or XISF
+    /// `Instrument:Filter:Name`), for a host's "group by filter" UI; `None`
+    /// when the header carries none. Hosts that predate the field ignore it.
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 /// Reply printed by `--probe-panels` on stdout as one bare JSON object.
@@ -245,6 +250,12 @@ pub struct PanelProbeReply {
     /// every panel carries a usable astrometric solution); `None` otherwise.
     /// Hosts size output slots by `max(max panel width, frame width)`.
     pub frame: Option<[u64; 3]>,
+    /// The shared reference frame `reference::derive` yields over `paths`
+    /// with the request's `input_select`; `None` when it cannot be derived
+    /// (mixed geometry without solutions under `Auto`). Multi-group hosts
+    /// impose it on every group's job via `InitJob.reference`.
+    #[serde(default)]
+    pub reference: Option<crate::reference::ReferenceFrame>,
 }
 
 /// Wire form of [`BlendParams`]: plain data so it serializes with serde.

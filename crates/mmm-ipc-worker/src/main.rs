@@ -19,10 +19,13 @@ use mmm_core::surfaces::Surfaces;
 fn main() {
     let probe_frame_mode = std::env::args().any(|a| a == "--probe-frame");
     let probe_panels_mode = std::env::args().any(|a| a == "--probe-panels");
+    let probe_reference_mode = std::env::args().any(|a| a == "--probe-reference");
     let result = if probe_frame_mode {
         probe_frame()
     } else if probe_panels_mode {
         probe_panels()
+    } else if probe_reference_mode {
+        probe_reference()
     } else {
         run()
     };
@@ -109,6 +112,36 @@ fn probe_panels() -> mmm_core::Result<()> {
         .map_err(|e| mmm_core::Error::compute(format!("encoding PanelProbeReply: {e}")))?;
     writeln!(std::io::stdout(), "{text}")
         .map_err(|e| mmm_core::Error::compute(format!("probe-panels: writing stdout: {e}")))
+}
+
+/// `--probe-reference`: read an `InitJob`-shaped JSON object on stdin (Views-
+/// style `PanelDesc`s with their astrometric properties) and print the
+/// shared [`mmm_core::reference::ReferenceFrame`]
+/// [`mmm_core::reference::derive_from_descs`] yields as one line of JSON —
+/// the same shape as a `.mmm-frame.json`. The kind override comes from
+/// `mode`: `Aligned`/`Solved` force that kind, `Files` carries its own
+/// `input_select`. Lets a GUI host derive one frame over every group's
+/// views before running the groups' jobs (PROTOCOL.md §11).
+fn probe_reference() -> mmm_core::Result<()> {
+    use mmm_core::analyze::InputSelect;
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .map_err(|e| mmm_core::Error::compute(format!("reading probe JSON from stdin: {e}")))?;
+    let job: mmm_core::ipc::protocol::InitJob = serde_json::from_str(&buf)
+        .map_err(|e| mmm_core::Error::compute(format!("parsing probe InitJob JSON: {e}")))?;
+    if job.worker_version != WORKER_VERSION {
+        return Err(version_mismatch_error(&job.worker_version));
+    }
+    let input = match &job.mode {
+        JobMode::Aligned => InputSelect::Aligned,
+        JobMode::Solved => InputSelect::Solved,
+        JobMode::Files { input_select, .. } => input_select.to_input_select(),
+    };
+    let reference = mmm_core::reference::derive_from_descs(&job.panels, input)?;
+    let text = serde_json::to_string(&reference)
+        .map_err(|e| mmm_core::Error::compute(format!("encoding ReferenceFrame: {e}")))?;
+    writeln!(std::io::stdout(), "{text}")
+        .map_err(|e| mmm_core::Error::compute(format!("probe-reference: writing stdout: {e}")))
 }
 
 /// Reads the one `HostMsg::Init` frame off stdin, drives analyze then blend
