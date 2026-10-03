@@ -266,6 +266,36 @@ enum Command {
         #[command(flatten)]
         opts: BlendOpts,
     },
+
+    /// Merge several panel groups (one per filter) onto one shared frame:
+    /// derives the frame from every panel, analyzes each group into
+    /// DIR/<name>.mmm-session and blends it to OUTDIR/<name>.fits, so the
+    /// outputs can be combined directly (LRGB, Ha+RGB, …)
+    Batch {
+        /// A group: its name followed by its panel files. Repeat per group,
+        /// e.g. `--group L L/*.xisf --group R R/*.xisf`
+        #[arg(long = "group", num_args = 2.., action = clap::ArgAction::Append,
+              value_names = ["NAME", "PANELS"], required = true)]
+        group: Vec<String>,
+
+        /// Directory for the reference frame and the per-group sessions
+        #[arg(short, long)]
+        session: std::path::PathBuf,
+
+        /// Directory for the per-group output FITS files (<name>.fits)
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+
+        /// Also write an autostretched PNG preview per group (downsampled runs only)
+        #[arg(long)]
+        png: bool,
+
+        #[command(flatten)]
+        analyze: AnalyzeOpts,
+
+        #[command(flatten)]
+        blend: BlendOpts,
+    },
 }
 
 fn parse_roi(s: &str) -> anyhow::Result<[u64; 4]> {
@@ -281,7 +311,12 @@ fn parse_roi(s: &str) -> anyhow::Result<[u64; 4]> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // Raw matches are kept beside the typed `Cli`: `batch` recovers its
+    // per-occurrence `--group` values through `ArgMatches::get_occurrences`,
+    // which the derive API cannot express on stable clap.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     if !cli.no_banner {
         eprintln!("{}", banner());
@@ -333,7 +368,110 @@ fn main() -> anyhow::Result<()> {
             let cfg = opts.resolve()?;
             blend_cmd(&session, &output, png.as_deref(), &cfg)
         }
+        Command::Batch {
+            group: _,
+            session,
+            output,
+            png,
+            analyze,
+            blend,
+        } => {
+            let sub = matches
+                .subcommand_matches("batch")
+                .expect("batch was matched");
+            let groups = group_specs(sub)?;
+            batch_cmd(
+                groups,
+                &session,
+                &output,
+                png,
+                &analyze.resolve()?,
+                &blend.resolve()?,
+            )
+        }
     }
+}
+
+/// The `--group NAME PANELS...` occurrences of a `batch` invocation, in
+/// order. Names must be unique and match `[A-Za-z0-9._-]+` (they become
+/// directory and file names).
+fn group_specs(m: &clap::ArgMatches) -> anyhow::Result<Vec<(String, Vec<std::path::PathBuf>)>> {
+    let mut groups: Vec<(String, Vec<std::path::PathBuf>)> = Vec::new();
+    for values in m.get_occurrences::<String>("group").into_iter().flatten() {
+        let mut it = values.cloned();
+        let name = it.next().expect("num_args >= 2 guarantees a name");
+        let panels: Vec<std::path::PathBuf> = it.map(std::path::PathBuf::from).collect();
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
+            "group name '{name}' must match [A-Za-z0-9._-]+"
+        );
+        anyhow::ensure!(!panels.is_empty(), "group '{name}' has no panels");
+        anyhow::ensure!(
+            !groups.iter().any(|(n, _)| n == &name),
+            "group name '{name}' is used twice"
+        );
+        groups.push((name, panels));
+    }
+    anyhow::ensure!(!groups.is_empty(), "batch needs at least one --group");
+    Ok(groups)
+}
+
+/// `mmm batch`: one reference frame over every group, then analyze and blend
+/// each group with it. Pure orchestration over `analyze_cmd` / `blend_cmd`.
+fn batch_cmd(
+    groups: Vec<(String, Vec<std::path::PathBuf>)>,
+    session_dir: &std::path::Path,
+    out_dir: &std::path::Path,
+    png: bool,
+    analyze: &AnalyzeConfig,
+    blend: &BlendConfig,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    std::fs::create_dir_all(session_dir)
+        .with_context(|| format!("cannot create {}", session_dir.display()))?;
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("cannot create {}", out_dir.display()))?;
+
+    let all: Vec<std::path::PathBuf> = groups.iter().flat_map(|(_, p)| p.iter().cloned()).collect();
+    let reference = mmm_core::reference::derive(&all, analyze.input)?;
+    let frame_path = session_dir.join("reference.mmm-frame.json");
+    reference.save(&frame_path)?;
+    println!(
+        "reference: {} over {} panels in {} groups → {}",
+        reference.describe(),
+        all.len(),
+        groups.len(),
+        frame_path.display()
+    );
+
+    let session_of = |name: &str| session_dir.join(format!("{name}.mmm-session"));
+    for (name, panels) in &groups {
+        println!("\n== group {name}: analyze ({} panels)", panels.len());
+        analyze_cmd(panels, &session_of(name), analyze, Some(&reference))
+            .with_context(|| format!("group {name}: analyze failed"))?;
+    }
+    let mut outputs = Vec::with_capacity(groups.len());
+    for (name, _) in &groups {
+        println!("\n== group {name}: blend");
+        let out = out_dir.join(format!("{name}.fits"));
+        let png_path = png.then(|| out_dir.join(format!("{name}.png")));
+        blend_cmd(&session_of(name), &out, png_path.as_deref(), blend)
+            .with_context(|| format!("group {name}: blend failed"))?;
+        outputs.push((name.clone(), out));
+    }
+
+    let (w, h) = reference.canvas();
+    println!(
+        "\nbatch: {} outputs, all on the shared {w}x{h} grid:",
+        outputs.len()
+    );
+    for (name, out) in &outputs {
+        println!("  {name}: {}", out.display());
+    }
+    Ok(())
 }
 
 /// `mmm frame`: header-only derivation of a shared reference frame.
@@ -950,7 +1088,7 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::geometry_card;
+    use super::{Cli, geometry_card, group_specs};
 
     #[test]
     fn geometry_card_drops_pointing_wcs_and_sip_and_imagewh() {
@@ -964,5 +1102,48 @@ mod tests {
         ] {
             assert!(!geometry_card(name), "{name} should not be a geometry card");
         }
+    }
+
+    fn batch_matches(args: &[&str]) -> clap::ArgMatches {
+        let mut full = vec!["mmm", "batch"];
+        full.extend_from_slice(args);
+        <Cli as clap::CommandFactory>::command()
+            .try_get_matches_from(full)
+            .unwrap()
+            .subcommand_matches("batch")
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn batch_groups_keep_occurrence_boundaries() {
+        let m = batch_matches(&[
+            "--group", "L", "l1.xisf", "l2.xisf", "--group", "R", "r1.xisf", "-s", "out", "-o",
+            "fits",
+        ]);
+        let g = group_specs(&m).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].0, "L");
+        assert_eq!(
+            g[0].1,
+            vec![
+                std::path::PathBuf::from("l1.xisf"),
+                std::path::PathBuf::from("l2.xisf")
+            ]
+        );
+        assert_eq!(g[1].0, "R");
+        assert_eq!(g[1].1, vec![std::path::PathBuf::from("r1.xisf")]);
+    }
+
+    #[test]
+    fn batch_rejects_duplicate_and_unsafe_names() {
+        let dup = batch_matches(&[
+            "--group", "L", "a.xisf", "--group", "L", "b.xisf", "-s", "s", "-o", "o",
+        ]);
+        let err = group_specs(&dup).unwrap_err().to_string();
+        assert!(err.contains("used twice"), "{err}");
+        let slash = batch_matches(&["--group", "L/R", "a.xisf", "-s", "s", "-o", "o"]);
+        let err = group_specs(&slash).unwrap_err().to_string();
+        assert!(err.contains("[A-Za-z0-9._-]+"), "{err}");
     }
 }

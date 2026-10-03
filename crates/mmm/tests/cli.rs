@@ -198,3 +198,72 @@ fn analyze_with_missing_frame_file_fails_naming_it() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn batch_merges_every_group_onto_one_grid() {
+    let dir = tempdir("batch");
+    let a = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let b = write_group(&dir.join("B"), "b", (40.0, 25.0), 140);
+    let sessions = dir.join("sessions");
+    let out_dir = dir.join("out");
+    let out = run(mmm()
+        .arg("batch")
+        .arg("--group")
+        .arg("L")
+        .args(&a)
+        .arg("--group")
+        .arg("Ha")
+        .args(&b)
+        .arg("-s")
+        .arg(&sessions)
+        .arg("-o")
+        .arg(&out_dir)
+        .arg("--input")
+        .arg("solved")
+        .arg("--mode")
+        .arg("feather")
+        .arg("--feather")
+        .arg("24"));
+    assert!(out.contains("group L"), "{out}");
+    assert!(out.contains("group Ha"), "{out}");
+    assert!(matches!(
+        ReferenceFrame::load(&sessions.join("reference.mmm-frame.json")).unwrap(),
+        ReferenceFrame::Solved { .. }
+    ));
+    assert!(sessions.join("L.mmm-session").join("session.json").exists());
+    assert!(
+        sessions
+            .join("Ha.mmm-session")
+            .join("session.json")
+            .exists()
+    );
+    let (gl, wl) = geometry_and_wcs(&out_dir.join("L.fits"));
+    let (gh, wh) = geometry_and_wcs(&out_dir.join("Ha.fits"));
+    assert_eq!(gl, gh);
+    assert_eq!(wl, wh);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn batch_refuses_bad_group_names_before_any_work() {
+    let dir = tempdir("batch-names");
+    let a = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let out = mmm()
+        .arg("batch")
+        .arg("--group")
+        .arg("L")
+        .args(&a)
+        .arg("--group")
+        .arg("L")
+        .args(&a)
+        .arg("-s")
+        .arg(dir.join("sessions"))
+        .arg("-o")
+        .arg(dir.join("out"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("used twice"));
+    assert!(!dir.join("sessions").exists(), "no work before validation");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
