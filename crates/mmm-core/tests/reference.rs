@@ -4,9 +4,12 @@
 
 use std::path::{Path, PathBuf};
 
-use mmm_core::analyze::InputSelect;
+use mmm_core::Result;
+use mmm_core::analyze::{InputSelect, analyze_full};
 use mmm_core::astrometry::LinearWcs;
+use mmm_core::photometry::GainMode;
 use mmm_core::reference::{ReferenceFrame, derive};
+use mmm_core::session::{InputKind, Session};
 use mmm_core::synth::{SynthWcs, write_xisf, write_xisf_solved};
 
 /// Pixel scale of every synthetic solution, degrees per pixel (3.6″).
@@ -246,4 +249,173 @@ fn derive_allows_mixed_channel_counts() {
 fn derive_refuses_empty_input() {
     let err = derive(&[], InputSelect::Auto).unwrap_err().to_string();
     assert!(err.contains("no input panels"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// analyze with an imposed frame
+
+fn analyze(
+    paths: &[PathBuf],
+    dir: &Path,
+    input: InputSelect,
+    reference: Option<&ReferenceFrame>,
+) -> Result<Session> {
+    analyze_full(paths, dir, Some(2), GainMode::Fit, input, None, reference)
+}
+
+#[test]
+fn solved_group_adopts_the_imposed_frame() {
+    let dir = tempdir("adopt-solved");
+    let a = write_solved_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let b = write_solved_group(&dir.join("B"), "b", (40.0, 25.0), 140);
+    let all: Vec<PathBuf> = a.iter().chain(&b).cloned().collect();
+    let reference = derive(&all, InputSelect::Auto).unwrap();
+    let ReferenceFrame::Solved { frame } = &reference else {
+        unreachable!()
+    };
+
+    let sa = analyze(
+        &a,
+        &dir.join("a.mmm-session"),
+        InputSelect::Solved,
+        Some(&reference),
+    )
+    .unwrap();
+    assert_eq!(sa.input, InputKind::Solved);
+    assert!(sa.frame_imposed);
+    assert_eq!(sa.frame.as_ref(), Some(frame));
+    assert_eq!(sa.canvas, (frame.width, frame.height, 1));
+    // Persisted and read back.
+    let reopened = Session::open(&dir.join("a.mmm-session")).unwrap();
+    assert!(reopened.frame_imposed);
+    assert_eq!(reopened.frame.as_ref(), Some(frame));
+
+    // Without a reference the group gets its own, smaller frame.
+    let own = analyze(&a, &dir.join("own.mmm-session"), InputSelect::Solved, None).unwrap();
+    assert!(!own.frame_imposed);
+    assert!(own.canvas.0 < sa.canvas.0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn panel_outside_the_imposed_frame_is_refused_by_name() {
+    let dir = tempdir("footprint");
+    let a = write_solved_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let b = write_solved_group(&dir.join("B"), "b", (40.0, 25.0), 140);
+    let only_a = derive(&a, InputSelect::Solved).unwrap();
+    let err = analyze(
+        &b,
+        &dir.join("b.mmm-session"),
+        InputSelect::Solved,
+        Some(&only_a),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("b_01.xisf"), "{err}");
+    assert!(err.contains("beyond the"), "{err}");
+    assert!(err.contains("mmm frame"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aligned_group_adopts_a_matching_canvas() {
+    let dir = tempdir("adopt-aligned");
+    let a = write_aligned_group(&dir.join("A"), "a", STAR, 10, 20);
+    let reference = derive(&a, InputSelect::Auto).unwrap();
+    let s = analyze(
+        &a,
+        &dir.join("a.mmm-session"),
+        InputSelect::Auto,
+        Some(&reference),
+    )
+    .unwrap();
+    assert_eq!(s.input, InputKind::Aligned);
+    assert!(s.frame_imposed);
+    assert!(s.frame.is_none(), "aligned sessions keep passthrough WCS");
+    assert_eq!(s.canvas, (CANVAS.0, CANVAS.1, 1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aligned_group_on_another_canvas_is_refused_with_hint() {
+    let dir = tempdir("aligned-size");
+    let a = write_aligned_group(&dir.join("A"), "a", STAR, 10, 20);
+    let smaller = ReferenceFrame::Aligned {
+        width: CANVAS.0 - 10,
+        height: CANVAS.1,
+        wcs: None,
+    };
+    let err = analyze(
+        &a,
+        &dir.join("a.mmm-session"),
+        InputSelect::Auto,
+        Some(&smaller),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("does not match the reference frame"), "{err}");
+    assert!(
+        err.contains("align every group to one common reference"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn aligned_group_with_shifted_wcs_is_refused_quoting_pixels() {
+    let dir = tempdir("aligned-wcs");
+    let a = write_aligned_group(&dir.join("A"), "a", STAR, 10, 20);
+    // Same canvas, but this group's registration put the sky 2 px further north.
+    let b = write_aligned_group(&dir.join("B"), "b", offset_px(0.0, 2.0), 10, 20);
+    let reference = derive(&a, InputSelect::Auto).unwrap();
+    let err = analyze(
+        &b,
+        &dir.join("b.mmm-session"),
+        InputSelect::Auto,
+        Some(&reference),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("displaced up to 2.00 px"), "{err}");
+    assert!(
+        err.contains("align every group to one common reference"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn reference_kind_must_match_the_input_kind() {
+    let dir = tempdir("kind");
+    let raw = write_solved_group(&dir.join("raw"), "r", (0.0, 0.0), 150);
+    let registered = write_aligned_group(&dir.join("reg"), "g", STAR, 10, 20);
+    let solved_ref = derive(&raw, InputSelect::Solved).unwrap();
+    let aligned_ref = derive(&registered, InputSelect::Auto).unwrap();
+
+    let err = analyze(
+        &registered,
+        &dir.join("x.mmm-session"),
+        InputSelect::Auto,
+        Some(&solved_ref),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("solved mosaic frame") && err.contains("--input solved"),
+        "{err}"
+    );
+
+    let err = analyze(
+        &raw,
+        &dir.join("y.mmm-session"),
+        InputSelect::Solved,
+        Some(&aligned_ref),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("aligned canvas") && err.contains("--input aligned"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

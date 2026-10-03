@@ -81,6 +81,14 @@ pub struct Session {
     /// frames' own (passthrough) solution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<MosaicFrame>,
+    /// `true` when the analyze stage adopted a shared
+    /// [`crate::reference::ReferenceFrame`] instead of deriving its own
+    /// frame / taking the input canvas as given. The blender then defaults
+    /// to the whole canvas as its output extent so every session sharing
+    /// the frame yields identically sized, co-registered output. Sessions
+    /// from before the field read as `false`.
+    #[serde(default)]
+    pub frame_imposed: bool,
     /// Gain mode of the photometric solve that produced this session's
     /// corrections (default: fit; sessions from before the field read as fit).
     #[serde(default)]
@@ -101,6 +109,7 @@ impl Session {
             panels: Vec::new(),
             input: InputKind::Aligned,
             frame: None,
+            frame_imposed: false,
             gain_mode: crate::photometry::GainMode::default(),
             align_secs: None,
         })

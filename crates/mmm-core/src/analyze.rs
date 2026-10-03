@@ -51,6 +51,7 @@ use crate::ipc::protocol::{PanelDesc, PanelProbeGeom, PanelProbeReply};
 use crate::overlap::OverlapGraph;
 use crate::panel_reader::{PanelReader, PanelStorage};
 use crate::photometry::GainMode;
+use crate::reference::ReferenceFrame;
 use crate::session::{InputKind, PanelMeta, Session};
 use crate::summary::{BLOCK, L8Summary};
 use crate::{Error, Result};
@@ -180,6 +181,7 @@ pub fn analyze_gain(
         gain,
         InputSelect::Auto,
         None,
+        None,
     )
 }
 
@@ -207,11 +209,17 @@ pub fn analyze_input_progress(
         GainMode::Fit,
         input,
         progress,
+        None,
     )
 }
 
 /// The full-parameter analyze entry point: [`analyze_input_progress`] plus an
-/// explicit photometric [`GainMode`].
+/// explicit photometric [`GainMode`] and an optional shared reference frame.
+///
+/// With `reference = Some(frame)` the session adopts that shared
+/// [`ReferenceFrame`] instead of deriving its own frame (solved input) or
+/// taking the canvas as given (aligned input), after checking the group fits
+/// it — see [`crate::reference`]. The session then records `frame_imposed`.
 pub fn analyze_full(
     paths: &[PathBuf],
     session_dir: &Path,
@@ -219,6 +227,7 @@ pub fn analyze_full(
     gain: GainMode,
     input: InputSelect,
     progress: Option<AnalyzeProgress>,
+    reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
@@ -240,10 +249,18 @@ pub fn analyze_full(
         return Err(Error::compute(reason));
     }
     match input {
-        InputSelect::Aligned => {
-            analyze_aligned(paths, session_dir, surface_order, gain, false, progress)
+        InputSelect::Aligned => analyze_aligned(
+            paths,
+            session_dir,
+            surface_order,
+            gain,
+            false,
+            progress,
+            reference,
+        ),
+        InputSelect::Solved => {
+            analyze_solved(paths, session_dir, surface_order, gain, progress, reference)
         }
-        InputSelect::Solved => analyze_solved(paths, session_dir, surface_order, gain, progress),
         InputSelect::Auto => {
             // Cheap signal first: header geometries only.
             let mut geoms = Vec::with_capacity(paths.len());
@@ -252,9 +269,17 @@ pub fn analyze_full(
                 geoms.push((x.width(), x.height(), x.channels()));
             }
             if paths.len() >= 2 && geoms.iter().all(|&g| g == geoms[0]) {
-                analyze_aligned(paths, session_dir, surface_order, gain, true, progress)
+                analyze_aligned(
+                    paths,
+                    session_dir,
+                    surface_order,
+                    gain,
+                    true,
+                    progress,
+                    reference,
+                )
             } else {
-                analyze_solved(paths, session_dir, surface_order, gain, progress)
+                analyze_solved(paths, session_dir, surface_order, gain, progress, reference)
             }
         }
     }
@@ -277,6 +302,7 @@ fn analyze_aligned(
     gain: GainMode,
     auto: bool,
     progress: Option<AnalyzeProgress>,
+    reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
@@ -328,7 +354,33 @@ fn analyze_aligned(
              raw panels (--input aligned overrides)",
             ALIGNED_MAX_COVERAGE * 100.0
         );
-        return analyze_solved(paths, session_dir, surface_order, gain, progress);
+        return analyze_solved(paths, session_dir, surface_order, gain, progress, reference);
+    }
+
+    if let Some(r) = reference {
+        match r {
+            ReferenceFrame::Aligned { width, height, wcs } => {
+                let panel_wcs = InputPanel::open(&paths[0])?.linear_wcs();
+                crate::reference::check_aligned(
+                    (canvas.0, canvas.1),
+                    panel_wcs.as_ref(),
+                    *width,
+                    *height,
+                    wcs.as_ref(),
+                )
+                .map_err(|reason| Error::format(session_dir, reason))?;
+                session.frame_imposed = true;
+            }
+            ReferenceFrame::Solved { .. } => {
+                return Err(Error::format(
+                    session_dir,
+                    "the reference frame is a solved mosaic frame but these panels were read as \
+                     aligned full-canvas frames: pass `--input solved` if they are raw \
+                     plate-solved panels, or derive an aligned reference from the registered \
+                     canvases",
+                ));
+            }
+        }
     }
 
     session.canvas = canvas;
@@ -343,6 +395,7 @@ fn analyze_solved(
     surface_order: Option<u32>,
     gain: GainMode,
     progress: Option<AnalyzeProgress>,
+    reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
@@ -375,7 +428,27 @@ fn analyze_solved(
     .map_err(Error::compute)?;
 
     let models: Vec<WcsModel> = panels.iter().map(|(_, m)| m.clone()).collect();
-    let frame = choose_frame(&models);
+    let frame = match reference {
+        None => choose_frame(&models),
+        Some(ReferenceFrame::Solved { frame }) => {
+            crate::reference::check_footprints(
+                panels
+                    .iter()
+                    .map(|(p, m)| (p.path().display().to_string(), m)),
+                frame,
+            )
+            .map_err(|reason| Error::format(session_dir, reason))?;
+            frame.clone()
+        }
+        Some(ReferenceFrame::Aligned { .. }) => {
+            return Err(Error::format(
+                session_dir,
+                "the reference frame is an aligned canvas but these panels were read as solved \
+                 raw panels: pass `--input aligned` if they are registered full-canvas frames, \
+                 or derive a solved reference from the raw panels",
+            ));
+        }
+    };
     let canvas = (frame.width, frame.height, ch);
     tracing::info!(
         "mosaic frame: {}x{} px, {:.3}\"/px, center RA {:.4} Dec {:+.4}",
@@ -450,6 +523,7 @@ fn analyze_solved(
     session.canvas = canvas;
     session.input = InputKind::Solved;
     session.frame = Some(frame);
+    session.frame_imposed = reference.is_some();
     session.align_secs = Some(align_secs);
     finish_session(session, scans, surface_order, gain)
 }

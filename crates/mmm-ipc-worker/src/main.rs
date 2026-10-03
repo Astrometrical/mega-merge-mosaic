@@ -189,6 +189,7 @@ fn run() -> mmm_core::Result<()> {
                     gain,
                     input_select.to_input_select(),
                     Some(&progress),
+                    None,
                 )?
             }
         };

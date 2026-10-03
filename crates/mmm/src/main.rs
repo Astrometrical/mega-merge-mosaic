@@ -256,7 +256,8 @@ fn analyze_cmd(
         other => anyhow::bail!("--gain must be fit or unity (got {other})"),
     };
     let t0 = std::time::Instant::now();
-    let s = mmm_core::analyze::analyze_full(panels, session, surface_order, gain, input, None)?;
+    let s =
+        mmm_core::analyze::analyze_full(panels, session, surface_order, gain, input, None, None)?;
     match (&s.frame, s.align_secs) {
         (Some(f), align_secs) => println!(
             "input: solved panels — {} reprojected onto a fresh {}x{} frame \
