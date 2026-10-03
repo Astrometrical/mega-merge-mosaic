@@ -25,7 +25,7 @@ void ImageWindowCollector::begin( uint64_t w, uint64_t h, uint64_t ch )
    m_window = ImageWindow( int( w ), int( h ), int( ch ),
                            32 /*bitsPerSample*/, true /*floatSample*/,
                            ch >= 3 /*color*/, true /*initialProcessing*/,
-                           "MegaMergeMosaic" );
+                           m_windowId );
 
    // Belt-and-braces at the handoff: every band() memcpy below is bounded by
    // the geometry REQUESTED here, but the image it writes into is the one the

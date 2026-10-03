@@ -1,6 +1,7 @@
 // MmmExecution.cpp -- see MmmExecution.h. Spec section 10.1 execution flow.
 
 #include "MmmExecution.h"
+#include "MmmGroups.h"
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -437,11 +438,12 @@ struct AutoSessionDirGuard
 };
 
 // Loads the worker-written seam/ownership map (<sessionDir>/seam_map.png,
-// PROTOCOL.md section 6) and shows it as a new 8-bit "seam_map" image window.
+// PROTOCOL.md section 6) and shows it as a new 8-bit image window named
+// `windowId` ("seam_map", or "seam_map_<group>" in a multi-filter run).
 // Called after a successful run, BEFORE AutoSessionDirGuard removes a temp
 // session dir. Best-effort: a missing or unreadable file warns on the console
 // but never fails the completed blend.
-void ShowSeamMap( const std::string& sessionDirUtf8 )
+void ShowSeamMap( const std::string& sessionDirUtf8, const IsoString& windowId )
 {
    Console console;
 
@@ -473,7 +475,7 @@ void ShowSeamMap( const std::string& sessionDirUtf8 )
       window = ImageWindow( img.Width(), img.Height(), img.NumberOfChannels(),
                             8 /*bitsPerSample*/, false /*floatSample*/,
                             img.NumberOfChannels() >= 3 /*color*/,
-                            true /*initialProcessing*/, "seam_map" );
+                            true /*initialProcessing*/, windowId );
       {
          View view = window.MainView();
          ViewWriteLockGuard lock( view );
@@ -532,13 +534,34 @@ void PrintSummary( const std::string& sessionDirUtf8 )
    }
 }
 
+// One group's job: the instance rows it covers, where its output goes, and
+// the shared reference frame every group of a multi-filter run adopts
+// (null for a single-group run, which is byte-identical to a 1.5 run).
+struct GroupJob
+{
+   std::string      name;        // "" = the default group
+   IsoString        windowId;    // MegaMergeMosaic[_<sanitised>]
+   IsoString        seamMapId;   // seam_map[_<sanitised>]
+   Array<size_type> rows;        // instance rows in this group
+   json             reference;   // ReferenceFrame JSON, or null
+   std::string      sessionDir;  // this group's session directory (UTF-8)
+};
+
+// UTF-8 std::string -> pcl::String. Group names are user text: never route
+// them through String::Format's %s, which decodes narrow text as ISO-8859-1.
+String U( const std::string& utf8 )
+{
+   return String( IsoString( utf8.c_str() ).UTF8ToUTF16() );
+}
+
 // Drives one fully-assembled job to completion and shows the output window on
 // success. Throws on any fault or cancellation, leaving no window shown.
 // `prog` is caller-owned (RunViews/RunFiles construct it before their probe
 // phase, so the same abort state spans probe and run; the caller has already
-// called Console().EnableAbort()).
+// called Console().EnableAbort()). `windowId` names the output window.
 void DriveHost( const std::string& worker_path, json init_body, const std::string& shm_name,
-                const mmm::SlotLayout& layout, mmm::PanelSource& source, ConsoleProgress& prog )
+                const mmm::SlotLayout& layout, mmm::PanelSource& source, ConsoleProgress& prog,
+                const IsoString& windowId )
 {
    mmm::HostConfig cfg;
    cfg.worker_path = worker_path;
@@ -546,7 +569,7 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    cfg.shm_name    = shm_name;
    cfg.init        = json{ { "Init", std::move( init_body ) } };
 
-   ImageWindowCollector collector;
+   ImageWindowCollector collector( windowId );
 
    mmm::Host host( std::move( cfg ), source, collector, &prog );
    prog.host = &host;
@@ -585,72 +608,106 @@ void DriveHost( const std::string& worker_path, json init_body, const std::strin
    collector.Window().Show();
 }
 
+// Resolves every stored view id in `rows` to a live view (throws naming a
+// missing one).
+Array<View> ResolveViews( const Params& in, const Array<size_type>& rows )
+{
+   Array<View> views;
+   for ( size_type r : rows )
+   {
+      const String& id = in.viewIds[r];
+      View v = View::ViewById( id );
+      if ( v.IsNull() )
+         throw Error( "MegaMergeMosaic: input view not found: " + id );
+      views.Add( v );
+   }
+   return views;
+}
+
+// Lock/unlock every view in `views` for the lifetime of the guard (the
+// ViewPanelSource contract). `locked` counts views whose Lock() returned, so
+// a throwing Lock() still releases the ones already acquired.
+struct ViewLockGuard
+{
+   Array<View>& views;
+   size_type    locked = 0;
+   explicit ViewLockGuard( Array<View>& v ) : views( v )
+   {
+      for ( ; locked < views.Length(); ++locked )
+         views[locked].Lock();
+   }
+   ~ViewLockGuard()
+   {
+      for ( size_type i = 0; i < locked; ++i )
+      {
+         try { views[i].Unlock(); } catch ( ... ) {}
+      }
+   }
+   ViewLockGuard( const ViewLockGuard& ) = delete;
+   ViewLockGuard& operator=( const ViewLockGuard& ) = delete;
+};
+
+// Per-view geometry of a locked view set; throws on a missing/complex image.
+void CollectGeometry( const Array<View>& views, Array<uint64_t>& ws, Array<uint64_t>& hs,
+                      Array<uint64_t>& cs, bool& uniform )
+{
+   uniform = true;
+   for ( size_type i = 0; i < views.Length(); ++i )
+   {
+      const ImageVariant img = views[i].Image();
+      if ( !img )
+         throw Error( "MegaMergeMosaic: input view carries no image: " + views[i].FullId() );
+      if ( img.IsComplexSample() )
+         throw Error( "MegaMergeMosaic: complex images are not supported: " + views[i].FullId() );
+      const uint64_t w = uint64_t( img.Width() );
+      const uint64_t h = uint64_t( img.Height() );
+      const uint64_t c = uint64_t( img.NumberOfChannels() );
+      ws.Add( w );
+      hs.Add( h );
+      cs.Add( c );
+      if ( i > 0 && ( w != ws[0] || h != hs[0] || c != cs[0] ) )
+         uniform = false;
+   }
+}
+
 // ---- Views path (Aligned / Solved) ----------------------------------------
 
-void RunViews( const Params& in, const std::string& worker_path )
+void RunViews( const Params& in, const std::string& worker_path, const GroupJob& group )
 {
    // Progress/abort observer shared by the probe phase and the run itself
    // (want_cancel is sticky across both).
    Console().EnableAbort();
    ConsoleProgress prog;
 
-   // Resolve every stored view id to a live view.
-   Array<View> views;
-   for ( const String& id : in.viewIds )
-   {
-      View v = View::ViewById( id );
-      if ( v.IsNull() )
-         throw Error( "MegaMergeMosaic: input view not found: " + id );
-      views.Add( v );
-   }
+   const bool haveRef = !group.reference.is_null();
 
-   // Lock all views for the duration of the run (ViewPanelSource contract);
-   // unlock on every exit path. The lock loop is INSIDE the try so that a
-   // throwing Lock() still releases the [0, locked) views already acquired
-   // (locked counts successfully-locked views: it is only incremented after a
-   // Lock() returns).
-   size_type locked = 0;
-   try
-   {
-      for ( ; locked < views.Length(); ++locked )
-         views[locked].Lock();
+   Array<View> views = ResolveViews( in, group.rows );
+   ViewLockGuard lock( views );
 
-      // Collect geometry; note whether all views share identical dimensions.
-      Array<uint64_t> ws, hs, cs;
-      bool uniform = true;
-      for ( size_type i = 0; i < views.Length(); ++i )
-      {
-         const ImageVariant img = views[i].Image();
-         if ( !img )
-            throw Error( "MegaMergeMosaic: input view carries no image: " + views[i].FullId() );
-         if ( img.IsComplexSample() )
-            throw Error( "MegaMergeMosaic: complex images are not supported: " + views[i].FullId() );
-         const uint64_t w = uint64_t( img.Width() );
-         const uint64_t h = uint64_t( img.Height() );
-         const uint64_t c = uint64_t( img.NumberOfChannels() );
-         ws.Add( w );
-         hs.Add( h );
-         cs.Add( c );
-         if ( i > 0 && ( w != ws[0] || h != hs[0] || c != cs[0] ) )
-            uniform = false;
-      }
+   Array<uint64_t> ws, hs, cs;
+   bool uniform = true;
+   CollectGeometry( views, ws, hs, cs, uniform );
 
-      // A mono/colour mix cannot be blended, in either mode: the Init canvas
-      // carries ONE channel count (cs[0]) that the worker addresses every
-      // panel with, and the shm slots are sized from it. Refuse here, naming
-      // both views -- otherwise Auto reads the differing geometries as
-      // unregistered panels and the run dies complaining about a missing
-      // astrometric solution.
-      for ( size_type i = 1; i < views.Length(); ++i )
-         if ( cs[i] != cs[0] )
-            throw Error( "MegaMergeMosaic: all input views must have the same number of channels, "
-                         "but " + views[0].FullId() + " has " + ChannelsDescription( cs[0] ) +
-                         " and " + views[i].FullId() + " has " + ChannelsDescription( cs[i] ) +
-                         "; mono and colour images cannot be mixed in one mosaic." );
+   // A mono/colour mix cannot be blended, in either mode: the Init canvas
+   // carries ONE channel count (cs[0]) that the worker addresses every
+   // panel with, and the shm slots are sized from it. Refuse here, naming
+   // both views -- otherwise Auto reads the differing geometries as
+   // unregistered panels and the run dies complaining about a missing
+   // astrometric solution.
+   for ( size_type i = 1; i < views.Length(); ++i )
+      if ( cs[i] != cs[0] )
+         throw Error( "MegaMergeMosaic: all input views must have the same number of channels, "
+                      "but " + views[0].FullId() + " has " + ChannelsDescription( cs[0] ) +
+                      " and " + views[i].FullId() + " has " + ChannelsDescription( cs[i] ) +
+                      "; mono and colour images cannot be mixed in one mosaic." );
 
-      // Resolve the effective JobMode (spec section 10.1): the override wins;
-      // Auto classifies by uniform-vs-differing geometry.
-      bool solved;
+   // Resolve the effective JobMode (spec section 10.1). With a shared
+   // reference its kind decides for every group; otherwise the override
+   // wins and Auto classifies by uniform-vs-differing geometry.
+   bool solved;
+   if ( haveRef )
+      solved = ( mmm::reference_kind( group.reference ) == "solved" );
+   else
       switch ( in.inputSelect )
       {
       case MmmInputSelectParameter::Aligned: solved = false;      break;
@@ -658,54 +715,63 @@ void RunViews( const Params& in, const std::string& worker_path )
       default:                               solved = !uniform;   break;
       }
 
-      // Solved mode requires each view to carry an astrometric solution.
-      if ( solved )
-         for ( size_type i = 0; i < views.Length(); ++i )
-            if ( !views[i].Window().HasAstrometricSolution() )
-               throw Error( "MegaMergeMosaic: solved mode requires an astrometric solution on every "
-                            "view; this one has none: " + views[i].FullId() );
-
-      const uint64_t ch        = cs[0];
-      const uint64_t band_rows = uint64_t( uint32_t( in.bandRows ) );
-
-      // Ordered PanelDescs (PROTOCOL.md section 6). Solved mode attaches the
-      // plate solution verbatim as each panel's properties.
-      json panels = json::array();
-      uint64_t max_panel_w = 0;
+   // Solved mode requires each view to carry an astrometric solution.
+   if ( solved )
       for ( size_type i = 0; i < views.Length(); ++i )
+         if ( !views[i].Window().HasAstrometricSolution() )
+            throw Error( "MegaMergeMosaic: solved mode requires an astrometric solution on every "
+                         "view; this one has none: " + views[i].FullId() );
+
+   const uint64_t ch        = cs[0];
+   const uint64_t band_rows = uint64_t( uint32_t( in.bandRows ) );
+
+   // Ordered PanelDescs (PROTOCOL.md section 6). Solved mode attaches the
+   // plate solution verbatim as each panel's properties; with a shared
+   // reference the aligned path gets them too (empty when a view has none),
+   // so the worker can check the canvas WCS against the reference.
+   json panels = json::array();
+   uint64_t max_panel_w = 0;
+   for ( size_type i = 0; i < views.Length(); ++i )
+   {
+      json pd;
+      pd["panel_id"]   = uint32_t( i );
+      pd["width"]      = ws[i];
+      pd["height"]     = hs[i];
+      pd["channels"]   = cs[i];
+      pd["properties"] = ( solved || haveRef ) ? extract_astrometry_props( views[i] ) : json::array();
+      panels.push_back( std::move( pd ) );
+      if ( ws[i] > max_panel_w )
+         max_panel_w = ws[i];
+   }
+
+   // Init body sans slot sizing (filled below).
+   json init_body;
+   // protocol_version + worker_version are stamped by mmm::Host (run and probes).
+   init_body["shm_name"]         = "";
+   init_body["slot_bytes"]       = 0;
+   init_body["input_slots"]      = kInputSlots;
+   init_body["output_slots"]     = kOutputSlots;
+   init_body["panels"]           = panels;
+   init_body["session_dir"]      = group.sessionDir;
+   init_body["params"]           = BuildParams( in );
+   if ( haveRef )
+      init_body["reference"]     = group.reference;
+
+   uint64_t slot_bytes = 0;
+   if ( solved )
+   {
+      // Aligned mode knows the canvas; solved mode does not -- slots must fit
+      // BOTH an input band (a raw panel's width) and an output band (the
+      // frame's width). The frame is the shared reference when one is
+      // imposed, else the worker's own choose_frame via --probe-frame.
+      init_body["mode"]   = "Solved";
+      init_body["canvas"] = { uint64_t( 0 ), uint64_t( 0 ), ch };
+
+      uint64_t fw = 0, fh = 0, fch = 0;
+      if ( haveRef )
+         mmm::reference_canvas( group.reference, fw, fh );
+      else
       {
-         json pd;
-         pd["panel_id"]   = uint32_t( i );
-         pd["width"]      = ws[i];
-         pd["height"]     = hs[i];
-         pd["channels"]   = cs[i];
-         pd["properties"] = solved ? extract_astrometry_props( views[i] ) : json::array();
-         panels.push_back( std::move( pd ) );
-         if ( ws[i] > max_panel_w )
-            max_panel_w = ws[i];
-      }
-
-      // Init body sans slot sizing (filled below).
-      json init_body;
-      // protocol_version + worker_version are stamped by mmm::Host (run and probes).
-      init_body["shm_name"]         = "";
-      init_body["slot_bytes"]       = 0;
-      init_body["input_slots"]      = kInputSlots;
-      init_body["output_slots"]     = kOutputSlots;
-      init_body["panels"]           = panels;
-      init_body["session_dir"]      = in.sessionDir;
-      init_body["params"]           = BuildParams( in );
-
-      uint64_t slot_bytes = 0;
-      if ( solved )
-      {
-         // Aligned mode knows the canvas; solved mode does not -- probe the
-         // worker for the reprojected frame width so slots fit BOTH an input
-         // band (a raw panel's width) and an output band (the frame's width).
-         init_body["mode"]   = "Solved";
-         init_body["canvas"] = { uint64_t( 0 ), uint64_t( 0 ), ch };
-
-         uint64_t fw = 0, fh = 0, fch = 0;
          try
          {
             mmm::Host::probe_frame( worker_path, init_body, fw, fh, fch, &prog );
@@ -714,47 +780,40 @@ void RunViews( const Params& in, const std::string& worker_path )
          {
             throw ProcessAborted();
          }
-         const uint64_t width = ( fw > max_panel_w ) ? fw : max_panel_w;
-         slot_bytes = width * ch * band_rows * 4;
       }
-      else
-      {
-         if ( !uniform )
-            throw Error( "MegaMergeMosaic: aligned mode requires all views to share the same "
-                         "dimensions; use solved mode for unregistered panels." );
-         init_body["mode"]   = "Aligned";
-         init_body["canvas"] = { ws[0], hs[0], ch };
-         slot_bytes = ws[0] * ch * band_rows * 4;
-      }
-
-      init_body["slot_bytes"] = slot_bytes;
-      const std::string shm_name = MakeShmName();
-      init_body["shm_name"]   = shm_name;
-
-      mmm::SlotLayout layout{ slot_bytes, kInputSlots, kOutputSlots };
-      ViewPanelSource source( views );
-      DriveHost( worker_path, std::move( init_body ), shm_name, layout, source, prog );
+      const uint64_t width = ( fw > max_panel_w ) ? fw : max_panel_w;
+      slot_bytes = width * ch * band_rows * 4;
    }
-   catch ( ... )
+   else
    {
-      for ( size_type i = 0; i < locked; ++i )
-         views[i].Unlock();
-      throw;
+      if ( !uniform )
+         throw Error( "MegaMergeMosaic: aligned mode requires all views to share the same "
+                      "dimensions; use solved mode for unregistered panels." );
+      init_body["mode"]   = "Aligned";
+      init_body["canvas"] = { ws[0], hs[0], ch };
+      slot_bytes = ws[0] * ch * band_rows * 4;
    }
 
-   for ( size_type i = 0; i < locked; ++i )
-      views[i].Unlock();
+   init_body["slot_bytes"] = slot_bytes;
+   const std::string shm_name = MakeShmName();
+   init_body["shm_name"]   = shm_name;
+
+   mmm::SlotLayout layout{ slot_bytes, kInputSlots, kOutputSlots };
+   ViewPanelSource source( views );
+   DriveHost( worker_path, std::move( init_body ), shm_name, layout, source, prog, group.windowId );
 }
 
 // ---- Files path ------------------------------------------------------------
 
-void RunFiles( const Params& in, const std::string& worker_path )
+void RunFiles( const Params& in, const std::string& worker_path, const GroupJob& group )
 {
    // Progress/abort observer shared by the probe phase and the run itself
    // (want_cancel is sticky across both).
    Console console;
    console.EnableAbort();
    ConsoleProgress prog;
+
+   const bool haveRef = !group.reference.is_null();
 
    // Delegate the metadata pass to the worker (PROTOCOL.md section 11,
    // --probe-panels): header-only parallel reads in a child process while this
@@ -765,9 +824,9 @@ void RunFiles( const Params& in, const std::string& worker_path )
    // when the run can resolve to solved mode, replacing the separate
    // host-side property read + --probe-frame round trip.
    std::vector<std::string> paths_utf8;
-   paths_utf8.reserve( size_t( in.filePaths.Length() ) );
-   for ( const String& path : in.filePaths )
-      paths_utf8.push_back( std::string( path.ToUTF8().c_str() ) );
+   paths_utf8.reserve( size_t( group.rows.Length() ) );
+   for ( size_type r : group.rows )
+      paths_utf8.push_back( std::string( in.filePaths[r].ToUTF8().c_str() ) );
 
    console.Write( String().Format( "<end><cbr>Reading metadata of %u panel files... ",
                                    unsigned( paths_utf8.size() ) ) );
@@ -804,19 +863,24 @@ void RunFiles( const Params& in, const std::string& worker_path )
    const uint64_t band_rows = uint64_t( uint32_t( in.bandRows ) );
 
    // Output-slot sizing. The output band width is the width of the frame the
-   // worker computes, which differs by how Files mode resolves aligned-vs-solved
-   // (PROTOCOL.md section 11):
+   // worker blends onto (PROTOCOL.md section 11):
+   //   * a shared REFERENCE -- the worker adopts it and blends the whole
+   //     canvas, so its width is exact;
    //   * SOLVED  -- the worker reprojects onto its own choose_frame, whose width
    //     can EXCEED every input file's width. Sizing by input width alone would
    //     silently overrun the output slot (section 7 hazard). The probe reports
-   //     that frame (has_frame) exactly when the run can resolve to solved
-   //     (input_select Solved or Auto, and every file carries a plate
-   //     solution); take the max.
+   //     that frame (has_frame) exactly when the run can resolve to solved;
    //   * ALIGNED -- the output canvas width == the (shared) file width, so the
-   //     widest input file is exact. This covers input_select Aligned, and Auto
-   //     with registered (no-solution) files -- the probe reports no frame.
+   //     widest input file is exact.
    uint64_t width = max_w;
-   if ( probe.has_frame && probe.frame_w > width )
+   if ( haveRef )
+   {
+      uint64_t rw = 0, rh = 0;
+      mmm::reference_canvas( group.reference, rw, rh );
+      if ( rw > width )
+         width = rw;
+   }
+   else if ( probe.has_frame && probe.frame_w > width )
       width = probe.frame_w;
    const uint64_t slot_bytes = width * ch0 * band_rows * 4;
 
@@ -830,15 +894,161 @@ void RunFiles( const Params& in, const std::string& worker_path )
    init_body["mode"]             = json{ { "Files",
                                            { { "paths", file_paths },
                                              { "input_select", InputSelectWireString( in.inputSelect ) } } } };
-   init_body["session_dir"]      = in.sessionDir;
+   init_body["session_dir"]      = group.sessionDir;
    init_body["params"]           = BuildParams( in );
+   if ( haveRef )
+      init_body["reference"]     = group.reference;
 
    const std::string shm_name = MakeShmName();
    init_body["shm_name"]      = shm_name;
 
    mmm::SlotLayout layout{ slot_bytes, kInputSlots, kOutputSlots };
    NullPanelSource source;
-   DriveHost( worker_path, std::move( init_body ), shm_name, layout, source, prog );
+   DriveHost( worker_path, std::move( init_body ), shm_name, layout, source, prog, group.windowId );
+}
+
+// ---- Multi-group helpers ---------------------------------------------------
+
+// The shared reference frame over EVERY view of every group, derived by the
+// worker (--probe-reference) from the views' geometry and astrometric
+// properties, honouring the registration-method override.
+json DeriveReferenceFromViews( const Params& in, ConsoleProgress& prog, const std::string& worker_path )
+{
+   Array<size_type> all;
+   for ( size_type r = 0; r < in.viewIds.Length(); ++r )
+      all.Add( r );
+   Array<View> views = ResolveViews( in, all );
+   ViewLockGuard lock( views );
+
+   Array<uint64_t> ws, hs, cs;
+   bool uniform = true;
+   CollectGeometry( views, ws, hs, cs, uniform );
+
+   json panels = json::array();
+   for ( size_type i = 0; i < views.Length(); ++i )
+   {
+      json pd;
+      pd["panel_id"]   = uint32_t( i );
+      pd["width"]      = ws[i];
+      pd["height"]     = hs[i];
+      pd["channels"]   = cs[i];
+      pd["properties"] = extract_astrometry_props( views[i] );
+      panels.push_back( std::move( pd ) );
+   }
+
+   json init_body;
+   init_body["shm_name"]     = "";
+   init_body["slot_bytes"]   = 0;
+   init_body["input_slots"]  = 0;
+   init_body["output_slots"] = 0;
+   init_body["canvas"]       = { uint64_t( 0 ), uint64_t( 0 ), cs[0] };
+   init_body["panels"]       = panels;
+   // The probe reads only the kind override from `mode`; the Files shape
+   // carries all three overrides uniformly (its paths are ignored).
+   init_body["mode"]         = json{ { "Files",
+                                       { { "paths", json::array() },
+                                         { "input_select", InputSelectWireString( in.inputSelect ) } } } };
+   init_body["session_dir"]  = "";
+   init_body["params"]       = BuildParams( in );
+   try
+   {
+      return mmm::Host::probe_reference( worker_path, init_body, &prog );
+   }
+   catch ( const mmm::HostCancelled& )
+   {
+      throw ProcessAborted();
+   }
+}
+
+// The shared reference frame over EVERY file of every group (the
+// --probe-panels reply carries it).
+json DeriveReferenceFromFiles( const Params& in, ConsoleProgress& prog, const std::string& worker_path )
+{
+   std::vector<std::string> paths;
+   paths.reserve( size_t( in.filePaths.Length() ) );
+   for ( const String& p : in.filePaths )
+      paths.push_back( std::string( p.ToUTF8().c_str() ) );
+   mmm::PanelProbeResult probe;
+   try
+   {
+      probe = mmm::Host::probe_panels( worker_path, paths, InputSelectWireString( in.inputSelect ), &prog );
+   }
+   catch ( const mmm::HostCancelled& )
+   {
+      throw ProcessAborted();
+   }
+   if ( probe.reference.is_null() )
+      throw Error( "MegaMergeMosaic: could not derive a shared reference frame over the panel set: "
+                   "the files are neither registered to one canvas nor all plate-solved." );
+   return probe.reference;
+}
+
+// One-line console description of a ReferenceFrame JSON (ASCII only).
+String DescribeReference( const json& ref )
+{
+   uint64_t w = 0, h = 0;
+   mmm::reference_canvas( ref, w, h );
+   if ( mmm::reference_kind( ref ) == "solved" )
+   {
+      const json& f = ref.at( "frame" );
+      return String().Format( "solved frame %llu x %llu px, %.3f\"/px, center RA %.4f Dec %+.4f",
+                              (unsigned long long)w, (unsigned long long)h,
+                              f.at( "scale_deg" ).get<double>()*3600.0,
+                              f.at( "crval" )[0].get<double>(), f.at( "crval" )[1].get<double>() );
+   }
+   String s = String().Format( "aligned canvas %llu x %llu px", (unsigned long long)w, (unsigned long long)h );
+   if ( ref.contains( "wcs" ) && !ref.at( "wcs" ).is_null() )
+      s += " with canvas WCS";
+   return s;
+}
+
+std::string GroupNameList( const std::vector<mmm_groups::Group>& groups )
+{
+   std::string out;
+   for ( size_t i = 0; i < groups.size(); ++i )
+   {
+      if ( i > 0 )
+         out += ", ";
+      out += mmm_groups::display_name( groups[i].name );
+   }
+   return out;
+}
+
+// A fresh process-unique directory under the system temp dir (not created
+// here; the worker creates it). Any stale same-named dir left behind by a
+// failed prior cleanup is removed first so it cannot be silently reused.
+std::string FreshTempSessionDir()
+{
+   String t = File::SystemTempDirectory();
+   if ( !t.EndsWith( '/' ) )
+      t += '/';
+   t += "mmm-session-" +
+        String( (unsigned long)
+#ifdef _WIN32
+                ::GetCurrentProcessId()
+#else
+                ::getpid()
+#endif
+              ) + "-" + String( (unsigned long long) s_runCounter.fetch_add( 1 ) );
+   std::string dir( t.ToUTF8().c_str() );
+   RemoveSessionDir( dir );
+   return dir;
+}
+
+// The session directory one group runs out of: a fresh temp dir (removed by
+// `guard` afterwards) when the user left the session directory empty, else
+// `<user dir>/<sanitised group>` (preserved, like a single-group user dir).
+std::string GroupSessionDir( const std::string& userDir, const std::string& groupName,
+                             AutoSessionDirGuard& guard )
+{
+   if ( userDir.empty() )
+   {
+      std::string dir = FreshTempSessionDir();
+      guard.dir    = dir;
+      guard.active = true;
+      return dir;
+   }
+   return userDir + "/" + ( groupName.empty() ? std::string( "default" ) : mmm_groups::sanitize( groupName ) );
 }
 
 } // namespace
@@ -867,6 +1077,22 @@ void run_blend( MmmBlendInstance& in )
    if ( ( haveViews && in.p_viewIds.Length() < 2 ) || ( haveFiles && in.p_filePaths.Length() < 2 ) )
       throw Error( "MegaMergeMosaic: need at least two views or files to blend." );
 
+   // 2. Partition into groups (first-appearance order; "" = the default
+   // group) and refuse two groups that would share one window id.
+   const Array<String>& groupsArr = haveViews ? in.p_viewGroups : in.p_fileGroups;
+   const size_type n = haveViews ? in.p_viewIds.Length() : in.p_filePaths.Length();
+   std::vector<std::string> groupOfRow( static_cast<size_t>( n ), std::string() );
+   for ( size_type i = 0; i < n; ++i )
+      if ( i < groupsArr.Length() )
+         groupOfRow[size_t( i )] = mmm_groups::trim( std::string( groupsArr[i].ToUTF8().c_str() ) );
+   std::vector<mmm_groups::Group> groups = mmm_groups::partition( groupOfRow );
+   {
+      std::string a, b, id;
+      if ( mmm_groups::find_window_collision( groups, "MegaMergeMosaic", a, b, id ) )
+         throw Error( "MegaMergeMosaic: groups '" + U( a ) + "' and '" + U( b ) +
+                      "' both map to window id " + U( id ) + "; rename one of them." );
+   }
+
    const std::string worker_path = ResolveWorkerPath();
 
    // Snapshot the private parameters (run_blend is the sole friend) so the
@@ -886,44 +1112,104 @@ void run_blend( MmmBlendInstance& in )
    p.gainMode       = in.p_gainMode;
    p.bandRows       = in.p_bandRows;
 
-   // Empty session dir (the default): run out of a fresh directory under the
-   // system temp dir and remove it afterwards, success or failure. A
-   // user-specified directory is used as-is and preserved (its cache makes
-   // re-runs with the same inputs resume completed analysis stages).
-   AutoSessionDirGuard sessionGuard;
-   if ( p.sessionDir.empty() )
+   // 3a. A single group: today's path, untouched -- no reference imposed,
+   // plain window ids, the user's session directory used as-is (its cache
+   // makes re-runs resume completed analysis stages) or a fresh temp dir
+   // removed afterwards.
+   if ( groups.size() == 1 )
    {
-      String t = File::SystemTempDirectory();
-      if ( !t.EndsWith( '/' ) )
-         t += '/';
-      t += "mmm-session-" +
-           String( (unsigned long)
-#ifdef _WIN32
-                   ::GetCurrentProcessId()
-#else
-                   ::getpid()
-#endif
-                 ) + "-" + String( (unsigned long long) s_runCounter.fetch_add( 1 ) );
-      p.sessionDir      = std::string( t.ToUTF8().c_str() );
-      // Defend against a stale same-named dir left behind by a failed prior
-      // cleanup (e.g. after a module reload) being silently reused as cache.
-      RemoveSessionDir( p.sessionDir );
-      sessionGuard.dir    = p.sessionDir;
-      sessionGuard.active = true;
+      AutoSessionDirGuard sessionGuard;
+      GroupJob single;
+      single.windowId  = "MegaMergeMosaic";
+      single.seamMapId = "seam_map";
+      for ( size_t r : groups[0].rows )
+         single.rows.Add( size_type( r ) );
+      if ( p.sessionDir.empty() )
+      {
+         single.sessionDir   = FreshTempSessionDir();
+         sessionGuard.dir    = single.sessionDir;
+         sessionGuard.active = true;
+      }
+      else
+         single.sessionDir = p.sessionDir;
+
+      if ( haveViews )
+         RunViews( p, worker_path, single );
+      else
+         RunFiles( p, worker_path, single );
+
+      // The run succeeded; surface the requested seam map and the end-of-run
+      // summary while the session dir (and the files the worker wrote into
+      // it) still exists -- sessionGuard removes a temp dir on return.
+      if ( p.seamMap )
+         ShowSeamMap( single.sessionDir, single.seamMapId );
+      PrintSummary( single.sessionDir );
+      return;
    }
 
-   if ( haveViews )
-      RunViews( p, worker_path );
-   else
-      RunFiles( p, worker_path );
+   // 3b. Several groups: one reference frame over every panel of every
+   // group, then one worker job per group with that frame imposed, so the
+   // outputs share one pixel grid.
+   Console console;
+   console.EnableAbort();
+   ConsoleProgress prog;
+   json reference = haveViews ? DeriveReferenceFromViews( p, prog, worker_path )
+                              : DeriveReferenceFromFiles( p, prog, worker_path );
+   uint64_t rw = 0, rh = 0;
+   mmm::reference_canvas( reference, rw, rh );
+   console.WriteLn( "<end><cbr><br><b>Reference frame</b>  " + DescribeReference( reference ) );
+   console.WriteLn( String().Format( "  groups          %u (", unsigned( groups.size() ) ) +
+                    U( GroupNameList( groups ) ) + String().Format( ")   panels %u", unsigned( n ) ) );
 
-   // The run succeeded; surface the requested seam map and the end-of-run
-   // summary while the session dir (and the files the worker wrote into it)
-   // still exists -- sessionGuard removes a temp dir when this function
-   // returns.
-   if ( p.seamMap )
-      ShowSeamMap( p.sessionDir );
-   PrintSummary( p.sessionDir );
+   std::vector<std::pair<std::string, IsoString>> outputs;
+   for ( const mmm_groups::Group& g : groups )
+   {
+      GroupJob job;
+      job.name      = g.name;
+      job.windowId  = IsoString( mmm_groups::window_id( g.name, "MegaMergeMosaic" ).c_str() );
+      job.seamMapId = IsoString( mmm_groups::window_id( g.name, "seam_map" ).c_str() );
+      for ( size_t r : g.rows )
+         job.rows.Add( size_type( r ) );
+      job.reference = reference;
+      AutoSessionDirGuard guard;   // per-group temp dir, or <user dir>/<sanitised group>
+      job.sessionDir = GroupSessionDir( p.sessionDir, g.name, guard );
+
+      console.WriteLn( "<end><cbr><br><b>== Group " + U( mmm_groups::display_name( g.name ) ) +
+                       String().Format( " (%u panels)</b>", unsigned( g.rows.size() ) ) );
+      try
+      {
+         if ( haveViews )
+            RunViews( p, worker_path, job );
+         else
+            RunFiles( p, worker_path, job );
+      }
+      catch ( const ProcessAborted& )
+      {
+         throw;   // earlier groups' windows stay shown; nothing more runs
+      }
+      catch ( const Error& e )
+      {
+         throw Error( "MegaMergeMosaic: group " + U( mmm_groups::display_name( g.name ) ) + ": " + e.Message() );
+      }
+      catch ( const std::exception& e )
+      {
+         throw Error( "MegaMergeMosaic: group " + U( mmm_groups::display_name( g.name ) ) + ": " + String( e.what() ) );
+      }
+      if ( p.seamMap )
+         ShowSeamMap( job.sessionDir, job.seamMapId );
+      PrintSummary( job.sessionDir );
+      outputs.emplace_back( g.name, job.windowId );
+   }
+
+   console.WriteLn( String().Format( "<end><cbr><br><b>Groups complete</b>  %u outputs on the shared %llu x %llu grid",
+                                     unsigned( outputs.size() ), (unsigned long long)rw, (unsigned long long)rh ) );
+   for ( const auto& o : outputs )
+   {
+      String name = U( mmm_groups::display_name( o.first ) );
+      if ( name.Length() < 15 )
+         name.Append( ' ', 15 - name.Length() );
+      console.WriteLn( "  " + name + " " + String( o.second ) );
+   }
 }
 
 // ----------------------------------------------------------------------------

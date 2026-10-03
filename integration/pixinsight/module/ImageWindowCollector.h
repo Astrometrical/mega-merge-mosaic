@@ -85,7 +85,15 @@ class ImageWindowCollector : public mmm::OutputCollector
 {
 public:
 
-   ImageWindowCollector() = default;
+   /*!
+    * \a windowId names the output ImageWindow begin() creates: the plain
+    * MegaMergeMosaic for a single-group run, MegaMergeMosaic_<group> per
+    * group in a multi-filter run (PixInsight suffixes collisions itself).
+    */
+   explicit ImageWindowCollector( const IsoString& windowId = "MegaMergeMosaic" )
+      : m_windowId( windowId )
+   {
+   }
 
    ~ImageWindowCollector() override = default;
 
@@ -110,6 +118,7 @@ public:
 
 private:
 
+   IsoString   m_windowId;
    ImageWindow m_window = ImageWindow::Null();
    uint64_t    m_width  = 0;
    uint64_t    m_height = 0;
