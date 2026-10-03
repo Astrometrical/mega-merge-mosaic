@@ -155,6 +155,7 @@ fn full_pipeline_recovers_ground_truth() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -421,6 +422,7 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -581,6 +583,7 @@ fn surface_off_bypasses_cleanly() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -652,6 +655,7 @@ fn full_pipeline_twoband_recovers_ground_truth() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -735,6 +739,7 @@ fn twoband_single_panel_reconstructs_input() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -850,6 +855,7 @@ fn twoband_never_averages_misregistered_stars() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -997,6 +1003,7 @@ fn pyramid_reduces_midfrequency_ghosting() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -1235,6 +1242,7 @@ fn feather_and_twoband_outputs_are_bit_stable() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -1379,6 +1387,7 @@ fn flatten_removes_common_sky_gradient() {
             roi: None,
             defect_veto: true,
             flatten,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -1473,6 +1482,7 @@ fn flatten_off_keeps_common_sky_gradient() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -1918,6 +1928,7 @@ fn run_solved_pipeline(tag: &str, gain_tol: f64, format: &dyn Fn(usize) -> Solve
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -2402,6 +2413,7 @@ fn real_solved_pipeline_matches_registered() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
             ..Default::default()
         };
         let bbox = mmm_core::blend::output_bbox(session, &params).unwrap();
@@ -2598,6 +2610,7 @@ fn pyramid_deep_single_coverage_matches_panel() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();

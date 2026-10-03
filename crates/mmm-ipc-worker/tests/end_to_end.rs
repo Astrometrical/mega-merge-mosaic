@@ -132,6 +132,7 @@ fn blend_params(band_rows: usize) -> BlendParams {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     }
 }
 

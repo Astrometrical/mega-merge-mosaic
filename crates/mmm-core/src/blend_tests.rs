@@ -118,6 +118,7 @@ fn feather_blend_two_overlapping_panels() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -188,6 +189,7 @@ fn blend_with_file_source_matches_plain_blend() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
 
     let mut a = MemSink::new();
@@ -232,6 +234,7 @@ fn roi_matches_full_blend_subregion() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut full_sink = MemSink::new();
     blend(&session, &phot, None, &graph, &full, &mut full_sink).unwrap();
@@ -283,6 +286,7 @@ fn photometric_corrections_are_applied() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -322,6 +326,7 @@ fn surfaces_are_applied_during_accumulation() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -356,6 +361,7 @@ fn surfaces_are_applied_during_accumulation() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink8 = MemSink::new();
     blend(&session, &phot, Some(&surf), &graph, &params8, &mut sink8).unwrap();
@@ -383,6 +389,7 @@ fn downsample_blends_from_l8_summaries() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -452,6 +459,7 @@ fn twoband_spike_arms_match_one_panel() {
         // must detect. The veto has its own tests.
         defect_veto: false,
         flatten: None,
+        extent: None,
     };
 
     let run = |use_mask: bool, mode: BlendMode| -> MemSink {
@@ -666,6 +674,7 @@ fn twoband_defect_veto_suppresses_overlap_defects() {
             roi: None,
             defect_veto: veto,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -763,6 +772,7 @@ fn defect_outside_overlap_is_untouched() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -959,6 +969,7 @@ fn seam_through_structure_ramps_the_mismatch() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(session, &phot, None, graph, &params, &mut sink).unwrap();
@@ -1124,6 +1135,7 @@ fn bright_star_halo_leaves_no_dark_moat() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -1190,6 +1202,7 @@ fn rejects_unsupported_downsample() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     assert!(blend(&session, &phot, None, &graph, &params, &mut sink).is_err());
@@ -1249,6 +1262,7 @@ fn non_finite_input_samples_are_zeroed_in_output() {
         roi: None,
         defect_veto: true,
         flatten: None,
+        extent: None,
     };
     let mut sink = MemSink::new();
     blend(&session, &phot, None, &graph, &params, &mut sink).unwrap();
@@ -1360,6 +1374,7 @@ fn masked_core_on_narrow_overlap_corner_reconstructs_cleanly() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -1462,6 +1477,7 @@ fn output_is_clamped_to_unit_range() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = MemSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
@@ -1489,5 +1505,118 @@ fn output_is_clamped_to_unit_range() {
         );
     }
 
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn extent_defaults_to_union_and_canvas_widens_with_zero_fill() {
+    let dir = tmpdir("extent");
+    let (session, graph) = make_panels(&dir);
+    let phot = identity_phot(2, 1);
+    let base = BlendParams {
+        feather_px: 16.0,
+        downsample: 1,
+        band_rows: 16,
+        mode: BlendMode::Feather,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+        extent: None,
+    };
+    assert_eq!(output_bbox(&session, &base).unwrap(), [8, 8, 120, 64]);
+    let canvas = BlendParams {
+        extent: Some(Extent::Canvas),
+        ..base.clone()
+    };
+    assert_eq!(output_bbox(&session, &canvas).unwrap(), [0, 0, 128, 64]);
+
+    let mut union_sink = MemSink::new();
+    blend(&session, &phot, None, &graph, &base, &mut union_sink).unwrap();
+    let mut wide = MemSink::new();
+    blend(&session, &phot, None, &graph, &canvas, &mut wide).unwrap();
+    assert_eq!((wide.w, wide.h), (128, 64));
+    assert!(
+        wide.data.iter().all(|v| v.is_finite()),
+        "no NaN/Inf in zero-filled bands"
+    );
+    for y in 0..8 {
+        for x in 0..128 {
+            assert_eq!(
+                wide.at(0, x, y),
+                0.0,
+                "rows above the content must be zero ({x},{y})"
+            );
+        }
+    }
+    for y in 0..64 {
+        for x in 0..8 {
+            assert_eq!(
+                wide.at(0, x, y),
+                0.0,
+                "columns left of the content must be zero ({x},{y})"
+            );
+        }
+    }
+    for y in 0..union_sink.h {
+        for x in 0..union_sink.w {
+            let (a, b) = (wide.at(0, x + 8, y + 8), union_sink.at(0, x, y));
+            assert!(
+                (a - b).abs() < 1e-6,
+                "canvas extent must reproduce the union blend at ({x},{y}): {a} vs {b}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn imposed_frame_defaults_to_canvas_extent() {
+    let dir = tmpdir("extent-imposed");
+    let (mut session, _) = make_panels(&dir);
+    let params = BlendParams {
+        feather_px: 16.0,
+        downsample: 1,
+        band_rows: 16,
+        mode: BlendMode::Feather,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+        extent: None,
+    };
+    session.frame_imposed = true;
+    assert_eq!(output_bbox(&session, &params).unwrap(), [0, 0, 128, 64]);
+    let union = BlendParams {
+        extent: Some(Extent::Union),
+        ..params.clone()
+    };
+    assert_eq!(
+        output_bbox(&session, &union).unwrap(),
+        [8, 8, 120, 64],
+        "explicit union still wins"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn roi_intersects_the_active_extent() {
+    let dir = tmpdir("extent-roi");
+    let (session, _) = make_panels(&dir);
+    // The ROI pokes outside the content union but stays inside the canvas.
+    let params = BlendParams {
+        feather_px: 16.0,
+        downsample: 1,
+        band_rows: 16,
+        mode: BlendMode::Feather,
+        roi: Some([0, 0, 64, 32]),
+        defect_veto: true,
+        flatten: None,
+        extent: None,
+    };
+    assert_eq!(output_bbox(&session, &params).unwrap(), [8, 8, 64, 32]);
+    let canvas = BlendParams {
+        extent: Some(Extent::Canvas),
+        ..params.clone()
+    };
+    assert_eq!(output_bbox(&session, &canvas).unwrap(), [0, 0, 64, 32]);
     std::fs::remove_dir_all(&dir).unwrap();
 }

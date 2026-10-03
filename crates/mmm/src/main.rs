@@ -371,6 +371,7 @@ fn blend_cmd(
         roi,
         defect_veto,
         flatten,
+        extent: None,
         ..Default::default()
     };
     let bbox = output_bbox(&session, &params_for_bbox)?;

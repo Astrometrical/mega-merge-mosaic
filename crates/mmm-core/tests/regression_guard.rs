@@ -202,6 +202,7 @@ fn aligned_pipeline_is_byte_identical_to_pre_refactor_head() {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         };
         let mut sink = HashSink::new();
         blend(&session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();

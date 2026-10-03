@@ -1,8 +1,9 @@
 //! Blend: stream the photometrically-corrected union of panels as row bands
 //! to a [`RowSink`], either feathered (phase-1) or two-band (default).
 //!
-//! Output canvas = union of panel content bboxes (cropped — never the full
-//! mosaic canvas). Per pixel and panel, the weight is
+//! Output extent = union of panel content bboxes by default (cropped), or the
+//! whole canvas for sessions on a shared reference frame / on request
+//! ([`Extent`]). Per pixel and panel, the weight is
 //! `max(clamp(d_px/feather, 0, 1), MIN_WEIGHT)` where `d_px` is 8× the
 //! bilinear sample of the panel's L8 chamfer distance map at `(x/8, y/8)` —
 //! pixels near a panel's rim get tiny weight so interpolation garbage loses to
@@ -161,6 +162,20 @@ pub enum BlendMode {
     Pyramid,
 }
 
+/// Which region of the canvas the blend writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extent {
+    /// The union of the panels' content bboxes (cropped — the historical
+    /// behaviour).
+    Union,
+    /// The whole session canvas: for a solved session the mosaic frame
+    /// including its margin, for an aligned session the full input canvas.
+    /// Pixels outside every panel are written as `0.0` (no-data). Sessions
+    /// sharing one [`crate::reference::ReferenceFrame`] blend to identical
+    /// geometry this way.
+    Canvas,
+}
+
 /// Parameters of the blend.
 #[derive(Debug, Clone)]
 pub struct BlendParams {
@@ -186,6 +201,11 @@ pub struct BlendParams {
     /// see) while preserving the central level. `None` = off (default).
     /// Errors when the mosaic is signal-dominated (< 20% background cells).
     pub flatten: Option<u32>,
+    /// Output extent. `None` picks the session default: [`Extent::Canvas`]
+    /// when the session's frame was imposed from a shared reference
+    /// ([`crate::session::Session::frame_imposed`]), else [`Extent::Union`],
+    /// so pre-existing sessions blend exactly as before.
+    pub extent: Option<Extent>,
 }
 
 impl Default for BlendParams {
@@ -198,14 +218,24 @@ impl Default for BlendParams {
             roi: None,
             defect_veto: true,
             flatten: None,
+            extent: None,
         }
     }
 }
 
-/// The blend's output bbox: union of panel bboxes, intersected with the ROI
+/// The blend's output bbox: the active [`Extent`] (see
+/// [`BlendParams::extent`] for the default rule), intersected with the ROI
 /// when one is set. Errors if the intersection is empty.
 pub fn output_bbox(session: &Session, params: &BlendParams) -> Result<[u64; 4]> {
-    let u = union_bbox(session)?;
+    let extent = params.extent.unwrap_or(if session.frame_imposed {
+        Extent::Canvas
+    } else {
+        Extent::Union
+    });
+    let u = match extent {
+        Extent::Union => union_bbox(session)?,
+        Extent::Canvas => [0, 0, session.canvas.0, session.canvas.1],
+    };
     let Some(r) = params.roi else { return Ok(u) };
     let b = [
         u[0].max(r[0]),

@@ -304,4 +304,13 @@ mod tests {
             "missing-session error must point at the analyze stage: {err}"
         );
     }
+
+    #[test]
+    fn session_json_without_frame_imposed_reads_false() {
+        let json = r#"{"canvas":[128,64,1],"panels":[]}"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert!(!s.frame_imposed);
+        assert!(s.frame.is_none());
+        assert_eq!(s.input, InputKind::Aligned);
+    }
 }

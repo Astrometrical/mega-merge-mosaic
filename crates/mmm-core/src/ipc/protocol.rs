@@ -328,6 +328,7 @@ impl BlendParamsWire {
             roi: self.roi,
             defect_veto: self.defect_veto,
             flatten: self.flatten,
+            extent: None,
         }
     }
 
