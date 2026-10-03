@@ -7,9 +7,12 @@ use std::path::{Path, PathBuf};
 use mmm_core::Result;
 use mmm_core::analyze::{InputSelect, analyze_full};
 use mmm_core::astrometry::LinearWcs;
-use mmm_core::photometry::GainMode;
+use mmm_core::blend::{BlendMode, BlendParams, RowSink, blend, union_bbox};
+use mmm_core::overlap::OverlapGraph;
+use mmm_core::photometry::{GainMode, Photometry};
 use mmm_core::reference::{ReferenceFrame, derive};
 use mmm_core::session::{InputKind, Session};
+use mmm_core::surfaces::Surfaces;
 use mmm_core::synth::{SynthWcs, write_xisf, write_xisf_solved};
 
 /// Pixel scale of every synthetic solution, degrees per pixel (3.6″).
@@ -417,5 +420,221 @@ fn reference_kind_must_match_the_input_kind() {
         err.contains("aligned canvas") && err.contains("--input aligned"),
         "{err}"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// two groups → one grid
+
+/// In-memory sink collecting the whole (small) blended output, planar.
+struct MemSink {
+    w: usize,
+    h: usize,
+    ch: usize,
+    data: Vec<f32>,
+}
+
+impl MemSink {
+    fn new() -> Self {
+        Self {
+            w: 0,
+            h: 0,
+            ch: 0,
+            data: Vec::new(),
+        }
+    }
+    fn at(&self, c: usize, x: usize, y: usize) -> f32 {
+        self.data[(c * self.h + y) * self.w + x]
+    }
+}
+
+impl RowSink for MemSink {
+    fn begin(&mut self, w: u64, h: u64, ch: u64) -> Result<()> {
+        self.w = w as usize;
+        self.h = h as usize;
+        self.ch = ch as usize;
+        self.data = vec![f32::NAN; self.w * self.h * self.ch];
+        Ok(())
+    }
+    fn band(&mut self, y0: u64, rows: &[f32]) -> Result<()> {
+        let band_rows = rows.len() / (self.ch * self.w);
+        for c in 0..self.ch {
+            for r in 0..band_rows {
+                let src = &rows[(c * band_rows + r) * self.w..][..self.w];
+                let off = (c * self.h + y0 as usize + r) * self.w;
+                self.data[off..off + self.w].copy_from_slice(src);
+            }
+        }
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Blend a session with the given mode and the session-default extent.
+fn blend_session(session: &Session, mode: BlendMode) -> MemSink {
+    let phot = Photometry::load(&session.photometry_path()).unwrap();
+    let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+    let surf = Surfaces::load(&session.surfaces_path()).unwrap();
+    let params = BlendParams {
+        feather_px: 24.0,
+        downsample: 1,
+        band_rows: 64,
+        mode,
+        roi: None,
+        defect_veto: true,
+        flatten: None,
+        extent: None,
+    };
+    let mut sink = MemSink::new();
+    blend(session, &phot, Some(&surf), &graph, &params, &mut sink).unwrap();
+    sink
+}
+
+/// Background-subtracted intensity-weighted centroid of the brightest spot
+/// (±4 px window), channel 0, in output pixel coordinates.
+fn star_centroid(sink: &MemSink) -> (f64, f64) {
+    let mut best = (0usize, 0usize, f32::MIN);
+    for y in 0..sink.h {
+        for x in 0..sink.w {
+            let v = sink.at(0, x, y);
+            if v > best.2 {
+                best = (x, y, v);
+            }
+        }
+    }
+    let (bx, by) = (best.0 as i64, best.1 as i64);
+    let (mut sx, mut sy, mut sw) = (0.0f64, 0.0f64, 0.0f64);
+    for dy in -4..=4 {
+        for dx in -4..=4 {
+            let (x, y) = (bx + dx, by + dy);
+            if x < 0 || y < 0 || x >= sink.w as i64 || y >= sink.h as i64 {
+                continue;
+            }
+            let w = (f64::from(sink.at(0, x as usize, y as usize)) - 0.05).max(0.0);
+            sx += w * x as f64;
+            sy += w * y as f64;
+            sw += w;
+        }
+    }
+    (sx / sw, sy / sw)
+}
+
+#[test]
+fn two_solved_groups_share_one_grid() {
+    let dir = tempdir("two-solved");
+    let a = write_solved_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let b = write_solved_group(&dir.join("B"), "b", (40.0, 25.0), 140);
+
+    // Sanity: left alone the groups land on different frames (the bug).
+    let own_a = analyze(
+        &a,
+        &dir.join("own_a.mmm-session"),
+        InputSelect::Solved,
+        None,
+    )
+    .unwrap();
+    let own_b = analyze(
+        &b,
+        &dir.join("own_b.mmm-session"),
+        InputSelect::Solved,
+        None,
+    )
+    .unwrap();
+    assert_ne!(
+        own_a.frame, own_b.frame,
+        "fixture must make independently chosen frames differ"
+    );
+
+    let all: Vec<PathBuf> = a.iter().chain(&b).cloned().collect();
+    let reference = derive(&all, InputSelect::Auto).unwrap();
+    let sa = analyze(
+        &a,
+        &dir.join("a.mmm-session"),
+        InputSelect::Solved,
+        Some(&reference),
+    )
+    .unwrap();
+    let sb = analyze(
+        &b,
+        &dir.join("b.mmm-session"),
+        InputSelect::Solved,
+        Some(&reference),
+    )
+    .unwrap();
+    assert_eq!(sa.frame, sb.frame);
+    assert_eq!(sa.canvas, sb.canvas);
+    assert_ne!(
+        union_bbox(&sa).unwrap(),
+        union_bbox(&sb).unwrap(),
+        "coverage differs, grid must not"
+    );
+
+    for mode in [BlendMode::Feather, BlendMode::Pyramid] {
+        let out_a = blend_session(&sa, mode);
+        let out_b = blend_session(&sb, mode);
+        assert_eq!((out_a.w, out_a.h), (out_b.w, out_b.h), "{mode:?}");
+        assert_eq!(
+            (out_a.w as u64, out_a.h as u64),
+            (sa.canvas.0, sa.canvas.1),
+            "{mode:?}: canvas extent"
+        );
+        assert!(
+            out_a.data.iter().chain(&out_b.data).all(|v| v.is_finite()),
+            "{mode:?}"
+        );
+        assert_eq!(
+            out_a.at(0, 0, 0),
+            0.0,
+            "{mode:?}: frame margin is zero-filled"
+        );
+        let ca = star_centroid(&out_a);
+        let cb = star_centroid(&out_b);
+        assert!(
+            (ca.0 - cb.0).abs() < 0.1 && (ca.1 - cb.1).abs() < 0.1,
+            "{mode:?}: star at {ca:?} in group A vs {cb:?} in group B"
+        );
+        // The same WCS cards would be emitted: identical frames.
+        assert_eq!(
+            sa.frame.as_ref().unwrap().linear_wcs(),
+            sb.frame.as_ref().unwrap().linear_wcs()
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn two_aligned_groups_share_the_full_canvas() {
+    let dir = tempdir("two-aligned");
+    let a = write_aligned_group(&dir.join("A"), "a", STAR, 10, 20);
+    let b = write_aligned_group(&dir.join("B"), "b", STAR, 30, 40);
+    let all: Vec<PathBuf> = a.iter().chain(&b).cloned().collect();
+    let reference = derive(&all, InputSelect::Auto).unwrap();
+    let sa = analyze(
+        &a,
+        &dir.join("a.mmm-session"),
+        InputSelect::Auto,
+        Some(&reference),
+    )
+    .unwrap();
+    let sb = analyze(
+        &b,
+        &dir.join("b.mmm-session"),
+        InputSelect::Auto,
+        Some(&reference),
+    )
+    .unwrap();
+    assert_eq!(sa.input, InputKind::Aligned);
+    assert_ne!(union_bbox(&sa).unwrap(), union_bbox(&sb).unwrap());
+    let out_a = blend_session(&sa, BlendMode::Feather);
+    let out_b = blend_session(&sb, BlendMode::Feather);
+    assert_eq!((out_a.w as u64, out_a.h as u64), CANVAS);
+    assert_eq!((out_b.w as u64, out_b.h as u64), CANVAS);
+    // Content sits where the windows were, zero elsewhere.
+    assert!((out_a.at(0, 50, 80) - 0.4).abs() < 1e-3);
+    assert_eq!(out_a.at(0, 5, 5), 0.0);
+    assert!((out_b.at(0, 70, 100) - 0.4).abs() < 1e-3);
+    assert_eq!(out_b.at(0, 5, 5), 0.0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
