@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::align::{MosaicFrame, choose_frame};
 use crate::analyze::InputSelect;
-use crate::astrometry::{LinearWcs, WcsModel};
+use crate::astrometry::{LinearWcs, WcsModel, describe_unsolved, wcs_from_properties};
 use crate::formats::InputPanel;
+use crate::ipc::protocol::PanelDesc;
 use crate::{Error, Result};
 
 /// On-disk format version of `*.mmm-frame.json` files this build writes and
@@ -156,37 +157,90 @@ pub fn derive(paths: &[PathBuf], input: InputSelect) -> Result<ReferenceFrame> {
         .iter()
         .map(|p| InputPanel::open(p))
         .collect::<Result<_>>()?;
-    let geoms: Vec<(u64, u64)> = opened.iter().map(|x| (x.width(), x.height())).collect();
-    let same_geometry = geoms.iter().all(|g| *g == geoms[0]);
+    let items = opened
+        .iter()
+        .zip(paths)
+        .map(|(x, p)| DeriveItem {
+            label: p.display().to_string(),
+            width: x.width(),
+            height: x.height(),
+            wcs: x.linear_wcs(),
+            model: x.wcs_model(),
+        })
+        .collect();
+    derive_items(items, input)
+}
+
+/// [`derive`] over wire panel descriptors (a Views-mode host's `PanelDesc`s
+/// with the astrometric properties attached): the same kind rule and frame
+/// choice, so a frame derived from views equals one derived from the same
+/// panels saved to disk. Labels in errors are `panel <id>`.
+pub fn derive_from_descs(panels: &[PanelDesc], input: InputSelect) -> Result<ReferenceFrame> {
+    let items = panels
+        .iter()
+        .map(|p| DeriveItem {
+            label: format!("panel {}", p.panel_id),
+            width: p.width,
+            height: p.height,
+            wcs: wcs_from_properties(&p.properties),
+            model: WcsModel::from_properties(&p.properties, p.width, p.height)
+                .ok_or_else(|| describe_unsolved(&p.properties)),
+        })
+        .collect();
+    derive_items(items, input)
+}
+
+/// One panel's header-level facts for frame derivation, from a file or a
+/// wire descriptor — the two sources must never drift, so both feed
+/// [`derive_items`].
+struct DeriveItem {
+    label: String,
+    width: u64,
+    height: u64,
+    wcs: Option<LinearWcs>,
+    model: std::result::Result<WcsModel, String>,
+}
+
+fn derive_items(items: Vec<DeriveItem>, input: InputSelect) -> Result<ReferenceFrame> {
+    if items.is_empty() {
+        return Err(Error::compute("no input panels given"));
+    }
+    let same_geometry = items
+        .iter()
+        .all(|i| (i.width, i.height) == (items[0].width, items[0].height));
     let aligned = match input {
         InputSelect::Aligned => true,
         InputSelect::Solved => false,
-        InputSelect::Auto => paths.len() >= 2 && same_geometry,
+        InputSelect::Auto => items.len() >= 2 && same_geometry,
     };
     if aligned {
-        if let Some(k) = geoms.iter().position(|g| *g != geoms[0]) {
+        if let Some(k) = items
+            .iter()
+            .position(|i| (i.width, i.height) != (items[0].width, items[0].height))
+        {
             return Err(Error::compute(format!(
                 "aligned input needs one canvas geometry, but {} is {}x{} and {} is {}x{}",
-                paths[0].display(),
-                geoms[0].0,
-                geoms[0].1,
-                paths[k].display(),
-                geoms[k].0,
-                geoms[k].1
+                items[0].label,
+                items[0].width,
+                items[0].height,
+                items[k].label,
+                items[k].width,
+                items[k].height
             )));
         }
+        let first = items.into_iter().next().expect("non-empty");
         return Ok(ReferenceFrame::Aligned {
-            width: geoms[0].0,
-            height: geoms[0].1,
-            wcs: opened[0].linear_wcs(),
+            width: first.width,
+            height: first.height,
+            wcs: first.wcs,
         });
     }
-    let mut models: Vec<WcsModel> = Vec::with_capacity(paths.len());
+    let mut models: Vec<WcsModel> = Vec::with_capacity(items.len());
     let mut errors: Vec<String> = Vec::new();
-    for (x, path) in opened.iter().zip(paths) {
-        match x.wcs_model() {
+    for item in items {
+        match item.model {
             Ok(m) => models.push(m),
-            Err(reason) => errors.push(format!("{}: {reason}", path.display())),
+            Err(reason) => errors.push(format!("{}: {reason}", item.label)),
         }
     }
     if !errors.is_empty() {

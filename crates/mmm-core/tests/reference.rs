@@ -8,12 +8,17 @@ use mmm_core::Result;
 use mmm_core::analyze::{InputSelect, analyze_full};
 use mmm_core::astrometry::LinearWcs;
 use mmm_core::blend::{BlendMode, BlendParams, RowSink, blend, union_bbox};
+use mmm_core::formats::xisf::XisfPanel;
+use mmm_core::formats::{FitsKeyword, InputPanel};
+use mmm_core::ipc::protocol::PanelDesc;
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::{GainMode, Photometry};
-use mmm_core::reference::{ReferenceFrame, derive};
+use mmm_core::reference::{ReferenceFrame, derive, derive_from_descs};
 use mmm_core::session::{InputKind, Session};
 use mmm_core::surfaces::Surfaces;
-use mmm_core::synth::{SynthWcs, write_xisf, write_xisf_solved};
+use mmm_core::synth::{
+    SynthWcs, write_fits, write_xisf, write_xisf_solved, write_xisf_with_header_xml,
+};
 
 /// Pixel scale of every synthetic solution, degrees per pixel (3.6″).
 const S: f64 = 1.0e-3;
@@ -691,5 +696,126 @@ fn header_knowable_mismatches_fail_before_any_scan() {
     .to_string();
     assert!(err.contains("solved mosaic frame"), "{err}");
     assert_eq!(scanned.load(Ordering::Relaxed), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// stage 2: descriptors and FILTER names
+
+/// Wire descriptors for `paths`, exactly as a Views-mode host builds them
+/// (geometry from the header, the astrometric properties verbatim).
+fn descs_for(paths: &[PathBuf]) -> Vec<PanelDesc> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let x = XisfPanel::open(p).unwrap();
+            PanelDesc {
+                panel_id: i as u32,
+                width: x.width(),
+                height: x.height(),
+                channels: x.channels(),
+                properties: x.header().properties.clone(),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn descriptors_derive_the_same_frame_as_files() {
+    let dir = tempdir("descs");
+    let a = write_solved_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let b = write_solved_group(&dir.join("B"), "b", (40.0, 25.0), 140);
+    let all: Vec<PathBuf> = a.iter().chain(&b).cloned().collect();
+    let from_files = derive(&all, InputSelect::Auto).unwrap();
+    let from_descs = derive_from_descs(&descs_for(&all), InputSelect::Auto).unwrap();
+    assert_eq!(from_files, from_descs);
+
+    let reg = write_aligned_group(&dir.join("R"), "r", STAR, 10, 20);
+    let from_files = derive(&reg, InputSelect::Auto).unwrap();
+    let from_descs = derive_from_descs(&descs_for(&reg), InputSelect::Auto).unwrap();
+    assert_eq!(from_files, from_descs);
+    assert!(matches!(
+        from_descs,
+        ReferenceFrame::Aligned { wcs: Some(_), .. }
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn descriptors_without_solution_are_named_by_panel_id() {
+    let dir = tempdir("descs-unsolved");
+    let a = write_solved_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let mut descs = descs_for(&a);
+    descs[1].properties.clear();
+    let err = derive_from_descs(&descs, InputSelect::Solved)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("panel 1"), "{err}");
+    assert!(!err.contains("panel 0"), "{err}");
+    let err = derive_from_descs(&[], InputSelect::Auto)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no input panels"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn filter_name_strips_quotes_and_padding() {
+    let dir = tempdir("filter-fits");
+    let path = dir.join("ha.fits");
+    let card = FitsKeyword {
+        name: "FILTER".into(),
+        value: "'Ha      '".into(),
+        comment: String::new(),
+    };
+    write_fits(&path, 8, 6, 1, &[0.2f32; 48], -32, &[card]).unwrap();
+    assert_eq!(
+        InputPanel::open(&path).unwrap().filter_name().as_deref(),
+        Some("Ha")
+    );
+
+    let plain = dir.join("plain.fits");
+    write_fits(&plain, 8, 6, 1, &[0.2f32; 48], -32, &[]).unwrap();
+    assert_eq!(InputPanel::open(&plain).unwrap().filter_name(), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn filter_name_falls_back_to_xisf_property() {
+    let dir = tempdir("filter-xisf");
+    let by_card = dir.join("card.xisf");
+    write_xisf_with_header_xml(
+        &by_card,
+        8,
+        6,
+        1,
+        &[0.2f32; 48],
+        r#"<FITSKeyword name="FILTER" value="'R'" comment=""/>"#,
+    )
+    .unwrap();
+    assert_eq!(
+        InputPanel::open(&by_card).unwrap().filter_name().as_deref(),
+        Some("R")
+    );
+
+    let by_prop = dir.join("prop.xisf");
+    write_xisf_with_header_xml(
+        &by_prop,
+        8,
+        6,
+        1,
+        &[0.2f32; 48],
+        r#"<Property id="Instrument:Filter:Name" type="String">OIII</Property>"#,
+    )
+    .unwrap();
+    assert_eq!(
+        InputPanel::open(&by_prop).unwrap().filter_name().as_deref(),
+        Some("OIII")
+    );
+
+    let none = dir.join("none.xisf");
+    write_xisf(&none, 8, 6, 1, &[0.2f32; 48]).unwrap();
+    assert_eq!(InputPanel::open(&none).unwrap().filter_name(), None);
     std::fs::remove_dir_all(&dir).unwrap();
 }

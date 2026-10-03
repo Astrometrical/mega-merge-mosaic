@@ -682,6 +682,21 @@ pub fn write_xisf_solved_standard(
     write_xisf_impl(path, w, h, ch, planes, &standard_wcs_property_xml(wcs))
 }
 
+/// [`write_xisf`] with arbitrary extra XML spliced into the `<Image>`
+/// element — `<FITSKeyword …/>` cards or `<Property …>` elements — so tests
+/// can exercise header-driven behaviour (FILTER names, custom properties)
+/// without a dedicated writer per case.
+pub fn write_xisf_with_header_xml(
+    path: &Path,
+    w: u64,
+    h: u64,
+    ch: u64,
+    planes: &[f32],
+    extra_xml: &str,
+) -> Result<()> {
+    write_xisf_impl(path, w, h, ch, planes, extra_xml)
+}
+
 fn write_xisf_impl(
     path: &Path,
     w: u64,

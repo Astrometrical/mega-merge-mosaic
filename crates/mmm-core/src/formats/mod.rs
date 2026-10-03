@@ -169,6 +169,34 @@ impl InputPanel {
             }
         }
     }
+
+    /// The panel's filter name, for grouping UIs: the FITS `FILTER` card
+    /// (either format; quotes and padding stripped), else — XISF only — the
+    /// `Instrument:Filter:Name` property. `None` when neither is present or
+    /// the value is empty.
+    pub fn filter_name(&self) -> Option<String> {
+        let clean = |s: &str| {
+            let t = s.trim().trim_matches('\'').trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        if let Some(k) = self.fits_keywords().iter().find(|k| k.name == "FILTER")
+            && let Some(name) = clean(&k.value)
+        {
+            return Some(name);
+        }
+        match self {
+            Self::Xisf(p) => p
+                .header()
+                .properties
+                .iter()
+                .find(|pr| pr.id == "Instrument:Filter:Name")
+                .and_then(|pr| match &pr.value {
+                    PropertyValue::Str(s) => clean(s),
+                    _ => None,
+                }),
+            Self::Fits(_) => None,
+        }
+    }
 }
 
 /// Stored row order of a FITS image, from its `ROWORDER` card.
