@@ -158,6 +158,33 @@ int main(int argc, char** argv) {
   }
   CHECK(threw);
 
+  // ---- 5. The reply carries the reference frame (solved kind for raw
+  // panels) and FILTER names (none in these fixtures). ----
+  CHECK(!res.reference.is_null());
+  CHECK(mmm::reference_kind(res.reference) == "solved");
+  uint64_t rw = 0, rh = 0;
+  CHECK(mmm::reference_canvas(res.reference, rw, rh));
+  CHECK(rw == frame_w && rh == frame_h);
+  for (const auto& p : res.panels) CHECK(p.filter.empty());
+  CHECK(mmm::reference_kind(ares.reference) == "aligned");
+  CHECK(mmm::reference_canvas(ares.reference, rw, rh));
+  CHECK(rw == ameta.at("canvas")[0].get<uint64_t>());
+
+  // ---- 6. probe_reference over Views-style descriptors equals the
+  // file-derived reference. ----
+  json ref = mmm::Host::probe_reference(worker_path, probe_init, &idle);
+  CHECK(ref == res.reference);
+  json bad_init = probe_init;
+  bad_init["panels"][1]["properties"] = json::array();
+  threw = false;
+  try {
+    (void)mmm::Host::probe_reference(worker_path, bad_init, nullptr);
+  } catch (const mmm::HostError& e) {
+    threw = true;
+    CHECK(std::string(e.what()).find("panel 1") != std::string::npos);
+  }
+  CHECK(threw);
+
   std::fprintf(stderr, "test_probe_panels: OK (%d idle ticks on run 1)\n", idle.idles);
   return 0;
 }

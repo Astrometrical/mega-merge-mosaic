@@ -794,7 +794,13 @@ PanelProbeResult Host::probe_panels(const std::string& worker_path,
       pp.width = p.at("width").get<uint64_t>();
       pp.height = p.at("height").get<uint64_t>();
       pp.channels = p.at("channels").get<uint64_t>();
+      if (p.contains("filter") && p.at("filter").is_string()) {
+        pp.filter = p.at("filter").get<std::string>();
+      }
       res.panels.push_back(pp);
+    }
+    if (reply.contains("reference")) {
+      res.reference = reply.at("reference");
     }
     const auto& frame = reply.at("frame");
     if (!frame.is_null()) {
@@ -816,6 +822,24 @@ PanelProbeResult Host::probe_panels(const std::string& worker_path,
                     " panels for " + std::to_string(paths_utf8.size()) + " files");
   }
   return res;
+}
+
+nlohmann::json Host::probe_reference(const std::string& worker_path, const nlohmann::json& init_obj,
+                                     ProgressCallback* prog) {
+  nlohmann::json obj = init_obj;
+  obj["protocol_version"] = kProtocolVersion;
+  obj["worker_version"] = kExpectedWorkerVersion;
+  const std::string out = run_probe_process(worker_path, "--probe-reference", obj.dump(), prog);
+  try {
+    nlohmann::json ref = nlohmann::json::parse(out);
+    uint64_t w = 0, h = 0;
+    if (!reference_canvas(ref, w, h)) {
+      throw HostError("probe-reference: reply is not a ReferenceFrame: " + out);
+    }
+    return ref;
+  } catch (const nlohmann::json::exception& e) {
+    throw HostError(std::string("probe-reference: could not parse worker reply: ") + e.what());
+  }
 }
 
 }  // namespace mmm

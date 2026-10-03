@@ -76,6 +76,7 @@ struct ProbedPanel {
   uint64_t width = 0;     ///< Panel width in pixels.
   uint64_t height = 0;    ///< Panel height in pixels.
   uint64_t channels = 0;  ///< Channel count.
+  std::string filter;     ///< FILTER name from the header; empty when none.
 };
 
 /// Result of `Host::probe_panels` (PROTOCOL.md Section 11, `--probe-panels`).
@@ -88,6 +89,10 @@ struct PanelProbeResult {
   uint64_t frame_w = 0;   ///< Solved mosaic frame width (pixels).
   uint64_t frame_h = 0;   ///< Solved mosaic frame height (pixels).
   uint64_t frame_ch = 0;  ///< Solved mosaic frame channel count.
+  /// ReferenceFrame JSON the worker derived over the paths (the value a
+  /// multi-group host puts in each group's `InitJob.reference`); null when
+  /// the set is neither registered to one canvas nor all plate-solved.
+  nlohmann::json reference;
 };
 
 /// Everything needed to start one run. `init` is the full `{"Init":{...}}`
@@ -171,6 +176,16 @@ class Host {
                                        const std::string& input_select,
                                        ProgressCallback* prog = nullptr);
 
+  /// Multi-group helper: spawn `worker_path --probe-reference`, write
+  /// `init_obj` (an `InitJob`-shaped object whose `panels` carry every
+  /// group's descriptors with their astrometric properties; `mode` selects
+  /// the kind override) and return the `ReferenceFrame` JSON it prints --
+  /// the value to put in each group's `InitJob.reference`. Throws
+  /// `HostError` (worker stderr in the message) or `HostCancelled`.
+  static nlohmann::json probe_reference(const std::string& worker_path,
+                                        const nlohmann::json& init_obj,
+                                        ProgressCallback* prog = nullptr);
+
   /// Longest stretch (ms) `run()` waits on a quiet worker pipe between
   /// `ProgressCallback::on_idle()` calls. When frames are flowing the wait
   /// returns as soon as data is available, so this bounds GUI-event latency
@@ -200,5 +215,29 @@ class Host {
   uint64_t out_h_ = 0;
   uint64_t out_ch_ = 0;
 };
+
+/// The `kind` of a ReferenceFrame JSON (`"solved"` / `"aligned"`), or "".
+inline std::string reference_kind(const nlohmann::json& reference) {
+  if (!reference.is_object() || !reference.contains("kind") || !reference.at("kind").is_string()) {
+    return "";
+  }
+  return reference.at("kind").get<std::string>();
+}
+
+/// Canvas size a ReferenceFrame JSON prescribes: `frame.width/height` for
+/// the solved kind, `width/height` for the aligned kind. False if the value
+/// has neither shape.
+inline bool reference_canvas(const nlohmann::json& reference, uint64_t& w, uint64_t& h) {
+  try {
+    const std::string kind = reference_kind(reference);
+    if (kind != "solved" && kind != "aligned") return false;
+    const nlohmann::json& geom = (kind == "solved") ? reference.at("frame") : reference;
+    w = geom.at("width").get<uint64_t>();
+    h = geom.at("height").get<uint64_t>();
+    return true;
+  } catch (const nlohmann::json::exception&) {
+    return false;
+  }
+}
 
 }  // namespace mmm

@@ -77,6 +77,13 @@ target_link_libraries(test_golden_solved PRIVATE mmm_host)
 add_dependencies(test_golden_solved gen_fixtures build_worker)
 add_test(NAME test_golden_solved COMMAND test_golden_solved ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
 
+# Two-group run: one reference derived over every group's panels, imposed on
+# each group's Solved job; both outputs share the reference geometry.
+add_executable(test_golden_groups test/test_golden_groups.cpp)
+target_link_libraries(test_golden_groups PRIVATE mmm_host)
+add_dependencies(test_golden_groups gen_fixtures build_worker)
+add_test(NAME test_golden_groups COMMAND test_golden_groups ${CMAKE_BINARY_DIR}/fixtures ${MMM_WORKER})
+
 # Files-mode metadata probe test: drives the real worker's --probe-panels
 # through Host::probe_panels against both fixture sets and checks frame
 # parity with Host::probe_frame plus stderr capture on a missing file.
