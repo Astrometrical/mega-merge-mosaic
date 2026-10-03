@@ -33,7 +33,7 @@
 //!   next `row` call lands in a different band — hold one band's rows at a time.
 //! - [`astrometry`] + [`align`] — WCS extraction/emission and the solved-panel
 //!   reprojection path.
-//! - [`reference`] — the shared [`reference::ReferenceFrame`] several
+//! - [`mod@reference`] — the shared [`reference::ReferenceFrame`] several
 //!   sessions adopt so their outputs share one pixel grid (multi-filter
 //!   mosaics): derivation over every group's panels, persistence as
 //!   `*.mmm-frame.json`, and the fit checks analyze applies.

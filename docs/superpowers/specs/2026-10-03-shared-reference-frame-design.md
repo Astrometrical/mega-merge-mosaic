@@ -1,6 +1,6 @@
 # Shared reference frame across mosaic groups (aligned multi-filter output)
 
-Status: approved design 2026-10-03, not yet implemented. Stage 1 covers
+Status: implemented 2026-10-03 (stage 1: mmm-core + CLI). Stage 1 covers
 `mmm-core` and the `mmm` CLI; the PixInsight module and IPC protocol follow
 in a later stage (§8).
 

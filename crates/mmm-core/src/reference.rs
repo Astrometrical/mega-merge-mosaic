@@ -3,7 +3,7 @@
 //! filter for a mono imager, combined afterwards (LRGB, Ha+RGB, …).
 //!
 //! A [`ReferenceFrame`] is persisted as `<name>.mmm-frame.json`, derived
-//! header-only from *every* panel of *every* group by [`derive`], and handed
+//! header-only from *every* panel of *every* group by [`fn@derive`], and handed
 //! to the analyze stage ([`crate::analyze::analyze_full`] with
 //! `Some(&frame)`), which adopts it instead of choosing its own frame and
 //! checks that the group fits it ([`check_footprints`], [`check_aligned`]).

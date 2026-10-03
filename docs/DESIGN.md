@@ -218,22 +218,28 @@ phase-3/4 guarantees and the pyramid's mid-frequency benefit are preserved
 <name>.mmm-session/
   session.json        # canvas geometry, panel list+paths, stage stamps, params
                       # + input kind and the mosaic frame for solved input
+                      # + frame_imposed when a shared reference frame was adopted
   panels/<id>/summary.bin   # L8 planes: mean[ch] + coverage, f32
   panels/<id>/aligned.bin   # solved input only: reprojection cache (planar f32)
   analysis/overlap_graph.json
   analysis/photometry.json  # per-edge fits + global gains/offsets per channel
+<name>.mmm-frame.json # shared reference frame (mmm frame / batch), outside any session
 ```
 
 ## CLI surface
 
 ```
 mmm info <files…> [--stats]
-mmm analyze <panels…> --session S [--surface off|0|1|2] [--input auto|aligned|solved]
-            [--gain fit|unity]
+mmm frame <all panels…> -o F.mmm-frame.json [--input auto|aligned|solved]
+mmm analyze <panels…> --session S [--frame F] [--surface off|0|1|2]
+            [--input auto|aligned|solved] [--gain fit|unity]
 mmm report --session S [--seam-png P]   # graph + fit/seam tables, ⚠ on outliers
 mmm blend --session S -o out.fits [--downsample 1|8] [--feather PX]
           [--mode pyramid|twoband|feather] [--png P] [--roi x,y,w,h]
           [--defect-veto on|off] [--flatten off|1|2] [--wcs-frame topdown|flipped]
+          [--extent auto|union|canvas]
+mmm batch --group NAME <panels…> [--group …] -s DIR -o OUTDIR [--png]
+          [analyze options] [blend options]
 ```
 
 ## Testing
@@ -566,6 +572,47 @@ Files path); spec:
 - FITS output is big-endian: byte-swap on write. Write ROWORDER='TOP-DOWN'.
 - WSL2 caps RAM at 50% of host by default (`.wslconfig` to raise); mmap +
   streaming keeps us indifferent.
+
+## Shared reference frame across groups (2026-10-03)
+
+Mono imagers merge one mosaic per filter and combine afterwards, which needs
+every output on one pixel grid. Two mechanisms broke that: `choose_frame`
+derives the frame from the panels it is given (per-filter pointings differ by
+fractions of a pixel), and the blend crops to the union of content bboxes
+(per-filter coverage differs). Spec:
+[shared reference frame design](superpowers/specs/2026-10-03-shared-reference-frame-design.md).
+
+- **`reference::ReferenceFrame`** (`*.mmm-frame.json`, version 1): `solved`
+  wraps a `MosaicFrame`; `aligned` wraps the canvas geometry plus the first
+  panel's canvas WCS. No channel count — OSC and mono groups may share one.
+  `reference::derive` is header-only over *every* panel of *every* group
+  (cheap half of the auto-detect rule; same-geometry raw panels still need
+  `--input solved`).
+- **`analyze --frame F`** adopts the frame instead of choosing one. Solved
+  input: footprint check — every panel's boundary samples must land inside
+  the frame, else a hard error naming the panel, side and overshoot
+  (`check_footprints`; no clipping by design). Aligned input: the canvas must
+  equal the frame's and, when both carry a WCS, corners and centre must
+  agree within `ALIGNED_WCS_TOLERANCE_PX = 0.05` px (`check_aligned`); the
+  hint is tool-neutral ("align every group to one common reference, or
+  process the groups separately"). Kind mismatch (solved frame, aligned
+  set or vice versa) is an error. The session records `frame_imposed`.
+- **Blend extent** (`blend::Extent`): `Union` (historical crop) or `Canvas`
+  (whole canvas, zero outside coverage). Default: `Canvas` when
+  `frame_imposed`, else `Union` — pre-existing sessions are byte-identical
+  (regression guard unchanged). `--roi` intersects the active extent.
+- **`mmm batch`** is CLI-only orchestration: derive once over all groups
+  into `DIR/reference.mmm-frame.json`, analyze each group into
+  `DIR/<name>.mmm-session`, blend each to `OUTDIR/<name>.fits`. Groups are
+  `--group NAME panels…` occurrences (recovered through
+  `ArgMatches::get_occurrences`; clap's grouped `Vec<Vec<T>>` derive is
+  unstable).
+- **Aligned-input caveat for users**: filters registered separately get
+  separate canvases; either align all against one common reference or feed
+  the raw solved panels.
+- **PixInsight (later stage)**: `InitJob` gains optional `frame` and
+  `extent`; the worker passes them into the same entry points. Not in this
+  stage.
 
 ## IPC transport (PixInsight)
 
