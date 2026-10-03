@@ -125,8 +125,8 @@ failure is a hard error with the hint:
 
 ```
 canvas 9255x18310 of this group does not match the reference frame
-(9240x18300): register every group against one common reference in
-MosaicByCoordinates, or process the groups separately
+(9240x18300): align every group to one common reference, or process the
+groups separately
 ```
 
 (The WCS variant of the message quotes the displacement.) A panel set
@@ -222,7 +222,7 @@ reusable with the single commands (`mmm report -s DIR/L.mmm-session`).
 - **Footprint failure**: a panel displaced outside the frame → error names
   the panel and side.
 - **Aligned mismatch**: differing canvas size → error with the
-  MosaicByCoordinates hint; same size but WCS shifted by 2 px → error
+  common-reference hint; same size but WCS shifted by 2 px → error
   quoting the displacement.
 - **Kind mismatch** both directions.
 - **Extent default**: an un-imposed session blends with `Union` and stays
@@ -241,9 +241,8 @@ reusable with the single commands (`mmm report -s DIR/L.mmm-session`).
 `docs/DESIGN.md`: new section describing the reference frame, the extent
 rule and `batch`; CLI surface and session-directory listings updated
 (`frame_imposed`, `*.mmm-frame.json`). User-facing note for the aligned
-case: filters registered separately in MosaicByCoordinates get separate
-canvases; either register all against one reference image or feed the raw
-solved panels.
+case: filters registered separately get separate canvases; either align
+all against one common reference or feed the raw solved panels.
 
 ### 8. Later stage: PixInsight
 
