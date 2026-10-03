@@ -29,6 +29,164 @@ fn banner() -> String {
     )
 }
 
+/// Analyze options shared by `analyze` and `batch`.
+#[derive(clap::Args, Clone, Debug)]
+struct AnalyzeOpts {
+    /// Residual surface correction: off, 0 (constant), 1 (plane), 2 (quadratic)
+    #[arg(long, default_value = "2")]
+    surface: String,
+
+    /// Input kind: auto (detect), aligned (registered full-canvas
+    /// frames), solved (unaligned panels with astrometric solutions)
+    #[arg(long, default_value = "auto")]
+    input: String,
+
+    /// Photometric gain handling: fit (measure per-panel gains from
+    /// overlaps), unity (pin every gain at 1, match levels with offsets
+    /// only — for same-rig/same-exposure mosaics)
+    #[arg(long, default_value = "fit")]
+    gain: String,
+}
+
+/// Parsed [`AnalyzeOpts`].
+#[derive(Clone, Copy)]
+struct AnalyzeConfig {
+    surface_order: Option<u32>,
+    input: mmm_core::analyze::InputSelect,
+    gain: mmm_core::photometry::GainMode,
+}
+
+fn parse_input(input: &str) -> anyhow::Result<mmm_core::analyze::InputSelect> {
+    Ok(match input {
+        "auto" => mmm_core::analyze::InputSelect::Auto,
+        "aligned" => mmm_core::analyze::InputSelect::Aligned,
+        "solved" => mmm_core::analyze::InputSelect::Solved,
+        other => anyhow::bail!("--input must be auto, aligned or solved (got {other})"),
+    })
+}
+
+impl AnalyzeOpts {
+    fn resolve(&self) -> anyhow::Result<AnalyzeConfig> {
+        let surface_order = match self.surface.as_str() {
+            "off" => None,
+            "0" => Some(0),
+            "1" => Some(1),
+            "2" => Some(2),
+            other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
+        };
+        let gain = match self.gain.as_str() {
+            "fit" => mmm_core::photometry::GainMode::Fit,
+            "unity" => mmm_core::photometry::GainMode::Unity,
+            other => anyhow::bail!("--gain must be fit or unity (got {other})"),
+        };
+        Ok(AnalyzeConfig {
+            surface_order,
+            input: parse_input(&self.input)?,
+            gain,
+        })
+    }
+}
+
+/// Blend options shared by `blend` and `batch`.
+#[derive(clap::Args, Clone, Debug)]
+struct BlendOpts {
+    /// Downsample factor: 1 = full resolution, 8 = fast preview from L8 summaries
+    #[arg(long, default_value_t = 1)]
+    downsample: u32,
+
+    /// Feather ramp length in canvas pixels
+    #[arg(long, default_value_t = 256.0)]
+    feather: f32,
+
+    /// Blend mode: pyramid (multiband base + star-safe seams, default),
+    /// twoband (feathered base + star-safe seams) or feather (phase-1)
+    #[arg(long, default_value = "pyramid")]
+    mode: String,
+
+    /// Region of interest in full-res canvas pixels: x,y,w,h
+    #[arg(long)]
+    roi: Option<String>,
+
+    /// Cross-panel defect veto in overlaps (twoband mode): suppresses
+    /// cosmic-ray residue and satellite trails that survive in one panel
+    #[arg(long, default_value = "on")]
+    defect_veto: String,
+
+    /// Opt-in global background flatten: off (default), 1 (plane) or
+    /// 2 (quadratic). Fits the merged mosaic's background and subtracts
+    /// its varying part, preserving the central level; refuses on
+    /// signal-dominated (nebula-heavy) mosaics
+    #[arg(long, default_value = "off")]
+    flatten: String,
+
+    /// WCS card convention: topdown (PI display-space, default) or
+    /// flipped (reflected bottom-up) for readers that mirror annotations
+    #[arg(long, default_value = "topdown")]
+    wcs_frame: String,
+
+    /// Output extent: auto (canvas for sessions on a shared reference
+    /// frame, else the content union), union (crop to the panels'
+    /// content), canvas (the whole canvas, zero outside coverage)
+    #[arg(long, default_value = "auto")]
+    extent: String,
+}
+
+/// Parsed [`BlendOpts`].
+#[derive(Clone, Copy)]
+struct BlendConfig {
+    downsample: u32,
+    feather: f32,
+    mode: mmm_core::blend::BlendMode,
+    roi: Option<[u64; 4]>,
+    defect_veto: bool,
+    flatten: Option<u32>,
+    wcs_flip: bool,
+    extent: Option<mmm_core::blend::Extent>,
+}
+
+impl BlendOpts {
+    fn resolve(&self) -> anyhow::Result<BlendConfig> {
+        let mode = match self.mode.as_str() {
+            "feather" => mmm_core::blend::BlendMode::Feather,
+            "twoband" => mmm_core::blend::BlendMode::TwoBand,
+            "pyramid" => mmm_core::blend::BlendMode::Pyramid,
+            other => anyhow::bail!("--mode must be pyramid, twoband or feather (got {other})"),
+        };
+        let defect_veto = match self.defect_veto.as_str() {
+            "on" => true,
+            "off" => false,
+            other => anyhow::bail!("--defect-veto must be on or off (got {other})"),
+        };
+        let flatten = match self.flatten.as_str() {
+            "off" => None,
+            "1" => Some(1),
+            "2" => Some(2),
+            other => anyhow::bail!("--flatten must be off, 1 or 2 (got {other})"),
+        };
+        let wcs_flip = match self.wcs_frame.as_str() {
+            "topdown" => false,
+            "flipped" => true,
+            other => anyhow::bail!("--wcs-frame must be topdown or flipped (got {other})"),
+        };
+        let extent = match self.extent.as_str() {
+            "auto" => None,
+            "union" => Some(mmm_core::blend::Extent::Union),
+            "canvas" => Some(mmm_core::blend::Extent::Canvas),
+            other => anyhow::bail!("--extent must be auto, union or canvas (got {other})"),
+        };
+        Ok(BlendConfig {
+            downsample: self.downsample,
+            feather: self.feather,
+            mode,
+            roi: self.roi.as_deref().map(parse_roi).transpose()?,
+            defect_veto,
+            flatten,
+            wcs_flip,
+            extent,
+        })
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Print header metadata for panel files (and optionally quick pixel stats)
@@ -42,6 +200,23 @@ enum Command {
         stats: bool,
     },
 
+    /// Derive a shared reference frame from the headers of every panel of
+    /// every group, so each group analyzed with `--frame` lands on one grid
+    Frame {
+        /// Every panel of every group (XISF or FITS); headers only are read
+        #[arg(required = true)]
+        panels: Vec<std::path::PathBuf>,
+
+        /// Output reference frame file (`<name>.mmm-frame.json`)
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+
+        /// Input kind: auto (detect), aligned (registered full-canvas
+        /// frames), solved (unaligned panels with astrometric solutions)
+        #[arg(long, default_value = "auto")]
+        input: String,
+    },
+
     /// Analyze panels: build tiled cache, coverage masks, and the overlap graph
     Analyze {
         /// Input panel files (XISF or FITS): pre-aligned full-canvas frames, or
@@ -53,20 +228,13 @@ enum Command {
         #[arg(short, long, default_value = "mosaic.mmm-session")]
         session: std::path::PathBuf,
 
-        /// Residual surface correction: off, 0 (constant), 1 (plane), 2 (quadratic)
-        #[arg(long, default_value = "2")]
-        surface: String,
+        /// Shared reference frame from `mmm frame` to adopt instead of
+        /// deriving this set's own; the blend then covers the whole frame
+        #[arg(long)]
+        frame: Option<std::path::PathBuf>,
 
-        /// Input kind: auto (detect), aligned (registered full-canvas
-        /// frames), solved (unaligned panels with astrometric solutions)
-        #[arg(long, default_value = "auto")]
-        input: String,
-
-        /// Photometric gain handling: fit (measure per-panel gains from
-        /// overlaps), unity (pin every gain at 1, match levels with offsets
-        /// only — for same-rig/same-exposure mosaics)
-        #[arg(long, default_value = "fit")]
-        gain: String,
+        #[command(flatten)]
+        opts: AnalyzeOpts,
     },
 
     /// Report analysis results: the overlap-graph edge table
@@ -91,43 +259,12 @@ enum Command {
         #[arg(short, long)]
         output: std::path::PathBuf,
 
-        /// Downsample factor: 1 = full resolution, 8 = fast preview from L8 summaries
-        #[arg(long, default_value_t = 1)]
-        downsample: u32,
-
-        /// Feather ramp length in canvas pixels
-        #[arg(long, default_value_t = 256.0)]
-        feather: f32,
-
-        /// Blend mode: pyramid (multiband base + star-safe seams, default),
-        /// twoband (feathered base + star-safe seams) or feather (phase-1)
-        #[arg(long, default_value = "pyramid")]
-        mode: String,
-
         /// Also write an autostretched 8-bit PNG preview (downsampled runs only)
         #[arg(long)]
         png: Option<std::path::PathBuf>,
 
-        /// Region of interest in full-res canvas pixels: x,y,w,h
-        #[arg(long)]
-        roi: Option<String>,
-
-        /// Cross-panel defect veto in overlaps (twoband mode): suppresses
-        /// cosmic-ray residue and satellite trails that survive in one panel
-        #[arg(long, default_value = "on")]
-        defect_veto: String,
-
-        /// Opt-in global background flatten: off (default), 1 (plane) or
-        /// 2 (quadratic). Fits the merged mosaic's background and subtracts
-        /// its varying part, preserving the central level; refuses on
-        /// signal-dominated (nebula-heavy) mosaics
-        #[arg(long, default_value = "off")]
-        flatten: String,
-
-        /// WCS card convention: topdown (PI display-space, default) or
-        /// flipped (reflected bottom-up) for readers that mirror annotations
-        #[arg(long, default_value = "topdown")]
-        wcs_frame: String,
+        #[command(flatten)]
+        opts: BlendOpts,
     },
 }
 
@@ -168,101 +305,80 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Frame {
+            panels,
+            output,
+            input,
+        } => frame_cmd(&panels, &output, &input),
         Command::Analyze {
             panels,
             session,
-            surface,
-            input,
-            gain,
-        } => analyze_cmd(&panels, &session, &surface, &input, &gain),
+            frame,
+            opts,
+        } => {
+            let cfg = opts.resolve()?;
+            let reference = frame
+                .as_deref()
+                .map(mmm_core::reference::ReferenceFrame::load)
+                .transpose()?;
+            analyze_cmd(&panels, &session, &cfg, reference.as_ref()).map(|_| ())
+        }
         Command::Report { session, seam_png } => report(&session, seam_png.as_deref()),
         Command::Blend {
             session,
             output,
-            downsample,
-            feather,
-            mode,
             png,
-            roi,
-            defect_veto,
-            flatten,
-            wcs_frame,
+            opts,
         } => {
-            let mode = match mode.as_str() {
-                "feather" => mmm_core::blend::BlendMode::Feather,
-                "twoband" => mmm_core::blend::BlendMode::TwoBand,
-                "pyramid" => mmm_core::blend::BlendMode::Pyramid,
-                other => anyhow::bail!("--mode must be pyramid, twoband or feather (got {other})"),
-            };
-            let defect_veto = match defect_veto.as_str() {
-                "on" => true,
-                "off" => false,
-                other => anyhow::bail!("--defect-veto must be on or off (got {other})"),
-            };
-            let flatten = match flatten.as_str() {
-                "off" => None,
-                "1" => Some(1),
-                "2" => Some(2),
-                other => anyhow::bail!("--flatten must be off, 1 or 2 (got {other})"),
-            };
-            let wcs_flip = match wcs_frame.as_str() {
-                "topdown" => false,
-                "flipped" => true,
-                other => anyhow::bail!("--wcs-frame must be topdown or flipped (got {other})"),
-            };
-            let roi = roi.as_deref().map(parse_roi).transpose()?;
-            blend_cmd(
-                &session,
-                &output,
-                downsample,
-                feather,
-                mode,
-                png.as_deref(),
-                roi,
-                defect_veto,
-                flatten,
-                wcs_flip,
-            )
+            let cfg = opts.resolve()?;
+            blend_cmd(&session, &output, png.as_deref(), &cfg)
         }
     }
 }
 
+/// `mmm frame`: header-only derivation of a shared reference frame.
+fn frame_cmd(
+    panels: &[std::path::PathBuf],
+    output: &std::path::Path,
+    input: &str,
+) -> anyhow::Result<()> {
+    let input = parse_input(input)?;
+    let frame = mmm_core::reference::derive(panels, input)?;
+    frame.save(output)?;
+    println!("reference: {} ({} panels)", frame.describe(), panels.len());
+    println!("written: {}", output.display());
+    Ok(())
+}
+
 /// `mmm analyze`: scan the input panels into a session directory and print
-/// the per-panel table.
+/// the per-panel table. Returns the session so `batch` can chain on it.
 fn analyze_cmd(
     panels: &[std::path::PathBuf],
     session: &std::path::Path,
-    surface: &str,
-    input: &str,
-    gain: &str,
-) -> anyhow::Result<()> {
+    cfg: &AnalyzeConfig,
+    reference: Option<&mmm_core::reference::ReferenceFrame>,
+) -> anyhow::Result<mmm_core::session::Session> {
     tracing::info!(?session, n_panels = panels.len(), "analyze requested");
-    let surface_order = match surface {
-        "off" => None,
-        "0" => Some(0),
-        "1" => Some(1),
-        "2" => Some(2),
-        other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
-    };
-    let input = match input {
-        "auto" => mmm_core::analyze::InputSelect::Auto,
-        "aligned" => mmm_core::analyze::InputSelect::Aligned,
-        "solved" => mmm_core::analyze::InputSelect::Solved,
-        other => anyhow::bail!("--input must be auto, aligned or solved (got {other})"),
-    };
-    let gain = match gain {
-        "fit" => mmm_core::photometry::GainMode::Fit,
-        "unity" => mmm_core::photometry::GainMode::Unity,
-        other => anyhow::bail!("--gain must be fit or unity (got {other})"),
-    };
     let t0 = std::time::Instant::now();
-    let s =
-        mmm_core::analyze::analyze_full(panels, session, surface_order, gain, input, None, None)?;
+    let s = mmm_core::analyze::analyze_full(
+        panels,
+        session,
+        cfg.surface_order,
+        cfg.gain,
+        cfg.input,
+        None,
+        reference,
+    )?;
     match (&s.frame, s.align_secs) {
         (Some(f), align_secs) => println!(
-            "input: solved panels — {} reprojected onto a fresh {}x{} frame \
+            "input: solved panels — {} reprojected onto {} {}x{} frame \
              ({:.3}\"/px, center RA {:.4} Dec {:+.4}) in {:.2}s",
             s.panels.len(),
+            if s.frame_imposed {
+                "the imposed"
+            } else {
+                "a fresh"
+            },
             f.width,
             f.height,
             f.scale_deg * 3600.0,
@@ -270,6 +386,9 @@ fn analyze_cmd(
             f.crval[1],
             align_secs.unwrap_or(0.0),
         ),
+        _ if s.frame_imposed => {
+            println!("input: aligned full-canvas frames (canvas matches the imposed reference)")
+        }
         _ => println!("input: aligned full-canvas frames"),
     }
     let (w, h, ch) = s.canvas;
@@ -300,7 +419,7 @@ fn analyze_cmd(
         );
     }
     println!("analyze: {:.2}s", t0.elapsed().as_secs_f64());
-    Ok(())
+    Ok(s)
 }
 
 /// Display name for a panel: the original input file for reprojected panels
@@ -340,18 +459,11 @@ fn geometry_card(name: &str) -> bool {
     .any(|p| n.starts_with(p))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn blend_cmd(
     session_dir: &std::path::Path,
     output: &std::path::Path,
-    downsample: u32,
-    feather: f32,
-    mode: mmm_core::blend::BlendMode,
     png: Option<&std::path::Path>,
-    roi: Option<[u64; 4]>,
-    defect_veto: bool,
-    flatten: Option<u32>,
-    wcs_flip: bool,
+    cfg: &BlendConfig,
 ) -> anyhow::Result<()> {
     use mmm_core::astrometry::{wcs_cards, wcs_cards_flipped};
     use mmm_core::blend::{BlendParams, blend, output_bbox};
@@ -360,6 +472,16 @@ fn blend_cmd(
     use mmm_core::output::fits::{FitsSink, keywords_for_output};
     use mmm_core::output::png::PngSink;
 
+    let BlendConfig {
+        downsample,
+        feather,
+        mode,
+        roi,
+        defect_veto,
+        flatten,
+        wcs_flip,
+        extent,
+    } = *cfg;
     let t0 = std::time::Instant::now();
     let session = mmm_core::session::Session::open(session_dir)?;
     let graph = mmm_core::overlap::OverlapGraph::load(&session.overlap_graph_path())?;
@@ -371,7 +493,7 @@ fn blend_cmd(
         roi,
         defect_veto,
         flatten,
-        extent: None,
+        extent,
         ..Default::default()
     };
     let bbox = output_bbox(&session, &params_for_bbox)?;
