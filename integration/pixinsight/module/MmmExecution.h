@@ -15,10 +15,22 @@
 #ifndef __MmmExecution_h
 #define __MmmExecution_h
 
+#include <string>
+#include <vector>
+
+#include "mmm_host.h"
+
 namespace pcl
 {
 
 class MmmBlendInstance;
+
+/*!
+ * \brief FILTER names of panel files, read header-only by the worker's
+ * --probe-panels (pumped so the GUI stays responsive). Returns the probe
+ * result; `panels[i].filter` is empty when a file has no FILTER.
+ */
+mmm::PanelProbeResult probe_filter_names( const std::vector<std::string>& pathsUtf8 );
 
 /*!
  * \brief Runs one blend job described by \a instance to completion.

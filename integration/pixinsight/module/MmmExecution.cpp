@@ -845,6 +845,14 @@ void RunFiles( const Params& in, const std::string& worker_path )
 
 // ----------------------------------------------------------------------------
 
+mmm::PanelProbeResult probe_filter_names( const std::vector<std::string>& pathsUtf8 )
+{
+   ConsoleProgress prog;
+   return mmm::Host::probe_panels( ResolveWorkerPath(), pathsUtf8, "Auto", &prog );
+}
+
+// ----------------------------------------------------------------------------
+
 void run_blend( MmmBlendInstance& in )
 {
    WriteBanner();

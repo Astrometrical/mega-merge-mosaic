@@ -116,6 +116,18 @@ private:
       PushButton      AddFiles_PushButton;
       PushButton      RemoveFile_PushButton;
 
+      // Group tools (shared by both lists): filter the displayed rows by a
+      // wildcard, set/clear the group of the selection (or of every displayed
+      // row), or fill groups from the FILTER keyword.
+      HorizontalSizer GroupTools_Sizer;
+      Label           Filter_Label;
+      Edit            Filter_Edit;
+      Label           Group_Label;
+      Edit            Group_Edit;
+      PushButton      SetGroup_PushButton;
+      PushButton      GroupByFilter_PushButton;
+      PushButton      ClearGroups_PushButton;
+
       // --- Parameters section ------------------------------------------------
       Control         Parameters_Control;
       SectionBar      Parameters_SectionBar;
@@ -166,11 +178,24 @@ private:
    // always keeping the *other* side's array empty, per spec 10.1.
    bool m_viewsMode = true;
 
+   // Target Frames filter: the live wildcard pattern (empty = show all), the
+   // emulated placeholder state of Filter_Edit (PCL Edit has no native
+   // placeholder), and the instance rows currently displayed, in TreeBox
+   // node order (so node index i maps to instance row m_visibleRows[i]).
+   String     m_filterPattern;
+   bool       m_filterHintShown = false;
+   Array<int> m_visibleRows;
+
+   static constexpr const char* kFilterHint = "e.g. *_Ha*";
+
    void UpdateControls();
    void UpdateInputModeControls();
    void UpdateFlattenControls();
-   void PopulateViewsTreeBox();
-   void PopulateFilesTreeBox();
+   void PopulateActiveTreeBox();
+   Array<int>     TargetRows() const;   // selection if any, else all displayed rows
+   Array<String>& ActiveGroups();       // p_viewGroups or p_fileGroups
+   Array<String>& ActiveItems();        // p_viewIds or p_filePaths
+   void           ShowFilterHint( bool show );
 
    // --- Event handlers (direct OnXxx idiom, no __CLASS_HANDLER macro) --------
 
@@ -179,6 +204,13 @@ private:
    void e_RemoveViewClick( Button& sender, bool checked );
    void e_AddFilesClick( Button& sender, bool checked );
    void e_RemoveFileClick( Button& sender, bool checked );
+
+   void e_FilterTextUpdated( Edit& sender, const String& text );
+   void e_FilterGetFocus( Control& sender );
+   void e_FilterLoseFocus( Control& sender );
+   void e_SetGroupClick( Button& sender, bool checked );
+   void e_GroupByFilterClick( Button& sender, bool checked );
+   void e_ClearGroupsClick( Button& sender, bool checked );
 
    void e_SessionDirEditCompleted( Edit& sender );
    void e_SessionDirBrowseClick( Button& sender, bool checked );

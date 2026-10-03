@@ -18,12 +18,19 @@
 
 #include "MmmInterface.h"
 #include "MmmExecution.h"
+#include "MmmGroups.h"
 #include "MmmIcon.h"
 #include "MmmVersion.h"
 
+#include <string>
+#include <vector>
+
 #include <pcl/Array.h>
+#include <pcl/Console.h>
 #include <pcl/Cursor.h>
 #include <pcl/ExternalProcess.h>
+#include <pcl/FITSHeaderKeyword.h>
+#include <pcl/File.h>
 #include <pcl/FileDialog.h>
 #include <pcl/Graphics.h>
 #include <pcl/MultiViewSelectionDialog.h>
@@ -100,9 +107,15 @@ bool MmmBlendInterface::ImportProcess( const ProcessImplementation& p )
    // point (e_ModeClick, e_AddViewsClick, e_AddFilesClick) enforces: clear
    // whichever side m_viewsMode did NOT select.
    if ( m_viewsMode )
+   {
       m_instance.p_filePaths.Clear();
+      m_instance.p_fileGroups.Clear();
+   }
    else
+   {
       m_instance.p_viewIds.Clear();
+      m_instance.p_viewGroups.Clear();
+   }
 
    if ( GUI != nullptr )
       UpdateControls();
@@ -131,6 +144,7 @@ bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*
       GUI = new GUIData( *this );
       SetWindowTitle( "Mega Merge Mosaic" );
       UpdateControls();
+      ShowFilterHint( true );
    }
 
    dynamic = false;
@@ -226,8 +240,9 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    InputMode_Sizer.Add( FilesMode_RadioButton );
    InputMode_Sizer.AddStretch();
 
-   Views_TreeBox.SetNumberOfColumns( 1 );
+   Views_TreeBox.SetNumberOfColumns( 2 );
    Views_TreeBox.SetHeaderText( 0, "View Id" );
+   Views_TreeBox.SetHeaderText( 1, "Group" );
    Views_TreeBox.EnableMultipleSelections();
    Views_TreeBox.SetScaledMinSize( 400, 120 );
    Views_TreeBox.SetToolTip( "<p>The mosaic panels to merge. All panels must belong to the same mosaic: "
@@ -246,8 +261,9 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    ViewButtons_Sizer.Add( RemoveView_PushButton );
    ViewButtons_Sizer.AddStretch();
 
-   Files_TreeBox.SetNumberOfColumns( 1 );
+   Files_TreeBox.SetNumberOfColumns( 2 );
    Files_TreeBox.SetHeaderText( 0, "File Path" );
+   Files_TreeBox.SetHeaderText( 1, "Group" );
    Files_TreeBox.EnableMultipleSelections();
    Files_TreeBox.SetScaledMinSize( 400, 120 );
    Files_TreeBox.SetToolTip( "<p>The mosaic panel files to merge. All panels must belong to the same mosaic: "
@@ -266,12 +282,53 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    FileButtons_Sizer.Add( RemoveFile_PushButton );
    FileButtons_Sizer.AddStretch();
 
+   Filter_Label.SetText( "Filter:" );
+   Filter_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
+   Filter_Edit.SetToolTip( "<p>Show only the panels whose view id or file name matches this "
+      "wildcard pattern (* = any run, ? = one character, case-insensitive), e.g. <b>*_Ha*</b>. "
+      "Then press <b>Set group</b> to assign every displayed panel to a group at once.</p>" );
+   Filter_Edit.OnTextUpdated( (Edit::text_event_handler)&MmmBlendInterface::e_FilterTextUpdated, w );
+   Filter_Edit.OnGetFocus( (Control::event_handler)&MmmBlendInterface::e_FilterGetFocus, w );
+   Filter_Edit.OnLoseFocus( (Control::event_handler)&MmmBlendInterface::e_FilterLoseFocus, w );
+
+   Group_Label.SetText( "Group:" );
+   Group_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
+   Group_Edit.SetToolTip( "<p>Group name to assign with <b>Set group</b>. Each group is merged into "
+      "its own output window (MegaMergeMosaic_&lt;group&gt;); all groups share one reference frame "
+      "so the outputs can be combined directly. Leave empty for the default group.</p>" );
+
+   SetGroup_PushButton.SetText( "Set group" );
+   SetGroup_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SetGroupClick, w );
+   SetGroup_PushButton.SetToolTip( "<p>Assign the group name to the selected panels, or to every "
+      "displayed panel when nothing is selected.</p>" );
+
+   GroupByFilter_PushButton.SetText( "Group by FILTER" );
+   GroupByFilter_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_GroupByFilterClick, w );
+   GroupByFilter_PushButton.SetToolTip( "<p>Fill each panel's group from its FILTER keyword "
+      "(selected panels, or every displayed panel when nothing is selected). Panels without a "
+      "FILTER keyword keep their current group.</p>" );
+
+   ClearGroups_PushButton.SetText( "Clear groups" );
+   ClearGroups_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ClearGroupsClick, w );
+   ClearGroups_PushButton.SetToolTip( "<p>Move the selected panels (or every displayed panel when "
+      "nothing is selected) back to the default group.</p>" );
+
+   GroupTools_Sizer.SetSpacing( 6 );
+   GroupTools_Sizer.Add( Filter_Label );
+   GroupTools_Sizer.Add( Filter_Edit, 100 );
+   GroupTools_Sizer.Add( Group_Label );
+   GroupTools_Sizer.Add( Group_Edit, 100 );
+   GroupTools_Sizer.Add( SetGroup_PushButton );
+   GroupTools_Sizer.Add( GroupByFilter_PushButton );
+   GroupTools_Sizer.Add( ClearGroups_PushButton );
+
    TargetFrames_Sizer.SetSpacing( 4 );
    TargetFrames_Sizer.Add( InputMode_Sizer );
    TargetFrames_Sizer.Add( Views_TreeBox );
    TargetFrames_Sizer.Add( ViewButtons_Sizer );
    TargetFrames_Sizer.Add( Files_TreeBox );
    TargetFrames_Sizer.Add( FileButtons_Sizer );
+   TargetFrames_Sizer.Add( GroupTools_Sizer );
    TargetFrames_Control.SetSizer( TargetFrames_Sizer );
 
    TargetFrames_SectionBar.SetTitle( "Target Frames" );
@@ -581,8 +638,7 @@ void MmmBlendInterface::UpdateControls()
    GUI->FilesMode_RadioButton.SetChecked( !m_viewsMode );
    UpdateInputModeControls();
 
-   PopulateViewsTreeBox();
-   PopulateFilesTreeBox();
+   PopulateActiveTreeBox();
 
    GUI->SessionDir_Edit.SetText( m_instance.p_sessionDir );
 
@@ -623,23 +679,81 @@ void MmmBlendInterface::UpdateFlattenControls()
    GUI->FlattenOrder_SpinBox.Enable( m_instance.p_flattenEnabled );
 }
 
-void MmmBlendInterface::PopulateViewsTreeBox()
+Array<String>& MmmBlendInterface::ActiveGroups()
 {
-   GUI->Views_TreeBox.Clear();
-   for ( const String& id : m_instance.p_viewIds )
-   {
-      TreeBox::Node* node = new TreeBox::Node( GUI->Views_TreeBox );
-      node->SetText( 0, id );
-   }
+   return m_viewsMode ? m_instance.p_viewGroups : m_instance.p_fileGroups;
 }
 
-void MmmBlendInterface::PopulateFilesTreeBox()
+Array<String>& MmmBlendInterface::ActiveItems()
 {
-   GUI->Files_TreeBox.Clear();
-   for ( const String& path : m_instance.p_filePaths )
+   return m_viewsMode ? m_instance.p_viewIds : m_instance.p_filePaths;
+}
+
+// Display text matched by the filter: the view id, or the file NAME (no dir).
+static String DisplayText( bool viewsMode, const String& item )
+{
+   return viewsMode ? item : File::ExtractNameAndSuffix( item );
+}
+
+// Rebuilds the active list from the instance arrays, showing only the rows
+// that match the filter pattern; m_visibleRows records the mapping back to
+// instance rows. The group array is kept in lockstep with the item array
+// (icons from older versions, or the add/remove paths, can leave it short).
+void MmmBlendInterface::PopulateActiveTreeBox()
+{
+   TreeBox& tree = m_viewsMode ? GUI->Views_TreeBox : GUI->Files_TreeBox;
+   tree.Clear();
+   m_visibleRows.Clear();
+   Array<String>& items  = ActiveItems();
+   Array<String>& groups = ActiveGroups();
+   while ( groups.Length() < items.Length() )
+      groups.Add( String() );
+   while ( groups.Length() > items.Length() )
+      groups.Remove( groups.At( groups.Length() - 1 ) );
+   const std::string pattern( m_filterPattern.ToUTF8().c_str() );
+   for ( size_type i = 0; i < items.Length(); ++i )
    {
-      TreeBox::Node* node = new TreeBox::Node( GUI->Files_TreeBox );
-      node->SetText( 0, path );
+      const String text = DisplayText( m_viewsMode, items[i] );
+      if ( !pattern.empty()
+        && !mmm_groups::wildcard_match( pattern, std::string( text.ToUTF8().c_str() ) ) )
+         continue;
+      TreeBox::Node* node = new TreeBox::Node( tree );
+      node->SetText( 0, items[i] );
+      node->SetText( 1, groups[i] );
+      m_visibleRows.Add( int( i ) );
+   }
+   tree.AdjustColumnWidthToContents( 0 );
+}
+
+Array<int> MmmBlendInterface::TargetRows() const
+{
+   TreeBox& tree = m_viewsMode ? GUI->Views_TreeBox : GUI->Files_TreeBox;
+   IndirectArray<TreeBox::Node> selected = tree.SelectedNodes();
+   if ( selected.IsEmpty() )
+      return m_visibleRows;   // nothing selected: every displayed row
+   Array<int> rows;
+   for ( TreeBox::Node* node : selected )
+   {
+      int idx = tree.ChildIndex( node );
+      if ( idx >= 0 && size_type( idx ) < m_visibleRows.Length() )
+         rows.Add( m_visibleRows[idx] );
+   }
+   return rows;
+}
+
+void MmmBlendInterface::ShowFilterHint( bool show )
+{
+   m_filterHintShown = show;
+   if ( show )
+   {
+      GUI->Filter_Edit.SetText( kFilterHint );
+      GUI->Filter_Edit.SetStyleSheet( "QLineEdit { color: #808080; font-style: italic; }" );
+   }
+   else
+   {
+      if ( GUI->Filter_Edit.Text() == kFilterHint )
+         GUI->Filter_Edit.Clear();
+      GUI->Filter_Edit.SetStyleSheet( String() );
    }
 }
 
@@ -659,11 +773,13 @@ void MmmBlendInterface::e_ModeClick( Button& sender, bool checked )
    {
       m_viewsMode = true;
       m_instance.p_filePaths.Clear();
+      m_instance.p_fileGroups.Clear();
    }
    else if ( &sender == &GUI->FilesMode_RadioButton )
    {
       m_viewsMode = false;
       m_instance.p_viewIds.Clear();
+      m_instance.p_viewGroups.Clear();
    }
 
    UpdateControls();
@@ -685,11 +801,15 @@ void MmmBlendInterface::e_AddViewsClick( Button&, bool )
                break;
             }
          if ( !exists )
+         {
             m_instance.p_viewIds.Add( id );
+            m_instance.p_viewGroups.Add( String() );
+         }
       }
 
       // Adding views implies Views mode (mutual exclusion, spec 10.1).
       m_instance.p_filePaths.Clear();
+      m_instance.p_fileGroups.Clear();
       m_viewsMode = true;
 
       UpdateControls();
@@ -700,18 +820,26 @@ void MmmBlendInterface::e_RemoveViewClick( Button&, bool )
 {
    IndirectArray<TreeBox::Node> selected = GUI->Views_TreeBox.SelectedNodes();
 
+   // Node indices map to instance rows through m_visibleRows (the list may
+   // be filtered). Remove from the highest row down so earlier rows stay
+   // valid, keeping the group column in lockstep.
    Array<int> rows;
    for ( TreeBox::Node* node : selected )
-      rows.Add( GUI->Views_TreeBox.ChildIndex( node ) );
+   {
+      int idx = GUI->Views_TreeBox.ChildIndex( node );
+      if ( idx >= 0 && size_type( idx ) < m_visibleRows.Length() )
+         rows.Add( m_visibleRows[idx] );
+   }
    rows.Sort();
-
-   // Remove from the highest index down so earlier indices stay valid, and
-   // keep p_viewIds in lockstep with the TreeBox's top-level row order.
    for ( int i = int( rows.Length() ) - 1; i >= 0; --i )
    {
       int row = rows[i];
       if ( row >= 0 && size_type( row ) < m_instance.p_viewIds.Length() )
+      {
          m_instance.p_viewIds.Remove( m_instance.p_viewIds.Begin() + row );
+         if ( size_type( row ) < m_instance.p_viewGroups.Length() )
+            m_instance.p_viewGroups.Remove( m_instance.p_viewGroups.Begin() + row );
+      }
    }
 
    UpdateControls();
@@ -734,11 +862,15 @@ void MmmBlendInterface::e_AddFilesClick( Button&, bool )
                break;
             }
          if ( !exists )
+         {
             m_instance.p_filePaths.Add( f );
+            m_instance.p_fileGroups.Add( String() );
+         }
       }
 
       // Adding files implies Files mode (mutual exclusion, spec 10.1).
       m_instance.p_viewIds.Clear();
+      m_instance.p_viewGroups.Clear();
       m_viewsMode = false;
 
       UpdateControls();
@@ -751,17 +883,131 @@ void MmmBlendInterface::e_RemoveFileClick( Button&, bool )
 
    Array<int> rows;
    for ( TreeBox::Node* node : selected )
-      rows.Add( GUI->Files_TreeBox.ChildIndex( node ) );
+   {
+      int idx = GUI->Files_TreeBox.ChildIndex( node );
+      if ( idx >= 0 && size_type( idx ) < m_visibleRows.Length() )
+         rows.Add( m_visibleRows[idx] );
+   }
    rows.Sort();
-
    for ( int i = int( rows.Length() ) - 1; i >= 0; --i )
    {
       int row = rows[i];
       if ( row >= 0 && size_type( row ) < m_instance.p_filePaths.Length() )
+      {
          m_instance.p_filePaths.Remove( m_instance.p_filePaths.Begin() + row );
+         if ( size_type( row ) < m_instance.p_fileGroups.Length() )
+            m_instance.p_fileGroups.Remove( m_instance.p_fileGroups.Begin() + row );
+      }
    }
 
    UpdateControls();
+}
+
+void MmmBlendInterface::e_FilterGetFocus( Control& )
+{
+   if ( m_filterHintShown )
+      ShowFilterHint( false );
+}
+
+void MmmBlendInterface::e_FilterLoseFocus( Control& )
+{
+   if ( GUI->Filter_Edit.Text().IsEmpty() )
+      ShowFilterHint( true );
+}
+
+void MmmBlendInterface::e_FilterTextUpdated( Edit&, const String& text )
+{
+   if ( m_filterHintShown )
+      return;   // programmatic hint text, not a pattern
+   m_filterPattern = text.Trimmed();
+   PopulateActiveTreeBox();
+}
+
+void MmmBlendInterface::e_SetGroupClick( Button&, bool )
+{
+   const String name = GUI->Group_Edit.Text().Trimmed();
+   Array<String>& groups = ActiveGroups();
+   for ( int row : TargetRows() )
+      if ( row >= 0 && size_type( row ) < groups.Length() )
+         groups[row] = name;
+   PopulateActiveTreeBox();
+}
+
+void MmmBlendInterface::e_ClearGroupsClick( Button&, bool )
+{
+   Array<String>& groups = ActiveGroups();
+   for ( int row : TargetRows() )
+      if ( row >= 0 && size_type( row ) < groups.Length() )
+         groups[row].Clear();
+   PopulateActiveTreeBox();
+}
+
+// FILTER value of an open view: the FITS keyword array, quotes/padding
+// stripped; empty when absent.
+static String ViewFilterName( const String& viewId )
+{
+   View v = View::ViewById( viewId );
+   if ( v.IsNull() )
+      return String();
+   FITSKeywordArray keywords = v.Window().Keywords();
+   for ( const FITSHeaderKeyword& k : keywords )
+      if ( k.name == "FILTER" )
+         return String( k.StripValueDelimiters() ).Trimmed();
+   return String();
+}
+
+void MmmBlendInterface::e_GroupByFilterClick( Button&, bool )
+{
+   Array<int> rows = TargetRows();
+   Array<String>& items  = ActiveItems();
+   Array<String>& groups = ActiveGroups();
+   int missing = 0;
+   if ( m_viewsMode )
+   {
+      for ( int row : rows )
+      {
+         String f = ViewFilterName( items[row] );
+         if ( f.IsEmpty() )
+            ++missing;
+         else
+            groups[row] = f;
+      }
+   }
+   else
+   {
+      // Header pass in the worker process (never on this thread): one
+      // --probe-panels over the targeted files, pumped like a run's probe.
+      std::vector<std::string> paths;
+      for ( int row : rows )
+         paths.push_back( std::string( items[row].ToUTF8().c_str() ) );
+      if ( !paths.empty() )
+      {
+         try
+         {
+            Console().EnableAbort();
+            mmm::PanelProbeResult probe = probe_filter_names( paths );
+            for ( size_type i = 0; i < rows.Length() && i < probe.panels.size(); ++i )
+            {
+               if ( probe.panels[i].filter.empty() )
+                  ++missing;
+               else
+                  groups[rows[i]] = String( IsoString( probe.panels[i].filter.c_str() ).UTF8ToUTF16() );
+            }
+         }
+         catch ( const mmm::HostCancelled& )
+         {
+            return;
+         }
+         catch ( const mmm::HostError& e )
+         {
+            throw Error( String( "MegaMergeMosaic: could not read FILTER keywords: " ) + e.what() );
+         }
+      }
+   }
+   if ( missing > 0 )
+      Console().WarningLn( String().Format( "<end><cbr>** MegaMergeMosaic: %d panel(s) carry no FILTER "
+                                            "keyword; their group was not changed.", missing ) );
+   PopulateActiveTreeBox();
 }
 
 void MmmBlendInterface::e_SessionDirEditCompleted( Edit& sender )
