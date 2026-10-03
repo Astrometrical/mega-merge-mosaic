@@ -181,9 +181,11 @@ mmm batch --group L L/*.xisf --group R R/*.xisf … -s DIR -o OUTDIR
           [analyze options] [blend options]
 ```
 
-Clap derive: `#[arg(long, num_args = 2.., action = Append)] group:
-Vec<Vec<String>>` keeps each occurrence's values together; the first value
-is the group name, the rest are panel paths (the shell expands globs).
+Clap: `--group` is declared with `num_args = 2..` and `ArgAction::Append`;
+the per-occurrence grouping is recovered through the stable
+`ArgMatches::get_occurrences` (clap's grouped `Vec<Vec<T>>` derive needs
+the `unstable-v5` feature). The first value of each occurrence is the group
+name, the rest are panel paths (the shell expands globs).
 Validation: ≥ 1 group; names unique, non-empty and filesystem-safe
 (`[A-Za-z0-9._-]+`); every group has ≥ 1 panel.
 
