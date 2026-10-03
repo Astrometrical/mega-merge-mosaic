@@ -211,7 +211,7 @@ pub(crate) fn validate_grids(
 /// A linear FITS WCS: `sky = project(crval, cd · (pixel − crpix))`, with
 /// `pixel` in FITS convention (1-based, pixel centers at integers, rows in
 /// stored order — top-down for our inputs and outputs).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LinearWcs {
     /// Reference sky coordinates [RA, Dec] in degrees.
     pub crval: [f64; 2],

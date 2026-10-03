@@ -33,6 +33,10 @@
 //!   next `row` call lands in a different band — hold one band's rows at a time.
 //! - [`astrometry`] + [`align`] — WCS extraction/emission and the solved-panel
 //!   reprojection path.
+//! - [`reference`] — the shared [`reference::ReferenceFrame`] several
+//!   sessions adopt so their outputs share one pixel grid (multi-filter
+//!   mosaics): derivation over every group's panels, persistence as
+//!   `*.mmm-frame.json`, and the fit checks analyze applies.
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
 //!   and benchmarks (in-tree and downstream) never need multi-GB real data.
 //!
@@ -60,6 +64,7 @@ pub mod overlap;
 pub mod panel_reader;
 pub mod photometry;
 pub mod pyramid;
+pub mod reference;
 pub mod seam;
 pub mod session;
 pub mod summary;
