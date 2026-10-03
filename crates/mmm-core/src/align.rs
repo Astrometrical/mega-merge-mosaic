@@ -140,7 +140,7 @@ pub struct AlignedPanel {
 
 /// Points along the boundary of the rect `[0, w] × [0, h]` (PixInsight image
 /// coordinates), [`EDGE_SAMPLES`] + 1 per edge.
-fn boundary_samples(w: f64, h: f64) -> Vec<(f64, f64)> {
+pub(crate) fn boundary_samples(w: f64, h: f64) -> Vec<(f64, f64)> {
     let mut pts = Vec::with_capacity(4 * (EDGE_SAMPLES + 1));
     for i in 0..=EDGE_SAMPLES {
         let t = i as f64 / EDGE_SAMPLES as f64;

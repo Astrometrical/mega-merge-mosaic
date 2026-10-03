@@ -200,6 +200,110 @@ pub fn derive(paths: &[PathBuf], input: InputSelect) -> Result<ReferenceFrame> {
     })
 }
 
+/// Largest displacement, in canvas pixels over the canvas corners and
+/// centre, allowed between a group's canvas WCS and the reference frame's
+/// before aligned input is refused ([`check_aligned`]).
+pub const ALIGNED_WCS_TOLERANCE_PX: f64 = 0.05;
+
+/// The hint every aligned-input refusal ends with.
+const ALIGNED_HINT: &str =
+    "align every group to one common reference, or process the groups separately";
+
+/// Footprint check for solved input against an imposed frame: every panel's
+/// boundary, mapped through its own model and then into `frame`, must lie
+/// inside the frame's canvas. Violations are aggregated into one message,
+/// one line per panel naming it, the side(s) and the overshoot in whole
+/// pixels (rounded up). No clipping: a hard refusal by design.
+pub fn check_footprints<'a, I>(panels: I, frame: &MosaicFrame) -> std::result::Result<(), String>
+where
+    I: IntoIterator<Item = (String, &'a WcsModel)>,
+{
+    let lin = frame.linear_wcs();
+    let (w, h) = (frame.width as f64, frame.height as f64);
+    let mut lines: Vec<String> = Vec::new();
+    for (label, m) in panels {
+        // Overshoot per side (left, right, top, bottom), pixels; the canvas
+        // spans FITS coordinates [0.5, w + 0.5] × [0.5, h + 0.5].
+        let mut over = [0.0f64; 4];
+        for (px, py) in crate::align::boundary_samples(m.width as f64, m.height as f64) {
+            let (ra, dec) = m.pixel_to_sky(px, py);
+            let (fx, fy) = lin.sky_to_pixel(ra, dec);
+            over[0] = over[0].max(0.5 - fx);
+            over[1] = over[1].max(fx - (w + 0.5));
+            over[2] = over[2].max(0.5 - fy);
+            over[3] = over[3].max(fy - (h + 0.5));
+        }
+        let sides = ["left", "right", "top", "bottom"];
+        let parts: Vec<String> = over
+            .iter()
+            .zip(sides)
+            .filter(|(o, _)| **o > 0.0)
+            .map(|(o, side)| format!("{} px beyond the {side} edge", o.ceil() as u64))
+            .collect();
+        if !parts.is_empty() {
+            lines.push(format!(
+                "{label} extends {} of the reference frame ({}x{} px)",
+                parts.join(" and "),
+                frame.width,
+                frame.height
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}\n  re-derive the frame over the full panel set with `mmm frame`, or exclude the panel",
+        lines.join("\n  ")
+    ))
+}
+
+/// Aligned-input check against an imposed frame: the group's `canvas`
+/// `(width, height)` must equal the reference's, and when both the group's
+/// first panel and the reference carry a canvas WCS, mapping the canvas
+/// corners and centre through the panel's solution and back through the
+/// reference's must move no point by more than
+/// [`ALIGNED_WCS_TOLERANCE_PX`]. A missing WCS on either side passes on
+/// geometry alone.
+pub fn check_aligned(
+    canvas: (u64, u64),
+    panel_wcs: Option<&LinearWcs>,
+    width: u64,
+    height: u64,
+    reference_wcs: Option<&LinearWcs>,
+) -> std::result::Result<(), String> {
+    if canvas != (width, height) {
+        return Err(format!(
+            "canvas {}x{} of this group does not match the reference frame ({width}x{height}): \
+             {ALIGNED_HINT}",
+            canvas.0, canvas.1
+        ));
+    }
+    if let (Some(p), Some(r)) = (panel_wcs, reference_wcs) {
+        let (w, h) = (width as f64, height as f64);
+        let samples = [
+            (1.0, 1.0),
+            (w, 1.0),
+            (1.0, h),
+            (w, h),
+            ((w + 1.0) / 2.0, (h + 1.0) / 2.0),
+        ];
+        let mut worst = 0.0f64;
+        for (x, y) in samples {
+            let (ra, dec) = p.pixel_to_sky(x, y);
+            let (rx, ry) = r.sky_to_pixel(ra, dec);
+            worst = worst.max((rx - x).hypot(ry - y));
+        }
+        if worst > ALIGNED_WCS_TOLERANCE_PX {
+            return Err(format!(
+                "canvas WCS of this group is displaced up to {worst:.2} px from the reference \
+                 frame's (tolerance {ALIGNED_WCS_TOLERANCE_PX} px): {ALIGNED_HINT}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +414,90 @@ mod tests {
             .to_string();
         assert!(missing.contains("absent.json"), "{missing}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A north-up linear model of `w`×`h` px centred on `crval` at 1e-3 °/px.
+    fn model(crval: [f64; 2], w: u64, h: u64) -> WcsModel {
+        let lin = LinearWcs {
+            crval,
+            crpix: [w as f64 / 2.0 + 0.5, h as f64 / 2.0 + 0.5],
+            cd: [[-1.0e-3, 0.0], [0.0, 1.0e-3]],
+            ctype: ["RA---TAN".into(), "DEC--TAN".into()],
+            radesys: "ICRS".into(),
+        };
+        WcsModel::linear_only(lin, w, h)
+    }
+
+    #[test]
+    fn footprints_inside_the_frame_pass() {
+        let m = model([66.0, 18.0], 200, 150);
+        let frame = choose_frame(std::slice::from_ref(&m));
+        check_footprints([("p0".to_string(), &m)], &frame).unwrap();
+    }
+
+    #[test]
+    fn footprint_beyond_an_edge_is_named_with_side_and_overshoot() {
+        let m = model([66.0, 18.0], 200, 150);
+        let frame = choose_frame(std::slice::from_ref(&m));
+        // 40 px north of the frame centre: exceeds the 16 px margin by ~24 px
+        // on one side (y grows north with cd[1][1] > 0 → the bottom edge in
+        // top-down rows).
+        let shifted = model([66.0, 18.0 + 40.0e-3], 200, 150);
+        let err = check_footprints(
+            [
+                ("fits.xisf".to_string(), &m),
+                ("P3_Ha.xisf".to_string(), &shifted),
+            ],
+            &frame,
+        )
+        .unwrap_err();
+        assert!(err.contains("P3_Ha.xisf"), "{err}");
+        assert!(!err.contains("fits.xisf"), "{err}");
+        assert!(
+            ["23 px", "24 px", "25 px"]
+                .iter()
+                .any(|px| err.contains(&format!("{px} beyond the bottom edge"))),
+            "{err}"
+        );
+        assert!(err.contains("mmm frame"), "{err}");
+    }
+
+    #[test]
+    fn aligned_check_accepts_matching_canvas_and_wcs() {
+        let wcs = sample_wcs();
+        check_aligned((240, 200), Some(&wcs), 240, 200, Some(&wcs)).unwrap();
+        check_aligned((240, 200), None, 240, 200, Some(&wcs)).unwrap();
+        check_aligned((240, 200), Some(&wcs), 240, 200, None).unwrap();
+    }
+
+    #[test]
+    fn aligned_check_refuses_other_canvas_with_the_hint() {
+        let err = check_aligned((230, 200), None, 240, 200, None).unwrap_err();
+        assert!(err.contains("230x200"), "{err}");
+        assert!(err.contains("240x200"), "{err}");
+        assert!(
+            err.contains(
+                "align every group to one common reference, or process the groups separately"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn aligned_check_refuses_displaced_wcs_quoting_pixels() {
+        let reference = sample_wcs();
+        let mut shifted = reference.clone();
+        shifted.crpix[0] += 2.0; // the same sky lands 2 px to the right
+        let err =
+            check_aligned((240, 200), Some(&shifted), 240, 200, Some(&reference)).unwrap_err();
+        assert!(err.contains("2.00 px"), "{err}");
+        assert!(
+            err.contains("align every group to one common reference"),
+            "{err}"
+        );
+        // Within tolerance: a 0.01 px shift passes.
+        let mut tiny = reference.clone();
+        tiny.crpix[0] += 0.01;
+        check_aligned((240, 200), Some(&tiny), 240, 200, Some(&reference)).unwrap();
     }
 }
