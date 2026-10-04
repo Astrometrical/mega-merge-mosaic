@@ -308,17 +308,16 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    //
    // Multi-Mosaic - Panel Grouping section.
    //
-   // Three rows of [action] [explanation]. The left cell of every row is the
-   // same physical width -- "Group:" label + edit + button on the Set group
-   // row, an unscaled spacer standing in for the label and edit on the other
-   // two -- so the buttons and the explanations line up. Font-metric widths
-   // are physical pixels, hence AddUnscaledSpacing (AddSpacing would scale a
-   // second time on HiDPI).
-   const int groupButtonWidth = w.Font().Width( String( "Group by FILTER" ) ) + w.LogicalPixelsToPhysical( 24 );
-   const int groupLabelWidth  = w.Font().Width( String( "Group:" ) );
-   const int groupEditWidth   = w.Font().Width( String( 'M', 10 ) );
-   const int rowSpacing       = 6;
-   const int leftCellSpacer   = groupLabelWidth + w.LogicalPixelsToPhysical( rowSpacing ) + groupEditWidth;
+   // Three rows of [controls] [explanation]. The controls of every row fill
+   // one block of the same width: the Set group row splits it between the
+   // group edit and its button (each `unit` wide), the other two rows'
+   // buttons span the whole block (`block` wide), so the left column is one
+   // flush rectangle and the explanations line up. Font-metric widths are
+   // physical pixels; the sizer spacing between the edit and the button is
+   // logical, so it is converted before being added into `block`.
+   const int rowSpacing = 6;
+   const int unit       = w.Font().Width( String( "Group by FILTER" ) ) + w.LogicalPixelsToPhysical( 40 );
+   const int block      = 2*unit + w.LogicalPixelsToPhysical( rowSpacing );
 
    PanelGroupsIntro_Label.SetText( "Shooting several filters? Give each panel a group and merge "
       "everything in one run. Each group becomes its own mosaic, and every mosaic lands on the "
@@ -326,7 +325,7 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    PanelGroupsIntro_Label.EnableWordWrapping();
 
    GroupByFilter_PushButton.SetText( "Group by FILTER" );
-   GroupByFilter_PushButton.SetFixedWidth( groupButtonWidth );
+   GroupByFilter_PushButton.SetFixedWidth( block );
    GroupByFilter_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_GroupByFilterClick, w );
    GroupByFilter_PushButton.SetToolTip( "<p>Fill each panel's group from its FILTER keyword "
       "(selected panels, or every panel shown in the list when nothing is selected). Panels "
@@ -335,42 +334,36 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    GroupByFilter_Label.EnableWordWrapping();
 
    GroupByFilter_Sizer.SetSpacing( rowSpacing );
-   GroupByFilter_Sizer.AddUnscaledSpacing( leftCellSpacer );
    GroupByFilter_Sizer.Add( GroupByFilter_PushButton );
    GroupByFilter_Sizer.Add( GroupByFilter_Label, 100 );
 
-   Group_Label.SetText( "Group:" );
-   Group_Label.SetFixedWidth( groupLabelWidth );
-   Group_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
-   Group_Edit.SetFixedWidth( groupEditWidth );
-   Group_Edit.SetToolTip( "<p>Group name to assign with <b>Set group</b>. Each group is merged into "
-      "its own output window (MegaMergeMosaic_&lt;group&gt;); all groups share one reference frame "
-      "so the outputs can be combined directly. Leave empty for the default group.</p>" );
+   Group_Edit.SetFixedWidth( unit );
+   Group_Edit.SetToolTip( "<p>The group name to assign with <b>Set group</b>. Each group is merged "
+      "into its own output window (MegaMergeMosaic_&lt;group&gt;); all groups share one reference "
+      "frame so the outputs can be combined directly. Leave empty for the default group.</p>" );
    SetGroup_PushButton.SetText( "Set group" );
-   SetGroup_PushButton.SetFixedWidth( groupButtonWidth );
+   SetGroup_PushButton.SetFixedWidth( unit );
    SetGroup_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SetGroupClick, w );
    SetGroup_PushButton.SetToolTip( "<p>Assign the group name to every panel shown in the list "
       "(narrow the list with <b>Filter</b> first), or only to the selected panels when there is "
       "a selection.</p>" );
-   SetGroup_Label.SetText( "Assign this group to every panel in the filtered list above "
-      "(use Filter to narrow it), or only to the selected panels when there is a selection." );
+   SetGroup_Label.SetText( "Assign the group named here to every panel in the filtered list "
+      "above (use Filter to narrow it), or only to the selected panels when there is a selection." );
    SetGroup_Label.EnableWordWrapping();
 
    SetGroup_Sizer.SetSpacing( rowSpacing );
-   SetGroup_Sizer.Add( Group_Label );
    SetGroup_Sizer.Add( Group_Edit );
    SetGroup_Sizer.Add( SetGroup_PushButton );
    SetGroup_Sizer.Add( SetGroup_Label, 100 );
 
    ClearGroups_PushButton.SetText( "Clear groups" );
-   ClearGroups_PushButton.SetFixedWidth( groupButtonWidth );
+   ClearGroups_PushButton.SetFixedWidth( block );
    ClearGroups_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ClearGroupsClick, w );
    ClearGroups_PushButton.SetToolTip( "<p>Move every panel back to the default group.</p>" );
    ClearGroups_Label.SetText( "Put every panel back in the default group." );
    ClearGroups_Label.EnableWordWrapping();
 
    ClearGroups_Sizer.SetSpacing( rowSpacing );
-   ClearGroups_Sizer.AddUnscaledSpacing( leftCellSpacer );
    ClearGroups_Sizer.Add( ClearGroups_PushButton );
    ClearGroups_Sizer.Add( ClearGroups_Label, 100 );
 

@@ -130,7 +130,6 @@ private:
       PushButton      GroupByFilter_PushButton;
       Label           GroupByFilter_Label;
       HorizontalSizer SetGroup_Sizer;
-      Label           Group_Label;
       Edit            Group_Edit;
       PushButton      SetGroup_PushButton;
       Label           SetGroup_Label;
