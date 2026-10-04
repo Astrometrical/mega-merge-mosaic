@@ -125,15 +125,28 @@ private:
       Control         PanelGroups_Control;
       SectionBar      PanelGroups_SectionBar;
       VerticalSizer   PanelGroups_Sizer;
+      // Each row: a fixed-width container ("cell") holding the controls,
+      // then the explanation. The core re-applies a text-based size to
+      // PushButtons after SetFixedWidth(), so widths are fixed on the plain
+      // cell controls instead and the buttons stretch to fill them.
+      HorizontalSizer PanelGroupsIntro_Sizer;
+      Control         PanelGroupsInfo_Control;   // paints the info icon
+      Bitmap          PanelGroupsInfo_Bitmap;
       Label           PanelGroupsIntro_Label;
       HorizontalSizer GroupByFilter_Sizer;
+      Control         GroupByFilter_Cell;
+      HorizontalSizer GroupByFilter_CellSizer;
       PushButton      GroupByFilter_PushButton;
       Label           GroupByFilter_Label;
       HorizontalSizer SetGroup_Sizer;
+      Control         SetGroup_Cell;
+      HorizontalSizer SetGroup_CellSizer;
       Edit            Group_Edit;
       PushButton      SetGroup_PushButton;
       Label           SetGroup_Label;
       HorizontalSizer ClearGroups_Sizer;
+      Control         ClearGroups_Cell;
+      HorizontalSizer ClearGroups_CellSizer;
       PushButton      ClearGroups_PushButton;
       Label           ClearGroups_Label;
 
@@ -198,8 +211,11 @@ private:
    // rejects re-entrant clicks delivered by that pump, and the whole
    // interface is disabled for the probe's duration.
    bool       m_probeInProgress = false;
+   // Emulated placeholder of the group-name edit, as for the filter.
+   bool       m_groupHintShown = false;
 
    static constexpr const char* kFilterHint = "e.g. *_Ha*";
+   static constexpr const char* kGroupHint  = "group name";
 
    void UpdateControls();
    void UpdateInputModeControls();
@@ -209,6 +225,9 @@ private:
    Array<String>& ActiveGroups();       // p_viewGroups or p_fileGroups
    Array<String>& ActiveItems();        // p_viewIds or p_filePaths
    void           ShowFilterHint( bool show );
+   void           ShowGroupHint( bool show );
+   String         GroupName() const;        // the edit's text, empty while the hint shows
+   void           SetGroupFromEdit();       // the Set group action
 
    // --- Event handlers (direct OnXxx idiom, no __CLASS_HANDLER macro) --------
 
@@ -222,6 +241,10 @@ private:
    void e_FilterGetFocus( Control& sender );
    void e_FilterLoseFocus( Control& sender );
    void e_SetGroupClick( Button& sender, bool checked );
+   void e_GroupGetFocus( Control& sender );
+   void e_GroupLoseFocus( Control& sender );
+   void e_GroupReturnPressed( Edit& sender );
+   void e_ExplanationResize( Control& sender, int newWidth, int newHeight, int oldWidth, int oldHeight );
    void e_GroupByFilterClick( Button& sender, bool checked );
    void e_ClearGroupsClick( Button& sender, bool checked );
 
@@ -245,6 +268,7 @@ private:
    void e_LinkMouseRelease( Control& sender, const pcl::Point& pos,
                             int button, unsigned buttons, unsigned modifiers );
    void e_LogoPaint( Control& sender, const pcl::Rect& updateRect );
+   void e_InfoPaint( Control& sender, const pcl::Rect& updateRect );
 };
 
 /*!

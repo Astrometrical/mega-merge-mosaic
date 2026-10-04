@@ -31,6 +31,7 @@
 #include <pcl/FITSHeaderKeyword.h>
 #include <pcl/File.h>
 #include <pcl/FileDialog.h>
+#include <pcl/Font.h>
 #include <pcl/Graphics.h>
 #include <pcl/MessageBox.h>
 #include <pcl/MultiViewSelectionDialog.h>
@@ -145,6 +146,7 @@ bool MmmBlendInterface::Launch( const MetaProcess&, const ProcessImplementation*
       SetWindowTitle( "Mega Merge Mosaic" );
       UpdateControls();
       ShowFilterHint( true );
+      ShowGroupHint( true );
    }
 
    dynamic = false;
@@ -252,8 +254,8 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    InputMode_Sizer.Add( Filter_Edit, 100 );
 
    Views_TreeBox.SetNumberOfColumns( 2 );
-   Views_TreeBox.SetHeaderText( 0, "View Id" );
-   Views_TreeBox.SetHeaderText( 1, "Group" );
+   Views_TreeBox.SetHeaderText( 0, "Group" );
+   Views_TreeBox.SetHeaderText( 1, "View Id" );
    Views_TreeBox.EnableMultipleSelections();
    Views_TreeBox.SetScaledMinSize( 400, 120 );
    Views_TreeBox.SetToolTip( "<p>The mosaic panels to merge. All panels must belong to the same mosaic: "
@@ -273,8 +275,8 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    ViewButtons_Sizer.AddStretch();
 
    Files_TreeBox.SetNumberOfColumns( 2 );
-   Files_TreeBox.SetHeaderText( 0, "File Path" );
-   Files_TreeBox.SetHeaderText( 1, "Group" );
+   Files_TreeBox.SetHeaderText( 0, "Group" );
+   Files_TreeBox.SetHeaderText( 1, "File Path" );
    Files_TreeBox.EnableMultipleSelections();
    Files_TreeBox.SetScaledMinSize( 400, 120 );
    Files_TreeBox.SetToolTip( "<p>The mosaic panel files to merge. All panels must belong to the same mosaic: "
@@ -308,41 +310,58 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    //
    // Multi-Mosaic - Panel Grouping section.
    //
-   // Three rows of [controls] [explanation]. The controls of every row fill
-   // one block of the same width: the Set group row splits it between the
-   // group edit and its button (each `unit` wide), the other two rows'
-   // buttons span the whole block (`block` wide), so the left column is one
-   // flush rectangle and the explanations line up. Font-metric widths are
-   // physical pixels; the sizer spacing between the edit and the button is
-   // logical, so it is converted before being added into `block`.
+   // Three rows of [controls] [explanation]. The controls of every row sit
+   // in a plain Control ("cell") fixed to one common width `block`, so the
+   // left column is one flush rectangle and the explanations line up: the
+   // Set group cell holds the group edit (fixed to `unit`) plus its button,
+   // the other two cells hold one button each; buttons are given no fixed
+   // width (the core re-applies their text-based size, see the header) and
+   // simply stretch to fill their cell. Font-metric widths are physical
+   // pixels; the logical sizer spacing is converted before entering `block`.
    const int rowSpacing = 6;
    const int unit       = w.Font().Width( String( "Group by FILTER" ) ) + w.LogicalPixelsToPhysical( 40 );
    const int block      = 2*unit + w.LogicalPixelsToPhysical( rowSpacing );
+
+   PanelGroupsInfo_Bitmap = Bitmap( w.ScaledResource( ":/icons/info.png" ) );
+   PanelGroupsInfo_Control.SetScaledFixedSize( 20, 20 );
+   PanelGroupsInfo_Control.OnPaint( (Control::paint_event_handler)&MmmBlendInterface::e_InfoPaint, w );
 
    PanelGroupsIntro_Label.SetText( "Shooting several filters? Give each panel a group and merge "
       "everything in one run. Each group becomes its own mosaic, and every mosaic lands on the "
       "same reference frame, ready to combine." );
    PanelGroupsIntro_Label.EnableWordWrapping();
+   PanelGroupsIntro_Label.SetStyleSheet( "QLabel { color: #909090; }" );
+   PanelGroupsIntro_Label.OnResize( (Control::resize_event_handler)&MmmBlendInterface::e_ExplanationResize, w );
+
+   PanelGroupsIntro_Sizer.SetSpacing( 8 );
+   PanelGroupsIntro_Sizer.Add( PanelGroupsInfo_Control );
+   PanelGroupsIntro_Sizer.Add( PanelGroupsIntro_Label, 100 );
 
    GroupByFilter_PushButton.SetText( "Group by FILTER" );
-   GroupByFilter_PushButton.SetFixedWidth( block );
    GroupByFilter_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_GroupByFilterClick, w );
    GroupByFilter_PushButton.SetToolTip( "<p>Fill each panel's group from its FILTER keyword "
       "(selected panels, or every panel shown in the list when nothing is selected). Panels "
       "without a FILTER keyword keep their current group.</p>" );
    GroupByFilter_Label.SetText( "Group panels by the FILTER keyword in their headers." );
    GroupByFilter_Label.EnableWordWrapping();
+   GroupByFilter_Label.OnResize( (Control::resize_event_handler)&MmmBlendInterface::e_ExplanationResize, w );
+
+   GroupByFilter_CellSizer.Add( GroupByFilter_PushButton, 100 );
+   GroupByFilter_Cell.SetSizer( GroupByFilter_CellSizer );
+   GroupByFilter_Cell.SetFixedWidth( block );
 
    GroupByFilter_Sizer.SetSpacing( rowSpacing );
-   GroupByFilter_Sizer.Add( GroupByFilter_PushButton );
+   GroupByFilter_Sizer.Add( GroupByFilter_Cell );
    GroupByFilter_Sizer.Add( GroupByFilter_Label, 100 );
 
    Group_Edit.SetFixedWidth( unit );
+   Group_Edit.OnGetFocus( (Control::event_handler)&MmmBlendInterface::e_GroupGetFocus, w );
+   Group_Edit.OnLoseFocus( (Control::event_handler)&MmmBlendInterface::e_GroupLoseFocus, w );
+   Group_Edit.OnReturnPressed( (Edit::edit_event_handler)&MmmBlendInterface::e_GroupReturnPressed, w );
    Group_Edit.SetToolTip( "<p>The group name to assign with <b>Set group</b>. Each group is merged "
       "into its own output window (MegaMergeMosaic_&lt;group&gt;); all groups share one reference "
       "frame so the outputs can be combined directly. Leave empty for the default group.</p>" );
    SetGroup_PushButton.SetText( "Set group" );
-   SetGroup_PushButton.SetFixedWidth( unit );
    SetGroup_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SetGroupClick, w );
    SetGroup_PushButton.SetToolTip( "<p>Assign the group name to every panel shown in the list "
       "(narrow the list with <b>Filter</b> first), or only to the selected panels when there is "
@@ -350,25 +369,39 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    SetGroup_Label.SetText( "Assign the group named here to every panel in the filtered list "
       "above (use Filter to narrow it), or only to the selected panels when there is a selection." );
    SetGroup_Label.EnableWordWrapping();
+   SetGroup_Label.OnResize( (Control::resize_event_handler)&MmmBlendInterface::e_ExplanationResize, w );
+
+   SetGroup_CellSizer.SetSpacing( rowSpacing );
+   SetGroup_CellSizer.Add( Group_Edit );
+   SetGroup_CellSizer.Add( SetGroup_PushButton, 100 );
+   SetGroup_Cell.SetSizer( SetGroup_CellSizer );
+   SetGroup_Cell.SetFixedWidth( block );
 
    SetGroup_Sizer.SetSpacing( rowSpacing );
-   SetGroup_Sizer.Add( Group_Edit );
-   SetGroup_Sizer.Add( SetGroup_PushButton );
+   SetGroup_Sizer.Add( SetGroup_Cell );
    SetGroup_Sizer.Add( SetGroup_Label, 100 );
 
    ClearGroups_PushButton.SetText( "Clear groups" );
-   ClearGroups_PushButton.SetFixedWidth( block );
    ClearGroups_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ClearGroupsClick, w );
    ClearGroups_PushButton.SetToolTip( "<p>Move every panel back to the default group.</p>" );
    ClearGroups_Label.SetText( "Put every panel back in the default group." );
    ClearGroups_Label.EnableWordWrapping();
+   ClearGroups_Label.OnResize( (Control::resize_event_handler)&MmmBlendInterface::e_ExplanationResize, w );
+
+   ClearGroups_CellSizer.Add( ClearGroups_PushButton, 100 );
+   ClearGroups_Cell.SetSizer( ClearGroups_CellSizer );
+   ClearGroups_Cell.SetFixedWidth( block );
 
    ClearGroups_Sizer.SetSpacing( rowSpacing );
-   ClearGroups_Sizer.Add( ClearGroups_PushButton );
+   ClearGroups_Sizer.Add( ClearGroups_Cell );
    ClearGroups_Sizer.Add( ClearGroups_Label, 100 );
 
-   PanelGroups_Sizer.SetSpacing( 6 );
-   PanelGroups_Sizer.Add( PanelGroupsIntro_Label );
+   // Breathing room: a wider gap between the three rows than the rest of
+   // the window uses, and a clear break after the introduction.
+   PanelGroups_Sizer.SetMargin( 4 );
+   PanelGroups_Sizer.SetSpacing( 12 );
+   PanelGroups_Sizer.Add( PanelGroupsIntro_Sizer );
+   PanelGroups_Sizer.AddSpacing( 4 );
    PanelGroups_Sizer.Add( GroupByFilter_Sizer );
    PanelGroups_Sizer.Add( SetGroup_Sizer );
    PanelGroups_Sizer.Add( ClearGroups_Sizer );
@@ -616,6 +649,13 @@ void MmmBlendInterface::e_LogoPaint( Control& sender, const pcl::Rect& )
       g.DrawScaledBitmap( sender.BoundsRect(), GUI->Logo_Bitmap );
 }
 
+void MmmBlendInterface::e_InfoPaint( Control& sender, const pcl::Rect& )
+{
+   Graphics g( sender );
+   if ( !GUI->PanelGroupsInfo_Bitmap.IsNull() )
+      g.DrawScaledBitmap( sender.BoundsRect(), GUI->PanelGroupsInfo_Bitmap );
+}
+
 void MmmBlendInterface::e_LinkMouseRelease( Control& sender, const pcl::Point&, int button, unsigned, unsigned )
 {
    if ( button != MouseButton::Left )
@@ -706,17 +746,33 @@ void MmmBlendInterface::UpdateControls()
 void MmmBlendInterface::UpdateInputModeControls()
 {
    // Show only the active side's list; hiding (not disabling) matches the
-   // reference tools and keeps the window compact.
-   GUI->Views_TreeBox.SetVisible( m_viewsMode );
-   GUI->AddViews_PushButton.SetVisible( m_viewsMode );
-   GUI->RemoveView_PushButton.SetVisible( m_viewsMode );
+   // reference tools and keeps the window compact. Hide the inactive side
+   // FIRST: if the incoming list is shown while the outgoing one is still
+   // visible, the layout briefly holds both, the window grows to fit them,
+   // and nothing shrinks it back once the other list hides.
+   if ( m_viewsMode )
+   {
+      GUI->Files_TreeBox.Hide();
+      GUI->AddFiles_PushButton.Hide();
+      GUI->RemoveFile_PushButton.Hide();
+      GUI->Views_TreeBox.Show();
+      GUI->AddViews_PushButton.Show();
+      GUI->RemoveView_PushButton.Show();
+   }
+   else
+   {
+      GUI->Views_TreeBox.Hide();
+      GUI->AddViews_PushButton.Hide();
+      GUI->RemoveView_PushButton.Hide();
+      GUI->Files_TreeBox.Show();
+      GUI->AddFiles_PushButton.Show();
+      GUI->RemoveFile_PushButton.Show();
+   }
 
-   GUI->Files_TreeBox.SetVisible( !m_viewsMode );
-   GUI->AddFiles_PushButton.SetVisible( !m_viewsMode );
-   GUI->RemoveFile_PushButton.SetVisible( !m_viewsMode );
-
+   // Relayout only: both lists have the same size, so the window has no
+   // reason to change. (AdjustToContents() here shrank the window to the
+   // wrapped explanation labels' one-line minimum and the rows overlapped.)
    EnsureLayoutUpdated();
-   AdjustToContents();
 }
 
 void MmmBlendInterface::UpdateFlattenControls()
@@ -763,8 +819,10 @@ void MmmBlendInterface::PopulateActiveTreeBox()
         && !mmm_groups::wildcard_match( pattern, std::string( text.ToUTF8().c_str() ) ) )
          continue;
       TreeBox::Node* node = new TreeBox::Node( tree );
-      node->SetText( 0, items[i] );
-      node->SetText( 1, groups[i] );
+      // Group first and content-sized, so long paths never push it out of
+      // view; the path/id column takes the remaining width.
+      node->SetText( 0, groups[i] );
+      node->SetText( 1, items[i] );
       m_visibleRows.Add( int( i ) );
    }
    tree.AdjustColumnWidthToContents( 0 );
@@ -948,6 +1006,81 @@ void MmmBlendInterface::e_RemoveFileClick( Button&, bool )
    UpdateControls();
 }
 
+void MmmBlendInterface::ShowGroupHint( bool show )
+{
+   m_groupHintShown = show;
+   if ( show )
+   {
+      GUI->Group_Edit.SetText( kGroupHint );
+      GUI->Group_Edit.SetStyleSheet( "QLineEdit { color: #808080; font-style: italic; }" );
+   }
+   else
+   {
+      if ( GUI->Group_Edit.Text() == kGroupHint )
+         GUI->Group_Edit.Clear();
+      GUI->Group_Edit.SetStyleSheet( String() );
+   }
+}
+
+String MmmBlendInterface::GroupName() const
+{
+   return m_groupHintShown ? String() : GUI->Group_Edit.Text().Trimmed();
+}
+
+void MmmBlendInterface::e_GroupGetFocus( Control& )
+{
+   if ( m_groupHintShown )
+      ShowGroupHint( false );
+}
+
+void MmmBlendInterface::e_GroupLoseFocus( Control& )
+{
+   if ( GUI->Group_Edit.Text().IsEmpty() )
+      ShowGroupHint( true );
+}
+
+void MmmBlendInterface::e_GroupReturnPressed( Edit& )
+{
+   SetGroupFromEdit();
+}
+
+// Word-wrapped labels report a one-line minimum height to the layout, so a
+// narrow window (or AdjustToContents after a section toggle) clips their
+// last lines. On every width change, measure how many lines the text
+// actually wraps to at that width -- a greedy word fill with the label's
+// own font metrics, as the core wraps -- and pin the minimum height to it.
+void MmmBlendInterface::e_ExplanationResize( Control& sender, int newWidth, int, int oldWidth, int )
+{
+   if ( newWidth <= 0 || newWidth == oldWidth )
+      return;
+   Label* label = dynamic_cast<Label*>( &sender );
+   if ( label == nullptr )
+      return;
+   const pcl::Font font = label->Font();
+   const int spaceWidth = font.Width( String( ' ' ) );
+   StringList words;
+   label->Text().Break( words, ' ', true /*trim*/ );
+   int lines = 1, lineWidth = 0;
+   for ( const String& word : words )
+   {
+      if ( word.IsEmpty() )
+         continue;
+      const int ww = font.Width( word );
+      if ( lineWidth == 0 )
+         lineWidth = ww;
+      else if ( lineWidth + spaceWidth + ww <= newWidth )
+         lineWidth += spaceWidth + ww;
+      else
+      {
+         ++lines;
+         lineWidth = ww;
+      }
+   }
+   const int wanted = lines * font.LineSpacing();
+   if ( label->MinHeight() != wanted )
+      label->SetMinHeight( wanted );
+}
+
 void MmmBlendInterface::e_FilterGetFocus( Control& )
 {
    if ( m_filterHintShown )
@@ -968,14 +1101,19 @@ void MmmBlendInterface::e_FilterTextUpdated( Edit&, const String& text )
    PopulateActiveTreeBox();
 }
 
-void MmmBlendInterface::e_SetGroupClick( Button&, bool )
+void MmmBlendInterface::SetGroupFromEdit()
 {
-   const String name = GUI->Group_Edit.Text().Trimmed();
+   const String name = GroupName();
    Array<String>& groups = ActiveGroups();
    for ( int row : TargetRows() )
       if ( row >= 0 && size_type( row ) < groups.Length() )
          groups[row] = name;
    PopulateActiveTreeBox();
+}
+
+void MmmBlendInterface::e_SetGroupClick( Button&, bool )
+{
+   SetGroupFromEdit();
 }
 
 void MmmBlendInterface::e_ClearGroupsClick( Button&, bool )
