@@ -235,10 +235,21 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    FilesMode_RadioButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ModeClick, w );
    FilesMode_RadioButton.SetToolTip( "<p>Blend image files read directly from disk, without opening them as views.</p>" );
 
+   Filter_Label.SetText( "Filter:" );
+   Filter_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
+   Filter_Edit.SetToolTip( "<p>Show only the panels whose view id or file name matches this "
+      "wildcard pattern (* = any run, ? = one character, case-insensitive), e.g. <b>*_Ha*</b>. "
+      "Clear it to show every panel again.</p>" );
+   Filter_Edit.OnTextUpdated( (Edit::text_event_handler)&MmmBlendInterface::e_FilterTextUpdated, w );
+   Filter_Edit.OnGetFocus( (Control::event_handler)&MmmBlendInterface::e_FilterGetFocus, w );
+   Filter_Edit.OnLoseFocus( (Control::event_handler)&MmmBlendInterface::e_FilterLoseFocus, w );
+
    InputMode_Sizer.SetSpacing( 8 );
    InputMode_Sizer.Add( ViewsMode_RadioButton );
    InputMode_Sizer.Add( FilesMode_RadioButton );
-   InputMode_Sizer.AddStretch();
+   InputMode_Sizer.AddSpacing( 16 );
+   InputMode_Sizer.Add( Filter_Label );
+   InputMode_Sizer.Add( Filter_Edit, 100 );
 
    Views_TreeBox.SetNumberOfColumns( 2 );
    Views_TreeBox.SetHeaderText( 0, "View Id" );
@@ -282,58 +293,97 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    FileButtons_Sizer.Add( RemoveFile_PushButton );
    FileButtons_Sizer.AddStretch();
 
-   Filter_Label.SetText( "Filter:" );
-   Filter_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
-   Filter_Edit.SetToolTip( "<p>Show only the panels whose view id or file name matches this "
-      "wildcard pattern (* = any run, ? = one character, case-insensitive), e.g. <b>*_Ha*</b>. "
-      "Then press <b>Set group</b> to assign every displayed panel to a group at once.</p>" );
-   Filter_Edit.OnTextUpdated( (Edit::text_event_handler)&MmmBlendInterface::e_FilterTextUpdated, w );
-   Filter_Edit.OnGetFocus( (Control::event_handler)&MmmBlendInterface::e_FilterGetFocus, w );
-   Filter_Edit.OnLoseFocus( (Control::event_handler)&MmmBlendInterface::e_FilterLoseFocus, w );
-
-   Group_Label.SetText( "Group:" );
-   Group_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
-   Group_Edit.SetToolTip( "<p>Group name to assign with <b>Set group</b>. Each group is merged into "
-      "its own output window (MegaMergeMosaic_&lt;group&gt;); all groups share one reference frame "
-      "so the outputs can be combined directly. Leave empty for the default group.</p>" );
-
-   SetGroup_PushButton.SetText( "Set group" );
-   SetGroup_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SetGroupClick, w );
-   SetGroup_PushButton.SetToolTip( "<p>Assign the group name to the selected panels, or to every "
-      "displayed panel when nothing is selected.</p>" );
-
-   GroupByFilter_PushButton.SetText( "Group by FILTER" );
-   GroupByFilter_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_GroupByFilterClick, w );
-   GroupByFilter_PushButton.SetToolTip( "<p>Fill each panel's group from its FILTER keyword "
-      "(selected panels, or every displayed panel when nothing is selected). Panels without a "
-      "FILTER keyword keep their current group.</p>" );
-
-   ClearGroups_PushButton.SetText( "Clear groups" );
-   ClearGroups_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ClearGroupsClick, w );
-   ClearGroups_PushButton.SetToolTip( "<p>Move the selected panels (or every displayed panel when "
-      "nothing is selected) back to the default group.</p>" );
-
-   GroupTools_Sizer.SetSpacing( 6 );
-   GroupTools_Sizer.Add( Filter_Label );
-   GroupTools_Sizer.Add( Filter_Edit, 100 );
-   GroupTools_Sizer.Add( Group_Label );
-   GroupTools_Sizer.Add( Group_Edit, 100 );
-   GroupTools_Sizer.Add( SetGroup_PushButton );
-   GroupTools_Sizer.Add( GroupByFilter_PushButton );
-   GroupTools_Sizer.Add( ClearGroups_PushButton );
-
    TargetFrames_Sizer.SetSpacing( 4 );
    TargetFrames_Sizer.Add( InputMode_Sizer );
    TargetFrames_Sizer.Add( Views_TreeBox );
    TargetFrames_Sizer.Add( ViewButtons_Sizer );
    TargetFrames_Sizer.Add( Files_TreeBox );
    TargetFrames_Sizer.Add( FileButtons_Sizer );
-   TargetFrames_Sizer.Add( GroupTools_Sizer );
    TargetFrames_Control.SetSizer( TargetFrames_Sizer );
 
    TargetFrames_SectionBar.SetTitle( "Target Frames" );
    TargetFrames_SectionBar.SetSection( TargetFrames_Control );
    TargetFrames_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
+
+   //
+   // Multi-Mosaic - Panel Grouping section.
+   //
+   // Three rows of [action] [explanation]. The left cell of every row is the
+   // same physical width -- "Group:" label + edit + button on the Set group
+   // row, an unscaled spacer standing in for the label and edit on the other
+   // two -- so the buttons and the explanations line up. Font-metric widths
+   // are physical pixels, hence AddUnscaledSpacing (AddSpacing would scale a
+   // second time on HiDPI).
+   const int groupButtonWidth = w.Font().Width( String( "Group by FILTER" ) ) + w.LogicalPixelsToPhysical( 24 );
+   const int groupLabelWidth  = w.Font().Width( String( "Group:" ) );
+   const int groupEditWidth   = w.Font().Width( String( 'M', 10 ) );
+   const int rowSpacing       = 6;
+   const int leftCellSpacer   = groupLabelWidth + w.LogicalPixelsToPhysical( rowSpacing ) + groupEditWidth;
+
+   PanelGroupsIntro_Label.SetText( "Shooting several filters? Give each panel a group and merge "
+      "everything in one run. Each group becomes its own mosaic, and every mosaic lands on the "
+      "same reference frame, ready to combine." );
+   PanelGroupsIntro_Label.EnableWordWrapping();
+
+   GroupByFilter_PushButton.SetText( "Group by FILTER" );
+   GroupByFilter_PushButton.SetFixedWidth( groupButtonWidth );
+   GroupByFilter_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_GroupByFilterClick, w );
+   GroupByFilter_PushButton.SetToolTip( "<p>Fill each panel's group from its FILTER keyword "
+      "(selected panels, or every panel shown in the list when nothing is selected). Panels "
+      "without a FILTER keyword keep their current group.</p>" );
+   GroupByFilter_Label.SetText( "Group panels by the FILTER keyword in their headers." );
+   GroupByFilter_Label.EnableWordWrapping();
+
+   GroupByFilter_Sizer.SetSpacing( rowSpacing );
+   GroupByFilter_Sizer.AddUnscaledSpacing( leftCellSpacer );
+   GroupByFilter_Sizer.Add( GroupByFilter_PushButton );
+   GroupByFilter_Sizer.Add( GroupByFilter_Label, 100 );
+
+   Group_Label.SetText( "Group:" );
+   Group_Label.SetFixedWidth( groupLabelWidth );
+   Group_Label.SetTextAlignment( TextAlign::Right | TextAlign::VertCenter );
+   Group_Edit.SetFixedWidth( groupEditWidth );
+   Group_Edit.SetToolTip( "<p>Group name to assign with <b>Set group</b>. Each group is merged into "
+      "its own output window (MegaMergeMosaic_&lt;group&gt;); all groups share one reference frame "
+      "so the outputs can be combined directly. Leave empty for the default group.</p>" );
+   SetGroup_PushButton.SetText( "Set group" );
+   SetGroup_PushButton.SetFixedWidth( groupButtonWidth );
+   SetGroup_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_SetGroupClick, w );
+   SetGroup_PushButton.SetToolTip( "<p>Assign the group name to every panel shown in the list "
+      "(narrow the list with <b>Filter</b> first), or only to the selected panels when there is "
+      "a selection.</p>" );
+   SetGroup_Label.SetText( "Assign this group to every panel in the filtered list above "
+      "(use Filter to narrow it), or only to the selected panels when there is a selection." );
+   SetGroup_Label.EnableWordWrapping();
+
+   SetGroup_Sizer.SetSpacing( rowSpacing );
+   SetGroup_Sizer.Add( Group_Label );
+   SetGroup_Sizer.Add( Group_Edit );
+   SetGroup_Sizer.Add( SetGroup_PushButton );
+   SetGroup_Sizer.Add( SetGroup_Label, 100 );
+
+   ClearGroups_PushButton.SetText( "Clear groups" );
+   ClearGroups_PushButton.SetFixedWidth( groupButtonWidth );
+   ClearGroups_PushButton.OnClick( (Button::click_event_handler)&MmmBlendInterface::e_ClearGroupsClick, w );
+   ClearGroups_PushButton.SetToolTip( "<p>Move every panel back to the default group.</p>" );
+   ClearGroups_Label.SetText( "Put every panel back in the default group." );
+   ClearGroups_Label.EnableWordWrapping();
+
+   ClearGroups_Sizer.SetSpacing( rowSpacing );
+   ClearGroups_Sizer.AddUnscaledSpacing( leftCellSpacer );
+   ClearGroups_Sizer.Add( ClearGroups_PushButton );
+   ClearGroups_Sizer.Add( ClearGroups_Label, 100 );
+
+   PanelGroups_Sizer.SetSpacing( 6 );
+   PanelGroups_Sizer.Add( PanelGroupsIntro_Label );
+   PanelGroups_Sizer.Add( GroupByFilter_Sizer );
+   PanelGroups_Sizer.Add( SetGroup_Sizer );
+   PanelGroups_Sizer.Add( ClearGroups_Sizer );
+   PanelGroups_Control.SetSizer( PanelGroups_Sizer );
+
+   PanelGroups_SectionBar.SetTitle( "Multi-Mosaic - Panel Grouping" );
+   PanelGroups_SectionBar.SetSection( PanelGroups_Control );
+   PanelGroups_SectionBar.OnToggleSection( (SectionBar::section_event_handler)&MmmBlendInterface::e_ToggleSection, w );
 
    //
    // Parameters section.
@@ -539,6 +589,8 @@ MmmBlendInterface::GUIData::GUIData( MmmBlendInterface& w )
    Global_Sizer.Add( Notice_Control );
    Global_Sizer.Add( TargetFrames_SectionBar );
    Global_Sizer.Add( TargetFrames_Control );
+   Global_Sizer.Add( PanelGroups_SectionBar );
+   Global_Sizer.Add( PanelGroups_Control );
    Global_Sizer.Add( Parameters_SectionBar );
    Global_Sizer.Add( Parameters_Control );
    Global_Sizer.Add( Advanced_SectionBar );
@@ -935,10 +987,10 @@ void MmmBlendInterface::e_SetGroupClick( Button&, bool )
 
 void MmmBlendInterface::e_ClearGroupsClick( Button&, bool )
 {
-   Array<String>& groups = ActiveGroups();
-   for ( int row : TargetRows() )
-      if ( row >= 0 && size_type( row ) < groups.Length() )
-         groups[row].Clear();
+   // Every panel, not just the displayed/selected ones: the button says
+   // "Clear groups". Set group with an empty name clears a subset.
+   for ( String& g : ActiveGroups() )
+      g.Clear();
    PopulateActiveTreeBox();
 }
 

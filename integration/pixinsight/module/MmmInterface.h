@@ -107,6 +107,8 @@ private:
       HorizontalSizer InputMode_Sizer;
       RadioButton     ViewsMode_RadioButton;
       RadioButton     FilesMode_RadioButton;
+      Label           Filter_Label;          // wildcard filter on the list below
+      Edit            Filter_Edit;
       TreeBox         Views_TreeBox;
       HorizontalSizer ViewButtons_Sizer;
       PushButton      AddViews_PushButton;
@@ -116,17 +118,25 @@ private:
       PushButton      AddFiles_PushButton;
       PushButton      RemoveFile_PushButton;
 
-      // Group tools (shared by both lists): filter the displayed rows by a
-      // wildcard, set/clear the group of the selection (or of every displayed
-      // row), or fill groups from the FILTER keyword.
-      HorizontalSizer GroupTools_Sizer;
-      Label           Filter_Label;
-      Edit            Filter_Edit;
+      // --- Multi-Mosaic - Panel Grouping section -----------------------------
+      // Three actions, one per row, each with a one-line explanation: the
+      // feature is new to mosaic tools, so the text carries the meaning.
+      // Control before SectionBar (see the Target Frames note above).
+      Control         PanelGroups_Control;
+      SectionBar      PanelGroups_SectionBar;
+      VerticalSizer   PanelGroups_Sizer;
+      Label           PanelGroupsIntro_Label;
+      HorizontalSizer GroupByFilter_Sizer;
+      PushButton      GroupByFilter_PushButton;
+      Label           GroupByFilter_Label;
+      HorizontalSizer SetGroup_Sizer;
       Label           Group_Label;
       Edit            Group_Edit;
       PushButton      SetGroup_PushButton;
-      PushButton      GroupByFilter_PushButton;
+      Label           SetGroup_Label;
+      HorizontalSizer ClearGroups_Sizer;
       PushButton      ClearGroups_PushButton;
+      Label           ClearGroups_Label;
 
       // --- Parameters section ------------------------------------------------
       Control         Parameters_Control;

@@ -258,14 +258,17 @@ more processing steps.</td>
 <p>Mono imagers stack one panel set per filter and want one mosaic per
 filter that can be combined directly (LRGBCombination, PixelMath). Add
 <b>every</b> panel of every filter to the Target Frames list, then assign
-each panel a <b>Group</b>:</p>
+each panel a <b>Group</b> in the <b>Multi-Mosaic - Panel Grouping</b>
+section:</p>
 <ul>
   <li><b>Group by FILTER</b> fills the Group column from each panel's
   FILTER keyword in one click.</li>
-  <li>Or type a wildcard in <b>Filter</b> (e.g. <code>*_Ha*</code>) so only
-  matching panels are shown, enter a name in <b>Group</b> and press
-  <b>Set group</b>; repeat for the next filter. With a selection, the
-  buttons act on the selected panels only.</li>
+  <li>Or type a wildcard in <b>Filter</b>, next to the Views/Files switch
+  (e.g. <code>*_Ha*</code>), so only matching panels are shown, enter a name
+  in <b>Group</b> and press <b>Set group</b>; repeat for the next filter.
+  With a selection, Group by FILTER and Set group act on the selected
+  panels only.</li>
+  <li><b>Clear groups</b> puts every panel back in the default group.</li>
 </ul>
 <p>When more than one group is present, MegaMergeMosaic derives one
 reference frame over every panel and merges each group onto it, producing
