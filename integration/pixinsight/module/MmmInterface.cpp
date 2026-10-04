@@ -26,13 +26,13 @@
 #include <vector>
 
 #include <pcl/Array.h>
-#include <pcl/Console.h>
 #include <pcl/Cursor.h>
 #include <pcl/ExternalProcess.h>
 #include <pcl/FITSHeaderKeyword.h>
 #include <pcl/File.h>
 #include <pcl/FileDialog.h>
 #include <pcl/Graphics.h>
+#include <pcl/MessageBox.h>
 #include <pcl/MultiViewSelectionDialog.h>
 #include <pcl/StringList.h>
 #include <pcl/View.h>
@@ -1002,10 +1002,13 @@ void MmmBlendInterface::e_GroupByFilterClick( Button&, bool )
          paths.push_back( std::string( items[row].ToUTF8().c_str() ) );
       if ( !paths.empty() )
       {
+         // No process-console calls here: this runs on the interface thread
+         // with no process executing, where the console's abort control
+         // fails with "Invalid user interface object handle" (host/test/
+         // test_interface_no_console). Feedback goes through MessageBox.
          try
          {
             ProbeScopeGuard scope( *this, m_probeInProgress );
-            Console().EnableAbort();
             mmm::PanelProbeResult probe = probe_filter_names( paths );
             // The probe pumped the event queue; re-validate every row against
             // the live arrays before writing (belt and braces beside the
@@ -1029,14 +1032,18 @@ void MmmBlendInterface::e_GroupByFilterClick( Button&, bool )
          }
          catch ( const mmm::HostError& e )
          {
-            throw Error( String( "MegaMergeMosaic: could not read FILTER keywords: " ) + e.what() );
+            MessageBox( String( "Could not read FILTER keywords:\n" ) + e.what(),
+                        "Mega Merge Mosaic", StdIcon::Error, StdButton::Ok ).Execute();
+            PopulateActiveTreeBox();
+            return;
          }
       }
    }
-   if ( missing > 0 )
-      Console().WarningLn( String().Format( "<end><cbr>** MegaMergeMosaic: %d panel(s) carry no FILTER "
-                                            "keyword; their group was not changed.", missing ) );
    PopulateActiveTreeBox();
+   if ( missing > 0 )
+      MessageBox( String().Format( "%d panel(s) carry no FILTER keyword; their group was not changed.",
+                                   missing ),
+                  "Mega Merge Mosaic", StdIcon::Warning, StdButton::Ok ).Execute();
 }
 
 void MmmBlendInterface::e_SessionDirEditCompleted( Edit& sender )

@@ -130,3 +130,14 @@ add_test(NAME test_sectionbar_order
          COMMAND test_sectionbar_order
                  ${CMAKE_CURRENT_SOURCE_DIR}/../module/MmmInterface.h
                  ${CMAKE_CURRENT_SOURCE_DIR}/../module/MmmInterface.cpp)
+
+# test_interface_no_console -- another source-text invariant: interface event
+# handlers run without a processing thread, where pcl::Console abort control
+# fails with "Invalid user interface object handle" (field report, 1.6.0).
+# MmmInterface.cpp must not use Console, and the interface-side probe helper
+# must not use ConsoleProgress.
+add_executable(test_interface_no_console test/test_interface_no_console.cpp)
+add_test(NAME test_interface_no_console
+         COMMAND test_interface_no_console
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../module/MmmInterface.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../module/MmmExecution.cpp)

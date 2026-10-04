@@ -1105,9 +1105,24 @@ std::string GroupSessionDir( const std::string& userDir, const std::string& grou
 
 // ----------------------------------------------------------------------------
 
+namespace
+{
+
+// Progress observer for probes started from the INTERFACE (no process is
+// executing): only pumps the GUI event queue so the window stays live. It
+// never touches pcl::Console -- Console abort control is valid only on a
+// process's execution thread and fails with "Invalid user interface object
+// handle" from an event handler (host/test/test_interface_no_console).
+struct UiPumpProgress : mmm::ProgressCallback
+{
+   void on_idle() override { Module->ProcessEvents(); }
+};
+
+} // namespace
+
 mmm::PanelProbeResult probe_filter_names( const std::vector<std::string>& pathsUtf8 )
 {
-   ConsoleProgress prog;
+   UiPumpProgress prog;
    return mmm::Host::probe_panels( ResolveWorkerPath(), pathsUtf8, "Auto", &prog );
 }
 
