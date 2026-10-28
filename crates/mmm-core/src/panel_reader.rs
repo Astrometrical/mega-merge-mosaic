@@ -103,6 +103,19 @@ impl FitsBacking {
     }
 }
 
+/// The backing for an opened XISF panel: its own mmap when the planes are
+/// mapped zero-copy.
+fn xisf_backing(x: XisfPanel) -> Result<Backing> {
+    if x.is_mapped() {
+        Ok(Backing::Xisf(x))
+    } else {
+        Err(Error::format(
+            x.path(),
+            "compressed/non-mappable XISF panels need the decode cache",
+        ))
+    }
+}
+
 /// Validates that an already-opened full-canvas panel's own geometry
 /// (`width, height, channels`) matches the session `canvas`; shared by the
 /// `FullCanvasXisf` and `FullCanvasFits` arms of [`PanelReader::open`],
@@ -154,7 +167,7 @@ impl PanelReader {
             PanelStorage::FullCanvasXisf => {
                 let x = XisfPanel::open(&meta.path)?;
                 check_full_canvas(&meta.path, (x.width(), x.height(), x.channels()), canvas)?;
-                Ok(full_canvas(Backing::Xisf(x), canvas))
+                Ok(full_canvas(xisf_backing(x)?, canvas))
             }
             PanelStorage::FullCanvasFits => {
                 let x = FitsPanel::open(&meta.path)?;
@@ -210,7 +223,7 @@ impl PanelReader {
             FileFormat::Xisf => {
                 let x = XisfPanel::open(path)?;
                 let canvas = (x.width(), x.height(), x.channels());
-                Ok(full_canvas(Backing::Xisf(x), canvas))
+                Ok(full_canvas(xisf_backing(x)?, canvas))
             }
             FileFormat::Fits => {
                 let x = FitsPanel::open(path)?;

@@ -1018,6 +1018,31 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
                 "  XISF geometry: {}x{} x{}ch  {:?}  data @ {} ({} bytes)",
                 h.width, h.height, h.channels, h.sample_format, h.data_offset, h.data_size
             );
+            let compression = h.block.compression.as_ref().map_or_else(
+                || "none".to_string(),
+                |c| {
+                    format!(
+                        "{} ({} subblock{}, {} bytes uncompressed)",
+                        c.codec_id(),
+                        c.subblocks.len(),
+                        if c.subblocks.len() == 1 { "" } else { "s" },
+                        c.uncompressed_size
+                    )
+                },
+            );
+            let checksum = h
+                .block
+                .checksum
+                .as_ref()
+                .map_or("none", |c| c.algorithm.name());
+            println!(
+                "  XISF block: compression {compression}  checksum {checksum}  pixels {}",
+                if x.is_mapped() {
+                    "mapped (zero-copy)"
+                } else {
+                    "decoded on first use (session decode cache)"
+                }
+            );
         }
         InputPanel::Fits(f) => {
             let h = f.header();

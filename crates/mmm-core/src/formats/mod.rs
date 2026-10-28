@@ -56,6 +56,9 @@ pub(crate) fn sniff_format(path: &Path) -> Result<FileFormat> {
 /// (`open_file`, or `open` with [`Self::storage`]); the XISF variant also
 /// exposes its zero-copy planes via [`Self::as_xisf`].
 #[derive(Debug)]
+// One per open panel file, never held in bulk: boxing the larger XISF
+// reader would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum InputPanel {
     /// A monolithic XISF file.
     Xisf(XisfPanel),
@@ -116,11 +119,14 @@ impl InputPanel {
             Self::Fits(_) => &[],
         }
     }
-    /// The XISF panel, for zero-copy plane access.
+    /// The XISF panel when its planes are mapped zero-copy from the file;
+    /// `None` for FITS and for XISF panels that need decoding (compressed,
+    /// non-Float32, …), which read through
+    /// [`crate::panel_reader::PanelReader`] (backed by the decode cache).
     pub fn as_xisf(&self) -> Option<&XisfPanel> {
         match self {
-            Self::Xisf(p) => Some(p),
-            Self::Fits(_) => None,
+            Self::Xisf(p) if p.is_mapped() => Some(p),
+            _ => None,
         }
     }
     /// `"XISF"` or `"FITS"`.
