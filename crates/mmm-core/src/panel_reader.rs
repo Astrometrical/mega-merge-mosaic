@@ -104,15 +104,14 @@ impl FitsBacking {
 }
 
 /// The backing for an opened XISF panel: its own mmap when the planes are
-/// mapped zero-copy.
+/// mapped zero-copy, else its planes decoded once into the session decode
+/// cache ([`crate::decoded`]) and mapped from there — the same raw planar
+/// layout a cropped cache uses, spanning the whole image.
 fn xisf_backing(x: XisfPanel) -> Result<Backing> {
     if x.is_mapped() {
         Ok(Backing::Xisf(x))
     } else {
-        Err(Error::format(
-            x.path(),
-            "compressed/non-mappable XISF panels need the decode cache",
-        ))
+        Ok(Backing::Cache(crate::decoded::decoded_planes(&x)?))
     }
 }
 
@@ -346,6 +345,70 @@ mod tests {
             ch_mean: vec![],
             storage,
         }
+    }
+
+    /// A zstd+sh compressed 40x30 RGB panel and its uncompressed twin.
+    fn compressed_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use mpp_core::formats::xisf_codec::Codec;
+        use mpp_core::testkit::{BlockSpec, ImageSpec, XisfBuilder};
+        let data: Vec<u8> = (0..40 * 30 * 3u32)
+            .flat_map(|i| (((i / 3) % 97) as f32 / 97.0).to_le_bytes())
+            .collect();
+        let unit = |block: BlockSpec| XisfBuilder {
+            images: vec![ImageSpec {
+                geometry: (40, 30, 3),
+                sample_format: "Float32",
+                data: data.clone(),
+                attrs: r#" bounds="0:1" colorSpace="RGB""#.into(),
+                children: String::new(),
+                block,
+            }],
+            ..Default::default()
+        };
+        let (cmp, raw) = (dir.join("cmp.xisf"), dir.join("raw.xisf"));
+        unit(BlockSpec {
+            codec: Some((Codec::Zstd, Some(4), 1 << 20)),
+            ..Default::default()
+        })
+        .write(&cmp);
+        unit(BlockSpec::default()).write(&raw);
+        (cmp, raw)
+    }
+
+    #[test]
+    fn compressed_panel_rows_match_uncompressed() {
+        let dir = std::env::temp_dir().join(format!("mmm-pr-cmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cmp, raw) = compressed_pair(&dir);
+        let a = PanelReader::open_file(&cmp).unwrap();
+        let b = PanelReader::open_file(&raw).unwrap();
+        assert!(
+            matches!(a.backing, Backing::Cache(_)),
+            "decoded into the cache"
+        );
+        assert_eq!(a.canvas(), b.canvas());
+        for c in 0..3 {
+            for y in 0..30 {
+                let (ra, rb) = (a.row(c, y).unwrap(), b.row(c, y).unwrap());
+                assert_eq!(ra.0, rb.0);
+                let bits = |r: &[f32]| r.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(ra.1), bits(rb.1), "channel {c} row {y}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mapped_panel_creates_no_cache() {
+        let dir = std::env::temp_dir().join(format!("mmm-pr-mapped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_, raw) = compressed_pair(&dir);
+        let r = PanelReader::open_file(&raw).unwrap();
+        assert!(
+            matches!(r.backing, Backing::Xisf(_)),
+            "served from its own mmap"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

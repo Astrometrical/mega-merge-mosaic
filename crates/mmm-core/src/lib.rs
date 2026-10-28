@@ -53,6 +53,7 @@ pub mod analyze;
 pub mod astrometry;
 pub(crate) mod band_cache;
 pub mod blend;
+pub mod decoded;
 pub mod diag;
 pub mod error;
 pub mod flatten;
