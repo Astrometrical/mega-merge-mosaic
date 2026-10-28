@@ -106,7 +106,7 @@ impl InputPanel {
     pub fn fits_keywords(&self) -> &[FitsKeyword] {
         match self {
             Self::Xisf(p) => &p.header().fits_keywords,
-            Self::Fits(p) => &p.header().fits_keywords,
+            Self::Fits(p) => &p.header().keywords,
         }
     }
     /// XISF properties; always empty for FITS.
@@ -148,7 +148,7 @@ impl InputPanel {
             }
             Self::Fits(p) => {
                 let h = p.header();
-                fits_wcs::model_from_keywords(&h.fits_keywords, h.width, h.height, h.row_order)
+                fits_wcs::model_from_keywords(&h.keywords, h.width, h.height, h.row_order)
             }
         }
     }
@@ -158,7 +158,7 @@ impl InputPanel {
             Self::Xisf(p) => wcs_from_properties(&p.header().properties),
             Self::Fits(p) => {
                 let h = p.header();
-                fits_wcs::linear_for_panel(&h.fits_keywords, h.height, h.row_order).ok()
+                fits_wcs::linear_for_panel(&h.keywords, h.height, h.row_order).ok()
             }
         }
     }
