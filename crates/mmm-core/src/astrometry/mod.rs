@@ -723,7 +723,11 @@ fn solution_of(
         properties: props.to_vec(),
         image_size: u32::try_from(width).ok().zip(u32::try_from(height).ok()),
     };
-    AstrometricSolution::from_header(&header).map_err(|e| e.to_string())
+    AstrometricSolution::from_header(&header).map_err(|e| match e {
+        // The bare reason: callers add their own context.
+        mpp_core::Error::Astrometry { reason } => reason,
+        other => other.to_string(),
+    })
 }
 
 /// True when `props` carry the XISF 1.0 revision 1 standard block.
@@ -1677,6 +1681,48 @@ mod tests {
         );
     }
 
+    /// The real PixInsight 1.9.5 ImageSolver result (NGC 3199, thin-plate
+    /// spline distortion) that mpp-core's decoder tests use.
+    fn pi195_props() -> Vec<XisfProperty> {
+        let h: mpp_core::header::Header = serde_json::from_str(include_str!(
+            "../../tests/fixtures/pi195_solved_header.json"
+        ))
+        .unwrap();
+        h.properties
+    }
+
+    #[test]
+    fn sampled_grids_reproduce_a_real_spline_solution_both_ways() {
+        let props = pi195_props();
+        let (w, h) = (4944u64, 3284u64);
+        let model = WcsModel::from_properties(&props, w, h).expect("spline model");
+        assert!(model.is_spline());
+        let sol = match solution_of(&props, w, h).unwrap().unwrap() {
+            AstrometricSolution::PixInsight(s) => s,
+            other => panic!("expected a PixInsight solution, got {other:?}"),
+        };
+        for j in 0..=8 {
+            for i in 0..=8 {
+                let (x, y) = (w as f64 * i as f64 / 8.0, h as f64 * j as f64 / 8.0);
+                // Forward: the 16 px image->projection grid against the model.
+                let (ra, dec) = sol.pixel_to_sky(x, y);
+                let (gr, gd) = model.pixel_to_sky(x, y);
+                let d = ((gr - ra) * dec.to_radians().cos()).hypot(gd - dec);
+                assert!(d < 4e-6, "forward grid vs model at ({x},{y}): {d} deg");
+                // Inverse: the projection->image grid against the model's own
+                // inverse direction (not against (x, y): PixInsight fits the
+                // two directions independently).
+                let (xi, eta) = tan_project_checked(sol.reference_celestial, ra, dec).unwrap();
+                let (ix, iy) = sol.projection_to_image(xi, eta);
+                let (gx, gy) = model.sky_to_pixel(ra, dec).expect("inside the grid");
+                assert!(
+                    (gx - ix).hypot(gy - iy) < 0.01,
+                    "inverse grid vs model at ({x},{y}): ({gx},{gy}) vs ({ix},{iy})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn broken_distortion_keeps_linear_but_refuses_model() {
         use self::fixtures::{layer1, layer2};
@@ -1693,6 +1739,10 @@ mod tests {
         );
         let why = describe_unsolved(&props, 100, 80);
         assert!(why.contains("standard astrometric solution"), "{why}");
+        assert!(
+            !why.contains("unusable astrometric solution"),
+            "prefix once: {why}"
+        );
     }
 
     #[test]

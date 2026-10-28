@@ -133,4 +133,68 @@ mod tests {
             w
         );
     }
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        width: u64,
+        height: u64,
+        cards: Vec<(String, String, String)>,
+        forward: Vec<[f64; 4]>,
+        inverse: Vec<[f64; 4]>,
+    }
+
+    #[test]
+    fn matches_astropy_oracle_through_grids() {
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../tests/fixtures/sip_oracle.json")).unwrap();
+        for case in cases {
+            let cards: Vec<FitsKeyword> = case
+                .cards
+                .iter()
+                .map(|(n, v, c)| FitsKeyword {
+                    name: n.clone(),
+                    value: v.clone(),
+                    comment: c.clone(),
+                })
+                .collect();
+            let ro = if cards
+                .iter()
+                .any(|k| k.name == "ROWORDER" && k.value.contains("TOP-DOWN"))
+            {
+                RowOrder::TopDown
+            } else {
+                RowOrder::BottomUp
+            };
+            let h = case.height;
+            let model = model_from_keywords(&cards, case.width, h, ro).unwrap();
+            assert!(model.is_spline(), "{}", case.name);
+            let to_img = |i: f64, j: f64| -> (f64, f64) {
+                match ro {
+                    RowOrder::TopDown => (i - 0.5, j - 0.5),
+                    RowOrder::BottomUp => (i - 0.5, h as f64 - j + 0.5),
+                }
+            };
+            for &[i, j, ra, dec] in &case.forward {
+                let (x, y) = to_img(i, j);
+                let (r2, d2) = model.pixel_to_sky(x, y);
+                let dra = ((r2 - ra + 180.0).rem_euclid(360.0) - 180.0) * dec.to_radians().cos();
+                assert!(
+                    dra.abs() < 2e-7 && (d2 - dec).abs() < 2e-7,
+                    "{} grid fwd at ({i},{j}): {dra:e} {:e}",
+                    case.name,
+                    d2 - dec
+                );
+            }
+            for &[ra, dec, i, j] in &case.inverse {
+                let (x, y) = to_img(i, j);
+                let (gx, gy) = model.sky_to_pixel(ra, dec).expect("inside native domain");
+                assert!(
+                    (gx - x).abs() < 5e-3 && (gy - y).abs() < 5e-3,
+                    "{} grid inv: ({gx},{gy}) vs ({x},{y})",
+                    case.name
+                );
+            }
+        }
+    }
 }
