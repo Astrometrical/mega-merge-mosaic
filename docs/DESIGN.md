@@ -612,6 +612,17 @@ The value types crossing the PixInsight IPC (`FitsKeyword`, `XisfProperty`,
   - Follow-up: parallel decodes each hold a full-size scratch buffer for
     `+sh` codecs. Bound the decode concurrency (or stream the unshuffle) if
     memory matters on smaller machines.
+- **Astrometric solutions** (2026-10-29) are decoded by mpp-core too:
+  - PixInsight's standard block and the legacy block, and FITS TAN /
+    TAN-SIP (`mpp_core::astrometry`).
+  - mmm keeps `WcsModel`: grid sampling (`astrometry/sampling.rs`), its own
+    `Grid2D` evaluation, and `validate_grids` on legacy grids.
+  - The linear WCS for output headers comes from mpp's lenient
+    `linear_layer`, so a broken higher layer still yields it.
+  - Parity on real data: analyze + blend of `orion_mosaic_raw_panels`
+    (legacy solutions) and `orion_mosaic_raw_panels_195` (standard
+    solutions, full distortion) give byte-identical sessions and blend
+    output, header included, to the pre-switch binary.
 - **Dependency.** A path dependency on the sibling checkout
   (`../mega-pixel-processor`) while both repos are on feature branches; it
   becomes a pinned git dependency once mega-pixel-processor is public (CI
