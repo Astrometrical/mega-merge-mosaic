@@ -1,0 +1,83 @@
+{
+  "keywords": [
+    {
+      "name": "OBJECT",
+      "value": "'M42'",
+      "comment": "target"
+    },
+    {
+      "name": "CRVAL1",
+      "value": "84.199",
+      "comment": ""
+    },
+    {
+      "name": "COMMENT",
+      "value": "",
+      "comment": "free text"
+    }
+  ],
+  "properties": [
+    {
+      "id": "Instrument:Filter:Name",
+      "type_": "String",
+      "value": {
+        "Str": "Ha"
+      },
+      "location": null
+    },
+    {
+      "id": "Test:F64",
+      "type_": "Float64",
+      "value": {
+        "F64": -0.5
+      },
+      "location": null
+    },
+    {
+      "id": "Test:I64",
+      "type_": "Int32",
+      "value": {
+        "I64": -7
+      },
+      "location": null
+    },
+    {
+      "id": "Test:Vector",
+      "type_": "F64Vector",
+      "value": {
+        "F64Vec": [
+          1.0,
+          2.5e-7,
+          -3.0
+        ]
+      },
+      "location": [
+        4096,
+        24
+      ]
+    },
+    {
+      "id": "Test:Matrix",
+      "type_": "F64Matrix",
+      "value": {
+        "F64Mat": {
+          "rows": 2,
+          "cols": 2,
+          "data": [
+            1.0,
+            0.0,
+            0.0,
+            -1.0
+          ]
+        }
+      },
+      "location": null
+    },
+    {
+      "id": "Test:Complex",
+      "type_": "C64Vector",
+      "value": "Unread",
+      "location": null
+    }
+  ]
+}
