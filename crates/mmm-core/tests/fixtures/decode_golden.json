@@ -1,0 +1,176 @@
+{
+  "fits_f32_bottomup": {
+    "width": 7,
+    "height": 5,
+    "channels": 3,
+    "keywords": [
+      [
+        "SIMPLE",
+        "T"
+      ],
+      [
+        "BITPIX",
+        "-32"
+      ],
+      [
+        "NAXIS",
+        "3"
+      ],
+      [
+        "NAXIS1",
+        "7"
+      ],
+      [
+        "NAXIS2",
+        "5"
+      ],
+      [
+        "NAXIS3",
+        "3"
+      ]
+    ],
+    "property_ids": [],
+    "pixel_fnv": "3bad023f04ba2f43"
+  },
+  "fits_f32_nonfinite": {
+    "width": 4,
+    "height": 3,
+    "channels": 1,
+    "keywords": [
+      [
+        "SIMPLE",
+        "T"
+      ],
+      [
+        "BITPIX",
+        "-32"
+      ],
+      [
+        "NAXIS",
+        "2"
+      ],
+      [
+        "NAXIS1",
+        "4"
+      ],
+      [
+        "NAXIS2",
+        "3"
+      ]
+    ],
+    "property_ids": [],
+    "pixel_fnv": "25a79d320486972b"
+  },
+  "fits_i16_topdown": {
+    "width": 6,
+    "height": 4,
+    "channels": 1,
+    "keywords": [
+      [
+        "SIMPLE",
+        "T"
+      ],
+      [
+        "BITPIX",
+        "16"
+      ],
+      [
+        "NAXIS",
+        "2"
+      ],
+      [
+        "NAXIS1",
+        "6"
+      ],
+      [
+        "NAXIS2",
+        "4"
+      ],
+      [
+        "BZERO",
+        "32768"
+      ],
+      [
+        "BSCALE",
+        "1"
+      ],
+      [
+        "ROWORDER",
+        "'TOP-DOWN'"
+      ]
+    ],
+    "property_ids": [],
+    "pixel_fnv": "c0a542e76dc82260"
+  },
+  "fits_u8": {
+    "width": 5,
+    "height": 3,
+    "channels": 1,
+    "keywords": [
+      [
+        "SIMPLE",
+        "T"
+      ],
+      [
+        "BITPIX",
+        "8"
+      ],
+      [
+        "NAXIS",
+        "2"
+      ],
+      [
+        "NAXIS1",
+        "5"
+      ],
+      [
+        "NAXIS2",
+        "3"
+      ],
+      [
+        "BZERO",
+        "0"
+      ],
+      [
+        "BSCALE",
+        "1"
+      ]
+    ],
+    "property_ids": [],
+    "pixel_fnv": "afdc92c780c8961e"
+  },
+  "xisf_mono_with_keywords": {
+    "width": 6,
+    "height": 4,
+    "channels": 1,
+    "keywords": [
+      [
+        "CREATOR",
+        "'mmm-synth'"
+      ],
+      [
+        "OBJECT",
+        "'M42'"
+      ],
+      [
+        "EXPTIME",
+        "30."
+      ]
+    ],
+    "property_ids": [],
+    "pixel_fnv": "136ddc1f6ca878ee"
+  },
+  "xisf_rgb": {
+    "width": 7,
+    "height": 5,
+    "channels": 3,
+    "keywords": [
+      [
+        "CREATOR",
+        "'mmm-synth'"
+      ]
+    ],
+    "property_ids": [],
+    "pixel_fnv": "3bad023f04ba2f43"
+  }
+}
