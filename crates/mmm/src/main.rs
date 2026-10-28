@@ -333,6 +333,23 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Compressed (e.g. WBPP) XISF panels are decoded once into a cache; say
+    // so loudly — it costs time and as much disk as the decoded panel. The
+    // cache lives in the session, next to everything else derived from it.
+    mmm_core::decoded::set_notifier(Box::new(|n| {
+        let rule = "=".repeat(78);
+        eprintln!("{rule}\n{}\n{rule}", n.message());
+    }));
+    match &cli.command {
+        Command::Analyze { session, .. }
+        | Command::Blend { session, .. }
+        | Command::Report { session, .. }
+        | Command::Batch { session, .. } => {
+            mmm_core::decoded::set_cache_dir(session.join("decoded"));
+        }
+        Command::Info { .. } | Command::Frame { .. } => {}
+    }
+
     match cli.command {
         Command::Info { panels, stats } => {
             for path in &panels {

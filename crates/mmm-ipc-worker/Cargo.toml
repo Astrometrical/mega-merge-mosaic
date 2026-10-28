@@ -16,3 +16,5 @@ serde_json.workspace = true
 # crate's `tests/end_to_end.rs`, a separate crate that can't see mmm-core's
 # own `#[cfg(test)]` items.
 mmm-core = { path = "../mmm-core", features = ["testkit"] }
+# Compressed XISF fixtures (xisf_codec::compress).
+mpp-core = { workspace = true, features = ["testkit"] }

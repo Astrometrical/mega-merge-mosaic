@@ -1282,3 +1282,125 @@ fn probe_reference_prints_reference_frame_json() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("panel 1"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Recompress a synthesized XISF file's pixel block in place (zstd+sh), the
+/// way WBPP writes masters.
+fn recompress(path: &Path) {
+    use mpp_core::formats::xisf_codec::{Codec, compress};
+    let mut bytes = std::fs::read(path).unwrap();
+    let hlen = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let xml = String::from_utf8(bytes[16..16 + hlen].to_vec()).unwrap();
+    let start = xml.find(r#"location="attachment:"#).unwrap() + r#"location=""#.len();
+    let attr = xml[start..start + xml[start..].find('"').unwrap()].to_string();
+    let mut it = attr.trim_start_matches("attachment:").split(':');
+    let off: usize = it.next().unwrap().parse().unwrap();
+    let size: usize = it.next().unwrap().parse().unwrap();
+    let (stored, _) = compress(Codec::Zstd, Some(4), &bytes[off..off + size], 1 << 20);
+    let xml = xml.replace(
+        &format!(r#"location="{attr}""#),
+        &format!(
+            r#"compression="zstd+sh:{size}:4" location="attachment:{off}:{}""#,
+            stored.len()
+        ),
+    );
+    bytes.truncate(16);
+    bytes[8..12].copy_from_slice(&(xml.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(xml.as_bytes());
+    bytes.resize(off, 0);
+    bytes.extend_from_slice(&stored);
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Files mode on compressed XISF panels: the worker decodes them into the
+/// job session's decode cache and announces each decode to the host as a
+/// Progress frame (which the PixInsight module prints verbatim).
+#[test]
+fn files_mode_announces_compressed_panel_decodes() {
+    with_watchdog(Duration::from_secs(60), || {
+        let dir = tmpdir("files-compressed");
+        let (paths, _) = write_two_solved_panels(&dir);
+        for p in &paths {
+            recompress(p);
+        }
+        let layout = SlotLayout {
+            slot_bytes: 64 << 20,
+            input_slots: 1,
+            output_slots: 2,
+        };
+        let shm_name = format!("/mmm-e2e-files-cmp-{}", std::process::id());
+        let shm = ShmSegment::create(&shm_name, layout.total_bytes()).unwrap();
+        let session = dir.join("worker.mmm-session");
+        let job = InitJob {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            worker_version: env!("CARGO_PKG_VERSION").to_string(),
+            shm_name,
+            slot_bytes: layout.slot_bytes,
+            input_slots: layout.input_slots,
+            output_slots: layout.output_slots,
+            canvas: [0, 0, 0],
+            panels: vec![],
+            mode: JobMode::Files {
+                paths: paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                input_select: Default::default(),
+            },
+            session_dir: session.to_string_lossy().into_owned(),
+            params: BlendParamsWire {
+                feather_px: 8.0,
+                downsample: 1,
+                band_rows: 16,
+                mode: "feather".to_string(),
+                roi: None,
+                defect_veto: true,
+                flatten: None,
+                surface_order: Some(2),
+                seam_map: false,
+                gain: "fit".to_string(),
+            },
+            reference: None,
+        };
+        let (mut child, mut child_stdin, mut child_stdout) = spawn_worker_with_init(&job);
+        let mut notices = Vec::new();
+        let mut saw_done = false;
+        loop {
+            match read_worker_frame(&mut child_stdout) {
+                Ok(Some(WorkerMsg::Progress { stage, done, total })) => {
+                    if stage.starts_with("Decoding compressed (zstd+sh) XISF panel") {
+                        assert_eq!((done, total), (1, 1), "a completed line");
+                        notices.push(stage);
+                    }
+                }
+                Ok(Some(WorkerMsg::OutputBand(ob))) => {
+                    write_frame(
+                        &mut child_stdin,
+                        &HostMsg::OutputAck {
+                            request_id: ob.request_id,
+                        },
+                    )
+                    .unwrap();
+                    child_stdin.flush().unwrap();
+                }
+                Ok(Some(WorkerMsg::Done)) => {
+                    saw_done = true;
+                    break;
+                }
+                Ok(Some(WorkerMsg::Error { message })) => panic!("worker error: {message}"),
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+        child.wait().unwrap();
+        drop(shm);
+        assert!(saw_done, "run should complete");
+        assert_eq!(
+            notices.len(),
+            2,
+            "one notice per compressed panel: {notices:?}"
+        );
+        assert!(notices[0].contains(&session.join("decoded").display().to_string()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    });
+}

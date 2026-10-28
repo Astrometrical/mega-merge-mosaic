@@ -393,6 +393,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mmm-core",
+ "mpp-core",
  "tracing",
  "tracing-subscriber",
 ]
@@ -421,6 +422,7 @@ name = "mmm-ipc-worker"
 version = "1.6.0"
 dependencies = [
  "mmm-core",
+ "mpp-core",
  "serde_json",
 ]
 

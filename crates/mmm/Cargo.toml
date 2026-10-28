@@ -17,3 +17,7 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Compressed XISF fixtures (XisfBuilder / xisf_codec::compress).
+mpp-core = { workspace = true, features = ["testkit"] }

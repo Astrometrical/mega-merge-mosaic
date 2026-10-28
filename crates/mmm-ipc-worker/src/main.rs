@@ -188,6 +188,16 @@ fn run() -> mmm_core::Result<()> {
         Box::new(std::io::stdout()),
     )?;
 
+    // Files-mode XISF panels that cannot be mapped (compressed WBPP masters,
+    // …) are decoded once into the job's session. Announce each decode on
+    // the PixInsight console: a Progress frame whose stage the host prints
+    // verbatim (no protocol change), as one completed line.
+    mmm_core::decoded::set_cache_dir(session_dir.join("decoded"));
+    let notice_link = link.clone();
+    mmm_core::decoded::set_notifier(Box::new(move |n| {
+        notice_link.send_progress(&n.message(), 1, 1);
+    }));
+
     // Analyze + blend as one fallible stage: once the host sends `Cancel`,
     // `HostLink::request_band`/`send_output_band` start failing fast (see
     // their doc comments), so a mid-analyze or mid-blend cancellation

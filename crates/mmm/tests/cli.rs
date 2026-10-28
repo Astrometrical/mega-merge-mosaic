@@ -267,3 +267,87 @@ fn batch_refuses_bad_group_names_before_any_work() {
     assert!(!dir.join("sessions").exists(), "no work before validation");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Recompress the pixel block of a synthesized XISF file in place
+/// (zstd+sh), the way PixInsight's WBPP writes masters.
+fn recompress(path: &Path) {
+    use mpp_core::formats::xisf_codec::{Codec, compress};
+    let mut bytes = std::fs::read(path).unwrap();
+    let hlen = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let xml = String::from_utf8(bytes[16..16 + hlen].to_vec()).unwrap();
+    let start = xml.find(r#"location="attachment:"#).unwrap();
+    let attr = &xml[start
+        ..xml[start..]
+            .find("\" ")
+            .map_or(xml.len(), |e| start + e + 1)];
+    let attr = attr.split('"').nth(1).unwrap().to_string(); // attachment:OFF:SIZE
+    let mut it = attr.trim_start_matches("attachment:").split(':');
+    let off: usize = it.next().unwrap().parse().unwrap();
+    let size: usize = it.next().unwrap().parse().unwrap();
+    let (stored, _) = compress(Codec::Zstd, Some(4), &bytes[off..off + size], 1 << 20);
+    let xml = xml.replace(
+        &format!(r#"location="{attr}""#),
+        &format!(
+            r#"compression="zstd+sh:{size}:4" location="attachment:{off}:{}""#,
+            stored.len()
+        ),
+    );
+    assert!(16 + xml.len() <= off, "header still fits before the block");
+    bytes.truncate(16);
+    bytes[8..12].copy_from_slice(&(xml.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(xml.as_bytes());
+    bytes.resize(off, 0);
+    bytes.extend_from_slice(&stored);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn analyze_reads_compressed_xisf_and_says_so() {
+    let dir = tempdir("compressed");
+    let panels = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    for p in &panels {
+        recompress(p);
+        assert!(
+            !InputPanel::open(p).unwrap().as_xisf().is_some(),
+            "not mappable"
+        );
+    }
+    let session = dir.join("A.mmm-session");
+    let out = mmm()
+        .arg("analyze")
+        .args(&panels)
+        .arg("-s")
+        .arg(&session)
+        .arg("--input")
+        .arg("solved")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "analyze failed:\n{stderr}");
+    assert!(
+        stderr.contains("Decoding compressed (zstd+sh) XISF panel a_00.xisf"),
+        "the decode is announced:\n{stderr}"
+    );
+    let cached: Vec<_> = std::fs::read_dir(session.join("decoded"))
+        .expect("decode cache inside the session")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "f32"))
+        .collect();
+    assert_eq!(cached.len(), 2, "one cache file per panel");
+    // Blending re-uses the cache: no second announcement.
+    let out = mmm()
+        .arg("blend")
+        .arg("-s")
+        .arg(&session)
+        .arg("-o")
+        .arg(dir.join("A.fits"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "blend failed:\n{stderr}");
+    assert!(
+        !stderr.contains("Decoding compressed"),
+        "cache re-used:\n{stderr}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
