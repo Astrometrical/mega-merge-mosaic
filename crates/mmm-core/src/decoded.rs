@@ -32,8 +32,9 @@ use crate::{Error, Result};
 pub struct DecodeNotice {
     /// The XISF panel being decoded.
     pub source: PathBuf,
-    /// The cache file it is decoded into.
-    pub cache: PathBuf,
+    /// The cache file it is decoded into; `None` when it is decoded into
+    /// memory (no cache directory set: a run without a session).
+    pub cache: Option<PathBuf>,
     /// Size of the cache file in bytes.
     pub bytes: u64,
     /// The block's codec (e.g. `zstd+sh`), or `uncompressed`.
@@ -47,16 +48,20 @@ impl DecodeNotice {
             || self.source.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        format!(
-            "Decoding {} XISF panel {name} to {} ({:.2} GB) — decoded once, re-used after",
-            if self.codec == "uncompressed" {
-                "non-mappable".to_string()
-            } else {
-                format!("compressed ({})", self.codec)
-            },
-            self.cache.display(),
-            self.bytes as f64 / 1e9
-        )
+        // Plain ASCII: the PixInsight console reads the stage text as Latin-1.
+        let kind = if self.codec == "uncompressed" {
+            "non-mappable".to_string()
+        } else {
+            format!("compressed ({})", self.codec)
+        };
+        let gb = self.bytes as f64 / 1e9;
+        match &self.cache {
+            Some(cache) => format!(
+                "Decoding {kind} XISF panel {name} to {} ({gb:.2} GB) - decoded once, re-used after",
+                cache.display()
+            ),
+            None => format!("Decoding {kind} XISF panel {name} into memory ({gb:.2} GB)"),
+        }
     }
 }
 
@@ -65,20 +70,27 @@ type Notifier = Box<dyn Fn(&DecodeNotice) + Send + Sync>;
 static CACHE_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 static NOTIFIER: RwLock<Option<Notifier>> = RwLock::new(None);
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Serializes decodes process-wide: a decode holds a full-size scratch
+/// buffer for byte-shuffled codecs plus the dirtied output pages, so
+/// decoding every panel of a mosaic at once (the analyze scan opens them in
+/// parallel) would multiply peak memory by the panel count. mpp-core already
+/// decodes one block's subblocks in parallel.
+static DECODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static MAX_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Set where decoded panels are cached (normally `<session>/decoded`).
 pub fn set_cache_dir(dir: PathBuf) {
     *CACHE_DIR.write().unwrap_or_else(|e| e.into_inner()) = Some(dir);
 }
 
-/// The cache directory: as set by [`set_cache_dir`], else
-/// `<temp dir>/mmm-decoded`.
-pub fn cache_dir() -> PathBuf {
-    CACHE_DIR
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("mmm-decoded"))
+/// The cache directory as set by [`set_cache_dir`]; `None` when no session
+/// provides one, in which case panels are decoded into memory and nothing is
+/// left behind on disk.
+pub fn cache_dir() -> Option<PathBuf> {
+    CACHE_DIR.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Install the process-wide decode notifier (default: a `tracing` warning).
@@ -96,25 +108,58 @@ fn notify_global(n: &DecodeNotice) {
 /// The decoded planes of `img` (planar f32, `w·h·c` samples), from the
 /// process-wide cache directory, decoding them there first if needed.
 pub fn decoded_planes(img: &XisfPanel) -> Result<Mmap> {
-    decoded_planes_in(img, &cache_dir(), &notify_global)
+    decoded_planes_in(img, cache_dir().as_deref(), &notify_global)
 }
 
-/// [`decoded_planes`] with an explicit cache directory and notifier.
+/// [`decoded_planes`] with an explicit cache directory (`None`: decode into
+/// memory) and notifier.
 pub fn decoded_planes_in(
     img: &XisfPanel,
-    dir: &Path,
+    dir: Option<&Path>,
     notify: &dyn Fn(&DecodeNotice),
 ) -> Result<Mmap> {
     let path = img.path();
     let len = img.width() * img.height() * img.channels() * 4;
-    let cache = dir.join(format!("{}.f32", cache_key(img)?));
-    if std::fs::metadata(&cache).is_ok_and(|m| m.is_file() && m.len() == len) {
-        return map(&cache);
+    let cache = match dir {
+        Some(d) => Some(d.join(format!("{}.f32", cache_key(img)?))),
+        None => None,
+    };
+    let valid = |c: &Path| std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.len() == len);
+    if let Some(c) = &cache
+        && valid(c)
+    {
+        return map(c);
     }
+    let _serial = DECODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Another thread may have produced the cache while this one waited.
+    if let Some(c) = &cache
+        && valid(c)
+    {
+        return map(c);
+    }
+    #[cfg(test)]
+    {
+        let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+    }
+    let result = decode_locked(img, path, len, cache.as_deref(), dir, notify);
+    #[cfg(test)]
+    IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    result
+}
+
+fn decode_locked(
+    img: &XisfPanel,
+    path: &Path,
+    len: u64,
+    cache: Option<&Path>,
+    dir: Option<&Path>,
+    notify: &dyn Fn(&DecodeNotice),
+) -> Result<Mmap> {
     let h = img.header();
     notify(&DecodeNotice {
         source: path.to_path_buf(),
-        cache: cache.clone(),
+        cache: cache.map(Path::to_path_buf),
         bytes: len,
         codec: h
             .block
@@ -122,6 +167,13 @@ pub fn decoded_planes_in(
             .as_ref()
             .map_or_else(|| "uncompressed".to_string(), |c| c.codec_id()),
     });
+    let (Some(cache), Some(dir)) = (cache, dir) else {
+        // No session: decode into anonymous memory, gone when unmapped.
+        let n = usize::try_from(len).map_err(|_| Error::format(path, "panel too large"))?;
+        let mut out = MmapMut::map_anon(n).map_err(|e| Error::io(path, e))?;
+        img.decode_into(bytemuck::cast_slice_mut(&mut out[..]))?;
+        return out.make_read_only().map_err(|e| Error::io(path, e));
+    };
     std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     let tmp = dir.join(format!(
         "{}.{}.{}.tmp",
@@ -136,27 +188,72 @@ pub fn decoded_planes_in(
             .create_new(true)
             .open(&tmp)
             .map_err(|e| Error::io(&tmp, e))?;
-        file.set_len(len).map_err(|e| Error::io(&tmp, e))?;
+        reserve(&file, len).map_err(|e| {
+            if e.raw_os_error() == Some(libc_enospc()) {
+                Error::format(
+                    &tmp,
+                    format!(
+                        "not enough disk space for the decoded panel ({:.2} GB needed)",
+                        len as f64 / 1e9
+                    ),
+                )
+            } else {
+                Error::io(&tmp, e)
+            }
+        })?;
         // SAFETY: the file was just created under a unique name; nothing else
         // maps or resizes it while this mapping is alive.
         let mut out = unsafe { MmapMut::map_mut(&file) }.map_err(|e| Error::io(&tmp, e))?;
         img.decode_into(bytemuck::cast_slice_mut(&mut out[..]))?;
         out.flush().map_err(|e| Error::io(&tmp, e))?;
+        drop(out);
+        file.sync_all().map_err(|e| Error::io(&tmp, e))?;
         Ok(())
     })();
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, &cache) {
-        // Another process may have won the race (Windows refuses to rename
-        // over an existing file); its file is identical.
+    if let Err(e) = std::fs::rename(&tmp, cache) {
+        // Replacing a cache file another process has mapped can fail
+        // (Windows: access denied); that file is identical, so use it.
         let _ = std::fs::remove_file(&tmp);
-        if !std::fs::metadata(&cache).is_ok_and(|m| m.len() == len) {
-            return Err(Error::io(&cache, e));
+        if !std::fs::metadata(cache).is_ok_and(|m| m.len() == len) {
+            return Err(Error::io(cache, e));
         }
     }
-    map(&cache)
+    map(cache)
+}
+
+/// Size `file` to `len` bytes with its disk space actually reserved, so a
+/// full disk is an error here rather than SIGBUS on a store into the
+/// mapping (a plain `set_len` makes a sparse file on unix). Filesystems
+/// without `fallocate` support fall back to `set_len`.
+fn reserve(file: &std::fs::File, len: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let n = libc::off_t::try_from(len)
+            .map_err(|_| std::io::Error::other("cache file too large"))?;
+        // SAFETY: a valid open file descriptor; posix_fallocate only reads it.
+        match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, n) } {
+            0 => return Ok(()),
+            libc::EOPNOTSUPP | libc::EINVAL => {}
+            err => return Err(std::io::Error::from_raw_os_error(err)),
+        }
+    }
+    file.set_len(len)
+}
+
+fn libc_enospc() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::ENOSPC
+    }
+    #[cfg(not(unix))]
+    {
+        112 // ERROR_DISK_FULL
+    }
 }
 
 fn map(path: &Path) -> Result<Mmap> {
@@ -256,16 +353,23 @@ mod tests {
 
     #[test]
     fn notice_text_names_file_cache_and_size() {
-        let n = DecodeNotice {
+        let mut n = DecodeNotice {
             source: "/data/masterLight_PANEL-4.xisf".into(),
-            cache: "/s.mmm-session/decoded/0123456789abcdef.f32".into(),
+            cache: Some("/s.mmm-session/decoded/0123456789abcdef.f32".into()),
             bytes: 2_033_508_600,
             codec: "zstd+sh".into(),
         };
+        // Plain ASCII: the PixInsight console reads the stage text as Latin-1.
         assert_eq!(
             n.message(),
             "Decoding compressed (zstd+sh) XISF panel masterLight_PANEL-4.xisf to \
-             /s.mmm-session/decoded/0123456789abcdef.f32 (2.03 GB) — decoded once, re-used after"
+             /s.mmm-session/decoded/0123456789abcdef.f32 (2.03 GB) - decoded once, re-used after"
+        );
+        assert!(n.message().is_ascii());
+        n.cache = None;
+        assert_eq!(
+            n.message(),
+            "Decoding compressed (zstd+sh) XISF panel masterLight_PANEL-4.xisf into memory (2.03 GB)"
         );
     }
 
@@ -278,8 +382,8 @@ mod tests {
             count.fetch_add(1, Ordering::Relaxed);
         };
         let img = XisfPanel::open(&cmp).unwrap();
-        let a = floats(&decoded_planes_in(&img, &dir.join("cache"), &note).unwrap());
-        let b = floats(&decoded_planes_in(&img, &dir.join("cache"), &note).unwrap());
+        let a = floats(&decoded_planes_in(&img, Some(&dir.join("cache")), &note).unwrap());
+        let b = floats(&decoded_planes_in(&img, Some(&dir.join("cache")), &note).unwrap());
         assert_eq!(a, pixels(0));
         assert_eq!(a, b);
         assert_eq!(
@@ -297,7 +401,7 @@ mod tests {
         let cache = dir.join("cache");
         let img = XisfPanel::open(&cmp).unwrap();
         assert_eq!(
-            floats(&decoded_planes_in(&img, &cache, &|_| {}).unwrap()),
+            floats(&decoded_planes_in(&img, Some(&cache), &|_| {}).unwrap()),
             pixels(0)
         );
         // Re-save with different pixels (same size) and a later mtime.
@@ -312,7 +416,7 @@ mod tests {
         let count = AtomicUsize::new(0);
         let img = XisfPanel::open(&cmp).unwrap();
         let got = floats(
-            &decoded_planes_in(&img, &cache, &|_| {
+            &decoded_planes_in(&img, Some(&cache), &|_| {
                 count.fetch_add(1, Ordering::Relaxed);
             })
             .unwrap(),
@@ -328,7 +432,7 @@ mod tests {
         let (cmp, _) = write_pair(&dir, 0);
         let cache = dir.join("cache");
         let img = XisfPanel::open(&cmp).unwrap();
-        drop(decoded_planes_in(&img, &cache, &|_| {}).unwrap());
+        drop(decoded_planes_in(&img, Some(&cache), &|_| {}).unwrap());
         let file = std::fs::read_dir(&cache)
             .unwrap()
             .next()
@@ -343,7 +447,7 @@ mod tests {
             .unwrap();
         std::fs::write(cache.join("leftover.123.0.tmp"), b"junk").unwrap();
         assert_eq!(
-            floats(&decoded_planes_in(&img, &cache, &|_| {}).unwrap()),
+            floats(&decoded_planes_in(&img, Some(&cache), &|_| {}).unwrap()),
             pixels(0)
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -359,7 +463,7 @@ mod tests {
                 .map(|_| {
                     s.spawn(|| {
                         let img = XisfPanel::open(&cmp).unwrap();
-                        floats(&decoded_planes_in(&img, &cache, &|_| {}).unwrap())
+                        floats(&decoded_planes_in(&img, Some(&cache), &|_| {}).unwrap())
                     })
                 })
                 .collect();
@@ -375,6 +479,56 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "no temporary files left: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_cache_dir_decodes_into_memory() {
+        let dir = tmpdir("memory");
+        let (cmp, _) = write_pair(&dir, 5);
+        let img = XisfPanel::open(&cmp).unwrap();
+        let seen = std::sync::Mutex::new(None);
+        let m =
+            decoded_planes_in(&img, None, &|n| *seen.lock().unwrap() = Some(n.clone())).unwrap();
+        assert_eq!(floats(&m), pixels(5));
+        let n = seen.lock().unwrap().clone().expect("announced");
+        assert_eq!(n.cache, None);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            left.len(),
+            2,
+            "nothing written besides the two inputs: {left:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn decodes_run_one_at_a_time() {
+        let dir = tmpdir("serial");
+        let paths: Vec<PathBuf> = (0..4u32)
+            .map(|k| {
+                let sub = dir.join(format!("p{k}"));
+                std::fs::create_dir_all(&sub).unwrap();
+                write_pair(&sub, k).0
+            })
+            .collect();
+        std::thread::scope(|s| {
+            for p in &paths {
+                s.spawn(|| {
+                    let img = XisfPanel::open(p).unwrap();
+                    decoded_planes_in(&img, None, &|_| {}).unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            MAX_IN_FLIGHT.load(Ordering::Relaxed),
+            1,
+            "decodes overlapped"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
