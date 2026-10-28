@@ -7,6 +7,8 @@ architecture, verified facts about the input data, and the algorithm choices.
 ## Layout
 
 - `crates/mmm-core` — engine library (UI-agnostic; a GUI will reuse it)
+- `../mega-pixel-processor` (sibling checkout, `mpp-core`) — all XISF/FITS
+  reading and writing; mmm depends on it by path (`default-features = false`)
 - `crates/mmm` — CLI frontend (thin)
 - `docs/DESIGN.md` — architecture spec; keep it current when design changes
 - `docs/superpowers/plans/` — implementation plans

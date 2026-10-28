@@ -19,7 +19,9 @@ follow. Cross-platform; CPU-parallel via rayon now, wgpu compute later.
 - PixInsight XISF: monolithic, uncompressed attachment at 4096-aligned offset,
   planar, little-endian → **directly mmap-able**. No cache copy of pixel data
   is needed for uncompressed inputs; the source file *is* the random-access
-  store. (Compressed inputs, later, will decompress into a tile cache once.)
+  store. **Compressed inputs** (WBPP writes compressed masters, 2026) are
+  decoded once into the session's decode cache and mapped from there — see
+  "Formats come from mpp-core" below.
 - Data may be raw stacks: no gradient removal, no color calibration. Panel
   background levels genuinely differ (2× between adjacent panels observed).
 
@@ -170,7 +172,8 @@ approximated by their linear part (documented limitation).
 **D. ROI blending.** `--roi x,y,w,h` restricts the output canvas (fast
 problem-area iteration at full res).
 
-Deferred to phase 3: compressed XISF ingest, full Laplacian pyramid (if
+Deferred to phase 3: compressed XISF ingest (landed 2026-10-29, see
+"Formats come from mpp-core"), full Laplacian pyramid (if
 two-band proves insufficient), wgpu GPU path, GUI (FITS input landed
 2026-09-26, below).
 
@@ -221,6 +224,8 @@ phase-3/4 guarantees and the pyramid's mid-frequency benefit are preserved
                       # + frame_imposed when a shared reference frame was adopted
   panels/<id>/summary.bin   # L8 planes: mean[ch] + coverage, f32
   panels/<id>/aligned.bin   # solved input only: reprojection cache (planar f32)
+  decoded/<key>.f32         # decode cache: non-mappable (e.g. compressed) XISF
+                            # panels decoded once, planar f32; deletable
   analysis/overlap_graph.json
   analysis/photometry.json  # per-edge fits + global gains/offsets per channel
 <name>.mmm-frame.json # shared reference frame (mmm frame / batch), outside any session
@@ -566,9 +571,51 @@ Files path); spec:
   0.99 %. Caveat: nova's order-3 SIP is less accurate than PixInsight's
   spline solution (worst in panel 7's corners, run-to-run p90 2–4 px).
   PNGs: same orientation, clean seams. **PASS** (trimmed gate).
-- Follow-up: the output FITS writer passes XISF keyword values with
-  lowercase exponents (`2.0496e+03`) and writes `COMMENT =` cards; astropy
-  flags both as non-standard.
+- Follow-up (fixed 2026-10-29, mpp-core's FITS writer): the output FITS
+  writer passed XISF keyword values with lowercase exponents (`2.0496e+03`)
+  and wrote `COMMENT =` cards; astropy flagged both as non-standard. Real
+  exponents are now uppercased, commentary cards carry no `= `, and
+  `CONTINUE` long strings pass through verbatim.
+
+## Formats come from mpp-core (2026-10-29)
+
+All XISF and FITS handling lives in the sibling Mega Pixel Processor repo
+(`mpp-core`, built `default-features = false`): XISF 1.0 baseline-decoder
+conformance at spec revision 1.02 — every codec (`zlib`/`lz4`/`lz4hc`/`zstd`,
+`+sh`), subblocks, SHA-1/2/3 checksums, both byte orders and storage models,
+UInt8/16/32 and Float32/64, multiple images, compressed property blocks —
+and the FITS reader/writer that used to live here (mpp `docs/DESIGN.md`,
+"XISF conformance"). mmm keeps the adapters: `InputPanel`, `PanelReader`,
+`FitsSink` (a `RowSink` over mpp's `FitsWriter`) and the astrometry glue.
+The value types crossing the PixInsight IPC (`FitsKeyword`, `XisfProperty`,
+`PropertyValue`) are mpp's, serde-identical to the former mmm ones
+(`tests/wire_golden.rs` pins the form in both repos).
+
+- **Decode cache.** An uncompressed full-canvas Float32 panel is still read
+  from its own mmap. Any other XISF panel is decoded once (`crate::decoded`)
+  into `<session>/decoded/<key>.f32` — written under a temporary name and
+  renamed, keyed by canonical path, size, mtime, image id and block checksum
+  — and served through `PanelReader`'s existing `Cache` backing, so analyze,
+  reprojection and blending are unchanged. Cost: time on first use and as
+  much disk as the decoded panel (a 2 GB panel → 2 GB cache).
+- **Notice.** Every decode is announced: the CLI prints a boxed notice on
+  stderr; the PixInsight worker sends it as a completed `Progress` frame,
+  whose stage text the module prints verbatim on the console — no protocol
+  or module change.
+- **Smoke test (2026-10-29), M42 panels 3/4/7/8** re-saved by PixInsight as
+  zstd+sh + SHA-256 (2.03 GB → ~122 MB each):
+  - The blended output is byte-identical (header and 708 MB of data) to the
+    uncompressed set's.
+  - Analyze took 14.8 s on first use (four parallel 2 GB decodes, peak RSS
+    16 GB) against 1.3 s for the uncompressed set, and 1.4 s on a re-run,
+    which reused the cache silently.
+  - Follow-up: parallel decodes each hold a full-size scratch buffer for
+    `+sh` codecs. Bound the decode concurrency (or stream the unshuffle) if
+    memory matters on smaller machines.
+- **Dependency.** A path dependency on the sibling checkout
+  (`../mega-pixel-processor`) while both repos are on feature branches; it
+  becomes a pinned git dependency once mega-pixel-processor is public (CI
+  checks out only this repo).
 
 ## Performance notes
 

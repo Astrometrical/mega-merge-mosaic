@@ -10,6 +10,7 @@
 //      --force-exit
 //
 // <mode>  small (default) | big | bigmixed | defaults | panel | all
+//         | recompress (then one or more panel paths)
 // <panel> a solved XISF panel to re-save compressed (mode panel/all)
 //
 // Every compressed file has an uncompressed twin ("__none__none") written
@@ -275,11 +276,9 @@ function genBigMixed( outDir )
    M.save();
 }
 
-// Re-save a real solved panel: AstrometricSolution properties (large attached
-// F64Matrix blocks, compressed too) plus FITS keywords.
-function genPanel( outDir, panelPath )
+// Read a panel's image, FITS keywords and properties.
+function readPanel( panelPath )
 {
-   let M = new Manifest( outDir, "panel" );
    let F = new FileFormat( "XISF", true/*toRead*/, false/*toWrite*/ );
    let f = new FileFormatInstance( F );
    let d = f.open( panelPath, "" );
@@ -298,13 +297,24 @@ function genPanel( outDir, panelPath )
          properties.push( { id: p[0], type: p[1], value: v } );
    }
    f.close();
-
-   let copyMeta = function( out )
-   {
-      out.keywords = keywords;
-      for ( let p of properties )
-         out.writeImageProperty( p.id, p.value, p.type );
+   return {
+      image: img,
+      copyMeta: function( out )
+      {
+         out.keywords = keywords;
+         for ( let p of properties )
+            out.writeImageProperty( p.id, p.value, p.type );
+      }
    };
+}
+
+// Re-save a real solved panel: AstrometricSolution properties (large attached
+// F64Matrix blocks, compressed too) plus FITS keywords.
+function genPanel( outDir, panelPath )
+{
+   let M = new Manifest( outDir, "panel" );
+   let src = readPanel( panelPath );
+   let img = src.image, copyMeta = src.copyMeta;
    let stem = "panel_" + File.extractName( panelPath ).replace( /[^A-Za-z0-9_-]+/g, "_" );
    let reference = stem + "__none__none.xisf";
    writeXisf( outDir + "/" + reference, img, hints( "none", "none" ), copyMeta );
@@ -330,6 +340,23 @@ function genDefaults( outDir )
    M.save();
 }
 
+// Re-save each given panel as zstd+sh with SHA-256 checksums (the way WBPP
+// writes masters) under its own file name in outDir: a compressed copy of a
+// real mosaic for end-to-end runs.
+function genRecompress( outDir, panelPaths )
+{
+   let M = new Manifest( outDir, "recompress" );
+   for ( let panelPath of panelPaths )
+   {
+      let src = readPanel( panelPath );
+      let name = File.extractName( panelPath ) + File.extractExtension( panelPath );
+      writeXisf( outDir + "/" + name, src.image, hints( "zstd+sh", "sha256" ), src.copyMeta );
+      M.add( { file: name, codec: "zstd+sh", checksum: "sha256", source: panelPath } );
+      src.image.free();
+   }
+   M.save();
+}
+
 function main()
 {
    if ( typeof jsArguments == "undefined" || jsArguments.length < 1 )
@@ -347,6 +374,8 @@ function main()
       genBigMixed( outDir );
    if ( mode == "defaults" || mode == "all" )
       genDefaults( outDir );
+   if ( mode == "recompress" )
+      genRecompress( outDir, jsArguments.slice( 2 ) );
    if ( mode == "panel" || mode == "all" )
    {
       if ( jsArguments.length < 3 )
