@@ -150,7 +150,7 @@ impl InputPanel {
             Self::Xisf(p) => {
                 let h = p.header();
                 WcsModel::from_properties(&h.properties, h.width, h.height)
-                    .ok_or_else(|| describe_unsolved(&h.properties))
+                    .ok_or_else(|| describe_unsolved(&h.properties, h.width, h.height))
             }
             Self::Fits(p) => {
                 let h = p.header();

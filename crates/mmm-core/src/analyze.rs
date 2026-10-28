@@ -602,7 +602,7 @@ pub fn solved_frame(
             format!("panel {}", p.panel_id),
             p.channels,
             WcsModel::from_properties(&p.properties, p.width, p.height)
-                .ok_or_else(|| describe_unsolved(&p.properties)),
+                .ok_or_else(|| describe_unsolved(&p.properties, p.width, p.height)),
         )
     }))
 }

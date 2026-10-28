@@ -132,32 +132,19 @@
 
 use std::sync::{Arc, OnceLock};
 
-use crate::formats::PropertyValue;
 use crate::formats::{FitsKeyword, XisfProperty};
 
 pub mod fits_wcs;
-mod legacy;
-pub mod sip;
-pub(crate) mod spline;
-pub(crate) mod standard;
+mod sampling;
 
-/// Value of the property with id `id`, if present.
-pub(crate) fn find_value<'a>(props: &'a [XisfProperty], id: &str) -> Option<&'a PropertyValue> {
-    props.iter().find(|p| p.id == id).map(|p| &p.value)
-}
+/// TAN-SIP solutions (mpp-core's decoder).
+pub use mpp_core::astrometry::sip;
+/// The linear FITS WCS (mpp-core's): `sky = project(crval, cd · (pixel −
+/// crpix))`, pixel coordinates in FITS convention (1-based, centres at
+/// integers, rows top-down for mmm's inputs and outputs).
+pub use mpp_core::wcs::LinearWcs;
 
-/// True when the native-frame properties are absent or carry the standard
-/// zenithal values (reference (0, 90), pole (180, 90)); a different frame
-/// would change the deprojection and is not implemented.
-pub(crate) fn std_native_frame_ok(props: &[XisfProperty], ref_id: &str, pole_id: &str) -> bool {
-    let ok = |id: &str, expect: [f64; 2]| match find_value(props, id) {
-        None => true,
-        Some(v) => v.as_f64_vec().is_some_and(|v| {
-            v.len() == 2 && (v[0] - expect[0]).abs() < 1e-9 && (v[1] - expect[1]).abs() < 1e-9
-        }),
-    };
-    ok(ref_id, [0.0, 90.0]) && ok(pole_id, [180.0, 90.0])
-}
+use mpp_core::astrometry::{AstrometricSolution, PiSolution};
 
 /// Layout validations shared by every grid source (empirically derived, see
 /// the module docs): the image→native grid must span the image bounds, both
@@ -206,59 +193,6 @@ pub(crate) fn validate_grids(
         }
     }
     true
-}
-
-/// A linear FITS WCS: `sky = project(crval, cd · (pixel − crpix))`, with
-/// `pixel` in FITS convention (1-based, pixel centers at integers, rows in
-/// stored order — top-down for our inputs and outputs).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct LinearWcs {
-    /// Reference sky coordinates [RA, Dec] in degrees.
-    pub crval: [f64; 2],
-    /// Reference pixel [x, y], FITS 1-based.
-    pub crpix: [f64; 2],
-    /// Linear transformation, degrees per pixel; `cd[0]` is axis 1 (ξ/RA).
-    pub cd: [[f64; 2]; 2],
-    /// Axis types, e.g. `RA---TAN` / `DEC--TAN`.
-    pub ctype: [String; 2],
-    /// Celestial reference system for the RADESYS card (e.g. `ICRS`).
-    pub radesys: String,
-}
-
-impl LinearWcs {
-    /// Map a FITS pixel coordinate to (RA, Dec) in degrees.
-    ///
-    /// Uses the gnomonic (TAN) deprojection — exact for `RA---TAN`, which is
-    /// what MosaicByCoordinates canvases use. Intended for validation and ROI
-    /// math, not high-volume transforms.
-    pub fn pixel_to_sky(&self, x: f64, y: f64) -> (f64, f64) {
-        let dx = x - self.crpix[0];
-        let dy = y - self.crpix[1];
-        let xi = self.cd[0][0] * dx + self.cd[0][1] * dy;
-        let eta = self.cd[1][0] * dx + self.cd[1][1] * dy;
-        tan_deproject(self.crval, xi, eta)
-    }
-
-    /// Map (RA, Dec) in degrees to a FITS pixel coordinate (TAN projection).
-    pub fn sky_to_pixel(&self, ra: f64, dec: f64) -> (f64, f64) {
-        let (xi, eta, _) = tan_project(self.crval, ra, dec);
-        let det = self.cd[0][0] * self.cd[1][1] - self.cd[0][1] * self.cd[1][0];
-        let dx = (self.cd[1][1] * xi - self.cd[0][1] * eta) / det;
-        let dy = (self.cd[0][0] * eta - self.cd[1][0] * xi) / det;
-        (self.crpix[0] + dx, self.crpix[1] + dy)
-    }
-
-    /// The same solution expressed for the vertically mirrored row order
-    /// (`H` rows): `CRPIX2' = H + 1 − CRPIX2`, second matrix column negated.
-    /// Converts a standard bottom-up FITS WCS into mmm's top-down frame and
-    /// back (it is its own inverse). See the FITS-input design spec.
-    pub fn reflect_rows(&self, height: u64) -> LinearWcs {
-        let mut r = self.clone();
-        r.crpix[1] = height as f64 + 1.0 - self.crpix[1];
-        r.cd[0][1] = -self.cd[0][1];
-        r.cd[1][1] = -self.cd[1][1];
-        r
-    }
 }
 
 /// Gnomonic (TAN) native plane (ξ, η) → celestial (RA, Dec) about `crval`,
@@ -396,7 +330,7 @@ enum Distortion {
     /// sky (frame choice) never pay for the inverse grid; the align stage
     /// samples both once. `None` inside the cell records a failed sampling.
     Standard {
-        sol: Arc<standard::StandardSolution>,
+        sol: Arc<PiSolution>,
         image_to_native: OnceLock<Option<Grid2D>>,
         native_to_image: OnceLock<Option<Grid2D>>,
     },
@@ -460,13 +394,9 @@ impl WcsModel {
     }
 
     /// A model over a decoded standard solution; grids are sampled on demand.
-    pub(crate) fn with_standard(
-        sol: standard::StandardSolution,
-        width: u64,
-        height: u64,
-    ) -> WcsModel {
+    pub(crate) fn with_standard(sol: PiSolution, width: u64, height: u64) -> WcsModel {
         WcsModel {
-            linear: sol.linear.clone(),
+            linear: pi_linear(&sol),
             distortion: Distortion::Standard {
                 sol: Arc::new(sol),
                 image_to_native: OnceLock::new(),
@@ -503,37 +433,70 @@ impl WcsModel {
     /// docs is refused (`None`) — never silently approximated by its linear
     /// part. An unsupported standard major revision is `None` too.
     pub fn from_properties(props: &[XisfProperty], width: u64, height: u64) -> Option<WcsModel> {
-        if !standard::has_standard_block(props) {
-            return legacy::model_from_legacy(props, width, height);
-        }
-        let sol = match standard::parse_standard(props) {
-            Ok(s) => s,
+        match solution_of(props, width, height) {
+            Ok(Some(sol)) => WcsModel::from_solution(&sol, width, height),
+            Ok(None) => None,
             Err(e) => {
-                tracing::debug!("standard astrometric solution rejected: {e}");
-                return None;
+                tracing::debug!("astrometric solution rejected: {e}");
+                None
             }
-        };
-        for n in &sol.notes {
-            tracing::warn!("astrometric solution: {n}");
         }
-        if sol.image_to_projection.is_none() {
-            return Some(WcsModel::linear_only(sol.linear, width, height));
+    }
+
+    /// Build the model from a decoded solution (mpp-core's).
+    ///
+    /// PixInsight legacy grids are used as decoded (after mmm's own layout
+    /// checks); a projective/spline solution is validated against its linear
+    /// layer and sampled onto grids on first use; a FITS SIP solution is
+    /// sampled likewise. Linear-only solutions yield a model without grids.
+    /// `None` when a distortion layer fails validation — never silently
+    /// approximated by its linear part.
+    pub fn from_solution(sol: &AstrometricSolution, width: u64, height: u64) -> Option<WcsModel> {
+        match sol {
+            AstrometricSolution::PixInsight(s) => {
+                for n in &s.notes {
+                    tracing::warn!("astrometric solution: {n}");
+                }
+                let linear = pi_linear(s);
+                match (&s.distortion, &s.projective) {
+                    (
+                        Some(mpp_core::astrometry::Distortion::Grids {
+                            image_to_native,
+                            native_to_image,
+                        }),
+                        _,
+                    ) => {
+                        let (fwd, inv) = (
+                            grid_from_mpp(image_to_native),
+                            grid_from_mpp(native_to_image),
+                        );
+                        if !validate_grids(&linear, &fwd, &inv, width, height) {
+                            return None;
+                        }
+                        Some(WcsModel::with_grids(linear, fwd, inv, width, height))
+                    }
+                    (_, None) => Some(WcsModel::linear_only(linear, width, height)),
+                    (_, Some(_)) => {
+                        if !sampling::validate_model(s, width, height) {
+                            return None;
+                        }
+                        Some(WcsModel::with_standard(s.clone(), width, height))
+                    }
+                }
+            }
+            AstrometricSolution::Wcs(w) => Some(match &w.sip {
+                None => WcsModel::linear_only(w.linear.clone(), width, height),
+                Some(sip) => WcsModel::with_sip(sip.clone(), width, height),
+            }),
+            _ => None,
         }
-        // The grid math is specific to the gnomonic tangent plane.
-        if sol.linear.ctype[0] != "RA---TAN" {
-            return None;
-        }
-        if !standard::validate_model(&sol, width, height) {
-            return None;
-        }
-        Some(WcsModel::with_standard(sol, width, height))
     }
 
     /// Sample both distortion grids now (a no-op for legacy and linear-only
     /// models). Call this from a plain (non-rayon) thread before handing the
     /// model to a parallel region: sampling then uses the whole rayon pool,
     /// whereas a first use from inside a rayon worker samples sequentially
-    /// (see `standard::sample`) — correct, but single-threaded.
+    /// (see `sampling::sample_fn`) — correct, but single-threaded.
     pub fn ensure_grids(&self) {
         let _ = self.image_to_native();
         let _ = self.native_to_image();
@@ -553,7 +516,7 @@ impl WcsModel {
                 ..
             } => image_to_native
                 .get_or_init(|| {
-                    let g = standard::sample_image_to_native(
+                    let g = sampling::sample_image_to_native(
                         sol,
                         self.width,
                         self.height,
@@ -575,10 +538,10 @@ impl WcsModel {
             } => image_to_native
                 .get_or_init(|| {
                     let s = sol.clone();
-                    let g = standard::sample_fn(
+                    let g = sampling::sample_fn(
                         move |x, y| s.image_to_native(x, y),
                         [0.0, 0.0, self.width as f64, self.height as f64],
-                        standard::IMAGE_DELTA_PX,
+                        sampling::IMAGE_DELTA_PX,
                         rayon::current_thread_index().is_none(),
                     );
                     if g.is_none() {
@@ -607,7 +570,7 @@ impl WcsModel {
                 ..
             } => native_to_image
                 .get_or_init(|| {
-                    let g = standard::sample_native_to_image(
+                    let g = sampling::sample_native_to_image(
                         sol,
                         self.width,
                         self.height,
@@ -629,16 +592,16 @@ impl WcsModel {
             } => native_to_image
                 .get_or_init(|| {
                     let s = sol.clone();
-                    let g = standard::matrix_scale(self.linear.cd).and_then(|scale| {
-                        let delta = standard::IMAGE_DELTA_PX * scale;
-                        let rect = standard::native_rect(
+                    let g = sampling::matrix_scale(self.linear.cd).and_then(|scale| {
+                        let delta = sampling::IMAGE_DELTA_PX * scale;
+                        let rect = sampling::native_rect(
                             |x, y| s.image_to_native(x, y),
                             self.width,
                             self.height,
                             delta,
                         );
                         let s2 = s.clone();
-                        standard::sample_fn(
+                        sampling::sample_fn(
                             move |xi, eta| s2.native_to_image(xi, eta),
                             rect,
                             delta,
@@ -746,17 +709,56 @@ pub(crate) fn expected_nodes(extent: f64, delta: f64) -> Option<u32> {
 /// coordinates, linear transformation matrix) is missing or malformed, or if
 /// the projection system is one we cannot express as a FITS CTYPE code.
 pub fn wcs_from_properties(props: &[XisfProperty]) -> Option<LinearWcs> {
-    if standard::has_standard_block(props) {
-        return standard::linear_from_standard(props).ok();
+    mpp_core::astrometry::linear_layer(props).ok().flatten()
+}
+
+/// The solution carried by a panel's XISF properties, decoded by mpp-core.
+fn solution_of(
+    props: &[XisfProperty],
+    width: u64,
+    height: u64,
+) -> std::result::Result<Option<AstrometricSolution>, String> {
+    let header = mpp_core::header::Header {
+        keywords: Vec::new(),
+        properties: props.to_vec(),
+        image_size: u32::try_from(width).ok().zip(u32::try_from(height).ok()),
+    };
+    AstrometricSolution::from_header(&header).map_err(|e| e.to_string())
+}
+
+/// True when `props` carry the XISF 1.0 revision 1 standard block.
+fn has_standard_block(props: &[XisfProperty]) -> bool {
+    props.iter().any(|p| p.id == "AstrometricSolution:Version")
+}
+
+/// The FITS-convention linear WCS of a PixInsight solution's layer 1.
+fn pi_linear(s: &PiSolution) -> LinearWcs {
+    LinearWcs {
+        crval: s.reference_celestial,
+        crpix: [s.reference_image[0] + 0.5, s.reference_image[1] + 0.5],
+        cd: s.linear,
+        ctype: ["RA---TAN".into(), "DEC--TAN".into()],
+        radesys: s.reference_system.clone(),
     }
-    legacy::linear_from_legacy(props)
+}
+
+/// mmm's lookup grid from mpp-core's (same layout; mmm evaluates its own).
+fn grid_from_mpp(g: &mpp_core::astrometry::Grid2D) -> Grid2D {
+    Grid2D {
+        rect: g.rect,
+        delta: g.delta,
+        rows: g.rows,
+        cols: g.cols,
+        gx: g.gx.clone(),
+        gy: g.gy.clone(),
+    }
 }
 
 /// Explain why a panel's XISF properties yield no [`WcsModel`], for per-file
 /// error listings.
-pub fn describe_unsolved(props: &[XisfProperty]) -> String {
-    if standard::has_standard_block(props) {
-        return match standard::parse_standard(props) {
+pub fn describe_unsolved(props: &[XisfProperty], width: u64, height: u64) -> String {
+    if has_standard_block(props) {
+        return match solution_of(props, width, height) {
             Err(e) => format!("standard astrometric solution unusable: {e}"),
             Ok(_) => "standard astrometric solution decoded but its sampled grids failed \
                       validation (non-gnomonic projection, or a model inconsistent with \
@@ -790,20 +792,6 @@ pub fn describe_unsolved(props: &[XisfProperty]) -> String {
          projection or malformed values)"
             .to_string()
     }
-}
-
-/// PixInsight projection-system name → 3-letter FITS projection code.
-pub(crate) fn projection_code(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "Gnomonic" => "TAN",
-        "Stereographic" => "STG",
-        "Orthographic" => "SIN",
-        "ZenithalEqualArea" => "ZEA",
-        "Mercator" => "MER",
-        "PlateCarree" => "CAR",
-        "HammerAitoff" => "AIT",
-        _ => return None,
-    })
 }
 
 /// Produce FITS WCS cards for an output crop of height `out_height` starting
@@ -911,6 +899,70 @@ pub fn wcs_cards_flipped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Standard-block property builders (layers 1 and 2) for the dispatch
+    /// tests; the decoder's own tests live in mpp-core.
+    mod fixtures {
+        use crate::formats::{PropertyValue, XisfProperty};
+
+        fn prop(id: &str, type_: &str, value: PropertyValue) -> XisfProperty {
+            XisfProperty {
+                id: id.into(),
+                type_: type_.into(),
+                value,
+                location: None,
+            }
+        }
+
+        fn mat(id: &str, rows: u32, cols: u32, data: Vec<f64>) -> XisfProperty {
+            prop(id, "F64Matrix", PropertyValue::F64Mat { rows, cols, data })
+        }
+
+        /// Layer 1 (Gnomonic, ICRS).
+        pub(super) fn layer1(
+            crval: [f64; 2],
+            refimg: [f64; 2],
+            cd: [[f64; 2]; 2],
+        ) -> Vec<XisfProperty> {
+            let s = |id: &str, v: &str| prop(id, "String", PropertyValue::Str(v.into()));
+            let v2 =
+                |id: &str, v: [f64; 2]| prop(id, "F64Vector", PropertyValue::F64Vec(v.to_vec()));
+            vec![
+                s("AstrometricSolution:Version", "1.0"),
+                s("AstrometricSolution:ProjectionSystem", "Gnomonic"),
+                v2("AstrometricSolution:ReferenceCelestialCoordinates", crval),
+                v2("AstrometricSolution:ReferenceImageCoordinates", refimg),
+                mat(
+                    "AstrometricSolution:LinearTransformationMatrix",
+                    2,
+                    2,
+                    vec![cd[0][0], cd[0][1], cd[1][0], cd[1][1]],
+                ),
+                s("AstrometricSolution:CelestialReferenceSystem", "ICRS"),
+            ]
+        }
+
+        /// Layer 2: both 3×3 matrices.
+        pub(super) fn layer2(
+            props: &mut Vec<XisfProperty>,
+            i2p: [[f64; 3]; 3],
+            p2i: [[f64; 3]; 3],
+        ) {
+            let flat = |m: [[f64; 3]; 3]| m.iter().flatten().copied().collect::<Vec<_>>();
+            props.push(mat(
+                "AstrometricSolution:ProjectiveTransformation:ImageToProjection",
+                3,
+                3,
+                flat(i2p),
+            ));
+            props.push(mat(
+                "AstrometricSolution:ProjectiveTransformation:ProjectionToImage",
+                3,
+                3,
+                flat(p2i),
+            ));
+        }
+    }
     use crate::formats::PropertyValue;
 
     fn prop(id: &str, type_: &str, value: PropertyValue) -> XisfProperty {
@@ -1626,8 +1678,26 @@ mod tests {
     }
 
     #[test]
+    fn broken_distortion_keeps_linear_but_refuses_model() {
+        use self::fixtures::{layer1, layer2};
+        let cd = [[-1e-3, 0.0], [0.0, 1e-3]];
+        let mut props = layer1([10.0, 20.0], [50.0, 40.0], cd);
+        // Layer 2 that contradicts layer 1 (identity is not pixels -> degrees).
+        let ident = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        layer2(&mut props, ident, ident);
+        let lin = wcs_from_properties(&props).expect("layer 1 still yields the linear WCS");
+        assert_eq!((lin.crval, lin.crpix), ([10.0, 20.0], [50.5, 40.5]));
+        assert!(
+            WcsModel::from_properties(&props, 100, 80).is_none(),
+            "model refused"
+        );
+        let why = describe_unsolved(&props, 100, 80);
+        assert!(why.contains("standard astrometric solution"), "{why}");
+    }
+
+    #[test]
     fn standard_block_takes_precedence_over_legacy_ids() {
-        use crate::astrometry::standard::fixtures::layer1;
+        use self::fixtures::layer1;
         let mut props = orion_props(); // legacy ids
         props.extend(layer1(
             [10.0, 20.0],
@@ -1655,7 +1725,7 @@ mod tests {
 
     #[test]
     fn standard_projective_only_solution_yields_a_grid_model() {
-        use crate::astrometry::standard::fixtures::{layer1, layer2};
+        use self::fixtures::{layer1, layer2};
         const S: f64 = 1e-3;
         let (rx, ry) = (50.0, 40.0);
         let mut props = layer1([10.0, 20.0], [rx, ry], [[-S, 0.0], [0.0, S]]);
@@ -1674,7 +1744,7 @@ mod tests {
 
     #[test]
     fn standard_grids_are_sampled_lazily_per_direction() {
-        use crate::astrometry::standard::fixtures::{layer1, layer2};
+        use self::fixtures::{layer1, layer2};
         const S: f64 = 1e-3;
         let (rx, ry) = (50.0, 40.0);
         let mut props = layer1([10.0, 20.0], [rx, ry], [[-S, 0.0], [0.0, S]]);
@@ -1709,7 +1779,7 @@ mod tests {
     /// regression fails by timeout instead of hanging the suite.
     #[test]
     fn lazy_sampling_from_inside_rayon_workers_completes() {
-        use crate::astrometry::standard::fixtures::{layer1, layer2};
+        use self::fixtures::{layer1, layer2};
         use rayon::prelude::*;
         const S: f64 = 1e-3;
         let (rx, ry) = (400.0, 300.0);
@@ -1851,7 +1921,7 @@ mod tests {
             seen += 1;
             let panel = XisfPanel::open(&path).unwrap();
             let h = panel.header();
-            assert!(standard::has_standard_block(&h.properties));
+            assert!(has_standard_block(&h.properties));
             let t = std::time::Instant::now();
             let model = WcsModel::from_properties(&h.properties, h.width, h.height)
                 .expect("standard model");
@@ -1859,11 +1929,8 @@ mod tests {
             assert!(model.is_spline());
             // PixInsight's cache, read ad hoc (never in product code).
             let get = |s: &str| {
-                find_value(
-                    &h.properties,
-                    &format!("PCL:AstrometricSolution:Grid:ImageToProjection:{s}"),
-                )
-                .unwrap()
+                let id = format!("PCL:AstrometricSolution:Grid:ImageToProjection:{s}");
+                &h.properties.iter().find(|p| p.id == id).unwrap().value
             };
             let rect = get("Rect").as_f64_vec().unwrap();
             let delta = get("Delta").as_f64().unwrap();

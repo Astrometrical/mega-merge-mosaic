@@ -186,7 +186,7 @@ pub fn derive_from_descs(panels: &[PanelDesc], input: InputSelect) -> Result<Ref
             height: p.height,
             wcs: wcs_from_properties(&p.properties),
             model: WcsModel::from_properties(&p.properties, p.width, p.height)
-                .ok_or_else(|| describe_unsolved(&p.properties)),
+                .ok_or_else(|| describe_unsolved(&p.properties, p.width, p.height)),
         })
         .collect();
     derive_items(items, input)
