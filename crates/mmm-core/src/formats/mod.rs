@@ -14,7 +14,7 @@ use crate::{Error, Result};
 use fits::FitsPanel;
 use xisf::XisfPanel;
 
-/// Format identified from a file's first 8 bytes by [`sniff_format`].
+/// Panel format identified from a file's first bytes by [`sniff_format`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileFormat {
     /// `XISF0100` signature.
@@ -23,38 +23,31 @@ pub(crate) enum FileFormat {
     Fits,
 }
 
-/// Identify a panel file's format from its first 8 bytes — the XISF
-/// `XISF0100` signature, or the FITS `SIMPLE` card's 8-byte keyword field
-/// (`SIMPLE` padded with spaces) — never from the file extension.
+/// Identify a panel file's format from its signature
+/// ([`mpp_core::formats::sniff_format`]) — never from the file extension.
 ///
-/// A short read (file under 8 bytes, including empty) is tolerated: it
-/// cannot match either signature, so it falls straight through to the
-/// "neither" error below rather than propagating an I/O error. A file
-/// matching neither signature errors naming exactly that, rather than being
-/// handed to the FITS reader and surfacing an unrelated FITS-specific
-/// complaint (e.g. "no END card") for what may not be a FITS file at all.
+/// A file matching neither panel format errors naming exactly that, rather
+/// than being handed to a reader that would surface an unrelated
+/// format-specific complaint (e.g. "no END card"). TIFF, which mpp-core
+/// recognizes, is not a panel format and is refused by name.
 ///
 /// Shared by [`InputPanel::open`] and
 /// [`crate::panel_reader::PanelReader::open_file`] so both name the same
 /// failure for a file that is neither.
 pub(crate) fn sniff_format(path: &Path) -> Result<FileFormat> {
-    use std::io::Read;
-    let mut magic = [0u8; 8];
-    let mut f = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
-    match f.read_exact(&mut magic) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        Err(e) => return Err(Error::io(path, e)),
-    }
-    if magic == *b"XISF0100" {
-        Ok(FileFormat::Xisf)
-    } else if magic == *b"SIMPLE  " {
-        Ok(FileFormat::Fits)
-    } else {
-        Err(Error::format(
+    use mpp_core::formats::FileFormat as F;
+    match mpp_core::formats::sniff_format(path) {
+        Ok(F::Xisf) => Ok(FileFormat::Xisf),
+        Ok(F::Fits) => Ok(FileFormat::Fits),
+        Ok(F::Tiff) => Err(Error::format(
+            path,
+            "TIFF panels are not supported (XISF or FITS expected)",
+        )),
+        Err(mpp_core::Error::Format { .. }) => Err(Error::format(
             path,
             "not an XISF or FITS file (no XISF0100 signature or SIMPLE card)",
-        ))
+        )),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -199,180 +192,12 @@ impl InputPanel {
     }
 }
 
-/// Stored row order of a FITS image, from its `ROWORDER` card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowOrder {
-    /// `ROWORDER = 'TOP-DOWN'`: the first stored row is the top image row
-    /// (mmm's internal convention); rows and WCS cards are used verbatim.
-    TopDown,
-    /// Standard FITS (`ROWORDER` absent or `'BOTTOM-UP'`): the first stored
-    /// row is the bottom image row; rows are flipped on read and the WCS is
-    /// reflected into the top-down frame.
-    BottomUp,
-}
-
-/// Numeric value of the card `name` (case-insensitive), accepting Fortran
-/// `D` exponents; `None` when absent or not a number.
-pub fn card_number(cards: &[FitsKeyword], name: &str) -> Option<f64> {
-    let v = cards.iter().find(|k| k.name.eq_ignore_ascii_case(name))?;
-    v.value.trim().replace(['D', 'd'], "E").parse().ok()
-}
-
-/// String value of the card `name`: quotes stripped, `''` unescaped,
-/// trailing spaces trimmed; `None` when absent or not a quoted string.
-pub fn card_string(cards: &[FitsKeyword], name: &str) -> Option<String> {
-    let v = cards.iter().find(|k| k.name.eq_ignore_ascii_case(name))?;
-    let t = v.value.trim();
-    let inner = t.strip_prefix('\'')?.strip_suffix('\'')?;
-    Some(inner.replace("''", "'").trim_end().to_string())
-}
-
-/// A FITS header keyword carried through from input to output.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FitsKeyword {
-    /// Keyword name (e.g. `OBJECT`, `CRVAL1`), as written in the header.
-    pub name: String,
-    /// Raw value text, quoting included for strings (e.g. `'M42'`).
-    pub value: String,
-    /// Free-text comment, empty when the card has none.
-    pub comment: String,
-}
-
-/// One XISF `<Property>` element carried through from the input header.
-///
-/// PixInsight stores plate solutions (and much other metadata) as properties,
-/// not FITS keywords. Values arrive in three shapes, all parsed by the XISF
-/// reader:
-/// - scalar `value="…"` attributes (Float64, Int*, TimePoint, …),
-/// - element text (String properties, and `location="inline:base64"` /
-///   `inline:hex` encoded vector/matrix data),
-/// - attachment data blocks (`location="attachment:offset:size"`), exposed via
-///   [`XisfProperty::location`] and resolved on open for f64 vectors/matrices.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct XisfProperty {
-    /// Property identifier (e.g. `PCL:AstrometricSolution:ProjectionSystem`).
-    pub id: String,
-    /// XISF type name as written in the header (e.g. `Float64`, `F64Vector`).
-    pub type_: String,
-    /// Decoded value (see [`PropertyValue`] for the shapes).
-    pub value: PropertyValue,
-    /// Byte offset and size of an attachment-located data block, if any.
-    pub location: Option<(u64, u64)>,
-}
-
-/// Decoded value of an XISF property.
-///
-/// Attachment-located numeric vector/matrix properties parse with empty
-/// `data` (dimensions from the header attributes); `XisfPanel::open` resolves
-/// them from the file. `Unread` marks types we do not decode.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum PropertyValue {
-    /// String-like value (`String`, `TimePoint`, or any `value` attribute of
-    /// an undecoded type).
-    Str(String),
-    /// Floating-point scalar (`Float32`/`Float64`).
-    F64(f64),
-    /// Integer scalar (all `Int*`/`UInt*` widths, and `Boolean` as 0/1).
-    I64(i64),
-    /// Vector data of any XISF numeric vector type (`F64Vector`, `I32Vector`,
-    /// `F32Vector`, …), converted to f64 in header order; the property's
-    /// `type_` records the original type. Integers are exact up to 2^53.
-    F64Vec(Vec<f64>),
-    /// Matrix data of any XISF numeric matrix type, converted to f64,
-    /// row-major; `type_` records the original type.
-    F64Mat {
-        /// Number of matrix rows.
-        rows: u32,
-        /// Number of matrix columns.
-        cols: u32,
-        /// Row-major element data, `rows × cols` long once resolved.
-        data: Vec<f64>,
-    },
-    /// A type this reader does not decode.
-    Unread,
-}
-
-impl PropertyValue {
-    /// The value as a float: `F64` directly, `I64` converted; else `None`.
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::F64(v) => Some(*v),
-            Self::I64(v) => Some(*v as f64),
-            _ => None,
-        }
-    }
-
-    /// The value as a string slice, for `Str` values only.
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    /// The value as an f64 slice, for `F64Vec` values only.
-    pub fn as_f64_vec(&self) -> Option<&[f64]> {
-        match self {
-            Self::F64Vec(v) => Some(v),
-            _ => None,
-        }
-    }
-
-    /// The value as `(rows, cols, row-major data)`, for `F64Mat` values only.
-    pub fn as_f64_mat(&self) -> Option<(u32, u32, &[f64])> {
-        match self {
-            Self::F64Mat { rows, cols, data } => Some((*rows, *cols, data)),
-            _ => None,
-        }
-    }
-
-    /// True for f64 vector/matrix values whose data still lives in an
-    /// attachment block (they parse with empty `data`; the reader fills them).
-    pub fn needs_attachment_data(&self) -> bool {
-        match self {
-            Self::F64Vec(v) => v.is_empty(),
-            Self::F64Mat { data, .. } => data.is_empty(),
-            _ => false,
-        }
-    }
-}
-
-/// Sample formats we recognize in headers. Only `Float32` is readable for now —
-/// MosaicByCoordinates output is always Float32/Float64, and Float32 is the
-/// overwhelmingly common case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)] // variants are the XISF sampleFormat names verbatim
-pub enum SampleFormat {
-    UInt8,
-    UInt16,
-    UInt32,
-    Float32,
-    Float64,
-}
-
-impl SampleFormat {
-    /// Parse an XISF `sampleFormat` attribute value; `None` if unrecognized.
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "UInt8" => Self::UInt8,
-            "UInt16" => Self::UInt16,
-            "UInt32" => Self::UInt32,
-            "Float32" => Self::Float32,
-            "Float64" => Self::Float64,
-            _ => return None,
-        })
-    }
-
-    /// Size of one sample of this format, in bytes.
-    pub fn bytes_per_sample(self) -> usize {
-        match self {
-            Self::UInt8 => 1,
-            Self::UInt16 => 2,
-            Self::UInt32 | Self::Float32 => 4,
-            Self::Float64 => 8,
-        }
-    }
-}
+// The value types are mpp-core's (serde-identical to mmm's former ones:
+// they cross the PixInsight IPC wire; see tests/wire_golden.rs).
+pub use mpp_core::formats::{
+    FitsKeyword, KeywordValue, PropertyValue, RowOrder, SampleFormat, XisfProperty, card_number,
+    card_string,
+};
 
 #[cfg(test)]
 mod tests {

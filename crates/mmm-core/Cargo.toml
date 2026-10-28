@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+mpp-core.workspace = true
 memmap2.workspace = true
 bytemuck.workspace = true
 png.workspace = true
@@ -17,6 +18,10 @@ quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Synthetic compressed/checksummed XISF for tests (XisfBuilder).
+mpp-core = { workspace = true, features = ["testkit"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["mman", "fs"] }

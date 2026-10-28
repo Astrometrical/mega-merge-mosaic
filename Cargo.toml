@@ -17,6 +17,10 @@ repository = "https://github.com/Astrometrical/mega-merge-mosaic"
 
 [workspace.dependencies]
 mmm-core = { path = "crates/mmm-core" }
+# Image formats (XISF/FITS) live in the sibling Mega Pixel Processor repo.
+# A path dependency while both repos are on feature branches; becomes a
+# pinned git dependency once mega-pixel-processor is public.
+mpp-core = { path = "../mega-pixel-processor/crates/mpp-core", default-features = false }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }

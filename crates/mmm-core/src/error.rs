@@ -68,3 +68,43 @@ impl Error {
         }
     }
 }
+
+impl From<mpp_core::Error> for Error {
+    /// mpp-core (the format readers) reports the same two file failures;
+    /// its path-less astrometry and invalid-option errors become a
+    /// path-less format error and a compute error.
+    fn from(e: mpp_core::Error) -> Self {
+        match e {
+            mpp_core::Error::Io { path, source } => Error::Io { path, source },
+            mpp_core::Error::Format { path, reason } => Error::Format { path, reason },
+            mpp_core::Error::Astrometry { reason } => Error::Format {
+                path: PathBuf::new(),
+                reason: format!("unusable astrometric solution: {reason}"),
+            },
+            mpp_core::Error::Invalid { reason } => Error::Compute { reason },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mpp_error_converts_keeping_path_and_reason() {
+        let e: Error = mpp_core::Error::format("/x/a.xisf", "bad block").into();
+        assert_eq!(
+            e.to_string(),
+            "unsupported or malformed file /x/a.xisf: bad block"
+        );
+        let e: Error = mpp_core::Error::io("/x/b.fits", std::io::Error::other("gone")).into();
+        assert!(matches!(&e, Error::Io { path, .. } if path == std::path::Path::new("/x/b.fits")));
+        let e: Error = mpp_core::Error::invalid("buffer").into();
+        assert!(matches!(e, Error::Compute { .. }));
+        let e: Error = mpp_core::Error::astrometry("no layer 1").into();
+        assert!(
+            e.to_string()
+                .contains("unusable astrometric solution: no layer 1")
+        );
+    }
+}
