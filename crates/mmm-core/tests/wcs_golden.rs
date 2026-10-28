@@ -76,7 +76,7 @@ fn wcs_golden_matches_fixture() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wcs_golden.json");
-    if std::env::var_os("MMM_BLESS").is_some() {
+    if std::env::var("MMM_BLESS").as_deref() == Ok("1") {
         let json = serde_json::to_string_pretty(&cases).unwrap();
         std::fs::write(&path, format!("{json}\n")).unwrap();
     }

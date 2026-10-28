@@ -75,7 +75,7 @@ fn sample() -> WireSample {
 fn wire_golden_matches_fixture() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wire_golden.json");
     let json = serde_json::to_string_pretty(&sample()).unwrap();
-    if std::env::var_os("MMM_BLESS").is_some() {
+    if std::env::var("MMM_BLESS").as_deref() == Ok("1") {
         std::fs::write(&path, format!("{json}\n")).unwrap();
     }
     let golden = std::fs::read_to_string(&path).expect("fixture missing: run with MMM_BLESS=1");

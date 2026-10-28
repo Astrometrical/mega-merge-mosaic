@@ -9,17 +9,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use mmm_core::formats::{FitsKeyword, InputPanel};
+use mmm_core::formats::{FitsKeyword, InputPanel, XisfProperty};
 use mmm_core::panel_reader::PanelReader;
 use mmm_core::synth::{write_fits, write_xisf, write_xisf_with_header_xml};
 
-#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize)]
 struct Decoded {
     width: u64,
     height: u64,
     channels: u64,
-    keywords: Vec<[String; 2]>,
-    property_ids: Vec<String>,
+    keywords: Vec<FitsKeyword>,
+    properties: Vec<XisfProperty>,
     pixel_fnv: String,
 }
 
@@ -72,12 +72,8 @@ fn decode(path: &Path) -> (Decoded, Vec<f32>) {
         width: w,
         height: h,
         channels: ch,
-        keywords: panel
-            .fits_keywords()
-            .iter()
-            .map(|k| [k.name.clone(), k.value.clone()])
-            .collect(),
-        property_ids: panel.properties().iter().map(|p| p.id.clone()).collect(),
+        keywords: panel.fits_keywords().to_vec(),
+        properties: panel.properties().to_vec(),
         pixel_fnv: format!("{hash:016x}"),
     };
     (d, all)
@@ -103,6 +99,30 @@ fn decode_golden_matches_fixture() {
     )
     .unwrap();
     cases.insert("xisf_mono_with_keywords".into(), decode(&p).0);
+
+    // One property of each kind the reader distinguishes. The F64Matrix
+    // attachment deliberately points at the start of the pixel block
+    // (offset 4096): overlapping, but a valid read that pins attachment
+    // decoding.
+    let p = dir.join("xisf_properties.xisf");
+    write_xisf_with_header_xml(
+        &p,
+        4,
+        2,
+        1,
+        &ramp(4, 2, 1),
+        concat!(
+            r#"<Property id="Test:String" type="String">hello world</Property>"#,
+            r#"<Property id="Test:F64" type="Float64" value="-0.5"/>"#,
+            r#"<Property id="Test:I32" type="Int32" value="42"/>"#,
+            r#"<Property id="Test:Vec" type="F64Vector" length="2" location="inline:base64">AAAAAAAA+D8AAAAAAAAAwA==</Property>"#,
+            r#"<Property id="Test:Mat" type="F64Matrix" rows="2" columns="2" location="attachment:4096:32"/>"#,
+            r#"<Property id="Test:Complex" type="Complex64" value="(1,2)"/>"#,
+            r#"<Property id="Test:C64Vec" type="C64Vector" length="1" location="inline:base64">AAAAAAAA8D8AAAAAAAAAQA==</Property>"#,
+        ),
+    )
+    .unwrap();
+    cases.insert("xisf_properties".into(), decode(&p).0);
 
     let p = dir.join("fits_f32_bottomup.fits");
     write_fits(&p, 7, 5, 3, &ramp(7, 5, 3), -32, &[]).unwrap();
@@ -141,13 +161,10 @@ fn decode_golden_matches_fixture() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decode_golden.json");
-    if std::env::var_os("MMM_BLESS").is_some() {
-        let json = serde_json::to_string_pretty(&cases).unwrap();
+    let json = serde_json::to_string_pretty(&cases).unwrap();
+    if std::env::var("MMM_BLESS").as_deref() == Ok("1") {
         std::fs::write(&path, format!("{json}\n")).unwrap();
     }
-    let golden: BTreeMap<String, Decoded> = serde_json::from_str(
-        &std::fs::read_to_string(&path).expect("fixture missing: run with MMM_BLESS=1"),
-    )
-    .unwrap();
-    assert_eq!(cases, golden, "decoded panels changed");
+    let golden = std::fs::read_to_string(&path).expect("fixture missing: run with MMM_BLESS=1");
+    assert_eq!(json, golden.trim_end(), "decoded panels changed");
 }

@@ -4,32 +4,38 @@
     "height": 5,
     "channels": 3,
     "keywords": [
-      [
-        "SIMPLE",
-        "T"
-      ],
-      [
-        "BITPIX",
-        "-32"
-      ],
-      [
-        "NAXIS",
-        "3"
-      ],
-      [
-        "NAXIS1",
-        "7"
-      ],
-      [
-        "NAXIS2",
-        "5"
-      ],
-      [
-        "NAXIS3",
-        "3"
-      ]
+      {
+        "name": "SIMPLE",
+        "value": "T",
+        "comment": ""
+      },
+      {
+        "name": "BITPIX",
+        "value": "-32",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS",
+        "value": "3",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS1",
+        "value": "7",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS2",
+        "value": "5",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS3",
+        "value": "3",
+        "comment": ""
+      }
     ],
-    "property_ids": [],
+    "properties": [],
     "pixel_fnv": "3bad023f04ba2f43"
   },
   "fits_f32_nonfinite": {
@@ -37,28 +43,33 @@
     "height": 3,
     "channels": 1,
     "keywords": [
-      [
-        "SIMPLE",
-        "T"
-      ],
-      [
-        "BITPIX",
-        "-32"
-      ],
-      [
-        "NAXIS",
-        "2"
-      ],
-      [
-        "NAXIS1",
-        "4"
-      ],
-      [
-        "NAXIS2",
-        "3"
-      ]
+      {
+        "name": "SIMPLE",
+        "value": "T",
+        "comment": ""
+      },
+      {
+        "name": "BITPIX",
+        "value": "-32",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS",
+        "value": "2",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS1",
+        "value": "4",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS2",
+        "value": "3",
+        "comment": ""
+      }
     ],
-    "property_ids": [],
+    "properties": [],
     "pixel_fnv": "25a79d320486972b"
   },
   "fits_i16_topdown": {
@@ -66,40 +77,48 @@
     "height": 4,
     "channels": 1,
     "keywords": [
-      [
-        "SIMPLE",
-        "T"
-      ],
-      [
-        "BITPIX",
-        "16"
-      ],
-      [
-        "NAXIS",
-        "2"
-      ],
-      [
-        "NAXIS1",
-        "6"
-      ],
-      [
-        "NAXIS2",
-        "4"
-      ],
-      [
-        "BZERO",
-        "32768"
-      ],
-      [
-        "BSCALE",
-        "1"
-      ],
-      [
-        "ROWORDER",
-        "'TOP-DOWN'"
-      ]
+      {
+        "name": "SIMPLE",
+        "value": "T",
+        "comment": ""
+      },
+      {
+        "name": "BITPIX",
+        "value": "16",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS",
+        "value": "2",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS1",
+        "value": "6",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS2",
+        "value": "4",
+        "comment": ""
+      },
+      {
+        "name": "BZERO",
+        "value": "32768",
+        "comment": ""
+      },
+      {
+        "name": "BSCALE",
+        "value": "1",
+        "comment": ""
+      },
+      {
+        "name": "ROWORDER",
+        "value": "'TOP-DOWN'",
+        "comment": ""
+      }
     ],
-    "property_ids": [],
+    "properties": [],
     "pixel_fnv": "c0a542e76dc82260"
   },
   "fits_u8": {
@@ -107,36 +126,43 @@
     "height": 3,
     "channels": 1,
     "keywords": [
-      [
-        "SIMPLE",
-        "T"
-      ],
-      [
-        "BITPIX",
-        "8"
-      ],
-      [
-        "NAXIS",
-        "2"
-      ],
-      [
-        "NAXIS1",
-        "5"
-      ],
-      [
-        "NAXIS2",
-        "3"
-      ],
-      [
-        "BZERO",
-        "0"
-      ],
-      [
-        "BSCALE",
-        "1"
-      ]
+      {
+        "name": "SIMPLE",
+        "value": "T",
+        "comment": ""
+      },
+      {
+        "name": "BITPIX",
+        "value": "8",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS",
+        "value": "2",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS1",
+        "value": "5",
+        "comment": ""
+      },
+      {
+        "name": "NAXIS2",
+        "value": "3",
+        "comment": ""
+      },
+      {
+        "name": "BZERO",
+        "value": "0",
+        "comment": ""
+      },
+      {
+        "name": "BSCALE",
+        "value": "1",
+        "comment": ""
+      }
     ],
-    "property_ids": [],
+    "properties": [],
     "pixel_fnv": "afdc92c780c8961e"
   },
   "xisf_mono_with_keywords": {
@@ -144,33 +170,121 @@
     "height": 4,
     "channels": 1,
     "keywords": [
-      [
-        "CREATOR",
-        "'mmm-synth'"
-      ],
-      [
-        "OBJECT",
-        "'M42'"
-      ],
-      [
-        "EXPTIME",
-        "30."
-      ]
+      {
+        "name": "CREATOR",
+        "value": "'mmm-synth'",
+        "comment": "synthetic ground-truth frame"
+      },
+      {
+        "name": "OBJECT",
+        "value": "'M42'",
+        "comment": ""
+      },
+      {
+        "name": "EXPTIME",
+        "value": "30.",
+        "comment": "s"
+      }
     ],
-    "property_ids": [],
+    "properties": [],
     "pixel_fnv": "136ddc1f6ca878ee"
+  },
+  "xisf_properties": {
+    "width": 4,
+    "height": 2,
+    "channels": 1,
+    "keywords": [
+      {
+        "name": "CREATOR",
+        "value": "'mmm-synth'",
+        "comment": "synthetic ground-truth frame"
+      }
+    ],
+    "properties": [
+      {
+        "id": "Test:String",
+        "type_": "String",
+        "value": {
+          "Str": "hello world"
+        },
+        "location": null
+      },
+      {
+        "id": "Test:F64",
+        "type_": "Float64",
+        "value": {
+          "F64": -0.5
+        },
+        "location": null
+      },
+      {
+        "id": "Test:I32",
+        "type_": "Int32",
+        "value": {
+          "I64": 42
+        },
+        "location": null
+      },
+      {
+        "id": "Test:Vec",
+        "type_": "F64Vector",
+        "value": {
+          "F64Vec": [
+            1.5,
+            -2.0
+          ]
+        },
+        "location": null
+      },
+      {
+        "id": "Test:Mat",
+        "type_": "F64Matrix",
+        "value": {
+          "F64Mat": {
+            "rows": 2,
+            "cols": 2,
+            "data": [
+              1.7547608877066523e-6,
+              5.238690722973033e-11,
+              0.0014062498191924533,
+              0.00006835938218046067
+            ]
+          }
+        },
+        "location": [
+          4096,
+          32
+        ]
+      },
+      {
+        "id": "Test:Complex",
+        "type_": "Complex64",
+        "value": {
+          "Str": "(1,2)"
+        },
+        "location": null
+      },
+      {
+        "id": "Test:C64Vec",
+        "type_": "C64Vector",
+        "value": "Unread",
+        "location": null
+      }
+    ],
+    "pixel_fnv": "bbf7e61c8812cf5e"
   },
   "xisf_rgb": {
     "width": 7,
     "height": 5,
     "channels": 3,
     "keywords": [
-      [
-        "CREATOR",
-        "'mmm-synth'"
-      ]
+      {
+        "name": "CREATOR",
+        "value": "'mmm-synth'",
+        "comment": "synthetic ground-truth frame"
+      }
     ],
-    "property_ids": [],
+    "properties": [],
     "pixel_fnv": "3bad023f04ba2f43"
   }
 }
