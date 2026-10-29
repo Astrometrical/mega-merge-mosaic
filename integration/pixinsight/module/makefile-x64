@@ -113,7 +113,8 @@ CXXFLAGS = -c -pipe -pthread -fPIC \
            -D_REENTRANT $(PLATFORM_CXXFLAGS) \
            -O3 -ffunction-sections -fdata-sections \
            -fvisibility=hidden -fvisibility-inlines-hidden \
-           -std=c++20 -Wall -Wno-parentheses
+           -std=c++20 -Wall -Wno-parentheses \
+           -MMD -MP
 
 LDFLAGS  = $(SHARED_FLAGS) -fPIC
 LIBS     = -L"$(PCLLIBDIR)" $(PLATFORM_LIBS)
@@ -187,6 +188,10 @@ $(OBJDIR)/%.o: $(HOSTDIR)/%.cpp | $(OBJDIR)
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
+
+# Header dependencies from -MMD (our own headers only: -isystem PCL headers
+# are left out), so e.g. a MmmVersion.h bump recompiles what includes it.
+-include $(OBJS:.o=.d)
 
 .PHONY: clean
 clean:
