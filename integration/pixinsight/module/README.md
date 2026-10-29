@@ -23,29 +23,25 @@ for what signed-repository distribution still needs.
 
 ## One-time prerequisite: build `libPCL-pxi.a`
 
-The module links PixInsight's own PCL library, statically. On a stock
-install (`/opt/PixInsight`), the PCL source tree
-(`/opt/PixInsight/src/{pcl,3rdparty}`) is **root-owned**, so build it
-out-of-tree into a writable directory instead of in place — no `sudo`
-required:
+The module links PCL statically, and must be compiled against the headers of
+**the same PCL** it links. Build the pinned PCL (`../ci/pcl-pin.env`, PCL
+2.10.8 = PixInsight 1.9.5's API 0x0188) out-of-tree with the CI script — no
+`sudo`, no PixInsight source tree needed:
 
 ```sh
-mkdir -p ~/.local/pcl-build/lib
-cp -r /opt/PixInsight/src/pcl      ~/.local/pcl-build/pcl
-cp -r /opt/PixInsight/src/3rdparty ~/.local/pcl-build/3rdparty
-mkdir -p ~/.local/pcl-build/pcl/linux/g++/x64/Release
-
-cd ~/.local/pcl-build/pcl/linux/g++
-PCLSRCDIR=~/.local/pcl-build \
-PCLINCDIR=/opt/PixInsight/include \
-PCLLIBDIR64=~/.local/pcl-build/lib \
-make -f makefile-x64 -j$(nproc)
+cd integration/pixinsight
+ci/build-pcl.sh --out ~/.local/pcl-2.10.8 --work ~/.local/pcl-2.10.8-src
 ```
 
-This produces `~/.local/pcl-build/lib/libPCL-pxi.a` (~45 MB). It builds clean
-with g++ 13.3 and needs no extra packages beyond what a stock PixInsight +
-build-essential install already provides. You only do this once per machine
-(or PixInsight core update — see the ABI note at the end of this file).
+This produces `~/.local/pcl-2.10.8/lib/libPCL-pxi.a` (~48 MB) and the matching
+headers in `~/.local/pcl-2.10.8/include`. You only do this once per machine,
+and again only when the pin changes.
+
+Do **not** compile against `/opt/PixInsight/include`: a PixInsight update
+replaces those headers with its own, newer PCL (1.9.5 build 1706 ships PCL
+2.11.0). They declare globals the pinned library lacks, and a module built
+that way fails to load with `undefined symbol: _ZN3pcl…`. On Linux the
+makefile checks for this after linking and refuses to produce such a module.
 
 ## Building the module
 
@@ -58,14 +54,16 @@ make
 the paths above:
 
 ```make
-PCLINCDIR ?= /opt/PixInsight/include
-PCLLIBDIR ?= $(HOME)/.local/pcl-build/lib
+PCL_PREFIX ?= $(HOME)/.local/pcl-2.10.8
+PCLINCDIR  ?= $(PCL_PREFIX)/include
+PCLLIBDIR  ?= $(PCL_PREFIX)/lib
 ```
 
-Override either if your PCL headers or `libPCL-pxi.a` live elsewhere, e.g.:
+Override `PCL_PREFIX` if you built the pinned PCL elsewhere (or `PCLINCDIR`
+and `PCLLIBDIR` separately, as CI does), e.g.:
 
 ```sh
-make PCLINCDIR=/opt/PixInsight/include PCLLIBDIR=/some/other/lib
+make PCL_PREFIX=/some/other/pcl
 ```
 
 The build compiles the module sources in this directory **and** the
@@ -302,9 +300,11 @@ one on macOS, so the equivalent macOS check is deferred entirely — see
 
 ## PCL ABI note
 
-The module is built against a specific PixInsight core's PCL/SDK
-(`/opt/PixInsight/include`, `libPCL-pxi.a`). A PixInsight core update can
-change that ABI, so re-run the `libPCL-pxi.a` build and re-link the module
-after updating PixInsight. `mmm-ipc-worker` is unaffected by PixInsight
+The module is built against the pinned PCL (`../ci/pcl-pin.env`), never
+against the installed core's headers, so a PixInsight update does not require
+a rebuild: newer cores load modules built for an older PCL API through
+backward compatibility. Bumping the pin is a deliberate act (it drops older
+cores; see the pin file) — rebuild `~/.local/pcl-2.10.8` from the new pin and
+re-link the module when that happens. `mmm-ipc-worker` is unaffected by PixInsight
 updates — it only speaks the wire protocol (`../PROTOCOL.md`), never links
 PCL, and never needs rebuilding for this reason.

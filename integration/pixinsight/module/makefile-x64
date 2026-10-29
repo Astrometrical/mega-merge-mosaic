@@ -11,8 +11,14 @@
 # are expected and correct.
 ######################################################################
 
-PCLINCDIR ?= /opt/PixInsight/include
-PCLLIBDIR ?= $(HOME)/.local/pcl-build/lib
+# Headers and libPCL-pxi.a must come from the SAME PCL: the pinned one that
+# ../ci/build-pcl.sh builds (see ../ci/pcl-pin.env). Do not point PCLINCDIR at
+# /opt/PixInsight/include -- a core update replaces those headers with a newer
+# PCL (1.9.5 build 1706 ships 2.11.0) whose new globals the pinned library
+# lacks, and the module then fails to load ("undefined symbol: _ZN3pcl...").
+PCL_PREFIX ?= $(HOME)/.local/pcl-2.10.8
+PCLINCDIR  ?= $(PCL_PREFIX)/include
+PCLLIBDIR  ?= $(PCL_PREFIX)/lib
 HOSTDIR    = ../host
 
 OBJDIR   = x64/Release
@@ -91,6 +97,10 @@ else
   PLATFORM_CXXFLAGS := -m64 -D__PCL_LINUX -D__PCL_AVX2 -D__PCL_FMA \
                         -mavx2 -mfma -fnon-call-exceptions -minline-all-stringops
   PLATFORM_LIBS := -lPCL-pxi -lpthread -lrt
+  # Core symbols are legitimately undefined (see header), but every pcl::
+  # symbol must resolve inside libPCL-pxi.a; one left undefined means the
+  # headers and the library are different PCL versions.
+  CHECK_PCL_SYMBOLS := 1
 endif
 
 TARGET   = mmm-pxm.$(MODULE_EXT)
@@ -128,6 +138,13 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $(TARGET) $(OBJS) $(LIBS)
+ifeq ($(CHECK_PCL_SYMBOLS),1)
+	@missing="$$(nm -D --undefined-only $(TARGET) | grep ' _ZN3pcl' || true)"; \
+	if [ -n "$$missing" ]; then \
+	  echo "error: $(TARGET) leaves PCL symbols undefined -- PCLINCDIR and" >&2; \
+	  echo "       PCLLIBDIR are from different PCL versions:" >&2; \
+	  echo "$$missing" >&2; rm -f $(TARGET); exit 1; fi
+endif
 
 # --- Code signing (PixInsight >= 1.9 refuses unsigned modules) ---------------
 # PixInsight 1.9 removed the "allow unsigned modules" option. For LOCAL
