@@ -227,10 +227,12 @@ fn decode_locked(
 
 /// Size `file` to `len` bytes with its disk space actually reserved, so a
 /// full disk is an error here rather than SIGBUS on a store into the
-/// mapping (a plain `set_len` makes a sparse file on unix). Filesystems
-/// without `fallocate` support fall back to `set_len`.
+/// mapping (a plain `set_len` makes a sparse file on unix). Linux & co use
+/// `posix_fallocate`, macOS `F_PREALLOCATE` (it has no `posix_fallocate`);
+/// filesystems without either fall back to `set_len`. On Windows `set_len`
+/// itself allocates.
 fn reserve(file: &std::fs::File, len: u64) -> std::io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         use std::os::fd::AsRawFd;
         let n = libc::off_t::try_from(len)
@@ -241,6 +243,29 @@ fn reserve(file: &std::fs::File, len: u64) -> std::io::Result<()> {
             libc::EOPNOTSUPP | libc::EINVAL => {}
             err => return Err(std::io::Error::from_raw_os_error(err)),
         }
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let n = libc::off_t::try_from(len)
+            .map_err(|_| std::io::Error::other("cache file too large"))?;
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: n,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: a valid open file descriptor and a live, initialised
+        // fstore_t that fcntl may write `fst_bytesalloc` into.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) } == -1 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ENOTSUP) | Some(libc::EINVAL) => {}
+                _ => return Err(err),
+            }
+        }
+        // F_PREALLOCATE reserves blocks but leaves the length; set it below.
     }
     file.set_len(len)
 }
@@ -404,6 +429,8 @@ mod tests {
             floats(&decoded_planes_in(&img, Some(&cache), &|_| {}).unwrap()),
             pixels(0)
         );
+        // Unmap the source first: Windows refuses to rewrite a mapped file.
+        drop(img);
         // Re-save with different pixels (same size) and a later mtime.
         write_pair(&dir, 7);
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
