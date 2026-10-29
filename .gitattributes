@@ -1,0 +1,3 @@
+# Golden fixtures are compared byte-for-byte (after trimming the trailing
+# newline); keep them LF on every checkout, Windows autocrlf included.
+crates/*/tests/fixtures/** text eol=lf
