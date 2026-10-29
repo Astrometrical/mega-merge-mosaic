@@ -88,7 +88,7 @@
 <h1>MegaMergeMosaic</h1>
 <!-- version kept in sync with MmmVersion.h / Cargo.toml; enforced by
      crates/mmm-ipc-worker/tests/version_sync.rs -->
-<p class="subtitle">Version 1.6.0 &mdash; Category: Mosaic</p>
+<p class="subtitle">Version 1.7.0 &mdash; Category: Mosaic</p>
 <p class="tagline">Big mosaics, no big deal.</p>
 <p>Requires PixInsight 1.9.5 or later (earlier versions: use MegaMergeMosaic 1.4.2).</p>
 
@@ -124,7 +124,10 @@ must also have the same number of channels: monochrome and colour images
 cannot be mixed in one run, and a mixed set is refused with a message naming
 the offending panels before any processing starts. Panels may be XISF or
 FITS files; FITS panels are aligned from their WCS solution, including SIP
-distortion terms.</p>
+distortion terms. Compressed XISF files, such as the masters written by
+WeightedBatchPreprocessing, are supported: each is decompressed once into the
+session directory (see <b>Session directory</b>), and the process console
+says so, with the size, when it happens.</p>
 
 <h2>Parameters</h2>
 
@@ -240,7 +243,11 @@ preserved; only large-scale gradients are removed.</td>
 folder). All intermediate stage results are written here; re-running the
 process against the same session directory and inputs reuses any stage
 that has already completed, instead of recomputing it. If empty (default),
-an automatic temporary directory is used and removed when the run finishes.</td>
+an automatic temporary directory is used and removed when the run finishes.
+Compressed XISF panels are decompressed into a <code>decoded</code> folder
+here (about the size of the uncompressed image, e.g. 2&nbsp;GB per
+full-canvas colour panel); set a session directory to keep them between runs
+instead of decompressing again each time.</td>
 </tr>
 
 <tr>

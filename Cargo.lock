@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "mmm"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "mmm-core"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "bytemuck",
  "libc",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "mmm-ipc-worker"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "mmm-core",
  "mpp-core",
