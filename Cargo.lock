@@ -429,6 +429,7 @@ dependencies = [
 [[package]]
 name = "mpp-core"
 version = "0.1.0"
+source = "git+https://github.com/Astrometrical/mega-pixel-processor?rev=3b7190e5fbf8ff6cd34c351096be59a24f89d24c#3b7190e5fbf8ff6cd34c351096be59a24f89d24c"
 dependencies = [
  "bytemuck",
  "flate2",

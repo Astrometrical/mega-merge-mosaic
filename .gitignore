@@ -19,3 +19,6 @@
 # Editor
 .vscode/
 .idea/
+
+# Local cargo overrides (e.g. mpp-core [patch] to the sibling checkout)
+/.cargo/config.toml

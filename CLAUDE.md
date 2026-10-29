@@ -8,7 +8,9 @@ architecture, verified facts about the input data, and the algorithm choices.
 
 - `crates/mmm-core` — engine library (UI-agnostic; a GUI will reuse it)
 - `../mega-pixel-processor` (sibling checkout, `mpp-core`) — all XISF/FITS
-  reading and writing; mmm depends on it by path (`default-features = false`)
+  reading and writing; mmm pins it as a git dependency by `rev`
+  (`default-features = false`); a gitignored `.cargo/config.toml` `[patch]`
+  points it at the sibling checkout (DESIGN.md "Dependency on mpp-core")
 - `crates/mmm` — CLI frontend (thin)
 - `docs/DESIGN.md` — architecture spec; keep it current when design changes
 - `docs/superpowers/plans/` — implementation plans

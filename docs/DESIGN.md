@@ -623,10 +623,22 @@ The value types crossing the PixInsight IPC (`FitsKeyword`, `XisfProperty`,
     (legacy solutions) and `orion_mosaic_raw_panels_195` (standard
     solutions, full distortion) give byte-identical sessions and blend
     output, header included, to the pre-switch binary.
-- **Dependency.** A path dependency on the sibling checkout
-  (`../mega-pixel-processor`) while both repos are on feature branches; it
-  becomes a pinned git dependency once mega-pixel-processor is public (CI
-  checks out only this repo).
+- **Dependency on mpp-core.** A git dependency on the public
+  mega-pixel-processor repo, pinned by `rev` in the workspace `Cargo.toml`
+  (CI checks out only this repo). Bump the rev deliberately, after the mpp
+  commit is pushed. For co-development against the sibling checkout, put
+  this in a gitignored `.cargo/config.toml` (paths are relative to the
+  directory holding `.cargo/`):
+
+  ```toml
+  [patch."https://github.com/Astrometrical/mega-pixel-processor"]
+  mpp-core = { path = "../mega-pixel-processor/crates/mpp-core" }
+  ```
+
+  Cargo then builds the local checkout; `cargo tree -i mpp-core` shows which
+  one is in use. While patched, cargo drops mpp-core's `source = "git+…"`
+  line from `Cargo.lock`; don't commit that hunk (`git checkout Cargo.lock`)
+  — the committed lock must keep the git source CI resolves.
 
 ## Performance notes
 
