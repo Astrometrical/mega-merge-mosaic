@@ -9,7 +9,9 @@
 //!
 //! # File format (version 1)
 //!
-//! All integers and samples are little endian.
+//! All integers and samples are little endian — including the tile state
+//! entries, which are accessed as atomics in place and converted with
+//! `to_le`/`from_le` on every load and store.
 //!
 //! 1. **Header**, 4096 bytes: magic `b"MMMTILE\0"`, `u32` version (`1`),
 //!    `u32` tile size, `u64` width, `u64` height, `u32` channels, `u32`
@@ -44,6 +46,27 @@
 //! value is forced odd and the final value even, so an entry left odd by a
 //! crash mid-write is simply invalid and the next write recovers it.
 //!
+//! [`TileStore::read_tile`] / [`TileReader::read_tile`] accept valid tiles
+//! only. For the viewer, which shows stale tiles dimmed, `state` reports a
+//! tile's [`TileState`] from its entry alone, and `read_tile_any` copies a
+//! valid *or* stale tile under the same protocol (the first load must be
+//! even and non-zero instead of even and valid).
+//!
+//! # Concurrency contract
+//!
+//! - **One [`TileStore`] (writer) per file.** Nothing enforces this yet, in
+//!   process or across processes (a later plan adds an in-process guard);
+//!   two writers on one file break the seqlock.
+//! - **Readers must close before a store is recreated.**
+//!   [`TileStore::create`] truncates the file; a live [`TileReader`] mapping
+//!   then faults. An existing store of matching geometry is reopened, never
+//!   recreated.
+//! - Any number of readers, on any threads or processes, may run alongside
+//!   the writer.
+//!
+//! The mosaic-level rules (cancelling a blend before editing settings, who
+//! saves the configuration) are in [`crate::mosaic`].
+//!
 //! `open`/`create` reject geometries whose layout would overflow (tile edge
 //! over 65536, a tile grid wider than `u32`, or a file size beyond `isize`).
 //!
@@ -74,6 +97,21 @@ const VALID: u32 = 1 << 31;
 const SEQ: u32 = !VALID;
 /// Largest supported tile edge.
 const MAX_TILE: u32 = 65536;
+
+/// What a tile's state entry says about it — the viewer's cheap validity
+/// query ([`TileStore::state`], [`TileReader::state`]; no sample copy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileState {
+    /// Never written (a zeroed entry): nothing to show.
+    Missing,
+    /// Written before but invalidated since — its samples are a complete
+    /// earlier result, shown dimmed until a blend re-validates it. An entry
+    /// caught mid-write (odd sequence, or left odd by a crash) also reports
+    /// `Stale`; [`TileStore::read_tile_any`] returns no copy for it.
+    Stale,
+    /// Holds the current blend's data.
+    Valid,
+}
 
 /// Shape of a tile pyramid: the level-0 image size, channel count, and tile
 /// edge. All rectangles are exclusive `[x0, y0, x1, y1]`.
@@ -311,32 +349,72 @@ impl Raw {
         unsafe { std::slice::from_raw_parts(self.base.add(off) as *const AtomicU32, n) }
     }
 
-    fn is_valid(&self, idx: usize) -> bool {
-        let e = self.state(idx).load(Ordering::Relaxed);
+    /// Load tile `idx`'s state entry (stored little endian), ordered before
+    /// any later load. Relaxed load + Acquire fence rather than an Acquire
+    /// load: std only guarantees Relaxed atomic loads on read-only (reader)
+    /// mappings.
+    fn load_state(&self, idx: usize) -> u32 {
+        let e = u32::from_le(self.state(idx).load(Ordering::Relaxed));
         fence(Ordering::Acquire);
-        stable_valid(e)
+        e
+    }
+
+    /// Store tile `idx`'s state entry (little endian) with Release ordering
+    /// (writer side only).
+    fn store_state(&self, idx: usize, e: u32) {
+        self.state(idx).store(e.to_le(), Ordering::Release);
+    }
+
+    fn is_valid(&self, idx: usize) -> bool {
+        stable_valid(self.load_state(idx))
+    }
+
+    fn tile_state(&self, idx: usize) -> TileState {
+        classify(self.load_state(idx))
     }
 
     fn read_tile(&self, idx: usize, out: &mut [f32]) -> bool {
-        self.read_tile_with(idx, out, || {})
+        self.copy_with(idx, out, stable_valid, || {}).is_some()
     }
 
     /// [`Self::read_tile`] with `mid` run between the copy and the
     /// re-check (a test hook for simulating a racing writer).
+    #[cfg(test)]
     fn read_tile_with(&self, idx: usize, out: &mut [f32], mid: impl FnOnce()) -> bool {
+        self.copy_with(idx, out, stable_valid, mid).is_some()
+    }
+
+    /// Copy tile `idx` if it holds a complete (stable, ever-written) copy,
+    /// valid or stale; `mid` runs between the copy and the re-check.
+    fn read_tile_any_with(
+        &self,
+        idx: usize,
+        out: &mut [f32],
+        mid: impl FnOnce(),
+    ) -> Option<TileState> {
+        self.copy_with(idx, out, |e| e != 0 && e & 1 == 0, mid)
+            .map(classify)
+    }
+
+    /// The seqlock read: load the entry, require `accept(entry)`, copy the
+    /// samples, run `mid`, and re-load the entry; the copy counts (returning
+    /// the entry) only if it did not change.
+    fn copy_with(
+        &self,
+        idx: usize,
+        out: &mut [f32],
+        accept: impl Fn(u32) -> bool,
+        mid: impl FnOnce(),
+    ) -> Option<u32> {
         let n = self.layout.g.tile_len();
         assert_eq!(
             out.len(),
             n,
             "tile buffer must hold channels × tile × tile samples"
         );
-        let state = self.state(idx);
-        // Relaxed load + Acquire fence rather than an Acquire load: std only
-        // guarantees Relaxed atomic loads on read-only (reader) mappings.
-        let first = state.load(Ordering::Relaxed);
-        fence(Ordering::Acquire);
-        if !stable_valid(first) {
-            return false;
+        let first = self.load_state(idx);
+        if !accept(first) {
+            return None;
         }
         for (o, s) in out.iter_mut().zip(self.samples(idx)) {
             *o = f32::from_bits(u32::from_le(s.load(Ordering::Relaxed)));
@@ -344,16 +422,26 @@ impl Raw {
         mid();
         // Keep the sample loads above from sinking below the re-check.
         fence(Ordering::Acquire);
-        state.load(Ordering::Relaxed) == first
+        (u32::from_le(self.state(idx).load(Ordering::Relaxed)) == first).then_some(first)
     }
 
     /// Clear tile `idx`'s valid bit (writer side only).
     fn invalidate(&self, idx: usize) {
-        let state = self.state(idx);
-        let e = state.load(Ordering::Relaxed);
+        let e = u32::from_le(self.state(idx).load(Ordering::Relaxed));
         if e & VALID != 0 {
-            state.store(e & SEQ, Ordering::Release);
+            self.store_state(idx, e & SEQ);
         }
+    }
+}
+
+/// The [`TileState`] a state entry encodes.
+fn classify(e: u32) -> TileState {
+    if e == 0 {
+        TileState::Missing
+    } else if stable_valid(e) {
+        TileState::Valid
+    } else {
+        TileState::Stale
     }
 }
 
@@ -472,12 +560,11 @@ impl TileStore {
         let t = t as usize;
 
         // Single writer (`&mut self`), so load-then-store cannot race.
-        let state = self.raw.state(idx);
-        let seq = state.load(Ordering::Relaxed) & SEQ;
+        let seq = u32::from_le(self.raw.state(idx).load(Ordering::Relaxed)) & SEQ;
         // Always odd while writing, always even after, even if a crash
         // mid-write left the persisted sequence odd.
         let writing = (seq.wrapping_add(1) | 1) & SEQ;
-        state.store(writing, Ordering::Release);
+        self.raw.store_state(idx, writing);
         // Keep the sample stores below from rising above the odd store.
         fence(Ordering::Release);
         let samples = self.raw.samples(idx);
@@ -487,7 +574,8 @@ impl TileStore {
             let v = if x < vw && y < vh { v } else { 0.0 };
             s.store(v.to_bits().to_le(), Ordering::Relaxed);
         }
-        state.store((writing.wrapping_add(1) & SEQ) | VALID, Ordering::Release);
+        self.raw
+            .store_state(idx, (writing.wrapping_add(1) & SEQ) | VALID);
         Ok(())
     }
 
@@ -499,6 +587,34 @@ impl TileStore {
     pub fn read_tile(&self, level: u32, tx: u32, ty: u32, out: &mut [f32]) -> bool {
         self.raw
             .read_tile(self.raw.layout.index(level, tx, ty), out)
+    }
+
+    /// The state of tile `(tx, ty)` at `level`, from its state entry alone
+    /// (no sample copy). A later read may still see it change.
+    ///
+    /// # Panics
+    /// If the level or tile is out of range.
+    pub fn state(&self, level: u32, tx: u32, ty: u32) -> TileState {
+        self.raw.tile_state(self.raw.layout.index(level, tx, ty))
+    }
+
+    /// Copy tile `(tx, ty)` at `level` into `out` whether valid or stale:
+    /// `Some(Valid | Stale)` if a complete copy was made (the tile was
+    /// written at least once, is not mid-write, and did not change during
+    /// the copy), `None` (contents of `out` unspecified) if it is missing or
+    /// the copy was torn. [`Self::read_tile`] accepts valid tiles only.
+    ///
+    /// # Panics
+    /// If the level or tile is out of range, or `out` is not one tile long.
+    pub fn read_tile_any(
+        &self,
+        level: u32,
+        tx: u32,
+        ty: u32,
+        out: &mut [f32],
+    ) -> Option<TileState> {
+        self.raw
+            .read_tile_any_with(self.raw.layout.index(level, tx, ty), out, || {})
     }
 
     /// Invalidate, at every level, the tiles covering `r` (level-0 coords).
@@ -583,6 +699,34 @@ impl TileReader {
     pub fn read_tile(&self, level: u32, tx: u32, ty: u32, out: &mut [f32]) -> bool {
         self.raw
             .read_tile(self.raw.layout.index(level, tx, ty), out)
+    }
+
+    /// The state of tile `(tx, ty)` at `level`, from its state entry alone
+    /// (no sample copy). A later read may still see it change.
+    ///
+    /// # Panics
+    /// If the level or tile is out of range.
+    pub fn state(&self, level: u32, tx: u32, ty: u32) -> TileState {
+        self.raw.tile_state(self.raw.layout.index(level, tx, ty))
+    }
+
+    /// Copy tile `(tx, ty)` at `level` into `out` whether valid or stale:
+    /// `Some(Valid | Stale)` if a complete copy was made (the tile was
+    /// written at least once, is not mid-write, and did not change during
+    /// the copy), `None` (contents of `out` unspecified) if it is missing or
+    /// the copy was torn. [`Self::read_tile`] accepts valid tiles only.
+    ///
+    /// # Panics
+    /// If the level or tile is out of range, or `out` is not one tile long.
+    pub fn read_tile_any(
+        &self,
+        level: u32,
+        tx: u32,
+        ty: u32,
+        out: &mut [f32],
+    ) -> Option<TileState> {
+        self.raw
+            .read_tile_any_with(self.raw.layout.index(level, tx, ty), out, || {})
     }
 }
 
@@ -782,10 +926,110 @@ mod tests {
 
         // The state entry: valid and even when stable, sequence advancing by
         // two per write, valid bit cleared (sequence kept) on invalidate.
-        let e = r.raw.state(idx).load(Ordering::Relaxed);
+        let e = r.raw.load_state(idx);
         assert_eq!(e, 4, "two writes then an invalidate");
         s.write_tile(0, 2, 1, &new).unwrap();
-        assert_eq!(r.raw.state(idx).load(Ordering::Relaxed), VALID | 6);
+        assert_eq!(r.raw.load_state(idx), VALID | 6);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn tile_state_reports_missing_stale_valid() {
+        let p = tmp("state");
+        let g = geom();
+        let mut s = TileStore::create(&p, g).unwrap();
+        let r = TileReader::open(&p).unwrap();
+        let mut out = filled(g, -1.0);
+        assert_eq!(s.state(0, 1, 1), TileState::Missing);
+        assert_eq!(r.state(0, 1, 1), TileState::Missing);
+        assert_eq!(r.read_tile_any(0, 1, 1, &mut out), None);
+
+        s.write_tile(0, 1, 1, &filled(g, 1.0)).unwrap();
+        assert_eq!(s.state(0, 1, 1), TileState::Valid);
+        assert_eq!(r.state(0, 1, 1), TileState::Valid);
+        assert_eq!(r.read_tile_any(0, 1, 1, &mut out), Some(TileState::Valid));
+        assert!(out.iter().all(|&v| v == 1.0));
+
+        // Invalidated: stale, still readable (dimmed in the viewer), but not
+        // through read_tile.
+        s.invalidate_rect([256, 256, 257, 257]);
+        assert_eq!(s.state(0, 1, 1), TileState::Stale);
+        assert_eq!(r.state(0, 1, 1), TileState::Stale);
+        assert!(!r.read_tile(0, 1, 1, &mut out));
+        out.fill(-1.0);
+        assert_eq!(r.read_tile_any(0, 1, 1, &mut out), Some(TileState::Stale));
+        assert!(out.iter().all(|&v| v == 1.0));
+        out.fill(-1.0);
+        assert_eq!(s.read_tile_any(0, 1, 1, &mut out), Some(TileState::Stale));
+        assert!(out.iter().all(|&v| v == 1.0));
+
+        // Rewritten: valid with the new data.
+        s.write_tile(0, 1, 1, &filled(g, 2.0)).unwrap();
+        assert_eq!(r.read_tile_any(0, 1, 1, &mut out), Some(TileState::Valid));
+        assert!(out.iter().all(|&v| v == 2.0));
+
+        // Mid-write (odd sequence, e.g. a crash): stale, no complete copy.
+        let idx = s.raw.layout.index(0, 1, 1);
+        s.raw.store_state(idx, 5);
+        assert_eq!(r.state(0, 1, 1), TileState::Stale);
+        assert_eq!(r.read_tile_any(0, 1, 1, &mut out), None);
+        assert!(!r.read_tile(0, 1, 1, &mut out));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_tile_any_rejects_straddled_rewrite() {
+        let p = tmp("straddle-any");
+        let g = geom();
+        let mut s = TileStore::create(&p, g).unwrap();
+        s.write_tile(0, 2, 1, &filled(g, 1.0)).unwrap();
+        let r = TileReader::open(&p).unwrap();
+        let idx = r.raw.layout.index(0, 2, 1);
+        let mut out = filled(g, 0.0);
+
+        // A complete rewrite between the copy and the re-check: rejected.
+        assert_eq!(
+            r.raw.read_tile_any_with(idx, &mut out, || {
+                s.write_tile(0, 2, 1, &filled(g, 2.0)).unwrap();
+            }),
+            None
+        );
+        // An invalidation mid-copy: rejected too (the entry changed).
+        assert_eq!(
+            r.raw.read_tile_any_with(idx, &mut out, || {
+                s.invalidate_rect([600, 300, 601, 301]);
+            }),
+            None
+        );
+        // A stale tile rewritten mid-copy: rejected.
+        assert_eq!(
+            r.raw.read_tile_any_with(idx, &mut out, || {
+                s.write_tile(0, 2, 1, &filled(g, 3.0)).unwrap();
+            }),
+            None
+        );
+        // Undisturbed copies succeed.
+        assert_eq!(
+            r.raw.read_tile_any_with(idx, &mut out, || {}),
+            Some(TileState::Valid)
+        );
+        assert!(out.iter().all(|&v| v == 3.0));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn state_entries_are_little_endian_on_disk() {
+        let p = tmp("le");
+        let g = geom();
+        let mut s = TileStore::create(&p, g).unwrap();
+        s.write_tile(0, 1, 0, &filled(g, 1.0)).unwrap();
+        s.flush().unwrap();
+        let idx = s.raw.layout.index(0, 1, 0);
+        drop(s);
+        let bytes = std::fs::read(&p).unwrap();
+        let off = HEADER_LEN + idx * 4;
+        let e = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        assert_eq!(e, VALID | 2);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -797,7 +1041,7 @@ mod tests {
         s.write_tile(0, 0, 1, &filled(g, 1.0)).unwrap();
         let idx = s.raw.layout.index(0, 0, 1);
         // Simulate a crash after the odd store: entry left odd, not valid.
-        s.raw.state(idx).store(3, Ordering::Relaxed);
+        s.raw.store_state(idx, 3);
         drop(s);
         let mut s = TileStore::open(&p).unwrap();
         assert!(!s.is_valid(0, 0, 1));
@@ -806,7 +1050,7 @@ mod tests {
         let mut out = filled(g, 0.0);
         assert!(TileReader::open(&p).unwrap().read_tile(0, 0, 1, &mut out));
         // Sequence wrap: from the top of the 31-bit range, still valid.
-        s.raw.state(idx).store(SEQ, Ordering::Relaxed);
+        s.raw.store_state(idx, SEQ);
         s.write_tile(0, 0, 1, &filled(g, 3.0)).unwrap();
         assert!(s.is_valid(0, 0, 1));
         let _ = std::fs::remove_file(&p);
