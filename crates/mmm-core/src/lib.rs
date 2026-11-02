@@ -26,6 +26,8 @@
 //! - [`output`] — ready-made sinks: streaming FITS, autostretched PNG
 //!   preview, and a [`output::Tee`] to feed both in one pass.
 //! - [`diag`] — seam/ownership diagnostics for reporting UIs.
+//! - [`health`] — seam steps (with outlier flags) and photometric gain/offset
+//!   spread as data for health UIs.
 //! - [`formats`] + [`panel_reader`] — input access: the XISF and FITS readers
 //!   behind the format-agnostic [`formats::InputPanel`], and the
 //!   storage-agnostic row reader the pipeline consumes. For band-cached

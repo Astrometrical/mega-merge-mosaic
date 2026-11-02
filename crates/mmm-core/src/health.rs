@@ -35,8 +35,10 @@ pub struct SeamStep {
 pub struct Health {
     /// Measured seam steps, ordered by `(a, b)`.
     pub seams: Vec<SeamStep>,
-    /// Median seam step (equals `MosaicSummary::seam_delta_median`); `0`
-    /// when there are no measurable edges.
+    /// Median seam step; `0` when there are no measurable edges. Equals
+    /// `MosaicSummary::seam_delta_median`: `seam_deltas` only creates an
+    /// entry once a cell is measured (`n >= 1`), so dropping `n == 0` edges
+    /// here never changes the set the summary takes its median over.
     pub seam_delta_median: f64,
     /// Largest seam step; `0` when there are none.
     pub seam_delta_max: f64,
