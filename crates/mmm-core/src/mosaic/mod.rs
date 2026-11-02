@@ -1,7 +1,14 @@
 //! The mosaic project: its persisted configuration (`mosaic.json`), panel
-//! grouping, and the names of the files in a mosaic directory.
+//! grouping, the names of the files in a mosaic directory, and the
+//! orchestration that analyzes every group and blends a group into its tiled
+//! result ([`Mosaic`], [`analyze_all`], [`blend_group`]).
 
 pub mod grouping;
+mod run;
+
+pub use run::{
+    Mosaic, analyze_all, blend_group, set_analyze_settings, set_blend_settings, set_group_override,
+};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

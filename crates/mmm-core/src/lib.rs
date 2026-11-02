@@ -47,7 +47,10 @@
 //!   [`tiles::blend_tiles`] blends a canvas rect into it and rebuilds the
 //!   parent levels, cancellably.
 //! - [`mosaic`] — the mosaic project: `mosaic.json` configuration, panel
-//!   grouping rules and the on-disk session layout.
+//!   grouping rules and the on-disk session layout; [`mosaic::Mosaic`] with
+//!   [`mosaic::analyze_all`] (every group onto one shared reference frame)
+//!   and [`mosaic::blend_group`] (a group into its tiled result), plus
+//!   settings edits that stale exactly the affected result stores.
 //! - [`stretch`] — display stretch maths: per-channel median/MAD statistics
 //!   and an auto stretch (display only; the data stays linear).
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
