@@ -10,15 +10,17 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
-    analyze_all, blend_group, set_blend_settings, set_group_override,
+    analyze_all, blend_group, set_analyze_settings, set_blend_settings, set_group_override,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
-use mmm_core::settings::{BlendOverride, BlendSettings, ChangeImpact, GroupOverride};
+use mmm_core::settings::{
+    AnalyzeOverride, BlendOverride, BlendSettings, ChangeImpact, GroupOverride,
+};
 use mmm_core::surfaces::Surfaces;
 use mmm_core::synth::{SynthSpec, generate, write_xisf_with_header_xml};
-use mmm_core::tiles::TileStore;
+use mmm_core::tiles::{TILE, TileGeometry, TileStore};
 
 /// Comparison tolerance (matches `tiles_blend.rs`).
 const TOL: f32 = 1e-6;
@@ -178,9 +180,9 @@ fn two_group_mosaic_end_to_end() {
     assert!(m.dir.join(GROUPS_DIR).join("Ha/session.json").is_file());
     assert!(m.dir.join(GROUPS_DIR).join("OIII/session.json").is_file());
     assert!(m.dir.join(FRAME_FILE).is_file());
-    assert_eq!(m.group_session_dir("Ha", &groups), m.dir.join("groups/Ha"));
+    assert_eq!(m.group_session_dir("Ha"), m.dir.join("groups/Ha"));
     assert_eq!(
-        m.result_path("Ha", &groups),
+        m.result_path("Ha"),
         m.dir.join("groups/Ha").join(RESULT_FILE)
     );
     assert!(m.config.panels.iter().all(|p| p.fingerprint.is_some()));
@@ -188,8 +190,8 @@ fn two_group_mosaic_end_to_end() {
     let r = blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
     assert_eq!(r, [0, 0, CANVAS.0, CANVAS.1]);
 
-    let full = direct_blend(&m.group_session_dir("Ha", &groups));
-    let store = TileStore::open(&m.result_path("Ha", &groups)).unwrap();
+    let full = direct_blend(&m.group_session_dir("Ha"));
+    let store = TileStore::open(&m.result_path("Ha")).unwrap();
     let g = store.geometry();
     assert_eq!(
         (g.width, g.height, g.channels as u64),
@@ -249,10 +251,10 @@ fn grouping_off_uses_single_group() {
 fn override_only_stales_its_group() {
     let tmp = TempDir::new("override");
     let mut m = two_group_mosaic(&tmp.0);
-    let groups = analyze_all(&mut m, &JobCtl::none()).unwrap();
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
     blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
     blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
-    let (ha, oiii) = (m.result_path("Ha", &groups), m.result_path("OIII", &groups));
+    let (ha, oiii) = (m.result_path("Ha"), m.result_path("OIII"));
     let oiii_before = valid0(&oiii);
     assert!(valid0(&ha) > 0 && oiii_before > 0);
 
@@ -294,7 +296,7 @@ fn override_only_stales_its_group() {
 fn blend_settings_change_stales_all() {
     let tmp = TempDir::new("blendset");
     let mut m = two_group_mosaic(&tmp.0);
-    let groups = analyze_all(&mut m, &JobCtl::none()).unwrap();
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
     blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
     blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
 
@@ -303,7 +305,7 @@ fn blend_settings_change_stales_all() {
         set_blend_settings(&mut m, same).unwrap(),
         ChangeImpact::None
     );
-    assert!(valid0(&m.result_path("Ha", &groups)) > 0);
+    assert!(valid0(&m.result_path("Ha")) > 0);
 
     let new = BlendSettings {
         feather_px: m.config.blend.feather_px + 10.0,
@@ -313,8 +315,8 @@ fn blend_settings_change_stales_all() {
         set_blend_settings(&mut m, new.clone()).unwrap(),
         ChangeImpact::Reblend
     );
-    assert_eq!(valid0(&m.result_path("Ha", &groups)), 0);
-    assert_eq!(valid0(&m.result_path("OIII", &groups)), 0);
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert_eq!(valid0(&m.result_path("OIII")), 0);
     assert_eq!(MosaicConfig::load(&m.dir).unwrap().blend, new);
 }
 
@@ -365,4 +367,146 @@ fn cancel_analyze_all_is_cancelled() {
     assert!(m.dir.join(GROUPS_DIR).join("Ha/session.json").is_file());
     assert!(!m.dir.join(GROUPS_DIR).join("OIII/session.json").exists());
     assert!(MosaicConfig::load(&m.dir).unwrap().provenance.is_empty());
+}
+
+/// Every level-0 tile of the store at `path` is valid and the geometry is
+/// the canvas.
+fn assert_fully_valid(path: &Path) {
+    let store = TileStore::open(path).unwrap();
+    let g = store.geometry();
+    assert_eq!(
+        (g.width, g.height, g.channels as u64),
+        (CANVAS.0, CANVAS.1, CH)
+    );
+    let (nx, ny) = g.tiles(0);
+    assert_eq!(store.valid_count(0), (nx * ny) as usize);
+}
+
+#[test]
+fn blend_group_replaces_mismatched_or_corrupt_store() {
+    let tmp = TempDir::new("replace");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let path = m.result_path("Ha");
+
+    // A store of another geometry (dropped before blending).
+    let wrong = TileGeometry {
+        width: 100,
+        height: 80,
+        channels: 1,
+        tile: TILE,
+    };
+    drop(TileStore::create(&path, wrong).unwrap());
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&path);
+
+    // A corrupt, short file.
+    std::fs::write(&path, b"not a tile store").unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&path);
+}
+
+#[test]
+fn group_dirs_stay_stable_when_names_collide() {
+    let tmp = TempDir::new("dirs");
+    let mut cfg = MosaicConfig::new(vec!["a.xisf".into()]);
+    cfg.grouping.enabled = true;
+    cfg.panels[0].manual_group = Some("Ha_3nm".into());
+    let mut m = Mosaic::create(&tmp.0.join("m"), cfg).unwrap();
+    let groups = m.groups().unwrap();
+    assert!(m.assign_group_dirs(&groups));
+    assert!(!m.assign_group_dirs(&groups));
+    let first = m.group_session_dir("Ha_3nm");
+    assert_eq!(first, m.dir.join(GROUPS_DIR).join("Ha_3nm"));
+
+    // "Ha 3nm" sanitises to the same name and sorts first, yet the existing
+    // assignment keeps its directory.
+    m.config.panels.push(mmm_core::mosaic::PanelEntry {
+        path: "b.xisf".into(),
+        fingerprint: None,
+        manual_group: Some("Ha 3nm".into()),
+    });
+    let groups = m.groups().unwrap();
+    assert!(m.assign_group_dirs(&groups));
+    assert_eq!(m.group_session_dir("Ha_3nm"), first);
+    let second = m.group_session_dir("Ha 3nm");
+    assert_ne!(second, first);
+    assert_eq!(second, m.dir.join(GROUPS_DIR).join("Ha_3nm-2"));
+
+    // Persisted: a reopened mosaic maps both the same way.
+    m.save().unwrap();
+    let reopened = Mosaic::open(&m.dir).unwrap();
+    assert_eq!(reopened.group_session_dir("Ha_3nm"), first);
+    assert_eq!(reopened.group_session_dir("Ha 3nm"), second);
+}
+
+#[test]
+fn analyze_settings_change_blocks_blend_until_reanalyzed() {
+    let tmp = TempDir::new("anaset");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+
+    let same = m.config.analyze.clone();
+    assert_eq!(
+        set_analyze_settings(&mut m, same).unwrap(),
+        ChangeImpact::None
+    );
+    assert!(m.config.needs_analyze.is_empty());
+
+    let mut new = m.config.analyze.clone();
+    new.surface = Some(1);
+    assert_eq!(
+        set_analyze_settings(&mut m, new.clone()).unwrap(),
+        ChangeImpact::Reanalyze
+    );
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert_eq!(valid0(&m.result_path("OIII")), 0);
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(saved.analyze, new);
+    assert_eq!(
+        saved.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Ha", "OIII"]
+    );
+
+    let err = blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap_err();
+    assert!(err.to_string().contains("analyze first"), "{err}");
+
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    assert!(m.config.needs_analyze.is_empty());
+    assert!(MosaicConfig::load(&m.dir).unwrap().needs_analyze.is_empty());
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&m.result_path("Ha"));
+}
+
+#[test]
+fn analyze_override_blocks_only_its_group() {
+    let tmp = TempDir::new("anaover");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let o = GroupOverride {
+        analyze: AnalyzeOverride {
+            surface: Some(Some(1)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        set_group_override(&mut m, "Ha", o).unwrap(),
+        ChangeImpact::Reanalyze
+    );
+    assert!(m.config.needs_analyze.contains("Ha"));
+    assert!(!m.config.needs_analyze.contains("OIII"));
+    let err = blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap_err();
+    assert!(err.to_string().contains("analyze first"), "{err}");
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+}
+
+#[test]
+fn blend_before_analyze_is_refused() {
+    let tmp = TempDir::new("noana");
+    let mut m = two_group_mosaic(&tmp.0);
+    let err = blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap_err();
+    assert!(err.to_string().contains("analyze first"), "{err}");
 }

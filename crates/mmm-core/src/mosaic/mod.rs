@@ -10,7 +10,7 @@ pub use run::{
     Mosaic, analyze_all, blend_group, set_analyze_settings, set_blend_settings, set_group_override,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -141,6 +141,14 @@ pub struct MosaicConfig {
     /// Per-group setting overrides, by group name.
     #[serde(default)]
     pub group_overrides: BTreeMap<String, GroupOverride>,
+    /// Group name to its directory under [`GROUPS_DIR`], assigned once by
+    /// [`grouping::allocate_group_dir`] and never changed afterwards.
+    #[serde(default)]
+    pub group_dirs: BTreeMap<String, String>,
+    /// Groups whose effective analyze settings changed since they were last
+    /// analyzed: [`blend_group`] refuses them until [`analyze_all`] reruns.
+    #[serde(default)]
+    pub needs_analyze: BTreeSet<String>,
     /// Check results the user has accepted.
     #[serde(default)]
     pub accepted_checks: Vec<CheckKey>,
@@ -170,6 +178,8 @@ impl MosaicConfig {
             analyze: AnalyzeSettings::default(),
             blend: BlendSettings::default(),
             group_overrides: BTreeMap::new(),
+            group_dirs: BTreeMap::new(),
+            needs_analyze: BTreeSet::new(),
             accepted_checks: Vec::new(),
             provenance: Vec::new(),
             ui: serde_json::Value::Null,

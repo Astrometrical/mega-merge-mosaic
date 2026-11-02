@@ -99,6 +99,50 @@ fn is_reserved_device_name(s: &str) -> bool {
             && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
+/// The safe directory-name base for a group name. Characters outside
+/// `[A-Za-z0-9._-]` become `_`; empty or all-dot results become `group`; a
+/// leading or trailing `.` becomes `_`; Windows reserved device names get a
+/// `_` appended to the stem (before the first `.`).
+fn dir_base(name: &str) -> String {
+    let mut base: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if base.chars().all(|c| c == '.') {
+        base = "group".into();
+    }
+    if base.starts_with('.') {
+        base.replace_range(..1, "_");
+    }
+    if base.ends_with('.') {
+        base.pop();
+        base.push('_');
+    }
+    if is_reserved_device_name(&base) {
+        let at = base.find('.').unwrap_or(base.len());
+        base.insert(at, '_');
+    }
+    base
+}
+
+/// `base`, or `base-2`, `base-3`, … — the first candidate whose lowercase
+/// form is not in `used`.
+fn unique_dir(base: &str, used: &BTreeSet<String>) -> String {
+    let mut cand = base.to_string();
+    let mut n = 2;
+    while used.contains(&cand.to_ascii_lowercase()) {
+        cand = format!("{base}-{n}");
+        n += 1;
+    }
+    cand
+}
+
 /// Map each group name to a safe, unique directory name. Characters outside
 /// `[A-Za-z0-9._-]` become `_`; empty or all-dot results become `group`; a
 /// leading or trailing `.` becomes `_`; Windows reserved device names get a
@@ -111,40 +155,25 @@ pub fn group_dirs(names: &[String]) -> BTreeMap<String, String> {
     let mut used = BTreeSet::new();
     let mut out = BTreeMap::new();
     for name in sorted {
-        let mut base: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if base.chars().all(|c| c == '.') {
-            base = "group".into();
-        }
-        if base.starts_with('.') {
-            base.replace_range(..1, "_");
-        }
-        if base.ends_with('.') {
-            base.pop();
-            base.push('_');
-        }
-        if is_reserved_device_name(&base) {
-            let at = base.find('.').unwrap_or(base.len());
-            base.insert(at, '_');
-        }
-        let mut cand = base.clone();
-        let mut n = 2;
-        while used.contains(&cand.to_ascii_lowercase()) {
-            cand = format!("{base}-{n}");
-            n += 1;
-        }
+        let cand = unique_dir(&dir_base(name), &used);
         used.insert(cand.to_ascii_lowercase());
         out.insert(name.clone(), cand);
     }
     out
+}
+
+/// The directory for `name` given the persisted `assigned` mapping (group
+/// name → directory name): its existing entry if it has one, otherwise a
+/// fresh name by the [`group_dirs`] sanitising rules, made unique
+/// (case-insensitively) against **every** directory already assigned.
+/// Existing assignments are never changed, so a group's directory is stable
+/// once recorded.
+pub fn allocate_group_dir(assigned: &BTreeMap<String, String>, name: &str) -> String {
+    if let Some(d) = assigned.get(name) {
+        return d.clone();
+    }
+    let used: BTreeSet<String> = assigned.values().map(|d| d.to_ascii_lowercase()).collect();
+    unique_dir(&dir_base(name), &used)
 }
 
 #[cfg(test)]
@@ -252,6 +281,22 @@ mod tests {
         assert_eq!(m["a."], "a_");
         let lower: BTreeSet<_> = m.values().map(|v| v.to_lowercase()).collect();
         assert_eq!(lower.len(), m.len());
+    }
+
+    #[test]
+    fn allocated_dirs_are_stable() {
+        let mut assigned = BTreeMap::new();
+        let d = allocate_group_dir(&assigned, "Ha_3nm");
+        assert_eq!(d, "Ha_3nm");
+        assigned.insert("Ha_3nm".to_string(), d);
+        // A later colliding name gets a fresh dir; the existing one stays.
+        let d2 = allocate_group_dir(&assigned, "Ha 3nm");
+        assert_eq!(d2, "Ha_3nm-2");
+        assigned.insert("Ha 3nm".to_string(), d2);
+        assert_eq!(allocate_group_dir(&assigned, "Ha_3nm"), "Ha_3nm");
+        // Case-insensitive against every assigned dir.
+        assert_eq!(allocate_group_dir(&assigned, "ha_3nm"), "ha_3nm-3");
+        assert_eq!(allocate_group_dir(&assigned, "R/G"), "R_G");
     }
 
     #[test]

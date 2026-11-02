@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use super::grouping::{Groups, group_dirs, header_value, resolve_groups};
+use super::grouping::{Groups, allocate_group_dir, header_value, resolve_groups};
 use super::{FRAME_FILE, GROUPS_DIR, GroupRule, MosaicConfig, RESULT_FILE, fingerprint};
 use crate::analyze::analyze_ctl;
 use crate::error::{Error, Result};
@@ -79,25 +79,33 @@ impl Mosaic {
         Ok(resolve_groups(&self.config, &header))
     }
 
-    /// The session directory of `group`: `<dir>/groups/<name>`, where the
-    /// name comes from [`group_dirs`] over `groups`' processing groups (a
-    /// group not among them is mapped as if it were added to them).
-    pub fn group_session_dir(&self, group: &str, groups: &Groups) -> PathBuf {
-        let mut names: Vec<String> = groups
-            .processing_groups()
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
-        if !names.iter().any(|n| n == group) {
-            names.push(group.to_string());
-        }
-        let dirs = group_dirs(&names);
-        self.dir.join(GROUPS_DIR).join(&dirs[group])
+    /// The session directory of `group`: `<dir>/groups/<dir name>`. The dir
+    /// name is the group's persisted entry in [`MosaicConfig::group_dirs`];
+    /// for a group without one it is the name
+    /// [`Mosaic::assign_group_dirs`] would allocate (not recorded here).
+    pub fn group_session_dir(&self, group: &str) -> PathBuf {
+        let name = allocate_group_dir(&self.config.group_dirs, group);
+        self.dir.join(GROUPS_DIR).join(name)
     }
 
     /// The tiled result store of `group` (inside its session directory).
-    pub fn result_path(&self, group: &str, groups: &Groups) -> PathBuf {
-        self.group_session_dir(group, groups).join(RESULT_FILE)
+    pub fn result_path(&self, group: &str) -> PathBuf {
+        self.group_session_dir(group).join(RESULT_FILE)
+    }
+
+    /// Record a directory for every processing group in `groups` that has
+    /// none yet (see [`allocate_group_dir`]); existing assignments never
+    /// change. Returns whether anything was added. Does not save.
+    pub fn assign_group_dirs(&mut self, groups: &Groups) -> bool {
+        let mut added = false;
+        for (name, _) in groups.processing_groups() {
+            if !self.config.group_dirs.contains_key(&name) {
+                let d = allocate_group_dir(&self.config.group_dirs, &name);
+                self.config.group_dirs.insert(name, d);
+                added = true;
+            }
+        }
+        added
     }
 }
 
@@ -110,12 +118,20 @@ impl Mosaic {
 /// are prefixed with the group name (`"Ha: analyze"`). Afterwards every
 /// panel's fingerprint is refreshed, an `"analyze"` provenance entry
 /// recording each group's resolved settings is appended, and the
-/// configuration is saved. A cancelled or failed run returns the error
-/// without touching the configuration (groups analyzed before the failure
-/// keep their new sessions).
+/// configuration is saved.
+///
+/// New groups get their directories recorded ([`Mosaic::assign_group_dirs`])
+/// and saved before any analysis runs. Each group is removed from
+/// [`MosaicConfig::needs_analyze`] (and the configuration saved) as soon as
+/// its analysis succeeds, so a cancelled or failed run keeps the groups it
+/// finished; it returns the error without adding provenance or refreshing
+/// fingerprints.
 pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
     ctl.check()?;
     let groups = m.groups()?;
+    if m.assign_group_dirs(&groups) {
+        m.save()?;
+    }
     let all: Vec<PathBuf> = m.config.panels.iter().map(|p| p.path.clone()).collect();
     let frame = reference::derive(&all, m.config.analyze.input)?;
     frame.save(&m.dir.join(FRAME_FILE))?;
@@ -129,8 +145,11 @@ pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
             let _ = ctl.report(&format!("{group}: {stage}"), done, total);
         };
         let group_ctl = JobCtl::new(ctl.cancel_token().clone(), Some(&prefixed));
-        let dir = m.group_session_dir(&group, &groups);
+        let dir = m.group_session_dir(&group);
         analyze_ctl(&paths, &dir, &settings, Some(&frame), &group_ctl)?;
+        if m.config.needs_analyze.remove(&group) {
+            m.save()?;
+        }
         detail.insert(group.clone(), json!(settings));
     }
 
@@ -155,6 +174,10 @@ pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
 /// the store mapped: recreating truncates the file under their mapping. An
 /// existing store of matching geometry is never recreated.
 ///
+/// Refuses (with [`Error::Compute`]) a group that has never been analyzed
+/// (no recorded directory) or whose analyze settings changed since its
+/// analysis ([`MosaicConfig::needs_analyze`]): run [`analyze_all`] first.
+///
 /// Appends a `"blend"` provenance entry (group, aligned rect, settings) and
 /// saves the configuration.
 pub fn blend_group(
@@ -163,8 +186,17 @@ pub fn blend_group(
     rect: Option<[u64; 4]>,
     ctl: &JobCtl,
 ) -> Result<[u64; 4]> {
-    let groups = m.groups()?;
-    let session = Session::open(&m.group_session_dir(group, &groups))?;
+    if !m.config.group_dirs.contains_key(group) {
+        return Err(Error::compute(format!(
+            "group '{group}' has not been analyzed yet — analyze first"
+        )));
+    }
+    if m.config.needs_analyze.contains(group) {
+        return Err(Error::compute(format!(
+            "analyze settings for group '{group}' changed since it was analyzed — analyze first"
+        )));
+    }
+    let session = Session::open(&m.group_session_dir(group))?;
     let graph = OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = Photometry::load(&session.photometry_path())?;
     let surfaces = if session.surfaces_path().exists() {
@@ -179,10 +211,15 @@ pub fn blend_group(
         channels: channels as u32,
         tile: TILE,
     };
-    let path = m.result_path(group, &groups);
-    let mut store = match TileStore::open(&path) {
-        Ok(s) if s.geometry() == geometry => s,
-        _ => TileStore::create(&path, geometry)?,
+    let path = m.result_path(group);
+    // A mismatched or unreadable store is dropped (unmapped) before `create`
+    // truncates the same file.
+    let existing = TileStore::open(&path)
+        .ok()
+        .filter(|s| s.geometry() == geometry);
+    let mut store = match existing {
+        Some(s) => s,
+        None => TileStore::create(&path, geometry)?,
     };
     let settings = m.config.settings_for(group).1;
     let aligned = blend_tiles(
@@ -256,14 +293,17 @@ pub fn set_blend_settings(m: &mut Mosaic, new: BlendSettings) -> Result<ChangeIm
 }
 
 /// Replace the global analyze settings. On [`ChangeImpact::Reanalyze`]
-/// every existing group result store is invalidated; the next
-/// [`analyze_all`] reruns analysis with the new settings. Saves the
-/// configuration.
+/// every existing group result store is invalidated and every analyzed
+/// group (each with a recorded directory) is marked in
+/// [`MosaicConfig::needs_analyze`], so [`blend_group`] refuses it until the
+/// next [`analyze_all`] reruns analysis. Saves the configuration.
 pub fn set_analyze_settings(m: &mut Mosaic, new: AnalyzeSettings) -> Result<ChangeImpact> {
     let impact = analyze_change(&m.config.analyze, &new);
     m.config.analyze = new;
     if impact == ChangeImpact::Reanalyze {
         invalidate_all_stores(m)?;
+        let analyzed: Vec<String> = m.config.group_dirs.keys().cloned().collect();
+        m.config.needs_analyze.extend(analyzed);
     }
     m.save()?;
     Ok(impact)
@@ -272,7 +312,8 @@ pub fn set_analyze_settings(m: &mut Mosaic, new: AnalyzeSettings) -> Result<Chan
 /// Set `group`'s setting override (an empty override removes the entry).
 /// The impact is that of the change in the group's effective settings; on
 /// anything but [`ChangeImpact::None`] only that group's result store is
-/// invalidated. Saves the configuration.
+/// invalidated, and on [`ChangeImpact::Reanalyze`] the group is marked in
+/// [`MosaicConfig::needs_analyze`]. Saves the configuration.
 pub fn set_group_override(m: &mut Mosaic, group: &str, o: GroupOverride) -> Result<ChangeImpact> {
     let (old_a, old_b) = m.config.settings_for(group);
     if o.is_empty() {
@@ -283,8 +324,10 @@ pub fn set_group_override(m: &mut Mosaic, group: &str, o: GroupOverride) -> Resu
     let (new_a, new_b) = m.config.settings_for(group);
     let impact = analyze_change(&old_a, &new_a).max(blend_change(&old_b, &new_b));
     if impact != ChangeImpact::None {
-        let groups = m.groups()?;
-        invalidate_store(&m.result_path(group, &groups))?;
+        invalidate_store(&m.result_path(group))?;
+    }
+    if impact == ChangeImpact::Reanalyze {
+        m.config.needs_analyze.insert(group.to_string());
     }
     m.save()?;
     Ok(impact)
