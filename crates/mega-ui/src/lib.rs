@@ -9,3 +9,4 @@
 pub mod jobs;
 pub mod status;
 pub mod theme;
+pub mod viewer;
