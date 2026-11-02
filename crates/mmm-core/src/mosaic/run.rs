@@ -291,7 +291,15 @@ fn invalidate_all_stores(m: &Mosaic) -> Result<()> {
 
 /// Replace the global blend settings. On [`ChangeImpact::Reblend`] every
 /// existing group result store is invalidated. Saves the configuration.
+///
+/// Settings failing [`BlendSettings::validate`] are refused with nothing
+/// changed (in memory or on disk).
 pub fn set_blend_settings(m: &mut Mosaic, new: BlendSettings) -> Result<ChangeImpact> {
+    new.validate()?;
+    for group in m.config.group_overrides.keys() {
+        new.with(&m.config.group_overrides[group].blend)
+            .validate()?;
+    }
     let impact = blend_change(&m.config.blend, &new);
     m.config.blend = new;
     if impact == ChangeImpact::Reblend {
@@ -323,7 +331,11 @@ pub fn set_analyze_settings(m: &mut Mosaic, new: AnalyzeSettings) -> Result<Chan
 /// anything but [`ChangeImpact::None`] only that group's result store is
 /// invalidated, and on [`ChangeImpact::Reanalyze`] the group is marked in
 /// [`MosaicConfig::needs_analyze`]. Saves the configuration.
+///
+/// An override whose resolved blend settings fail
+/// [`BlendSettings::validate`] is refused with nothing changed.
 pub fn set_group_override(m: &mut Mosaic, group: &str, o: GroupOverride) -> Result<ChangeImpact> {
+    m.config.blend.with(&o.blend).validate()?;
     let (old_a, old_b) = m.config.settings_for(group);
     if o.is_empty() {
         m.config.group_overrides.remove(group);

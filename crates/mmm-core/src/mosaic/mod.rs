@@ -207,7 +207,16 @@ impl MosaicConfig {
     }
 
     /// Save to `dir/mosaic.json` atomically (temp file, then rename).
+    ///
+    /// Refuses (leaving the file untouched) a configuration whose base or
+    /// any group's effective blend settings fail
+    /// [`BlendSettings::validate`]: JSON cannot hold a NaN or infinite
+    /// feather, and a file written with one would no longer load.
     pub fn save(&self, dir: &Path) -> Result<()> {
+        self.blend.validate()?;
+        for group in self.group_overrides.keys() {
+            self.settings_for(group).1.validate()?;
+        }
         let path = dir.join(CONFIG_FILE);
         let tmp = dir.join(format!("{CONFIG_FILE}.tmp"));
         let json = serde_json::to_vec_pretty(self)
@@ -288,6 +297,32 @@ mod tests {
         let err = MosaicConfig::load(&dir).unwrap_err();
         assert!(matches!(err, Error::Format { .. }));
         assert!(err.to_string().contains("upgrade"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_refuses_invalid_settings() {
+        let dir = tmp("invalid");
+        let cfg = MosaicConfig::new(vec![]);
+        cfg.save(&dir).unwrap();
+        let before = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
+        let mut bad = cfg.clone();
+        bad.blend.feather_px = f32::NAN;
+        assert!(bad.save(&dir).unwrap_err().to_string().contains("feather"));
+        let mut bad = cfg.clone();
+        bad.group_overrides.insert(
+            "Ha".into(),
+            GroupOverride {
+                blend: BlendOverride {
+                    feather_px: Some(-3.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(bad.save(&dir).unwrap_err().to_string().contains("feather"));
+        assert_eq!(std::fs::read(dir.join(CONFIG_FILE)).unwrap(), before);
+        assert_eq!(MosaicConfig::load(&dir).unwrap(), cfg);
         std::fs::remove_dir_all(&dir).ok();
     }
 

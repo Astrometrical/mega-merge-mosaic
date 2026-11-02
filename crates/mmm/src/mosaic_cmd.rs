@@ -64,6 +64,12 @@ pub(crate) struct SettingsOpts {
 impl SettingsOpts {
     /// The flags given, as an override: set fields are the flags passed.
     fn resolve(&self) -> anyhow::Result<GroupOverride> {
+        if let Some(f) = self.feather {
+            anyhow::ensure!(
+                f.is_finite() && f > 0.0,
+                "--feather must be a finite number of pixels greater than 0 (got {f}), e.g. --feather 64"
+            );
+        }
         Ok(GroupOverride {
             analyze: AnalyzeOverride {
                 input: self.input.as_deref().map(parse_input).transpose()?,

@@ -566,3 +566,31 @@ fn cancelled_reanalysis_refuses_unfinished_group() {
     blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
     assert_fully_valid(&m.result_path("OIII"));
 }
+
+#[test]
+fn invalid_feather_is_refused_and_not_persisted() {
+    let tmp = TempDir::new("badfeather");
+    let mut m = Mosaic::create(&tmp.0.join("m"), MosaicConfig::new(vec![])).unwrap();
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let cfg = m.config.clone();
+    for bad in [f32::NAN, f32::INFINITY, 0.0, -5.0] {
+        let new = BlendSettings {
+            feather_px: bad,
+            ..m.config.blend.clone()
+        };
+        let err = set_blend_settings(&mut m, new).unwrap_err();
+        assert!(err.to_string().contains("feather"), "{bad}: {err}");
+        let o = GroupOverride {
+            blend: BlendOverride {
+                feather_px: Some(bad),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = set_group_override(&mut m, "Ha", o).unwrap_err();
+        assert!(err.to_string().contains("feather"), "{bad}: {err}");
+        assert_eq!(m.config, cfg, "in-memory config unchanged");
+    }
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+    Mosaic::open(&m.dir).unwrap();
+}

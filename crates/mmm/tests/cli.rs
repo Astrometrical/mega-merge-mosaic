@@ -563,3 +563,42 @@ fn init_refuses_existing() {
     assert_eq!(MosaicConfig::load(&m).unwrap().panels.len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn set_rejects_non_finite_or_non_positive_feather() {
+    let dir = tempdir("set-bad-feather");
+    let a = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let m = dir.join("m");
+    run(mmm().arg("init").args(&a).arg("-s").arg(&m));
+    let before = std::fs::read_to_string(m.join("mosaic.json")).unwrap();
+    for bad in ["nan", "inf", "0", "-5"] {
+        let err = run_fail(
+            mmm()
+                .arg("set")
+                .arg("-s")
+                .arg(&m)
+                .arg(format!("--feather={bad}")),
+        );
+        assert!(err.contains("--feather"), "{bad}: {err}");
+        assert!(err.contains("greater than 0"), "{bad}: {err}");
+        assert_eq!(
+            std::fs::read_to_string(m.join("mosaic.json")).unwrap(),
+            before,
+            "{bad}: mosaic.json unchanged"
+        );
+    }
+    // `init` refuses it too, before creating anything.
+    let m2 = dir.join("m2");
+    let err = run_fail(
+        mmm()
+            .arg("init")
+            .args(&a)
+            .arg("-s")
+            .arg(&m2)
+            .arg("--feather=nan"),
+    );
+    assert!(err.contains("--feather"), "{err}");
+    assert!(!m2.exists());
+    MosaicConfig::load(&m).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -10,10 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyze::InputSelect;
 use crate::blend::{BlendMode, BlendParams};
+use crate::error::{Error, Result};
 use crate::photometry::GainMode;
 
-/// Settings that drive analysis (global: a change reruns analysis).
+/// Settings that drive analysis (global: a change reruns analysis). A field
+/// missing from the JSON takes its default, so files written before a field
+/// existed still load.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct AnalyzeSettings {
     /// How input panels are interpreted.
     pub input: InputSelect,
@@ -33,8 +37,11 @@ impl Default for AnalyzeSettings {
     }
 }
 
-/// Settings that drive blending (blend-local: analysis is kept).
+/// Settings that drive blending (blend-local: analysis is kept). A field
+/// missing from the JSON takes its default, so files written before a field
+/// existed still load.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct BlendSettings {
     /// Blend mode.
     pub mode: BlendMode,
@@ -59,6 +66,20 @@ impl Default for BlendSettings {
 }
 
 impl BlendSettings {
+    /// Check the settings can drive a blend: the feather ramp must be finite
+    /// and positive. Called by every settings edit and by
+    /// [`crate::mosaic::MosaicConfig::save`], so invalid settings are never
+    /// persisted (JSON cannot represent NaN or infinity).
+    pub fn validate(&self) -> Result<()> {
+        if !(self.feather_px.is_finite() && self.feather_px > 0.0) {
+            return Err(Error::compute(format!(
+                "feather must be a finite number of pixels greater than 0 (got {})",
+                self.feather_px
+            )));
+        }
+        Ok(())
+    }
+
     /// Engine parameters for these settings; other fields at their defaults.
     pub fn to_params(&self) -> BlendParams {
         BlendParams {
@@ -284,6 +305,35 @@ mod tests {
             serde_json::to_string(&g).unwrap(),
             r#"{"analyze":{},"blend":{}}"#
         );
+    }
+
+    #[test]
+    fn empty_object_deserialises_to_defaults() {
+        assert_eq!(
+            serde_json::from_str::<AnalyzeSettings>("{}").unwrap(),
+            AnalyzeSettings::default()
+        );
+        assert_eq!(
+            serde_json::from_str::<BlendSettings>("{}").unwrap(),
+            BlendSettings::default()
+        );
+        // A partial object keeps the fields given.
+        let b: BlendSettings = serde_json::from_str(r#"{"feather_px": 12.5}"#).unwrap();
+        assert_eq!(b.feather_px, 12.5);
+        assert_eq!(b.mode, BlendSettings::default().mode);
+    }
+
+    #[test]
+    fn validate_rejects_bad_feather() {
+        assert!(BlendSettings::default().validate().is_ok());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+            let b = BlendSettings {
+                feather_px: bad,
+                ..BlendSettings::default()
+            };
+            let err = b.validate().unwrap_err().to_string();
+            assert!(err.contains("feather"), "{bad}: {err}");
+        }
     }
 
     #[test]
