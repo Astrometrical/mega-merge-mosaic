@@ -48,11 +48,13 @@ use crate::astrometry::{LinearWcs, WcsModel, describe_unsolved};
 use crate::formats::InputPanel;
 use crate::ipc::client::HostLink;
 use crate::ipc::protocol::{PanelDesc, PanelProbeGeom, PanelProbeReply};
+use crate::job::{CancelToken, JobCtl};
 use crate::overlap::OverlapGraph;
 use crate::panel_reader::{PanelReader, PanelStorage};
 use crate::photometry::GainMode;
 use crate::reference::ReferenceFrame;
 use crate::session::{InputKind, PanelMeta, Session};
+use crate::settings::AnalyzeSettings;
 use crate::summary::{BLOCK, L8Summary};
 use crate::{Error, Result};
 
@@ -230,6 +232,33 @@ pub fn analyze_full(
     progress: Option<AnalyzeProgress>,
     reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
+    let settings = AnalyzeSettings {
+        input,
+        surface: surface_order,
+        gain,
+    };
+    let ctl = JobCtl::new(CancelToken::new(), progress);
+    analyze_ctl(paths, session_dir, &settings, reference, &ctl)
+}
+
+/// Cancellable, settings-driven analyze: [`analyze_full`] with its loose
+/// parameters bundled as [`AnalyzeSettings`] and progress/cancellation
+/// carried by a [`JobCtl`]. Cancellation is checked at every progress report,
+/// after each reprojected panel and before the session is persisted, so a
+/// cancelled run returns [`Error::Cancelled`] without writing `session.json`.
+/// Progress stages (`"reproject"`, `"analyze"`) and ordering are unchanged.
+pub fn analyze_ctl(
+    paths: &[PathBuf],
+    session_dir: &Path,
+    settings: &AnalyzeSettings,
+    reference: Option<&ReferenceFrame>,
+    ctl: &JobCtl,
+) -> Result<Session> {
+    let AnalyzeSettings {
+        input,
+        surface: surface_order,
+        gain,
+    } = *settings;
     if paths.is_empty() {
         return Err(Error::format(session_dir, "no input panels given"));
     }
@@ -312,11 +341,11 @@ pub fn analyze_full(
             surface_order,
             gain,
             false,
-            progress,
+            ctl,
             reference,
         ),
         InputSelect::Solved => {
-            analyze_solved(paths, session_dir, surface_order, gain, progress, reference)
+            analyze_solved(paths, session_dir, surface_order, gain, ctl, reference)
         }
         InputSelect::Auto => {
             if auto_reads_aligned {
@@ -326,11 +355,11 @@ pub fn analyze_full(
                     surface_order,
                     gain,
                     true,
-                    progress,
+                    ctl,
                     reference,
                 )
             } else {
-                analyze_solved(paths, session_dir, surface_order, gain, progress, reference)
+                analyze_solved(paths, session_dir, surface_order, gain, ctl, reference)
             }
         }
     }
@@ -346,13 +375,6 @@ const SOLVED_REFERENCE_ON_ALIGNED: &str = "the reference frame is a solved mosai
      full-canvas frames: pass `--input solved` if they are raw plate-solved panels, or derive \
      an aligned reference from the registered canvases";
 
-/// Reports `done`/`total` for a stage through an optional observer.
-fn report(progress: Option<AnalyzeProgress>, stage: &str, done: u64, total: u64) {
-    if let Some(p) = progress {
-        p(stage, done, total);
-    }
-}
-
 /// The aligned full-canvas path. With `auto` set, the coverage rule applies
 /// after the scan: any panel covering ≥ [`ALIGNED_MAX_COVERAGE`] of the
 /// canvas re-dispatches the whole set to [`analyze_solved`].
@@ -362,12 +384,12 @@ fn analyze_aligned(
     surface_order: Option<u32>,
     gain: GainMode,
     auto: bool,
-    progress: Option<AnalyzeProgress>,
+    ctl: &JobCtl,
     reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
 
-    report(progress, "analyze", 0, paths.len() as u64);
+    ctl.report("analyze", 0, paths.len() as u64)?;
     // Claim + report under one lock: with a bare atomic claim a later
     // completion could report before an earlier one, leaving a non-final
     // count (e.g. 1/2 after 2/2) as the observer's last event.
@@ -380,7 +402,7 @@ fn analyze_aligned(
             {
                 let mut done = scanned.lock().expect("progress lock poisoned");
                 *done += 1;
-                report(progress, "analyze", *done, paths.len() as u64);
+                ctl.report("analyze", *done, paths.len() as u64)?;
             }
             Ok(scan)
         })
@@ -415,7 +437,7 @@ fn analyze_aligned(
              raw panels (--input aligned overrides)",
             ALIGNED_MAX_COVERAGE * 100.0
         );
-        return analyze_solved(paths, session_dir, surface_order, gain, progress, reference);
+        return analyze_solved(paths, session_dir, surface_order, gain, ctl, reference);
     }
 
     if let Some(r) = reference {
@@ -439,7 +461,7 @@ fn analyze_aligned(
     }
 
     session.canvas = canvas;
-    finish_session(session, scans, surface_order, gain)
+    finish_session(session, scans, surface_order, gain, ctl)
 }
 
 /// The solved path: astrometric models → mosaic frame → reprojection caches →
@@ -449,7 +471,7 @@ fn analyze_solved(
     session_dir: &Path,
     surface_order: Option<u32>,
     gain: GainMode,
-    progress: Option<AnalyzeProgress>,
+    ctl: &JobCtl,
     reference: Option<&ReferenceFrame>,
 ) -> Result<Session> {
     let mut session = Session::create(session_dir)?;
@@ -513,13 +535,13 @@ fn analyze_solved(
     // over panels — reproject_panel is already rayon-parallel over output
     // rows, and one panel's working set at a time keeps memory bounded.
     let t_align = Instant::now();
-    report(progress, "reproject", 0, panels.len() as u64);
+    ctl.report("reproject", 0, panels.len() as u64)?;
     let mut aligned = Vec::with_capacity(panels.len());
     for (id, (panel, model)) in panels.iter().enumerate() {
         let t = Instant::now();
         let out_dir = session.dir.join("panels").join(id.to_string());
         let ap = reproject_panel(panel, model, &frame, &out_dir)?;
-        report(progress, "reproject", (id as u64) + 1, panels.len() as u64);
+        ctl.report("reproject", (id as u64) + 1, panels.len() as u64)?;
         tracing::info!(
             "aligned panel {}/{}: bbox [{},{})x[{},{}) in {:.2}s",
             id + 1,
@@ -541,7 +563,7 @@ fn analyze_solved(
     drop(panels); // source mmaps no longer needed
 
     // Scan the caches exactly like aligned frames, through PanelReader.
-    report(progress, "analyze", 0, aligned.len() as u64);
+    ctl.report("analyze", 0, aligned.len() as u64)?;
     // Claim + report under one lock (see analyze_aligned's scan loop).
     let scanned = std::sync::Mutex::new(0u64);
     let scans: Vec<PanelScan> = aligned
@@ -564,7 +586,7 @@ fn analyze_solved(
             {
                 let mut done = scanned.lock().expect("progress lock poisoned");
                 *done += 1;
-                report(progress, "analyze", *done, aligned.len() as u64);
+                ctl.report("analyze", *done, aligned.len() as u64)?;
             }
             Ok(scan)
         })
@@ -575,7 +597,7 @@ fn analyze_solved(
     session.frame = Some(frame);
     session.frame_imposed = reference.is_some();
     session.align_secs = Some(align_secs);
-    finish_session(session, scans, surface_order, gain)
+    finish_session(session, scans, surface_order, gain, ctl)
 }
 
 /// Builds every panel's [`WcsModel`] from its carried `properties`, checks
@@ -819,7 +841,7 @@ pub fn analyze_ipc_aligned(
         .collect::<Result<_>>()?;
 
     session.canvas = canvas;
-    finish_session(session, scans, surface_order, gain)
+    finish_session(session, scans, surface_order, gain, &JobCtl::none())
 }
 
 /// The solved path over raw panels streamed from an IPC host: mirrors
@@ -944,7 +966,7 @@ pub fn analyze_ipc_solved(
     session.frame = Some(frame);
     session.frame_imposed = reference.is_some();
     session.align_secs = Some(align_secs);
-    finish_session(session, scans, surface_order, gain)
+    finish_session(session, scans, surface_order, gain, &JobCtl::none())
 }
 
 /// Shared tail of both paths: persist summaries, build/save the overlap
@@ -954,6 +976,7 @@ fn finish_session(
     scans: Vec<PanelScan>,
     surface_order: Option<u32>,
     gain: GainMode,
+    ctl: &JobCtl,
 ) -> Result<Session> {
     let canvas = session.canvas;
     scans.par_iter().try_for_each(|scan| -> Result<()> {
@@ -991,6 +1014,7 @@ fn finish_session(
         }
     }
 
+    ctl.check()?;
     session.save()?;
     Ok(session)
 }
@@ -1287,6 +1311,57 @@ mod tests {
         let quiet = f.dir.join("quiet.mmm-session");
         analyze_input(&f.paths, &quiet, Some(2), InputSelect::Aligned).unwrap();
 
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// Cancelling from the first progress event aborts the run with a
+    /// cancelled error and leaves no `session.json` behind.
+    #[test]
+    fn analyze_ctl_cancels_from_progress() {
+        let f = synth_two_full_canvas_panels("ctl_cancel");
+        let dir = f.dir.join("cancel.mmm-session");
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        let observer = move |_s: &str, _d: u64, _t: u64| t2.cancel();
+        let ctl = JobCtl::new(token, Some(&observer));
+        let settings = AnalyzeSettings {
+            input: InputSelect::Aligned,
+            surface: Some(2),
+            gain: GainMode::Fit,
+        };
+        let err = analyze_ctl(&f.paths, &dir, &settings, None, &ctl).unwrap_err();
+        assert!(err.is_cancelled(), "{err}");
+        assert!(!dir.join("session.json").exists());
+        std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// Uncancelled `analyze_ctl` yields the same session as `analyze_full`.
+    #[test]
+    fn analyze_ctl_matches_analyze_full() {
+        let f = synth_two_full_canvas_panels("ctl_match");
+        let d1 = f.dir.join("full.mmm-session");
+        let d2 = f.dir.join("ctl.mmm-session");
+        let a = analyze_full(
+            &f.paths,
+            &d1,
+            Some(2),
+            GainMode::Fit,
+            InputSelect::Aligned,
+            None,
+            None,
+        )
+        .unwrap();
+        let settings = AnalyzeSettings {
+            input: InputSelect::Aligned,
+            surface: Some(2),
+            gain: GainMode::Fit,
+        };
+        let b = analyze_ctl(&f.paths, &d2, &settings, None, &JobCtl::none()).unwrap();
+        assert_eq!(a.panels.len(), b.panels.len());
+        for (pa, pb) in a.panels.iter().zip(&b.panels) {
+            assert_eq!(pa.bbox, pb.bbox);
+            assert_eq!(pa.ch_mean, pb.ch_mean);
+        }
         std::fs::remove_dir_all(&f.dir).unwrap();
     }
 
