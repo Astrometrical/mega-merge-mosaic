@@ -43,7 +43,9 @@
 //!   and the [`settings::ChangeImpact`] of editing them.
 //! - [`tiles`] — the memory-mapped tiled result store: a multi-level tile
 //!   pyramid with per-tile validity flags, written by a background blend
-//!   ([`tiles::TileStore`]) while viewers read it ([`tiles::TileReader`]).
+//!   ([`tiles::TileStore`]) while viewers read it ([`tiles::TileReader`]);
+//!   [`tiles::blend_tiles`] blends a canvas rect into it and rebuilds the
+//!   parent levels, cancellably.
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
 //!   and benchmarks (in-tree and downstream) never need multi-GB real data.
 //!

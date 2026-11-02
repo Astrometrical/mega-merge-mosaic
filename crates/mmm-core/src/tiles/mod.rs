@@ -4,7 +4,8 @@
 //! A background blend writes tiles through a [`TileStore`] while a viewer
 //! reads them through one or more [`TileReader`]s — separate mappings of the
 //! same file, sharing the OS page cache, possibly on different threads. The
-//! store is self-contained: it knows nothing about how tiles are produced.
+//! storage layer knows nothing about how tiles are produced; [`blend_tiles`]
+//! (with [`TileSink`] and [`build_parents`]) fills it from a blend.
 //!
 //! # File format (version 1)
 //!
@@ -56,6 +57,9 @@ use std::sync::atomic::{AtomicU32, Ordering, fence};
 use memmap2::{Mmap, MmapMut};
 
 use crate::error::{Error, Result};
+
+mod sink;
+pub use sink::{TileSink, blend_tiles, build_parents};
 
 /// The default tile edge, in pixels.
 pub const TILE: u32 = 256;
