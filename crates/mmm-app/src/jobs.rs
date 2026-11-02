@@ -20,9 +20,10 @@
 //!
 //! - A new analysis cancels the running job (whatever it is) and replaces
 //!   everything queued: it re-stales every group anyway.
-//! - A new blend cancels a running blend and replaces queued blends; behind
-//!   a running analysis it waits (its group cannot be blended until the
-//!   analysis is applied).
+//! - A new blend cancels a running blend of the same group and replaces
+//!   that group's queued blends; blends of other groups are kept and run
+//!   in order. Behind a running analysis it waits (its group cannot be
+//!   blended until the analysis is applied).
 //!
 //! A queued job starts once `poll` has applied (or discarded) its
 //! predecessor's outcome; its worker joins the predecessor's thread before
@@ -240,9 +241,11 @@ impl JobRunner {
     }
 
     /// Blend `rect` (level-0 canvas coordinates; `None` = the whole canvas)
-    /// of `group`; returns the job id. Cancels a running blend and replaces
-    /// queued blends (newer work wins); waits behind a running or queued
-    /// analysis. Planned (on the UI thread, no I/O) when it starts.
+    /// of `group`; returns the job id. Cancels a running blend of the same
+    /// group and replaces its queued ones (newer work wins); blends of
+    /// other groups are left to run, this one queueing behind them, and it
+    /// waits behind a running or queued analysis. Planned (on the UI
+    /// thread, no I/O) when it starts.
     pub fn start_blend(
         &mut self,
         session: &mut OpenSession,
@@ -251,17 +254,17 @@ impl JobRunner {
     ) -> u64 {
         let id = self.new_id(format!("Blend {group}"));
         if let Some(r) = &self.running
-            && r.blend.is_some()
+            && r.blend.as_ref().is_some_and(|p| p.group == group)
         {
             r.token.cancel();
         }
         let mut dropped = Vec::new();
-        self.queue.retain(|q| match q.kind {
-            Kind::Blend { .. } => {
+        self.queue.retain(|q| match &q.kind {
+            Kind::Blend { group: g, .. } if g == group => {
                 dropped.push(q.id);
                 false
             }
-            Kind::Analyze => true,
+            Kind::Blend { .. } | Kind::Analyze => true,
         });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
@@ -369,6 +372,21 @@ impl JobRunner {
         let r = self.running.as_ref()?;
         let plan = r.blend.as_ref()?;
         Some((r.id, plan.group.as_str(), r.updates))
+    }
+
+    /// Whether a blend of `group` is queued, or running but has not
+    /// reported progress yet: it may still create or recreate the group's
+    /// result store, so the result must not be opened until it reports.
+    pub fn blend_unstarted(&self, group: &str) -> bool {
+        let running = self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.updates == 0 && r.blend.as_ref().is_some_and(|p| p.group == group));
+        running
+            || self
+                .queue
+                .iter()
+                .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
     }
 
     /// Whether a job is running or queued.
@@ -618,7 +636,7 @@ fn describe(e: &mmm_core::Error) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use mmm_core::mosaic::{MosaicConfig, run_blend, set_blend_settings};
@@ -667,7 +685,7 @@ mod tests {
     }
 
     /// Poll until no job is running or queued (bounded); every event.
-    fn drain(runner: &mut JobRunner, s: &mut OpenSession) -> Vec<JobEvent> {
+    pub(crate) fn drain(runner: &mut JobRunner, s: &mut OpenSession) -> Vec<JobEvent> {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut events = runner.poll(s);
         while runner.busy() {
@@ -682,7 +700,8 @@ mod tests {
         JobRunner::new(egui::Context::default())
     }
 
-    fn analyzed(tag: &str) -> (std::path::PathBuf, OpenSession, JobRunner) {
+    /// An analysed two-group session (`Ha`, `OIII`) and its idle runner.
+    pub(crate) fn analyzed(tag: &str) -> (std::path::PathBuf, OpenSession, JobRunner) {
         let root = temp_dir(tag);
         let mut s = two_group_session(&root);
         let mut r = runner();
@@ -801,33 +820,116 @@ mod tests {
     }
 
     #[test]
-    fn newer_blend_cancels_older() {
+    fn newer_blend_cancels_older_of_same_group() {
         let (root, mut s, mut r) = analyzed("job-newer");
         let gate = r.hold();
         let old = r.start_blend(&mut s, "Ha", None);
-        let queued = r.start_blend(&mut s, "OIII", None);
+        let other = r.start_blend(&mut s, "OIII", None);
+        let superseded = r.start_blend(&mut s, "Ha", Some([0, 0, 512, 512]));
         let new = r.start_blend(&mut s, "Ha", Some([0, 0, 256, 256]));
-        // The old job is cancelling; the queued one was superseded at once.
+        // The old Ha job is cancelling and the queued Ha one was replaced at
+        // once; the OIII blend still waits its turn.
         let views = r.views();
-        assert_eq!(views.len(), 2);
+        assert_eq!(views.len(), 3);
         assert_eq!((views[0].id, views[0].stage.as_str()), (old, "Cancelling…"));
-        assert_eq!((views[1].id, views[1].stage.as_str()), (new, "Waiting…"));
+        assert_eq!((views[1].id, views[1].stage.as_str()), (other, "Waiting…"));
+        assert_eq!((views[2].id, views[2].stage.as_str()), (new, "Waiting…"));
         gate.open();
         let events = drain(&mut r, &mut s);
         assert_eq!(
             events,
             vec![
-                JobEvent::Cancelled { id: queued },
+                JobEvent::Cancelled { id: superseded },
                 JobEvent::Cancelled { id: old },
+                JobEvent::Finished {
+                    id: other,
+                    label: "Blend OIII".into()
+                },
                 JobEvent::Finished {
                     id: new,
                     label: "Blend Ha".into()
                 },
             ]
         );
-        assert_eq!(actions(&s), ["analyze", "blend"]);
+        assert_eq!(actions(&s), ["analyze", "blend", "blend"]);
         let last = s.mosaic.config.provenance.last().unwrap();
         assert_eq!(last.detail["rect"], serde_json::json!([0, 0, 256, 256]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blends_of_different_groups_both_finish() {
+        let (root, mut s, mut r) = analyzed("job-two-groups");
+        let gate = r.hold();
+        let ha = r.start_blend(&mut s, "Ha", None);
+        let oiii = r.start_blend(&mut s, "OIII", None);
+        gate.open();
+        assert_eq!(
+            drain(&mut r, &mut s),
+            vec![
+                JobEvent::Finished {
+                    id: ha,
+                    label: "Blend Ha".into()
+                },
+                JobEvent::Finished {
+                    id: oiii,
+                    label: "Blend OIII".into()
+                },
+            ]
+        );
+        assert!(valid0(&s.mosaic.result_path("Ha")) > 0);
+        assert!(valid0(&s.mosaic.result_path("OIII")) > 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blend_twice_cancels_the_first() {
+        let (root, mut s, mut r) = analyzed("job-twice");
+        let gate = r.hold();
+        let first = r.start_blend(&mut s, "Ha", None);
+        let second = r.start_blend(&mut s, "Ha", None);
+        gate.open();
+        assert_eq!(
+            drain(&mut r, &mut s),
+            vec![
+                JobEvent::Cancelled { id: first },
+                JobEvent::Finished {
+                    id: second,
+                    label: "Blend Ha".into()
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blend_unstarted_until_first_progress() {
+        let (root, mut s, mut r) = analyzed("job-unstarted");
+        assert!(!r.blend_unstarted("Ha"));
+        let gate = r.hold();
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        // Running without progress, and queued.
+        assert!(r.blend_unstarted("Ha"));
+        assert!(r.blend_unstarted("OIII"));
+        assert!(!r.blend_unstarted("SII"));
+        gate.open();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while r
+            .blend_progress()
+            .is_none_or(|(_, g, n)| g != "Ha" || n == 0)
+        {
+            assert!(Instant::now() < deadline, "no Ha progress");
+            std::thread::sleep(Duration::from_millis(1));
+            r.poll(&mut s);
+            if !r.busy() {
+                break;
+            }
+        }
+        // Ha has reported progress (or ended): its store exists.
+        assert!(!r.blend_unstarted("Ha"));
+        drain(&mut r, &mut s);
+        assert!(!r.blend_unstarted("OIII"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
