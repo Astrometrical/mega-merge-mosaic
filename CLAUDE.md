@@ -12,6 +12,9 @@ architecture, verified facts about the input data, and the algorithm choices.
   (`default-features = false`); a gitignored `.cargo/config.toml` `[patch]`
   points it at the sibling checkout (DESIGN.md "Dependency on mpp-core")
 - `crates/mmm` — CLI frontend (thin)
+- `integration/pixinsight/` — PCL module + `mmm-ipc-worker` host. **Development
+  eased off (2026-11-02), shelving expected** under PixInsight CPD rules 1.0.1;
+  no new feature work here (DESIGN.md "PixInsight module status")
 - `docs/DESIGN.md` — architecture spec; keep it current when design changes
 - `docs/superpowers/plans/` — implementation plans
 - `test_data/` — gitignored multi-GB real panels:

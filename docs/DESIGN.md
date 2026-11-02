@@ -699,9 +699,11 @@ fractions of a pixel), and the blend crops to the union of content bboxes
 
 ## IPC transport (PixInsight)
 
-A native C++ PCL module (Plan 2) can drive mmm without writing panels to
-disk first by spawning `mmm-ipc-worker` — a Rust process that links
-`mmm-core` and does the actual analyze/blend — and talking to it over a
+The PixInsight module (`integration/pixinsight/module/`, a C++ PCL module
+built on the PCL-free host library in `integration/pixinsight/host/`)
+drives mmm without writing panels to disk first. It spawns
+`mmm-ipc-worker` (`crates/mmm-ipc-worker`), a Rust process that links
+`mmm-core` and does the actual analyze/blend, and talks to it over a
 control channel (the worker's stdin/stdout, length-prefixed frames) plus a
 named shared-memory segment for bulk pixels. Panel bands are pulled by the
 worker on demand (request → host fills a shm slot → reply), and blended
@@ -711,14 +713,47 @@ panic is isolated to its own process and cannot take down the host. Three
 job modes cover the input side: `Aligned` (already-registered full-canvas
 panels, read as-is), `Solved` (raw panels carrying a PixInsight plate
 solution, reprojected by mmm's phase-5 path before blending), and `Files`
-(plain file paths, bypassing the shm band-pull entirely on input).
+(plain file paths, bypassing the shm band-pull entirely on input). Probe
+modes (`--probe-panels`, `--probe-reference`, `--probe-frame`) answer the module's
+pre-run questions, and multi-filter groups run one worker job per group on
+a shared reference frame (see "Shared reference frame across groups").
 
-The Rust-side transport (`crates/mmm-core/src/ipc/`) and `mmm-ipc-worker`
-are implemented and tested; the C++ host module itself is Plan 2, not yet
-built. See the
+All of it shipped: the module was released for Linux, Windows and macOS
+through v1.7.0, and its development is now eased off (next section). The
+Rust-side transport lives in `crates/mmm-core/src/ipc/`. See the
 [design spec](superpowers/specs/2026-07-27-pixinsight-integration-design.md)
-for the full design rationale and the
+for the design rationale and the
 [wire protocol reference](../integration/pixinsight/PROTOCOL.md) for the
-exact frame format, every tag, binary field layouts, JSON schemas, and shm
-slot layout — the latter is the authoritative reference for the Plan-2 C++
-implementer.
+exact frame format, every tag, binary field layouts, JSON schemas, shm
+slot layout, and the host-side validation rules; the protocol reference is
+authoritative for any host implementation.
+
+The worker is not PixInsight-specific: it is the ready-made out-of-process
+path should a standalone frontend ever want job isolation (an
+out-of-memory failure on 2 GB frames would otherwise take the UI down
+with it).
+
+## PixInsight module status (2026-11-02): development eased off
+
+The module (released through v1.7.0) is **expected to be shelved**; the
+formal call is deferred, but no further feature work goes into
+`integration/pixinsight/` until it is made. Fixes for users of the released
+module are still fair game. Two reasons:
+
+- **CPD rules 1.0.1** (published 2026-10-27, effective 2026-12-12). Rule
+  5.8 forbids signed code from being "a front end, launcher or bridge for
+  external programs", and rule 2.3 counts the developer's own worker as an
+  external program. The module drives `mmm-ipc-worker`, so it is
+  that front end. Mega Image Integrator shelved its module on these
+  grounds on 2026-10-26; its ROADMAP §5 ruling "The PixInsight module is
+  shelved" has the full reading of the rules and the open letter on
+  "internal competitors", and it applies to mmm unchanged.
+- **PixInsight 1.9.6 ships core mosaic features** that do much of what mmm
+  does, so mmm also falls under the letter's second kind of internal
+  competitor: projects that replace standard tools.
+
+If it is shelved, the same terms as mii apply: the code stays in the tree
+out of the release path (no signing, no repository publication), the module
+CI job goes, and PixInsight consumes mmm's output as files. The standalone
+application becomes the primary frontend; its direction is being worked out
+separately.
