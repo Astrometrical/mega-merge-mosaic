@@ -371,3 +371,49 @@
 - **Plan 2: app shell and viewer.** WSLg backend spike (glow vs wgpu); generic UI crate (theme, tiled pyramid viewer with OpenSeadragon-style springs, job panel, status bar); app crate (start screen, session lifecycle, background job runner over `JobCtl`).
 - **Plan 3: tabs.** Panels, Plan (preview pyramids per panel, including the low-resolution WCS warp for raw panels; compositions; selection; checks UI), Blend (settings, ROIs, staleness display, health, export from the tile store to FITS/XISF/TIFF with provenance headers).
 - **Plan 4: packaging and signing** (its own design).
+
+## Outcome and carried follow-ups (2026-11-03)
+
+Executed on `feat/app-groundwork` (subagent-driven, per-task review plus a
+whole-branch review and one fix wave). Deviations from this plan, ruled
+against the spec:
+
+- `align_rect([900,500,1000,600])` is `[768,256,1000,600]` (outward
+  expansion); the plan's example was wrong.
+- Tile state is a per-tile little-endian u32 seqlock (bit 31 valid, odd
+  sequence while writing), not a 0/1 byte; `TileState {Missing, Stale,
+  Valid}` and `read_tile_any` expose stale tiles for dimmed display.
+- On cancel, finished level-0 tiles stay valid (spec §8), replacing the
+  plan's "whole rect invalid" test.
+- Display stretch midtones use the normalised median
+  `(median − black)/(white − black)`.
+- Group directories are persisted in `MosaicConfig.group_dirs` and never
+  reassigned; `Mosaic::group_session_dir/result_path` take only the group.
+- `MosaicConfig.needs_analyze` gates `blend_group` after analyze-setting
+  changes and during/after an interrupted re-analysis.
+
+Must do in Plan 2, before the viewer ships:
+- Two-writer guard on a tile store (advisory lock or in-process registry);
+  the concurrency contract in `tiles`/`mosaic` docs and DESIGN.md is
+  documentation only today.
+- Split job computation from config mutation (a running job holds
+  `&mut Mosaic` and saves at the end — lost-update hazard), and make
+  `set_*` edits atomic (the CLI's mosaic-wide `set` makes two saves).
+- Build parents per completed tile row so zoomed-out views keep a coarse
+  level during a blend; make `build_parents` cancellable.
+- A test reading through `TileReader` while `blend_tiles` runs on another
+  thread.
+- Store replacement without SIGBUS risk (temp + rename + header
+  generation; readers closed first on Windows).
+- `analyze_all` leaves groups it never reached unmarked after a cancel.
+- Reprojection cancel is checked only per panel (~1 s target missed on
+  2 GB panels).
+
+Before the Checks UI (Plan 3): `panel_facts` reports a rejected/inconsistent
+solution as "no solution" (a Note); give it its own Problem.
+
+Can wait: `check` exit-code policy; unreadable header not a Check;
+`merge_override` lists fields by hand; `blend_group` recreates on any open
+error; empty tiles stored dense; `channel_stats` per-pixel allocation;
+seqlock sequence wrap at 2^31 reports a stale tile as Missing; tests that
+read synth files at fixed offsets.
