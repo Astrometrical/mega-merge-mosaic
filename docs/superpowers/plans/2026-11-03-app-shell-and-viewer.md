@@ -366,3 +366,47 @@
 
 - **Plan 3: tabs.** Panels (grouping UI), Plan (preview pyramids per panel with the low-resolution WCS warp, compositions, selection, checks UI), Blend ROIs (draw/save/notes, ROI blends, staleness cost estimate), export from the tile store (FITS/XISF/TIFF with provenance headers).
 - **Plan 4: packaging and signing** (its own design).
+
+## Outcome and carried follow-ups (2026-11-03)
+
+Executed on `feat/app-shell` (subagent-driven: per-task review, whole-branch
+review, one fix wave). Rulings against the spec or plan:
+
+- Display stretch runs on the CPU per visible tile on loader threads, not
+  in a GPU shader (backend-agnostic for the later lift into
+  workflow-platform). eframe uses the glow renderer.
+- Under WSL, when `GALLIUM_DRIVER` is unset, the app sets it to `d3d12`.
+  Default WSLg Mesa picks llvmpipe (software rendering); with d3d12 the
+  self-test renders on "D3D12 (NVIDIA GeForce RTX 2080 Ti)", GL 4.6.
+- The visible-tile bound is 2× per axis (tiles at the picked level span
+  128–256 screen px). The viewer requests every level from the top down to
+  the drawn one, coarsest first.
+- Zoom keeps the cursor point anchored for the whole animation, and pan
+  does not cancel an in-flight zoom.
+- `plan_analyze` marks and invalidates every group up front. `apply_*`
+  re-check the settings that were used and invalidate on mismatch.
+  `run_blend` locks the store first.
+- Groups are resolved on a worker (`plan_analyze_with`). Invalidation
+  flushes only the state table. A cancelled blend flushes only the state
+  table, so after an OS crash (not an app crash) a reblend may be needed.
+- A blend cancels only the same group's running or queued blend; other
+  groups queue.
+- A saved Blend display stretch means manual; Auto clears it.
+- The small `mosaic.json` saves in plan/apply and the debounced stretch
+  save run on the UI thread. This is a documented exception.
+
+Carried follow-ups:
+- A session-level lock across processes. Two windows can still open one
+  session: `mosaic.json` is last-writer-wins, and a store recreate in one
+  process can SIGBUS (crash) a viewer in the other.
+- Verify the writer lock and reader mmaps on Windows CI (LockFileEx).
+- rfd: switch to `AsyncFileDialog` before macOS builds. The xdg-portal
+  dialog on WSLg has not been tried by hand yet.
+- The viewer refetches every visible tile on each blend-progress tick;
+  per-tile versions or rate-limited bumps are needed.
+- Health is recomputed after every blend (off the UI thread).
+- `blend_tab.rs` tests move to a sibling file.
+- The recent list is last-writer-wins across windows.
+- Show an indeterminate progress bar when the total is 0.
+- Add a test for ROI re-blends with incremental parents.
+- Reprojection plane gathering on the FITS/IPC path cannot be cancelled.
