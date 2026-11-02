@@ -57,7 +57,8 @@ use crate::summary::{BLOCK, L8Summary};
 use crate::{Error, Result};
 
 /// How the caller wants the input panels interpreted (`--input` on the CLI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum InputSelect {
     /// Detect the kind (module docs); the default.
     #[default]

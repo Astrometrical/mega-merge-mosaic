@@ -39,6 +39,8 @@
 //!   `*.mmm-frame.json`, and the fit checks analyze applies.
 //! - [`job`] — cooperative cancellation ([`job::CancelToken`]), progress
 //!   reporting, and a cancellable [`blend::RowSink`] wrapper.
+//! - [`settings`] — serialisable analyze/blend settings, per-group overrides,
+//!   and the [`settings::ChangeImpact`] of editing them.
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
 //!   and benchmarks (in-tree and downstream) never need multi-GB real data.
 //!
@@ -71,6 +73,7 @@ pub mod pyramid;
 pub mod reference;
 pub mod seam;
 pub mod session;
+pub mod settings;
 pub mod summary;
 pub mod surfaces;
 pub mod synth;

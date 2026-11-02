@@ -143,7 +143,8 @@ const FILL_LOCAL_LAYERS: usize = 8;
 pub const DEFECT_VETO_FACTOR: f32 = 6.0;
 
 /// How the detail band is combined across panels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BlendMode {
     /// Phase-1 weighted average of full-res corrected pixels.
     Feather,
