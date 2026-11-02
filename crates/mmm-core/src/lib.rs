@@ -46,6 +46,8 @@
 //!   ([`tiles::TileStore`]) while viewers read it ([`tiles::TileReader`]);
 //!   [`tiles::blend_tiles`] blends a canvas rect into it and rebuilds the
 //!   parent levels, cancellably.
+//! - [`stretch`] — display stretch maths: per-channel median/MAD statistics
+//!   and an auto stretch (display only; the data stays linear).
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
 //!   and benchmarks (in-tree and downstream) never need multi-GB real data.
 //!
@@ -79,6 +81,7 @@ pub mod reference;
 pub mod seam;
 pub mod session;
 pub mod settings;
+pub mod stretch;
 pub mod summary;
 pub mod surfaces;
 pub mod synth;
