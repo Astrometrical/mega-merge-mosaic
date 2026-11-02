@@ -42,9 +42,18 @@ pub enum Error {
         /// Human-readable explanation of what went wrong.
         reason: String,
     },
+
+    /// The job was cancelled by the caller (see [`crate::job::CancelToken`]).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl Error {
+    /// True if this error is [`Error::Cancelled`].
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Error::Cancelled)
+    }
+
     /// Wrap an [`std::io::Error`] with the path it occurred on.
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Error::Io {

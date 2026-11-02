@@ -37,6 +37,8 @@
 //!   sessions adopt so their outputs share one pixel grid (multi-filter
 //!   mosaics): derivation over every group's panels, persistence as
 //!   `*.mmm-frame.json`, and the fit checks analyze applies.
+//! - [`job`] — cooperative cancellation ([`job::CancelToken`]), progress
+//!   reporting, and a cancellable [`blend::RowSink`] wrapper.
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
 //!   and benchmarks (in-tree and downstream) never need multi-GB real data.
 //!
@@ -59,6 +61,7 @@ pub mod error;
 pub mod flatten;
 pub mod formats;
 pub mod ipc;
+pub mod job;
 pub mod linalg;
 pub mod output;
 pub mod overlap;
