@@ -12,7 +12,7 @@ use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
     analyze_all, blend_group, invalidate_group, plan_analyze, plan_analyze_with, plan_blend,
     run_analyze, run_blend, set_analyze_settings, set_blend_settings, set_group_override,
-    set_settings,
+    set_inputs, set_settings,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -950,4 +950,86 @@ fn plan_analyze_with_uses_given_groups() {
     assert_eq!(with, plain);
     assert_eq!(with.resolved, resolved);
     assert_eq!(a.config, b.config);
+}
+
+fn blended_two_groups(name: &str) -> (TempDir, Mosaic) {
+    let tmp = TempDir::new(name);
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+    (tmp, m)
+}
+
+#[test]
+fn set_inputs_stales_everything() {
+    let (_tmp, mut m) = blended_two_groups("inputs-stale");
+    let mut panels = m.config.panels.clone();
+    panels.pop();
+    let grouping = m.config.grouping.clone();
+    let n = panels.len();
+    set_inputs(&mut m, panels.clone(), grouping.clone()).unwrap();
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert_eq!(valid0(&m.result_path("OIII")), 0);
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(saved, m.config);
+    assert_eq!(saved.panels, panels);
+    assert_eq!(
+        saved.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Ha", "OIII"]
+    );
+    let last = saved.provenance.last().unwrap();
+    assert_eq!(last.action, "inputs");
+    assert_eq!(last.detail["panels"], n);
+}
+
+#[test]
+fn set_inputs_busy_changes_nothing() {
+    let (_tmp, mut m) = blended_two_groups("inputs-busy");
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let cfg = m.config.clone();
+    let oiii_valid = valid0(&m.result_path("OIII"));
+    let held = TileStore::open(&m.result_path("Ha")).unwrap();
+    let mut panels = m.config.panels.clone();
+    panels.pop();
+    let err = set_inputs(&mut m, panels, cfg.grouping.clone()).unwrap_err();
+    assert!(err.is_busy(), "{err}");
+    assert_eq!(m.config, cfg);
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+    assert_eq!(valid0(&m.result_path("OIII")), oiii_valid);
+    drop(held);
+}
+
+#[test]
+fn set_inputs_noop_when_unchanged() {
+    let (_tmp, mut m) = blended_two_groups("inputs-noop");
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let ha_valid = valid0(&m.result_path("Ha"));
+    // Even a busy store does not matter for a no-op.
+    let held = TileStore::open(&m.result_path("Ha")).unwrap();
+    let (panels, grouping) = (m.config.panels.clone(), m.config.grouping.clone());
+    set_inputs(&mut m, panels, grouping).unwrap();
+    drop(held);
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+    assert_eq!(valid0(&m.result_path("Ha")), ha_valid);
+    assert!(m.config.needs_analyze.is_empty());
+}
+
+#[test]
+fn manual_group_survives_rule_change() {
+    let (_tmp, mut m) = blended_two_groups("inputs-manual");
+    let mut panels = m.config.panels.clone();
+    panels[0].manual_group = Some("Custom".into());
+    let grouping = Grouping {
+        enabled: true,
+        rule: GroupRule::FilenameToken {
+            keyword: "Ha".into(),
+        },
+    };
+    set_inputs(&mut m, panels, grouping.clone()).unwrap();
+    let panels = m.config.panels.clone();
+    set_inputs(&mut m, panels, Grouping::default()).unwrap();
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(saved.panels[0].manual_group.as_deref(), Some("Custom"));
+    assert_eq!(saved.grouping, Grouping::default());
 }

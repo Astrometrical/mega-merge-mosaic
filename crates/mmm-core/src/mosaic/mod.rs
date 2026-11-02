@@ -46,7 +46,7 @@ pub use lock::{LOCK_FILE, SessionLock, busy_message, lock_session};
 pub use run::{
     AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, BlendPlan, Mosaic, analyze_all, blend_group,
     invalidate_group, plan_analyze, plan_analyze_with, plan_blend, run_analyze, run_blend,
-    set_analyze_settings, set_blend_settings, set_group_override, set_settings,
+    set_analyze_settings, set_blend_settings, set_group_override, set_inputs, set_settings,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

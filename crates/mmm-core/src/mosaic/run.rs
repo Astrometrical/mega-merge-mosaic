@@ -25,8 +25,8 @@ use serde_json::json;
 
 use super::grouping::{Groups, allocate_group_dir, header_value, resolve_groups};
 use super::{
-    FRAME_FILE, Fingerprint, GROUPS_DIR, GroupRule, MosaicConfig, ProvenanceEntry, RESULT_FILE,
-    fingerprint,
+    FRAME_FILE, Fingerprint, GROUPS_DIR, GroupRule, Grouping, MosaicConfig, PanelEntry,
+    ProvenanceEntry, RESULT_FILE, fingerprint,
 };
 use crate::analyze::{InputSelect, analyze_ctl};
 use crate::error::{Error, Result};
@@ -606,6 +606,36 @@ pub fn set_settings(
     next.save(&m.dir)?;
     m.config = next;
     Ok(impact)
+}
+
+/// Replace the input panel list and grouping rule. Unchanged inputs are a
+/// no-op. Otherwise every existing group result store is invalidated, every
+/// group with a recorded directory is marked in
+/// [`MosaicConfig::needs_analyze`] (group membership may have changed), and
+/// an `"inputs"` provenance entry with the panel and group counts is
+/// appended. One save. A [`PanelEntry`]'s `manual_group` is part of the entry
+/// and so survives a rule change.
+///
+/// Refused with nothing changed (in memory or on disk) with [`Error::Busy`]
+/// when any store is held by a writer.
+pub fn set_inputs(m: &mut Mosaic, panels: Vec<PanelEntry>, grouping: Grouping) -> Result<()> {
+    if panels == m.config.panels && grouping == m.config.grouping {
+        return Ok(());
+    }
+    let mut stores = lock_stores(&all_result_stores(m)?)?;
+    let mut next = m.config.clone();
+    next.needs_analyze.extend(next.group_dirs.keys().cloned());
+    next.push_provenance(
+        "inputs",
+        None,
+        json!({ "panels": panels.len(), "groups": next.group_dirs.len() }),
+    );
+    next.panels = panels;
+    next.grouping = grouping;
+    invalidate(&mut stores)?;
+    next.save(&m.dir)?;
+    m.config = next;
+    Ok(())
 }
 
 /// Replace the global blend settings ([`set_settings`] with the analyze
