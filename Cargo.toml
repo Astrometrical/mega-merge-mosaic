@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mmm-core", "crates/mmm", "crates/mmm-ipc-worker"]
+members = ["crates/mmm-core", "crates/mmm", "crates/mmm-ipc-worker", "crates/mega-ui"]
 
 [workspace.package]
 # Kept in exact sync with the PixInsight module's MMM_VERSION_STRING
@@ -33,6 +33,12 @@ quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+# GUI stack (same versions as workflow-platform).
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence"] }
+egui_kittest = "0.36"
+rfd = "0.15"
+sysinfo = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Blend math is hot-path; always optimize dependencies even in dev builds

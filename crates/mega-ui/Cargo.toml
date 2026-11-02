@@ -1,0 +1,14 @@
+[package]
+name = "mega-ui"
+description = "Generic egui components and Astrometrical theme for the Mega apps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
