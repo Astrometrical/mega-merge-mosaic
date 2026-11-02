@@ -1,14 +1,19 @@
 //! Binary-level tests of the `mmm` CLI around the shared reference frame:
 //! `frame` → `analyze --frame` → `blend` yields co-registered FITS outputs,
-//! and `batch` does the same in one command.
+//! and `batch` does the same in one command; mosaic sessions (`init`, `set`,
+//! `check`, `run`) do it from a persisted `mosaic.json`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mmm_core::astrometry::LinearWcs;
+use mmm_core::blend::BlendMode;
 use mmm_core::formats::InputPanel;
+use mmm_core::mosaic::MosaicConfig;
 use mmm_core::reference::ReferenceFrame;
-use mmm_core::synth::{SynthWcs, write_xisf_solved};
+use mmm_core::synth::{
+    SynthSpec, SynthWcs, generate, write_xisf_solved, write_xisf_with_header_xml,
+};
 
 const S: f64 = 1.0e-3;
 const STAR: [f64; 2] = [66.0, 18.0];
@@ -349,5 +354,212 @@ fn analyze_reads_compressed_xisf_and_says_so() {
         !stderr.contains("Decoding compressed"),
         "cache re-used:\n{stderr}"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A 2×2 aligned synthetic panel set, each panel rewritten with a `FILTER`
+/// header card; returns the tagged panel paths.
+fn filter_group(root: &Path, filter: &str, seed: u64) -> Vec<PathBuf> {
+    const CANVAS: (u64, u64) = (240, 180);
+    let spec = SynthSpec {
+        canvas: CANVAS,
+        channels: 1,
+        grid: (2, 2),
+        overlap_frac: 0.25,
+        n_stars: 20,
+        noise_sigma: 0.002,
+        panel_gain_range: (0.8, 1.2),
+        panel_offset_range: (0.0, 0.01),
+        panel_gradient_range: (0.0, 0.0),
+        global_gradient: (0.0, 0.0, 0.0),
+        panel_shift: vec![],
+        panel_spike_angle: vec![],
+        panel_defects: vec![],
+        mid_blobs: 0,
+        shift_blobs: false,
+        core: None,
+        seed,
+    };
+    let res = generate(&spec, &root.join(format!("gen-{filter}"))).unwrap();
+    let out = root.join("panels");
+    std::fs::create_dir_all(&out).unwrap();
+    let n = (CANVAS.0 * CANVAS.1) as usize;
+    res.panel_paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            // The synth writer stores the Float32 planes at offset 4096.
+            let bytes = std::fs::read(p).unwrap();
+            let planes: Vec<f32> = bytes[4096..4096 + n * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            let path = out.join(format!("{filter}_{i}.xisf"));
+            write_xisf_with_header_xml(
+                &path,
+                CANVAS.0,
+                CANVAS.1,
+                1,
+                &planes,
+                &format!(r#"<FITSKeyword name="FILTER" value="'{filter}'" comment=""/>"#),
+            )
+            .unwrap();
+            path
+        })
+        .collect()
+}
+
+/// Run `mmm` expecting failure; returns stderr.
+fn run_fail(cmd: &mut Command) -> String {
+    let out = cmd.output().expect("mmm must start");
+    assert!(
+        !out.status.success(),
+        "mmm unexpectedly succeeded:\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// `mmm init` over Ha + OIII panels grouped by `FILTER` into `dir/m`.
+fn init_two_groups(dir: &Path) -> PathBuf {
+    let mut panels = filter_group(dir, "Ha", 7);
+    panels.extend(filter_group(dir, "OIII", 11));
+    let m = dir.join("m");
+    run(mmm()
+        .arg("init")
+        .args(&panels)
+        .arg("-s")
+        .arg(&m)
+        .arg("--group-by")
+        .arg("header:FILTER"));
+    m
+}
+
+#[test]
+fn init_run_two_groups() {
+    let dir = tempdir("init-run");
+    let m = init_two_groups(&dir);
+    let out_dir = dir.join("out");
+    let out = run(mmm().arg("run").arg("-s").arg(&m).arg("-o").arg(&out_dir));
+    assert!(out.contains("group Ha"), "{out}");
+    assert!(out.contains("group OIII"), "{out}");
+    let cfg = MosaicConfig::load(&m).unwrap();
+    let file = |g: &str| out_dir.join(format!("{}.fits", cfg.group_dirs[g]));
+    let ha = InputPanel::open(&file("Ha")).unwrap();
+    let oiii = InputPanel::open(&file("OIII")).unwrap();
+    assert_eq!(
+        (ha.width(), ha.height()),
+        (oiii.width(), oiii.height()),
+        "groups share one grid"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn set_group_override_persists() {
+    let dir = tempdir("set-override");
+    let m = init_two_groups(&dir);
+    let out = run(mmm()
+        .arg("set")
+        .arg("-s")
+        .arg(&m)
+        .arg("--group")
+        .arg("Ha")
+        .arg("--mode")
+        .arg("feather"));
+    assert!(out.contains("reblend"), "impact is printed:\n{out}");
+    let json: String = std::fs::read_to_string(m.join("mosaic.json")).unwrap();
+    let cfg = MosaicConfig::load(&m).unwrap();
+    assert_eq!(
+        cfg.group_overrides["Ha"].blend.mode,
+        Some(BlendMode::Feather),
+        "{json}"
+    );
+    assert_eq!(cfg.blend.mode, BlendMode::Pyramid, "mosaic-wide unchanged");
+    assert!(!cfg.group_overrides.contains_key("OIII"));
+
+    // Mosaic-wide: only the flag passed changes.
+    run(mmm()
+        .arg("set")
+        .arg("-s")
+        .arg(&m)
+        .arg("--feather")
+        .arg("100"));
+    let cfg2 = MosaicConfig::load(&m).unwrap();
+    assert_eq!(cfg2.blend.feather_px, 100.0);
+    assert_eq!(cfg2.blend.mode, BlendMode::Pyramid);
+    assert_eq!(cfg2.analyze, cfg.analyze);
+    assert_eq!(cfg2.group_overrides, cfg.group_overrides);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn check_lists_missing_distortion() {
+    let dir = tempdir("check-distortion");
+    let a = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let m = dir.join("m");
+    run(mmm().arg("init").args(&a).arg("-s").arg(&m));
+    let out = run(mmm().arg("check").arg("-s").arg(&m));
+    assert!(out.contains("mosaic: 2 panels"), "{out}");
+    assert!(out.contains("problems (2)"), "{out}");
+    assert!(
+        out.contains("a_00.xisf: missing distortion model."),
+        "{out}"
+    );
+    assert!(
+        out.contains("Re-solve the panel with distortion correction enabled."),
+        "{out}"
+    );
+    assert!(out.contains("passed:"), "{out}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn blend_on_mosaic_dir_points_to_run() {
+    let dir = tempdir("mosaic-guard");
+    let a = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let m = dir.join("m");
+    run(mmm().arg("init").args(&a).arg("-s").arg(&m));
+    let err = run_fail(
+        mmm()
+            .arg("blend")
+            .arg("-s")
+            .arg(&m)
+            .arg("-o")
+            .arg(dir.join("x.fits")),
+    );
+    assert!(err.contains("mmm run"), "{err}");
+    assert!(err.contains("mmm check"), "{err}");
+    let err = run_fail(mmm().arg("analyze").args(&a).arg("-s").arg(&m));
+    assert!(err.contains("mmm run"), "{err}");
+    assert!(!m.join("session.json").exists(), "nothing analyzed");
+    let err = run_fail(mmm().arg("report").arg("-s").arg(&m));
+    assert!(err.contains("mmm check"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn init_refuses_existing() {
+    let dir = tempdir("init-existing");
+    let a = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let m = dir.join("m");
+    run(mmm().arg("init").args(&a).arg("-s").arg(&m));
+    let before = std::fs::read_to_string(m.join("mosaic.json")).unwrap();
+    let err = run_fail(mmm().arg("init").args(&a[..1]).arg("-s").arg(&m));
+    assert!(err.contains("--force"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(m.join("mosaic.json")).unwrap(),
+        before,
+        "untouched"
+    );
+    run(mmm()
+        .arg("init")
+        .args(&a[..1])
+        .arg("-s")
+        .arg(&m)
+        .arg("--force"));
+    assert_eq!(MosaicConfig::load(&m).unwrap().panels.len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod mosaic_cmd;
+
 /// Mega Merge Mosaic — fast merging/blending of pre-aligned astro mosaic panels.
 #[derive(Parser)]
 #[command(name = "mmm", version, about)]
@@ -65,24 +67,30 @@ fn parse_input(input: &str) -> anyhow::Result<mmm_core::analyze::InputSelect> {
     })
 }
 
+fn parse_surface(surface: &str) -> anyhow::Result<Option<u32>> {
+    Ok(match surface {
+        "off" => None,
+        "0" => Some(0),
+        "1" => Some(1),
+        "2" => Some(2),
+        other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
+    })
+}
+
+fn parse_gain(gain: &str) -> anyhow::Result<mmm_core::photometry::GainMode> {
+    Ok(match gain {
+        "fit" => mmm_core::photometry::GainMode::Fit,
+        "unity" => mmm_core::photometry::GainMode::Unity,
+        other => anyhow::bail!("--gain must be fit or unity (got {other})"),
+    })
+}
+
 impl AnalyzeOpts {
     fn resolve(&self) -> anyhow::Result<AnalyzeConfig> {
-        let surface_order = match self.surface.as_str() {
-            "off" => None,
-            "0" => Some(0),
-            "1" => Some(1),
-            "2" => Some(2),
-            other => anyhow::bail!("--surface must be off, 0, 1 or 2 (got {other})"),
-        };
-        let gain = match self.gain.as_str() {
-            "fit" => mmm_core::photometry::GainMode::Fit,
-            "unity" => mmm_core::photometry::GainMode::Unity,
-            other => anyhow::bail!("--gain must be fit or unity (got {other})"),
-        };
         Ok(AnalyzeConfig {
-            surface_order,
+            surface_order: parse_surface(&self.surface)?,
             input: parse_input(&self.input)?,
-            gain,
+            gain: parse_gain(&self.gain)?,
         })
     }
 }
@@ -144,30 +152,46 @@ struct BlendConfig {
     extent: Option<mmm_core::blend::Extent>,
 }
 
+fn parse_mode(mode: &str) -> anyhow::Result<mmm_core::blend::BlendMode> {
+    Ok(match mode {
+        "feather" => mmm_core::blend::BlendMode::Feather,
+        "twoband" => mmm_core::blend::BlendMode::TwoBand,
+        "pyramid" => mmm_core::blend::BlendMode::Pyramid,
+        other => anyhow::bail!("--mode must be pyramid, twoband or feather (got {other})"),
+    })
+}
+
+fn parse_defect_veto(defect_veto: &str) -> anyhow::Result<bool> {
+    Ok(match defect_veto {
+        "on" => true,
+        "off" => false,
+        other => anyhow::bail!("--defect-veto must be on or off (got {other})"),
+    })
+}
+
+fn parse_flatten(flatten: &str) -> anyhow::Result<Option<u32>> {
+    Ok(match flatten {
+        "off" => None,
+        "1" => Some(1),
+        "2" => Some(2),
+        other => anyhow::bail!("--flatten must be off, 1 or 2 (got {other})"),
+    })
+}
+
+fn parse_wcs_frame(wcs_frame: &str) -> anyhow::Result<bool> {
+    Ok(match wcs_frame {
+        "topdown" => false,
+        "flipped" => true,
+        other => anyhow::bail!("--wcs-frame must be topdown or flipped (got {other})"),
+    })
+}
+
 impl BlendOpts {
     fn resolve(&self) -> anyhow::Result<BlendConfig> {
-        let mode = match self.mode.as_str() {
-            "feather" => mmm_core::blend::BlendMode::Feather,
-            "twoband" => mmm_core::blend::BlendMode::TwoBand,
-            "pyramid" => mmm_core::blend::BlendMode::Pyramid,
-            other => anyhow::bail!("--mode must be pyramid, twoband or feather (got {other})"),
-        };
-        let defect_veto = match self.defect_veto.as_str() {
-            "on" => true,
-            "off" => false,
-            other => anyhow::bail!("--defect-veto must be on or off (got {other})"),
-        };
-        let flatten = match self.flatten.as_str() {
-            "off" => None,
-            "1" => Some(1),
-            "2" => Some(2),
-            other => anyhow::bail!("--flatten must be off, 1 or 2 (got {other})"),
-        };
-        let wcs_flip = match self.wcs_frame.as_str() {
-            "topdown" => false,
-            "flipped" => true,
-            other => anyhow::bail!("--wcs-frame must be topdown or flipped (got {other})"),
-        };
+        let mode = parse_mode(&self.mode)?;
+        let defect_veto = parse_defect_veto(&self.defect_veto)?;
+        let flatten = parse_flatten(&self.flatten)?;
+        let wcs_flip = parse_wcs_frame(&self.wcs_frame)?;
         let extent = match self.extent.as_str() {
             "auto" => None,
             "union" => Some(mmm_core::blend::Extent::Union),
@@ -296,6 +320,22 @@ enum Command {
         #[command(flatten)]
         blend: BlendOpts,
     },
+
+    /// Create a mosaic session: a directory holding the panel list, grouping
+    /// and settings (`mosaic.json`) plus all cached analysis
+    Init(mosaic_cmd::InitArgs),
+
+    /// Change a mosaic session's settings, mosaic-wide or for one group;
+    /// flags not given leave their settings unchanged
+    Set(mosaic_cmd::SetArgs),
+
+    /// List a mosaic session's groups and every check on its panels (and
+    /// on the analysis of groups already analyzed)
+    Check(mosaic_cmd::CheckArgs),
+
+    /// Analyze every group of a mosaic session onto one shared frame and
+    /// blend each group to OUTDIR/<group dir>.fits
+    Run(mosaic_cmd::RunArgs),
 }
 
 fn parse_roi(s: &str) -> anyhow::Result<[u64; 4]> {
@@ -344,7 +384,11 @@ fn main() -> anyhow::Result<()> {
         Command::Analyze { session, .. }
         | Command::Blend { session, .. }
         | Command::Report { session, .. }
-        | Command::Batch { session, .. } => {
+        | Command::Batch { session, .. }
+        | Command::Init(mosaic_cmd::InitArgs { session, .. })
+        | Command::Set(mosaic_cmd::SetArgs { session, .. })
+        | Command::Check(mosaic_cmd::CheckArgs { session, .. })
+        | Command::Run(mosaic_cmd::RunArgs { session, .. }) => {
             mmm_core::decoded::set_cache_dir(session.join("decoded"));
         }
         Command::Info { .. } | Command::Frame { .. } => {}
@@ -368,6 +412,7 @@ fn main() -> anyhow::Result<()> {
             frame,
             opts,
         } => {
+            mosaic_cmd::refuse_mosaic_dir(&session)?;
             let cfg = opts.resolve()?;
             let reference = frame
                 .as_deref()
@@ -375,13 +420,17 @@ fn main() -> anyhow::Result<()> {
                 .transpose()?;
             analyze_cmd(&panels, &session, &cfg, reference.as_ref()).map(|_| ())
         }
-        Command::Report { session, seam_png } => report(&session, seam_png.as_deref()),
+        Command::Report { session, seam_png } => {
+            mosaic_cmd::refuse_mosaic_dir(&session)?;
+            report(&session, seam_png.as_deref())
+        }
         Command::Blend {
             session,
             output,
             png,
             opts,
         } => {
+            mosaic_cmd::refuse_mosaic_dir(&session)?;
             let cfg = opts.resolve()?;
             blend_cmd(&session, &output, png.as_deref(), &cfg)
         }
@@ -406,6 +455,10 @@ fn main() -> anyhow::Result<()> {
                 &blend.resolve()?,
             )
         }
+        Command::Init(args) => mosaic_cmd::init(&args),
+        Command::Set(args) => mosaic_cmd::set(&args),
+        Command::Check(args) => mosaic_cmd::check(&args),
+        Command::Run(args) => mosaic_cmd::run(&args),
     }
 }
 
@@ -480,15 +533,25 @@ fn batch_cmd(
         outputs.push((name.clone(), out));
     }
 
+    print_outputs_summary("batch", &reference, &outputs);
+    Ok(())
+}
+
+/// The closing summary of `batch` and `run`: every group's output file,
+/// all on the shared reference grid.
+fn print_outputs_summary(
+    command: &str,
+    reference: &mmm_core::reference::ReferenceFrame,
+    outputs: &[(String, std::path::PathBuf)],
+) {
     let (w, h) = reference.canvas();
     println!(
-        "\nbatch: {} outputs, all on the shared {w}x{h} grid:",
+        "\n{command}: {} outputs, all on the shared {w}x{h} grid:",
         outputs.len()
     );
-    for (name, out) in &outputs {
+    for (name, out) in outputs {
         println!("  {name}: {}", out.display());
     }
-    Ok(())
 }
 
 /// `mmm frame`: header-only derivation of a shared reference frame.
