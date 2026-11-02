@@ -58,6 +58,10 @@
 //!   ([`mosaic::set_settings`]) that stale exactly the affected result stores.
 //!   One writer per store is enforced (`Error::Busy`); the plan / run / apply
 //!   concurrency contract is in the [`mosaic`] module docs.
+//! - [`preview`] — cached low-resolution panel previews placed in the
+//!   shared reference frame (a block mean for aligned canvases, a WCS warp
+//!   for solved panels), built on a bounded pool before any analysis
+//!   ([`preview::plan_previews`] / [`preview::run_previews`]).
 //! - [`checks`] — structured input, file and analysis checks (severity, code,
 //!   affected groups, remedy) and the accepted-warning bookkeeping, as data
 //!   for a UI or `mmm check`.
@@ -99,6 +103,7 @@ pub mod output;
 pub mod overlap;
 pub mod panel_reader;
 pub mod photometry;
+pub mod preview;
 pub mod pyramid;
 pub mod reference;
 pub mod seam;
