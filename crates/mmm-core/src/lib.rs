@@ -75,6 +75,7 @@ pub mod diag;
 pub mod error;
 pub mod flatten;
 pub mod formats;
+pub mod health;
 pub mod ipc;
 pub mod job;
 pub mod linalg;

@@ -364,7 +364,7 @@ pub struct MosaicSummary {
 }
 
 /// Median of an unsorted slice; `0` when empty.
-fn median(mut v: Vec<f64>) -> f64 {
+pub(crate) fn median(mut v: Vec<f64>) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
