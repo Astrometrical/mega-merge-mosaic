@@ -602,3 +602,32 @@ fn set_rejects_non_finite_or_non_positive_feather() {
     MosaicConfig::load(&m).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn check_reports_corrupt_group_analysis_and_continues() {
+    let dir = tempdir("check-corrupt");
+    let m = init_two_groups(&dir);
+    run(mmm()
+        .arg("run")
+        .arg("-s")
+        .arg(&m)
+        .arg("-o")
+        .arg(dir.join("out")));
+    let cfg = MosaicConfig::load(&m).unwrap();
+    let session = m
+        .join("groups")
+        .join(&cfg.group_dirs["Ha"])
+        .join("session.json");
+    let json = std::fs::read(&session).unwrap();
+    std::fs::write(&session, &json[..json.len() / 2]).unwrap();
+
+    let out = run(mmm().arg("check").arg("-s").arg(&m));
+    assert!(
+        out.contains("cannot read analysis of group Ha:"),
+        "problem line for the corrupt group:\n{out}"
+    );
+    // The other group's checks and the summary still print.
+    assert!(out.contains("passed:"), "{out}");
+    assert!(!out.contains("group OIII:"), "{out}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

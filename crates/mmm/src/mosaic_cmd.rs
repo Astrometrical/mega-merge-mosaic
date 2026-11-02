@@ -363,6 +363,7 @@ pub(crate) fn check(a: &CheckArgs) -> anyhow::Result<()> {
     }
     let mut checks = input_checks(&m.config, &facts, &groups);
     checks.extend(file_checks(&m.config));
+    let mut unreadable = Vec::new();
     for (group, _) in groups.processing_groups() {
         if !m.config.group_dirs.contains_key(&group) {
             continue;
@@ -371,15 +372,32 @@ pub(crate) fn check(a: &CheckArgs) -> anyhow::Result<()> {
         if !dir.join("session.json").is_file() {
             continue;
         }
-        let session = Session::open(&dir)?;
-        let graph = OverlapGraph::load(&session.overlap_graph_path())
-            .with_context(|| format!("group {group}: cannot load its analysis"))?;
-        checks.extend(analysis_checks(&group, &session, &graph));
+        // A corrupt analysis is a problem to report, not a reason to stop
+        // checking the rest of the mosaic.
+        let loaded = Session::open(&dir).and_then(|session| {
+            OverlapGraph::load(&session.overlap_graph_path()).map(|graph| (session, graph))
+        });
+        match loaded {
+            Ok((session, graph)) => checks.extend(analysis_checks(&group, &session, &graph)),
+            Err(e) => unreadable.push(format!("cannot read analysis of group {group}: {e}")),
+        }
     }
 
     for (severity, title) in [(Severity::Problem, "problems"), (Severity::Note, "notes")] {
         let of: Vec<&Check> = checks.iter().filter(|c| c.severity == severity).collect();
-        println!("\n{title} ({}):", of.len());
+        let extra: &[String] = if severity == Severity::Problem {
+            &unreadable
+        } else {
+            &[]
+        };
+        println!("\n{title} ({}):", of.len() + extra.len());
+        for line in extra {
+            println!("  - {line}");
+            println!(
+                "      Re-analyse it with `mmm run -s {} -o OUTDIR`.",
+                m.dir.display()
+            );
+        }
         for c in of {
             print_check(c, is_accepted(&m.config, c));
         }
