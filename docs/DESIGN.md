@@ -834,9 +834,14 @@ below is UI-agnostic and the CLI is its first consumer.
   `blend_tiles` blends a canvas rect (an ROI re-blend invalidates only the
   tiles it touches) cancellably. A cancelled or failed blend keeps its
   finished work (spec §8): level-0 tiles it fully wrote stay valid, the
-  rest of the rect stays stale, and the parents are rebuilt from what is
-  valid. A store whose geometry no longer matches the analysis is dropped
-  and recreated; blending against stale analysis is refused.
+  rest of the rect stays stale, and only the parents over rows the sink
+  wrote but had not yet rebuilt are rebuilt (the rest are already current
+  or stay invalid), so a late cancel re-reads no finished tiles. The
+  rebuild checks every in-image child's state before copying any. A store
+  whose geometry no longer matches the analysis is dropped and recreated,
+  as is a missing or unparseable one (`Error::Format`); any other open
+  error is returned, never answered by truncating the file. Blending
+  against stale analysis is refused.
 - **Mosaic orchestration** (`mosaic`). `mosaic.json` config, grouping rules
   (`header:KEY`, `token:KEYWORD`; panels no rule places go to a "No group"
   processing group), persisted `group_dirs`, `needs_analyze`, `Mosaic` with
@@ -878,8 +883,9 @@ below is UI-agnostic and the CLI is its first consumer.
   invalidates the group's store (`invalidate_group`, busy-aware) when it
   discards one whose settings were superseded. Invalidation flushes only
   the store's state table (`TileStore::flush_state`); `run_blend` flushes
-  the whole store on its worker on every exit path, so the owner thread
-  never waits on tile write-back. `plan_analyze_with` plans from groups
+  the whole store on its worker on success, so the owner thread never
+  waits on tile write-back, and only the state table on an error or
+  cancellation, so a cancel ends within about a second. `plan_analyze_with` plans from groups
   resolved elsewhere (the app resolves them, reading panel headers, on a
   worker over a copy of the mosaic). The app cancels and joins a
   running job before applying settings; busy refusal and the apply guards
@@ -914,7 +920,10 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
 - **Job contract.** The app uses the plan / run / apply split and the
   concurrency contract above unchanged: plan and apply on the UI (owner)
   thread, run on a worker with no `Mosaic`. The job runner lets newer work
-  win: a settings edit cancels and joins a running job before applying.
+  win: a settings edit cancels and joins a running job before applying; an
+  analysis cancels everything; a blend cancels (or replaces) only a running
+  or queued blend of the same group, and blends of other groups queue and
+  run in order.
   Group resolution (reads panel headers) runs on a worker via
   `plan_analyze_with`. The `apply_*` saves of `mosaic.json` stay on the UI
   thread (small atomic write; the core requires apply on the owner thread).

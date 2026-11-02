@@ -39,7 +39,8 @@ target/release/mmm info test_data/orion_mosaic/*PANEL-4_*.xisf --stats
 
 GUI runs: launch the app only via `--selftest` (it closes itself; never
 kill a GUI on a timer). Selftest session: `cargo run -p mmm-app --example
-make_selftest_session -- DIR`. Under WSL the app sets `GALLIUM_DRIVER=d3d12`.
+make_selftest_session -- DIR`. Under WSL the app sets `GALLIUM_DRIVER=d3d12`
+(unless already set).
 
 Rust via rustup (`source ~/.cargo/env` if PATH lacks cargo).
 

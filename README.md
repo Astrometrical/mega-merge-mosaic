@@ -124,6 +124,8 @@ target/release/mega-merge-mosaic --selftest [SESSION_DIR]   # renders a few fram
 Currently it opens or creates mosaic sessions and shows the Blend tab. Under
 WSL the app selects Mesa's `d3d12` GL driver for GPU rendering (default WSLg
 falls back to software `llvmpipe`); set `GALLIUM_DRIVER` yourself to override.
+libEGL warnings on stderr such as "failed to get driver name for fd -1" are
+harmless.
 
 ## CLI reference
 
