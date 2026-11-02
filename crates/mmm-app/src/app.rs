@@ -104,6 +104,14 @@ impl Shell {
         &self.blend
     }
 
+    /// Save anything held back by a rate limit (the display stretch), e.g.
+    /// when the window closes.
+    pub fn flush_pending_saves(&mut self) {
+        if let Some(session) = &self.session {
+            self.blend.flush_save(session);
+        }
+    }
+
     /// Open or create a session on a background thread. With a session
     /// already open, the new one goes to a new process (spec §3).
     pub fn request(&mut self, request: Request, ctx: &egui::Context) {
@@ -571,9 +579,15 @@ impl eframe::App for MmmApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.shell.flush_pending_saves();
         if self.selftest.is_none() {
             eframe::set_value(storage, RECENT_KEY, &self.shell.start.recent());
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // `save` runs first only with persistence storage available.
+        self.shell.flush_pending_saves();
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -757,6 +771,24 @@ mod tests {
             .map(|p| p.action.clone())
             .collect();
         assert_eq!(actions, ["analyze", "blend"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_saves_flushed_by_shell() {
+        let root = temp_dir("shell-flush");
+        let mut session = crate::testutil::two_group_session(&root);
+        session.mosaic.save().unwrap();
+        let mut shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(StubPicker(None))));
+        // Nothing open: nothing to do.
+        shell.flush_pending_saves();
+        session.mosaic.config.ui = serde_json::json!({ "marker": 1 });
+        let dir = session.mosaic.dir.clone();
+        shell.session = Some(session);
+        shell.blend.touch_save();
+        shell.flush_pending_saves();
+        let back = mmm_core::mosaic::MosaicConfig::load(&dir).unwrap();
+        assert_eq!(back.ui["marker"], 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

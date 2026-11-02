@@ -11,7 +11,7 @@
 //! # No reader across a store recreation
 //!
 //! `run_blend` recreates (truncates) a group's store only when it is
-//! missing, unreadable, or its geometry differs from the group's analysed
+//! missing, unparseable, or its geometry differs from the group's analysed
 //! canvas; a live [`mmm_core::tiles::TileReader`] would then fault. This tab
 //! guards the geometry path (the other two have no reader to fault):
 //!
@@ -27,7 +27,9 @@
 //!   have dropped it; **Blend** stays disabled until then;
 //! - with no source open, a blend's first progress update means it has
 //!   created its store (progress is only reported once tiles are written),
-//!   so the result is opened then and tiles appear while it runs.
+//!   so the result is opened then and tiles appear while it runs; while a
+//!   blend of the shown group is queued or has not reported yet (e.g.
+//!   after switching to that group), no open starts.
 //!
 //! Another program (the `mmm` CLI) recreating the store while it is shown
 //! is not guarded against.
@@ -108,6 +110,11 @@ impl Debounce {
     /// Something changed that needs saving.
     pub fn touch(&mut self) {
         self.dirty = true;
+    }
+
+    /// Whether a change is waiting to be saved (due or not).
+    pub fn pending(&self) -> bool {
+        self.dirty
     }
 
     /// Whether to save at `now`.
@@ -326,6 +333,26 @@ impl BlendTab {
                 .is_none_or(|v| v.last_frame().is_some() && !v.is_loading())
     }
 
+    /// Save a pending (debounced) display stretch change now, whatever the
+    /// rate limit: the window is closing, or the session state is being
+    /// saved. A small `mosaic.json` write on the UI thread (the module's
+    /// documented exception).
+    pub fn flush_save(&mut self, session: &OpenSession) {
+        if !self.save.pending() {
+            return;
+        }
+        self.save.saved(Instant::now());
+        if let Err(e) = session.mosaic.save() {
+            tracing::warn!("display stretch not saved: {e}");
+        }
+    }
+
+    /// Mark the display stretch as changed and unsaved (tests).
+    #[cfg(test)]
+    pub(crate) fn touch_save(&mut self) {
+        self.save.touch();
+    }
+
     /// Whether **Blend** may start now (see the module docs for the store
     /// recreation guard).
     fn can_blend(&self, readiness: Readiness) -> bool {
@@ -471,7 +498,10 @@ impl BlendTab {
         let Some(group) = self.group.clone() else {
             return;
         };
-        if self.reopen && self.opening.is_none() {
+        // A blend of this group that is queued, or running but has not
+        // reported progress, may still create or recreate the store: open
+        // only once it reports (`follow_blend`) or ends.
+        if self.reopen && self.opening.is_none() && !jobs.blend_unstarted(&group) {
             self.reopen = false;
             let result = session.mosaic.result_path(&group);
             let dir = session.mosaic.group_session_dir(&group);
@@ -591,7 +621,17 @@ impl BlendTab {
         };
         self.auto = None;
         let keep = std::mem::take(&mut self.save_auto_result);
-        let (Some(src), Some(s)) = (&self.source, stretch) else {
+        let Some(s) = stretch else {
+            // No statistics (nothing blended yet). A Linked Auto saved
+            // nothing, so the stretch is automatic again: the next finished
+            // blend computes it (`on_event` sets `want_auto`). Asking for it
+            // now would only spin on the same empty result.
+            if keep {
+                self.manual = false;
+            }
+            return;
+        };
+        let Some(src) = &self.source else {
             return;
         };
         if keep {
@@ -983,5 +1023,97 @@ mod tests {
             label: "Blend Ha".into(),
         });
         assert!(tab.blend_job.is_none() && tab.reopen && tab.want_health);
+    }
+
+    #[test]
+    fn no_open_while_shown_groups_blend_is_unstarted() {
+        let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-unstarted-open");
+        let ctx = egui::Context::default();
+        let gate = jobs.hold();
+        jobs.start_blend(&mut s, "Ha", None);
+        jobs.start_blend(&mut s, "OIII", None);
+
+        // Switching to a group whose blend is running without progress, or
+        // queued, opens nothing: the blend may still (re)create the store.
+        let mut tab = BlendTab::new();
+        for g in ["Ha", "OIII"] {
+            tab.select(g.into());
+            tab.update(&ctx, &mut s, &jobs);
+            assert!(tab.opening.is_none(), "{g}: opened during its blend");
+            assert!(tab.reopen, "{g}: open forgotten");
+        }
+
+        // Once the blends end, the deferred open happens.
+        gate.open();
+        crate::jobs::tests::drain(&mut jobs, &mut s);
+        tab.update(&ctx, &mut s, &jobs);
+        assert!(tab.opening.is_some() && !tab.reopen);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_stretch_save_is_flushed() {
+        let root = temp_dir("blend-flush-save");
+        let mut s = crate::testutil::two_group_session(&root);
+        s.mosaic.save().unwrap();
+        let p = StretchParams {
+            black: 0.01,
+            white: 0.9,
+            midtones: 0.2,
+        };
+        let mut tab = BlendTab::new();
+        // A change saved at once, then a second one held back by the rate
+        // limit (not due yet)...
+        tab.save.saved(Instant::now());
+        save_stretch(&mut s.mosaic.config.ui, "Ha", Some(&[p]));
+        tab.save.touch();
+        assert!(!tab.save.due(Instant::now()));
+        // ...is written by the flush (window closing), and only once.
+        tab.flush_save(&s);
+        let back = MosaicConfig::load(&s.mosaic.dir).unwrap();
+        assert_eq!(saved_stretch(&back.ui, "Ha"), Some(vec![p]));
+        assert!(!tab.save.due(Instant::now() + SAVE_INTERVAL));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn linked_auto_without_statistics_falls_back_to_automatic() {
+        use mmm_core::tiles::{TileGeometry, TileStore};
+
+        let root = temp_dir("blend-auto-none");
+        let mut s = crate::testutil::two_group_session(&root);
+        let ctx = egui::Context::default();
+        // An empty (never blended) result: no statistics to stretch from.
+        let path = root.join("result.mmmt");
+        let g = TileGeometry {
+            width: 300,
+            height: 200,
+            channels: 3,
+            tile: 256,
+        };
+        drop(TileStore::create(&path, g).unwrap());
+        let mut tab = BlendTab::new();
+        tab.group = Some("Ha".into());
+        tab.source = Some(Arc::new(MosaicTileSource::open(&path, None).unwrap()));
+        tab.linked = true;
+        tab.auto_now(&ctx, &mut s);
+        assert!(tab.manual && tab.save_auto_result);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while tab.auto.is_some() {
+            assert!(Instant::now() < deadline, "auto stretch never ended");
+            std::thread::sleep(Duration::from_millis(2));
+            tab.poll_auto(&mut s);
+        }
+        // Nothing was saved, so the stretch is automatic again...
+        assert_eq!(saved_stretch(&s.mosaic.config.ui, "Ha"), None);
+        assert!(!tab.manual, "left manual with no saved stretch");
+        // ...and the next finished blend stretches automatically.
+        tab.blend_job = Some(3);
+        tab.on_event(&JobEvent::Finished {
+            id: 3,
+            label: "Blend Ha".into(),
+        });
+        assert!(tab.want_auto);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
