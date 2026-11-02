@@ -5,13 +5,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use mmm_core::mosaic::{CONFIG_FILE, Mosaic, MosaicConfig, is_mosaic_dir};
+use mmm_core::mosaic::{CONFIG_FILE, FRAME_FILE, Mosaic, MosaicConfig, is_mosaic_dir};
+use mmm_core::reference::ReferenceFrame;
 
 /// A mosaic session open in this window.
 #[derive(Debug)]
 pub struct OpenSession {
     /// The mosaic: its directory and configuration (`mosaic.json`).
     pub mosaic: Mosaic,
+    /// Canvas `(width, height)` of the shared reference frame, once an
+    /// analysis has derived one (read when opening, updated by the job
+    /// runner after each analysis).
+    pub canvas: Option<(u64, u64)>,
 }
 
 impl OpenSession {
@@ -101,7 +106,11 @@ pub fn open_blocking(dir: &Path) -> Result<OpenSession, String> {
         ));
     }
     let mosaic = Mosaic::open(dir).map_err(|e| format!("Cannot open {shown}: {e}"))?;
-    Ok(OpenSession { mosaic })
+    // A missing or unreadable frame only means no canvas size to show yet.
+    let canvas = ReferenceFrame::load(&dir.join(FRAME_FILE))
+        .ok()
+        .map(|f| f.canvas());
+    Ok(OpenSession { mosaic, canvas })
 }
 
 /// Create a new session in `dir` with an empty [`MosaicConfig`]. Blocking
@@ -116,7 +125,10 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
     }
     let mosaic = Mosaic::create(dir, MosaicConfig::new(Vec::new()))
         .map_err(|e| format!("Cannot create {shown}: {e}"))?;
-    Ok(OpenSession { mosaic })
+    Ok(OpenSession {
+        mosaic,
+        canvas: None,
+    })
 }
 
 /// A session being opened or created on a background thread.

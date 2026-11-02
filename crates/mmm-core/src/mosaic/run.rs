@@ -461,6 +461,18 @@ pub fn blend_group(
     Ok(aligned)
 }
 
+/// Mark every tile of `group`'s result store invalid (owner thread), e.g.
+/// when the app discards an unapplied blend whose settings were superseded
+/// meanwhile (see the module's concurrency contract). A missing or
+/// unreadable store is left alone; the configuration is not changed.
+///
+/// Fails with [`Error::Busy`], invalidating nothing, while another writer
+/// holds the store.
+pub fn invalidate_group(m: &Mosaic, group: &str) -> Result<()> {
+    let mut stores = lock_stores(&[m.result_path(group)])?;
+    invalidate(&mut stores)
+}
+
 /// Every existing group result store under `<dir>/groups`.
 fn all_result_stores(m: &Mosaic) -> Result<Vec<PathBuf>> {
     let root = m.dir.join(GROUPS_DIR);

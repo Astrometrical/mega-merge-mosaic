@@ -873,9 +873,12 @@ below is UI-agnostic and the CLI is its first consumer.
   is caught at apply time: `apply_analyze` keeps a group marked
   `needs_analyze` if its analyze settings changed since the plan, and
   `apply_blend` invalidates the store and returns an error if the group's
-  blend settings changed or it was marked `needs_analyze`. The app cancels
-  and joins a running job before applying settings; busy refusal and the
-  apply guards are the core's backstop.
+  blend settings changed or it was marked `needs_analyze`. A blend that is
+  never applied (cancelled or failed) carries no such guarantee, so the app
+  invalidates the group's store (`invalidate_group`, busy-aware) when it
+  discards one whose settings were superseded. The app cancels and joins a
+  running job before applying settings; busy refusal and the apply guards
+  are the core's backstop.
 - **Checks** (`checks`). Input checks (solution present, distortion model,
   scale mismatch, mixed channels, group count mismatch, filters differ
   ungrouped, ungrouped panels), file checks (changed or missing since added,

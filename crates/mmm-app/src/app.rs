@@ -5,16 +5,28 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use egui::RichText;
+use egui::{Color32, RichText};
+use mega_ui::jobs::{JobAction, job_panel};
 use mega_ui::theme::palette;
 
+use crate::jobs::{JobEvent, JobRunner};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::start::{RecentEntry, RfdPicker, StartAction, StartScreen, unix_now};
+use crate::status::{self, SysMonitor};
 
 /// eframe storage key of the recent sessions.
 const RECENT_KEY: &str = "recent_sessions";
+/// How long a job notice stays on screen.
+const NOTICE_TIME: Duration = Duration::from_secs(6);
+
+/// A toast-style notice about a job that ended.
+struct Notice {
+    text: String,
+    color: Color32,
+    until: Instant,
+}
 
 /// The window contents: start screen or open session.
 pub struct Shell {
@@ -23,6 +35,10 @@ pub struct Shell {
     session: Option<OpenSession>,
     pending: Option<Pending>,
     show_start: bool,
+    /// Background jobs of the open session (made with the session).
+    jobs: Option<JobRunner>,
+    sys: SysMonitor,
+    notices: Vec<Notice>,
 }
 
 impl Shell {
@@ -33,6 +49,9 @@ impl Shell {
             session: None,
             pending: None,
             show_start: false,
+            jobs: None,
+            sys: SysMonitor::start(),
+            notices: Vec::new(),
         }
     }
 
@@ -44,6 +63,11 @@ impl Shell {
     /// True while a session is being opened or created.
     pub fn is_busy(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// The open session and its job runner, to start or cancel jobs.
+    pub fn session_jobs(&mut self) -> Option<(&mut OpenSession, &mut JobRunner)> {
+        self.session.as_mut().zip(self.jobs.as_mut())
     }
 
     /// Open or create a session on a background thread. With a session
@@ -64,7 +88,8 @@ impl Shell {
     /// Draw one frame.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.poll();
+        self.poll(&ctx);
+        self.poll_jobs();
         if self.session.is_none() {
             egui::CentralPanel::default().show(ui, |ui| {
                 if let Some(action) = self.start.ui(ui) {
@@ -77,7 +102,7 @@ impl Shell {
     }
 
     /// Apply a finished open/create.
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         let Some(outcome) = self.pending.as_mut().and_then(Pending::poll) else {
             return;
         };
@@ -120,12 +145,34 @@ impl Shell {
                     tracing::info!("opened session {}", dir.display());
                     self.start.record_opened(&dir, unix_now());
                     self.session = Some(opened);
+                    self.jobs = Some(JobRunner::new(ctx.clone()));
                 }
             }
             Err(message) => {
                 tracing::warn!("{message}");
                 self.start.set_error(Some(message));
             }
+        }
+    }
+
+    /// Apply finished jobs and post a notice for each.
+    fn poll_jobs(&mut self) {
+        let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
+            return;
+        };
+        let until = Instant::now() + NOTICE_TIME;
+        for event in jobs.poll(session) {
+            let name = |id| jobs.label(id).unwrap_or("Job").to_string();
+            let (text, color) = match event {
+                JobEvent::Finished { label, .. } => {
+                    (format!("{label} finished"), palette::GREEN_300)
+                }
+                JobEvent::Cancelled { id } => {
+                    (format!("{} cancelled", name(id)), palette::TEXT_BODY)
+                }
+                JobEvent::Failed { message, .. } => (message, palette::HA_500),
+            };
+            self.notices.push(Notice { text, color, until });
         }
     }
 
@@ -175,13 +222,57 @@ impl Shell {
                 });
             }
         });
+        let views = self.jobs.as_ref().map(JobRunner::views).unwrap_or_default();
+        let busy = self.jobs.as_ref().is_some_and(JobRunner::busy);
+        egui::Panel::bottom("status-bar").show(ui, |ui| {
+            status::show(
+                ui,
+                &views,
+                session.canvas,
+                session.mosaic.config.group_dirs.len(),
+                self.sys.latest(),
+            );
+        });
+        let groups: Vec<String> = session.mosaic.config.group_dirs.keys().cloned().collect();
+        let mut start = None;
+        let mut actions = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
             let n = session.mosaic.config.panels.len();
             ui.label(
                 RichText::new(format!("{n} panel{}", if n == 1 { "" } else { "s" }))
                     .color(palette::TEXT_BODY),
             );
+            // Interim job controls until the Blend tab takes them over.
+            ui.horizontal(|ui| {
+                if ui.button("Analyze").clicked() {
+                    start = Some(None);
+                }
+                for g in &groups {
+                    if ui.button(format!("Blend {g}")).clicked() {
+                        start = Some(Some(g.clone()));
+                    }
+                }
+            });
+            if busy {
+                ui.add_space(8.0);
+                actions = job_panel(ui, &views);
+            }
         });
+        if let Some((session, jobs)) = self.session_jobs() {
+            match start {
+                Some(None) => {
+                    jobs.start_analyze(session);
+                }
+                Some(Some(group)) => {
+                    jobs.start_blend(session, &group, None);
+                }
+                None => {}
+            }
+            for JobAction::Cancel(id) in actions {
+                jobs.cancel(id);
+            }
+        }
+        self.notices_ui(&ctx);
         let mut open = self.show_start;
         let mut action = None;
         egui::Window::new("Open another session")
@@ -193,6 +284,27 @@ impl Shell {
         if let Some(action) = action {
             self.request(to_request(action), &ctx);
         }
+    }
+}
+
+impl Shell {
+    /// Draw the live notices (newest at the bottom) above the status bar.
+    fn notices_ui(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        self.notices.retain(|n| n.until > now);
+        let Some(next) = self.notices.iter().map(|n| n.until).min() else {
+            return;
+        };
+        ctx.request_repaint_after(next - now);
+        egui::Area::new(egui::Id::new("job-notices"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -36.0))
+            .show(ctx, |ui| {
+                for n in &self.notices {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(RichText::new(&n.text).color(n.color));
+                    });
+                }
+            });
     }
 }
 
@@ -522,6 +634,45 @@ mod tests {
             .count();
         assert!(shown >= 1);
         h.get_by_label("Dismiss");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn jobs_show_in_status_bar_and_notices() {
+        let root = temp_dir("shell-jobs");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let mut h = harness(StubPicker(None));
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        h.get_by_label("Ready");
+        h.get_by_label("0 groups");
+        h.get_by_label("Analyze").click();
+        h.step();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run();
+        h.get_by_label("Analyze finished");
+        h.get_by_label("Ready");
+        h.get_by_label("Canvas 600 × 420 (0.3 MP)");
+        h.get_by_label("2 groups");
+        h.get_by_label("Blend Ha").click();
+        h.step();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run();
+        h.get_by_label("Blend Ha finished");
+        let actions: Vec<_> = h
+            .state()
+            .session()
+            .unwrap()
+            .mosaic
+            .config
+            .provenance
+            .iter()
+            .map(|p| p.action.clone())
+            .collect();
+        assert_eq!(actions, ["analyze", "blend"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

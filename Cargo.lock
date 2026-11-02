@@ -1470,6 +1470,7 @@ dependencies = [
  "mmm-core",
  "rfd",
  "serde",
+ "serde_json",
  "sysinfo",
  "tracing",
  "tracing-subscriber",

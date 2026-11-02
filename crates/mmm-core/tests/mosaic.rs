@@ -10,7 +10,7 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
-    analyze_all, blend_group, plan_analyze, plan_blend, run_analyze, run_blend,
+    analyze_all, blend_group, invalidate_group, plan_analyze, plan_blend, run_analyze, run_blend,
     set_analyze_settings, set_blend_settings, set_group_override, set_settings,
 };
 use mmm_core::overlap::OverlapGraph;
@@ -911,4 +911,28 @@ fn settings_edit_between_plan_and_run_blend_is_caught() {
             provenance
         );
     }
+}
+
+#[test]
+fn invalidate_group_stales_only_that_group() {
+    let tmp = TempDir::new("invalidate");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    // No store yet: nothing to do.
+    invalidate_group(&m, "Ha").unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let oiii_valid = valid0(&m.result_path("OIII"));
+
+    // Busy while another writer holds the store, with nothing changed.
+    let held = TileStore::open(&m.result_path("Ha")).unwrap();
+    assert!(invalidate_group(&m, "Ha").unwrap_err().is_busy());
+    drop(held);
+    assert!(valid0(&m.result_path("Ha")) > 0);
+
+    invalidate_group(&m, "Ha").unwrap();
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert_eq!(valid0(&m.result_path("OIII")), oiii_valid);
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
 }

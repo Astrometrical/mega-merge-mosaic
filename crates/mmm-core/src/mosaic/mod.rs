@@ -28,7 +28,9 @@
 //!   [`Mosaic::apply_blend`] invalidates the group's store and returns an
 //!   error if its blend settings changed or it was marked `needs_analyze`.
 //!   So tiles blended with superseded settings never stay valid once the
-//!   job is applied — an unapplied job's tiles carry no such guarantee.
+//!   job is applied — an unapplied job's tiles carry no such guarantee:
+//!   the app invalidates them with [`invalidate_group`] when it discards a
+//!   blend whose settings changed since its plan.
 //! - **The app cancels and joins before applying settings.** That is the
 //!   app's workflow; busy refusal and the apply guards are the core's
 //!   backstop.
@@ -40,8 +42,8 @@ mod run;
 
 pub use run::{
     AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, BlendPlan, Mosaic, analyze_all, blend_group,
-    plan_analyze, plan_blend, run_analyze, run_blend, set_analyze_settings, set_blend_settings,
-    set_group_override, set_settings,
+    invalidate_group, plan_analyze, plan_blend, run_analyze, run_blend, set_analyze_settings,
+    set_blend_settings, set_group_override, set_settings,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

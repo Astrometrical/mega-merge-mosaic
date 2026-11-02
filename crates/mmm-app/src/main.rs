@@ -7,8 +7,12 @@
 //! checks launch the GUI.
 
 mod app;
+mod jobs;
 mod session;
 mod start;
+mod status;
+#[cfg(test)]
+mod testutil;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
