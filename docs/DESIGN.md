@@ -898,3 +898,50 @@ below is UI-agnostic and the CLI is its first consumer.
   automatic midtones stretch (shadows clip at -2.8 robust sigmas, median
   mapped to 0.25). Display only: the data and the tile store stay linear and
   the viewer applies the stretch.
+
+## Standalone app (phase 2, 2026-11)
+
+Phase 2 adds the first runnable desktop app on top of the phase 1 core. No
+algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-design.md`.
+
+- **Crates.** `crates/mega-ui` is a generic egui library (theme, status bar,
+  background job runner, and a tiled pyramid viewer with smooth zoom/pan) and
+  must not depend on `mmm-core`, so it can be lifted into other apps.
+  `crates/mmm-app` is the eframe app (binary `mega-merge-mosaic`): start
+  screen, session bar, and the Blend tab, with mmm-core adapters
+  (`tile_source`, `jobs`). egui/eframe are pinned at 0.36 in the workspace
+  `Cargo.toml`.
+- **Job contract.** The app uses the plan / run / apply split and the
+  concurrency contract above unchanged: plan and apply on the UI (owner)
+  thread, run on a worker with no `Mosaic`. The job runner lets newer work
+  win: a settings edit cancels and joins a running job before applying.
+  Group resolution (reads panel headers) runs on a worker via
+  `plan_analyze_with`. The `apply_*` saves of `mosaic.json` stay on the UI
+  thread (small atomic write; the core requires apply on the owner thread).
+  A blend discarded after its settings were superseded invalidates the
+  group's store (`invalidate_group`).
+- **Viewer.** Reads the memory-mapped tile store while a blend writes it,
+  picks a pyramid level from the zoom, shows stale tiles dimmed, and falls
+  back to coarser ancestors while tiles load on loader threads (which wake
+  the UI with `request_repaint`).
+- **Display stretch is CPU, per visible tile**, on the loader threads, not a
+  GPU shader. This keeps the viewer renderer-agnostic and needs no paint
+  callbacks; cost is screen-size work per slider change (may lag on 4K). A GPU
+  path is a follow-up. A saved `blend_stretch` entry means manual (kept across
+  opens and blends); Auto clears it.
+- **Renderer.** eframe `glow` (OpenGL), matching workflow-platform; `wgpu` is
+  deferred.
+- **WSLg record (2026-11-03).** `mega-merge-mosaic --selftest` (renders the
+  start screen, then the session if given, logs the GL renderer, closes itself,
+  exit 0 on success) exits 0 under WSLg. Default WSLg Mesa selects `llvmpipe`
+  (software, GL 4.5). Under WSL with `GALLIUM_DRIVER` unset, the app sets
+  `GALLIUM_DRIVER=d3d12` at the top of `main` (before any GL init), which gives
+  `D3D12 (NVIDIA GeForce RTX 2080 Ti)`, GL 4.6 (Core Profile) Mesa 25.2.8.
+  Users can override by setting `GALLIUM_DRIVER` themselves. libEGL "failed to
+  get driver name for fd -1" warnings on stderr are harmless.
+- **Self-test session.** `cargo run -p mmm-app --example make_selftest_session -- DIR`
+  builds a synthetic analysed and blended two-group session
+  (`DIR/m.mmm-session`) for `--selftest`. Automated checks launch the GUI only
+  through `--selftest`.
+- **Not yet built:** Panels, Plan and ROI tabs, export from the tile store,
+  packaging and signing (later plans).

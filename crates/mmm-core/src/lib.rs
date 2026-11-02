@@ -56,6 +56,8 @@
 //!   into plan / run / apply for background jobs ([`mosaic::plan_analyze`],
 //!   [`mosaic::run_blend`], ...), plus busy-aware settings edits
 //!   ([`mosaic::set_settings`]) that stale exactly the affected result stores.
+//!   One writer per store is enforced (`Error::Busy`); the plan / run / apply
+//!   concurrency contract is in the [`mosaic`] module docs.
 //! - [`checks`] — structured input, file and analysis checks (severity, code,
 //!   affected groups, remedy) and the accepted-warning bookkeeping, as data
 //!   for a UI or `mmm check`.

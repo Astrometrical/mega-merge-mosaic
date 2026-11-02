@@ -12,6 +12,9 @@ architecture, verified facts about the input data, and the algorithm choices.
   (`default-features = false`); a gitignored `.cargo/config.toml` `[patch]`
   points it at the sibling checkout (DESIGN.md "Dependency on mpp-core")
 - `crates/mmm` — CLI frontend (thin)
+- `crates/mega-ui` — generic egui components/theme/tile viewer; must not
+  depend on `mmm-core` (liftable to other apps); egui/eframe pinned at 0.36
+- `crates/mmm-app` — eframe desktop app (`mega-merge-mosaic`), glow renderer
 - `integration/pixinsight/` — PCL module + `mmm-ipc-worker` host. **Development
   eased off (2026-11-02), shelving expected** under PixInsight CPD rules 1.0.1;
   no new feature work here (DESIGN.md "PixInsight module status")
@@ -33,6 +36,10 @@ cargo test                 # unit + integration tests (no big files needed)
 cargo build --release      # required for real-data runs (2 GB frames)
 target/release/mmm info test_data/orion_mosaic/*PANEL-4_*.xisf --stats
 ```
+
+GUI runs: launch the app only via `--selftest` (it closes itself; never
+kill a GUI on a timer). Selftest session: `cargo run -p mmm-app --example
+make_selftest_session -- DIR`. Under WSL the app sets `GALLIUM_DRIVER=d3d12`.
 
 Rust via rustup (`source ~/.cargo/env` if PATH lacks cargo).
 

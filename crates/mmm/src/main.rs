@@ -293,7 +293,7 @@ enum Command {
 
     /// Merge several panel groups (one per filter) onto one shared frame:
     /// derives the frame from every panel, analyzes each group into
-    /// DIR/<name>.mmm-session and blends it to OUTDIR/<name>.fits, so the
+    /// `DIR/<name>.mmm-session` and blends it to `OUTDIR/<name>.fits`, so the
     /// outputs can be combined directly (LRGB, Ha+RGB, …)
     Batch {
         /// A group: its name followed by its panel files. Repeat per group,
@@ -306,7 +306,7 @@ enum Command {
         #[arg(short, long)]
         session: std::path::PathBuf,
 
-        /// Directory for the per-group output FITS files (<name>.fits)
+        /// Directory for the per-group output FITS files (`<name>.fits`)
         #[arg(short, long)]
         output: std::path::PathBuf,
 
@@ -334,7 +334,7 @@ enum Command {
     Check(mosaic_cmd::CheckArgs),
 
     /// Analyze every group of a mosaic session onto one shared frame and
-    /// blend each group to OUTDIR/<group dir>.fits
+    /// blend each group to `OUTDIR/<group dir>.fits`
     Run(mosaic_cmd::RunArgs),
 }
 

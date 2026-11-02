@@ -111,6 +111,20 @@ Prebuilt binaries for Linux, Windows, and macOS will be attached to GitHub
 releases once published (see [docs/RELEASING.md](docs/RELEASING.md) for how
 releases are cut).
 
+## Desktop app (preview)
+
+A desktop app (egui) with a tiled, zoomable result viewer sits beside the CLI:
+
+```sh
+cargo build --release -p mmm-app
+target/release/mega-merge-mosaic [SESSION_DIR]
+target/release/mega-merge-mosaic --selftest [SESSION_DIR]   # renders a few frames, exits 0/1
+```
+
+Currently it opens or creates mosaic sessions and shows the Blend tab. Under
+WSL the app selects Mesa's `d3d12` GL driver for GPU rendering (default WSLg
+falls back to software `llvmpipe`); set `GALLIUM_DRIVER` yourself to override.
+
 ## CLI reference
 
 All commands accept `-v` / `-vv` for debug/trace logging and `--no-banner`

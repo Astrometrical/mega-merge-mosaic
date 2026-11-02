@@ -30,6 +30,14 @@ to the output of existing commands.
 - **Serialisable settings** with per-group overrides and change-impact
   reporting, display-stretch statistics, structured checks and mosaic
   health metrics as data, for the app to consume.
+- **Desktop app preview** (`mega-merge-mosaic`, crate `mmm-app`) and the
+  generic `mega-ui` egui crate: start screen, sessions, background jobs, and
+  a Blend tab with a tiled zoomable viewer and automatic display stretch.
+  `--selftest` renders a few frames and exits. Under WSL the app selects the
+  Mesa `d3d12` GL driver unless `GALLIUM_DRIVER` is set.
+- **Concurrency hardening in `mmm-core`:** one writer per tile store
+  (`Error::Busy`), busy-aware settings edits, `plan_analyze_with`,
+  `invalidate_group`.
 
 ## 1.7.0 — 2026-10-29
 

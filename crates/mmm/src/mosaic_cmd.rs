@@ -147,11 +147,11 @@ pub(crate) struct RunArgs {
     #[arg(short, long)]
     pub(crate) session: PathBuf,
 
-    /// Directory for the per-group output FITS files (<group dir>.fits)
+    /// Directory for the per-group output FITS files (`<group dir>.fits`)
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Also write an autostretched PNG preview per group (<group dir>.png)
+    /// Also write an autostretched PNG preview per group (`<group dir>.png`)
     #[arg(long)]
     png: bool,
 
