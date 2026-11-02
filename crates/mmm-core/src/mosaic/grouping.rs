@@ -102,7 +102,7 @@ fn is_reserved_device_name(s: &str) -> bool {
 /// Map each group name to a safe, unique directory name. Characters outside
 /// `[A-Za-z0-9._-]` become `_`; empty or all-dot results become `group`; a
 /// leading or trailing `.` becomes `_`; Windows reserved device names get a
-/// trailing `_`. Uniqueness is case-insensitive (case-folding filesystems):
+/// `_` appended to the stem (before the first `.`). Uniqueness is case-insensitive (case-folding filesystems):
 /// collisions get `-2`, `-3`, … in name order. Deterministic.
 pub fn group_dirs(names: &[String]) -> BTreeMap<String, String> {
     let mut sorted: Vec<&String> = names.iter().collect();
@@ -132,7 +132,8 @@ pub fn group_dirs(names: &[String]) -> BTreeMap<String, String> {
             base.push('_');
         }
         if is_reserved_device_name(&base) {
-            base.push('_');
+            let at = base.find('.').unwrap_or(base.len());
+            base.insert(at, '_');
         }
         let mut cand = base.clone();
         let mut n = 2;
@@ -233,18 +234,21 @@ mod tests {
         assert_eq!(uniq.len(), m.len());
         assert_eq!(m, group_dirs(&names));
 
-        let names: Vec<String> = [".", "..", "Ha", "ha", "CON", "nul.txt", "com1", "a."]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let names: Vec<String> = [
+            ".", "..", "Ha", "ha", "CON", "nul.txt", "com1", "com1.log", "a.",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let m = group_dirs(&names);
         assert_eq!(m["."], "group");
         assert_eq!(m[".."], "group-2");
         assert_eq!(m["Ha"], "Ha");
         assert_eq!(m["ha"], "ha-2");
         assert_eq!(m["CON"], "CON_");
-        assert_eq!(m["nul.txt"], "nul.txt_");
+        assert_eq!(m["nul.txt"], "nul_.txt");
         assert_eq!(m["com1"], "com1_");
+        assert_eq!(m["com1.log"], "com1_.log");
         assert_eq!(m["a."], "a_");
         let lower: BTreeSet<_> = m.values().map(|v| v.to_lowercase()).collect();
         assert_eq!(lower.len(), m.len());
