@@ -4,7 +4,7 @@
 
 use crate::blend::{BlendParams, Extent, RowSink, blend};
 use crate::error::{Error, Result};
-use crate::job::{CtlSink, JobCtl};
+use crate::job::{CancelToken, CtlSink, JobCtl};
 use crate::overlap::OverlapGraph;
 use crate::photometry::Photometry;
 use crate::session::Session;
@@ -18,8 +18,9 @@ use super::TileStore;
 /// Rows are accumulated one tile row (`tile` image rows) at a time; each
 /// complete tile row is written to the store (and its tiles marked valid)
 /// as soon as its last row arrives. Bands must arrive in order, as the
-/// blend delivers them. Parent levels are not touched beyond the initial
-/// invalidation — see [`build_parents`].
+/// blend delivers them. After each tile row is written, the parents over
+/// it are rebuilt ([`build_parents`]), so a parent becomes valid during the
+/// blend as soon as all its in-image children are.
 pub struct TileSink<'a> {
     store: &'a mut TileStore,
     rect: [u64; 4],
@@ -34,13 +35,18 @@ pub struct TileSink<'a> {
     tile_buf: Vec<f32>,
     /// Rows of the rect (from its top) whose tiles are all written.
     written: u64,
+    /// Rows of the rect (from its top) whose parents have been rebuilt.
+    parents_built: u64,
+    /// Cancellation for the incremental parent rebuilds.
+    cancel: CancelToken,
 }
 
 impl<'a> TileSink<'a> {
     /// A sink for the tile-aligned `rect` (level-0 coords, as returned by
     /// [`super::TileGeometry::align_rect`]); invalidates the rect's tiles at
     /// every level immediately. Errors if `rect` is empty or not aligned.
-    pub fn new(store: &'a mut TileStore, rect: [u64; 4]) -> Result<Self> {
+    /// The parent rebuild after each tile row checks `ctl` for cancellation.
+    pub fn new(store: &'a mut TileStore, rect: [u64; 4], ctl: &JobCtl) -> Result<Self> {
         let g = store.geometry();
         if rect[0] >= rect[2] || rect[1] >= rect[3] || g.align_rect(rect) != rect {
             return Err(Error::compute(format!(
@@ -57,6 +63,8 @@ impl<'a> TileSink<'a> {
             pending: 0,
             tile_buf: Vec::new(),
             written: 0,
+            parents_built: 0,
+            cancel: ctl.cancel_token().clone(),
         })
     }
 
@@ -76,7 +84,7 @@ impl<'a> TileSink<'a> {
     }
 
     /// Write the buffered tile row (rows `next_y - pending .. next_y`) to
-    /// the store, then clear the buffer.
+    /// the store, clear the buffer, then rebuild the parents over the row.
     fn flush_tile_row(&mut self) -> Result<()> {
         let g = self.store.geometry();
         let t = g.tile as usize;
@@ -101,6 +109,14 @@ impl<'a> TileSink<'a> {
         self.buf.fill(0.0);
         self.written = self.next_y;
         self.pending = 0;
+        let row = [
+            self.rect[0],
+            first_row,
+            self.rect[2],
+            self.rect[1] + self.written,
+        ];
+        build_parents(self.store, row, &JobCtl::new(self.cancel.clone(), None))?;
+        self.parents_built = self.written;
         Ok(())
     }
 }
@@ -120,6 +136,7 @@ impl RowSink for TileSink<'_> {
         self.next_y = 0;
         self.pending = 0;
         self.written = 0;
+        self.parents_built = 0;
         Ok(())
     }
 
@@ -169,11 +186,15 @@ impl RowSink for TileSink<'_> {
 /// Rebuild, for every level ≥ 1, the tiles covering `rect` (level-0 coords)
 /// from their four children, lowest level first.
 ///
+/// Checks `ctl` for cancellation once per parent tile row; a cancelled
+/// rebuild returns [`Error::Cancelled`], leaving parents it did not reach
+/// as they were.
+///
 /// Each parent pixel is the per-channel mean of its (up to four) child
 /// pixels that are covered — any channel non-zero — or zero if none are. A
 /// parent is written (and marked valid) only if every child tile inside the
 /// image is valid; otherwise it is left invalid.
-pub fn build_parents(store: &mut TileStore, rect: [u64; 4]) -> Result<()> {
+pub fn build_parents(store: &mut TileStore, rect: [u64; 4], ctl: &JobCtl) -> Result<()> {
     let g = store.geometry();
     let t = g.tile as usize;
     let nch = g.channels as usize;
@@ -185,7 +206,12 @@ pub fn build_parents(store: &mut TileStore, rect: [u64; 4]) -> Result<()> {
     let mut sums = vec![0.0f32; nch];
     for level in 1..g.levels() {
         let (cnx, cny) = g.tiles(level - 1);
+        let mut row = None;
         for (tx, ty) in g.tiles_in_rect(level, rect) {
+            if row != Some(ty) {
+                ctl.check()?;
+                row = Some(ty);
+            }
             let mut all_valid = true;
             for (q, kid) in kids.iter_mut().enumerate() {
                 let (cx, cy) = (2 * tx + (q as u32 & 1), 2 * ty + (q as u32 >> 1));
@@ -240,7 +266,9 @@ pub fn build_parents(store: &mut TileStore, rect: [u64; 4]) -> Result<()> {
 ///
 /// The blend runs at full resolution over [`Extent::Canvas`] with the ROI
 /// set to the aligned rect, so every tile matches the same region of a
-/// whole-canvas blend. Progress is reported as stage `"blend"` (rows of the
+/// whole-canvas blend. Parents are rebuilt during the blend after each
+/// level-0 tile row ([`TileSink`]), then over any rows the blend left
+/// without them. Progress is reported as stage `"blend"` (rows of the
 /// rect) and then `("pyramid", 1, 1)` once the parents are built.
 ///
 /// The rect's tiles are invalidated (at every level) before blending, and
@@ -277,8 +305,9 @@ pub fn blend_tiles(
         ..settings.to_params()
     };
     let mut written = 0;
+    let mut with_parents = 0;
     let blended = (|| -> Result<()> {
-        let mut tiles = TileSink::new(store, aligned)?;
+        let mut tiles = TileSink::new(store, aligned, ctl)?;
         let res = blend(
             session,
             phot,
@@ -288,6 +317,7 @@ pub fn blend_tiles(
             &mut CtlSink::new(&mut tiles, ctl, "blend"),
         );
         written = tiles.rows_written();
+        with_parents = tiles.parents_built;
         res
     })();
     if let Err(e) = blended {
@@ -296,7 +326,17 @@ pub fn blend_tiles(
     }
     // Any error from here on leaves the store consistent: every level-0
     // tile is written, and a parent not yet rebuilt is still invalid.
-    build_parents(store, aligned)?;
+    // The sink rebuilt the parents over every row it finished, so this
+    // final pass normally has nothing left to do.
+    let rest = [
+        aligned[0],
+        aligned[1] + with_parents,
+        aligned[2],
+        aligned[3],
+    ];
+    if rest[1] < rest[3] {
+        build_parents(store, rest, ctl)?;
+    }
     ctl.report("pyramid", 1, 1)?;
     Ok(aligned)
 }
@@ -311,8 +351,9 @@ fn keep_finished(store: &mut TileStore, rect: [u64; 4], written: u64) {
         let idx = store.raw.layout.index(0, tx, ty);
         store.raw.invalidate(idx);
     }
+    // Not cancellable (the job's ctl is likely cancelled already), so
     // `build_parents` only fails on a tile-length mismatch, impossible here;
     // should it fail, parents it did not reach keep the invalidation
     // `TileSink::new` gave them.
-    let _ = build_parents(store, rect);
+    let _ = build_parents(store, rect, &JobCtl::none());
 }

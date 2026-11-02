@@ -1,9 +1,11 @@
 //! Blending into the tiled result store: level-0 tiles must match a direct
 //! whole-canvas blend, ROI blends touch only the aligned rect, parents are
 //! covered means of their children, and a cancelled blend keeps its
-//! finished tiles valid while unfinished ones stay stale.
+//! finished tiles valid while unfinished ones stay stale. Parents are built
+//! during the blend, match a from-scratch rebuild, and the rebuild cancels.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mmm_core::Result;
 use mmm_core::analyze::analyze;
@@ -15,7 +17,7 @@ use mmm_core::session::Session;
 use mmm_core::settings::BlendSettings;
 use mmm_core::surfaces::Surfaces;
 use mmm_core::synth::{SynthSpec, generate};
-use mmm_core::tiles::{TILE, TileGeometry, TileStore, blend_tiles};
+use mmm_core::tiles::{TILE, TileGeometry, TileReader, TileStore, blend_tiles, build_parents};
 
 /// Comparison tolerance (controller ruling: matches the existing
 /// `roi_matches_full_blend_subregion` tolerance).
@@ -451,4 +453,92 @@ fn wrong_geometry_errors() {
         fx.blend_tiles(&BlendSettings::default(), None, &mut store, &JobCtl::none())
             .is_err()
     );
+}
+
+#[test]
+fn parents_valid_during_blend() {
+    // Five level-0 tile rows; the first report past the halfway point comes
+    // after rows 0-2 are written, so level-1 row 0 has all its children.
+    let fx = Fixture::new("during", (600, 1100));
+    let path = fx.dir.join("during.mmmtile");
+    let mut store = TileStore::create(&path, fx.geometry()).unwrap();
+    let reader = TileReader::open(&path).unwrap();
+    let checked = AtomicBool::new(false);
+    let seen = AtomicBool::new(false);
+    let obs = |stage: &str, done: u64, total: u64| {
+        if stage != "blend" || 2 * done < total || checked.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let g = reader.geometry();
+        let (nx, ny) = g.tiles(1);
+        let mut buf = tile_buf(g);
+        let any = (0..ny).any(|ty| (0..nx).any(|tx| reader.read_tile(1, tx, ty, &mut buf)));
+        seen.store(any, Ordering::Relaxed);
+    };
+    let ctl = JobCtl::new(CancelToken::new(), Some(&obs));
+    fx.blend_tiles(&BlendSettings::default(), None, &mut store, &ctl)
+        .unwrap();
+    assert!(checked.load(Ordering::Relaxed), "no report past halfway");
+    assert!(
+        seen.load(Ordering::Relaxed),
+        "no valid level-1 tile past halfway"
+    );
+}
+
+#[test]
+fn parents_still_match_full_build() {
+    let fx = Fixture::new("rebuild", (600, 1100));
+    let mut store = fx.store("inc.mmmtile");
+    fx.blend_tiles(&BlendSettings::default(), None, &mut store, &JobCtl::none())
+        .unwrap();
+    // Copy level 0 into a fresh store and build its parents from scratch.
+    let g = store.geometry();
+    let mut fresh = fx.store("fresh.mmmtile");
+    let mut buf = tile_buf(g);
+    let (nx, ny) = g.tiles(0);
+    for ty in 0..ny {
+        for tx in 0..nx {
+            assert!(store.read_tile(0, tx, ty, &mut buf));
+            fresh.write_tile(0, tx, ty, &buf).unwrap();
+        }
+    }
+    build_parents(&mut fresh, [0, 0, g.width, g.height], &JobCtl::none()).unwrap();
+    let mut want = tile_buf(g);
+    for l in 1..g.levels() {
+        let (nx, ny) = g.tiles(l);
+        for ty in 0..ny {
+            for tx in 0..nx {
+                assert!(
+                    store.read_tile(l, tx, ty, &mut buf),
+                    "level {l} ({tx},{ty})"
+                );
+                assert!(fresh.read_tile(l, tx, ty, &mut want));
+                for (i, (a, b)) in buf.iter().zip(&want).enumerate() {
+                    assert!(
+                        (a - b).abs() <= TOL,
+                        "level {l} tile ({tx},{ty}) sample {i}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn build_parents_cancels() {
+    let dir = std::env::temp_dir().join(format!("mmm-tiles-bpcancel-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let g = TileGeometry {
+        width: 600,
+        height: 420,
+        channels: 3,
+        tile: TILE,
+    };
+    let mut store = TileStore::create(&dir.join("c.mmmtile"), g).unwrap();
+    let tok = CancelToken::new();
+    tok.cancel();
+    let err = build_parents(&mut store, [0, 0, 600, 420], &JobCtl::new(tok, None)).unwrap_err();
+    assert!(err.is_cancelled(), "{err}");
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
 }

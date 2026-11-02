@@ -827,10 +827,12 @@ below is UI-agnostic and the CLI is its first consumer.
   `TileState` (`Missing` / `Stale` / `Valid`) from its entry alone, and
   `read_tile_any` copies a stale tile too under the same protocol, so the
   viewer can show stale tiles dimmed; `read_tile` accepts valid tiles only.
-  `TileSink` is a `RowSink` that fills level 0, `build_parents` rebuilds the
-  upper levels (a parent is valid only when all its in-image children are),
-  and `blend_tiles` blends a canvas rect (an ROI re-blend invalidates only
-  the tiles it touches) cancellably. A cancelled or failed blend keeps its
+  `TileSink` is a `RowSink` that fills level 0 and, after each level-0 tile
+  row, runs `build_parents` over that row, so the upper levels fill in
+  during the blend (a parent is valid only when all its in-image children
+  are; the rebuild checks cancellation once per parent tile row), and
+  `blend_tiles` blends a canvas rect (an ROI re-blend invalidates only the
+  tiles it touches) cancellably. A cancelled or failed blend keeps its
   finished work (spec §8): level-0 tiles it fully wrote stay valid, the
   rest of the rect stays stale, and the parents are rebuilt from what is
   valid. A store whose geometry no longer matches the analysis is dropped
