@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use mmm_core::mosaic::grouping::Groups;
-use mmm_core::mosaic::{CONFIG_FILE, FRAME_FILE, Mosaic, MosaicConfig, is_mosaic_dir};
+use mmm_core::mosaic::{
+    CONFIG_FILE, FRAME_FILE, Mosaic, MosaicConfig, SessionLock, busy_message, is_mosaic_dir,
+    lock_session,
+};
 use mmm_core::reference::ReferenceFrame;
 
 /// A mosaic session open in this window.
@@ -21,6 +24,10 @@ pub struct OpenSession {
     /// The groups as last resolved (when opening, off the UI thread, and by
     /// each analysis); `None` if resolution failed.
     pub groups: Option<Groups>,
+    /// The cross-process session lock, held for the session's lifetime;
+    /// `None` only for a check made to hand the session to a new process.
+    #[allow(dead_code)] // held for its Drop, never read
+    pub lock: Option<SessionLock>,
 }
 
 impl OpenSession {
@@ -94,7 +101,14 @@ pub fn normalize(path: &Path) -> PathBuf {
 
 /// Open the session in `dir`. Blocking (file I/O): call off the UI thread.
 /// Errors are actionable messages for the start screen.
+#[cfg(test)]
 pub fn open_blocking(dir: &Path) -> Result<OpenSession, String> {
+    open_with(dir, true)
+}
+
+/// Open `dir`; `lock` false skips the session lock, for checking a session
+/// before handing it to a new process (which takes the lock itself).
+fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
     let dir = &normalize(dir);
     let shown = dir.display();
     if !dir.exists() {
@@ -118,6 +132,7 @@ pub fn open_blocking(dir: &Path) -> Result<OpenSession, String> {
              .{SESSION_EXT} folder, or start a new one with New mosaic…"
         ));
     }
+    let lock = if lock { Some(take_lock(dir)?) } else { None };
     let mosaic = Mosaic::open(dir).map_err(|e| format!("Cannot open {shown}: {e}"))?;
     // A missing or unreadable frame only means no canvas size to show yet.
     let canvas = ReferenceFrame::load(&dir.join(FRAME_FILE))
@@ -129,6 +144,18 @@ pub fn open_blocking(dir: &Path) -> Result<OpenSession, String> {
         mosaic,
         canvas,
         groups,
+        lock,
+    })
+}
+
+/// The session lock on `dir`, or an actionable message.
+fn take_lock(dir: &Path) -> Result<SessionLock, String> {
+    lock_session(dir).map_err(|e| {
+        if e.is_busy() {
+            busy_message(dir)
+        } else {
+            format!("Cannot lock {}: {e}", dir.display())
+        }
     })
 }
 
@@ -144,10 +171,12 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
     }
     let mosaic = Mosaic::create(dir, MosaicConfig::new(Vec::new()))
         .map_err(|e| format!("Cannot create {shown}: {e}"))?;
+    let lock = Some(take_lock(dir)?);
     Ok(OpenSession {
         mosaic,
         canvas: None,
         groups: Some(Groups::default()),
+        lock,
     })
 }
 
@@ -161,7 +190,10 @@ pub struct Pending {
 impl Pending {
     /// Start `request` on a background thread; `ctx` is repainted when it
     /// finishes.
-    pub fn spawn(request: Request, ctx: &egui::Context) -> Self {
+    ///
+    /// `keep_lock` is false when the session is only being checked before a
+    /// new process opens it (the child takes the lock; ours would refuse it).
+    pub fn spawn(request: Request, keep_lock: bool, ctx: &egui::Context) -> Self {
         let (tx, rx) = mpsc::channel();
         let req = request.clone();
         let ctx = ctx.clone();
@@ -169,7 +201,7 @@ impl Pending {
             .name("mmm-session-open".into())
             .spawn(move || {
                 let outcome = match &req {
-                    Request::Open(dir) => open_blocking(dir),
+                    Request::Open(dir) => open_with(dir, keep_lock),
                     Request::Create(dir) => create_blocking(dir),
                 };
                 let _ = tx.send(outcome);
@@ -216,8 +248,24 @@ mod tests {
         let created = create_blocking(&dir).unwrap();
         assert_eq!(created.name(), "Orion");
         assert!(dir.join("mosaic.json").is_file());
+        drop(created);
         let opened = open_blocking(&dir).unwrap();
         assert!(opened.mosaic.config.panels.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_refused_while_locked() {
+        let root = temp_dir("locked");
+        let dir = root.join("L.mmm-session");
+        let created = create_blocking(&dir).unwrap();
+        let err = open_blocking(&dir).unwrap_err();
+        assert!(err.contains("open in another window or process"), "{err}");
+        drop(created);
+        let opened = open_blocking(&dir).unwrap();
+        // A check without the lock (for a hand-off) leaves it free.
+        assert!(open_with(&dir, false).unwrap().lock.is_none());
+        drop(opened);
         let _ = std::fs::remove_dir_all(&root);
     }
 

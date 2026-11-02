@@ -11,8 +11,8 @@ use mmm_core::checks::{
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
-    CONFIG_FILE, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, analyze_all,
-    is_mosaic_dir, set_group_override, set_settings,
+    CONFIG_FILE, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, SessionLock,
+    analyze_all, busy_message, is_mosaic_dir, lock_session, set_group_override, set_settings,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::session::Session;
@@ -175,6 +175,18 @@ pub(crate) fn refuse_mosaic_dir(session: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Take the session lock (see [`lock_session`]) with a message naming the
+/// session when another window or process holds it.
+fn lock_dir(dir: &Path) -> anyhow::Result<SessionLock> {
+    lock_session(dir).map_err(|e| {
+        if e.is_busy() {
+            anyhow::anyhow!(busy_message(dir))
+        } else {
+            e.into()
+        }
+    })
+}
+
 fn open_mosaic(dir: &Path) -> anyhow::Result<Mosaic> {
     anyhow::ensure!(
         is_mosaic_dir(dir),
@@ -182,6 +194,13 @@ fn open_mosaic(dir: &Path) -> anyhow::Result<Mosaic> {
         dir.display()
     );
     Ok(Mosaic::open(dir)?)
+}
+
+/// Lock then open the mosaic in `dir`; hold the returned lock for the whole
+/// command.
+fn open_mosaic_locked(dir: &Path) -> anyhow::Result<(Mosaic, SessionLock)> {
+    let lock = lock_dir(dir)?;
+    Ok((open_mosaic(dir)?, lock))
 }
 
 fn parse_group_by(rule: &str) -> anyhow::Result<GroupRule> {
@@ -226,6 +245,10 @@ pub(crate) fn init(a: &InitArgs) -> anyhow::Result<()> {
     // Validate every flag before touching the disk.
     let rule = a.group_by.as_deref().map(parse_group_by).transpose()?;
     let edit = a.settings.resolve()?;
+    // Held to the end: another process must not open it half-initialised.
+    std::fs::create_dir_all(&a.session)
+        .with_context(|| format!("cannot create {}", a.session.display()))?;
+    let _lock = lock_dir(&a.session)?;
     if is_mosaic_dir(&a.session) {
         anyhow::ensure!(
             a.force,
@@ -290,7 +313,7 @@ pub(crate) fn set(a: &SetArgs) -> anyhow::Result<()> {
         "nothing to set: pass at least one of --surface, --input, --gain, --mode, \
          --feather, --defect-veto, --flatten"
     );
-    let mut m = open_mosaic(&a.session)?;
+    let (mut m, _lock) = open_mosaic_locked(&a.session)?;
     let (scope, impact) = match &a.group {
         Some(group) => {
             let names: Vec<String> = m
@@ -415,7 +438,7 @@ pub(crate) fn check(a: &CheckArgs) -> anyhow::Result<()> {
 /// `blend` path to `OUTDIR/<group dir>.fits`.
 pub(crate) fn run(a: &RunArgs) -> anyhow::Result<()> {
     let wcs_flip = parse_wcs_frame(&a.wcs_frame)?;
-    let mut m = open_mosaic(&a.session)?;
+    let (mut m, _lock) = open_mosaic_locked(&a.session)?;
     std::fs::create_dir_all(&a.output)
         .with_context(|| format!("cannot create {}", a.output.display()))?;
 
@@ -462,6 +485,25 @@ pub(crate) fn run(a: &RunArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_refused_while_locked() {
+        let dir = std::env::temp_dir().join(format!("mmm-cli-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Mosaic::create(&dir, MosaicConfig::new(Vec::new())).unwrap();
+        let held = mmm_core::mosaic::lock_session(&dir).unwrap();
+        let a = RunArgs {
+            session: dir.clone(),
+            output: dir.join("out"),
+            png: false,
+            wcs_frame: "topdown".into(),
+        };
+        let err = run(&a).unwrap_err().to_string();
+        assert!(err.contains("open in another window or process"), "{err}");
+        assert!(!dir.join("out").exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn group_by_parses_both_rules_and_rejects_others() {

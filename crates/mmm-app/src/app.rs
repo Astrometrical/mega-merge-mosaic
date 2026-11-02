@@ -124,7 +124,7 @@ impl Shell {
             verb(&request),
             request.path().display()
         )));
-        self.pending = Some(Pending::spawn(request, ctx));
+        self.pending = Some(Pending::spawn(request, self.session.is_none(), ctx));
     }
 
     /// Draw one frame.
@@ -172,6 +172,9 @@ impl Shell {
                     )));
                 } else if self.session.is_some() {
                     // One session per window: the other one gets its own.
+                    // A created session holds the lock; release it so the
+                    // child can take it.
+                    drop(opened);
                     match open_in_new_process(&dir) {
                         Ok(()) => {
                             tracing::info!("opened {} in a new window", dir.display());

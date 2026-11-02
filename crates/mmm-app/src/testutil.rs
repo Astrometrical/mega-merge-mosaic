@@ -15,5 +15,6 @@ pub(crate) fn two_group_session(root: &Path) -> OpenSession {
         mosaic,
         canvas: None,
         groups,
+        lock: None,
     }
 }
