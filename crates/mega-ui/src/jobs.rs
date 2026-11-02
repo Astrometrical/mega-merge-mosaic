@@ -3,6 +3,7 @@
 use egui::Ui;
 
 /// Display snapshot of one running job.
+#[derive(Debug, Clone, PartialEq)]
 pub struct JobView {
     /// Job id, echoed back in actions.
     pub id: u64,
@@ -19,7 +20,7 @@ pub struct JobView {
 }
 
 /// User action raised by the job panel.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobAction {
     /// Cancel the job with this id.
     Cancel(u64),

@@ -3,6 +3,7 @@
 use egui::{Color32, Ui};
 
 /// One piece of status text.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatusItem {
     /// Text shown.
     pub text: String,
