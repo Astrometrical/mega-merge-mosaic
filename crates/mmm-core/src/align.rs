@@ -60,6 +60,7 @@ use rayon::prelude::*;
 
 use crate::astrometry::{LinearWcs, WcsModel};
 use crate::formats::InputPanel;
+use crate::job::JobCtl;
 use crate::panel_reader::PanelReader;
 use crate::{Error, Result};
 
@@ -279,17 +280,18 @@ pub fn reproject_panel(
     model: &WcsModel,
     frame: &MosaicFrame,
     out_dir: &Path,
+    ctl: &JobCtl,
 ) -> Result<AlignedPanel> {
     match panel.as_xisf() {
         Some(x) => {
             let (sw, sh) = (x.width() as usize, x.height() as usize);
             let nch = x.channels() as usize;
             let planes: Vec<&[f32]> = (0..nch as u64).map(|c| x.channel(c)).collect();
-            reproject_core(&planes, sw, sh, nch, x.path(), model, frame, out_dir)
+            reproject_core(&planes, sw, sh, nch, x.path(), model, frame, out_dir, ctl)
         }
         None => {
             let reader = PanelReader::open_file(panel.path())?;
-            reproject_from_reader(&reader, Some(panel.path()), model, frame, out_dir)
+            reproject_from_reader(&reader, Some(panel.path()), model, frame, out_dir, ctl)
         }
     }
 }
@@ -317,6 +319,7 @@ pub fn reproject_from_reader(
     model: &WcsModel,
     frame: &MosaicFrame,
     out_dir: &Path,
+    ctl: &JobCtl,
 ) -> Result<AlignedPanel> {
     let (cw, ch_h, cch) = reader.canvas();
     let (sw, sh, nch) = (cw as usize, ch_h as usize, cch as usize);
@@ -353,8 +356,11 @@ pub fn reproject_from_reader(
     }
     let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
     let err_path = source.unwrap_or(out_dir);
-    reproject_core(&refs, sw, sh, nch, err_path, model, frame, out_dir)
+    reproject_core(&refs, sw, sh, nch, err_path, model, frame, out_dir, ctl)
 }
+
+/// Output rows reprojected between cancellation checks.
+const REPROJECT_BAND_ROWS: usize = 256;
 
 /// The resampling core shared by [`reproject_panel`] and
 /// [`reproject_from_reader`]: everything after the source planes are in hand
@@ -372,6 +378,7 @@ fn reproject_core(
     model: &WcsModel,
     frame: &MosaicFrame,
     out_dir: &Path,
+    ctl: &JobCtl,
 ) -> Result<AlignedPanel> {
     // Sample the standard-solution grids on the pool *before* the parallel
     // row loop below (a first use from inside the loop would sample
@@ -417,69 +424,78 @@ fn reproject_core(
     }
     let (bw, bh) = ((x1 - x0) as usize, (y1 - y0) as usize);
 
-    // Rayon over output rows; each row holds nch × bw (channel-major).
-    let rows_out: Vec<Vec<f32>> = (0..bh)
-        .into_par_iter()
-        .map(|oy| {
-            let mut out = vec![0.0f32; nch * bw];
-            let cy = (y0 + oy as u64) as f64;
-            for ox in 0..bw {
-                let cx = (x0 + ox as u64) as f64;
-                // Placement law: output index (cx, cy) carries the sky of
-                // frame solution *coordinate* (cx, cy) = FITS (cx+.5, cy+.5).
-                let (ra, dec) = flin.pixel_to_sky(cx + 0.5, cy + 0.5);
-                let Some((sx, sy)) = model.sky_to_pixel(ra, dec) else {
-                    continue; // outside the solved domain: no data
-                };
-                // Source span coordinate → array position (raw panels honor
-                // the span convention: centers at k + 0.5).
-                let (u, vv) = (sx - 0.5, sy - 0.5);
-                let k0 = u.floor() as i64;
-                let l0 = vv.floor() as i64;
-                // Full 6×6 support inside the source, or nothing.
-                if k0 < 2 || k0 + 3 >= sw as i64 || l0 < 2 || l0 + 3 >= sh as i64 {
-                    continue;
-                }
-                let (mut wx, mut wy) = ([0.0f64; 6], [0.0f64; 6]);
-                let (mut sx_w, mut sy_w) = (0.0f64, 0.0f64);
-                for i in 0..6 {
-                    wx[i] = lanczos3(u - (k0 - 2 + i as i64) as f64);
-                    wy[i] = lanczos3(vv - (l0 - 2 + i as i64) as f64);
-                    sx_w += wx[i];
-                    sy_w += wy[i];
-                }
-                // Normalize per axis: constant fields reproduce exactly.
-                for i in 0..6 {
-                    wx[i] /= sx_w;
-                    wy[i] /= sy_w;
-                }
-                let base = (l0 - 2) as usize * sw + (k0 - 2) as usize;
-                let mut ok = true;
-                for (c, plane) in planes.iter().enumerate() {
-                    let mut acc = 0.0f64;
-                    for (j, wj) in wy.iter().enumerate() {
-                        let row = &plane[base + j * sw..base + j * sw + 6];
-                        let mut racc = 0.0f64;
-                        for (wi, &s) in wx.iter().zip(row) {
-                            racc += wi * f64::from(s);
+    // Rayon over output rows, in bands of REPROJECT_BAND_ROWS so cancellation
+    // is observed between bands; each row holds nch × bw (channel-major).
+    let mut rows_out: Vec<Vec<f32>> = Vec::with_capacity(bh);
+    for band_start in (0..bh).step_by(REPROJECT_BAND_ROWS) {
+        ctl.check()?;
+        let band_end = (band_start + REPROJECT_BAND_ROWS).min(bh);
+        let band: Vec<Vec<f32>> = (band_start..band_end)
+            .into_par_iter()
+            .map(|oy| {
+                let mut out = vec![0.0f32; nch * bw];
+                let cy = (y0 + oy as u64) as f64;
+                for ox in 0..bw {
+                    let cx = (x0 + ox as u64) as f64;
+                    // Placement law: output index (cx, cy) carries the sky of
+                    // frame solution *coordinate* (cx, cy) = FITS (cx+.5, cy+.5).
+                    let (ra, dec) = flin.pixel_to_sky(cx + 0.5, cy + 0.5);
+                    let Some((sx, sy)) = model.sky_to_pixel(ra, dec) else {
+                        continue; // outside the solved domain: no data
+                    };
+                    // Source span coordinate → array position (raw panels honor
+                    // the span convention: centers at k + 0.5).
+                    let (u, vv) = (sx - 0.5, sy - 0.5);
+                    let k0 = u.floor() as i64;
+                    let l0 = vv.floor() as i64;
+                    // Full 6×6 support inside the source, or nothing.
+                    if k0 < 2 || k0 + 3 >= sw as i64 || l0 < 2 || l0 + 3 >= sh as i64 {
+                        continue;
+                    }
+                    let (mut wx, mut wy) = ([0.0f64; 6], [0.0f64; 6]);
+                    let (mut sx_w, mut sy_w) = (0.0f64, 0.0f64);
+                    for i in 0..6 {
+                        wx[i] = lanczos3(u - (k0 - 2 + i as i64) as f64);
+                        wy[i] = lanczos3(vv - (l0 - 2 + i as i64) as f64);
+                        sx_w += wx[i];
+                        sy_w += wy[i];
+                    }
+                    // Normalize per axis: constant fields reproduce exactly.
+                    for i in 0..6 {
+                        wx[i] /= sx_w;
+                        wy[i] /= sy_w;
+                    }
+                    let base = (l0 - 2) as usize * sw + (k0 - 2) as usize;
+                    let mut ok = true;
+                    for (c, plane) in planes.iter().enumerate() {
+                        let mut acc = 0.0f64;
+                        for (j, wj) in wy.iter().enumerate() {
+                            let row = &plane[base + j * sw..base + j * sw + 6];
+                            let mut racc = 0.0f64;
+                            for (wi, &s) in wx.iter().zip(row) {
+                                racc += wi * f64::from(s);
+                            }
+                            acc += wj * racc;
                         }
-                        acc += wj * racc;
+                        if !acc.is_finite() {
+                            ok = false; // non-finite source in support: no data
+                            break;
+                        }
+                        out[c * bw + ox] = acc as f32;
                     }
-                    if !acc.is_finite() {
-                        ok = false; // non-finite source in support: no data
-                        break;
+                    if !ok {
+                        for c in 0..nch {
+                            out[c * bw + ox] = 0.0;
+                        }
                     }
-                    out[c * bw + ox] = acc as f32;
                 }
-                if !ok {
-                    for c in 0..nch {
-                        out[c * bw + ox] = 0.0;
-                    }
-                }
-            }
-            out
-        })
-        .collect();
+                out
+            })
+            .collect();
+        rows_out.extend(band);
+        #[cfg(test)]
+        test_hooks::band_done();
+    }
 
     // Cropped planar f32 LE cache, mmap-able by PanelReader.
     std::fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
@@ -499,6 +515,40 @@ fn reproject_core(
         path,
     })
 }
+
+/// Test-only instrumentation of the reprojection band loop (thread-local:
+/// the loop runs on the calling thread).
+#[cfg(test)]
+mod test_hooks {
+    use std::cell::{Cell, RefCell};
+
+    type Hook = Box<dyn Fn(usize)>;
+
+    thread_local! {
+        static BANDS: Cell<usize> = const { Cell::new(0) };
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn band_done() {
+        let n = BANDS.get() + 1;
+        BANDS.set(n);
+        HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(n);
+            }
+        });
+    }
+
+    pub(crate) fn set_band_hook(h: Option<Hook>) {
+        HOOK.with(|c| *c.borrow_mut() = h);
+    }
+
+    pub(crate) fn take_band_count() -> usize {
+        BANDS.replace(0)
+    }
+}
+#[cfg(test)]
+pub(crate) use test_hooks::{set_band_hook, take_band_count};
 
 #[cfg(test)]
 mod tests {
@@ -693,7 +743,8 @@ mod tests {
             sw as u64,
             sh as u64,
         );
-        let ap = reproject_panel(&panel, &model, &frame, &dir.join("out")).unwrap();
+        let ap =
+            reproject_panel(&panel, &model, &frame, &dir.join("out"), &JobCtl::none()).unwrap();
         // Forward-mapped footprint: f_x = p_x + 7.5 ∈ [7.5, 71.5] → x ∈ [4, 40)
         // after padding/clamping; f_y = p_y − 20.5 ∈ [−20.5, 27.5] → y ∈ [0, 32).
         assert_eq!(ap.bbox, [4, 0, 40, 32]);
@@ -771,7 +822,8 @@ mod tests {
             sw as u64,
             sh as u64,
         );
-        let ap = reproject_panel(&panel, &model, &frame, &dir.join("out")).unwrap();
+        let ap =
+            reproject_panel(&panel, &model, &frame, &dir.join("out"), &JobCtl::none()).unwrap();
         let [x0, y0, x1, y1] = ap.bbox;
         let bw = (x1 - x0) as usize;
         let bytes = std::fs::read(&ap.path).unwrap();
@@ -826,7 +878,8 @@ mod tests {
             sw as u64,
             sh as u64,
         );
-        let ap = reproject_panel(&panel, &model, &frame, &dir.join("out")).unwrap();
+        let ap =
+            reproject_panel(&panel, &model, &frame, &dir.join("out"), &JobCtl::none()).unwrap();
         let bytes = std::fs::read(&ap.path).unwrap();
         let data: &[f32] = bytemuck::cast_slice(&bytes);
         let bw = (ap.bbox[2] - ap.bbox[0]) as usize;
@@ -868,10 +921,12 @@ mod tests {
         };
         // Panel 10° away on the sky: footprint misses the canvas entirely.
         let far = linear_model([40.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 32, 24);
-        assert!(reproject_panel(&panel, &far, &frame, &dir.join("out")).is_err());
+        assert!(reproject_panel(&panel, &far, &frame, &dir.join("out"), &JobCtl::none()).is_err());
         // Solved geometry differing from the pixel geometry is refused.
         let wrong = linear_model([30.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 64, 24);
-        assert!(reproject_panel(&panel, &wrong, &frame, &dir.join("out")).is_err());
+        assert!(
+            reproject_panel(&panel, &wrong, &frame, &dir.join("out"), &JobCtl::none()).is_err()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -892,7 +947,7 @@ mod tests {
         };
         let out = dir.join("out");
         let wrong = linear_model([30.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 64, 24);
-        let e = reproject_panel(&panel, &wrong, &frame, &out)
+        let e = reproject_panel(&panel, &wrong, &frame, &out, &JobCtl::none())
             .unwrap_err()
             .to_string();
         assert!(e.contains("does not match panel"), "{e}");
@@ -901,7 +956,7 @@ mod tests {
             "error must cite the source file: {e}"
         );
         let far = linear_model([40.0, 0.0], [16.0, 12.0], [[-S, 0.0], [0.0, S]], 32, 24);
-        let e = reproject_panel(&panel, &far, &frame, &out)
+        let e = reproject_panel(&panel, &far, &frame, &out, &JobCtl::none())
             .unwrap_err()
             .to_string();
         assert!(e.contains("does not intersect"), "{e}");
@@ -962,7 +1017,7 @@ mod tests {
         let out = std::env::temp_dir().join(format!("mmm-align-real-{}", std::process::id()));
         let panel = InputPanel::open(&path(1)).unwrap();
         let t1 = std::time::Instant::now();
-        let ap = reproject_panel(&panel, &models[0], &frame, &out).unwrap();
+        let ap = reproject_panel(&panel, &models[0], &frame, &out, &JobCtl::none()).unwrap();
         let dt = t1.elapsed().as_secs_f64();
         let (bw, bh) = (ap.bbox[2] - ap.bbox[0], ap.bbox[3] - ap.bbox[1]);
         eprintln!(
@@ -1069,7 +1124,8 @@ mod tests {
             sh as u64,
         );
         let frame = choose_frame(std::slice::from_ref(&model));
-        let ap = reproject_panel(&panel, &model, &frame, &dir.join("out")).unwrap();
+        let ap =
+            reproject_panel(&panel, &model, &frame, &dir.join("out"), &JobCtl::none()).unwrap();
 
         let meta = PanelMeta {
             id: 0,

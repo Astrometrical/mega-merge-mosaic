@@ -540,7 +540,7 @@ fn analyze_solved(
     for (id, (panel, model)) in panels.iter().enumerate() {
         let t = Instant::now();
         let out_dir = session.dir.join("panels").join(id.to_string());
-        let ap = reproject_panel(panel, model, &frame, &out_dir)?;
+        let ap = reproject_panel(panel, model, &frame, &out_dir, ctl)?;
         ctl.report("reproject", (id as u64) + 1, panels.len() as u64)?;
         tracing::info!(
             "aligned panel {}/{}: bbox [{},{})x[{},{}) in {:.2}s",
@@ -910,7 +910,7 @@ pub fn analyze_ipc_solved(
             (p.width, p.height, p.channels),
             band_rows,
         );
-        let ap = reproject_from_reader(&reader, None, model, &frame, &out_dir)?;
+        let ap = reproject_from_reader(&reader, None, model, &frame, &out_dir, &JobCtl::none())?;
         tracing::info!(
             "aligned panel {}/{}: bbox [{},{})x[{},{}) in {:.2}s",
             id + 1,
@@ -1333,6 +1333,47 @@ mod tests {
         assert!(err.is_cancelled(), "{err}");
         assert!(!dir.join("session.json").exists());
         std::fs::remove_dir_all(&f.dir).unwrap();
+    }
+
+    /// A solved panel tall enough for several 256-row reprojection bands,
+    /// cancelled once the first band is done, stops mid-panel.
+    #[test]
+    fn reproject_cancels_mid_panel() {
+        let dir = tmpdir("reproject-cancel");
+        let (w, h) = (40u64, 800u64);
+        let planes: Vec<f32> = (0..w * h).map(|i| (i % 97) as f32 / 97.0 + 0.01).collect();
+        let path = dir.join("tall.xisf");
+        let s = 1.0e-3_f64;
+        write_xisf_solved(
+            &path,
+            w,
+            h,
+            1,
+            &planes,
+            &SynthWcs {
+                crval: [10.0, 0.0],
+                refimg: [w as f64 / 2.0, h as f64 / 2.0],
+                cd: [[-s, 0.0], [0.0, s]],
+            },
+        )
+        .unwrap();
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        crate::align::set_band_hook(Some(Box::new(move |_| t2.cancel())));
+        let ctl = JobCtl::new(token, None);
+        let settings = AnalyzeSettings {
+            input: InputSelect::Solved,
+            surface: Some(2),
+            gain: GainMode::Fit,
+        };
+        let out = dir.join("c.mmm-session");
+        let err = analyze_ctl(&[path], &out, &settings, None, &ctl).unwrap_err();
+        let done = crate::align::take_band_count();
+        crate::align::set_band_hook(None);
+        assert!(err.is_cancelled(), "{err}");
+        assert!(done >= 1, "first band should have run");
+        assert!(done < 3, "cancel must stop before all bands: {done}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Uncancelled `analyze_ctl` yields the same session as `analyze_full`.
