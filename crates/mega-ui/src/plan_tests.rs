@@ -1,0 +1,192 @@
+use egui::{ColorImage, Pos2, Rect, Vec2};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+
+use super::*;
+
+const SCREEN: Vec2 = Vec2::new(1024.0, 768.0);
+
+struct State {
+    canvas: PlanCanvas,
+    extent: [f64; 4],
+    items: Vec<PlacedItem>,
+    log: Vec<PlanResponse>,
+}
+
+fn harness(extent: [f64; 4], items: Vec<PlacedItem>) -> Harness<'static, State> {
+    // Short steps so two clicks land inside egui's double-click window.
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut State| {
+                let r = s.canvas.show(ui, s.extent, &s.items, true, true);
+                s.log.push(r);
+            },
+            State {
+                canvas: PlanCanvas::new(),
+                extent,
+                items,
+                log: Vec::new(),
+            },
+        )
+}
+
+fn item(id: u64, rect: [f64; 4]) -> PlacedItem {
+    PlacedItem {
+        id,
+        rect,
+        layers: Vec::new(),
+        outline: palette::ACCENT_500,
+        label: format!("{id}"),
+        marker: None,
+        selected: false,
+    }
+}
+
+/// Screen position of canvas point `p` in the last frame.
+fn to_screen(h: &Harness<'_, State>, p: (f64, f64)) -> Pos2 {
+    let (rect, now) = h.state().canvas.last_frame().expect("shown");
+    h.state().canvas.view().image_to_screen(p, rect, now)
+}
+
+fn click(h: &mut Harness<'_, State>, p: Pos2) {
+    h.hover_at(p);
+    h.drag_at(p);
+    h.event(egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+}
+
+#[test]
+fn click_selects_topmost() {
+    let items = vec![
+        item(1, [0.0, 0.0, 600.0, 600.0]),
+        item(2, [400.0, 400.0, 1000.0, 1000.0]),
+    ];
+    let mut h = harness([0.0, 0.0, 1000.0, 1000.0], items);
+    h.run();
+
+    let cases = [
+        ((500.0, 500.0), Some(2)), // both: the later item is on top
+        ((100.0, 100.0), Some(1)),
+        ((900.0, 900.0), Some(2)),
+        ((900.0, 100.0), None),
+    ];
+    for (p, want) in cases {
+        let s = to_screen(&h, p);
+        h.state_mut().log.clear();
+        click(&mut h, s);
+        h.run();
+        let clicked: Vec<Option<u64>> = h.state().log.iter().map(|r| r.clicked).collect();
+        let empty = h.state().log.iter().any(|r| r.clicked_empty);
+        match want {
+            Some(id) => {
+                assert!(clicked.contains(&Some(id)), "{p:?}: {clicked:?}");
+                assert!(!empty, "{p:?}");
+            }
+            None => {
+                assert!(clicked.iter().all(Option::is_none), "{p:?}: {clicked:?}");
+                assert!(empty, "{p:?}");
+            }
+        }
+        let hovered = h.state().log.last().unwrap().hovered;
+        assert_eq!(hovered, want, "{p:?}");
+    }
+}
+
+#[test]
+fn double_click_zooms_to_item() {
+    let target = [600.0, 100.0, 800.0, 300.0];
+    let items = vec![item(1, [0.0, 0.0, 2000.0, 1000.0]), item(7, target)];
+    let mut h = harness([0.0, 0.0, 2000.0, 1000.0], items);
+    h.run();
+    let z0 = {
+        let (_, now) = h.state().canvas.last_frame().unwrap();
+        h.state().canvas.view().zoom(now)
+    };
+    let p = to_screen(&h, (700.0, 200.0));
+    h.state_mut().log.clear();
+    click(&mut h, p);
+    click(&mut h, p);
+    h.run();
+    assert!(
+        h.state().log.iter().any(|r| r.double_clicked == Some(7)),
+        "no double click reported"
+    );
+    let (rect, now) = h.state().canvas.last_frame().unwrap();
+    let view = h.state().canvas.view();
+    assert!(view.zoom(now) > z0 * 2.0);
+    let a = view.image_to_screen((target[0], target[1]), rect, now);
+    let b = view.image_to_screen((target[2], target[3]), rect, now);
+    let shown = Rect::from_min_max(a, b);
+    // The item is centred, fully visible and fills most of the canvas.
+    assert!(rect.contains_rect(shown), "{shown:?} in {rect:?}");
+    assert!((shown.center() - rect.center()).length() < 1.0);
+    assert!(shown.height() > 0.8 * rect.height(), "{shown:?}");
+
+    // Home fits the extent again.
+    h.get_by_label("Home").click();
+    h.run();
+    let (_, now) = h.state().canvas.last_frame().unwrap();
+    assert!((h.state().canvas.view().zoom(now) - z0).abs() < 1e-9);
+}
+
+#[test]
+fn additive_layer_mesh_has_zero_alpha() {
+    let mut h = harness([0.0, 0.0, 1000.0, 1000.0], Vec::new());
+    let img = || ColorImage::new([4, 4], vec![Color32::WHITE; 16]);
+    let base = h
+        .ctx
+        .load_texture("base", img(), egui::TextureOptions::LINEAR);
+    let add = h
+        .ctx
+        .load_texture("add", img(), egui::TextureOptions::LINEAR);
+    let (base_id, add_id) = (base.id(), add.id());
+    let mut it = item(3, [100.0, 100.0, 900.0, 900.0]);
+    it.selected = true;
+    it.layers = vec![
+        Layer {
+            texture: base,
+            tint: Color32::WHITE,
+            additive: false,
+        },
+        Layer {
+            texture: add,
+            tint: Color32::from_rgb(200, 50, 0),
+            additive: true,
+        },
+    ];
+    h.state_mut().items = vec![it];
+    h.run();
+
+    let (mut n_base, mut n_add, mut selected_outline) = (0, 0, false);
+    for cs in &h.output().shapes {
+        match &cs.shape {
+            egui::Shape::Mesh(m) if m.texture_id == add_id => {
+                let want = Color32::from_rgba_premultiplied(200, 50, 0, 0);
+                assert!(m.vertices.iter().all(|v| v.color == want), "{m:?}");
+                n_add += 1;
+            }
+            egui::Shape::Mesh(m) if m.texture_id == base_id => {
+                assert!(m.vertices.iter().all(|v| v.color == Color32::WHITE));
+                n_base += 1;
+            }
+            egui::Shape::Rect(r)
+                if r.stroke.color == palette::ACCENT_400 && r.stroke.width == 2.5 =>
+            {
+                selected_outline = true;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((n_base, n_add), (1, 1));
+    assert!(
+        selected_outline,
+        "selected item has no 2.5 px accent outline"
+    );
+}

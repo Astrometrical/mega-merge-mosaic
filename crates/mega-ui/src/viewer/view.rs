@@ -162,6 +162,13 @@ impl View {
     /// exceeds [`MAX_ZOOM`].
     pub fn fit(&mut self, geom: &PyramidGeometry, screen: Vec2, now: f64) {
         let (w, h) = (geom.width as f64, geom.height as f64);
+        self.fit_rect([0.0, 0.0, w, h], screen, now);
+    }
+
+    /// Animate home onto an arbitrary image rect `[x0, y0, x1, y1]`: like
+    /// [`View::fit`], for content whose extent does not start at the origin.
+    pub fn fit_rect(&mut self, image_rect: [f64; 4], screen: Vec2, now: f64) {
+        let (w, h) = (image_rect[2] - image_rect[0], image_rect[3] - image_rect[1]);
         let mut z = (f64::from(screen.x) / w).min(f64::from(screen.y) / h);
         if !z.is_finite() || z <= 0.0 {
             z = 1.0;
@@ -169,8 +176,8 @@ impl View {
         let z = z.min(MAX_ZOOM);
         self.min_zoom = z / 2.0;
         self.detach_anchor(now);
-        self.cx.spring_to(w / 2.0, now);
-        self.cy.spring_to(h / 2.0, now);
+        self.cx.spring_to(image_rect[0] + w / 2.0, now);
+        self.cy.spring_to(image_rect[1] + h / 2.0, now);
         self.ln_zoom.spring_to(z.ln(), now);
     }
 
@@ -510,6 +517,19 @@ mod tests {
         let mut v = View::new();
         v.fit(&PyramidGeometry::new(10, 10, 256), SCREEN, 0.0);
         assert!(v.zoom_target() <= MAX_ZOOM);
+    }
+
+    #[test]
+    fn fit_rect_centres_offset_extent() {
+        let mut v = View::new();
+        v.fit_rect([-500.0, 1000.0, 1500.0, 2000.0], SCREEN, 0.0);
+        let a = v.image_to_screen((-500.0, 1000.0), rect(), 10.0);
+        let b = v.image_to_screen((1500.0, 2000.0), rect(), 10.0);
+        assert!(
+            (a.x - 0.0).abs() < 0.01 && (b.x - 1920.0).abs() < 0.01,
+            "{a:?} {b:?}"
+        );
+        assert!(((a.y + b.y) / 2.0 - 540.0).abs() < 0.01);
     }
 
     #[test]

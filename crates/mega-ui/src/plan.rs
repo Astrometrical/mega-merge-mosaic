@@ -1,0 +1,394 @@
+//! Plan canvas: low-resolution images placed in a shared frame, over the
+//! viewer's spring pan and zoom.
+//!
+//! Each [`PlacedItem`] is a rect in canvas coordinates with any number of
+//! image [`Layer`]s stretched over it. Drag pans, the scroll wheel zooms about
+//! the cursor, a click reports the topmost item under the pointer and a
+//! double-click zooms to it. `+`, `−`, `Home` and `Zoom to selection` buttons
+//! sit top-left.
+
+use egui::{
+    Align2, Color32, Event, FontId, MouseWheelUnit, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
+    Ui,
+};
+
+use crate::theme::palette;
+use crate::viewer::{OverlayButton, View, overlay_buttons};
+
+/// Zoom factor per scroll-wheel notch (as in the tiled viewer).
+const SCROLL_ZOOM_PER_NOTCH: f64 = 1.2;
+/// Width of the selection outline, in points.
+const SELECTED_STROKE: f32 = 2.5;
+/// Width of an ordinary outline, in points.
+const OUTLINE_STROKE: f32 = 1.0;
+/// Margin left around an item zoomed to, as a fraction of its size.
+const ZOOM_MARGIN: f64 = 0.05;
+/// Radius of an item's marker, in points.
+const MARKER_RADIUS: f32 = 9.0;
+/// Dash and gap of the outline of an item with no layers yet, in points.
+const DASH: (f32, f32) = (6.0, 4.0);
+
+/// One image drawn in a [`PlacedItem`], stretched over the item's rect.
+///
+/// An opaque layer is drawn with `tint` as its vertex colour, covering what
+/// is below. An **additive** layer instead adds `tint × image` onto what is
+/// below (e.g. one display channel of a colour composition). It uses egui's
+/// premultiplied-alpha blending: the vertex colour keeps `tint`'s RGB with
+/// alpha 0 ([`Color32::from_rgb_additive`]). The backends multiply the vertex
+/// colour by the texel (`egui_glow` `fragment.glsl`:
+/// `v_rgba_in_gamma * texture_in_gamma`), then blend with source factor
+/// `ONE` and destination factor `ONE_MINUS_SRC_ALPHA` (`egui_glow`
+/// `painter.rs` `blend_func_separate(ONE, ONE_MINUS_SRC_ALPHA, ..)`;
+/// `egui-wgpu` `renderer.rs` `BlendFactor::One` / `OneMinusSrcAlpha`, egui
+/// 0.36). With an opaque texel the source alpha is 0, so the destination is
+/// kept and the colour is added. The sum is formed in the framebuffer's
+/// (gamma) space and saturates at white.
+pub struct Layer {
+    /// The image.
+    pub texture: egui::TextureHandle,
+    /// Colour the image is multiplied by.
+    pub tint: Color32,
+    /// Add onto what is below instead of covering it.
+    pub additive: bool,
+}
+
+impl Layer {
+    /// Vertex colour the layer is painted with.
+    fn vertex_color(&self) -> Color32 {
+        if self.additive {
+            Color32::from_rgb_additive(self.tint.r(), self.tint.g(), self.tint.b())
+        } else {
+            self.tint
+        }
+    }
+}
+
+/// An item placed on a [`PlanCanvas`].
+pub struct PlacedItem {
+    /// Caller's identifier, reported back in [`PlanResponse`].
+    pub id: u64,
+    /// Placement `[x0, y0, x1, y1]` in canvas coordinates.
+    pub rect: [f64; 4],
+    /// Images, drawn in order. With none (not loaded yet) the outline is
+    /// drawn dashed.
+    pub layers: Vec<Layer>,
+    /// Outline colour (when outlines are shown).
+    pub outline: Color32,
+    /// Label drawn at the item's centre (when labels are shown).
+    pub label: String,
+    /// Colour of a filled "!" marker at the item's top-right, if flagged.
+    pub marker: Option<Color32>,
+    /// Drawn with a 2.5 px accent outline, whether or not outlines are shown;
+    /// the target of "Zoom to selection".
+    pub selected: bool,
+}
+
+impl PlacedItem {
+    fn contains(&self, p: (f64, f64)) -> bool {
+        let r = self.rect;
+        p.0 >= r[0] && p.0 < r[2] && p.1 >= r[1] && p.1 < r[3]
+    }
+}
+
+/// What the canvas reports back each frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlanResponse {
+    /// Item clicked this frame (the topmost under the pointer).
+    pub clicked: Option<u64>,
+    /// Item double-clicked this frame; the canvas zooms to it.
+    pub double_clicked: Option<u64>,
+    /// Item under the pointer.
+    pub hovered: Option<u64>,
+    /// A click landed on no item (callers usually deselect).
+    pub clicked_empty: bool,
+}
+
+/// Canvas command from a button or the host app, applied in `show`.
+#[derive(Clone, Copy, Debug)]
+enum Command {
+    Home,
+    Zoom(f64),
+    ZoomTo([f64; 4]),
+    ZoomToSelection,
+}
+
+/// Canvas of placed items (see the module docs). Items are drawn in slice
+/// order, so later items are on top, and hit-testing picks the topmost.
+pub struct PlanCanvas {
+    view: View,
+    /// The extent the view was last fitted to; a new extent re-homes.
+    homed_extent: Option<[f64; 4]>,
+    commands: Vec<Command>,
+    last_frame: Option<(Rect, f64)>,
+}
+
+impl Default for PlanCanvas {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PlanCanvas {
+    /// A canvas that fits the extent on its first frame.
+    pub fn new() -> Self {
+        Self {
+            view: View::new(),
+            homed_extent: None,
+            commands: Vec::new(),
+            last_frame: None,
+        }
+    }
+
+    /// The current view (canvas coordinates are the view's image pixels).
+    pub fn view(&self) -> &View {
+        &self.view
+    }
+
+    /// Viewport rect and `ui.input().time` of the last frame shown, for
+    /// mapping between screen and canvas with [`PlanCanvas::view`].
+    pub fn last_frame(&self) -> Option<(Rect, f64)> {
+        self.last_frame
+    }
+
+    /// Animate to the home view (the whole extent visible).
+    pub fn home(&mut self) {
+        self.commands.push(Command::Home);
+    }
+
+    /// Animate so `rect` (`[x0, y0, x1, y1]`, canvas coordinates) fills the
+    /// canvas, with a small margin.
+    pub fn zoom_to(&mut self, rect: [f64; 4]) {
+        self.commands.push(Command::ZoomTo(rect));
+    }
+
+    /// Draw `items` over a canvas spanning `extent` (`[x0, y0, x1, y1]`),
+    /// filling `ui`'s available space, and handle input. The view fits the
+    /// extent on the first frame and whenever the extent changes.
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        extent: [f64; 4],
+        items: &[PlacedItem],
+        show_outlines: bool,
+        show_labels: bool,
+    ) -> PlanResponse {
+        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let now = ui.input(|i| i.time);
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return PlanResponse::default();
+        }
+        self.last_frame = Some((rect, now));
+
+        if self.homed_extent != Some(extent) {
+            self.view.fit_rect(extent, rect.size(), now);
+            self.view.finish_animation();
+            self.homed_extent = Some(extent);
+        }
+        for c in std::mem::take(&mut self.commands) {
+            match c {
+                Command::Home => self.view.fit_rect(extent, rect.size(), now),
+                Command::Zoom(f) => self.view.zoom_by(f, rect.center(), rect, now),
+                Command::ZoomTo(r) => self.zoom_to_padded(r, rect, now),
+                Command::ZoomToSelection => {
+                    if let Some(r) = selection_bounds(items) {
+                        self.zoom_to_padded(r, rect, now);
+                    }
+                }
+            }
+        }
+
+        let hit = |p: Pos2| {
+            let c = self.view.screen_to_image(p, rect, now);
+            items.iter().rev().find(|it| it.contains(c)).map(|it| it.id)
+        };
+        let mut out = PlanResponse {
+            hovered: response.hover_pos().and_then(hit),
+            ..PlanResponse::default()
+        };
+        if response.clicked()
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            out.clicked = hit(p);
+            out.clicked_empty = out.clicked.is_none();
+        }
+        if response.double_clicked()
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            out.double_clicked = hit(p);
+            match out
+                .double_clicked
+                .and_then(|id| items.iter().find(|it| it.id == id))
+            {
+                Some(it) => self.zoom_to_padded(it.rect, rect, now),
+                None => self.view.zoom_by(2.0, p, rect, now),
+            }
+        }
+        self.handle_pan_zoom(ui, &response, rect, now);
+
+        self.paint(
+            &ui.painter_at(rect),
+            rect,
+            now,
+            items,
+            show_outlines,
+            show_labels,
+        );
+        let buttons = [
+            OverlayButton::new("+", 28.0, "Zoom in"),
+            OverlayButton::new("\u{2212}", 28.0, "Zoom out"),
+            OverlayButton::new("Home", 52.0, "Fit everything"),
+            OverlayButton {
+                enabled: items.iter().any(|it| it.selected),
+                ..OverlayButton::new("Zoom to selection", 128.0, "Zoom to the selection")
+            },
+        ];
+        let cmds = [
+            Command::Zoom(2.0),
+            Command::Zoom(0.5),
+            Command::Home,
+            Command::ZoomToSelection,
+        ];
+        if let Some(i) = overlay_buttons(ui, rect, &buttons) {
+            self.commands.push(cmds[i]);
+        }
+
+        if !self.view.is_settled(now) || !self.commands.is_empty() {
+            ui.ctx().request_repaint();
+        }
+        out
+    }
+
+    fn zoom_to_padded(&mut self, r: [f64; 4], screen: Rect, now: f64) {
+        let (mx, my) = ((r[2] - r[0]) * ZOOM_MARGIN, (r[3] - r[1]) * ZOOM_MARGIN);
+        self.view.zoom_to_rect(
+            [r[0] - mx, r[1] - my, r[2] + mx, r[3] + my],
+            screen.size(),
+            now,
+        );
+    }
+
+    fn handle_pan_zoom(&mut self, ui: &Ui, response: &egui::Response, rect: Rect, now: f64) {
+        if response.dragged() {
+            self.view.pan_by(response.drag_delta(), now);
+        }
+        let Some(p) = response.hover_pos() else {
+            return;
+        };
+        let line = ui.ctx().options(|o| o.input_options.line_scroll_speed);
+        let notches: f32 = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::MouseWheel { unit, delta, .. } => Some(match unit {
+                        MouseWheelUnit::Line => delta.y,
+                        MouseWheelUnit::Point => delta.y / line.max(1.0),
+                        MouseWheelUnit::Page => delta.y * rect.height() / line.max(1.0),
+                    }),
+                    _ => None,
+                })
+                .sum()
+        });
+        if notches != 0.0 {
+            let factor = SCROLL_ZOOM_PER_NOTCH.powf(f64::from(notches));
+            self.view.zoom_by(factor, p, rect, now);
+        }
+    }
+
+    /// Images in slice order, then outlines, labels and markers over them
+    /// (selected outlines last, so they are never hidden).
+    fn paint(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        now: f64,
+        items: &[PlacedItem],
+        show_outlines: bool,
+        show_labels: bool,
+    ) {
+        painter.rect_filled(rect, 0.0, palette::SURFACE_900);
+        let screen = |r: [f64; 4]| {
+            Rect::from_min_max(
+                self.view.image_to_screen((r[0], r[1]), rect, now),
+                self.view.image_to_screen((r[2], r[3]), rect, now),
+            )
+        };
+        let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        for it in items {
+            let r = screen(it.rect);
+            if !r.intersects(rect) {
+                continue;
+            }
+            for layer in &it.layers {
+                painter.image(layer.texture.id(), r, full_uv, layer.vertex_color());
+            }
+        }
+        for it in items {
+            let r = screen(it.rect);
+            if !r.intersects(rect) {
+                continue;
+            }
+            if show_outlines && !it.selected {
+                let stroke = Stroke::new(OUTLINE_STROKE, it.outline);
+                if it.layers.is_empty() {
+                    let ring = [
+                        r.left_top(),
+                        r.right_top(),
+                        r.right_bottom(),
+                        r.left_bottom(),
+                        r.left_top(),
+                    ];
+                    painter.extend(Shape::dashed_line(&ring, stroke, DASH.0, DASH.1));
+                } else {
+                    painter.rect_stroke(r, 0.0, stroke, StrokeKind::Inside);
+                }
+            }
+            if show_labels && !it.label.is_empty() {
+                painter.text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    &it.label,
+                    FontId::proportional(14.0),
+                    palette::TEXT_STRONG,
+                );
+            }
+            if let Some(c) = it.marker {
+                let at = Pos2::new(
+                    r.right() - MARKER_RADIUS - 4.0,
+                    r.top() + MARKER_RADIUS + 4.0,
+                );
+                painter.circle_filled(at, MARKER_RADIUS, c);
+                painter.text(
+                    at,
+                    Align2::CENTER_CENTER,
+                    "!",
+                    FontId::proportional(13.0),
+                    palette::TEXT_STRONG,
+                );
+            }
+        }
+        for it in items.iter().filter(|it| it.selected) {
+            let stroke = Stroke::new(SELECTED_STROKE, palette::ACCENT_400);
+            painter.rect_stroke(screen(it.rect), 0.0, stroke, StrokeKind::Inside);
+        }
+    }
+}
+
+/// Union of the selected items' rects.
+fn selection_bounds(items: &[PlacedItem]) -> Option<[f64; 4]> {
+    items
+        .iter()
+        .filter(|it| it.selected)
+        .map(|it| it.rect)
+        .reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ]
+        })
+}
+
+#[cfg(test)]
+#[path = "plan_tests.rs"]
+mod tests;

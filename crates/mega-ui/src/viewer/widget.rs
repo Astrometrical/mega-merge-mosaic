@@ -501,25 +501,62 @@ impl TiledViewer {
     }
 
     fn overlay_buttons(&mut self, ui: &mut Ui, rect: Rect) {
-        let mut x = rect.min.x + 8.0;
-        let y = rect.min.y + 8.0;
         let buttons = [
-            ("+", 28.0, Command::Zoom(2.0), "Zoom in"),
-            ("\u{2212}", 28.0, Command::Zoom(0.5), "Zoom out"),
-            ("Home", 52.0, Command::Home, "Fit the whole image"),
+            OverlayButton::new("+", 28.0, "Zoom in"),
+            OverlayButton::new("\u{2212}", 28.0, "Zoom out"),
+            OverlayButton::new("Home", 52.0, "Fit the whole image"),
         ];
-        for (label, w, cmd, tip) in buttons {
-            let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, 28.0));
-            if ui
-                .put(r, egui::Button::new(label))
-                .on_hover_text(tip)
-                .clicked()
-            {
-                self.commands.push(cmd);
-            }
-            x += w + 4.0;
+        let cmds = [Command::Zoom(2.0), Command::Zoom(0.5), Command::Home];
+        if let Some(i) = overlay_buttons(ui, rect, &buttons) {
+            self.commands.push(cmds[i]);
         }
     }
+}
+
+/// One button of an overlay row (see [`overlay_buttons`]).
+pub(crate) struct OverlayButton<'a> {
+    pub label: &'a str,
+    pub width: f32,
+    pub tip: &'a str,
+    pub enabled: bool,
+}
+
+impl<'a> OverlayButton<'a> {
+    /// An enabled button.
+    pub fn new(label: &'a str, width: f32, tip: &'a str) -> Self {
+        Self {
+            label,
+            width,
+            tip,
+            enabled: true,
+        }
+    }
+}
+
+/// Draw a row of 28-px-high buttons over the top-left corner of `rect`;
+/// returns the index of the one clicked this frame.
+pub(crate) fn overlay_buttons(ui: &mut Ui, rect: Rect, buttons: &[OverlayButton]) -> Option<usize> {
+    let mut x = rect.min.x + 8.0;
+    let y = rect.min.y + 8.0;
+    let mut clicked = None;
+    for (i, b) in buttons.iter().enumerate() {
+        let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(b.width, 28.0));
+        let resp = ui
+            .scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(r)
+                    .layout(egui::Layout::centered_and_justified(
+                        egui::Direction::TopDown,
+                    )),
+                |ui| ui.add_enabled(b.enabled, egui::Button::new(b.label)),
+            )
+            .inner;
+        if resp.on_hover_text(b.tip).clicked() {
+            clicked = Some(i);
+        }
+        x += b.width + 4.0;
+    }
+    clicked
 }
 
 /// Texture sampling for a tile of `level`. Only level 0 is ever magnified as

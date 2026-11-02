@@ -11,4 +11,5 @@ pub use view::{
     ANIMATION_TIME, MAX_ZOOM, PyramidGeometry, SPRING_STIFFNESS, Spring, TileKey, View, pick_level,
     visible_tiles,
 };
+pub(crate) use widget::{OverlayButton, overlay_buttons};
 pub use widget::{TiledViewer, ViewerResponse, tile_tint};

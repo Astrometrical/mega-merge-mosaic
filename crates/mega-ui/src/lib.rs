@@ -6,7 +6,9 @@
 //! Photometrical. App-specific knowledge lives in the app crates.
 #![warn(missing_docs)]
 
+pub mod checks;
 pub mod jobs;
+pub mod plan;
 pub mod status;
 pub mod theme;
 pub mod viewer;
