@@ -114,14 +114,28 @@ impl Spring {
     }
 }
 
+/// Zoom anchor: while set, the image point `img` is held at screen offset
+/// `off` (from the viewport centre) at every frame of the zoom animation, so
+/// the point under the cursor never drifts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Anchor {
+    off: (f64, f64),
+    img: (f64, f64),
+}
+
 /// Viewport onto an image: centre (image pixels) and zoom (screen pixels per
 /// image pixel), each on a spring. Zoom animates in log space.
+///
+/// A zoom about a point stores an anchor; the centre is then derived each
+/// frame from the current zoom so the anchored image point stays under the
+/// cursor throughout the animation (OpenSeadragon behaviour).
 #[derive(Clone, Debug)]
 pub struct View {
     cx: Spring,
     cy: Spring,
     ln_zoom: Spring,
     min_zoom: f64,
+    anchor: Option<Anchor>,
 }
 
 impl Default for View {
@@ -138,18 +152,33 @@ impl View {
             cy: Spring::new(0.0),
             ln_zoom: Spring::new(0.0),
             min_zoom: 1e-9,
+            anchor: None,
         }
     }
 
     /// Animate home: the whole image visible and centred on a `screen`-sized
-    /// viewport. Also sets the minimum zoom (half the fit zoom).
+    /// viewport. Also sets the minimum zoom (half the fit zoom). Degenerate
+    /// geometry or screen sizes fall back to zoom 1; the fit zoom never
+    /// exceeds [`MAX_ZOOM`].
     pub fn fit(&mut self, geom: &PyramidGeometry, screen: Vec2, now: f64) {
         let (w, h) = (geom.width as f64, geom.height as f64);
-        let z = (f64::from(screen.x) / w).min(f64::from(screen.y) / h);
+        let mut z = (f64::from(screen.x) / w).min(f64::from(screen.y) / h);
+        if !z.is_finite() || z <= 0.0 {
+            z = 1.0;
+        }
+        let z = z.min(MAX_ZOOM);
         self.min_zoom = z / 2.0;
+        self.detach_anchor(now);
         self.cx.spring_to(w / 2.0, now);
         self.cy.spring_to(h / 2.0, now);
         self.ln_zoom.spring_to(z.ln(), now);
+    }
+
+    /// Jump every spring to its target, ending any animation.
+    pub fn finish_animation(&mut self) {
+        self.cx.reset_to(self.cx.target);
+        self.cy.reset_to(self.cy.target);
+        self.ln_zoom.reset_to(self.ln_zoom.target);
     }
 
     /// Current zoom at `now`.
@@ -164,7 +193,13 @@ impl View {
 
     /// Current centre in image pixels at `now`.
     pub fn centre(&self, now: f64) -> (f64, f64) {
-        (self.cx.value(now), self.cy.value(now))
+        match self.anchor {
+            Some(a) => {
+                let z = self.zoom(now);
+                (a.img.0 - a.off.0 / z, a.img.1 - a.off.1 / z)
+            }
+            None => (self.cx.value(now), self.cy.value(now)),
+        }
     }
 
     /// True when no spring is still animating.
@@ -174,6 +209,7 @@ impl View {
 
     /// Jump to `centre` and `zoom` (clamped) with no animation.
     pub fn set_view(&mut self, centre: (f64, f64), zoom: f64, _now: f64) {
+        self.anchor = None;
         self.cx.reset_to(centre.0);
         self.cy.reset_to(centre.1);
         self.ln_zoom.reset_to(self.clamp_zoom(zoom).ln());
@@ -183,29 +219,58 @@ impl View {
         z.clamp(self.min_zoom, MAX_ZOOM.max(self.min_zoom))
     }
 
-    /// Multiply the target zoom by `factor`, keeping the image point under
-    /// `about_screen` fixed at the target.
-    pub fn zoom_by(&mut self, factor: f64, about_screen: Pos2, screen_rect: Rect, now: f64) {
-        let old_z = self.zoom_target();
-        let new_z = self.clamp_zoom(old_z * factor);
-        let off = about_screen - screen_rect.center();
-        let (ox, oy) = (f64::from(off.x), f64::from(off.y));
-        // Image point under the cursor at the target view.
-        let px = self.cx.target + ox / old_z;
-        let py = self.cy.target + oy / old_z;
-        self.cx.spring_to(px - ox / new_z, now);
-        self.cy.spring_to(py - oy / new_z, now);
-        self.ln_zoom.spring_to(new_z.ln(), now);
+    /// Drop the zoom anchor, moving the centre springs to the centre shown
+    /// at `now` so the view does not jump.
+    fn detach_anchor(&mut self, now: f64) {
+        if self.anchor.is_some() {
+            let c = self.centre(now);
+            self.anchor = None;
+            self.cx.reset_to(c.0);
+            self.cy.reset_to(c.1);
+        }
     }
 
-    /// Drag the image by `screen_delta` screen pixels, immediately.
+    /// Keep the centre springs at the anchored view's final centre.
+    fn sync_centre_to_anchor(&mut self) {
+        if let Some(a) = self.anchor {
+            let z = self.zoom_target();
+            self.cx.reset_to(a.img.0 - a.off.0 / z);
+            self.cy.reset_to(a.img.1 - a.off.1 / z);
+        }
+    }
+
+    /// Multiply the target zoom by `factor`, keeping the image point under
+    /// `about_screen` fixed there throughout the animation.
+    pub fn zoom_by(&mut self, factor: f64, about_screen: Pos2, screen_rect: Rect, now: f64) {
+        let new_z = self.clamp_zoom(self.zoom_target() * factor);
+        if !new_z.is_finite() || new_z <= 0.0 {
+            return;
+        }
+        let off = about_screen - screen_rect.center();
+        let img = self.screen_to_image(about_screen, screen_rect, now);
+        self.anchor = Some(Anchor {
+            off: (f64::from(off.x), f64::from(off.y)),
+            img,
+        });
+        self.ln_zoom.spring_to(new_z.ln(), now);
+        self.sync_centre_to_anchor();
+    }
+
+    /// Drag the image by `screen_delta` screen pixels, immediately. An
+    /// in-flight zoom animation keeps running, re-based so the dragged image
+    /// follows the pointer.
     pub fn pan_by(&mut self, screen_delta: Vec2, now: f64) {
-        let z = self.zoom(now);
-        let c = self.centre(now);
-        self.cx.reset_to(c.0 - f64::from(screen_delta.x) / z);
-        self.cy.reset_to(c.1 - f64::from(screen_delta.y) / z);
-        let lz = self.ln_zoom.value(now);
-        self.ln_zoom.reset_to(lz);
+        let (dx, dy) = (f64::from(screen_delta.x), f64::from(screen_delta.y));
+        if let Some(a) = &mut self.anchor {
+            a.off.0 += dx;
+            a.off.1 += dy;
+            self.sync_centre_to_anchor();
+        } else {
+            let z = self.zoom(now);
+            let c = self.centre(now);
+            self.cx.reset_to(c.0 - dx / z);
+            self.cy.reset_to(c.1 - dy / z);
+        }
     }
 
     /// Animate so `image_rect` (`[x0, y0, x1, y1]`) fills a `screen`-sized
@@ -214,6 +279,7 @@ impl View {
         let w = (image_rect[2] - image_rect[0]).max(1e-9);
         let h = (image_rect[3] - image_rect[1]).max(1e-9);
         let z = self.clamp_zoom((f64::from(screen.x) / w).min(f64::from(screen.y) / h));
+        self.detach_anchor(now);
         self.cx
             .spring_to((image_rect[0] + image_rect[2]) / 2.0, now);
         self.cy
@@ -373,6 +439,77 @@ mod tests {
         let z = v.zoom(10.0);
         assert!((p0.0 - p1.0 - 100.0 / z).abs() < 1e-6);
         assert!((p0.1 - p1.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cursor_anchored_mid_animation() {
+        let g = geom();
+        let mut v = View::new();
+        v.fit(&g, SCREEN, 0.0);
+        let cursor = Pos2::new(1400.0, 300.0);
+        let before = v.screen_to_image(cursor, rect(), 10.0);
+        v.zoom_by(4.0, cursor, rect(), 10.0);
+        for i in 0..=12 {
+            let t = 10.0 + f64::from(i) * 0.1;
+            let p = v.screen_to_image(cursor, rect(), t);
+            assert!(
+                (p.0 - before.0).abs() < 1e-6 && (p.1 - before.1).abs() < 1e-6,
+                "t={t}: {p:?} vs {before:?}"
+            );
+        }
+        // A second zoom mid-animation, about another point, re-anchors there.
+        let c2 = Pos2::new(300.0, 900.0);
+        let b2 = v.screen_to_image(c2, rect(), 10.3);
+        v.zoom_by(0.5, c2, rect(), 10.3);
+        for i in 0..=12 {
+            let t = 10.3 + f64::from(i) * 0.1;
+            let p = v.screen_to_image(c2, rect(), t);
+            assert!((p.0 - b2.0).abs() < 1e-6 && (p.1 - b2.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn pan_keeps_zoom_animation() {
+        let g = geom();
+        let mut v = View::new();
+        v.fit(&g, SCREEN, 0.0);
+        let cursor = Pos2::new(1400.0, 300.0);
+        v.zoom_by(4.0, cursor, rect(), 10.0);
+        let target = v.zoom_target();
+        let p0 = v.screen_to_image(Pos2::new(500.0, 500.0), rect(), 10.2);
+        v.pan_by(Vec2::new(50.0, -20.0), 10.2);
+        assert!(!v.is_settled(10.2), "pan cancelled the zoom animation");
+        assert!((v.zoom_target() - target).abs() < 1e-12);
+        // Pan is immediate: the dragged point follows the pointer.
+        let p1 = v.screen_to_image(Pos2::new(550.0, 480.0), rect(), 10.2);
+        assert!((p0.0 - p1.0).abs() < 1e-6 && (p0.1 - p1.1).abs() < 1e-6);
+        // The zoom still lands on its target.
+        assert!((v.zoom(20.0) - target).abs() < 1e-9);
+        // ...with the panned image point still under the moved cursor.
+        let anchor = v.screen_to_image(cursor + Vec2::new(50.0, -20.0), rect(), 10.2);
+        let later = v.screen_to_image(cursor + Vec2::new(50.0, -20.0), rect(), 20.0);
+        assert!((anchor.0 - later.0).abs() < 1e-6 && (anchor.1 - later.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fit_handles_degenerate() {
+        let finite = |v: &View| {
+            let c = v.centre(10.0);
+            v.zoom(10.0).is_finite() && v.zoom(10.0) > 0.0 && c.0.is_finite() && c.1.is_finite()
+        };
+        let mut v = View::new();
+        v.fit(&PyramidGeometry::new(0, 0, 256), SCREEN, 0.0);
+        assert!(finite(&v));
+        let mut v = View::new();
+        v.fit(&geom(), Vec2::ZERO, 0.0);
+        assert!(finite(&v));
+        // Zooming afterwards stays finite too.
+        v.zoom_by(2.0, Pos2::new(5.0, 5.0), Rect::ZERO, 1.0);
+        assert!(finite(&v));
+        // A tiny image fits no closer than MAX_ZOOM.
+        let mut v = View::new();
+        v.fit(&PyramidGeometry::new(10, 10, 256), SCREEN, 0.0);
+        assert!(v.zoom_target() <= MAX_ZOOM);
     }
 
     #[test]
