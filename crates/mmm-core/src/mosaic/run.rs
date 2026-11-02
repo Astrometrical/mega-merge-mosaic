@@ -121,11 +121,15 @@ impl Mosaic {
 /// configuration is saved.
 ///
 /// New groups get their directories recorded ([`Mosaic::assign_group_dirs`])
-/// and saved before any analysis runs. Each group is removed from
-/// [`MosaicConfig::needs_analyze`] (and the configuration saved) as soon as
-/// its analysis succeeds, so a cancelled or failed run keeps the groups it
-/// finished; it returns the error without adding provenance or refreshing
-/// fingerprints.
+/// and saved before any analysis runs. Before a group's analysis starts it
+/// is inserted into [`MosaicConfig::needs_analyze`] (and the configuration
+/// saved) and its result store, if any, is invalidated — its tiles were
+/// blended from the analysis being replaced. The group is removed from
+/// `needs_analyze` (and the configuration saved) as soon as its analysis
+/// succeeds. So a cancelled or failed run keeps the groups it finished,
+/// leaves the interrupted group refused by [`blend_group`] until the next
+/// `analyze_all`, and leaves groups it never reached untouched; it returns
+/// the error without adding provenance or refreshing fingerprints.
 pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
     ctl.check()?;
     let groups = m.groups()?;
@@ -145,11 +149,16 @@ pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
             let _ = ctl.report(&format!("{group}: {stage}"), done, total);
         };
         let group_ctl = JobCtl::new(ctl.cancel_token().clone(), Some(&prefixed));
+        // Mark the group before touching its analysis, so an interrupted
+        // run leaves it refused by `blend_group` rather than half-replaced;
+        // its tiles were blended from the analysis being replaced.
+        m.config.needs_analyze.insert(group.clone());
+        m.save()?;
+        invalidate_store(&m.result_path(&group))?;
         let dir = m.group_session_dir(&group);
         analyze_ctl(&paths, &dir, &settings, Some(&frame), &group_ctl)?;
-        if m.config.needs_analyze.remove(&group) {
-            m.save()?;
-        }
+        m.config.needs_analyze.remove(&group);
+        m.save()?;
         detail.insert(group.clone(), json!(settings));
     }
 

@@ -510,3 +510,59 @@ fn blend_before_analyze_is_refused() {
     let err = blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap_err();
     assert!(err.to_string().contains("analyze first"), "{err}");
 }
+
+#[test]
+fn reanalysis_invalidates_blended_store() {
+    let tmp = TempDir::new("reana");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&m.result_path("Ha"));
+
+    // Re-analysis (e.g. after a FileChanged check) replaces the analysis the
+    // tiles were blended from: they must go stale.
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert!(m.config.needs_analyze.is_empty());
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&m.result_path("Ha"));
+}
+
+#[test]
+fn cancelled_reanalysis_refuses_unfinished_group() {
+    let tmp = TempDir::new("reanacancel");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+
+    let token = CancelToken::new();
+    let obs = |s: &str, _: u64, _: u64| {
+        if s.starts_with("OIII: ") {
+            token.cancel();
+        }
+    };
+    let ctl = JobCtl::new(token.clone(), Some(&obs));
+    assert!(analyze_all(&mut m, &ctl).unwrap_err().is_cancelled());
+
+    // OIII's analysis was interrupted: marked, persisted, its store stale,
+    // and blending it is refused until the next analyze_all.
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(
+        saved.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["OIII"]
+    );
+    assert_eq!(m.config.needs_analyze, saved.needs_analyze);
+    assert_eq!(valid0(&m.result_path("OIII")), 0);
+    let err = blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap_err();
+    assert!(err.to_string().contains("analyze first"), "{err}");
+
+    // Ha finished re-analysis: stale tiles, but blendable.
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&m.result_path("Ha"));
+
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&m.result_path("OIII"));
+}
