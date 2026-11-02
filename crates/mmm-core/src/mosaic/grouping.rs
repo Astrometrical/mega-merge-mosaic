@@ -42,7 +42,9 @@ pub struct Groups {
 
 impl Groups {
     /// The groups to process: every named group, then [`UNGROUPED`] when
-    /// non-empty (ungrouped panels are processed as their own group).
+    /// non-empty (ungrouped panels are processed as their own group). Names
+    /// are never duplicated: if a manual group is itself named [`UNGROUPED`],
+    /// the ungrouped panels are merged into it.
     pub fn processing_groups(&self) -> Vec<(String, Vec<PathBuf>)> {
         let mut out: Vec<_> = self
             .groups
@@ -50,7 +52,10 @@ impl Groups {
             .map(|(n, p)| (n.clone(), p.clone()))
             .collect();
         if !self.ungrouped.is_empty() {
-            out.push((UNGROUPED.to_string(), self.ungrouped.clone()));
+            match out.iter_mut().find(|(n, _)| n == UNGROUPED) {
+                Some((_, panels)) => panels.extend(self.ungrouped.iter().cloned()),
+                None => out.push((UNGROUPED.to_string(), self.ungrouped.clone())),
+            }
         }
         out
     }
@@ -85,8 +90,19 @@ pub fn resolve_groups(cfg: &MosaicConfig, header: &dyn Fn(&Path) -> Option<Strin
     out
 }
 
+/// Windows reserved device names (with or without an extension).
+fn is_reserved_device_name(s: &str) -> bool {
+    let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+}
+
 /// Map each group name to a safe, unique directory name. Characters outside
-/// `[A-Za-z0-9._-]` become `_`, an empty result becomes `group`, and
+/// `[A-Za-z0-9._-]` become `_`; empty or all-dot results become `group`; a
+/// leading or trailing `.` becomes `_`; Windows reserved device names get a
+/// trailing `_`. Uniqueness is case-insensitive (case-folding filesystems):
 /// collisions get `-2`, `-3`, … in name order. Deterministic.
 pub fn group_dirs(names: &[String]) -> BTreeMap<String, String> {
     let mut sorted: Vec<&String> = names.iter().collect();
@@ -105,16 +121,26 @@ pub fn group_dirs(names: &[String]) -> BTreeMap<String, String> {
                 }
             })
             .collect();
-        if base.is_empty() {
+        if base.chars().all(|c| c == '.') {
             base = "group".into();
+        }
+        if base.starts_with('.') {
+            base.replace_range(..1, "_");
+        }
+        if base.ends_with('.') {
+            base.pop();
+            base.push('_');
+        }
+        if is_reserved_device_name(&base) {
+            base.push('_');
         }
         let mut cand = base.clone();
         let mut n = 2;
-        while used.contains(&cand) {
+        while used.contains(&cand.to_ascii_lowercase()) {
             cand = format!("{base}-{n}");
             n += 1;
         }
-        used.insert(cand.clone());
+        used.insert(cand.to_ascii_lowercase());
         out.insert(name.clone(), cand);
     }
     out
@@ -183,6 +209,16 @@ mod tests {
     }
 
     #[test]
+    fn processing_groups_never_duplicate_names() {
+        let mut g = Groups::default();
+        g.groups.insert(UNGROUPED.into(), vec!["m.xisf".into()]);
+        g.ungrouped.push("u.xisf".into());
+        let pg = g.processing_groups();
+        assert_eq!(pg.len(), 1);
+        assert_eq!(pg[0].1.len(), 2);
+    }
+
+    #[test]
     fn group_dirs_are_safe_and_unique() {
         let names: Vec<String> = ["Ha 3nm", "Ha_3nm", "R/G", ""]
             .iter()
@@ -196,6 +232,22 @@ mod tests {
         let uniq: BTreeSet<_> = m.values().collect();
         assert_eq!(uniq.len(), m.len());
         assert_eq!(m, group_dirs(&names));
+
+        let names: Vec<String> = [".", "..", "Ha", "ha", "CON", "nul.txt", "com1", "a."]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let m = group_dirs(&names);
+        assert_eq!(m["."], "group");
+        assert_eq!(m[".."], "group-2");
+        assert_eq!(m["Ha"], "Ha");
+        assert_eq!(m["ha"], "ha-2");
+        assert_eq!(m["CON"], "CON_");
+        assert_eq!(m["nul.txt"], "nul.txt_");
+        assert_eq!(m["com1"], "com1_");
+        assert_eq!(m["a."], "a_");
+        let lower: BTreeSet<_> = m.values().map(|v| v.to_lowercase()).collect();
+        assert_eq!(lower.len(), m.len());
     }
 
     #[test]
