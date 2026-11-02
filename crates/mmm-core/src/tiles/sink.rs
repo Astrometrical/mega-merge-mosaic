@@ -32,6 +32,8 @@ pub struct TileSink<'a> {
     pending: usize,
     /// Scratch for one tile.
     tile_buf: Vec<f32>,
+    /// Rows of the rect (from its top) whose tiles are all written.
+    written: u64,
 }
 
 impl<'a> TileSink<'a> {
@@ -54,7 +56,15 @@ impl<'a> TileSink<'a> {
             next_y: 0,
             pending: 0,
             tile_buf: Vec::new(),
+            written: 0,
         })
+    }
+
+    /// Rows of the rect, from its top, whose level-0 tiles have all been
+    /// written (and marked valid) by this sink: a multiple of the tile size,
+    /// or the rect's height once [`RowSink::finish`] succeeded.
+    pub fn rows_written(&self) -> u64 {
+        self.written
     }
 
     fn width(&self) -> usize {
@@ -89,6 +99,7 @@ impl<'a> TileSink<'a> {
                 .write_tile(0, tx0 + i as u32, ty, &self.tile_buf)?;
         }
         self.buf.fill(0.0);
+        self.written = self.next_y;
         self.pending = 0;
         Ok(())
     }
@@ -108,6 +119,7 @@ impl RowSink for TileSink<'_> {
         self.buf = vec![0.0; self.ch * t * self.width()];
         self.next_y = 0;
         self.pending = 0;
+        self.written = 0;
         Ok(())
     }
 
@@ -231,9 +243,12 @@ pub fn build_parents(store: &mut TileStore, rect: [u64; 4]) -> Result<()> {
 /// whole-canvas blend. Progress is reported as stage `"blend"` (rows of the
 /// rect) and then `("pyramid", 1, 1)` once the parents are built.
 ///
-/// The rect's tiles are invalidated (at every level) before blending. On any
-/// error — including cancellation through `ctl` — they are invalidated again,
-/// so a failed or cancelled run never leaves a tile of the rect valid.
+/// The rect's tiles are invalidated (at every level) before blending, and
+/// each level-0 tile row is marked valid as soon as it is written. On any
+/// error — including cancellation through `ctl` — finished work is kept:
+/// level-0 tiles the run did not fully write are invalidated (they stay
+/// stale), then the parents over the rect are rebuilt, so a parent is valid
+/// exactly when all its in-image children are; then the error is returned.
 /// Errors if the store's geometry does not match `session.canvas`.
 #[allow(clippy::too_many_arguments)]
 pub fn blend_tiles(
@@ -261,16 +276,43 @@ pub fn blend_tiles(
         roi: Some(aligned),
         ..settings.to_params()
     };
-    let run = |store: &mut TileStore| -> Result<()> {
+    let mut written = 0;
+    let blended = (|| -> Result<()> {
         let mut tiles = TileSink::new(store, aligned)?;
-        let mut sink = CtlSink::new(&mut tiles, ctl, "blend");
-        blend(session, phot, surfaces, graph, &params, &mut sink)?;
-        build_parents(store, aligned)?;
-        ctl.report("pyramid", 1, 1)
-    };
-    if let Err(e) = run(store) {
-        store.invalidate_rect(aligned);
+        let res = blend(
+            session,
+            phot,
+            surfaces,
+            graph,
+            &params,
+            &mut CtlSink::new(&mut tiles, ctl, "blend"),
+        );
+        written = tiles.rows_written();
+        res
+    })();
+    if let Err(e) = blended {
+        keep_finished(store, aligned, written);
         return Err(e);
     }
+    // Any error from here on leaves the store consistent: every level-0
+    // tile is written, and a parent not yet rebuilt is still invalid.
+    build_parents(store, aligned)?;
+    ctl.report("pyramid", 1, 1)?;
     Ok(aligned)
+}
+
+/// After a failed blend of `rect`: invalidate the level-0 tiles below the
+/// first `written` rows (not fully written by this run), then rebuild the
+/// parents over `rect` from whatever is valid.
+fn keep_finished(store: &mut TileStore, rect: [u64; 4], written: u64) {
+    let g = store.geometry();
+    let unfinished = [rect[0], (rect[1] + written).min(rect[3]), rect[2], rect[3]];
+    for (tx, ty) in g.tiles_in_rect(0, unfinished) {
+        let idx = store.raw.layout.index(0, tx, ty);
+        store.raw.invalidate(idx);
+    }
+    // `build_parents` only fails on a tile-length mismatch, impossible here;
+    // should it fail, parents it did not reach keep the invalidation
+    // `TileSink::new` gave them.
+    let _ = build_parents(store, rect);
 }

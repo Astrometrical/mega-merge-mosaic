@@ -45,9 +45,10 @@
 //!   and the [`settings::ChangeImpact`] of editing them.
 //! - [`tiles`] — the memory-mapped tiled result store: a multi-level tile
 //!   pyramid with per-tile validity flags, written by a background blend
-//!   ([`tiles::TileStore`]) while viewers read it ([`tiles::TileReader`]);
+//!   ([`tiles::TileStore`]) while viewers read it ([`tiles::TileReader`],
+//!   with a cheap per-tile [`tiles::TileState`] query and stale-tile reads);
 //!   [`tiles::blend_tiles`] blends a canvas rect into it and rebuilds the
-//!   parent levels, cancellably.
+//!   parent levels, cancellably (finished tiles stay valid).
 //! - [`mosaic`] — the mosaic project: `mosaic.json` configuration, panel
 //!   grouping rules and the on-disk session layout; [`mosaic::Mosaic`] with
 //!   [`mosaic::analyze_all`] (every group onto one shared reference frame)

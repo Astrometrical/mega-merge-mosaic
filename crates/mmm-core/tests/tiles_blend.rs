@@ -1,13 +1,13 @@
 //! Blending into the tiled result store: level-0 tiles must match a direct
 //! whole-canvas blend, ROI blends touch only the aligned rect, parents are
-//! covered means of their children, and a cancelled blend leaves the rect
-//! invalid.
+//! covered means of their children, and a cancelled blend keeps its
+//! finished tiles valid while unfinished ones stay stale.
 
 use std::path::PathBuf;
 
 use mmm_core::Result;
 use mmm_core::analyze::analyze;
-use mmm_core::blend::{BlendParams, Extent, RowSink, blend};
+use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -358,27 +358,75 @@ fn parents_are_covered_means() {
 }
 
 #[test]
-fn cancelled_blend_leaves_rect_invalid() {
-    let fx = Fixture::new("cancel", (600, 420));
+fn cancelled_blend_keeps_finished_tiles() {
+    // Five level-0 tile rows; the blend delivers 256-row bands, so
+    // cancelling at the report for row 512 leaves tile rows 0-1 finished.
+    let fx = Fixture::new("cancel", (600, 1100));
+    let settings = BlendSettings::default();
+    let full = fx.full_blend(&settings);
     let mut store = fx.store("cancel.mmmtile");
-    // Pre-populate so the cancelled rerun must invalidate existing tiles.
-    fx.blend_tiles(&BlendSettings::default(), None, &mut store, &JobCtl::none())
+    // Pre-populate with other settings, so finished tiles must have been
+    // rewritten and unfinished ones must not pass as current.
+    let other = BlendSettings {
+        mode: BlendMode::Feather,
+        ..settings.clone()
+    };
+    fx.blend_tiles(&other, None, &mut store, &JobCtl::none())
         .unwrap();
     let tok = CancelToken::new();
     let cancel = tok.clone();
-    let obs = move |stage: &str, _: u64, _: u64| {
-        if stage == "blend" {
+    let obs = move |stage: &str, done: u64, _: u64| {
+        if stage == "blend" && done >= 512 {
             cancel.cancel();
         }
     };
     let ctl = JobCtl::new(tok, Some(&obs));
     let err = fx
-        .blend_tiles(&BlendSettings::default(), None, &mut store, &ctl)
+        .blend_tiles(&settings, None, &mut store, &ctl)
         .unwrap_err();
     assert!(err.is_cancelled(), "{err}");
+
     let g = store.geometry();
+    let (nx, ny) = g.tiles(0);
+    assert_eq!(ny, 5);
+    for ty in 0..ny {
+        for tx in 0..nx {
+            if ty < 2 {
+                // Finished: valid, with the full blend's data.
+                assert_tile_matches(&store, &full, tx, ty);
+            } else {
+                assert!(!store.is_valid(0, tx, ty), "unfinished ({tx},{ty}) valid");
+            }
+        }
+    }
+    // A parent is valid exactly when every in-image child is valid.
+    for l in 1..g.levels() {
+        let (cnx, cny) = g.tiles(l - 1);
+        let (pnx, pny) = g.tiles(l);
+        for ty in 0..pny {
+            for tx in 0..pnx {
+                let kids_valid = (0..4).all(|q| {
+                    let (cx, cy) = (2 * tx + (q & 1), 2 * ty + (q >> 1));
+                    cx >= cnx || cy >= cny || store.is_valid(l - 1, cx, cy)
+                });
+                assert_eq!(
+                    store.is_valid(l, tx, ty),
+                    kids_valid,
+                    "level {l} tile ({tx},{ty})"
+                );
+            }
+        }
+    }
+    // Level 1's top row has only finished children, so it was rebuilt.
+    assert!(store.is_valid(1, 0, 0) && store.is_valid(1, 1, 0));
+    assert_eq!(store.valid_count(1), 2);
+
+    // Reblending completes the rest.
+    fx.blend_tiles(&settings, None, &mut store, &JobCtl::none())
+        .unwrap();
     for l in 0..g.levels() {
-        assert_eq!(store.valid_count(l), 0, "level {l}");
+        let (nx, ny) = g.tiles(l);
+        assert_eq!(store.valid_count(l), (nx * ny) as usize, "level {l}");
     }
 }
 
