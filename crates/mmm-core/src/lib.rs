@@ -53,10 +53,18 @@
 //!   [`mosaic::analyze_all`] (every group onto one shared reference frame)
 //!   and [`mosaic::blend_group`] (a group into its tiled result), plus
 //!   settings edits that stale exactly the affected result stores.
+//! - [`checks`] — structured input, file and analysis checks (severity, code,
+//!   affected groups, remedy) and the accepted-warning bookkeeping, as data
+//!   for a UI or `mmm check`.
 //! - [`stretch`] — display stretch maths: per-channel median/MAD statistics
 //!   and an auto stretch (display only; the data stays linear).
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
 //!   and benchmarks (in-tree and downstream) never need multi-GB real data.
+//!
+//! Support modules: [`error`] (the crate [`Error`], including
+//! [`Error::Cancelled`]), [`decoded`] (the decode cache for non-mappable
+//! XISF panels) and [`ipc`] (shared-memory transport for the PixInsight
+//! host).
 //!
 //! The remaining modules ([`summary`], [`overlap`], [`photometry`],
 //! [`surfaces`], [`seam`], [`pyramid`], [`flatten`], [`linalg`]) are the

@@ -115,7 +115,7 @@ releases are cut).
 
 All commands accept `-v` / `-vv` for debug/trace logging and `--no-banner`
 to suppress the startup banner (printed to stderr; useful when a frontend
-parses the output). `--session` defaults to `mosaic.mmm-session` everywhere.
+parses the output). `--session` defaults to `mosaic.mmm-session` for `analyze`, `report` and `blend`.
 
 ### `mmm info <panels…> [--stats]`
 
@@ -169,6 +169,60 @@ Blend the analyzed panels into a mosaic FITS (BITPIX=-32, planar channels).
 | `--defect-veto on\|off` | `on` | Cross-panel defect veto in overlaps (seam modes): suppress cosmic-ray residue / satellite trails surviving in one panel |
 | `--flatten off\|1\|2` | `off` | Opt-in global background flatten (plane / quadratic); refuses on signal-dominated mosaics |
 | `--wcs-frame topdown\|flipped` | `topdown` | WCS card convention: PixInsight display-space (default), or reflected bottom-up for readers that mirror annotations |
+
+### `mmm init <panels…> -s <DIR> [options]`
+
+Create a **mosaic session**: a directory holding the panel list, grouping,
+settings and all cached analysis for a whole mosaic (see "Mosaic sessions"
+below). `init`, `set`, `check` and `run` require `--session`; there is no
+default.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-s, --session <DIR>` | required | Mosaic directory to create |
+| `--group-by header:KEY\|token:KEYWORD` | — | Split panels into groups blended separately on one shared frame: by a header keyword's value (e.g. `header:FILTER`) or by the file-name token after a keyword (e.g. `token:FILTER` for `..._FILTER-Ha_...`) |
+| `--force` | off | Replace a mosaic already in the directory, discarding its cached analysis |
+| `--surface`, `--input`, `--gain` | as `analyze` | Analyze settings |
+| `--mode`, `--feather`, `--defect-veto`, `--flatten` | as `blend` | Blend settings |
+
+### `mmm set -s <DIR> [--group <NAME>] [settings]`
+
+Change settings mosaic-wide, or for one group with `--group`. Takes the same
+settings flags as `init`; flags not given are left unchanged. Prints what the
+change makes stale (`none`, `reblend` or `reanalyze`).
+
+### `mmm check -s <DIR>`
+
+List the groups, then every check on the panels (and on the analysis of
+groups already analyzed) as problems, notes and a count of passed checks,
+with a suggested remedy for each.
+
+### `mmm run -s <DIR> -o <OUTDIR> [options]`
+
+Analyze every group onto one shared frame and blend each group to
+`OUTDIR/<group dir>.fits`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-s, --session <DIR>` | required | Mosaic directory created by `mmm init` |
+| `-o, --output <OUTDIR>` | required | Directory for the per-group FITS files |
+| `--png` | off | Also write an autostretched PNG per group |
+| `--wcs-frame topdown\|flipped` | `topdown` | WCS card convention, as for `blend` |
+
+`analyze`, `blend` and `report` operate on single-group sessions and refuse a
+mosaic directory, pointing at `run` / `check`.
+
+## Mosaic sessions
+
+```sh
+mmm init test_data/orion/*.xisf -s orion.mmm-session --group-by token:FILTER
+mmm set -s orion.mmm-session --group Ha --mode twoband   # one group only
+mmm check -s orion.mmm-session                           # review warnings
+mmm run -s orion.mmm-session -o out/ --png               # out/<group>.fits
+```
+
+Cached analysis lives in the session directory, so re-running `run` after
+`set` recomputes only what the change made stale.
 
 ## Worked examples
 

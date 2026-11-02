@@ -231,6 +231,25 @@ phase-3/4 guarantees and the pyramid's mid-frequency benefit are preserved
 <name>.mmm-frame.json # shared reference frame (mmm frame / batch), outside any session
 ```
 
+A **mosaic session** (`mmm init`, 2026-11) wraps one such session per group:
+
+```
+<name>.mmm-session/
+  mosaic.json               # panel list (+ file fingerprints), grouping rule,
+                            # analyze/blend settings + per-group overrides,
+                            # group_dirs (group name -> directory, persisted),
+                            # accepted check keys
+  reference.mmm-frame.json  # the shared frame all groups adopt
+  groups/<dir>/             # an ordinary session in the layout above
+  groups/<dir>/result.mmmt  # tiled result store (see "Standalone app groundwork")
+```
+
+`<dir>` is a filesystem-safe, case-insensitively unique form of the group
+name, chosen once and kept in `mosaic.json` so renaming rules never orphans a
+cache. A directory holding `session.json` and no `mosaic.json` is a legacy
+single-group session; `analyze`/`blend`/`report` still work on it and refuse
+a mosaic directory.
+
 ## CLI surface
 
 ```
@@ -245,7 +264,18 @@ mmm blend --session S -o out.fits [--downsample 1|8] [--feather PX]
           [--extent auto|union|canvas]
 mmm batch --group NAME <panels…> [--group …] -s DIR -o OUTDIR [--png]
           [analyze options] [blend options]
+mmm init <panels…> -s DIR [--group-by header:KEY|token:KEYWORD] [--force]
+         [--surface] [--input] [--gain] [--mode] [--feather]
+         [--defect-veto] [--flatten]       # mosaic session (no --session default)
+mmm set -s DIR [--group NAME] [same settings flags]  # prints the change impact
+mmm check -s DIR                  # groups + problems / notes / passed count
+mmm run -s DIR -o OUTDIR [--png] [--wcs-frame topdown|flipped]
+                                  # analyze all groups on one frame, blend each
 ```
+
+`init`/`set`/`check`/`run` operate on mosaic sessions and require `--session`.
+`run` is the non-interactive equivalent of what the app does: `analyze_all`
+then one blend per group, written to `OUTDIR/<group dir>.fits`.
 
 ## Testing
 
@@ -757,3 +787,61 @@ out of the release path (no signing, no repository publication), the module
 CI job goes, and PixInsight consumes mmm's output as files. The standalone
 application becomes the primary frontend; its direction is being worked out
 separately.
+
+## Standalone app groundwork (2026-11)
+
+Phase 1 of the standalone app (spec:
+`docs/superpowers/specs/2026-11-02-standalone-app-design.md`) gave `mmm-core`
+what a desktop frontend needs, without changing any algorithm: every item
+below is UI-agnostic and the CLI is its first consumer.
+
+- **Job control** (`job`). `CancelToken` is a shared atomic flag;
+  `JobCtl` bundles a token with a progress callback; `CtlSink` wraps any
+  `RowSink`, checks the token per row and reports progress. Cancellation
+  surfaces as `Error::Cancelled` (not a failure to log). `analyze_ctl` is the
+  cancellable analyze; `analyze` is a wrapper with no-op control.
+- **Settings** (`settings`). `AnalyzeSettings` / `BlendSettings` are the
+  serialisable forms of the CLI options; `GroupOverride` holds per-group
+  deltas (an explicit `null` is distinct from absent). Editing returns a
+  `ChangeImpact` (`None` / `Reblend` / `Reanalyze`): analyze changes rerun
+  analysis and stale every result tile; blend changes keep the analysis and
+  stale only result tiles, so the UI can show exactly what needs recomputing.
+- **Tile store** (`tiles`, file `result.mmmt`). The blended mosaic as a
+  memory-mapped pyramid so a viewer reads it while a blend writes it.
+  Layout: 4096-byte header (magic `MMMTILE\0`, version 1, tile size 256,
+  width, height, channels, levels); a per-tile `u32` state table
+  (bit 31 = valid, bits 0-30 = sequence number, odd while being written);
+  then f32 planar tile data per level, edge tiles stored full size and
+  zero-padded. Level `l` is `ceil(w/2^l) x ceil(h/2^l)`, added until one tile
+  holds it. Each state entry is a **seqlock** with a single writer: a reader
+  copies a tile only if the entry is valid and even before the copy and
+  unchanged after it, so a copy straddling any rewrite or invalidation,
+  including a full rewrite, is rejected. A crash mid-write leaves the entry
+  odd = invalid, and the next write recovers it. Samples are accessed as
+  relaxed atomics so racing copies are never UB. `TileSink` is a `RowSink`
+  that fills level 0, `build_parents` rebuilds the upper levels, and
+  `blend_tiles` blends a canvas rect (an ROI re-blend invalidates only the
+  tiles it touches) cancellably. A store whose geometry no longer matches
+  the analysis is dropped and recreated; blending against stale analysis is
+  refused.
+- **Mosaic orchestration** (`mosaic`). `mosaic.json` config, grouping rules
+  (`header:KEY`, `token:KEYWORD`; panels no rule places go to a "No group"
+  processing group), persisted `group_dirs`, `needs_analyze`, `Mosaic` with
+  `analyze_all` (every group onto one shared reference frame, the existing
+  shared-frame machinery) and `blend_group` (a group into its tile store),
+  and `set_analyze_settings` / `set_blend_settings` / `set_group_override`,
+  which invalidate exactly the affected stores.
+- **Checks** (`checks`). Input checks (solution present, distortion model,
+  scale mismatch, mixed channels, group count mismatch, filters differ
+  ungrouped, ungrouped panels), file checks (changed or missing since added,
+  by fingerprint of size + mtime) and analysis checks (no overlap, sky-level
+  mismatch) as structured values: severity (problem / note / passed), a
+  stable serialised `CheckCode`, affected groups and a remedy. The user can
+  accept a warning; accepted `CheckKey`s persist in `mosaic.json`. `mmm check`
+  renders them as text.
+- **Health** (`health`). Seam steps with outlier flags and the photometric
+  gain/offset spread, as data (the numbers `report` prints).
+- **Display stretch** (`stretch`). Per-channel median/MAD statistics and an
+  automatic midtones stretch (shadows clip at -2.8 robust sigmas, median
+  mapped to 0.25). Display only: the data and the tile store stay linear and
+  the viewer applies the stretch.

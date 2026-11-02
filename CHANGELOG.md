@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+Groundwork for the standalone application; no change to any algorithm or
+to the output of existing commands.
+
+### Added
+
+- **Mosaic sessions.** `mmm init` creates a mosaic directory
+  (`mosaic.json`, a shared reference frame, one analysis session per group)
+  from a panel list, optionally split into groups with
+  `--group-by header:KEY|token:KEYWORD`. `mmm set` edits settings
+  mosaic-wide or for one group (`--group`) and reports which cached results
+  the change makes stale. `mmm check` lists the groups and every input,
+  file and analysis check, by severity. `mmm run` analyzes every group onto
+  the shared frame and writes one FITS (and optional PNG) per group.
+  Existing single-group session directories keep working with
+  `analyze`, `blend` and `report`; those commands refuse a mosaic directory
+  and point at `run` / `check`.
+- **Tiled result store** (`result.mmmt`) in `mmm-core`: a memory-mapped
+  multi-level tile pyramid with per-tile validity and torn-read protection,
+  so a viewer can read a blend while it is still being written.
+- **Job control** in `mmm-core`: cancellation tokens, progress reporting and
+  cancellable analyze and blend.
+- **Serialisable settings** with per-group overrides and change-impact
+  reporting, display-stretch statistics, structured checks and mosaic
+  health metrics as data, for the app to consume.
+
 ## 1.7.0 — 2026-10-29
 
 CLI, PixInsight module and worker. Requires PixInsight ≥ 1.9.5, as 1.6.0 did.
