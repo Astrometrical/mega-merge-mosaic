@@ -43,6 +43,14 @@ pub enum Error {
         reason: String,
     },
 
+    /// The result store at `path` is held open by another writer (in this
+    /// process or another); retry once that writer closes.
+    #[error("result store {path} is in use by another writer")]
+    Busy {
+        /// The tile store file that could not be locked.
+        path: PathBuf,
+    },
+
     /// The job was cancelled by the caller (see [`crate::job::CancelToken`]).
     #[error("cancelled")]
     Cancelled,
@@ -52,6 +60,16 @@ impl Error {
     /// True if this error is [`Error::Cancelled`].
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Error::Cancelled)
+    }
+
+    /// True if this error is [`Error::Busy`].
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Error::Busy { .. })
+    }
+
+    /// Build an [`Error::Busy`] for `path`.
+    pub fn busy(path: impl Into<PathBuf>) -> Self {
+        Error::Busy { path: path.into() }
     }
 
     /// Wrap an [`std::io::Error`] with the path it occurred on.

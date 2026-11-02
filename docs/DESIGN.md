@@ -850,7 +850,10 @@ below is UI-agnostic and the CLI is its first consumer.
   so `mosaic.json` never holds a value JSON cannot represent; settings
   structs default missing fields so older files keep loading.
 - **Concurrency contract** (tiles and mosaic). One `TileStore` writer per
-  file — nothing enforces it yet (a later plan adds an in-process guard).
+  file, enforced: `create`/`open` take an exclusive advisory lock
+  (`File::try_lock`, released on drop) and fail with `Error::Busy`
+  (`is_busy()`) on contention; `create` locks before truncating. Readers
+  take no lock.
   Readers must close before a store is recreated (`TileStore::create`
   truncates under their mapping); a matching store is reopened, never
   recreated. Callers must cancel and join a running blend or analyze before

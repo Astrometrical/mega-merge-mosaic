@@ -54,9 +54,11 @@
 //!
 //! # Concurrency contract
 //!
-//! - **One [`TileStore`] (writer) per file.** Nothing enforces this yet, in
-//!   process or across processes (a later plan adds an in-process guard);
-//!   two writers on one file break the seqlock.
+//! - **One [`TileStore`] (writer) per file, enforced.** `create` and `open`
+//!   take an exclusive advisory file lock (released on drop) and fail with
+//!   [`Error::Busy`] if another writer, in this
+//!   process or another, holds it; `create` locks before truncating, so a
+//!   refused create leaves the live file intact. Readers take no lock.
 //! - **Readers must close before a store is recreated.**
 //!   [`TileStore::create`] truncates the file; a live [`TileReader`] mapping
 //!   then faults. An existing store of matching geometry is reopened, never
@@ -454,9 +456,21 @@ fn map_err(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
     move |e| Error::io(path, e)
 }
 
+/// Take the exclusive advisory writer lock on `file`; contention is
+/// [`Error::Busy`]. The lock lives as long as the `File` (held by the store).
+fn lock_exclusive(path: &Path, file: &File) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::busy(path)),
+        Err(std::fs::TryLockError::Error(e)) => Err(Error::io(path, e)),
+    }
+}
+
 /// Read-write tile store (the blend side).
 pub struct TileStore {
     path: PathBuf,
+    // Held for the exclusive writer lock; released on drop.
+    _lock: File,
     raw: Raw,
     // Keeps the mapping that `raw.base` points into alive.
     map: MmapMut,
@@ -483,12 +497,16 @@ impl TileStore {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(path)
             .map_err(map_err(path))?;
+        // Lock before truncating so a refused create never touches a live
+        // writer's file.
+        lock_exclusive(path, &file)?;
+        file.set_len(0).map_err(map_err(path))?;
         file.set_len(layout.file_len as u64)
             .map_err(map_err(path))?;
-        let mut store = Self::map(path, &file, layout)?;
+        let mut store = Self::map(path, file, layout)?;
         let header = store.raw.layout.header();
         store.map[..header.len()].copy_from_slice(&header);
         Ok(store)
@@ -501,24 +519,26 @@ impl TileStore {
             .write(true)
             .open(path)
             .map_err(map_err(path))?;
+        lock_exclusive(path, &file)?;
         // SAFETY: see `map`; the read-only map is dropped before remapping.
         let probe = unsafe { Mmap::map(&file) }.map_err(map_err(path))?;
         let layout = Layout::parse(path, &probe)?;
         drop(probe);
-        Self::map(path, &file, layout)
+        Self::map(path, file, layout)
     }
 
-    fn map(path: &Path, file: &File, layout: Layout) -> Result<Self> {
+    fn map(path: &Path, file: File, layout: Layout) -> Result<Self> {
         // SAFETY: the file is our tile store; other processes/threads may map
         // it too, but every access to shared bytes is atomic (see the module
         // docs) and nobody resizes it while mapped.
-        let mut map = unsafe { MmapMut::map_mut(file) }.map_err(map_err(path))?;
+        let mut map = unsafe { MmapMut::map_mut(&file) }.map_err(map_err(path))?;
         let raw = Raw {
             base: map.as_mut_ptr(),
             layout,
         };
         Ok(TileStore {
             path: path.to_path_buf(),
+            _lock: file,
             raw,
             map,
         })
@@ -770,6 +790,45 @@ mod tests {
         // y0 = 500 lies in tile row 1 (256..512), so it expands to 256.
         assert_eq!(g.align_rect([900, 500, 1000, 600]), [768, 256, 1000, 600]);
         assert_eq!(g.align_rect([900, 520, 1000, 600]), [768, 512, 1000, 600]);
+    }
+
+    #[test]
+    fn second_writer_is_refused() {
+        let p = tmp("busy_open");
+        let first = TileStore::create(&p, geom()).unwrap();
+        let err = TileStore::open(&p).err().expect("second writer refused");
+        assert!(err.is_busy(), "{err}");
+        drop(first);
+        TileStore::open(&p).unwrap();
+    }
+
+    #[test]
+    fn create_refused_while_open() {
+        let p = tmp("busy_create");
+        let g = geom();
+        let mut first = TileStore::create(&p, g).unwrap();
+        let data = filled(g, 1.0);
+        first.write_tile(0, 0, 0, &data).unwrap();
+        let err = TileStore::create(&p, g).err().expect("create refused");
+        assert!(err.is_busy(), "{err}");
+        // The refused create must not have truncated the live file.
+        assert!(first.is_valid(0, 0, 0));
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len() as usize,
+            first.raw.layout.file_len
+        );
+    }
+
+    #[test]
+    fn reader_unaffected_by_writer_lock() {
+        let p = tmp("busy_reader");
+        let g = geom();
+        let mut w = TileStore::create(&p, g).unwrap();
+        w.write_tile(0, 0, 0, &filled(g, 2.0)).unwrap();
+        let r = TileReader::open(&p).unwrap();
+        let mut out = filled(g, 0.0);
+        assert!(r.read_tile(0, 0, 0, &mut out));
+        assert_eq!(out, filled(g, 2.0));
     }
 
     #[test]
