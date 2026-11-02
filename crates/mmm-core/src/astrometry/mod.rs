@@ -665,6 +665,19 @@ impl WcsModel {
         !matches!(self.distortion, Distortion::None)
     }
 
+    /// True when the model carries a distortion model; false only for the
+    /// linear-only model.
+    pub fn has_distortion(&self) -> bool {
+        self.is_spline()
+    }
+
+    /// Pixel scale of the linear solution in arcseconds per pixel
+    /// (`sqrt(|det CD|)`·3600); `None` for a degenerate matrix. (`LinearWcs`
+    /// lives in `mpp-core`, so the accessor sits on the model.)
+    pub fn pixel_scale_arcsec(&self) -> Option<f64> {
+        sampling::matrix_scale(self.linear.cd).map(|s| s * 3600.0)
+    }
+
     /// Which lazily sampled grids exist yet: `(image_to_native, native_to_image)`.
     #[cfg(test)]
     fn grids_sampled(&self) -> (bool, bool) {
