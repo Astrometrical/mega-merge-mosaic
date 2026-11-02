@@ -474,6 +474,9 @@ pub struct TileStore {
     raw: Raw,
     // Keeps the mapping that `raw.base` points into alive.
     map: MmapMut,
+    /// Whole-mapping flushes so far (tests check invalidation avoids them).
+    #[cfg(test)]
+    full_flushes: std::sync::atomic::AtomicUsize,
 }
 
 // SAFETY: `raw.base` points into `map`, which moves with the struct (the
@@ -541,6 +544,8 @@ impl TileStore {
             _lock: file,
             raw,
             map,
+            #[cfg(test)]
+            full_flushes: Default::default(),
         })
     }
 
@@ -666,9 +671,31 @@ impl TileStore {
             .count()
     }
 
-    /// Flush the mapping to disk.
+    /// Flush the whole mapping (tile data included) to disk. The writer
+    /// does this when it finishes; it can take long after a big blend.
     pub fn flush(&self) -> Result<()> {
+        #[cfg(test)]
+        self.full_flushes.fetch_add(1, Ordering::Relaxed);
         self.map.flush().map_err(map_err(&self.path))
+    }
+
+    /// Flush only the tile state table (a few pages): enough after
+    /// [`TileStore::invalidate_all`] / [`TileStore::invalidate_rect`], and
+    /// cheap — it never forces write-back of dirty tile data.
+    pub fn flush_state(&self) -> Result<()> {
+        let (off, len) = self.state_span();
+        self.map.flush_range(off, len).map_err(map_err(&self.path))
+    }
+
+    /// Byte offset and length of the state table in the file.
+    fn state_span(&self) -> (usize, usize) {
+        (HEADER_LEN, self.raw.layout.data_off - HEADER_LEN)
+    }
+
+    /// Number of [`TileStore::flush`] calls so far.
+    #[cfg(test)]
+    pub(crate) fn full_flushes(&self) -> usize {
+        self.full_flushes.load(Ordering::Relaxed)
     }
 }
 
@@ -771,6 +798,26 @@ mod tests {
 
     fn filled(g: TileGeometry, v: f32) -> Vec<f32> {
         vec![v; g.tile_len()]
+    }
+
+    #[test]
+    fn flush_state_covers_exactly_the_state_table() {
+        let g = geom();
+        let p = tmp("flush-state");
+        let mut s = TileStore::create(&p, g).unwrap();
+        let (off, len) = s.state_span();
+        let layout = Layout::new(g).unwrap();
+        assert_eq!(off, HEADER_LEN);
+        assert_eq!(off + len, layout.data_off);
+        assert!(len >= layout.total_tiles * 4 && len.is_multiple_of(PAGE));
+        s.write_tile(0, 0, 0, &filled(g, 1.0)).unwrap();
+        s.flush().unwrap();
+        s.invalidate_all();
+        s.flush_state().unwrap();
+        assert_eq!(s.full_flushes(), 1);
+        drop(s);
+        assert_eq!(TileStore::open(&p).unwrap().valid_count(0), 0);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[test]

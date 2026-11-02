@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{CONFIG_FILE, FRAME_FILE, Mosaic, MosaicConfig, is_mosaic_dir};
 use mmm_core::reference::ReferenceFrame;
 
@@ -17,12 +18,24 @@ pub struct OpenSession {
     /// analysis has derived one (read when opening, updated by the job
     /// runner after each analysis).
     pub canvas: Option<(u64, u64)>,
+    /// The groups as last resolved (when opening, off the UI thread, and by
+    /// each analysis); `None` if resolution failed.
+    pub groups: Option<Groups>,
 }
 
 impl OpenSession {
     /// The display name: the folder name without `.mmm-session`.
     pub fn name(&self) -> String {
         session_name(&self.mosaic.dir)
+    }
+
+    /// The number of processing groups: from the resolved groups, else the
+    /// groups known from analysis.
+    pub fn group_count(&self) -> usize {
+        match &self.groups {
+            Some(g) => g.processing_groups().len(),
+            None => self.mosaic.config.group_dirs.len(),
+        }
     }
 }
 
@@ -110,7 +123,13 @@ pub fn open_blocking(dir: &Path) -> Result<OpenSession, String> {
     let canvas = ReferenceFrame::load(&dir.join(FRAME_FILE))
         .ok()
         .map(|f| f.canvas());
-    Ok(OpenSession { mosaic, canvas })
+    // Reads panel headers (Header rule): fine here, off the UI thread.
+    let groups = mosaic.groups().ok();
+    Ok(OpenSession {
+        mosaic,
+        canvas,
+        groups,
+    })
 }
 
 /// Create a new session in `dir` with an empty [`MosaicConfig`]. Blocking
@@ -128,6 +147,7 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
     Ok(OpenSession {
         mosaic,
         canvas: None,
+        groups: Some(Groups::default()),
     })
 }
 

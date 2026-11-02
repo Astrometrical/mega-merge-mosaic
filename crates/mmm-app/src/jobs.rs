@@ -4,8 +4,19 @@
 //! Each job follows the core's concurrency contract
 //! ([`mmm_core::mosaic`]): it is *planned* on the UI thread when it starts,
 //! *run* on its own `std::thread` with a [`JobCtl`], and its outcome is
-//! *applied* on the UI thread by [`JobRunner::poll`]. At most one job runs
-//! at a time; newer requests queue behind it:
+//! *applied* on the UI thread by [`JobRunner::poll`]. An analysis first
+//! resolves the groups (panel header reads) on a worker over a copy of the
+//! mosaic, then plans with [`plan_analyze_with`], so the UI thread never
+//! reads panels.
+//!
+//! The UI thread does write a little: planning, applying and discarding
+//! save `mosaic.json` (a few kilobytes) and invalidation flushes only the
+//! tile state table. That is the accepted exception to "no file I/O on the
+//! UI thread" (spec §8): the core's contract is that only the owner thread
+//! saves the configuration, and these writes are bookkeeping, not
+//! processing — no pixel data is read or written.
+//!
+//! At most one job runs at a time; newer requests queue behind it:
 //!
 //! - A new analysis cancels the running job (whatever it is) and replaces
 //!   everything queued: it re-stales every group anyway.
@@ -25,9 +36,10 @@ use std::time::{Duration, Instant};
 
 use mega_ui::jobs::JobView;
 use mmm_core::job::{CancelToken, JobCtl};
+use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
-    AnalyzeOutcome, AnalyzePlan, BlendPlan, invalidate_group, plan_analyze, plan_blend,
-    run_analyze, run_blend,
+    AnalyzeOutcome, AnalyzePlan, BlendPlan, Grouping, Mosaic, PanelEntry, invalidate_group,
+    plan_analyze_with, plan_blend, run_analyze, run_blend,
 };
 use mmm_core::reference::ReferenceFrame;
 
@@ -42,6 +54,8 @@ const ANALYZE_LABEL: &str = "Analyze";
 const CANCELLING: &str = "Cancelling…";
 /// Stage shown for a queued job.
 const WAITING: &str = "Waiting…";
+/// Stage shown while an analysis resolves its groups.
+const RESOLVING: &str = "Resolving groups…";
 
 /// How a job ended, as reported by [`JobRunner::poll`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,12 +100,32 @@ struct Queued {
 
 /// A planned job, handed to its worker.
 enum Planned {
+    /// An analysis's first phase: resolve the groups of a copy of the
+    /// mosaic (reads panel headers).
+    Resolve(Box<Mosaic>),
     Analyze(AnalyzePlan),
     Blend(BlendPlan),
 }
 
+/// What resolution was based on: the inputs of [`Mosaic::groups`].
+#[derive(PartialEq)]
+struct GroupInputs {
+    panels: Vec<PanelEntry>,
+    grouping: Grouping,
+}
+
+impl GroupInputs {
+    fn of(m: &Mosaic) -> Self {
+        GroupInputs {
+            panels: m.config.panels.clone(),
+            grouping: m.config.grouping.clone(),
+        }
+    }
+}
+
 /// What a worker achieved.
 enum Done {
+    Resolved(mmm_core::Result<Groups>),
     Analyze {
         outcome: AnalyzeOutcome,
         result: mmm_core::Result<()>,
@@ -114,6 +148,8 @@ struct Running {
     handle: JoinHandle<()>,
     /// The plan of a blend, kept to apply or discard its outcome.
     blend: Option<BlendPlan>,
+    /// While resolving groups: the inputs the resolution is based on.
+    resolving: Option<GroupInputs>,
     stage: String,
     done: u64,
     total: u64,
@@ -179,11 +215,12 @@ impl JobRunner {
     /// Analyze every group; returns the job id. Cancels the running job and
     /// replaces anything queued (newer work wins).
     ///
-    /// Planning happens on the UI thread when the job starts: it resolves
-    /// the groups and marks and saves `mosaic.json`, invalidating each
-    /// group's existing store by flag (a header-sized write). That is
-    /// bookkeeping of a few kilobytes, not processing: no pixel data is
-    /// read, and the analysis itself runs on the worker.
+    /// The groups are resolved on a worker first ("Resolving groups…").
+    /// Planning then happens on the UI thread: it marks and saves
+    /// `mosaic.json` and invalidates each group's existing store by flag
+    /// (flushing only the state table). That is bookkeeping of a few
+    /// kilobytes, not processing: no panel or pixel data is read there, and
+    /// the analysis itself runs on the worker.
     pub fn start_analyze(&mut self, session: &mut OpenSession) -> u64 {
         let id = self.new_id(ANALYZE_LABEL.into());
         if let Some(r) = &self.running {
@@ -263,8 +300,7 @@ impl JobRunner {
                 }
                 Ok(Msg::Done(done)) => {
                     let r = self.running.take().expect("running job");
-                    events.push(self.finish(&r, done, session));
-                    self.previous = Some(r.handle);
+                    events.extend(self.finish(r, done, session));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -351,7 +387,7 @@ impl JobRunner {
                 return;
             };
             let planned = match &q.kind {
-                Kind::Analyze => plan_analyze(&mut session.mosaic).map(Planned::Analyze),
+                Kind::Analyze => Ok(Planned::Resolve(Box::new(session.mosaic.clone()))),
                 Kind::Blend { group, rect } => {
                     plan_blend(&session.mosaic, group, *rect).map(Planned::Blend)
                 }
@@ -372,7 +408,16 @@ impl JobRunner {
         let token = CancelToken::new();
         let blend = match &planned {
             Planned::Blend(plan) => Some(plan.clone()),
-            Planned::Analyze(_) => None,
+            Planned::Analyze(_) | Planned::Resolve(_) => None,
+        };
+        let resolving = match &planned {
+            Planned::Resolve(m) => Some(GroupInputs::of(m)),
+            Planned::Analyze(_) | Planned::Blend(_) => None,
+        };
+        let stage = if resolving.is_some() {
+            RESOLVING
+        } else {
+            "Starting…"
         };
         let worker_token = token.clone();
         let ctx = self.ctx.clone();
@@ -405,6 +450,7 @@ impl JobRunner {
                     };
                     let ctl = JobCtl::new(worker_token, Some(&observer));
                     match &planned {
+                        Planned::Resolve(m) => Done::Resolved(m.groups()),
                         Planned::Analyze(plan) => {
                             let (outcome, result) = run_analyze(plan, &ctl);
                             let canvas = ReferenceFrame::load(&plan.frame_path)
@@ -432,7 +478,8 @@ impl JobRunner {
                     rx,
                     handle,
                     blend,
-                    stage: "Starting…".into(),
+                    resolving,
+                    stage: stage.into(),
                     done: 0,
                     total: 0,
                 });
@@ -444,12 +491,40 @@ impl JobRunner {
         }
     }
 
-    /// Apply (or discard) a finished worker's outcome on the UI thread.
-    fn finish(&self, r: &Running, done: Done, session: &mut OpenSession) -> JobEvent {
+    /// Apply (or discard) a finished worker's outcome on the UI thread; an
+    /// analysis's resolved groups start its next phase (no event yet).
+    fn finish(&mut self, r: Running, done: Done, session: &mut OpenSession) -> Option<JobEvent> {
+        self.previous = Some(r.handle);
         let id = r.id;
         let name = self.name(id).to_string();
         let failed = |message: String| JobEvent::Failed { id, message };
-        match (done, &r.blend) {
+        if let Done::Resolved(resolved) = done {
+            let groups = match resolved {
+                Ok(g) => g,
+                Err(e) => return Some(failed(format!("{name}: {}", describe(&e)))),
+            };
+            let current = GroupInputs::of(&session.mosaic);
+            let fresh = r.resolving.as_ref() == Some(&current);
+            if fresh {
+                session.groups = Some(groups.clone());
+            }
+            if r.token.is_cancelled() {
+                return Some(JobEvent::Cancelled { id });
+            }
+            // Panels or grouping changed meanwhile: resolve again.
+            let planned = if fresh {
+                match plan_analyze_with(&mut session.mosaic, groups) {
+                    Ok(plan) => Planned::Analyze(plan),
+                    Err(e) => return Some(failed(format!("{name}: {}", describe(&e)))),
+                }
+            } else {
+                Planned::Resolve(Box::new(session.mosaic.clone()))
+            };
+            self.spawn(id, planned);
+            return None;
+        }
+        Some(match (done, &r.blend) {
+            (Done::Resolved(_), _) => unreachable!("handled above"),
             (
                 Done::Analyze {
                     outcome,
@@ -484,7 +559,7 @@ impl JobRunner {
                 }
             }
             (Done::Blend(_), None) => unreachable!("a blend outcome always has its plan"),
-        }
+        })
     }
 }
 
@@ -662,11 +737,29 @@ mod tests {
         assert_eq!(actions(&s), ["analyze"]);
         assert_eq!(MosaicConfig::load(&s.mosaic.dir).unwrap(), s.mosaic.config);
 
-        // A cancelled analysis keeps every unfinished group refused.
+        // Cancelled while resolving groups: nothing was planned or changed.
+        let config = s.mosaic.config.clone();
         let gate = r.hold();
         let id = r.start_analyze(&mut s);
         r.cancel(id);
         gate.open();
+        assert_eq!(drain(&mut r, &mut s), vec![JobEvent::Cancelled { id }]);
+        assert_eq!(s.mosaic.config, config);
+
+        // Cancelled once analysing: every unfinished group stays refused.
+        let resolve = r.hold();
+        let id = r.start_analyze(&mut s);
+        let analyze = r.hold();
+        resolve.open();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while r.views()[0].stage == "Resolving groups…" {
+            assert!(Instant::now() < deadline, "resolution never finished");
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(r.poll(&mut s).is_empty());
+        }
+        assert_eq!(s.mosaic.config.needs_analyze.len(), 2, "planned");
+        r.cancel(id);
+        analyze.open();
         assert_eq!(drain(&mut r, &mut s), vec![JobEvent::Cancelled { id }]);
         assert_eq!(s.mosaic.config.needs_analyze.len(), 2);
         assert_eq!(MosaicConfig::load(&s.mosaic.dir).unwrap(), s.mosaic.config);
@@ -809,6 +902,42 @@ mod tests {
                 JobEvent::Cancelled { id: first },
             ]
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn analysis_resolves_groups_on_a_worker() {
+        let root = temp_dir("job-resolve");
+        let mut s = two_group_session(&root);
+        let before = std::fs::read(s.mosaic.dir.join("mosaic.json")).unwrap();
+        let mut r = runner();
+        let gate = r.hold();
+        let id = r.start_analyze(&mut s);
+        assert_eq!(r.views()[0].stage, "Resolving groups…");
+        // Nothing planned (or saved) on the UI thread before resolution.
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_eq!(
+            std::fs::read(s.mosaic.dir.join("mosaic.json")).unwrap(),
+            before
+        );
+        // The panels' grouping changes while the worker resolves...
+        for p in s.mosaic.config.panels.iter_mut().take(4) {
+            p.manual_group = Some("Red".into());
+        }
+        gate.open();
+        assert_eq!(
+            drain(&mut r, &mut s),
+            vec![JobEvent::Finished {
+                id,
+                label: "Analyze".into()
+            }]
+        );
+        // ...so it resolved again, and analysed the current groups.
+        let names: Vec<&String> = s.mosaic.config.group_dirs.keys().collect();
+        assert_eq!(names, ["OIII", "Red"]);
+        let cached = s.groups.as_ref().unwrap();
+        assert_eq!(cached.groups.keys().collect::<Vec<_>>(), ["OIII", "Red"]);
+        assert_eq!(s.group_count(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -245,6 +245,15 @@ pub struct AnalyzeOutcome {
 /// changed (in memory or on disk) and the busy error is returned.
 pub fn plan_analyze(m: &mut Mosaic) -> Result<AnalyzePlan> {
     let resolved = m.groups()?;
+    plan_analyze_with(m, resolved)
+}
+
+/// [`plan_analyze`] with the groups already resolved (by
+/// [`Mosaic::groups`], possibly on another thread over a copy of the
+/// mosaic): no panel is read, so this is bookkeeping only — suitable for an
+/// owner thread that must not do file reads proportional to the panel
+/// count. `resolved` must come from the current panels and grouping.
+pub fn plan_analyze_with(m: &mut Mosaic, resolved: Groups) -> Result<AnalyzePlan> {
     let mut next = m.clone();
     next.assign_group_dirs(&resolved);
     let groups: Vec<AnalyzeGroup> = resolved
@@ -388,7 +397,9 @@ pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<Ble
 }
 
 /// Run a planned blend (any thread; no [`Mosaic`] needed); returns the
-/// tile-aligned rect blended (see [`blend_tiles`]).
+/// tile-aligned rect blended (see [`blend_tiles`]). Once blending has
+/// started, the store is flushed before returning on every path (success,
+/// error or cancellation).
 ///
 /// Loads the group's session, overlap graph, photometry and (when present)
 /// residual surfaces, as `mmm blend` does. An existing result store is
@@ -431,7 +442,7 @@ pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
         Some(s) => s,
         None => TileStore::create(path, geometry)?,
     };
-    let aligned = blend_tiles(
+    let blended = blend_tiles(
         &session,
         &phot,
         surfaces.as_ref(),
@@ -440,8 +451,13 @@ pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
         plan.rect,
         &mut store,
         ctl,
-    )?;
-    store.flush()?;
+    );
+    // Flush here on the worker whatever happened (success, error, cancel),
+    // so the tiles written so far never wait for write-back on the owner
+    // thread (whose invalidation flushes only the state table).
+    let flushed = store.flush();
+    let aligned = blended?;
+    flushed?;
     Ok(aligned)
 }
 
@@ -512,11 +528,13 @@ fn lock_stores(paths: &[PathBuf]) -> Result<Vec<TileStore>> {
     Ok(out)
 }
 
-/// Mark every tile of every store invalid and flush.
+/// Mark every tile of every store invalid and flush the state tables only
+/// (never a whole-mapping flush: this runs on the owner — UI — thread, and
+/// writers flush their own tile data, see [`run_blend`]).
 fn invalidate(stores: &mut [TileStore]) -> Result<()> {
     for s in stores {
         s.invalidate_all();
-        s.flush()?;
+        s.flush_state()?;
     }
     Ok(())
 }
@@ -620,4 +638,31 @@ pub fn set_group_override(m: &mut Mosaic, group: &str, o: GroupOverride) -> Resu
     next.save(&m.dir)?;
     m.config = next;
     Ok(impact)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalidate_flushes_only_the_state_table() {
+        let d = std::env::temp_dir().join(format!("mmm-run-invalidate-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let g = TileGeometry {
+            width: 600,
+            height: 420,
+            channels: 3,
+            tile: TILE,
+        };
+        let mut store = TileStore::create(&d.join(RESULT_FILE), g).unwrap();
+        let n = (g.channels * g.tile * g.tile) as usize;
+        store.write_tile(0, 0, 0, &vec![1.0; n]).unwrap();
+        let mut stores = vec![store];
+        invalidate(&mut stores).unwrap();
+        assert_eq!(stores[0].valid_count(0), 0);
+        // No whole-mapping msync: only the state table is written back.
+        assert_eq!(stores[0].full_flushes(), 0);
+        drop(stores);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

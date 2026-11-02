@@ -10,8 +10,9 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
-    analyze_all, blend_group, invalidate_group, plan_analyze, plan_blend, run_analyze, run_blend,
-    set_analyze_settings, set_blend_settings, set_group_override, set_settings,
+    analyze_all, blend_group, invalidate_group, plan_analyze, plan_analyze_with, plan_blend,
+    run_analyze, run_blend, set_analyze_settings, set_blend_settings, set_group_override,
+    set_settings,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -935,4 +936,18 @@ fn invalidate_group_stales_only_that_group() {
     assert_eq!(valid0(&m.result_path("Ha")), 0);
     assert_eq!(valid0(&m.result_path("OIII")), oiii_valid);
     assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+}
+
+#[test]
+fn plan_analyze_with_uses_given_groups() {
+    let tmp = TempDir::new("planwith");
+    let mut a = two_group_mosaic(&tmp.0);
+    let mut b = a.clone();
+    let resolved = b.groups().unwrap();
+    // Resolution (header reads) can happen elsewhere; the plan is the same.
+    let with = plan_analyze_with(&mut b, resolved.clone()).unwrap();
+    let plain = plan_analyze(&mut a).unwrap();
+    assert_eq!(with, plain);
+    assert_eq!(with.resolved, resolved);
+    assert_eq!(a.config, b.config);
 }

@@ -876,7 +876,12 @@ below is UI-agnostic and the CLI is its first consumer.
   blend settings changed or it was marked `needs_analyze`. A blend that is
   never applied (cancelled or failed) carries no such guarantee, so the app
   invalidates the group's store (`invalidate_group`, busy-aware) when it
-  discards one whose settings were superseded. The app cancels and joins a
+  discards one whose settings were superseded. Invalidation flushes only
+  the store's state table (`TileStore::flush_state`); `run_blend` flushes
+  the whole store on its worker on every exit path, so the owner thread
+  never waits on tile write-back. `plan_analyze_with` plans from groups
+  resolved elsewhere (the app resolves them, reading panel headers, on a
+  worker over a copy of the mosaic). The app cancels and joins a
   running job before applying settings; busy refusal and the apply guards
   are the core's backstop.
 - **Checks** (`checks`). Input checks (solution present, distortion model,

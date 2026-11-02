@@ -229,7 +229,7 @@ impl Shell {
                 ui,
                 &views,
                 session.canvas,
-                session.mosaic.config.group_dirs.len(),
+                session.group_count(),
                 self.sys.latest(),
             );
         });
@@ -648,7 +648,7 @@ mod tests {
         h.step();
         step_until(&mut h, |s| s.session().is_some());
         h.get_by_label("Ready");
-        h.get_by_label("0 groups");
+        h.get_by_label("2 groups");
         h.get_by_label("Analyze").click();
         h.step();
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());

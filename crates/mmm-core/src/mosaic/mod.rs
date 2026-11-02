@@ -42,8 +42,8 @@ mod run;
 
 pub use run::{
     AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, BlendPlan, Mosaic, analyze_all, blend_group,
-    invalidate_group, plan_analyze, plan_blend, run_analyze, run_blend, set_analyze_settings,
-    set_blend_settings, set_group_override, set_settings,
+    invalidate_group, plan_analyze, plan_analyze_with, plan_blend, run_analyze, run_blend,
+    set_analyze_settings, set_blend_settings, set_group_override, set_settings,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

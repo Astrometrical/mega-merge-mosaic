@@ -78,8 +78,10 @@ pub(crate) fn two_group_session(root: &Path) -> OpenSession {
         },
     };
     let mosaic = Mosaic::create(&root.join("m.mmm-session"), cfg).unwrap();
+    let groups = mosaic.groups().ok();
     OpenSession {
         mosaic,
         canvas: None,
+        groups,
     }
 }
