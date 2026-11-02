@@ -92,6 +92,23 @@ impl AnalyzeSettings {
     }
 }
 
+/// (De)serialiser keeping `Some(None)` (explicit null) distinct from `None`
+/// (absent): absent -> `None`, null -> `Some(None)`, value -> `Some(Some(v))`.
+mod double_option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Option<u32>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(inner) => inner.serialize(s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<u32>>, D::Error> {
+        Option::<u32>::deserialize(d).map(Some)
+    }
+}
+
 /// Per-group override of [`AnalyzeSettings`]; unset fields inherit.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct AnalyzeOverride {
@@ -99,7 +116,11 @@ pub struct AnalyzeOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<InputSelect>,
     /// Override for [`AnalyzeSettings::surface`] (outer `Some` = set).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
     pub surface: Option<Option<u32>>,
     /// Override for [`AnalyzeSettings::gain`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,7 +140,11 @@ pub struct BlendOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defect_veto: Option<bool>,
     /// Override for [`BlendSettings::flatten`] (outer `Some` = set).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
     pub flatten: Option<Option<u32>>,
 }
 
@@ -196,7 +221,7 @@ mod tests {
             gain: GainMode::Unity,
         };
         let s = serde_json::to_string(&a).unwrap();
-        assert!(s.contains("\"solved\"") && s.contains("null") && s.contains("\"unity\""));
+        assert_eq!(s, r#"{"input":"solved","surface":null,"gain":"unity"}"#);
         assert_eq!(serde_json::from_str::<AnalyzeSettings>(&s).unwrap(), a);
         assert_eq!(
             serde_json::to_string(&BlendMode::TwoBand).unwrap(),
@@ -225,6 +250,30 @@ mod tests {
         });
         assert_eq!(a.surface, None);
         assert_eq!(a.gain, GainMode::Fit);
+    }
+
+    #[test]
+    fn populated_overrides_roundtrip() {
+        for surface in [None, Some(None), Some(Some(1))] {
+            let o = AnalyzeOverride {
+                surface,
+                ..Default::default()
+            };
+            let s = serde_json::to_string(&o).unwrap();
+            assert_eq!(
+                serde_json::from_str::<AnalyzeOverride>(&s).unwrap(),
+                o,
+                "{s}"
+            );
+        }
+        for flatten in [None, Some(None), Some(Some(1))] {
+            let o = BlendOverride {
+                flatten,
+                ..Default::default()
+            };
+            let s = serde_json::to_string(&o).unwrap();
+            assert_eq!(serde_json::from_str::<BlendOverride>(&s).unwrap(), o, "{s}");
+        }
     }
 
     #[test]
