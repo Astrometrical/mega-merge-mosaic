@@ -10,7 +10,8 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
-    analyze_all, blend_group, set_analyze_settings, set_blend_settings, set_group_override,
+    analyze_all, blend_group, plan_analyze, plan_blend, run_analyze, run_blend,
+    set_analyze_settings, set_blend_settings, set_group_override, set_settings,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -101,6 +102,11 @@ fn filter_group(root: &Path, filter: &str, seed: u64) -> Vec<PathBuf> {
 fn two_group_mosaic(root: &Path) -> Mosaic {
     let mut paths = filter_group(root, "Ha", 7);
     paths.extend(filter_group(root, "OIII", 11));
+    grouped_mosaic(&root.join("m"), paths)
+}
+
+/// A mosaic in `dir` over `paths`, grouped by the `FILTER` header.
+fn grouped_mosaic(dir: &Path, paths: Vec<PathBuf>) -> Mosaic {
     let mut cfg = MosaicConfig::new(paths);
     cfg.grouping = Grouping {
         enabled: true,
@@ -108,7 +114,7 @@ fn two_group_mosaic(root: &Path) -> Mosaic {
             key: "FILTER".into(),
         },
     };
-    Mosaic::create(&root.join("m"), cfg).unwrap()
+    Mosaic::create(dir, cfg).unwrap()
 }
 
 struct MemSink {
@@ -593,4 +599,245 @@ fn invalid_feather_is_refused_and_not_persisted() {
     }
     assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
     Mosaic::open(&m.dir).unwrap();
+}
+
+#[test]
+fn plan_run_apply_matches_analyze_all() {
+    let tmp = TempDir::new("split");
+    let mut paths = filter_group(&tmp.0, "Ha", 7);
+    paths.extend(filter_group(&tmp.0, "OIII", 11));
+    let mut a = grouped_mosaic(&tmp.0.join("a"), paths.clone());
+    let mut b = grouped_mosaic(&tmp.0.join("b"), paths);
+
+    let groups = analyze_all(&mut a, &JobCtl::none()).unwrap();
+
+    let plan = plan_analyze(&mut b).unwrap();
+    assert_eq!(plan.resolved, groups);
+    let saved = MosaicConfig::load(&b.dir).unwrap();
+    assert_eq!(
+        saved.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Ha", "OIII"],
+        "plan marks every group before the run"
+    );
+    let (outcome, res) = run_analyze(&plan, &JobCtl::none());
+    res.unwrap();
+    assert_eq!(outcome.completed, ["Ha", "OIII"]);
+    b.apply_analyze(&outcome).unwrap();
+
+    // Same configuration apart from the provenance timestamps.
+    let strip = |m: &Mosaic| {
+        let mut c = MosaicConfig::load(&m.dir).unwrap();
+        assert_eq!(c, m.config);
+        for p in &mut c.provenance {
+            p.unix_ms = 0;
+        }
+        c
+    };
+    assert_eq!(strip(&a), strip(&b));
+    assert!(b.config.needs_analyze.is_empty());
+    assert!(b.config.panels.iter().all(|p| p.fingerprint.is_some()));
+    for f in [
+        FRAME_FILE,
+        "groups/Ha/analysis/photometry.json",
+        "groups/OIII/analysis/photometry.json",
+    ] {
+        assert_eq!(
+            std::fs::read(a.dir.join(f)).unwrap(),
+            std::fs::read(b.dir.join(f)).unwrap(),
+            "{f}"
+        );
+    }
+
+    // The blend split matches blend_group too.
+    let ra = blend_group(&mut a, "Ha", None, &JobCtl::none()).unwrap();
+    let bp = plan_blend(&b, "Ha", None).unwrap();
+    let rb = run_blend(&bp, &JobCtl::none()).unwrap();
+    b.apply_blend(&bp, rb).unwrap();
+    assert_eq!(ra, rb);
+    assert_eq!(strip(&a), strip(&b));
+    assert_fully_valid(&b.result_path("Ha"));
+}
+
+#[test]
+fn cancelled_run_marks_all_unfinished_groups() {
+    let tmp = TempDir::new("runcancel");
+    let mut m = two_group_mosaic(&tmp.0);
+    for (cancel_at, done) in [("Ha: ", &[][..]), ("OIII: ", &["Ha"][..])] {
+        let plan = plan_analyze(&mut m).unwrap();
+        let token = CancelToken::new();
+        let obs = |s: &str, _: u64, _: u64| {
+            if s.starts_with(cancel_at) {
+                token.cancel();
+            }
+        };
+        let ctl = JobCtl::new(token.clone(), Some(&obs));
+        let (outcome, res) = run_analyze(&plan, &ctl);
+        assert!(res.unwrap_err().is_cancelled());
+        assert_eq!(outcome.completed, done);
+        assert!(outcome.provenance.is_empty());
+        m.apply_analyze(&outcome).unwrap();
+
+        let saved = MosaicConfig::load(&m.dir).unwrap();
+        assert_eq!(saved, m.config);
+        assert!(saved.provenance.is_empty());
+        for g in ["Ha", "OIII"] {
+            let finished = done.contains(&g);
+            assert_eq!(!finished, saved.needs_analyze.contains(g), "{g}");
+            match plan_blend(&m, g, None) {
+                Ok(_) => assert!(finished, "{g} must be refused"),
+                Err(e) => {
+                    assert!(!finished, "{g}: {e}");
+                    assert!(e.to_string().contains("analyze first"), "{e}");
+                }
+            }
+        }
+        // Only the finished groups' panels got fingerprints.
+        for p in &saved.panels {
+            let ha = p
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("Ha_");
+            assert_eq!(p.fingerprint.is_some(), ha && done.contains(&"Ha"));
+        }
+    }
+}
+
+#[test]
+fn run_blend_without_mosaic_borrow() {
+    fn job_plan<T: Clone + Send + 'static>() {}
+    job_plan::<mmm_core::mosaic::AnalyzePlan>();
+    job_plan::<mmm_core::mosaic::BlendPlan>();
+    let tmp = TempDir::new("runblend");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let plan = plan_blend(&m, "Ha", Some([0, 0, 300, 300])).unwrap();
+    let worker_plan = plan.clone();
+    let worker = std::thread::spawn(move || run_blend(&worker_plan, &JobCtl::none()));
+    // The owner thread keeps using the mosaic while the job runs.
+    let groups = m.groups().unwrap();
+    assert_eq!(groups.groups.len(), 2);
+    assert!(m.config.needs_analyze.is_empty());
+    let rect = worker.join().unwrap().unwrap();
+    assert_eq!(rect, [0, 0, 512, 420]);
+    m.apply_blend(&plan, rect).unwrap();
+    let cfg = MosaicConfig::load(&m.dir).unwrap();
+    let last = cfg.provenance.last().unwrap();
+    assert_eq!(last.action, "blend");
+    assert_eq!(last.detail["rect"], serde_json::json!([0, 0, 512, 420]));
+    assert!(valid0(&m.result_path("Ha")) > 0);
+}
+
+#[test]
+fn set_while_blend_holds_store_is_busy() {
+    let tmp = TempDir::new("busy");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let cfg = m.config.clone();
+    let oiii_valid = valid0(&m.result_path("OIII"));
+
+    // A running blend holds Ha's store.
+    let held = TileStore::open(&m.result_path("Ha")).unwrap();
+    let blend = BlendSettings {
+        feather_px: m.config.blend.feather_px + 10.0,
+        ..m.config.blend.clone()
+    };
+    let mut analyze = m.config.analyze.clone();
+    analyze.surface = Some(1);
+    let o = GroupOverride {
+        blend: BlendOverride {
+            mode: Some(BlendMode::Feather),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let errs = [
+        set_blend_settings(&mut m, blend.clone()).unwrap_err(),
+        set_analyze_settings(&mut m, analyze.clone()).unwrap_err(),
+        set_group_override(&mut m, "Ha", o.clone()).unwrap_err(),
+        set_settings(&mut m, analyze.clone(), blend.clone()).unwrap_err(),
+        plan_analyze(&mut m).unwrap_err(),
+    ];
+    for e in &errs {
+        assert!(e.is_busy(), "{e}");
+    }
+    assert_eq!(m.config, cfg, "in-memory config unchanged");
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+    // Nothing was invalidated, not even the stores that were free.
+    let (nx, ny) = held.geometry().tiles(0);
+    assert_eq!(held.valid_count(0), (nx * ny) as usize);
+    assert_eq!(valid0(&m.result_path("OIII")), oiii_valid);
+    // An edit that touches only the free store goes through.
+    assert_eq!(
+        set_group_override(&mut m, "OIII", o).unwrap(),
+        ChangeImpact::Reblend
+    );
+    assert_eq!(valid0(&m.result_path("OIII")), 0);
+    drop(held);
+    assert!(valid0(&m.result_path("Ha")) > 0);
+    assert_eq!(
+        set_blend_settings(&mut m, blend).unwrap(),
+        ChangeImpact::Reblend
+    );
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+}
+
+#[test]
+fn set_settings_is_one_save() {
+    let tmp = TempDir::new("setboth");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+
+    let (a0, b0) = (m.config.analyze.clone(), m.config.blend.clone());
+    assert_eq!(
+        set_settings(&mut m, a0.clone(), b0.clone()).unwrap(),
+        ChangeImpact::None
+    );
+    assert!(valid0(&m.result_path("Ha")) > 0);
+
+    let b1 = BlendSettings {
+        feather_px: b0.feather_px + 10.0,
+        ..b0.clone()
+    };
+    assert_eq!(
+        set_settings(&mut m, a0.clone(), b1.clone()).unwrap(),
+        ChangeImpact::Reblend
+    );
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert!(m.config.needs_analyze.is_empty());
+
+    // A failing blend validation leaves the analyze settings unchanged too.
+    let mut a1 = a0.clone();
+    a1.surface = Some(1);
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let bad = BlendSettings {
+        feather_px: f32::NAN,
+        ..b1.clone()
+    };
+    let err = set_settings(&mut m, a1.clone(), bad).unwrap_err();
+    assert!(err.to_string().contains("feather"), "{err}");
+    assert_eq!(m.config.analyze, a0);
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+
+    // Both change: the impact is the larger, and both land in one save.
+    let b2 = BlendSettings {
+        mode: BlendMode::Feather,
+        ..b1
+    };
+    assert_eq!(
+        set_settings(&mut m, a1.clone(), b2.clone()).unwrap(),
+        ChangeImpact::Reanalyze
+    );
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!((saved.analyze, saved.blend), (a1, b2));
+    assert_eq!(
+        saved.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Ha", "OIII"]
+    );
 }

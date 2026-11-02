@@ -52,8 +52,10 @@
 //! - [`mosaic`] — the mosaic project: `mosaic.json` configuration, panel
 //!   grouping rules and the on-disk session layout; [`mosaic::Mosaic`] with
 //!   [`mosaic::analyze_all`] (every group onto one shared reference frame)
-//!   and [`mosaic::blend_group`] (a group into its tiled result), plus
-//!   settings edits that stale exactly the affected result stores.
+//!   and [`mosaic::blend_group`] (a group into its tiled result), each split
+//!   into plan / run / apply for background jobs ([`mosaic::plan_analyze`],
+//!   [`mosaic::run_blend`], ...), plus busy-aware settings edits
+//!   ([`mosaic::set_settings`]) that stale exactly the affected result stores.
 //! - [`checks`] — structured input, file and analysis checks (severity, code,
 //!   affected groups, remedy) and the accepted-warning bookkeeping, as data
 //!   for a UI or `mmm check`.

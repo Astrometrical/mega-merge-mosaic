@@ -14,6 +14,7 @@ use mmm_core::reference::ReferenceFrame;
 use mmm_core::synth::{
     SynthSpec, SynthWcs, generate, write_xisf_solved, write_xisf_with_header_xml,
 };
+use mmm_core::tiles::{TILE, TileGeometry, TileStore};
 
 const S: f64 = 1.0e-3;
 const STAR: [f64; 2] = [66.0, 18.0];
@@ -492,6 +493,51 @@ fn set_group_override_persists() {
     assert_eq!(cfg2.blend.mode, BlendMode::Pyramid);
     assert_eq!(cfg2.analyze, cfg.analyze);
     assert_eq!(cfg2.group_overrides, cfg.group_overrides);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn set_mosaic_wide_is_atomic() {
+    let dir = tempdir("set-atomic");
+    let a = write_group(&dir.join("A"), "a", (0.0, 0.0), 150);
+    let m = dir.join("m");
+    run(mmm().arg("init").args(&a).arg("-s").arg(&m));
+    // A blend in progress holds a group's result store.
+    let group = m.join("groups").join("mosaic");
+    std::fs::create_dir_all(&group).unwrap();
+    let g = TileGeometry {
+        width: 64,
+        height: 64,
+        channels: 1,
+        tile: TILE,
+    };
+    let held = TileStore::create(&group.join("result.mmmt"), g).unwrap();
+    let before = std::fs::read_to_string(m.join("mosaic.json")).unwrap();
+    let set_both = || {
+        let mut c = mmm();
+        c.arg("set")
+            .arg("-s")
+            .arg(&m)
+            .arg("--surface")
+            .arg("1")
+            .arg("--feather")
+            .arg("100");
+        c
+    };
+    let err = run_fail(&mut set_both());
+    assert!(err.contains("in use"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(m.join("mosaic.json")).unwrap(),
+        before,
+        "neither half of the edit is saved"
+    );
+
+    drop(held);
+    let out = run(&mut set_both());
+    assert!(out.contains("reanalyze"), "{out}");
+    let cfg = MosaicConfig::load(&m).unwrap();
+    assert_eq!(cfg.analyze.surface, Some(1));
+    assert_eq!(cfg.blend.feather_px, 100.0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

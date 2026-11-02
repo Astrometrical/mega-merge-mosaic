@@ -842,12 +842,18 @@ below is UI-agnostic and the CLI is its first consumer.
   processing group), persisted `group_dirs`, `needs_analyze`, `Mosaic` with
   `analyze_all` (every group onto one shared reference frame, the existing
   shared-frame machinery) and `blend_group` (a group into its tile store),
-  and `set_analyze_settings` / `set_blend_settings` / `set_group_override`,
-  which invalidate exactly the affected stores. `analyze_all` marks each
-  group in `needs_analyze` (saved) and invalidates its store before
-  re-analysing it, clearing the mark on success: a re-analysis stales the
-  old tiles, and an interrupted one leaves that group refused by
-  `blend_group` rather than half-replaced. `BlendSettings::validate`
+  and `set_settings` (analyze + blend in one validation, invalidation pass
+  and save) / `set_analyze_settings` / `set_blend_settings` /
+  `set_group_override`, which invalidate exactly the affected stores. Jobs
+  are split from the configuration: `plan_analyze` / `plan_blend` take a
+  self-contained `Send` plan from the `Mosaic`, `run_analyze` /
+  `run_blend` run it with no `Mosaic`, and `Mosaic::apply_analyze` /
+  `apply_blend` record the outcome; `analyze_all` and `blend_group` compose
+  the three. `plan_analyze` marks every group in `needs_analyze` (saved) and
+  invalidates its store; `apply_analyze` clears the mark of each group the
+  run completed: a re-analysis stales the old tiles, and an interrupted one
+  leaves every unfinished group refused by `plan_blend` rather than
+  half-replaced. `BlendSettings::validate`
   (finite feather > 0) guards every settings edit and `MosaicConfig::save`,
   so `mosaic.json` never holds a value JSON cannot represent; settings
   structs default missing fields so older files keep loading.
@@ -858,11 +864,13 @@ below is UI-agnostic and the CLI is its first consumer.
   take no lock.
   Readers must close before a store is recreated (`TileStore::create`
   truncates under their mapping); a matching store is reopened, never
-  recreated. Callers must cancel and join a running blend or analyze before
-  calling any `set_*`: a `set_*` while a blend writes leaves the tiles it
-  then writes valid under the new settings, i.e. stale tiles marked valid.
-  The job holding `&mut Mosaic` saves the configuration, so the app must
-  not edit a clone of it concurrently (the later save wins).
+  recreated. Plan on the owner thread, run on a worker with no `Mosaic`,
+  apply on the owner thread (only the owner saves `mosaic.json`). Every
+  `set_*` (and `plan_analyze`) locks every store it would invalidate before
+  changing anything and returns `Error::Busy` with nothing changed while a
+  writer holds one, so a running blend can never leave tiles blended with
+  superseded settings marked valid. The app cancels and joins a running
+  job before applying settings; busy is the core's backstop.
 - **Checks** (`checks`). Input checks (solution present, distortion model,
   scale mismatch, mixed channels, group count mismatch, filters differ
   ungrouped, ungrouped panels), file checks (changed or missing since added,

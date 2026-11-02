@@ -12,7 +12,7 @@ use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
     CONFIG_FILE, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, analyze_all,
-    is_mosaic_dir, set_analyze_settings, set_blend_settings, set_group_override,
+    is_mosaic_dir, set_group_override, set_settings,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::session::Session;
@@ -319,9 +319,10 @@ pub(crate) fn set(a: &SetArgs) -> anyhow::Result<()> {
         None => {
             let analyze = m.config.analyze.with(&edit.analyze);
             let blend = m.config.blend.with(&edit.blend);
-            let ia = set_analyze_settings(&mut m, analyze)?;
-            let ib = set_blend_settings(&mut m, blend)?;
-            ("mosaic-wide".to_string(), ia.max(ib))
+            (
+                "mosaic-wide".to_string(),
+                set_settings(&mut m, analyze, blend)?,
+            )
         }
     };
     let what = match impact {

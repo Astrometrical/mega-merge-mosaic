@@ -2,6 +2,13 @@
 //! reference frame, blend a group into its tiled result store, and apply
 //! settings edits, staling exactly the result stores they affect.
 //!
+//! Each job is split in three: a *plan* taken from the [`Mosaic`] on the
+//! owner thread ([`plan_analyze`], [`plan_blend`]), a *run* on any thread
+//! that needs only the plan ([`run_analyze`], [`run_blend`]), and an *apply*
+//! back on the owner thread that records the outcome in the configuration
+//! ([`Mosaic::apply_analyze`], [`Mosaic::apply_blend`]). [`analyze_all`]
+//! and [`blend_group`] compose the three.
+//!
 //! On-disk layout of a mosaic directory:
 //!
 //! ```text
@@ -16,8 +23,11 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 
 use super::grouping::{Groups, allocate_group_dir, header_value, resolve_groups};
-use super::{FRAME_FILE, GROUPS_DIR, GroupRule, MosaicConfig, RESULT_FILE, fingerprint};
-use crate::analyze::analyze_ctl;
+use super::{
+    FRAME_FILE, Fingerprint, GROUPS_DIR, GroupRule, MosaicConfig, ProvenanceEntry, RESULT_FILE,
+    fingerprint,
+};
+use crate::analyze::{InputSelect, analyze_ctl};
 use crate::error::{Error, Result};
 use crate::formats::InputPanel;
 use crate::job::JobCtl;
@@ -107,94 +117,226 @@ impl Mosaic {
         }
         added
     }
+
+    /// Record a finished (or partly finished) [`run_analyze`]: remove the
+    /// completed groups from [`MosaicConfig::needs_analyze`], record the
+    /// fingerprints of their panels, append the outcome's provenance, and
+    /// save. Groups that did not complete stay in `needs_analyze`, so
+    /// [`plan_blend`] keeps refusing them until the next analysis.
+    pub fn apply_analyze(&mut self, o: &AnalyzeOutcome) -> Result<()> {
+        let mut next = self.config.clone();
+        for group in &o.completed {
+            next.needs_analyze.remove(group);
+        }
+        for (path, fp) in &o.fingerprints {
+            for p in next.panels.iter_mut().filter(|p| &p.path == path) {
+                p.fingerprint = Some(fp.clone());
+            }
+        }
+        next.provenance.extend(o.provenance.iter().cloned());
+        next.save(&self.dir)?;
+        self.config = next;
+        Ok(())
+    }
+
+    /// Record a finished [`run_blend`] of `plan` that blended `rect` (the
+    /// aligned rect it returned): append a `"blend"` provenance entry
+    /// (group, rect, settings) and save.
+    pub fn apply_blend(&mut self, plan: &BlendPlan, rect: [u64; 4]) -> Result<()> {
+        let mut next = self.config.clone();
+        next.push_provenance(
+            "blend",
+            Some(&plan.group),
+            json!({ "group": plan.group, "rect": rect, "settings": plan.settings }),
+        );
+        next.save(&self.dir)?;
+        self.config = next;
+        Ok(())
+    }
 }
 
-/// Analyze every processing group onto one shared reference frame.
-///
-/// Resolves the groups, derives the reference frame over **all** panels
-/// (with the base [`AnalyzeSettings::input`]) and saves it to
-/// [`FRAME_FILE`], then analyzes each processing group into its session
-/// directory with the group's effective analyze settings. Progress stages
-/// are prefixed with the group name (`"Ha: analyze"`). Afterwards every
-/// panel's fingerprint is refreshed, an `"analyze"` provenance entry
-/// recording each group's resolved settings is appended, and the
-/// configuration is saved.
-///
-/// New groups get their directories recorded ([`Mosaic::assign_group_dirs`])
-/// and saved before any analysis runs. Before a group's analysis starts it
-/// is inserted into [`MosaicConfig::needs_analyze`] (and the configuration
-/// saved) and its result store, if any, is invalidated — its tiles were
-/// blended from the analysis being replaced. The group is removed from
-/// `needs_analyze` (and the configuration saved) as soon as its analysis
-/// succeeds. So a cancelled or failed run keeps the groups it finished,
-/// leaves the interrupted group refused by [`blend_group`] until the next
-/// `analyze_all`, and leaves groups it never reached untouched; it returns
-/// the error without adding provenance or refreshing fingerprints.
-pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
-    ctl.check()?;
-    let groups = m.groups()?;
-    if m.assign_group_dirs(&groups) {
-        m.save()?;
-    }
-    let all: Vec<PathBuf> = m.config.panels.iter().map(|p| p.path.clone()).collect();
-    let frame = reference::derive(&all, m.config.analyze.input)?;
-    frame.save(&m.dir.join(FRAME_FILE))?;
+/// One processing group of an [`AnalyzePlan`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnalyzeGroup {
+    /// The group name.
+    pub name: String,
+    /// The group's session directory (see [`Mosaic::group_session_dir`]).
+    pub session_dir: PathBuf,
+    /// The group's tiled result store (see [`Mosaic::result_path`]).
+    pub result_path: PathBuf,
+    /// The group's effective analyze settings.
+    pub settings: AnalyzeSettings,
+    /// The group's panels.
+    pub paths: Vec<PathBuf>,
+}
 
+/// Everything a background analysis needs, detached from the [`Mosaic`]
+/// (made by [`plan_analyze`], run by [`run_analyze`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnalyzePlan {
+    /// The mosaic directory.
+    pub dir: PathBuf,
+    /// Where the shared reference frame is saved ([`FRAME_FILE`]).
+    pub frame_path: PathBuf,
+    /// Every panel, in configuration order; the reference frame is derived
+    /// over all of them.
+    pub panels: Vec<PathBuf>,
+    /// Input interpretation for the reference frame (the base
+    /// [`AnalyzeSettings::input`]).
+    pub input: InputSelect,
+    /// The groups as resolved when planning.
+    pub resolved: Groups,
+    /// The processing groups to analyze, in order.
+    pub groups: Vec<AnalyzeGroup>,
+}
+
+/// What a [`run_analyze`] achieved, for [`Mosaic::apply_analyze`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AnalyzeOutcome {
+    /// Groups whose analysis finished, in order.
+    pub completed: Vec<String>,
+    /// Fingerprints of the completed groups' panels, taken after analysis.
+    pub fingerprints: Vec<(PathBuf, Fingerprint)>,
+    /// Provenance to append: one `"analyze"` entry recording each group's
+    /// resolved settings when every group finished; empty otherwise.
+    pub provenance: Vec<ProvenanceEntry>,
+}
+
+/// Plan an analysis of every processing group (owner thread).
+///
+/// Resolves the groups and records directories for new ones
+/// ([`Mosaic::assign_group_dirs`]). Every processing group is marked in
+/// [`MosaicConfig::needs_analyze`] and its result store, if any, is
+/// invalidated — its tiles were blended from the analysis being replaced —
+/// so an interrupted run leaves the groups it did not finish refused by
+/// [`plan_blend`]. Then the configuration is saved.
+///
+/// If any group's store is held by a writer ([`Error::Busy`]), nothing is
+/// changed (in memory or on disk) and the busy error is returned.
+pub fn plan_analyze(m: &mut Mosaic) -> Result<AnalyzePlan> {
+    let resolved = m.groups()?;
+    let mut next = m.clone();
+    next.assign_group_dirs(&resolved);
+    let groups: Vec<AnalyzeGroup> = resolved
+        .processing_groups()
+        .into_iter()
+        .map(|(name, paths)| AnalyzeGroup {
+            session_dir: next.group_session_dir(&name),
+            result_path: next.result_path(&name),
+            settings: next.config.settings_for(&name).0,
+            paths,
+            name,
+        })
+        .collect();
+    let paths: Vec<PathBuf> = groups.iter().map(|g| g.result_path.clone()).collect();
+    let mut stores = lock_stores(&paths)?;
+    next.config
+        .needs_analyze
+        .extend(groups.iter().map(|g| g.name.clone()));
+    invalidate(&mut stores)?;
+    next.save()?;
+    *m = next;
+    Ok(AnalyzePlan {
+        dir: m.dir.clone(),
+        frame_path: m.dir.join(FRAME_FILE),
+        panels: m.config.panels.iter().map(|p| p.path.clone()).collect(),
+        input: m.config.analyze.input,
+        resolved,
+        groups,
+    })
+}
+
+/// Run a planned analysis (any thread; no [`Mosaic`] needed).
+///
+/// Derives the reference frame over all panels and saves it, then analyzes
+/// each group into its session directory with its effective settings.
+/// Progress stages are prefixed with the group name (`"Ha: analyze"`).
+///
+/// Returns the outcome alongside the result: on cancellation or error the
+/// outcome lists the groups that finished before it (and no provenance), so
+/// [`Mosaic::apply_analyze`] keeps them.
+pub fn run_analyze(plan: &AnalyzePlan, ctl: &JobCtl) -> (AnalyzeOutcome, Result<()>) {
+    let mut out = AnalyzeOutcome::default();
+    let res = run_analyze_into(plan, ctl, &mut out);
+    (out, res)
+}
+
+fn run_analyze_into(plan: &AnalyzePlan, ctl: &JobCtl, out: &mut AnalyzeOutcome) -> Result<()> {
+    ctl.check()?;
+    let frame = reference::derive(&plan.panels, plan.input)?;
+    frame.save(&plan.frame_path)?;
     let mut detail = serde_json::Map::new();
-    for (group, paths) in groups.processing_groups() {
+    for g in &plan.groups {
         ctl.check()?;
-        let settings = m.config.settings_for(&group).0;
         let prefixed = |stage: &str, done: u64, total: u64| {
             // Cancellation is observed through the shared token below.
-            let _ = ctl.report(&format!("{group}: {stage}"), done, total);
+            let _ = ctl.report(&format!("{}: {stage}", g.name), done, total);
         };
         let group_ctl = JobCtl::new(ctl.cancel_token().clone(), Some(&prefixed));
-        // Mark the group before touching its analysis, so an interrupted
-        // run leaves it refused by `blend_group` rather than half-replaced;
-        // its tiles were blended from the analysis being replaced.
-        m.config.needs_analyze.insert(group.clone());
-        m.save()?;
-        invalidate_store(&m.result_path(&group))?;
-        let dir = m.group_session_dir(&group);
-        analyze_ctl(&paths, &dir, &settings, Some(&frame), &group_ctl)?;
-        m.config.needs_analyze.remove(&group);
-        m.save()?;
-        detail.insert(group.clone(), json!(settings));
+        analyze_ctl(
+            &g.paths,
+            &g.session_dir,
+            &g.settings,
+            Some(&frame),
+            &group_ctl,
+        )?;
+        let fps = g
+            .paths
+            .iter()
+            .map(|p| Ok((p.clone(), fingerprint(p)?)))
+            .collect::<Result<Vec<_>>>()?;
+        out.fingerprints.extend(fps);
+        out.completed.push(g.name.clone());
+        detail.insert(g.name.clone(), json!(g.settings));
     }
-
-    for p in &mut m.config.panels {
-        p.fingerprint = Some(fingerprint(&p.path)?);
-    }
-    m.config
-        .push_provenance("analyze", None, json!({ "groups": detail }));
-    m.save()?;
-    Ok(groups)
+    out.provenance.push(ProvenanceEntry::new(
+        "analyze",
+        None,
+        json!({ "groups": detail }),
+    ));
+    Ok(())
 }
 
-/// Blend `rect` (level-0 canvas coordinates; `None` = the whole canvas) of
-/// `group` into its tiled result store; returns the tile-aligned rect
-/// blended (see [`blend_tiles`]).
+/// Analyze every processing group onto one shared reference frame:
+/// [`plan_analyze`], [`run_analyze`] and [`Mosaic::apply_analyze`] in turn,
+/// on the calling thread. Returns the resolved groups.
 ///
-/// Loads the group's session, overlap graph, photometry and (when present)
-/// residual surfaces, as `mmm blend` does. The result store is opened if it
-/// exists with the canvas geometry; it is (re)created when missing,
-/// unreadable, or of a different geometry. Callers must not let that
-/// recreation happen while readers ([`crate::tiles::TileReader`]) still have
-/// the store mapped: recreating truncates the file under their mapping. An
-/// existing store of matching geometry is never recreated.
+/// A cancelled or failed run keeps the groups it finished, leaves every
+/// other group refused by [`blend_group`] until the next `analyze_all`, and
+/// returns the error without adding provenance.
+pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
+    ctl.check()?;
+    let plan = plan_analyze(m)?;
+    let (outcome, res) = run_analyze(&plan, ctl);
+    let applied = m.apply_analyze(&outcome);
+    res?;
+    applied?;
+    Ok(plan.resolved)
+}
+
+/// Everything a background blend of one group needs, detached from the
+/// [`Mosaic`] (made by [`plan_blend`], run by [`run_blend`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlendPlan {
+    /// The group name.
+    pub group: String,
+    /// The group's session directory.
+    pub session_dir: PathBuf,
+    /// The group's tiled result store.
+    pub result_path: PathBuf,
+    /// The group's effective blend settings.
+    pub settings: BlendSettings,
+    /// Level-0 canvas rect to blend; `None` = the whole canvas.
+    pub rect: Option<[u64; 4]>,
+}
+
+/// Plan a blend of `rect` (level-0 canvas coordinates; `None` = the whole
+/// canvas) of `group` (owner thread).
 ///
 /// Refuses (with [`Error::Compute`]) a group that has never been analyzed
-/// (no recorded directory) or whose analyze settings changed since its
-/// analysis ([`MosaicConfig::needs_analyze`]): run [`analyze_all`] first.
-///
-/// Appends a `"blend"` provenance entry (group, aligned rect, settings) and
-/// saves the configuration.
-pub fn blend_group(
-    m: &mut Mosaic,
-    group: &str,
-    rect: Option<[u64; 4]>,
-    ctl: &JobCtl,
-) -> Result<[u64; 4]> {
+/// (no recorded directory) or whose analysis is out of date
+/// ([`MosaicConfig::needs_analyze`]): run [`analyze_all`] first.
+pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<BlendPlan> {
     if !m.config.group_dirs.contains_key(group) {
         return Err(Error::compute(format!(
             "group '{group}' has not been analyzed yet — analyze first"
@@ -205,7 +347,28 @@ pub fn blend_group(
             "analyze settings for group '{group}' changed since it was analyzed — analyze first"
         )));
     }
-    let session = Session::open(&m.group_session_dir(group))?;
+    Ok(BlendPlan {
+        group: group.to_string(),
+        session_dir: m.group_session_dir(group),
+        result_path: m.result_path(group),
+        settings: m.config.settings_for(group).1,
+        rect,
+    })
+}
+
+/// Run a planned blend (any thread; no [`Mosaic`] needed); returns the
+/// tile-aligned rect blended (see [`blend_tiles`]).
+///
+/// Loads the group's session, overlap graph, photometry and (when present)
+/// residual surfaces, as `mmm blend` does. The result store is opened under
+/// its writer lock if it exists with the canvas geometry; it is (re)created
+/// when missing, unreadable, or of a different geometry. A store held by
+/// another writer fails with [`Error::Busy`]. Callers must not let the
+/// recreation happen while readers ([`crate::tiles::TileReader`]) still have
+/// the store mapped: recreating truncates the file under their mapping. An
+/// existing store of matching geometry is never recreated.
+pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
+    let session = Session::open(&plan.session_dir)?;
     let graph = OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = Photometry::load(&session.photometry_path())?;
     let surfaces = if session.surfaces_path().exists() {
@@ -220,34 +383,45 @@ pub fn blend_group(
         channels: channels as u32,
         tile: TILE,
     };
-    let path = m.result_path(group);
+    let path = &plan.result_path;
     // A mismatched or unreadable store is dropped (unmapped) before `create`
     // truncates the same file.
-    let existing = TileStore::open(&path)
-        .ok()
-        .filter(|s| s.geometry() == geometry);
+    let existing = match TileStore::open(path) {
+        Ok(s) => Some(s).filter(|s| s.geometry() == geometry),
+        Err(e) if e.is_busy() => return Err(e),
+        Err(_) => None,
+    };
     let mut store = match existing {
         Some(s) => s,
-        None => TileStore::create(&path, geometry)?,
+        None => TileStore::create(path, geometry)?,
     };
-    let settings = m.config.settings_for(group).1;
     let aligned = blend_tiles(
         &session,
         &phot,
         surfaces.as_ref(),
         &graph,
-        &settings,
-        rect,
+        &plan.settings,
+        plan.rect,
         &mut store,
         ctl,
     )?;
     store.flush()?;
-    m.config.push_provenance(
-        "blend",
-        Some(group),
-        json!({ "group": group, "rect": aligned, "settings": settings }),
-    );
-    m.save()?;
+    Ok(aligned)
+}
+
+/// Blend `rect` (level-0 canvas coordinates; `None` = the whole canvas) of
+/// `group` into its tiled result store: [`plan_blend`], [`run_blend`] and
+/// [`Mosaic::apply_blend`] in turn, on the calling thread. Returns the
+/// tile-aligned rect blended.
+pub fn blend_group(
+    m: &mut Mosaic,
+    group: &str,
+    rect: Option<[u64; 4]>,
+    ctl: &JobCtl,
+) -> Result<[u64; 4]> {
+    let plan = plan_blend(m, group, rect)?;
+    let aligned = run_blend(&plan, ctl)?;
+    m.apply_blend(&plan, aligned)?;
     Ok(aligned)
 }
 
@@ -272,58 +446,99 @@ fn all_result_stores(m: &Mosaic) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Mark every tile of the store at `path` invalid. A missing or unreadable
-/// store is skipped: [`blend_group`] recreates it before use anyway.
-fn invalidate_store(path: &Path) -> Result<()> {
-    if let Ok(mut store) = TileStore::open(path) {
-        store.invalidate_all();
-        store.flush()?;
+/// Open (taking the writer lock) every store in `paths`, for invalidation.
+/// A missing or unparseable store is skipped: [`run_blend`] recreates it
+/// before use anyway. A store held by another writer fails the whole call
+/// with [`Error::Busy`] (as does any other I/O error), with every lock taken
+/// so far released.
+fn lock_stores(paths: &[PathBuf]) -> Result<Vec<TileStore>> {
+    let mut out = Vec::new();
+    for p in paths {
+        match TileStore::open(p) {
+            Ok(s) => out.push(s),
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(Error::Format { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// Mark every tile of every store invalid and flush.
+fn invalidate(stores: &mut [TileStore]) -> Result<()> {
+    for s in stores {
+        s.invalidate_all();
+        s.flush()?;
     }
     Ok(())
 }
 
-fn invalidate_all_stores(m: &Mosaic) -> Result<()> {
-    for p in all_result_stores(m)? {
-        invalidate_store(&p)?;
+/// Every blend setting resolved from `base` (the base and each group's
+/// override) passes [`BlendSettings::validate`].
+fn validate_blend(cfg: &MosaicConfig, base: &BlendSettings) -> Result<()> {
+    base.validate()?;
+    for o in cfg.group_overrides.values() {
+        base.with(&o.blend).validate()?;
     }
     Ok(())
 }
 
-/// Replace the global blend settings. On [`ChangeImpact::Reblend`] every
-/// existing group result store is invalidated. Saves the configuration.
+/// Replace the global analyze and blend settings together: one validation,
+/// one invalidation pass and one save. Returns the larger of the two
+/// impacts.
 ///
-/// Settings failing [`BlendSettings::validate`] are refused with nothing
-/// changed (in memory or on disk).
-pub fn set_blend_settings(m: &mut Mosaic, new: BlendSettings) -> Result<ChangeImpact> {
-    new.validate()?;
-    for group in m.config.group_overrides.keys() {
-        new.with(&m.config.group_overrides[group].blend)
-            .validate()?;
+/// On any impact every existing group result store is invalidated; on
+/// [`ChangeImpact::Reanalyze`] every analyzed group (each with a recorded
+/// directory) is also marked in [`MosaicConfig::needs_analyze`], so
+/// [`blend_group`] refuses it until the next [`analyze_all`].
+///
+/// Refused with nothing changed (in memory or on disk) when any resolved
+/// blend settings fail [`BlendSettings::validate`], or — with
+/// [`Error::Busy`] — when any affected store is held by a writer.
+pub fn set_settings(
+    m: &mut Mosaic,
+    analyze: AnalyzeSettings,
+    blend: BlendSettings,
+) -> Result<ChangeImpact> {
+    validate_blend(&m.config, &blend)?;
+    let ia = analyze_change(&m.config.analyze, &analyze);
+    let impact = ia.max(blend_change(&m.config.blend, &blend));
+    let mut stores = match impact {
+        ChangeImpact::None => Vec::new(),
+        _ => lock_stores(&all_result_stores(m)?)?,
+    };
+    let mut next = m.config.clone();
+    next.analyze = analyze;
+    next.blend = blend;
+    if ia == ChangeImpact::Reanalyze {
+        next.needs_analyze.extend(next.group_dirs.keys().cloned());
     }
-    let impact = blend_change(&m.config.blend, &new);
-    m.config.blend = new;
-    if impact == ChangeImpact::Reblend {
-        invalidate_all_stores(m)?;
-    }
-    m.save()?;
+    invalidate(&mut stores)?;
+    next.save(&m.dir)?;
+    m.config = next;
     Ok(impact)
 }
 
-/// Replace the global analyze settings. On [`ChangeImpact::Reanalyze`]
-/// every existing group result store is invalidated and every analyzed
-/// group (each with a recorded directory) is marked in
-/// [`MosaicConfig::needs_analyze`], so [`blend_group`] refuses it until the
-/// next [`analyze_all`] reruns analysis. Saves the configuration.
+/// Replace the global blend settings ([`set_settings`] with the analyze
+/// settings unchanged). On [`ChangeImpact::Reblend`] every existing group
+/// result store is invalidated. Saves the configuration.
+///
+/// Refused with nothing changed (in memory or on disk) when settings fail
+/// [`BlendSettings::validate`] or a store is busy ([`Error::Busy`]).
+pub fn set_blend_settings(m: &mut Mosaic, new: BlendSettings) -> Result<ChangeImpact> {
+    let analyze = m.config.analyze.clone();
+    set_settings(m, analyze, new)
+}
+
+/// Replace the global analyze settings ([`set_settings`] with the blend
+/// settings unchanged). On [`ChangeImpact::Reanalyze`] every existing group
+/// result store is invalidated and every analyzed group is marked in
+/// [`MosaicConfig::needs_analyze`]. Saves the configuration.
+///
+/// Refused with nothing changed when a store is busy ([`Error::Busy`]).
 pub fn set_analyze_settings(m: &mut Mosaic, new: AnalyzeSettings) -> Result<ChangeImpact> {
-    let impact = analyze_change(&m.config.analyze, &new);
-    m.config.analyze = new;
-    if impact == ChangeImpact::Reanalyze {
-        invalidate_all_stores(m)?;
-        let analyzed: Vec<String> = m.config.group_dirs.keys().cloned().collect();
-        m.config.needs_analyze.extend(analyzed);
-    }
-    m.save()?;
-    Ok(impact)
+    let blend = m.config.blend.clone();
+    set_settings(m, new, blend)
 }
 
 /// Set `group`'s setting override (an empty override removes the entry).
@@ -332,24 +547,29 @@ pub fn set_analyze_settings(m: &mut Mosaic, new: AnalyzeSettings) -> Result<Chan
 /// invalidated, and on [`ChangeImpact::Reanalyze`] the group is marked in
 /// [`MosaicConfig::needs_analyze`]. Saves the configuration.
 ///
-/// An override whose resolved blend settings fail
-/// [`BlendSettings::validate`] is refused with nothing changed.
+/// Refused with nothing changed (in memory or on disk) when the resolved
+/// blend settings fail [`BlendSettings::validate`] or the group's store is
+/// busy ([`Error::Busy`]).
 pub fn set_group_override(m: &mut Mosaic, group: &str, o: GroupOverride) -> Result<ChangeImpact> {
     m.config.blend.with(&o.blend).validate()?;
-    let (old_a, old_b) = m.config.settings_for(group);
+    let mut next = m.config.clone();
     if o.is_empty() {
-        m.config.group_overrides.remove(group);
+        next.group_overrides.remove(group);
     } else {
-        m.config.group_overrides.insert(group.to_string(), o);
+        next.group_overrides.insert(group.to_string(), o);
     }
-    let (new_a, new_b) = m.config.settings_for(group);
+    let (old_a, old_b) = m.config.settings_for(group);
+    let (new_a, new_b) = next.settings_for(group);
     let impact = analyze_change(&old_a, &new_a).max(blend_change(&old_b, &new_b));
-    if impact != ChangeImpact::None {
-        invalidate_store(&m.result_path(group))?;
-    }
+    let mut stores = match impact {
+        ChangeImpact::None => Vec::new(),
+        _ => lock_stores(&[m.result_path(group)])?,
+    };
     if impact == ChangeImpact::Reanalyze {
-        m.config.needs_analyze.insert(group.to_string());
+        next.needs_analyze.insert(group.to_string());
     }
-    m.save()?;
+    invalidate(&mut stores)?;
+    next.save(&m.dir)?;
+    m.config = next;
     Ok(impact)
 }

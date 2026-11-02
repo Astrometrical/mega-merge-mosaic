@@ -5,23 +5,35 @@
 //!
 //! # Concurrency contract
 //!
-//! - One [`crate::tiles::TileStore`] writer per result file; nothing
-//!   enforces it yet (a later plan adds an in-process guard). Readers must
-//!   close before [`blend_group`] recreates a store (see [`crate::tiles`]).
-//! - **Cancel and join a running [`blend_group`] or [`analyze_all`] before
-//!   calling any `set_*`.** A `set_*` that lands while a blend writes
-//!   invalidates the store, then the blend marks the tiles it writes
-//!   afterwards valid although they were blended with the old settings:
-//!   stale tiles marked valid.
-//! - The job holding `&mut Mosaic` saves the configuration (fingerprints,
-//!   `needs_analyze`, provenance). The app must not edit a clone of the
-//!   configuration while such a job runs: whichever saves last wins.
+//! Jobs are split from the configuration in three steps:
+//!
+//! - **Plan on the owner thread.** [`plan_analyze`] and [`plan_blend`] read
+//!   (and, for analysis, update and save) the [`Mosaic`] and return a
+//!   self-contained, `Send` plan.
+//! - **Run on a worker with no `Mosaic`.** [`run_analyze`] and
+//!   [`run_blend`] need only the plan and a [`crate::job::JobCtl`].
+//! - **Apply on the owner thread.** [`Mosaic::apply_analyze`] and
+//!   [`Mosaic::apply_blend`] record the outcome and save. Only the owner
+//!   thread ever saves the configuration.
+//! - **`set_*` is refused while a writer holds a store.** Each result store
+//!   has one [`crate::tiles::TileStore`] writer, enforced by a file lock;
+//!   every `set_*` (and [`plan_analyze`]) locks every store it would
+//!   invalidate *before* changing anything, and returns [`Error::Busy`]
+//!   with nothing changed if one is held — so a running blend can never
+//!   mark tiles valid that were blended with superseded settings.
+//! - **The app cancels and joins before applying settings.** A busy error
+//!   is the core's backstop, not the app's workflow: cancel the running
+//!   job, join it (dropping its store), then call `set_*`.
+//! - Readers must close before [`run_blend`] recreates a store (see
+//!   [`crate::tiles`]).
 
 pub mod grouping;
 mod run;
 
 pub use run::{
-    Mosaic, analyze_all, blend_group, set_analyze_settings, set_blend_settings, set_group_override,
+    AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, BlendPlan, Mosaic, analyze_all, blend_group,
+    plan_analyze, plan_blend, run_analyze, run_blend, set_analyze_settings, set_blend_settings,
+    set_group_override, set_settings,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -136,6 +148,23 @@ pub struct ProvenanceEntry {
     pub detail: serde_json::Value,
 }
 
+impl ProvenanceEntry {
+    /// An entry stamped with the current time and this `mmm-core` version.
+    pub fn new(action: &str, group: Option<&str>, detail: serde_json::Value) -> Self {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        ProvenanceEntry {
+            unix_ms,
+            mmm_version: env!("CARGO_PKG_VERSION").to_string(),
+            action: action.to_string(),
+            group: group.map(str::to_string),
+            detail,
+        }
+    }
+}
+
 /// The persisted mosaic project (`mosaic.json`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct MosaicConfig {
@@ -159,8 +188,9 @@ pub struct MosaicConfig {
     /// [`grouping::allocate_group_dir`] and never changed afterwards.
     #[serde(default)]
     pub group_dirs: BTreeMap<String, String>,
-    /// Groups whose effective analyze settings changed since they were last
-    /// analyzed: [`blend_group`] refuses them until [`analyze_all`] reruns.
+    /// Groups whose analysis is out of date (settings changed, or an
+    /// analysis was planned and has not finished): [`plan_blend`] refuses
+    /// them until an analysis completes.
     #[serde(default)]
     pub needs_analyze: BTreeSet<String>,
     /// Check results the user has accepted.
@@ -255,17 +285,8 @@ impl MosaicConfig {
         group: Option<&str>,
         detail: serde_json::Value,
     ) {
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        self.provenance.push(ProvenanceEntry {
-            unix_ms,
-            mmm_version: env!("CARGO_PKG_VERSION").to_string(),
-            action: action.to_string(),
-            group: group.map(str::to_string),
-            detail,
-        });
+        self.provenance
+            .push(ProvenanceEntry::new(action, group, detail));
     }
 }
 
