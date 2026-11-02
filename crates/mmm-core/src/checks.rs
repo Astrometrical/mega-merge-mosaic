@@ -669,11 +669,6 @@ mod tests {
         // A panel without a stored fingerprint is never "changed".
         cfg.panels[1].fingerprint = None;
         assert!(of(&file_checks(&cfg), CheckCode::FileChanged).is_empty());
-        let _ = Fingerprint {
-            len: 0,
-            modified_unix_ms: 0,
-        };
-        let _: Option<PanelEntry> = None;
     }
 
     #[test]
