@@ -39,7 +39,35 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     Ok(parsed)
 }
 
+/// Whether to select Mesa's d3d12 (GPU) driver: under WSL (`WSL_DISTRO_NAME`
+/// set, or a Microsoft kernel `osrelease`), unless the user chose a driver
+/// with `GALLIUM_DRIVER`. Mesa's default there is llvmpipe (software).
+fn wants_d3d12(distro: Option<&str>, osrelease: Option<&str>, gallium_set: bool) -> bool {
+    if gallium_set {
+        return false;
+    }
+    let wsl_kernel = osrelease.is_some_and(|r| {
+        let r = r.to_ascii_lowercase();
+        r.contains("microsoft") || r.contains("wsl")
+    });
+    distro.is_some_and(|d| !d.is_empty()) || wsl_kernel
+}
+
 fn main() -> ExitCode {
+    let distro = std::env::var("WSL_DISTRO_NAME").ok();
+    let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    let use_d3d12 = wants_d3d12(
+        distro.as_deref(),
+        osrelease.as_deref(),
+        std::env::var_os("GALLIUM_DRIVER").is_some(),
+    );
+    if use_d3d12 {
+        // SAFETY: first thing in main, before logging, the event loop or
+        // any other thread exists: nothing can read the environment
+        // concurrently.
+        unsafe { std::env::set_var("GALLIUM_DRIVER", "d3d12") };
+    }
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -47,6 +75,13 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| "warn,mega_merge_mosaic=info,mmm_core=info".into()),
         )
         .init();
+
+    if use_d3d12 {
+        tracing::info!(
+            "WSL: set GALLIUM_DRIVER=d3d12 for GPU OpenGL; set GALLIUM_DRIVER yourself \
+             (e.g. llvmpipe) to override"
+        );
+    }
 
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -100,6 +135,23 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn wsl_detection_selects_d3d12() {
+        assert!(wants_d3d12(Some("Ubuntu"), None, false));
+        assert!(wants_d3d12(
+            None,
+            Some("6.6.87.2-microsoft-standard-WSL2"),
+            false
+        ));
+        assert!(wants_d3d12(None, Some("4.4.0-19041-Microsoft"), false));
+        assert!(
+            !wants_d3d12(Some("Ubuntu"), None, true),
+            "user override wins"
+        );
+        assert!(!wants_d3d12(None, Some("6.8.0-45-generic"), false));
+        assert!(!wants_d3d12(None, None, false));
     }
 
     #[test]

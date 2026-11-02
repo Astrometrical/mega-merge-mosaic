@@ -3,8 +3,9 @@
 //! [`MmmApp`] wraps it for eframe with persistence and the self-test.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::RichText;
 use mega_ui::theme::palette;
@@ -51,21 +52,12 @@ impl Shell {
         if self.pending.is_some() {
             return;
         }
-        if let Some(open) = &self.session
-            && open.mosaic.dir == request.path()
-        {
-            let dir = request.path().display();
-            self.start
-                .set_error(Some(format!("{dir} is already open in this window.")));
-            return;
-        }
-        let verb = match request {
-            Request::Open(_) => "Opening",
-            Request::Create(_) => "Creating",
-        };
         self.start.set_error(None);
-        self.start
-            .set_busy(Some(format!("{verb} {}…", request.path().display())));
+        self.start.set_busy(Some(format!(
+            "{} {}…",
+            verb(&request),
+            request.path().display()
+        )));
         self.pending = Some(Pending::spawn(request, ctx));
     }
 
@@ -89,12 +81,29 @@ impl Shell {
         let Some(outcome) = self.pending.as_mut().and_then(Pending::poll) else {
             return;
         };
-        self.pending = None;
+        let created = self
+            .pending
+            .take()
+            .is_some_and(|p| matches!(p.request, Request::Create(_)));
         self.start.set_busy(None);
         match outcome {
             Ok(opened) => {
+                // Both paths are normalised (absolute, canonical) by
+                // `session::open_blocking`, so this compares like with like.
                 let dir = opened.mosaic.dir.clone();
-                if self.session.is_some() {
+                if created {
+                    self.start.clear_new_form();
+                }
+                if self
+                    .session
+                    .as_ref()
+                    .is_some_and(|open| open.mosaic.dir == dir)
+                {
+                    self.start.set_error(Some(format!(
+                        "{} is already open in this window.",
+                        dir.display()
+                    )));
+                } else if self.session.is_some() {
                     // One session per window: the other one gets its own.
                     match open_in_new_process(&dir) {
                         Ok(()) => {
@@ -142,6 +151,29 @@ impl Shell {
                     }
                 });
             });
+            // Opening another session reports here too: the start window
+            // may be closed meanwhile.
+            if let Some(p) = &self.pending {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}…",
+                            verb(&p.request),
+                            p.request.path().display()
+                        ))
+                        .color(palette::TEXT_BODY),
+                    );
+                });
+            }
+            if let Some(e) = self.start.error().map(str::to_string) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(e).color(palette::HA_500));
+                    if ui.small_button("Dismiss").clicked() {
+                        self.start.set_error(None);
+                    }
+                });
+            }
         });
         egui::CentralPanel::default().show(ui, |ui| {
             let n = session.mosaic.config.panels.len();
@@ -164,6 +196,14 @@ impl Shell {
     }
 }
 
+/// "Opening" or "Creating", for progress labels.
+fn verb(request: &Request) -> &'static str {
+    match request {
+        Request::Open(_) => "Opening",
+        Request::Create(_) => "Creating",
+    }
+}
+
 fn to_request(action: StartAction) -> Request {
     match action {
         StartAction::Open(p) => Request::Open(p),
@@ -182,6 +222,8 @@ const SELFTEST_START_FRAMES: u32 = 5;
 const SELFTEST_SESSION_FRAMES: u32 = 10;
 /// Give up on a self-test after this long.
 const SELFTEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Exit outright if no frame follows the timeout within this long.
+const SELFTEST_BACKSTOP: Duration = Duration::from_secs(10);
 
 /// `--selftest` state: render a fixed number of frames, then close.
 struct SelfTest {
@@ -189,7 +231,7 @@ struct SelfTest {
     session_frames: u32,
     session: Option<PathBuf>,
     session_requested: bool,
-    started: Instant,
+    timed_out: Arc<AtomicBool>,
     outcome: SelfTestOutcome,
     done: bool,
 }
@@ -215,7 +257,7 @@ impl SelfTest {
         if panicked {
             return self.finish(ctx, Err(format!("frame {} panicked", self.frames)));
         }
-        if self.started.elapsed() > SELFTEST_TIMEOUT {
+        if self.timed_out.load(Ordering::SeqCst) {
             return self.finish(ctx, Err("timed out".into()));
         }
         if let Some(dir) = &self.session {
@@ -276,6 +318,34 @@ fn log_gl(frame: &eframe::Frame) -> Result<(), String> {
     Ok(())
 }
 
+/// Self-test watchdog: after `timeout` it raises the returned flag and
+/// wakes the UI, so the next frame fails the test and closes the window.
+/// If no frame comes (an occluded or minimised window gets none), the
+/// process exits with 1 after a further `backstop`.
+pub fn selftest_watchdog(
+    ctx: &egui::Context,
+    timeout: Duration,
+    backstop: Option<Duration>,
+) -> Arc<AtomicBool> {
+    let fired = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&fired);
+    let ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name("mmm-selftest-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(timeout);
+            flag.store(true, Ordering::SeqCst);
+            ctx.request_repaint();
+            if let Some(backstop) = backstop {
+                std::thread::sleep(backstop);
+                tracing::error!("self-test failed: no frame after the timeout; exiting");
+                std::process::exit(1);
+            }
+        })
+        .expect("spawn the self-test watchdog");
+    fired
+}
+
 /// The eframe application.
 pub struct MmmApp {
     shell: Shell,
@@ -303,7 +373,7 @@ impl MmmApp {
             session_frames: 0,
             session: initial.clone(),
             session_requested: false,
-            started: Instant::now(),
+            timed_out: selftest_watchdog(&cc.egui_ctx, SELFTEST_TIMEOUT, Some(SELFTEST_BACKSTOP)),
             outcome,
             done: false,
         });
@@ -350,7 +420,7 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::*;
-    use crate::start::tests::{StubPicker, step_until, temp_dir};
+    use crate::start::tests::{StubPicker, relative_to_cwd, step_until, temp_dir};
 
     fn harness(picker: StubPicker) -> Harness<'static, Shell> {
         let shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(picker)));
@@ -385,12 +455,14 @@ mod tests {
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert!(dir.join("mosaic.json").is_file());
         assert_eq!(h.state().start.recent()[0].path, dir);
+        // The form is cleared for the next New mosaic….
+        assert_eq!(h.state().start.new_parent(), None);
         let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]
     fn non_mosaic_folder_shows_error() {
-        let root = temp_dir("legacy");
+        let root = temp_dir("shell-legacy");
         std::fs::write(root.join("session.json"), "{}").unwrap();
         let mut h = harness(StubPicker(None));
         h.run();
@@ -401,6 +473,66 @@ mod tests {
         h.run();
         assert!(h.state().session().is_none());
         h.get_by_label_contains("mmm init");
+
+        // A folder that is no session of any kind.
+        let plain = temp_dir("shell-plain");
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Session folder")
+            .focus();
+        h.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
+        h.step();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Session folder")
+            .type_text(plain.to_str().unwrap());
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| !s.is_busy());
+        h.run();
+        assert!(h.state().session().is_none());
+        h.get_by_label_contains("not a Mega Merge Mosaic session");
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn relative_path_is_absolute_and_reopen_refused() {
+        let root = temp_dir("shell-relative");
+        let dir = root.join("Rel.mmm-session");
+        crate::session::create_blocking(&dir).unwrap();
+        let rel = relative_to_cwd(&dir);
+        let mut h = harness(StubPicker(None));
+        h.run();
+        type_into(&mut h, "Session folder", rel.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
+        assert_eq!(h.state().start.recent()[0].path, dir);
+
+        // Opening it again (relative) from this window is refused, and the
+        // error shows in the session bar, not only in the start window.
+        h.get_by_label("Open another…").click();
+        h.run();
+        type_into(&mut h, "Session folder", "");
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| !s.is_busy());
+        h.run();
+        let shown = h
+            .get_all_by_label_contains("already open in this window")
+            .count();
+        assert!(shown >= 1);
+        h.get_by_label("Dismiss");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watchdog_fires_after_deadline() {
+        let ctx = egui::Context::default();
+        let fired = selftest_watchdog(&ctx, std::time::Duration::from_millis(10), None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

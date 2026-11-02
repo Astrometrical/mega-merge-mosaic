@@ -55,9 +55,29 @@ impl Request {
     }
 }
 
+/// `path` made absolute, so recent entries and the "already open" check
+/// compare like with like. The longest existing prefix is canonicalised
+/// (symlinks and `..` resolved); a path that cannot be resolved at all is
+/// made absolute lexically. Blocking (file I/O): call off the UI thread.
+pub fn normalize(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Ok(c) = abs.canonicalize() {
+        return c;
+    }
+    // Not there yet (a session being created): resolve the parent.
+    match (abs.parent(), abs.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(p) => p.join(name),
+            Err(_) => abs,
+        },
+        _ => abs,
+    }
+}
+
 /// Open the session in `dir`. Blocking (file I/O): call off the UI thread.
 /// Errors are actionable messages for the start screen.
 pub fn open_blocking(dir: &Path) -> Result<OpenSession, String> {
+    let dir = &normalize(dir);
     let shown = dir.display();
     if !dir.exists() {
         return Err(format!("{shown} does not exist."));
@@ -87,6 +107,7 @@ pub fn open_blocking(dir: &Path) -> Result<OpenSession, String> {
 /// Create a new session in `dir` with an empty [`MosaicConfig`]. Blocking
 /// (file I/O): call off the UI thread. Refuses an existing `dir`.
 pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
+    let dir = &normalize(dir);
     let shown = dir.display();
     if dir.exists() {
         return Err(format!(
@@ -154,13 +175,7 @@ pub fn open_in_new_process(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    pub(crate) fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mmm-app-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
+    use crate::start::tests::{relative_to_cwd, temp_dir};
 
     #[test]
     fn create_then_open_roundtrip() {
@@ -185,10 +200,21 @@ mod tests {
 
     #[test]
     fn legacy_session_suggests_mmm_init() {
-        let root = temp_dir("legacy");
+        let root = temp_dir("session-legacy");
         std::fs::write(root.join("session.json"), "{}").unwrap();
         let err = open_blocking(&root).unwrap_err();
         assert!(err.contains("mmm init"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_paths_become_absolute() {
+        let root = temp_dir("relative");
+        let dir = root.join("Rel.mmm-session");
+        let rel = relative_to_cwd(&dir);
+        assert!(rel.is_relative());
+        assert_eq!(create_blocking(&rel).unwrap().mosaic.dir, dir);
+        assert_eq!(open_blocking(&rel).unwrap().mosaic.dir, dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 

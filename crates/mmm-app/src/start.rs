@@ -171,6 +171,11 @@ impl StartScreen {
         self.busy = label;
     }
 
+    /// Close the New mosaic form (after a successful Create).
+    pub fn clear_new_form(&mut self) {
+        self.new_form = None;
+    }
+
     /// The parent folder typed or picked in the New mosaic form, if open.
     #[cfg(test)]
     pub fn new_parent(&self) -> Option<&str> {
@@ -555,6 +560,7 @@ fn new_session_dir(parent: &str, name: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     use egui_kittest::Harness;
@@ -571,11 +577,22 @@ pub(crate) mod tests {
         }
     }
 
+    /// A fresh, canonical temp folder; `tag` must be unique per test.
     pub(crate) fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mmm-app-start-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("mmm-app-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        d.canonicalize().unwrap()
+    }
+
+    /// `path` (absolute) as a path relative to the current directory.
+    pub(crate) fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.join(path.strip_prefix("/").unwrap())
     }
 
     /// Step `harness` until `done` holds (bounded: background threads).
@@ -647,6 +664,9 @@ pub(crate) mod tests {
         assert_eq!(h.query_all_by_label("missing").count(), 1);
         h.get_by_label_contains(&gone.display().to_string());
         // The missing entry is not openable; the present one is.
+        h.get_by_label("Gone").click();
+        h.run();
+        assert!(h.state().actions.is_empty());
         h.get_by_label("Present").click();
         h.run();
         assert_eq!(h.state().actions, vec![StartAction::Open(present.clone())]);
