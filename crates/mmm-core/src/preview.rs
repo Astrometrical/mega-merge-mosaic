@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::align::{MosaicFrame, boundary_samples};
 use crate::analyze::InputSelect;
 use crate::formats::InputPanel;
+use crate::fsutil::write_atomic;
 use crate::job::JobCtl;
 use crate::mosaic::{FRAME_FILE, Fingerprint, Mosaic, fingerprint};
 use crate::panel_reader::PanelReader;
@@ -192,25 +193,13 @@ fn aligned_preview(
     }
     reader.advise_sequential();
 
-    // Pass 1: the bbox of nonzero channel-0 samples (a superset of the
-    // covered pixels).
-    let (mut x0, mut y0, mut x1, mut y1) = (u64::MAX, u64::MAX, 0u64, 0u64);
-    for y in 0..h {
-        if y % BBOX_CHECK_ROWS == 0 {
-            ctl.check()?;
-        }
-        let row = channel_rows(&reader, path, y, 1)?[0];
-        if let Some(first) = row.iter().position(|v| covered(*v)) {
-            let last = row.iter().rposition(|v| covered(*v)).unwrap_or(first);
-            x0 = x0.min(first as u64);
-            x1 = x1.max(last as u64 + 1);
-            y0 = y0.min(y);
-            y1 = y + 1;
-        }
-    }
-    if y0 == u64::MAX {
+    // Pass 1: the bbox of covered channel-0 samples (a superset of the
+    // covered pixels), sampling rows at about half the block size a
+    // full-canvas bbox would need.
+    let stride = (w.max(h).div_ceil(max_side) / 2).max(1);
+    let Some([x0, y0, x1, y1]) = covered_bbox(&reader, path, stride, ctl)? else {
         return Err(Error::format(path, "panel has no covered pixels"));
-    }
+    };
 
     // Pass 2: block means over the bbox, one row of blocks at a time.
     let block = (x1 - x0).max(y1 - y0).div_ceil(max_side).max(1);
@@ -247,7 +236,81 @@ fn aligned_preview(
 }
 
 /// Canvas rows of pass 1 between cancellation checks.
-const BBOX_CHECK_ROWS: u64 = 64;
+const BBOX_CHECK_ROWS: usize = 64;
+
+/// `[first, last + 1)` of the covered channel-0 samples of row `y`.
+fn row_extent(reader: &PanelReader, path: &Path, y: u64) -> Result<Option<(u64, u64)>> {
+    let row = channel_rows(reader, path, y, 1)?[0];
+    Ok(row.iter().position(|v| covered(*v)).map(|first| {
+        let last = row.iter().rposition(|v| covered(*v)).unwrap_or(first);
+        (first as u64, last as u64 + 1)
+    }))
+}
+
+/// The bbox `[x0, y0, x1, y1]` (exclusive) of the covered channel-0
+/// samples of a full-canvas panel, `None` when there are none.
+///
+/// Reads every `stride`-th row, then refines exactly where the extremes can
+/// hide: the rows between the first hit and the miss above it, between the
+/// last hit and the miss below it, and within `stride` rows of the sampled
+/// rows reaching furthest left and right. Exact for a convex footprint (a
+/// registered panel is a reprojected rectangle): its edges are convex
+/// functions of the row, so each extreme lies within one stride of the
+/// sampled extreme. A footprint thinner than the stride that no sampled
+/// row meets falls back to a full scan.
+fn covered_bbox(
+    reader: &PanelReader,
+    path: &Path,
+    stride: u64,
+    ctl: &JobCtl,
+) -> Result<Option<[u64; 4]>> {
+    let h = reader.canvas().1;
+    let k = stride.max(1);
+    let mut hits: Vec<(u64, u64, u64)> = Vec::new();
+    for (n, y) in (0..h).step_by(k as usize).enumerate() {
+        if n % BBOX_CHECK_ROWS == 0 {
+            ctl.check()?;
+        }
+        if let Some((a, b)) = row_extent(reader, path, y)? {
+            hits.push((y, a, b));
+        }
+    }
+    let (Some(first), Some(last)) = (hits.first().copied(), hits.last().copied()) else {
+        return if k == 1 {
+            Ok(None)
+        } else {
+            covered_bbox(reader, path, 1, ctl)
+        };
+    };
+    let left = hits.iter().min_by_key(|t| t.1).expect("non-empty").0;
+    let right = hits.iter().max_by_key(|t| t.2).expect("non-empty").0;
+    let mut bb = [u64::MAX, u64::MAX, 0, 0];
+    let mut add = |y: u64, (a, b): (u64, u64)| {
+        bb = [bb[0].min(a), bb[1].min(y), bb[2].max(b), bb[3].max(y + 1)];
+    };
+    for &(y, a, b) in &hits {
+        add(y, (a, b));
+    }
+    // Unsampled rows that may hold an extreme.
+    let near = |y: u64| y.saturating_sub(k - 1)..(y + k).min(h);
+    let mut rows: Vec<u64> = (first.0.saturating_sub(k - 1)..first.0)
+        .chain(last.0 + 1..(last.0 + k).min(h))
+        .chain(near(left))
+        .chain(near(right))
+        .filter(|y| y % k != 0)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for (n, &y) in rows.iter().enumerate() {
+        if n % BBOX_CHECK_ROWS == 0 {
+            ctl.check()?;
+        }
+        if let Some(ext) = row_extent(reader, path, y)? {
+            add(y, ext);
+        }
+    }
+    Ok(Some(bb))
+}
 
 /// A block-averaged copy of a whole raw panel (planar, `cols × rows`,
 /// covered-pixel means, zero = no data).
@@ -462,9 +525,6 @@ struct Header {
     frame: Option<ReferenceFrame>,
 }
 
-/// Distinguishes concurrent temporary files of one process.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Write `p` to `file` atomically (module docs for the format), creating
 /// the parent directory.
 pub fn save_preview(p: &Preview, file: &Path) -> Result<()> {
@@ -501,21 +561,7 @@ fn write_preview(p: &Preview, frame: Option<&ReferenceFrame>, file: &Path) -> Re
     for v in &p.data {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
-    let dir = file.parent().filter(|d| !d.as_os_str().is_empty());
-    if let Some(d) = dir {
-        std::fs::create_dir_all(d).map_err(|e| Error::io(d, e))?;
-    }
-    let tmp = file.with_file_name(format!(
-        "{}.{}.{}.tmp",
-        file.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, bytes).map_err(|e| Error::io(&tmp, e))?;
-    std::fs::rename(&tmp, file).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        Error::io(file, e)
-    })
+    write_atomic(file, &bytes)
 }
 
 /// Read a preview written by [`save_preview`] (or cached by
@@ -606,20 +652,27 @@ const MAX_THREADS: usize = 4;
 
 /// Build or load every planned preview (worker thread; no [`Mosaic`]).
 ///
-/// 1. Loads the reference frame from [`PreviewPlan::frame_path`]; when it
-///    is missing, derives it header-only ([`reference::derive`]) over the
-///    panels that open and — only if every panel opened — saves it there
-///    atomically. Panels that cannot be opened are per-panel errors.
+/// 1. Derives the reference frame header-only with [`reference::derive`]
+///    (the function analysis uses) over the panels that open — never
+///    trusting a frame file left by an earlier input set. If that fails and
+///    the input is not forced aligned, it derives over the panels with a
+///    usable astrometric solution instead, and the others become per-panel
+///    errors. Only a frame derived from every panel is saved to
+///    [`PreviewPlan::frame_path`], and only when it differs from the file
+///    there (atomically). Panels that cannot be opened are per-panel errors.
 /// 2. For each panel, loads its cached preview ([`cache_path`], reused only
 ///    when it was placed in the same frame) or builds it with
 ///    [`PREVIEW_MAX_SIDE`] and caches it, on a dedicated pool of at most
-///    four threads, each holding one panel at a time.
+///    four threads, each holding one panel at a time. When no decode cache
+///    directory is set ([`crate::decoded::cache_dir`]), it is pointed at
+///    `<session_dir>/decoded`, so compressed XISF panels are decoded to
+///    disk once and shared with analysis instead of held in memory.
 /// 3. Calls `on_ready` (from a pool thread) as each preview finishes, and
 ///    reports `("previews", done, total)` after every panel, failed or not.
 ///
 /// Returns the per-panel failures `(path, message)` in plan order; each is
 /// also logged. Whole-run failures — cancellation ([`Error::Cancelled`]),
-/// a frame that cannot be loaded or derived, no pool — are the `Err`.
+/// a frame that cannot be derived, no pool — are the `Err`.
 pub fn run_previews(
     plan: &PreviewPlan,
     ctl: &JobCtl,
@@ -628,28 +681,10 @@ pub fn run_previews(
     ctl.check()?;
     let total = plan.panels.len() as u64;
     let mut errors: Vec<(usize, PathBuf, String)> = Vec::new();
-    let frame = if plan.frame_path.is_file() {
-        ReferenceFrame::load(&plan.frame_path)?
-    } else {
-        let mut ok: Vec<PathBuf> = Vec::new();
-        for (k, (path, _)) in plan.panels.iter().enumerate() {
-            ctl.check()?;
-            match InputPanel::open(path) {
-                Ok(_) => ok.push(path.clone()),
-                Err(e) => errors.push((k, path.clone(), e.to_string())),
-            }
-        }
-        if ok.is_empty() {
-            return Err(Error::compute(
-                "no panel could be opened to derive the reference frame",
-            ));
-        }
-        let frame = reference::derive(&ok, plan.input)?;
-        if errors.is_empty() {
-            save_frame_atomic(&frame, &plan.frame_path)?;
-        }
-        frame
-    };
+    let frame = preview_frame(plan, ctl, &mut errors)?;
+    if crate::decoded::cache_dir().is_none() {
+        crate::decoded::set_cache_dir(plan.session_dir.join(DECODED_DIR));
+    }
     let failed: Vec<usize> = errors.iter().map(|e| e.0).collect();
     let done = AtomicU64::new(failed.len() as u64);
     ctl.report("previews", done.load(Ordering::Relaxed), total)?;
@@ -692,6 +727,61 @@ pub fn run_previews(
     Ok(errors.into_iter().map(|(_, p, m)| (p, m)).collect())
 }
 
+/// Decode cache directory, inside the session directory, that
+/// [`run_previews`] uses when none is set (the CLI's convention).
+const DECODED_DIR: &str = "decoded";
+
+/// The frame for a preview run (see [`run_previews`] step 1), recording
+/// panels left out of it in `errors`.
+fn preview_frame(
+    plan: &PreviewPlan,
+    ctl: &JobCtl,
+    errors: &mut Vec<(usize, PathBuf, String)>,
+) -> Result<ReferenceFrame> {
+    let mut opened: Vec<(usize, &PathBuf, InputPanel)> = Vec::new();
+    for (k, (path, _)) in plan.panels.iter().enumerate() {
+        ctl.check()?;
+        match InputPanel::open(path) {
+            Ok(panel) => opened.push((k, path, panel)),
+            Err(e) => errors.push((k, path.clone(), e.to_string())),
+        }
+    }
+    if opened.is_empty() {
+        return Err(Error::compute(
+            "no panel could be opened to derive the reference frame",
+        ));
+    }
+    let paths: Vec<PathBuf> = opened.iter().map(|o| o.1.clone()).collect();
+    let (frame, complete) = match reference::derive(&paths, plan.input) {
+        Ok(frame) => (frame, errors.is_empty()),
+        Err(e) if plan.input != InputSelect::Aligned => {
+            // One unsolved panel must not hide every other preview: place
+            // the solved ones and report the rest.
+            let mut solved: Vec<PathBuf> = Vec::new();
+            for (k, path, panel) in &opened {
+                match panel.wcs_model() {
+                    Ok(_) => solved.push((*path).clone()),
+                    Err(reason) => errors.push((
+                        *k,
+                        (*path).clone(),
+                        format!("cannot place the panel: {reason}"),
+                    )),
+                }
+            }
+            if solved.is_empty() || solved.len() == paths.len() {
+                return Err(e);
+            }
+            (reference::derive(&solved, plan.input)?, false)
+        }
+        Err(e) => return Err(e),
+    };
+    drop(opened);
+    if complete && !ReferenceFrame::load(&plan.frame_path).is_ok_and(|on_disk| on_disk == frame) {
+        frame.save(&plan.frame_path)?;
+    }
+    Ok(frame)
+}
+
 /// The cached preview of `path` in `frame`, or a freshly built (and
 /// cached) one. A failed cache write is logged, not an error.
 fn cached_or_build(
@@ -713,21 +803,6 @@ fn cached_or_build(
         tracing::warn!("cannot cache the preview of {}: {e}", path.display());
     }
     Ok(p)
-}
-
-/// [`ReferenceFrame::save`] to a temporary name, then rename into place.
-fn save_frame_atomic(frame: &ReferenceFrame, path: &Path) -> Result<()> {
-    let tmp = path.with_file_name(format!(
-        "{}.{}.{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    frame.save(&tmp)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        Error::io(path, e)
-    })
 }
 
 /// Test-only count of [`build_preview`] calls per panel path.
@@ -973,20 +1048,109 @@ mod tests {
         assert_eq!(builds(&paths[0]), 2);
         assert_eq!(builds(&paths[1]), 1);
         assert!((third[0].data[0] - 2.0 * first[0].data[0]).abs() < 1e-5);
-        // A different frame (re-derived after an input edit) misses too.
-        let mut other = aligned_frame();
-        if let ReferenceFrame::Aligned { wcs, .. } = &mut other {
-            *wcs = Some(crate::astrometry::LinearWcs {
-                crval: [10.0, 20.0],
-                crpix: [150.5, 100.5],
-                cd: [[-1e-3, 0.0], [0.0, 1e-3]],
-                ctype: ["RA---TAN".into(), "DEC--TAN".into()],
-                radesys: "ICRS".into(),
-            });
+        // A stale or foreign frame file is not trusted: the frame is
+        // re-derived (unchanged here), the file restored, nothing rebuilt.
+        let mut foreign = aligned_frame();
+        if let ReferenceFrame::Aligned { wcs, .. } = &mut foreign {
+            *wcs = Some(sample_wcs());
         }
-        other.save(&plan.frame_path).unwrap();
+        foreign.save(&plan.frame_path).unwrap();
         collect();
+        assert_eq!(
+            ReferenceFrame::load(&plan.frame_path).unwrap(),
+            aligned_frame()
+        );
+        assert_eq!(builds(&paths[1]), 1);
+        // A different derived frame (inputs edited: a first panel carrying a
+        // canvas WCS) misses the cache.
+        let solved = dir.join("w.xisf");
+        crate::synth::write_xisf_solved(
+            &solved,
+            W,
+            H,
+            2,
+            &planes,
+            &crate::synth::SynthWcs {
+                crval: [10.0, 20.0],
+                refimg: [150.0, 100.0],
+                cd: [[-1e-3, 0.0], [0.0, 1e-3]],
+            },
+        )
+        .unwrap();
+        let mut edited = plan.clone();
+        edited.panels.insert(0, (solved, None));
+        let got = std::sync::Mutex::new(0usize);
+        let errs = run_previews(&edited, &JobCtl::none(), &|_| *got.lock().unwrap() += 1).unwrap();
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(*got.lock().unwrap(), 3);
+        assert!(matches!(
+            ReferenceFrame::load(&plan.frame_path).unwrap(),
+            ReferenceFrame::Aligned { wcs: Some(_), .. }
+        ));
         assert_eq!(builds(&paths[1]), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn sample_wcs() -> crate::astrometry::LinearWcs {
+        crate::astrometry::LinearWcs {
+            crval: [10.0, 20.0],
+            crpix: [150.5, 100.5],
+            cd: [[-1e-3, 0.0], [0.0, 1e-3]],
+            ctype: ["RA---TAN".into(), "DEC--TAN".into()],
+            radesys: "ICRS".into(),
+        }
+    }
+
+    #[test]
+    fn strided_bbox_matches_full_scan() {
+        let dir = tmp("bbox");
+        let ctl = JobCtl::none();
+        // A rectangle rotated by ~20°, a nearly flat sliver and a strip
+        // thinner than the stride, each on its own canvas.
+        type Shape = Box<dyn Fn(f64, f64) -> bool>;
+        let shapes: Vec<(&str, Shape)> = vec![
+            (
+                "rotated",
+                Box::new(|x, y| {
+                    let (dx, dy) = (x - 150.0, y - 100.0);
+                    let (s, c) = 20f64.to_radians().sin_cos();
+                    (c * dx + s * dy).abs() < 70.0 && (-s * dx + c * dy).abs() < 40.0
+                }),
+            ),
+            (
+                "sliver",
+                Box::new(|x, y| {
+                    let (dx, dy) = (x - 120.0, y - 77.0);
+                    let (s, c) = 3f64.to_radians().sin_cos();
+                    (c * dx + s * dy).abs() < 90.0 && (-s * dx + c * dy).abs() < 6.0
+                }),
+            ),
+            (
+                "thin",
+                Box::new(|x, y| (101.0..103.0).contains(&y) && (20.0..280.0).contains(&x)),
+            ),
+        ];
+        for (name, inside) in shapes {
+            let mut p = vec![0f32; (W * H) as usize];
+            for y in 0..H {
+                for x in 0..W {
+                    if inside(x as f64 + 0.5, y as f64 + 0.5) {
+                        p[(y * W + x) as usize] = 0.3;
+                    }
+                }
+            }
+            let path = dir.join(format!("{name}.xisf"));
+            write_xisf(&path, W, H, 1, &p).unwrap();
+            let r = PanelReader::open_file(&path).unwrap();
+            let full = covered_bbox(&r, &path, 1, &ctl).unwrap().unwrap();
+            for k in 2..=30 {
+                assert_eq!(
+                    covered_bbox(&r, &path, k, &ctl).unwrap(),
+                    Some(full),
+                    "{name} stride {k}"
+                );
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -99,20 +99,16 @@ impl ReferenceFrame {
     }
 
     /// Write the frame as versioned, pretty-printed JSON to `path`, creating
-    /// parent directories.
+    /// parent directories. Atomic (temporary file, then rename): a
+    /// concurrent reader never sees a half-written frame.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-        }
         let file = ReferenceFrameFile {
             version: REFERENCE_FRAME_VERSION,
             frame: self.clone(),
         };
         let json = serde_json::to_string_pretty(&file)
             .map_err(|e| Error::format(path, format!("cannot serialize reference frame: {e}")))?;
-        std::fs::write(path, json).map_err(|e| Error::io(path, e))
+        crate::fsutil::write_atomic(path, json.as_bytes())
     }
 
     /// Read a frame written by [`ReferenceFrame::save`]. Malformed files and

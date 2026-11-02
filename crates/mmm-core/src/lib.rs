@@ -94,6 +94,7 @@ pub mod diag;
 pub mod error;
 pub mod flatten;
 pub mod formats;
+pub(crate) mod fsutil;
 pub mod health;
 pub mod ipc;
 pub mod job;

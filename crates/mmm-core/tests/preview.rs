@@ -291,3 +291,71 @@ fn bad_panel_does_not_fail_run() {
     assert_eq!(errs.len(), 2, "{errs:?}");
     assert_eq!(*ready.lock().unwrap(), 3);
 }
+
+#[test]
+fn unsolved_panel_is_reported_not_fatal() {
+    let t = TempDir::new("unsolved");
+    let a = t.0.join("a.xisf");
+    let b = t.0.join("b.xisf");
+    solved_panel(&a, [200.0, 150.0]);
+    solved_panel(&b, [140.0, 110.0]);
+    // A valid image without an astrometric solution, of another geometry.
+    let u = t.0.join("unsolved.xisf");
+    write_xisf(&u, 120, 90, 1, &vec![0.4; 120 * 90]).unwrap();
+    let m = mosaic(&t.0, vec![a.clone(), u.clone(), b.clone()]);
+    let ready = Mutex::new(Vec::<PathBuf>::new());
+    let errs = run_previews(&plan_previews(&m), &JobCtl::none(), &|p| {
+        ready.lock().unwrap().push(p.path)
+    })
+    .unwrap();
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(errs[0].0, u);
+    assert!(errs[0].1.contains("astrometric solution"), "{errs:?}");
+    let mut ready = ready.into_inner().unwrap();
+    ready.sort();
+    assert_eq!(ready, vec![a, b]);
+    // A frame derived from a subset is not the mosaic's frame.
+    assert!(!m.dir.join(FRAME_FILE).exists());
+}
+
+#[test]
+fn frame_grows_with_inputs() {
+    let t = TempDir::new("grow");
+    let a = t.0.join("a.xisf");
+    let b = t.0.join("b.xisf");
+    solved_panel(&a, [200.0, 150.0]);
+    solved_panel(&b, [140.0, 110.0]);
+    let mut m = mosaic(&t.0, vec![a.clone(), b.clone()]);
+    let run = |m: &Mosaic| {
+        let got = Mutex::new(Vec::<Preview>::new());
+        let errs = run_previews(&plan_previews(m), &JobCtl::none(), &|p| {
+            got.lock().unwrap().push(p)
+        })
+        .unwrap();
+        assert!(errs.is_empty(), "{errs:?}");
+        got.into_inner().unwrap()
+    };
+    run(&m);
+    let old = ReferenceFrame::load(&m.dir.join(FRAME_FILE)).unwrap();
+    // C lies 700 px right of A: outside the old canvas.
+    let c = t.0.join("c.xisf");
+    solved_panel(&c, [200.0 - 700.0, 150.0]);
+    let panels = MosaicConfig::new(vec![a, b, c.clone()]).panels;
+    let grouping = m.config.grouping.clone();
+    mmm_core::mosaic::set_inputs(&mut m, panels, grouping).unwrap();
+    let got = run(&m);
+    let new = ReferenceFrame::load(&m.dir.join(FRAME_FILE)).unwrap();
+    let (ow, _) = old.canvas();
+    let (nw, nh) = new.canvas();
+    assert!(nw >= ow + 600, "frame {ow} -> {nw} px wide");
+    let pc = got.iter().find(|p| p.path == c).expect("C previewed");
+    assert!(
+        pc.rect[0] >= 0.0
+            && pc.rect[1] >= 0.0
+            && pc.rect[2] <= nw as f64 + 1.0
+            && pc.rect[3] <= nh as f64 + 1.0,
+        "{:?} in {nw}x{nh}",
+        pc.rect
+    );
+    assert_eq!(got.len(), 3);
+}

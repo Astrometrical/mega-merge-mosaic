@@ -275,11 +275,9 @@ impl MosaicConfig {
             self.settings_for(group).1.validate()?;
         }
         let path = dir.join(CONFIG_FILE);
-        let tmp = dir.join(format!("{CONFIG_FILE}.tmp"));
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| Error::format(&path, format!("cannot serialise configuration: {e}")))?;
-        std::fs::write(&tmp, json).map_err(|e| Error::io(&tmp, e))?;
-        std::fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))
+        crate::fsutil::write_atomic(&path, &json)
     }
 
     /// The effective settings for `group`: the base settings with the
