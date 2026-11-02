@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mmm-core", "crates/mmm", "crates/mmm-ipc-worker", "crates/mega-ui"]
+members = ["crates/mmm-core", "crates/mmm", "crates/mmm-ipc-worker", "crates/mega-ui", "crates/mmm-app"]
 
 [workspace.package]
 # Kept in exact sync with the PixInsight module's MMM_VERSION_STRING

@@ -1,0 +1,27 @@
+[package]
+name = "mmm-app"
+description = "Mega Merge Mosaic — desktop app for astrophotography mosaic merging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mega-merge-mosaic"
+path = "src/main.rs"
+
+[dependencies]
+mega-ui = { path = "../mega-ui" }
+mmm-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+# Memory/CPU readout in the status bar (Task 9).
+sysinfo.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
