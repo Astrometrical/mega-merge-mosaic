@@ -153,6 +153,8 @@ struct Running {
     stage: String,
     done: u64,
     total: u64,
+    /// Progress updates received so far.
+    updates: u64,
 }
 
 /// Limits progress updates to one per `min` interval; a final update
@@ -297,6 +299,7 @@ impl JobRunner {
                     r.stage = stage;
                     r.done = done;
                     r.total = total;
+                    r.updates += 1;
                 }
                 Ok(Msg::Done(done)) => {
                     let r = self.running.take().expect("running job");
@@ -356,6 +359,16 @@ impl JobRunner {
             cancellable: true,
         });
         running.chain(queued).collect()
+    }
+
+    /// The running blend, if any: `(job id, group, progress updates
+    /// received)`. The count changes whenever the blend reports progress
+    /// (each update follows newly written tiles); once it is non-zero the
+    /// blend has created or reopened its result store.
+    pub fn blend_progress(&self) -> Option<(u64, &str, u64)> {
+        let r = self.running.as_ref()?;
+        let plan = r.blend.as_ref()?;
+        Some((r.id, plan.group.as_str(), r.updates))
     }
 
     /// Whether a job is running or queued.
@@ -482,6 +495,7 @@ impl JobRunner {
                     stage: stage.into(),
                     done: 0,
                     total: 0,
+                    updates: 0,
                 });
             }
             Err(e) => self.pending.push(JobEvent::Failed {

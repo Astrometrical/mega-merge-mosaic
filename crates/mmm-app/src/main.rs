@@ -7,12 +7,16 @@
 //! checks launch the GUI.
 
 mod app;
+mod blend_tab;
 mod jobs;
 mod session;
 mod start;
 mod status;
 #[cfg(test)]
+mod synth_mosaic;
+#[cfg(test)]
 mod testutil;
+mod tile_source;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
-use mega_ui::jobs::{JobAction, job_panel};
 use mega_ui::theme::palette;
 
+use crate::blend_tab::BlendTab;
 use crate::jobs::{JobEvent, JobRunner};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::start::{RecentEntry, RfdPicker, StartAction, StartScreen, unix_now};
@@ -20,6 +20,29 @@ use crate::status::{self, SysMonitor};
 const RECENT_KEY: &str = "recent_sessions";
 /// How long a job notice stays on screen.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
+
+/// The session view's tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    /// Panels and their checks (next phase).
+    Panels,
+    /// The plan view (next phase).
+    Plan,
+    /// Blend controls and the result viewer.
+    Blend,
+}
+
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::Panels, Tab::Plan, Tab::Blend];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Panels => "Panels",
+            Tab::Plan => "Plan",
+            Tab::Blend => "Blend",
+        }
+    }
+}
 
 /// A toast-style notice about a job that ended.
 struct Notice {
@@ -39,6 +62,9 @@ pub struct Shell {
     jobs: Option<JobRunner>,
     sys: SysMonitor,
     notices: Vec<Notice>,
+    tab: Tab,
+    /// The Blend tab (made afresh with each session).
+    blend: BlendTab,
 }
 
 impl Shell {
@@ -52,6 +78,9 @@ impl Shell {
             jobs: None,
             sys: SysMonitor::start(),
             notices: Vec::new(),
+            // The Blend tab is the one that works in this phase.
+            tab: Tab::Blend,
+            blend: BlendTab::new(),
         }
     }
 
@@ -65,9 +94,14 @@ impl Shell {
         self.pending.is_some()
     }
 
-    /// The open session and its job runner, to start or cancel jobs.
-    pub fn session_jobs(&mut self) -> Option<(&mut OpenSession, &mut JobRunner)> {
-        self.session.as_mut().zip(self.jobs.as_mut())
+    /// The tab shown in the session view.
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// The Blend tab.
+    pub fn blend(&self) -> &BlendTab {
+        &self.blend
     }
 
     /// Open or create a session on a background thread. With a session
@@ -146,6 +180,7 @@ impl Shell {
                     self.start.record_opened(&dir, unix_now());
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
+                    self.blend = BlendTab::new();
                 }
             }
             Err(message) => {
@@ -162,6 +197,7 @@ impl Shell {
         };
         let until = Instant::now() + NOTICE_TIME;
         for event in jobs.poll(session) {
+            self.blend.on_event(&event);
             let name = |id| jobs.label(id).unwrap_or("Job").to_string();
             let (text, color) = match event {
                 JobEvent::Finished { label, .. } => {
@@ -223,7 +259,6 @@ impl Shell {
             }
         });
         let views = self.jobs.as_ref().map(JobRunner::views).unwrap_or_default();
-        let busy = self.jobs.as_ref().is_some_and(JobRunner::busy);
         egui::Panel::bottom("status-bar").show(ui, |ui| {
             status::show(
                 ui,
@@ -233,43 +268,23 @@ impl Shell {
                 self.sys.latest(),
             );
         });
-        let groups: Vec<String> = session.mosaic.config.group_dirs.keys().cloned().collect();
-        let mut start = None;
-        let mut actions = Vec::new();
-        egui::CentralPanel::default().show(ui, |ui| {
-            let n = session.mosaic.config.panels.len();
-            ui.label(
-                RichText::new(format!("{n} panel{}", if n == 1 { "" } else { "s" }))
-                    .color(palette::TEXT_BODY),
-            );
-            // Interim job controls until the Blend tab takes them over.
+        egui::Panel::top("session-tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Analyze").clicked() {
-                    start = Some(None);
-                }
-                for g in &groups {
-                    if ui.button(format!("Blend {g}")).clicked() {
-                        start = Some(Some(g.clone()));
-                    }
+                for tab in Tab::ALL {
+                    ui.selectable_value(&mut self.tab, tab, tab.label());
                 }
             });
-            if busy {
-                ui.add_space(8.0);
-                actions = job_panel(ui, &views);
-            }
         });
-        if let Some((session, jobs)) = self.session_jobs() {
-            match start {
-                Some(None) => {
-                    jobs.start_analyze(session);
-                }
-                Some(Some(group)) => {
-                    jobs.start_blend(session, &group, None);
-                }
-                None => {}
-            }
-            for JobAction::Cancel(id) in actions {
-                jobs.cancel(id);
+        match (self.tab, self.session.as_mut(), self.jobs.as_mut()) {
+            (Tab::Blend, Some(session), Some(jobs)) => self.blend.ui(ui, session, jobs),
+            _ => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("Coming in the next phase").color(palette::TEXT_MUTED),
+                        );
+                    });
+                });
             }
         }
         self.notices_ui(&ctx);
@@ -346,6 +361,7 @@ struct SelfTest {
     timed_out: Arc<AtomicBool>,
     outcome: SelfTestOutcome,
     done: bool,
+    blend_logged: bool,
 }
 
 impl SelfTest {
@@ -391,8 +407,16 @@ impl SelfTest {
                     Err(format!("session {} did not open: {why}", dir.display())),
                 );
             }
-            Some(_) => self.session_frames >= SELFTEST_SESSION_FRAMES,
+            Some(_) => {
+                self.session_frames >= SELFTEST_SESSION_FRAMES
+                    && shell.tab() == Tab::Blend
+                    && shell.blend().is_settled()
+            }
         };
+        if session_done && self.session.is_some() && !self.blend_logged {
+            self.blend_logged = true;
+            log_blend_tab(shell.blend());
+        }
         if self.frames >= SELFTEST_FRAMES && session_done {
             return self.finish(ctx, Ok(()));
         }
@@ -407,6 +431,38 @@ impl SelfTest {
         *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
         self.done = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+/// Log what the self-test's Blend tab shows.
+fn log_blend_tab(blend: &BlendTab) {
+    let group = blend.group().unwrap_or("(none)");
+    match (blend.source(), blend.absent()) {
+        (Some(src), _) => {
+            let g = src.tile_geometry();
+            let stretch = src.stretch();
+            tracing::info!(
+                "self-test: Blend tab shows group {group}: {} × {} × {} result, display stretch {stretch:?}",
+                g.width,
+                g.height,
+                g.channels
+            );
+        }
+        (None, why) => tracing::info!(
+            "self-test: Blend tab, group {group}: no result ({})",
+            why.unwrap_or("none")
+        ),
+    }
+    match blend.health() {
+        Some(Ok(h)) => tracing::info!(
+            "self-test: health: seam step median {:.3e}, max {:.3e}, {} of {} edges flagged",
+            h.seam_delta_median,
+            h.seam_delta_max,
+            h.seams.iter().filter(|s| s.flagged).count(),
+            h.seams.len()
+        ),
+        Some(Err(e)) => tracing::info!("self-test: health unavailable: {e}"),
+        None => tracing::info!("self-test: no health (group not analyzed)"),
     }
 }
 
@@ -488,6 +544,7 @@ impl MmmApp {
             timed_out: selftest_watchdog(&cc.egui_ctx, SELFTEST_TIMEOUT, Some(SELFTEST_BACKSTOP)),
             outcome,
             done: false,
+            blend_logged: false,
         });
         MmmApp {
             shell,
@@ -533,6 +590,8 @@ mod tests {
 
     use super::*;
     use crate::start::tests::{StubPicker, relative_to_cwd, step_until, temp_dir};
+
+    const CANVAS_W: u64 = crate::testutil::CANVAS.0;
 
     fn harness(picker: StubPicker) -> Harness<'static, Shell> {
         let shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(picker)));
@@ -657,11 +716,36 @@ mod tests {
         h.get_by_label("Ready");
         h.get_by_label("Canvas 600 × 420 (0.3 MP)");
         h.get_by_label("2 groups");
-        h.get_by_label("Blend Ha").click();
+        // The Blend tab shows the first group, Ha; it was never blended.
+        assert_eq!(h.state().tab(), Tab::Blend);
+        assert_eq!(h.state().blend().group(), Some("Ha"));
+        step_until(&mut h, |s| s.blend().absent().is_some());
+        h.get_by_label("Not blended yet.");
+        step_until(&mut h, |s| s.blend().health().is_some());
+        assert!(matches!(h.state().blend().health(), Some(Ok(_))));
+        h.get_by_label("Seam step median");
+        h.get_by_label("Blend whole mosaic").click();
         h.step();
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
         h.run();
         h.get_by_label("Blend Ha finished");
+        // The result opens with an automatic display stretch, and the
+        // viewer settles with its tiles loaded.
+        step_until(&mut h, |s| {
+            s.blend().source().is_some() && s.blend().is_settled()
+        });
+        let src = h.state().blend().source().unwrap().clone();
+        assert_eq!(src.tile_geometry().width, CANVAS_W);
+        assert_ne!(
+            src.stretch()[0],
+            crate::tile_source::LINEAR,
+            "auto stretch applied"
+        );
+        h.get_by_label("Automatic");
+        // Panels and Plan come later.
+        h.get_by_label("Panels").click();
+        h.run();
+        h.get_by_label("Coming in the next phase");
         let actions: Vec<_> = h
             .state()
             .session()
