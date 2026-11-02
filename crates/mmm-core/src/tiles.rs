@@ -1,5 +1,5 @@
 //! Memory-mapped tiled result store: the blended mosaic as a multi-level tile
-//! pyramid with a per-tile validity flag.
+//! pyramid with a per-tile sequence lock and validity bit.
 //!
 //! A background blend writes tiles through a [`TileStore`] while a viewer
 //! reads them through one or more [`TileReader`]s — separate mappings of the
@@ -13,9 +13,11 @@
 //! 1. **Header**, 4096 bytes: magic `b"MMMTILE\0"`, `u32` version (`1`),
 //!    `u32` tile size, `u64` width, `u64` height, `u32` channels, `u32`
 //!    level count; the rest is zero padding.
-//! 2. **Validity table**: one byte per tile, level 0 first, each level
-//!    row-major; `0` = invalid, `1` = valid. Zero-padded to a multiple of
-//!    4096 bytes.
+//! 2. **Tile state table**: one `u32` per tile, level 0 first, each level
+//!    row-major. Bit 31 is the *valid* bit; bits 0–30 are the tile's
+//!    sequence number (odd = being written, even = stable), wrapping within
+//!    31 bits. A zeroed entry is "never written, invalid". Zero-padded to a
+//!    multiple of 4096 bytes.
 //! 3. **Tile data**, level by level, each level row-major: every tile is
 //!    `channels × tile × tile` `f32` samples, planar (channel 0's rows, then
 //!    channel 1's, ...). Edge tiles are stored full size; samples beyond the
@@ -27,22 +29,23 @@
 //!
 //! # Torn-read protection
 //!
-//! The validity bytes are accessed as [`AtomicU8`] through the mapping. The
-//! writer stores the flag `0` (Release), writes the samples, then stores `1`
-//! (Release). A reader loads the flag (Acquire), copies the samples, and loads
-//! the flag again; the tile counts as valid only if both loads read `1`.
+//! Each tile's state entry is a seqlock, accessed as [`AtomicU32`] through
+//! the mapping. The (single) writer bumps the sequence to odd and clears the
+//! valid bit (Release), writes the samples, then bumps the sequence to even
+//! and sets the valid bit (Release). Invalidation clears the valid bit
+//! without touching the samples. A reader loads the entry (Acquire) — it
+//! must be even and valid — copies the samples, then (after an Acquire
+//! fence) loads the entry again; the copy counts only if the second load
+//! equals the first. Because every write and invalidation changes the entry,
+//! a copy that straddles any of them, including a complete rewrite, is
+//! rejected (barring exactly 2^30 rewrites during one copy).
+//!
 //! Samples are themselves read and written as relaxed 32-bit atomics, so a
 //! racing copy is a well-defined (if possibly stale) read, never UB.
-//!
-//! Limitation of the 0/1 flag: a *complete* rewrite (`1 → 0 → data → 1`)
-//! that starts after a reader's first load and finishes before its second is
-//! not detected. Writers that rewrite a tile should invalidate it well before
-//! rewriting (as an invalidate-then-blend pass does), not overwrite it in
-//! place while readers are copying it.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 use memmap2::{Mmap, MmapMut};
 
@@ -55,6 +58,10 @@ const MAGIC: &[u8; 8] = b"MMMTILE\0";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 4096;
 const PAGE: usize = 4096;
+/// Valid bit of a tile state entry.
+const VALID: u32 = 1 << 31;
+/// Sequence bits of a tile state entry.
+const SEQ: u32 = !VALID;
 
 /// Shape of a tile pyramid: the level-0 image size, channel count, and tile
 /// edge. All rectangles are exclusive `[x0, y0, x1, y1]`.
@@ -162,7 +169,7 @@ impl Layout {
             let (tx, ty) = g.tiles(l);
             total += tx as usize * ty as usize;
         }
-        let data_off = HEADER_LEN + total.div_ceil(PAGE) * PAGE;
+        let data_off = HEADER_LEN + (total * 4).div_ceil(PAGE) * PAGE;
         let file_len = data_off + total * g.tile_len() * 4;
         Layout {
             g,
@@ -244,13 +251,14 @@ struct Raw {
 }
 
 impl Raw {
-    fn flag(&self, idx: usize) -> &AtomicU8 {
+    fn state(&self, idx: usize) -> &AtomicU32 {
         debug_assert!(idx < self.layout.total_tiles);
-        // SAFETY: `idx < total_tiles`, so the byte lies inside the validity
-        // table of the mapping, which outlives `self` (the owning struct
-        // keeps the map alive). AtomicU8 has the size and alignment of u8,
-        // and every access to these bytes goes through atomics.
-        unsafe { &*(self.base.add(HEADER_LEN + idx) as *const AtomicU8) }
+        // SAFETY: `idx < total_tiles`, so the 4 bytes at `HEADER_LEN + 4 idx`
+        // lie inside the state table of the mapping, which outlives `self`
+        // (the owning struct keeps the map alive). The offset is a multiple
+        // of 4 from a page-aligned base, so the AtomicU32 is aligned, and
+        // every access to these bytes goes through atomics.
+        unsafe { &*(self.base.add(HEADER_LEN + idx * 4) as *const AtomicU32) }
     }
 
     fn samples(&self, idx: usize) -> &[AtomicU32] {
@@ -264,27 +272,49 @@ impl Raw {
     }
 
     fn is_valid(&self, idx: usize) -> bool {
-        self.flag(idx).load(Ordering::Acquire) == 1
+        stable_valid(self.state(idx).load(Ordering::Acquire))
     }
 
     fn read_tile(&self, idx: usize, out: &mut [f32]) -> bool {
+        self.read_tile_with(idx, out, || {})
+    }
+
+    /// [`Self::read_tile`] with `mid` run between the copy and the
+    /// re-check (a test hook for simulating a racing writer).
+    fn read_tile_with(&self, idx: usize, out: &mut [f32], mid: impl FnOnce()) -> bool {
         let n = self.layout.g.tile_len();
         assert_eq!(
             out.len(),
             n,
             "tile buffer must hold channels × tile × tile samples"
         );
-        let flag = self.flag(idx);
-        if flag.load(Ordering::Acquire) != 1 {
+        let state = self.state(idx);
+        let first = state.load(Ordering::Acquire);
+        if !stable_valid(first) {
             return false;
         }
         for (o, s) in out.iter_mut().zip(self.samples(idx)) {
             *o = f32::from_bits(u32::from_le(s.load(Ordering::Relaxed)));
         }
+        mid();
         // Keep the sample loads above from sinking below the re-check.
         fence(Ordering::Acquire);
-        flag.load(Ordering::Relaxed) == 1
+        state.load(Ordering::Relaxed) == first
     }
+
+    /// Clear tile `idx`'s valid bit (writer side only).
+    fn invalidate(&self, idx: usize) {
+        let state = self.state(idx);
+        let e = state.load(Ordering::Relaxed);
+        if e & VALID != 0 {
+            state.store(e & SEQ, Ordering::Release);
+        }
+    }
+}
+
+/// True if a state entry is stable (even sequence) and valid.
+fn stable_valid(e: u32) -> bool {
+    e & VALID != 0 && e & 1 == 0
 }
 
 fn map_err(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
@@ -310,6 +340,10 @@ impl TileStore {
     /// Create (or truncate) a store at `path` for geometry `g`, with every
     /// tile invalid. The file is sized with `set_len` (sparse where the
     /// filesystem supports it).
+    ///
+    /// Callers must not recreate a store that readers still have mapped:
+    /// truncating the file under a live mapping makes their accesses fault
+    /// (`SIGBUS` on Unix). Drop every [`TileReader`] first.
     pub fn create(path: &Path, g: TileGeometry) -> Result<Self> {
         if g.tile == 0 || g.width == 0 || g.height == 0 || g.channels == 0 {
             return Err(Error::compute(
@@ -397,9 +431,12 @@ impl TileStore {
         let vh = (lh - ty as u64 * t).min(t) as usize;
         let t = t as usize;
 
-        let flag = self.raw.flag(idx);
-        flag.store(0, Ordering::Release);
-        // Keep the sample stores below from rising above the flag clear.
+        // Single writer (`&mut self`), so load-then-store cannot race.
+        let state = self.raw.state(idx);
+        let seq = state.load(Ordering::Relaxed) & SEQ;
+        let writing = seq.wrapping_add(1) & SEQ;
+        state.store(writing, Ordering::Release);
+        // Keep the sample stores below from rising above the odd store.
         fence(Ordering::Release);
         let samples = self.raw.samples(idx);
         for (i, (s, &v)) in samples.iter().zip(data).enumerate() {
@@ -408,7 +445,7 @@ impl TileStore {
             let v = if x < vw && y < vh { v } else { 0.0 };
             s.store(v.to_bits().to_le(), Ordering::Relaxed);
         }
-        flag.store(1, Ordering::Release);
+        state.store((writing.wrapping_add(1) & SEQ) | VALID, Ordering::Release);
         Ok(())
     }
 
@@ -427,8 +464,7 @@ impl TileStore {
         let g = self.raw.layout.g;
         for level in 0..self.raw.layout.levels {
             for (tx, ty) in g.tiles_in_rect(level, r) {
-                let idx = self.raw.layout.index(level, tx, ty);
-                self.raw.flag(idx).store(0, Ordering::Release);
+                self.raw.invalidate(self.raw.layout.index(level, tx, ty));
             }
         }
     }
@@ -436,7 +472,7 @@ impl TileStore {
     /// Invalidate every tile at every level.
     pub fn invalidate_all(&mut self) {
         for idx in 0..self.raw.layout.total_tiles {
-            self.raw.flag(idx).store(0, Ordering::Release);
+            self.raw.invalidate(idx);
         }
     }
 
@@ -654,7 +690,7 @@ mod tests {
         assert!(r.read_tile(0, 1, 1, &mut out));
         assert!(out.iter().all(|&v| v == 1.0));
 
-        // A rewrite clears the flag first (as write_tile does).
+        // Invalidation clears the valid bit (write_tile also does, first).
         s.invalidate_rect([256, 256, 257, 257]);
         assert!(!r.read_tile(0, 1, 1, &mut out));
         // Reader on another thread still sees it invalid.
@@ -668,6 +704,43 @@ mod tests {
         s.write_tile(0, 1, 1, &filled(g, 2.0)).unwrap();
         assert!(r.read_tile(0, 1, 1, &mut out));
         assert!(out.iter().all(|&v| v == 2.0));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reader_rejects_copy_straddling_complete_rewrite() {
+        let p = tmp("straddle");
+        let g = geom();
+        let mut s = TileStore::create(&p, g).unwrap();
+        s.write_tile(0, 2, 1, &filled(g, 1.0)).unwrap();
+        let r = TileReader::open(&p).unwrap();
+        let idx = r.raw.layout.index(0, 2, 1);
+        let mut out = filled(g, 0.0);
+
+        // A complete rewrite lands between the copy and the re-check: the
+        // copy holds the old data, the tile is valid again at both loads,
+        // yet the read must be rejected.
+        let mut new = filled(g, 2.0);
+        new[0] = 9.0;
+        assert!(!r.raw.read_tile_with(idx, &mut out, || {
+            s.write_tile(0, 2, 1, &new).unwrap();
+        }));
+        assert!(s.is_valid(0, 2, 1));
+        assert!(r.read_tile(0, 2, 1, &mut out));
+        assert!(out == new, "tile contents differ");
+
+        // So is an invalidation that lands mid-copy.
+        assert!(!r.raw.read_tile_with(idx, &mut out, || {
+            s.invalidate_rect([600, 300, 601, 301]);
+        }));
+        assert!(!r.read_tile(0, 2, 1, &mut out));
+
+        // The state entry: valid and even when stable, sequence advancing by
+        // two per write, valid bit cleared (sequence kept) on invalidate.
+        let e = r.raw.state(idx).load(Ordering::Acquire);
+        assert_eq!(e, 4, "two writes then an invalidate");
+        s.write_tile(0, 2, 1, &new).unwrap();
+        assert_eq!(r.raw.state(idx).load(Ordering::Acquire), VALID | 6);
         let _ = std::fs::remove_file(&p);
     }
 
