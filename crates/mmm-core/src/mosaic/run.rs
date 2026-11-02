@@ -398,28 +398,26 @@ pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<Ble
 
 /// Run a planned blend (any thread; no [`Mosaic`] needed); returns the
 /// tile-aligned rect blended (see [`blend_tiles`]). Once blending has
-/// started, the store is flushed before returning on every path (success,
-/// error or cancellation).
+/// started, the store is flushed before returning: wholly on success, its
+/// state table only on an error or cancellation (so a cancel stays quick).
 ///
 /// Loads the group's session, overlap graph, photometry and (when present)
 /// residual surfaces, as `mmm blend` does. An existing result store is
 /// opened under its writer lock first, before anything is loaded; it is
-/// (re)created when missing, unreadable, or of a different geometry. A
-/// store held by another writer fails with [`Error::Busy`]. While no store
-/// is locked (before a missing one is created, or while a mismatched one is
-/// recreated) a `set_*` can still land; [`Mosaic::apply_blend`] catches it. Callers must not let the
-/// recreation happen while readers ([`crate::tiles::TileReader`]) still have
-/// the store mapped: recreating truncates the file under their mapping. An
-/// existing store of matching geometry is never recreated.
+/// (re)created when missing, unparseable ([`Error::Format`]), or of a
+/// different geometry. A store held by another writer fails with
+/// [`Error::Busy`]; any other error opening it is returned as is (the file
+/// is never truncated for it). While no store is locked (before a missing
+/// one is created, or while a mismatched one is recreated) a `set_*` can
+/// still land; [`Mosaic::apply_blend`] catches it. Callers must not let the
+/// recreation happen while readers ([`crate::tiles::TileReader`]) still
+/// have the store mapped: recreating truncates the file under their
+/// mapping. An existing store of matching geometry is never recreated.
 pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
     let path = &plan.result_path;
     // Take an existing store's writer lock before anything else, so a
     // `set_*` from here on is refused busy rather than racing the blend.
-    let existing = match TileStore::open(path) {
-        Ok(s) => Some(s),
-        Err(e) if e.is_busy() => return Err(e),
-        Err(_) => None,
-    };
+    let existing = open_existing(path)?;
     let session = Session::open(&plan.session_dir)?;
     let graph = OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = Photometry::load(&session.photometry_path())?;
@@ -452,13 +450,43 @@ pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
         &mut store,
         ctl,
     );
-    // Flush here on the worker whatever happened (success, error, cancel),
-    // so the tiles written so far never wait for write-back on the owner
-    // thread (whose invalidation flushes only the state table).
-    let flushed = store.flush();
-    let aligned = blended?;
-    flushed?;
-    Ok(aligned)
+    finish_store(&store, blended)
+}
+
+/// Open the store at `path` under its writer lock: `None` if it is
+/// missing or not a readable store (wrong header or size —
+/// [`Error::Format`]), which callers may (re)create. Every other error —
+/// busy ([`Error::Busy`]), permissions, I/O — is returned: the file may
+/// hold a valid result that must not be truncated.
+fn open_existing(path: &Path) -> Result<Option<TileStore>> {
+    match TileStore::open(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(Error::Format { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Flush `store` after [`blend_tiles`] returned `blended`, then return it.
+///
+/// On success the whole mapping is flushed (tile data included), here on
+/// the worker, so it never waits for write-back on the owner thread. On
+/// an error or cancellation only the state table is flushed: writing back
+/// a big blend's tile data could take long, and a cancel must end within
+/// about a second (spec §8); the kernel writes the data back on its own.
+fn finish_store(store: &TileStore, blended: Result<[u64; 4]>) -> Result<[u64; 4]> {
+    match blended {
+        Ok(aligned) => {
+            store.flush()?;
+            Ok(aligned)
+        }
+        Err(e) => {
+            if let Err(f) = store.flush_state() {
+                tracing::warn!("result state not flushed after a failed blend: {f}");
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Blend `rect` (level-0 canvas coordinates; `None` = the whole canvas) of
@@ -511,19 +539,14 @@ fn all_result_stores(m: &Mosaic) -> Result<Vec<PathBuf>> {
 }
 
 /// Open (taking the writer lock) every store in `paths`, for invalidation.
-/// A missing or unparseable store is skipped: [`run_blend`] recreates it
-/// before use anyway. A store held by another writer fails the whole call
+/// A missing or unparseable store is skipped ([`open_existing`]):
+/// [`run_blend`] recreates it before use anyway. A store held by another writer fails the whole call
 /// with [`Error::Busy`] (as does any other I/O error), with every lock taken
 /// so far released.
 fn lock_stores(paths: &[PathBuf]) -> Result<Vec<TileStore>> {
     let mut out = Vec::new();
     for p in paths {
-        match TileStore::open(p) {
-            Ok(s) => out.push(s),
-            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(Error::Format { .. }) => {}
-            Err(e) => return Err(e),
-        }
+        out.extend(open_existing(p)?);
     }
     Ok(out)
 }
@@ -643,6 +666,58 @@ pub fn set_group_override(m: &mut Mosaic, group: &str, o: GroupOverride) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn geometry() -> TileGeometry {
+        TileGeometry {
+            width: 600,
+            height: 420,
+            channels: 3,
+            tile: TILE,
+        }
+    }
+
+    #[test]
+    fn failed_blend_flushes_only_the_state_table() {
+        let d = std::env::temp_dir().join(format!("mmm-run-finish-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let store = TileStore::create(&d.join(RESULT_FILE), geometry()).unwrap();
+        let err = finish_store(&store, Err(Error::Cancelled)).unwrap_err();
+        assert!(err.is_cancelled(), "{err}");
+        assert_eq!(store.full_flushes(), 0, "whole mapping flushed on cancel");
+        // Success keeps the full flush (tile data durable).
+        let rect = [0, 0, 600, 420];
+        assert_eq!(finish_store(&store, Ok(rect)).unwrap(), rect);
+        assert_eq!(store.full_flushes(), 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_missing_or_unparseable_store_is_recreated() {
+        let d = std::env::temp_dir().join(format!("mmm-run-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // Missing: create it.
+        assert!(open_existing(&d.join("missing")).unwrap().is_none());
+        // Not a store: recreate it.
+        let junk = d.join("junk");
+        std::fs::write(&junk, b"not a tile store").unwrap();
+        assert!(open_existing(&junk).unwrap().is_none());
+        // A valid store opens.
+        let good = d.join(RESULT_FILE);
+        drop(TileStore::create(&good, geometry()).unwrap());
+        assert!(open_existing(&good).unwrap().is_some());
+        // Any other error (here: the path is a directory) is propagated,
+        // never answered by truncating the file.
+        let dir = d.join("adir");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(open_existing(&dir).is_err());
+        // A store held by another writer is busy.
+        let held = TileStore::open(&good).unwrap();
+        assert!(open_existing(&good).err().is_some_and(|e| e.is_busy()));
+        drop(held);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn invalidate_flushes_only_the_state_table() {

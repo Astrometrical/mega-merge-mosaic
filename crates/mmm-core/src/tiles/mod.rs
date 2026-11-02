@@ -477,6 +477,10 @@ pub struct TileStore {
     /// Whole-mapping flushes so far (tests check invalidation avoids them).
     #[cfg(test)]
     full_flushes: std::sync::atomic::AtomicUsize,
+    /// Successful [`TileStore::read_tile`] copies so far (tests count the
+    /// tile data the parent rebuild reads).
+    #[cfg(test)]
+    copies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 // SAFETY: `raw.base` points into `map`, which moves with the struct (the
@@ -546,6 +550,8 @@ impl TileStore {
             map,
             #[cfg(test)]
             full_flushes: Default::default(),
+            #[cfg(test)]
+            copies: Default::default(),
         })
     }
 
@@ -610,8 +616,14 @@ impl TileStore {
     /// # Panics
     /// If the level or tile is out of range, or `out` is not one tile long.
     pub fn read_tile(&self, level: u32, tx: u32, ty: u32, out: &mut [f32]) -> bool {
-        self.raw
-            .read_tile(self.raw.layout.index(level, tx, ty), out)
+        let copied = self
+            .raw
+            .read_tile(self.raw.layout.index(level, tx, ty), out);
+        #[cfg(test)]
+        if copied {
+            self.copies.fetch_add(1, Ordering::Relaxed);
+        }
+        copied
     }
 
     /// The state of tile `(tx, ty)` at `level`, from its state entry alone
@@ -621,6 +633,13 @@ impl TileStore {
     /// If the level or tile is out of range.
     pub fn state(&self, level: u32, tx: u32, ty: u32) -> TileState {
         self.raw.tile_state(self.raw.layout.index(level, tx, ty))
+    }
+
+    /// Counter of successful [`TileStore::read_tile`] copies, shareable
+    /// with an observer while the store is borrowed.
+    #[cfg(test)]
+    pub(crate) fn copy_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.copies.clone()
     }
 
     /// Copy tile `(tx, ty)` at `level` into `out` whether valid or stale:

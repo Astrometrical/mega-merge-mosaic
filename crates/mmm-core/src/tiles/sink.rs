@@ -11,7 +11,7 @@ use crate::session::Session;
 use crate::settings::BlendSettings;
 use crate::surfaces::Surfaces;
 
-use super::TileStore;
+use super::{TileState, TileStore};
 
 /// A [`RowSink`] writing blended rows into the level-0 tiles of a rect.
 ///
@@ -212,17 +212,26 @@ pub fn build_parents(store: &mut TileStore, rect: [u64; 4], ctl: &JobCtl) -> Res
                 ctl.check()?;
                 row = Some(ty);
             }
-            let mut all_valid = true;
-            for (q, kid) in kids.iter_mut().enumerate() {
+            let child = |q: usize| {
                 let (cx, cy) = (2 * tx + (q as u32 & 1), 2 * ty + (q as u32 >> 1));
-                if cx >= cnx || cy >= cny {
-                    *kid = None;
-                    continue;
-                }
-                let buf = kid.get_or_insert_with(|| vec![0.0; tile_len]);
-                if !store.read_tile(level - 1, cx, cy, buf) {
-                    all_valid = false;
-                    break;
+                (cx < cnx && cy < cny).then_some((cx, cy))
+            };
+            // Check every in-image child before copying any, so a parent
+            // with an invalid child costs no tile copies.
+            let mut all_valid = (0..4).all(|q| {
+                child(q).is_none_or(|(cx, cy)| store.state(level - 1, cx, cy) == TileState::Valid)
+            });
+            if all_valid {
+                for (q, kid) in kids.iter_mut().enumerate() {
+                    let Some((cx, cy)) = child(q) else {
+                        *kid = None;
+                        continue;
+                    };
+                    let buf = kid.get_or_insert_with(|| vec![0.0; tile_len]);
+                    if !store.read_tile(level - 1, cx, cy, buf) {
+                        all_valid = false;
+                        break;
+                    }
                 }
             }
             if !all_valid {
@@ -321,7 +330,7 @@ pub fn blend_tiles(
         res
     })();
     if let Err(e) = blended {
-        keep_finished(store, aligned, written);
+        keep_finished(store, aligned, written, with_parents);
         return Err(e);
     }
     // Any error from here on leaves the store consistent: every level-0
@@ -343,17 +352,159 @@ pub fn blend_tiles(
 
 /// After a failed blend of `rect`: invalidate the level-0 tiles below the
 /// first `written` rows (not fully written by this run), then rebuild the
-/// parents over `rect` from whatever is valid.
-fn keep_finished(store: &mut TileStore, rect: [u64; 4], written: u64) {
+/// parents over rows `parents_built..written` only — the rows the sink
+/// wrote but did not get to rebuild parents over (its incremental rebuild
+/// was cancelled). Parents over earlier rows are already current, and
+/// parents over unfinished rows were invalidated by [`TileSink::new`] and
+/// stay so (a child of theirs is invalid), so a parent ends valid exactly
+/// when all its in-image children are, without re-reading finished tiles.
+fn keep_finished(store: &mut TileStore, rect: [u64; 4], written: u64, parents_built: u64) {
     let g = store.geometry();
-    let unfinished = [rect[0], (rect[1] + written).min(rect[3]), rect[2], rect[3]];
+    let done = (rect[1] + written).min(rect[3]);
+    let unfinished = [rect[0], done, rect[2], rect[3]];
     for (tx, ty) in g.tiles_in_rect(0, unfinished) {
         let idx = store.raw.layout.index(0, tx, ty);
         store.raw.invalidate(idx);
     }
-    // Not cancellable (the job's ctl is likely cancelled already), so
-    // `build_parents` only fails on a tile-length mismatch, impossible here;
-    // should it fail, parents it did not reach keep the invalidation
-    // `TileSink::new` gave them.
-    let _ = build_parents(store, rect, &JobCtl::none());
+    let from = (rect[1] + parents_built).min(done);
+    if from < done {
+        // Not cancellable (the job's ctl is likely cancelled already), so
+        // `build_parents` only fails on a tile-length mismatch, impossible
+        // here; should it fail, parents it did not reach keep the
+        // invalidation `TileSink::new` gave them.
+        let _ = build_parents(store, [rect[0], from, rect[2], done], &JobCtl::none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::analyze::analyze;
+    use crate::synth::{SynthSpec, generate};
+    use crate::tiles::{TILE, TileGeometry};
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mmm-sink-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn geometry(width: u64, height: u64) -> TileGeometry {
+        TileGeometry {
+            width,
+            height,
+            channels: 3,
+            tile: TILE,
+        }
+    }
+
+    #[test]
+    fn parent_with_invalid_child_copies_nothing() {
+        let d = tmp("nocopy");
+        let g = geometry(600, 420);
+        let mut store = TileStore::create(&d.join("s.mmmtile"), g).unwrap();
+        let data = vec![0.5; g.tile_len()];
+        // Level-1 tile (0,0) has children (0,0) (1,0) (0,1) (1,1); the last
+        // one, in copy order, stays invalid.
+        for (tx, ty) in [(0, 0), (1, 0), (0, 1)] {
+            store.write_tile(0, tx, ty, &data).unwrap();
+        }
+        let copies = store.copy_counter();
+        build_parents(&mut store, [0, 0, 512, 512], &JobCtl::none()).unwrap();
+        assert!(!store.is_valid(1, 0, 0));
+        assert_eq!(copies.load(Ordering::Relaxed), 0, "children copied");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancel_near_end_rereads_no_finished_tiles() {
+        let d = tmp("late-cancel");
+        let spec = SynthSpec {
+            canvas: (600, 1100),
+            channels: 3,
+            grid: (2, 2),
+            overlap_frac: 0.25,
+            n_stars: 40,
+            noise_sigma: 0.002,
+            panel_gain_range: (0.7, 1.4),
+            panel_offset_range: (-0.01, 0.02),
+            panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
+            panel_shift: vec![],
+            panel_spike_angle: vec![],
+            panel_defects: vec![],
+            mid_blobs: 0,
+            shift_blobs: false,
+            core: None,
+            seed: 7,
+        };
+        let res = generate(&spec, &d.join("panels")).unwrap();
+        let session = analyze(&res.panel_paths, &d.join("s.mmm-session")).unwrap();
+        let phot = Photometry::load(&session.photometry_path()).unwrap();
+        let graph = OverlapGraph::load(&session.overlap_graph_path()).unwrap();
+        let surf = Surfaces::load(&session.surfaces_path()).unwrap();
+        let g = geometry(600, 1100);
+        let mut store = TileStore::create(&d.join("r.mmmtile"), g).unwrap();
+
+        // Cancel once four of the five tile rows (and their parents) are
+        // written; count tile copies made after that point.
+        let copies = store.copy_counter();
+        let at_cancel = AtomicUsize::new(usize::MAX);
+        let tok = CancelToken::new();
+        let cancel = tok.clone();
+        let obs = |stage: &str, done: u64, _: u64| {
+            if stage == "blend" && done >= 1024 && !cancel.is_cancelled() {
+                at_cancel.store(copies.load(Ordering::Relaxed), Ordering::Relaxed);
+                cancel.cancel();
+            }
+        };
+        let ctl = JobCtl::new(tok, Some(&obs));
+        let err = blend_tiles(
+            &session,
+            &phot,
+            Some(&surf),
+            &graph,
+            &BlendSettings::default(),
+            None,
+            &mut store,
+            &ctl,
+        )
+        .unwrap_err();
+        assert!(err.is_cancelled(), "{err}");
+        assert_eq!(
+            copies.load(Ordering::Relaxed),
+            at_cancel.load(Ordering::Relaxed),
+            "finished tiles re-read after the cancel"
+        );
+
+        // The cancel contract: finished rows valid, the rest not, and a
+        // parent valid exactly when its in-image children are.
+        let (nx, ny) = g.tiles(0);
+        for ty in 0..ny {
+            for tx in 0..nx {
+                assert_eq!(store.is_valid(0, tx, ty), ty < 4, "({tx},{ty})");
+            }
+        }
+        for l in 1..g.levels() {
+            let (cnx, cny) = g.tiles(l - 1);
+            let (pnx, pny) = g.tiles(l);
+            for ty in 0..pny {
+                for tx in 0..pnx {
+                    let kids = (0..4).all(|q| {
+                        let (cx, cy) = (2 * tx + (q & 1), 2 * ty + (q >> 1));
+                        cx >= cnx || cy >= cny || store.is_valid(l - 1, cx, cy)
+                    });
+                    assert_eq!(store.is_valid(l, tx, ty), kids, "level {l} ({tx},{ty})");
+                }
+            }
+        }
+        assert!(store.valid_count(1) > 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
