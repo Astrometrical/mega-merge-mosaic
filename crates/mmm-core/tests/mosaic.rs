@@ -841,3 +841,74 @@ fn set_settings_is_one_save() {
         ["Ha", "OIII"]
     );
 }
+
+#[test]
+fn settings_edit_during_analyze_keeps_group_marked() {
+    let tmp = TempDir::new("raceana");
+    let mut m = two_group_mosaic(&tmp.0);
+    let plan = plan_analyze(&mut m).unwrap();
+    // Ha's analyze settings change while the run is in flight.
+    let o = GroupOverride {
+        analyze: AnalyzeOverride {
+            surface: Some(Some(1)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        set_group_override(&mut m, "Ha", o).unwrap(),
+        ChangeImpact::Reanalyze
+    );
+    let (outcome, res) = run_analyze(&plan, &JobCtl::none());
+    res.unwrap();
+    assert_eq!(outcome.completed, ["Ha", "OIII"]);
+    m.apply_analyze(&outcome).unwrap();
+
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(
+        saved.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Ha"],
+        "Ha was analysed with superseded settings"
+    );
+    let err = plan_blend(&m, "Ha", None).unwrap_err();
+    assert!(err.to_string().contains("analyze first"), "{err}");
+    plan_blend(&m, "OIII", None).unwrap();
+}
+
+#[test]
+fn settings_edit_between_plan_and_run_blend_is_caught() {
+    let tmp = TempDir::new("raceblend");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    // First with no store yet, then with an existing, fully valid one.
+    for round in 0..2 {
+        if round == 1 {
+            blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+            assert_fully_valid(&m.result_path("Ha"));
+        }
+        let provenance = m.config.provenance.len();
+        let plan = plan_blend(&m, "Ha", None).unwrap();
+        let new = BlendSettings {
+            feather_px: m.config.blend.feather_px + 10.0,
+            ..m.config.blend.clone()
+        };
+        assert_eq!(
+            set_blend_settings(&mut m, new).unwrap(),
+            ChangeImpact::Reblend
+        );
+        // The worker blends with the superseded settings...
+        let rect = run_blend(&plan, &JobCtl::none()).unwrap();
+        // ...and applying the result catches it.
+        let err = m.apply_blend(&plan, rect).unwrap_err();
+        assert!(
+            err.to_string().contains("changed during the blend"),
+            "{err}"
+        );
+        assert_eq!(valid0(&m.result_path("Ha")), 0, "round {round}");
+        assert_eq!(m.config.provenance.len(), provenance);
+        assert_eq!(
+            MosaicConfig::load(&m.dir).unwrap().provenance.len(),
+            provenance
+        );
+    }
+}

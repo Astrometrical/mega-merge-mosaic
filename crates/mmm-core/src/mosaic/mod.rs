@@ -17,13 +17,21 @@
 //!   thread ever saves the configuration.
 //! - **`set_*` is refused while a writer holds a store.** Each result store
 //!   has one [`crate::tiles::TileStore`] writer, enforced by a file lock;
-//!   every `set_*` (and [`plan_analyze`]) locks every store it would
-//!   invalidate *before* changing anything, and returns [`Error::Busy`]
-//!   with nothing changed if one is held — so a running blend can never
-//!   mark tiles valid that were blended with superseded settings.
-//! - **The app cancels and joins before applying settings.** A busy error
-//!   is the core's backstop, not the app's workflow: cancel the running
-//!   job, join it (dropping its store), then call `set_*`.
+//!   every `set_*` (and [`plan_analyze`]) locks every existing store it
+//!   would invalidate *before* changing anything, and returns
+//!   [`Error::Busy`] with nothing changed if one is held. [`run_blend`]
+//!   locks an existing store before loading anything.
+//! - **Apply guards the rest.** A `set_*` can still land while no store is
+//!   locked (during an analysis, or before a blend has created or locked
+//!   its store). [`Mosaic::apply_analyze`] keeps a group marked
+//!   `needs_analyze` if its analyze settings changed since the plan;
+//!   [`Mosaic::apply_blend`] invalidates the group's store and returns an
+//!   error if its blend settings changed or it was marked `needs_analyze`.
+//!   So tiles blended with superseded settings never stay valid once the
+//!   job is applied — an unapplied job's tiles carry no such guarantee.
+//! - **The app cancels and joins before applying settings.** That is the
+//!   app's workflow; busy refusal and the apply guards are the core's
+//!   backstop.
 //! - Readers must close before [`run_blend`] recreates a store (see
 //!   [`crate::tiles`]).
 

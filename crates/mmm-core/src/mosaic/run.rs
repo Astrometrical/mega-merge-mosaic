@@ -18,6 +18,7 @@
 //! <dir>/groups/<group dir>/result.mmmt   the group's tiled result
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -123,10 +124,17 @@ impl Mosaic {
     /// fingerprints of their panels, append the outcome's provenance, and
     /// save. Groups that did not complete stay in `needs_analyze`, so
     /// [`plan_blend`] keeps refusing them until the next analysis.
+    ///
+    /// A completed group whose effective analyze settings changed since it
+    /// was planned (a `set_*` landed during the run) also stays marked: it
+    /// was analysed with superseded settings.
     pub fn apply_analyze(&mut self, o: &AnalyzeOutcome) -> Result<()> {
         let mut next = self.config.clone();
         for group in &o.completed {
-            next.needs_analyze.remove(group);
+            let current = next.settings_for(group).0;
+            if o.analyzed.get(group) == Some(&current) {
+                next.needs_analyze.remove(group);
+            }
         }
         for (path, fp) in &o.fingerprints {
             for p in next.panels.iter_mut().filter(|p| &p.path == path) {
@@ -142,7 +150,26 @@ impl Mosaic {
     /// Record a finished [`run_blend`] of `plan` that blended `rect` (the
     /// aligned rect it returned): append a `"blend"` provenance entry
     /// (group, rect, settings) and save.
+    ///
+    /// If the group's effective blend settings no longer equal the plan's,
+    /// or the group was marked [`MosaicConfig::needs_analyze`] since (a
+    /// `set_*` landed between [`plan_blend`] and the run taking the store's
+    /// writer lock), the tiles just written are stale: the group's store is
+    /// invalidated, nothing is recorded, and an [`Error::Compute`] saying
+    /// the settings changed during the blend is returned ([`Error::Busy`]
+    /// if another writer holds the store).
     pub fn apply_blend(&mut self, plan: &BlendPlan, rect: [u64; 4]) -> Result<()> {
+        let group = &plan.group;
+        if self.config.settings_for(group).1 != plan.settings
+            || self.config.needs_analyze.contains(group)
+        {
+            let mut stores = lock_stores(std::slice::from_ref(&plan.result_path))?;
+            invalidate(&mut stores)?;
+            return Err(Error::compute(format!(
+                "settings for group '{group}' changed during the blend — its tiles were \
+                 invalidated; blend again"
+            )));
+        }
         let mut next = self.config.clone();
         next.push_provenance(
             "blend",
@@ -195,6 +222,9 @@ pub struct AnalyzePlan {
 pub struct AnalyzeOutcome {
     /// Groups whose analysis finished, in order.
     pub completed: Vec<String>,
+    /// The analyze settings each completed group was analysed with (checked
+    /// by [`Mosaic::apply_analyze`] against the settings current then).
+    pub analyzed: BTreeMap<String, AnalyzeSettings>,
     /// Fingerprints of the completed groups' panels, taken after analysis.
     pub fingerprints: Vec<(PathBuf, Fingerprint)>,
     /// Provenance to append: one `"analyze"` entry recording each group's
@@ -287,6 +317,7 @@ fn run_analyze_into(plan: &AnalyzePlan, ctl: &JobCtl, out: &mut AnalyzeOutcome) 
             .collect::<Result<Vec<_>>>()?;
         out.fingerprints.extend(fps);
         out.completed.push(g.name.clone());
+        out.analyzed.insert(g.name.clone(), g.settings.clone());
         detail.insert(g.name.clone(), json!(g.settings));
     }
     out.provenance.push(ProvenanceEntry::new(
@@ -360,14 +391,24 @@ pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<Ble
 /// tile-aligned rect blended (see [`blend_tiles`]).
 ///
 /// Loads the group's session, overlap graph, photometry and (when present)
-/// residual surfaces, as `mmm blend` does. The result store is opened under
-/// its writer lock if it exists with the canvas geometry; it is (re)created
-/// when missing, unreadable, or of a different geometry. A store held by
-/// another writer fails with [`Error::Busy`]. Callers must not let the
+/// residual surfaces, as `mmm blend` does. An existing result store is
+/// opened under its writer lock first, before anything is loaded; it is
+/// (re)created when missing, unreadable, or of a different geometry. A
+/// store held by another writer fails with [`Error::Busy`]. While no store
+/// is locked (before a missing one is created, or while a mismatched one is
+/// recreated) a `set_*` can still land; [`Mosaic::apply_blend`] catches it. Callers must not let the
 /// recreation happen while readers ([`crate::tiles::TileReader`]) still have
 /// the store mapped: recreating truncates the file under their mapping. An
 /// existing store of matching geometry is never recreated.
 pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
+    let path = &plan.result_path;
+    // Take an existing store's writer lock before anything else, so a
+    // `set_*` from here on is refused busy rather than racing the blend.
+    let existing = match TileStore::open(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.is_busy() => return Err(e),
+        Err(_) => None,
+    };
     let session = Session::open(&plan.session_dir)?;
     let graph = OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = Photometry::load(&session.photometry_path())?;
@@ -383,14 +424,9 @@ pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
         channels: channels as u32,
         tile: TILE,
     };
-    let path = &plan.result_path;
-    // A mismatched or unreadable store is dropped (unmapped) before `create`
+    // A mismatched store is dropped (unmapped, unlocked) before `create`
     // truncates the same file.
-    let existing = match TileStore::open(path) {
-        Ok(s) => Some(s).filter(|s| s.geometry() == geometry),
-        Err(e) if e.is_busy() => return Err(e),
-        Err(_) => None,
-    };
+    let existing = existing.filter(|s| s.geometry() == geometry);
     let mut store = match existing {
         Some(s) => s,
         None => TileStore::create(path, geometry)?,

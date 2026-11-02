@@ -866,11 +866,16 @@ below is UI-agnostic and the CLI is its first consumer.
   truncates under their mapping); a matching store is reopened, never
   recreated. Plan on the owner thread, run on a worker with no `Mosaic`,
   apply on the owner thread (only the owner saves `mosaic.json`). Every
-  `set_*` (and `plan_analyze`) locks every store it would invalidate before
-  changing anything and returns `Error::Busy` with nothing changed while a
-  writer holds one, so a running blend can never leave tiles blended with
-  superseded settings marked valid. The app cancels and joins a running
-  job before applying settings; busy is the core's backstop.
+  `set_*` (and `plan_analyze`) locks every existing store it would
+  invalidate before changing anything and returns `Error::Busy` with
+  nothing changed while a writer holds one; `run_blend` locks an existing
+  store before loading anything. A `set_*` landing while no store is locked
+  is caught at apply time: `apply_analyze` keeps a group marked
+  `needs_analyze` if its analyze settings changed since the plan, and
+  `apply_blend` invalidates the store and returns an error if the group's
+  blend settings changed or it was marked `needs_analyze`. The app cancels
+  and joins a running job before applying settings; busy refusal and the
+  apply guards are the core's backstop.
 - **Checks** (`checks`). Input checks (solution present, distortion model,
   scale mismatch, mixed channels, group count mismatch, filters differ
   ungrouped, ungrouped panels), file checks (changed or missing since added,
