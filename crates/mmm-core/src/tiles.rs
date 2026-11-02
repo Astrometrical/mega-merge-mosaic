@@ -33,12 +33,18 @@
 //! the mapping. The (single) writer bumps the sequence to odd and clears the
 //! valid bit (Release), writes the samples, then bumps the sequence to even
 //! and sets the valid bit (Release). Invalidation clears the valid bit
-//! without touching the samples. A reader loads the entry (Acquire) — it
+//! without touching the samples. A reader loads the entry (Relaxed, then an
+//! Acquire fence: read-only mappings only support Relaxed loads) — it
 //! must be even and valid — copies the samples, then (after an Acquire
 //! fence) loads the entry again; the copy counts only if the second load
 //! equals the first. Because every write and invalidation changes the entry,
 //! a copy that straddles any of them, including a complete rewrite, is
-//! rejected (barring exactly 2^30 rewrites during one copy).
+//! rejected (barring exactly 2^30 rewrites during one copy). The writing
+//! value is forced odd and the final value even, so an entry left odd by a
+//! crash mid-write is simply invalid and the next write recovers it.
+//!
+//! `open`/`create` reject geometries whose layout would overflow (tile edge
+//! over 65536, a tile grid wider than `u32`, or a file size beyond `isize`).
 //!
 //! Samples are themselves read and written as relaxed 32-bit atomics, so a
 //! racing copy is a well-defined (if possibly stale) read, never UB.
@@ -62,6 +68,8 @@ const PAGE: usize = 4096;
 const VALID: u32 = 1 << 31;
 /// Sequence bits of a tile state entry.
 const SEQ: u32 = !VALID;
+/// Largest supported tile edge.
+const MAX_TILE: u32 = 65536;
 
 /// Shape of a tile pyramid: the level-0 image size, channel count, and tile
 /// edge. All rectangles are exclusive `[x0, y0, x1, y1]`.
@@ -160,25 +168,55 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(g: TileGeometry) -> Self {
+    /// Validate `g` and derive its layout; `Err` explains an unsupported
+    /// geometry (zero sizes, a tile edge over `MAX_TILE`, a tile grid that
+    /// does not fit `u32`, or a file size that overflows `usize`).
+    fn new(g: TileGeometry) -> std::result::Result<Self, String> {
+        if g.tile == 0 || g.width == 0 || g.height == 0 || g.channels == 0 {
+            return Err("zero tile size, dimension, or channel count".into());
+        }
+        if g.tile > MAX_TILE {
+            return Err(format!("tile size {} exceeds {MAX_TILE}", g.tile));
+        }
+        let t = g.tile as u64;
+        // Level 0 has the largest grid; later levels only shrink.
+        if g.width.div_ceil(t) > u32::MAX as u64 || g.height.div_ceil(t) > u32::MAX as u64 {
+            return Err("tile grid does not fit in u32".into());
+        }
+        let overflow = || "geometry too large for this platform".to_string();
+        let tile_bytes = (g.channels as usize)
+            .checked_mul(g.tile as usize * g.tile as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(overflow)?;
         let levels = g.levels();
         let mut level_start = Vec::with_capacity(levels as usize);
         let mut total = 0usize;
         for l in 0..levels {
             level_start.push(total);
             let (tx, ty) = g.tiles(l);
-            total += tx as usize * ty as usize;
+            total = (tx as usize)
+                .checked_mul(ty as usize)
+                .and_then(|n| n.checked_add(total))
+                .ok_or_else(overflow)?;
         }
-        let data_off = HEADER_LEN + (total * 4).div_ceil(PAGE) * PAGE;
-        let file_len = data_off + total * g.tile_len() * 4;
-        Layout {
+        let table = total
+            .checked_mul(4)
+            .and_then(|n| n.checked_next_multiple_of(PAGE))
+            .ok_or_else(overflow)?;
+        let data_off = HEADER_LEN.checked_add(table).ok_or_else(overflow)?;
+        let file_len = total
+            .checked_mul(tile_bytes)
+            .and_then(|n| n.checked_add(data_off))
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or_else(overflow)?;
+        Ok(Layout {
             g,
             levels,
             level_start,
             total_tiles: total,
             data_off,
             file_len,
-        }
+        })
     }
 
     /// Global tile index; panics on an out-of-range level or tile.
@@ -225,10 +263,7 @@ impl Layout {
             height: u64_at(24),
             channels: u32_at(32),
         };
-        if g.tile == 0 || g.width == 0 || g.height == 0 || g.channels == 0 {
-            return Err(bad("zero tile size, dimension, or channel count"));
-        }
-        let layout = Layout::new(g);
+        let layout = Layout::new(g).map_err(|why| bad(&why))?;
         if u32_at(36) != layout.levels {
             return Err(bad("level count does not match geometry"));
         }
@@ -264,15 +299,18 @@ impl Raw {
     fn samples(&self, idx: usize) -> &[AtomicU32] {
         let n = self.layout.g.tile_len();
         let off = self.layout.data_off + idx * n * 4;
-        // SAFETY: `off + 4n <= file_len` (checked by Layout::parse / sized
-        // by create), `off` is a multiple of 4 from a page-aligned base, so
+        // SAFETY: `off + 4n <= file_len` (Layout::new computes file_len with
+        // checked arithmetic, parse checks the file is exactly that long and
+        // create sizes it so), `off` is a multiple of 4 from a page-aligned base, so
         // the AtomicU32s are aligned and in bounds; the mapping outlives
         // `self`. All sample accesses go through atomics.
         unsafe { std::slice::from_raw_parts(self.base.add(off) as *const AtomicU32, n) }
     }
 
     fn is_valid(&self, idx: usize) -> bool {
-        stable_valid(self.state(idx).load(Ordering::Acquire))
+        let e = self.state(idx).load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        stable_valid(e)
     }
 
     fn read_tile(&self, idx: usize, out: &mut [f32]) -> bool {
@@ -289,7 +327,10 @@ impl Raw {
             "tile buffer must hold channels × tile × tile samples"
         );
         let state = self.state(idx);
-        let first = state.load(Ordering::Acquire);
+        // Relaxed load + Acquire fence rather than an Acquire load: std only
+        // guarantees Relaxed atomic loads on read-only (reader) mappings.
+        let first = state.load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
         if !stable_valid(first) {
             return false;
         }
@@ -345,12 +386,7 @@ impl TileStore {
     /// truncating the file under a live mapping makes their accesses fault
     /// (`SIGBUS` on Unix). Drop every [`TileReader`] first.
     pub fn create(path: &Path, g: TileGeometry) -> Result<Self> {
-        if g.tile == 0 || g.width == 0 || g.height == 0 || g.channels == 0 {
-            return Err(Error::compute(
-                "tile store needs a non-zero tile size, image size, and channel count",
-            ));
-        }
-        let layout = Layout::new(g);
+        let layout = Layout::new(g).map_err(|why| Error::compute(format!("tile store: {why}")))?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -434,7 +470,9 @@ impl TileStore {
         // Single writer (`&mut self`), so load-then-store cannot race.
         let state = self.raw.state(idx);
         let seq = state.load(Ordering::Relaxed) & SEQ;
-        let writing = seq.wrapping_add(1) & SEQ;
+        // Always odd while writing, always even after, even if a crash
+        // mid-write left the persisted sequence odd.
+        let writing = (seq.wrapping_add(1) | 1) & SEQ;
         state.store(writing, Ordering::Release);
         // Keep the sample stores below from rising above the odd store.
         fence(Ordering::Release);
@@ -503,7 +541,8 @@ pub struct TileReader {
 }
 
 // SAFETY: `raw.base` points into `_map`, which lives as long as the struct
-// and whose memory never moves; the reader only performs atomic loads, so
+// and whose memory never moves; the reader only performs Relaxed atomic
+// loads (read-only memory permits nothing else), so
 // sharing or sending it across threads cannot race in the Rust model.
 unsafe impl Send for TileReader {}
 // SAFETY: as above.
@@ -514,8 +553,10 @@ impl TileReader {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(map_err(path))?;
         // SAFETY: a writer may modify the file concurrently through its own
-        // mapping; this side reads the shared bytes only through atomics (see
-        // the module docs), and the file is never resized while mapped.
+        // mapping; this side reads the shared bytes only through Relaxed
+        // atomic loads (each followed by an Acquire fence where ordering is
+        // needed — the only atomic access std supports on read-only memory),
+        // and the file is never resized while mapped.
         let map = unsafe { Mmap::map(&file) }.map_err(map_err(path))?;
         let layout = Layout::parse(path, &map)?;
         let raw = Raw {
@@ -737,10 +778,83 @@ mod tests {
 
         // The state entry: valid and even when stable, sequence advancing by
         // two per write, valid bit cleared (sequence kept) on invalidate.
-        let e = r.raw.state(idx).load(Ordering::Acquire);
+        let e = r.raw.state(idx).load(Ordering::Relaxed);
         assert_eq!(e, 4, "two writes then an invalidate");
         s.write_tile(0, 2, 1, &new).unwrap();
-        assert_eq!(r.raw.state(idx).load(Ordering::Acquire), VALID | 6);
+        assert_eq!(r.raw.state(idx).load(Ordering::Relaxed), VALID | 6);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn crash_mid_write_does_not_strand_tile() {
+        let p = tmp("crash");
+        let g = geom();
+        let mut s = TileStore::create(&p, g).unwrap();
+        s.write_tile(0, 0, 1, &filled(g, 1.0)).unwrap();
+        let idx = s.raw.layout.index(0, 0, 1);
+        // Simulate a crash after the odd store: entry left odd, not valid.
+        s.raw.state(idx).store(3, Ordering::Relaxed);
+        drop(s);
+        let mut s = TileStore::open(&p).unwrap();
+        assert!(!s.is_valid(0, 0, 1));
+        s.write_tile(0, 0, 1, &filled(g, 2.0)).unwrap();
+        assert!(s.is_valid(0, 0, 1));
+        let mut out = filled(g, 0.0);
+        assert!(TileReader::open(&p).unwrap().read_tile(0, 0, 1, &mut out));
+        // Sequence wrap: from the top of the 31-bit range, still valid.
+        s.raw.state(idx).store(SEQ, Ordering::Relaxed);
+        s.write_tile(0, 0, 1, &filled(g, 3.0)).unwrap();
+        assert!(s.is_valid(0, 0, 1));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn open_rejects_absurd_geometry() {
+        let p = tmp("absurd");
+        let g = geom();
+        // Rewrite a fresh, valid store's header fields, then reopen.
+        let patched = |fields: &[(usize, &[u8])]| {
+            drop(TileStore::create(&p, g).unwrap());
+            let mut f = std::fs::read(&p).unwrap();
+            for &(off, bytes) in fields {
+                f[off..off + bytes.len()].copy_from_slice(bytes);
+            }
+            std::fs::write(&p, &f).unwrap();
+            TileStore::open(&p).is_err() && TileReader::open(&p).is_err()
+        };
+        // Tile edge over the limit.
+        assert!(patched(&[(12, &u32::MAX.to_le_bytes())]));
+        // u32::MAX channels × a huge canvas overflow the file size.
+        assert!(patched(&[
+            (16, &(u64::MAX / 2).to_le_bytes()),
+            (32, &u32::MAX.to_le_bytes()),
+        ]));
+        // A grid that fits u32 but whose byte size overflows usize.
+        let side = (256u64 << 20).to_le_bytes();
+        assert!(patched(&[
+            (16, &side),
+            (24, &side),
+            (32, &u32::MAX.to_le_bytes())
+        ]));
+        let big = TileGeometry {
+            width: 256 << 20,
+            height: 256 << 20,
+            channels: u32::MAX,
+            tile: TILE,
+        };
+        assert!(Layout::new(big).unwrap_err().contains("too large"));
+        // u32::MAX channels alone: no overflow on 64-bit, but the file size
+        // no longer matches.
+        assert!(patched(&[(32, &u32::MAX.to_le_bytes())]));
+        // Tile grid wider than u32 with tile 1.
+        let huge = TileGeometry {
+            width: u64::MAX,
+            height: 1,
+            channels: 1,
+            tile: 1,
+        };
+        assert!(Layout::new(huge).is_err());
+        assert!(TileStore::create(&p, huge).is_err());
         let _ = std::fs::remove_file(&p);
     }
 
@@ -752,7 +866,8 @@ mod tests {
         let g = geom();
         drop(TileStore::create(&p, g).unwrap());
         let f = OpenOptions::new().write(true).open(&p).unwrap();
-        f.set_len(Layout::new(g).file_len as u64 - 4).unwrap();
+        f.set_len(Layout::new(g).unwrap().file_len as u64 - 4)
+            .unwrap();
         assert!(TileStore::open(&p).is_err());
         let _ = std::fs::remove_file(&p);
     }
