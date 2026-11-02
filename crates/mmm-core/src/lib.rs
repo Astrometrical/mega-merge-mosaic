@@ -46,6 +46,8 @@
 //!   ([`tiles::TileStore`]) while viewers read it ([`tiles::TileReader`]);
 //!   [`tiles::blend_tiles`] blends a canvas rect into it and rebuilds the
 //!   parent levels, cancellably.
+//! - [`mosaic`] — the mosaic project: `mosaic.json` configuration, panel
+//!   grouping rules and the on-disk session layout.
 //! - [`stretch`] — display stretch maths: per-channel median/MAD statistics
 //!   and an auto stretch (display only; the data stays linear).
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
@@ -64,6 +66,7 @@ pub mod analyze;
 pub mod astrometry;
 pub(crate) mod band_cache;
 pub mod blend;
+pub mod checks;
 pub mod decoded;
 pub mod diag;
 pub mod error;
@@ -72,6 +75,7 @@ pub mod formats;
 pub mod ipc;
 pub mod job;
 pub mod linalg;
+pub mod mosaic;
 pub mod output;
 pub mod overlap;
 pub mod panel_reader;
