@@ -41,6 +41,9 @@
 //!   reporting, and a cancellable [`blend::RowSink`] wrapper.
 //! - [`settings`] — serialisable analyze/blend settings, per-group overrides,
 //!   and the [`settings::ChangeImpact`] of editing them.
+//! - [`tiles`] — the memory-mapped tiled result store: a multi-level tile
+//!   pyramid with per-tile validity flags, written by a background blend
+//!   ([`tiles::TileStore`]) while viewers read it ([`tiles::TileReader`]).
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
 //!   and benchmarks (in-tree and downstream) never need multi-GB real data.
 //!
@@ -77,5 +80,6 @@ pub mod settings;
 pub mod summary;
 pub mod surfaces;
 pub mod synth;
+pub mod tiles;
 
 pub use error::{Error, Result};
