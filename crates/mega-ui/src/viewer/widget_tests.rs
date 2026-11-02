@@ -103,17 +103,21 @@ fn task6_bound() -> usize {
 
 #[test]
 fn requests_independent_of_canvas_size() {
+    let mut counts = Vec::new();
     for size in [10_000u64, 1_000_000] {
         let src = TestSource::new(size, size);
-        let mut h = harness(TiledViewer::new(src.clone(), 0));
+        let mut h = harness(TiledViewer::new_synchronous(src.clone()));
         h.run();
         assert!(!h.state().is_loading());
         let (rect, now) = h.state().last_frame().unwrap();
         assert!(h.state().view().is_settled(now));
         let fetched = src.fetched();
-        let levels: HashSet<u32> = fetched.iter().map(|k| k.level).collect();
         assert!(!fetched.is_empty());
-        assert!(levels.len() <= 2, "{levels:?}");
+        // Every level from the top down to the drawn one, and no other.
+        let levels: HashSet<u32> = fetched.iter().map(|k| k.level).collect();
+        let top = src.geom.levels - 1;
+        let drawn = *levels.iter().min().unwrap();
+        assert_eq!(levels, (drawn..=top).collect::<HashSet<u32>>());
         let bound = task6_bound() * levels.len();
         assert!(
             fetched.len() <= bound,
@@ -125,7 +129,167 @@ fn requests_independent_of_canvas_size() {
         assert_eq!(unique.len(), fetched.len());
         let wanted: HashSet<TileKey> = h.state().wanted_tiles(rect, now).into_iter().collect();
         assert_eq!(unique, wanted);
+        // Drawn-level tiles dominate: each coarser level has about a quarter
+        // as many (~4/3 in total), plus rounding at the grid edges.
+        let fine = fetched.iter().filter(|k| k.level == drawn).count();
+        assert!(fetched.len() <= fine * 2, "{} vs {fine}", fetched.len());
+        counts.push(fetched.len());
     }
+    // A 10^4 x larger canvas costs no more than a small constant extra.
+    assert!(counts[1] <= counts[0] + task6_bound() * 2, "{counts:?}");
+}
+
+#[test]
+fn texture_filter_by_level() {
+    use egui::TextureFilter::{Linear, Nearest};
+    let t0 = texture_options(0);
+    assert_eq!((t0.magnification, t0.minification), (Nearest, Linear));
+    for level in 1..5 {
+        let t = texture_options(level);
+        assert_eq!((t.magnification, t.minification), (Linear, Linear));
+    }
+}
+
+#[test]
+fn old_missing_does_not_block_ancestor() {
+    let src = TestSource::new(20_000, 20_000);
+    let mut v = TiledViewer::new_synchronous(src.clone());
+    let ctx = egui::Context::default();
+    let tex = ctx.load_texture(
+        "t",
+        ColorImage::new([1, 1], vec![Color32::WHITE]),
+        egui::TextureOptions::LINEAR,
+    );
+    let leaf = TileKey {
+        level: 0,
+        tx: 4,
+        ty: 4,
+    };
+    let mid = TileKey {
+        level: 1,
+        tx: 2,
+        ty: 2,
+    };
+    let coarse = TileKey {
+        level: 2,
+        tx: 1,
+        ty: 1,
+    };
+    v.cache.insert(
+        mid,
+        1,
+        CachedTile {
+            texture: None,
+            stale: false,
+        },
+    );
+    v.cache.insert(
+        coarse,
+        1,
+        CachedTile {
+            texture: Some(tex.clone()),
+            stale: false,
+        },
+    );
+    // At generation 1 the Missing tile is current: background.
+    assert!(matches!(v.loaded_ancestor(leaf, 1), Some((None, _, _))));
+    // At generation 2 it is an old result: draw the valid coarser tile.
+    let (found, _, rect) = v.loaded_ancestor(leaf, 2).expect("ancestor");
+    assert_eq!(found, Some(tex.id()));
+    assert_eq!(rect, v.tile_image_rect(coarse));
+}
+
+/// A source whose fetches block until `gate` is released.
+struct GatedSource {
+    inner: Arc<TestSource>,
+    gate: Mutex<()>,
+}
+
+impl TileSource for GatedSource {
+    fn geometry(&self) -> PyramidGeometry {
+        self.inner.geometry()
+    }
+    fn generation(&self) -> u64 {
+        self.inner.generation()
+    }
+    fn fetch(&self, key: TileKey) -> Fetched {
+        let _g = self.gate.lock().unwrap();
+        self.inner.fetch(key)
+    }
+}
+
+#[test]
+fn hung_fetch_does_not_spin_repaints() {
+    let src = Arc::new(GatedSource {
+        inner: TestSource::new(20_000, 20_000),
+        gate: Mutex::new(()),
+    });
+    let gate = src.gate.lock().unwrap();
+    let mut h = Harness::builder()
+        .with_size(SCREEN)
+        .with_max_steps(10)
+        .build_ui_state(
+            |ui, v: &mut TiledViewer| {
+                v.show(ui);
+            },
+            TiledViewer::new(src.clone(), 1),
+        );
+    // Settled view, fetch stuck: the frame loop goes idle.
+    let steps = h.run();
+    assert!(steps <= 3, "{steps}");
+    assert!(h.state().is_loading());
+    drop(gate);
+    // Once released, the loader wakes the UI and tiles arrive.
+    for _ in 0..2000 {
+        h.step();
+        if !h.state().is_loading() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(!h.state().is_loading());
+}
+
+/// Records which threads fetched.
+struct ThreadSource {
+    inner: Arc<TestSource>,
+    threads: Mutex<HashSet<std::thread::ThreadId>>,
+}
+
+impl TileSource for ThreadSource {
+    fn geometry(&self) -> PyramidGeometry {
+        self.inner.geometry()
+    }
+    fn generation(&self) -> u64 {
+        self.inner.generation()
+    }
+    fn fetch(&self, key: TileKey) -> Fetched {
+        self.threads
+            .lock()
+            .unwrap()
+            .insert(std::thread::current().id());
+        self.inner.fetch(key)
+    }
+}
+
+#[test]
+fn zero_loader_threads_still_never_fetch_on_ui_thread() {
+    let src = Arc::new(ThreadSource {
+        inner: TestSource::new(20_000, 20_000),
+        threads: Mutex::new(HashSet::new()),
+    });
+    let mut h = harness(TiledViewer::new(src.clone(), 0));
+    for _ in 0..2000 {
+        h.step();
+        if !h.state().is_loading() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(!h.state().is_loading());
+    let threads = src.threads.lock().unwrap();
+    assert!(!threads.is_empty());
+    assert!(!threads.contains(&std::thread::current().id()));
 }
 
 #[test]
@@ -143,7 +307,7 @@ fn stale_tiles_drawn_dimmed() {
     // the border-colour hatch.
     let src = TestSource::new(5000, 5000);
     *src.all.lock().unwrap() = Some(Kind::Stale);
-    let mut h = harness(TiledViewer::new(src, 0));
+    let mut h = harness(TiledViewer::new_synchronous(src));
     h.run();
     let mut dimmed = 0;
     let mut hatch = 0;
@@ -167,7 +331,7 @@ fn stale_tiles_drawn_dimmed() {
 #[test]
 fn generation_change_refetches_visible_only() {
     let src = TestSource::new(20_000, 20_000);
-    let mut h = harness(TiledViewer::new(src.clone(), 0));
+    let mut h = harness(TiledViewer::new_synchronous(src.clone()));
     h.run();
     let home: HashSet<TileKey> = src.fetched().into_iter().collect();
     h.state_mut().zoom_in();
@@ -191,7 +355,7 @@ fn generation_change_refetches_visible_only() {
 #[test]
 fn home_button_fits() {
     let src = TestSource::new(20_000, 10_000);
-    let mut h = harness(TiledViewer::new(src, 0));
+    let mut h = harness(TiledViewer::new_synchronous(src));
     h.run();
     let (c0, z0) = centre_zoom(h.state());
     assert!((c0.0 - 10_000.0).abs() < 1e-6 && (c0.1 - 5_000.0).abs() < 1e-6);
@@ -231,7 +395,7 @@ fn home_button_fits() {
 #[test]
 fn drag_pans() {
     let src = TestSource::new(20_000, 10_000);
-    let mut h = harness(TiledViewer::new(src, 0));
+    let mut h = harness(TiledViewer::new_synchronous(src));
     h.run();
     let (c0, z0) = centre_zoom(h.state());
     h.drag_at(Pos2::new(600.0, 400.0));
@@ -249,7 +413,7 @@ fn drag_pans() {
 #[test]
 fn scroll_zooms_about_cursor() {
     let src = TestSource::new(20_000, 10_000);
-    let mut h = harness(TiledViewer::new(src, 0));
+    let mut h = harness(TiledViewer::new_synchronous(src));
     h.run();
     let (rect, now) = h.state().last_frame().unwrap();
     let cursor = Pos2::new(300.0, 200.0);
@@ -292,7 +456,7 @@ fn threaded_loader_fills_visible_tiles() {
 #[test]
 fn set_source_rehomes_on_new_geometry() {
     let src = TestSource::new(20_000, 10_000);
-    let mut h = harness(TiledViewer::new(src, 0));
+    let mut h = harness(TiledViewer::new_synchronous(src));
     h.run();
     let other = TestSource::new(4_000, 4_000);
     h.state_mut().set_source(other.clone());
@@ -306,7 +470,7 @@ fn set_source_rehomes_on_new_geometry() {
 fn missing_tiles_draw_background() {
     let src = TestSource::new(5000, 5000);
     *src.all.lock().unwrap() = Some(Kind::Missing);
-    let mut h = harness(TiledViewer::new(src.clone(), 0));
+    let mut h = harness(TiledViewer::new_synchronous(src.clone()));
     h.run();
     assert!(!h.state().is_loading());
     let textured = h.output().shapes.iter().any(|cs| {
@@ -331,7 +495,7 @@ fn double_click_zooms_in_about_point() {
             |ui, v: &mut TiledViewer| {
                 v.show(ui);
             },
-            TiledViewer::new(src, 0),
+            TiledViewer::new_synchronous(src),
         );
     h.run();
     let (rect, now) = h.state().last_frame().unwrap();

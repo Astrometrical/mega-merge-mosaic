@@ -8,7 +8,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use egui::{
     Color32, Event, MouseWheelUnit, Pos2, Rect, Sense, Stroke, TextureHandle, TextureId,
@@ -62,6 +62,8 @@ struct Queue {
 struct Shared {
     queue: Mutex<Queue>,
     wake: Condvar,
+    /// The UI context, woken after each finished fetch.
+    ctx: OnceLock<egui::Context>,
 }
 
 impl Shared {
@@ -76,8 +78,10 @@ struct Loader {
     tx: Sender<Loaded>,
     rx: Receiver<Loaded>,
     source: Arc<dyn TileSource>,
-    /// Threads running; 0 = fetch synchronously in `show` (tests).
+    /// Loader threads asked for.
     threads: usize,
+    /// Fetch on the calling thread inside `show` (tests only).
+    synchronous: bool,
 }
 
 fn fetch_guarded(source: &dyn TileSource, key: TileKey) -> Fetched {
@@ -86,30 +90,36 @@ fn fetch_guarded(source: &dyn TileSource, key: TileKey) -> Fetched {
 }
 
 impl Loader {
-    fn new(source: Arc<dyn TileSource>, threads: usize) -> Self {
+    fn new(source: Arc<dyn TileSource>, threads: usize, synchronous: bool) -> Self {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 items: VecDeque::new(),
                 shutdown: false,
             }),
             wake: Condvar::new(),
+            ctx: OnceLock::new(),
         });
         let (tx, rx) = channel();
-        let mut spawned = 0;
-        for i in 0..threads {
+        let spawn = if synchronous { 0 } else { threads };
+        for i in 0..spawn {
             let (shared, tx, source) = (shared.clone(), tx.clone(), source.clone());
-            let ok = std::thread::Builder::new()
+            if let Err(e) = std::thread::Builder::new()
                 .name(format!("mega-ui-tile-loader-{i}"))
                 .spawn(move || Self::worker(&shared, &tx, &*source))
-                .is_ok();
-            spawned += usize::from(ok);
+            {
+                // Requests stay queued for the threads that did start (if
+                // none did, tiles never load); never fall back to fetching on
+                // the UI thread.
+                tracing::error!("tile loader thread {i} failed to start: {e}");
+            }
         }
         Self {
             shared,
             tx,
             rx,
             source,
-            threads: spawned,
+            threads,
+            synchronous,
         }
     }
 
@@ -131,6 +141,9 @@ impl Loader {
             if tx.send((key, generation, fetched)).is_err() {
                 return;
             }
+            if let Some(ctx) = shared.ctx.get() {
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -139,10 +152,15 @@ impl Loader {
         self.shared.lock().items.drain(..).collect()
     }
 
-    /// Queue `items` (in order) and wake the loaders; with no loader threads,
+    /// Remember the UI context so loaders can wake it.
+    fn set_ctx(&self, ctx: &egui::Context) {
+        self.shared.ctx.get_or_init(|| ctx.clone());
+    }
+
+    /// Queue `items` (in order) and wake the loaders; in synchronous mode,
     /// fetch them now.
     fn set_queue(&self, items: Vec<Request>) {
-        if self.threads == 0 {
+        if self.synchronous {
             for (key, generation) in items {
                 let fetched = fetch_guarded(&*self.source, key);
                 let _ = self.tx.send((key, generation, fetched));
@@ -195,14 +213,23 @@ pub struct TiledViewer {
 }
 
 impl TiledViewer {
-    /// A viewer over `source` with `loader_threads` background loaders. With
-    /// 0 loader threads tiles are fetched synchronously inside
-    /// [`TiledViewer::show`], which is deterministic but blocks the UI thread:
-    /// meant for tests only.
+    /// A viewer over `source` with `loader_threads` background loaders (at
+    /// least one). Fetches never run on the UI thread.
     pub fn new(source: Arc<dyn TileSource>, loader_threads: usize) -> Self {
+        Self::build(source, loader_threads.max(1), false)
+    }
+
+    /// Test-only: a viewer that fetches synchronously inside
+    /// [`TiledViewer::show`], with no loader threads. Deterministic, but it
+    /// blocks the UI thread on every fetch; never use it in an app.
+    pub fn new_synchronous(source: Arc<dyn TileSource>) -> Self {
+        Self::build(source, 0, true)
+    }
+
+    fn build(source: Arc<dyn TileSource>, threads: usize, synchronous: bool) -> Self {
         Self {
             geom: source.geometry(),
-            loader: Loader::new(source.clone(), loader_threads),
+            loader: Loader::new(source.clone(), threads, synchronous),
             source,
             view: View::new(),
             cache: TileCache::new(DEFAULT_CAPACITY),
@@ -222,7 +249,7 @@ impl TiledViewer {
             self.needs_home = true;
         }
         self.geom = geom;
-        self.loader = Loader::new(source.clone(), self.loader.threads);
+        self.loader = Loader::new(source.clone(), self.loader.threads, self.loader.synchronous);
         self.source = source;
         self.cache.clear();
         self.requested.clear();
@@ -267,16 +294,17 @@ impl TiledViewer {
         (level, visible_tiles(&self.geom, level, r))
     }
 
-    /// Tiles requested for `rect` at `now`, coarse to fine: the coarsest
-    /// level (an always-available fallback) then the level drawn.
+    /// Tiles requested for `rect` at `now`, coarse to fine: every level from
+    /// the top down to the one drawn (progressive refinement; each coarser
+    /// level adds about a quarter of the drawn level's count).
     pub(crate) fn wanted_tiles(&self, rect: Rect, now: f64) -> Vec<TileKey> {
         let (level, fine) = self.fine_tiles(rect, now);
         let top = self.geom.levels.saturating_sub(1);
-        if level == top {
-            return fine;
-        }
         let r = self.view.visible_image_rect(rect, now);
-        let mut out = visible_tiles(&self.geom, top, r);
+        let mut out = Vec::new();
+        for l in (level + 1..=top).rev() {
+            out.extend(visible_tiles(&self.geom, l, r));
+        }
         out.extend(fine);
         out
     }
@@ -306,12 +334,15 @@ impl TiledViewer {
 
         let generation = self.source.generation();
         let wanted = self.wanted_tiles(rect, now);
+        self.loader.set_ctx(ui.ctx());
         self.request(&wanted, generation);
-        self.receive(ui.ctx());
-        self.paint(&ui.painter_at(rect), rect, now);
+        let backlog = self.receive(ui.ctx());
+        self.paint(&ui.painter_at(rect), rect, now, generation);
         self.overlay_buttons(ui, rect);
 
-        if !self.view.is_settled(now) || self.is_loading() || !self.commands.is_empty() {
+        // Loaders wake the UI when a tile arrives; repaint here only for
+        // motion, pending commands and an upload backlog.
+        if !self.view.is_settled(now) || !self.commands.is_empty() || backlog {
             ui.ctx().request_repaint();
         }
         ViewerResponse {
@@ -368,7 +399,8 @@ impl TiledViewer {
     }
 
     /// Upload finished tiles, at most [`MAX_UPLOADS_PER_FRAME`] textures.
-    fn receive(&mut self, ctx: &egui::Context) {
+    /// Returns true if the cap was hit (more results may be waiting).
+    fn receive(&mut self, ctx: &egui::Context) -> bool {
         let mut uploads = 0;
         while uploads < MAX_UPLOADS_PER_FRAME {
             let Ok((key, generation, fetched)) = self.loader.rx.try_recv() else {
@@ -378,7 +410,7 @@ impl TiledViewer {
             let mut upload = |img: egui::ColorImage| {
                 uploads += 1;
                 let name = format!("tile-{}-{}-{}", key.level, key.tx, key.ty);
-                Some(ctx.load_texture(name, img, texture_options()))
+                Some(ctx.load_texture(name, img, texture_options(key.level)))
             };
             let tile = match fetched {
                 Fetched::Valid(img) => CachedTile {
@@ -396,6 +428,7 @@ impl TiledViewer {
             };
             self.cache.insert(key, generation, tile);
         }
+        uploads >= MAX_UPLOADS_PER_FRAME
     }
 
     /// Image rect (level-0 pixels) covered by `key`.
@@ -413,14 +446,21 @@ impl TiledViewer {
         ]
     }
 
-    /// Nearest loaded tile at or above `key`: its texture (if not `Missing`),
-    /// stale flag and image rect.
-    fn loaded_ancestor(&mut self, key: TileKey) -> Option<(Option<TextureId>, bool, [f64; 4])> {
+    /// Nearest loaded tile at or above `key`: its texture (`None` for a
+    /// current `Missing`), stale flag and image rect. A `Missing` from an
+    /// older generation is skipped so it never hides a coarser image.
+    pub(crate) fn loaded_ancestor(
+        &mut self,
+        key: TileKey,
+        generation: u64,
+    ) -> Option<(Option<TextureId>, bool, [f64; 4])> {
         let mut k = key;
         loop {
-            if let Some((_, tile)) = self.cache.get(k) {
+            if let Some((g, tile)) = self.cache.get(k) {
                 let found = (tile.texture.as_ref().map(TextureHandle::id), tile.stale);
-                return Some((found.0, found.1, self.tile_image_rect(k)));
+                if found.0.is_some() || g == generation {
+                    return Some((found.0, found.1, self.tile_image_rect(k)));
+                }
             }
             if k.level + 1 >= self.geom.levels {
                 return None;
@@ -435,11 +475,11 @@ impl TiledViewer {
 
     /// Coarse to fine: each visible tile of the drawn level shows itself or
     /// the matching sub-rect of its nearest loaded ancestor.
-    fn paint(&mut self, painter: &egui::Painter, rect: Rect, now: f64) {
+    fn paint(&mut self, painter: &egui::Painter, rect: Rect, now: f64, generation: u64) {
         painter.rect_filled(rect, 0.0, palette::SURFACE_900);
         let (_, fine) = self.fine_tiles(rect, now);
         for key in fine {
-            let Some((Some(tex), stale, a)) = self.loaded_ancestor(key) else {
+            let Some((Some(tex), stale, a)) = self.loaded_ancestor(key, generation) else {
                 continue; // nothing loaded, or Missing: background shows
             };
             let c = self.tile_image_rect(key);
@@ -482,12 +522,19 @@ impl TiledViewer {
     }
 }
 
-/// Texture sampling: smooth when minified, crisp pixels when magnified.
-fn texture_options() -> TextureOptions {
-    TextureOptions {
-        magnification: egui::TextureFilter::Nearest,
-        minification: egui::TextureFilter::Linear,
-        ..TextureOptions::LINEAR
+/// Texture sampling for a tile of `level`. Only level 0 is ever magnified as
+/// the drawn level (zoom > 1), so it gets crisp `Nearest` magnification;
+/// every other level is magnified only as a stretched ancestor fallback (or
+/// minified when drawn) and is sampled `Linear`.
+pub(crate) fn texture_options(level: u32) -> TextureOptions {
+    if level == 0 {
+        TextureOptions {
+            magnification: egui::TextureFilter::Nearest,
+            minification: egui::TextureFilter::Linear,
+            ..TextureOptions::LINEAR
+        }
+    } else {
+        TextureOptions::LINEAR
     }
 }
 

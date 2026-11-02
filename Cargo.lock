@@ -683,6 +683,7 @@ version = "1.7.0"
 dependencies = [
  "egui",
  "egui_kittest",
+ "tracing",
 ]
 
 [[package]]
