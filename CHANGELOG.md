@@ -14,13 +14,17 @@ to the output of existing commands.
   mosaic-wide or for one group (`--group`) and reports which cached results
   the change makes stale. `mmm check` lists the groups and every input,
   file and analysis check, by severity. `mmm run` analyzes every group onto
-  the shared frame and writes one FITS (and optional PNG) per group.
+  the shared frame and writes one FITS (and optional PNG) per group; each
+  run re-analyses and re-blends every group. `init` and `set` refuse a
+  `--feather` that is not a finite number greater than 0, and `check`
+  reports a group whose cached analysis cannot be read instead of stopping.
   Existing single-group session directories keep working with
   `analyze`, `blend` and `report`; those commands refuse a mosaic directory
   and point at `run` / `check`.
 - **Tiled result store** (`result.mmmt`) in `mmm-core`: a memory-mapped
   multi-level tile pyramid with per-tile validity and torn-read protection,
-  so a viewer can read a blend while it is still being written.
+  so a viewer can read a blend while it is still being written (stale tiles
+  included); a cancelled blend keeps the tiles it finished.
 - **Job control** in `mmm-core`: cancellation tokens, progress reporting and
   cancellable analyze and blend.
 - **Serialisable settings** with per-group overrides and change-impact

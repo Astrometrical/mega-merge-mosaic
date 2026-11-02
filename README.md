@@ -115,7 +115,8 @@ releases are cut).
 
 All commands accept `-v` / `-vv` for debug/trace logging and `--no-banner`
 to suppress the startup banner (printed to stderr; useful when a frontend
-parses the output). `--session` defaults to `mosaic.mmm-session` for `analyze`, `report` and `blend`.
+parses the output). `--session` defaults to `mosaic.mmm-session` for
+`analyze`, `report` and `blend`.
 
 ### `mmm info <panels…> [--stats]`
 
@@ -182,14 +183,19 @@ default.
 | `-s, --session <DIR>` | required | Mosaic directory to create |
 | `--group-by header:KEY\|token:KEYWORD` | — | Split panels into groups blended separately on one shared frame: by a header keyword's value (e.g. `header:FILTER`) or by the file-name token after a keyword (e.g. `token:FILTER` for `..._FILTER-Ha_...`) |
 | `--force` | off | Replace a mosaic already in the directory, discarding its cached analysis |
-| `--surface`, `--input`, `--gain` | as `analyze` | Analyze settings |
-| `--mode`, `--feather`, `--defect-veto`, `--flatten` | as `blend` | Blend settings |
+| `--surface`, `--input`, `--gain` | — | Analyze settings, values as for `analyze` |
+| `--mode`, `--feather`, `--defect-veto`, `--flatten` | — | Blend settings, values as for `blend`; `--feather` must be a finite number greater than 0 |
+
+The settings flags of `init` and `set` have no defaults of their own: a flag
+not given leaves the setting at its built-in value (`init`, the same values
+`analyze` and `blend` default to) or at its current value (`set`).
 
 ### `mmm set -s <DIR> [--group <NAME>] [settings]`
 
 Change settings mosaic-wide, or for one group with `--group`. Takes the same
-settings flags as `init`; flags not given are left unchanged. Prints what the
-change makes stale (`none`, `reblend` or `reanalyze`).
+settings flags as `init`; flags not given are left unchanged, and at least
+one is required (otherwise it fails with "nothing to set" and lists them).
+Prints what the change makes stale (`none`, `reblend` or `reanalyze`).
 
 ### `mmm check -s <DIR>`
 
@@ -200,7 +206,9 @@ with a suggested remedy for each.
 ### `mmm run -s <DIR> -o <OUTDIR> [options]`
 
 Analyze every group onto one shared frame and blend each group to
-`OUTDIR/<group dir>.fits`.
+`OUTDIR/<group dir>.fits`. Every run re-analyses and re-blends every group;
+the blend streams straight to FITS, as `blend` does, and does not write the
+session's tiled result (`result.mmmt`, which the app fills).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -221,8 +229,10 @@ mmm check -s orion.mmm-session                           # review warnings
 mmm run -s orion.mmm-session -o out/ --png               # out/<group>.fits
 ```
 
-Cached analysis lives in the session directory, so re-running `run` after
-`set` recomputes only what the change made stale.
+All analysis is cached in the session directory, and `set` records which
+groups a change makes stale. `run` itself does not use that yet: it
+re-analyses and re-blends every group each time. Stale tracking serves the
+upcoming app, which reblends only what a change affects.
 
 ## Worked examples
 

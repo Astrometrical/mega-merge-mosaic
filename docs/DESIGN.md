@@ -241,7 +241,8 @@ A **mosaic session** (`mmm init`, 2026-11) wraps one such session per group:
                             # accepted check keys
   reference.mmm-frame.json  # the shared frame all groups adopt
   groups/<dir>/             # an ordinary session in the layout above
-  groups/<dir>/result.mmmt  # tiled result store (see "Standalone app groundwork")
+  groups/<dir>/result.mmmt  # tiled result store (see "Standalone app groundwork");
+                            # written by blend_group (the app), not `mmm run`
 ```
 
 `<dir>` is a filesystem-safe, case-insensitively unique form of the group
@@ -274,8 +275,11 @@ mmm run -s DIR -o OUTDIR [--png] [--wcs-frame topdown|flipped]
 ```
 
 `init`/`set`/`check`/`run` operate on mosaic sessions and require `--session`.
-`run` is the non-interactive equivalent of what the app does: `analyze_all`
-then one blend per group, written to `OUTDIR/<group dir>.fits`.
+`run` is the batch counterpart of what the app does: `analyze_all`, then one
+blend per group through the streaming `blend` path to
+`OUTDIR/<group dir>.fits`. It never writes `result.mmmt` (the app's
+`blend_group` does) and it re-analyses and re-blends every group on each
+run; the staleness `set` reports is tracked for the app, not used by `run`.
 
 ## Testing
 
@@ -809,8 +813,9 @@ below is UI-agnostic and the CLI is its first consumer.
 - **Tile store** (`tiles`, file `result.mmmt`). The blended mosaic as a
   memory-mapped pyramid so a viewer reads it while a blend writes it.
   Layout: 4096-byte header (magic `MMMTILE\0`, version 1, tile size 256,
-  width, height, channels, levels); a per-tile `u32` state table
-  (bit 31 = valid, bits 0-30 = sequence number, odd while being written);
+  width, height, channels, levels; all little endian); a per-tile `u32`
+  state table (little endian; bit 31 = valid, bits 0-30 = sequence number,
+  odd while being written; zero = never written);
   then f32 planar tile data per level, edge tiles stored full size and
   zero-padded. Level `l` is `ceil(w/2^l) x ceil(h/2^l)`, added until one tile
   holds it. Each state entry is a **seqlock** with a single writer: a reader
@@ -818,19 +823,41 @@ below is UI-agnostic and the CLI is its first consumer.
   unchanged after it, so a copy straddling any rewrite or invalidation,
   including a full rewrite, is rejected. A crash mid-write leaves the entry
   odd = invalid, and the next write recovers it. Samples are accessed as
-  relaxed atomics so racing copies are never UB. `TileSink` is a `RowSink`
-  that fills level 0, `build_parents` rebuilds the upper levels, and
-  `blend_tiles` blends a canvas rect (an ROI re-blend invalidates only the
-  tiles it touches) cancellably. A store whose geometry no longer matches
-  the analysis is dropped and recreated; blending against stale analysis is
-  refused.
+  relaxed atomics so racing copies are never UB. `state()` reports a tile's
+  `TileState` (`Missing` / `Stale` / `Valid`) from its entry alone, and
+  `read_tile_any` copies a stale tile too under the same protocol, so the
+  viewer can show stale tiles dimmed; `read_tile` accepts valid tiles only.
+  `TileSink` is a `RowSink` that fills level 0, `build_parents` rebuilds the
+  upper levels (a parent is valid only when all its in-image children are),
+  and `blend_tiles` blends a canvas rect (an ROI re-blend invalidates only
+  the tiles it touches) cancellably. A cancelled or failed blend keeps its
+  finished work (spec §8): level-0 tiles it fully wrote stay valid, the
+  rest of the rect stays stale, and the parents are rebuilt from what is
+  valid. A store whose geometry no longer matches the analysis is dropped
+  and recreated; blending against stale analysis is refused.
 - **Mosaic orchestration** (`mosaic`). `mosaic.json` config, grouping rules
   (`header:KEY`, `token:KEYWORD`; panels no rule places go to a "No group"
   processing group), persisted `group_dirs`, `needs_analyze`, `Mosaic` with
   `analyze_all` (every group onto one shared reference frame, the existing
   shared-frame machinery) and `blend_group` (a group into its tile store),
   and `set_analyze_settings` / `set_blend_settings` / `set_group_override`,
-  which invalidate exactly the affected stores.
+  which invalidate exactly the affected stores. `analyze_all` marks each
+  group in `needs_analyze` (saved) and invalidates its store before
+  re-analysing it, clearing the mark on success: a re-analysis stales the
+  old tiles, and an interrupted one leaves that group refused by
+  `blend_group` rather than half-replaced. `BlendSettings::validate`
+  (finite feather > 0) guards every settings edit and `MosaicConfig::save`,
+  so `mosaic.json` never holds a value JSON cannot represent; settings
+  structs default missing fields so older files keep loading.
+- **Concurrency contract** (tiles and mosaic). One `TileStore` writer per
+  file — nothing enforces it yet (a later plan adds an in-process guard).
+  Readers must close before a store is recreated (`TileStore::create`
+  truncates under their mapping); a matching store is reopened, never
+  recreated. Callers must cancel and join a running blend or analyze before
+  calling any `set_*`: a `set_*` while a blend writes leaves the tiles it
+  then writes valid under the new settings, i.e. stale tiles marked valid.
+  The job holding `&mut Mosaic` saves the configuration, so the app must
+  not edit a clone of it concurrently (the later save wins).
 - **Checks** (`checks`). Input checks (solution present, distortion model,
   scale mismatch, mixed channels, group count mismatch, filters differ
   ungrouped, ungrouped panels), file checks (changed or missing since added,

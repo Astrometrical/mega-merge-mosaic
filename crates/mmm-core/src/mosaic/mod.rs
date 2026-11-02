@@ -2,6 +2,20 @@
 //! grouping, the names of the files in a mosaic directory, and the
 //! orchestration that analyzes every group and blends a group into its tiled
 //! result ([`Mosaic`], [`analyze_all`], [`blend_group`]).
+//!
+//! # Concurrency contract
+//!
+//! - One [`crate::tiles::TileStore`] writer per result file; nothing
+//!   enforces it yet (a later plan adds an in-process guard). Readers must
+//!   close before [`blend_group`] recreates a store (see [`crate::tiles`]).
+//! - **Cancel and join a running [`blend_group`] or [`analyze_all`] before
+//!   calling any `set_*`.** A `set_*` that lands while a blend writes
+//!   invalidates the store, then the blend marks the tiles it writes
+//!   afterwards valid although they were blended with the old settings:
+//!   stale tiles marked valid.
+//! - The job holding `&mut Mosaic` saves the configuration (fingerprints,
+//!   `needs_analyze`, provenance). The app must not edit a clone of the
+//!   configuration while such a job runs: whichever saves last wins.
 
 pub mod grouping;
 mod run;
