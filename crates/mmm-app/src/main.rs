@@ -9,6 +9,7 @@
 mod app;
 mod blend_tab;
 mod jobs;
+mod panels_tab;
 mod session;
 mod start;
 mod status;

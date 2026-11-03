@@ -138,12 +138,12 @@ impl Debounce {
 }
 
 /// A computation on its own thread; the UI is repainted when it ends.
-struct Task<T> {
+pub(crate) struct Task<T> {
     rx: Receiver<T>,
 }
 
 /// What a [`Task`] has to say.
-enum Poll<T> {
+pub(crate) enum Poll<T> {
     Pending,
     Done(T),
     /// The thread ended without a result (it panicked).
@@ -151,7 +151,7 @@ enum Poll<T> {
 }
 
 impl<T: Send + 'static> Task<T> {
-    fn spawn(
+    pub(crate) fn spawn(
         name: &str,
         ctx: &egui::Context,
         f: impl FnOnce() -> T + Send + 'static,
@@ -173,7 +173,7 @@ impl<T: Send + 'static> Task<T> {
         }
     }
 
-    fn poll(&self) -> Poll<T> {
+    pub(crate) fn poll(&self) -> Poll<T> {
         match self.rx.try_recv() {
             Ok(v) => Poll::Done(v),
             Err(TryRecvError::Empty) => Poll::Pending,

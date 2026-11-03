@@ -12,6 +12,7 @@ use mega_ui::theme::palette;
 
 use crate::blend_tab::BlendTab;
 use crate::jobs::{JobEvent, JobRunner};
+use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::start::{RecentEntry, RfdPicker, StartAction, StartScreen, unix_now};
 use crate::status::{self, SysMonitor};
@@ -24,7 +25,7 @@ const NOTICE_TIME: Duration = Duration::from_secs(6);
 /// The session view's tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
-    /// Panels and their checks (next phase).
+    /// The panel files and their grouping.
     Panels,
     /// The plan view (next phase).
     Plan,
@@ -65,6 +66,10 @@ pub struct Shell {
     tab: Tab,
     /// The Blend tab (made afresh with each session).
     blend: BlendTab,
+    /// The Panels tab (made afresh with each session).
+    panels: PanelsTab,
+    /// The panel file dialog used by the Panels tab.
+    files_picker: Arc<dyn FilesPicker>,
 }
 
 impl Shell {
@@ -81,6 +86,8 @@ impl Shell {
             // The Blend tab is the one that works in this phase.
             tab: Tab::Blend,
             blend: BlendTab::new(),
+            panels: PanelsTab::new(Arc::new(RfdFilesPicker)),
+            files_picker: Arc::new(RfdFilesPicker),
         }
     }
 
@@ -131,7 +138,7 @@ impl Shell {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
-        self.poll_jobs();
+        self.poll_jobs(&ctx);
         if self.session.is_none() {
             egui::CentralPanel::default().show(ui, |ui| {
                 if let Some(action) = self.start.ui(ui) {
@@ -192,6 +199,7 @@ impl Shell {
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
                     self.blend = BlendTab::new();
+                    self.panels = PanelsTab::new(self.files_picker.clone());
                 }
             }
             Err(message) => {
@@ -201,8 +209,9 @@ impl Shell {
         }
     }
 
-    /// Apply finished jobs and post a notice for each.
-    fn poll_jobs(&mut self) {
+    /// Apply finished jobs and post a notice for each, then let the Panels
+    /// tab take its background work and apply a waiting edit.
+    fn poll_jobs(&mut self, ctx: &egui::Context) {
         let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
             return;
         };
@@ -221,6 +230,7 @@ impl Shell {
             };
             self.notices.push(Notice { text, color, until });
         }
+        self.panels.poll(ctx, session, jobs);
     }
 
     /// The open session (the Panels, Plan and Blend tabs build on this).
@@ -288,6 +298,7 @@ impl Shell {
         });
         match (self.tab, self.session.as_mut(), self.jobs.as_mut()) {
             (Tab::Blend, Some(session), Some(jobs)) => self.blend.ui(ui, session, jobs),
+            (Tab::Panels, Some(session), Some(jobs)) => self.panels.ui(ui, session, jobs),
             _ => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.centered_and_justified(|ui| {
@@ -759,8 +770,17 @@ mod tests {
             "auto stretch applied"
         );
         h.get_by_label("Automatic");
-        // Panels and Plan come later.
+        // The Panels tab shows the panels in their groups; Plan comes later.
         h.get_by_label("Panels").click();
+        h.step();
+        step_until(&mut h, |s| s.tab() == Tab::Panels);
+        h.get_by_label("Ha_0.xisf");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.query_by_label("OIII").is_none() {
+            assert!(Instant::now() < deadline, "no OIII column");
+            h.step();
+        }
+        h.get_by_label("Plan").click();
         h.run();
         h.get_by_label("Coming in the next phase");
         let actions: Vec<_> = h

@@ -291,6 +291,17 @@ impl JobRunner {
         }
     }
 
+    /// Cancel every job: the running one winds down (reported by
+    /// [`JobRunner::poll`] when it has), queued ones are dropped at once.
+    pub fn cancel_all(&mut self) {
+        if let Some(r) = &self.running {
+            r.token.cancel();
+        }
+        let dropped: Vec<u64> = self.queue.drain(..).map(|q| q.id).collect();
+        self.pending
+            .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+    }
+
     /// Take progress and outcomes from the workers, apply outcomes to
     /// `session` (UI thread), start the next queued job, and return what
     /// ended since the last call.
