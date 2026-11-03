@@ -355,8 +355,7 @@ whole-branch review, then one fix wave). Rulings against the spec or plan:
 - **Export and edits:** editing panels never cancels an export. Export is
   disabled while a blend of any chosen group is pending.
 
-Open, load-bearing, surfaced for a decision (the final fix wave's
-re-review):
+Resolved after the final fix wave (c15014c) — previously open:
 
 - A blend can still be started while an export dialog's check holds a
   result store mapped. If that blend recreates the store because its
@@ -364,8 +363,8 @@ re-review):
 - The dialog's "blend pending" set is taken from the current view's
   members, not from the dialog's chosen groups.
 
-Smallest fix: `can_blend` returns false while the export dialog is not
-idle, and the pending-blend set is built from the dialog's chosen groups.
+Fix applied: blends are disabled while the export dialog is not idle, and
+the pending-blend set comes from the dialog's groups.
 
 Carried follow-ups:
 
