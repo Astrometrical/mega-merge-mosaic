@@ -13,7 +13,7 @@ use egui::{
 };
 
 use crate::theme::palette;
-use crate::viewer::{OverlayButton, View, overlay_buttons};
+use crate::viewer::{OverlayButton, View, drag_delta, overlay_buttons};
 
 /// Zoom factor per scroll-wheel notch (as in the tiled viewer).
 const SCROLL_ZOOM_PER_NOTCH: f64 = 1.2;
@@ -184,6 +184,7 @@ impl PlanCanvas {
             self.view.finish_animation();
             self.homed_extent = Some(extent);
         }
+        self.view.update(now);
         for c in std::mem::take(&mut self.commands) {
             match c {
                 Command::Home => self.view.fit_rect(extent, rect.size(), now),
@@ -197,6 +198,8 @@ impl PlanCanvas {
             }
         }
 
+        // Input before hit-testing and painting, so both use this frame's view.
+        self.handle_pan_zoom(ui, &response, rect, now);
         let hit = |p: Pos2| {
             let c = self.view.screen_to_image(p, rect, now);
             items.iter().rev().find(|it| it.contains(c)).map(|it| it.id)
@@ -223,8 +226,6 @@ impl PlanCanvas {
                 None => self.view.zoom_by(2.0, p, rect, now),
             }
         }
-        self.handle_pan_zoom(ui, &response, rect, now);
-
         self.paint(
             &ui.painter_at(rect),
             rect,
@@ -269,7 +270,7 @@ impl PlanCanvas {
 
     fn handle_pan_zoom(&mut self, ui: &Ui, response: &egui::Response, rect: Rect, now: f64) {
         if response.dragged() {
-            self.view.pan_by(response.drag_delta(), now);
+            self.view.pan_by(drag_delta(response), now);
         }
         let Some(p) = response.hover_pos() else {
             return;

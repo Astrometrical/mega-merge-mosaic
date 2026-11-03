@@ -656,3 +656,228 @@ fn overlays_drawn_and_zoom_to_rect() {
     let want = (f64::from(rect.width()) / 2000.0).min(f64::from(rect.height()) / 1000.0);
     assert!((z - want).abs() < 1e-6, "{z} vs {want}");
 }
+
+/// A viewer harness stepping at 60 fps.
+fn harness_60fps(viewer: TiledViewer) -> Harness<'static, TiledViewer> {
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(1.0 / 60.0)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, v: &mut TiledViewer| {
+                v.show(ui);
+            },
+            viewer,
+        )
+}
+
+/// Screen bounding box of the tiles drawn last frame (the image's drawn
+/// rect when every edge tile is at least partly on screen).
+fn drawn_image_rect(h: &Harness<'static, TiledViewer>) -> Rect {
+    let mut r = Rect::NOTHING;
+    for cs in &h.output().shapes {
+        if let egui::Shape::Mesh(m) = &cs.shape
+            && m.texture_id != egui::TextureId::default()
+        {
+            for v in &m.vertices {
+                r.extend_with(v.pos);
+            }
+        }
+    }
+    assert!(r.is_positive(), "no tiles drawn");
+    r
+}
+
+/// Where image point `p` was drawn last frame, from the drawn tiles.
+fn drawn_point(h: &Harness<'static, TiledViewer>, p: (f64, f64)) -> Pos2 {
+    let r = drawn_image_rect(h);
+    let g = h.state().geom;
+    Pos2::new(
+        r.min.x + (p.0 / g.width as f64) as f32 * r.width(),
+        r.min.y + (p.1 / g.height as f64) as f32 * r.height(),
+    )
+}
+
+/// Drag from `from` by `step` per input event over `events` events, with
+/// `idle` input-free frames after each (a display faster than the pointer),
+/// then release and let the view settle. Returns where image point `track`
+/// was drawn each frame.
+fn drag_track(
+    h: &mut Harness<'static, TiledViewer>,
+    from: Pos2,
+    step: Vec2,
+    events: usize,
+    idle: usize,
+    track: (f64, f64),
+) -> Vec<Pos2> {
+    let mut out = Vec::new();
+    h.hover_at(from);
+    h.step();
+    h.drag_at(from);
+    h.step();
+    out.push(drawn_point(h, track));
+    let mut p = from;
+    for _ in 0..events {
+        p += step;
+        h.hover_at(p);
+        h.step();
+        out.push(drawn_point(h, track));
+        for _ in 0..idle {
+            h.step();
+            out.push(drawn_point(h, track));
+        }
+    }
+    h.drop_at(p);
+    h.step();
+    out.push(drawn_point(h, track));
+    for _ in 0..200 {
+        h.step();
+        out.push(drawn_point(h, track));
+        let (_, now) = h.state().last_frame().unwrap();
+        if h.state().view().is_settled(now) {
+            break;
+        }
+    }
+    out
+}
+
+/// Panics if the drawn track ever moves against `dir` (a back-and-forth).
+fn assert_no_reversal(track: &[Pos2], dir: Vec2) {
+    for (i, w) in track.windows(2).enumerate() {
+        let d = (w[1] - w[0]).dot(dir);
+        assert!(
+            d >= -1e-3,
+            "frame {i}: drawn image moved back by {d}: {track:?}"
+        );
+    }
+}
+
+#[test]
+fn drag_motion_never_reverses() {
+    let src = TestSource::new(10_000, 10_000);
+    let mut h = harness_60fps(TiledViewer::new_synchronous(src));
+    h.run();
+    let step = Vec2::new(6.0, 3.0);
+    let track = drag_track(
+        &mut h,
+        Pos2::new(400.0, 300.0),
+        step,
+        20,
+        0,
+        (5_000.0, 5_000.0),
+    );
+    assert_no_reversal(&track, step);
+    // The dragged point ends where the pointer took it.
+    let moved = *track.last().unwrap() - track[0];
+    assert!((moved - step * 20.0).length() < 0.5, "{moved:?}");
+}
+
+#[test]
+fn drag_after_scroll_zoom_never_reverses() {
+    let src = TestSource::new(10_000, 10_000);
+    let mut h = harness_60fps(TiledViewer::new_synchronous(src));
+    h.run();
+    let cursor = Pos2::new(300.0, 300.0);
+    let (rect, now) = h.state().last_frame().unwrap();
+    let under = h.state().view().screen_to_image(cursor, rect, now);
+    h.hover_at(cursor);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: Vec2::new(0.0, -1.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    // Drag while the zoom is still animating, then again once settled.
+    h.step();
+    h.step();
+    let step = Vec2::new(5.0, 2.0);
+    let track = drag_track(&mut h, cursor, step, 20, 0, under);
+    assert_no_reversal(&track, step);
+    eprintln!("{track:?}");
+    let moved = *track.last().unwrap() - cursor;
+    assert!((moved - step * 20.0).length() < 0.5, "{moved:?}");
+    let from = cursor + step * 20.0;
+    let track = drag_track(&mut h, from, -step, 20, 0, under);
+    assert_no_reversal(&track, -step);
+    assert!((*track.last().unwrap() - cursor).length() < 0.5);
+}
+
+#[test]
+fn drag_motion_smooth_when_pointer_slower_than_display() {
+    // The display runs at 60 fps but pointer events come every 3rd frame:
+    // the image must keep moving between events, not stop and jump.
+    let src = TestSource::new(10_000, 10_000);
+    let mut h = harness_60fps(TiledViewer::new_synchronous(src));
+    h.run();
+    let step = Vec2::new(9.0, 0.0);
+    let track = drag_track(
+        &mut h,
+        Pos2::new(400.0, 300.0),
+        step,
+        12,
+        2,
+        (5_000.0, 5_000.0),
+    );
+    assert_no_reversal(&track, step);
+    // Every frame of the drag (after the first event) moves the image.
+    let drag_frames = &track[1..1 + 12 * 3];
+    for (i, w) in drag_frames.windows(2).enumerate() {
+        assert!((w[1].x - w[0].x) > 1e-3, "frame {i} stood still: {track:?}");
+    }
+    let moved = *track.last().unwrap() - track[0];
+    assert!((moved - step * 12.0).length() < 0.5, "{moved:?}");
+}
+
+#[test]
+fn irregular_pointer_deltas_are_smoothed() {
+    // Uneven input sampling: per-frame pointer moves of 0, 2d, 0, 2d, d, 0,
+    // 3d, ... The drawn image must move every frame, never back, with no
+    // frame-to-frame jump much above the average step.
+    let src = TestSource::new(10_000, 10_000);
+    let mut h = harness_60fps(TiledViewer::new_synchronous(src));
+    h.run();
+    let start = Pos2::new(400.0, 300.0);
+    let (rect, now) = h.state().last_frame().unwrap();
+    let grabbed = h.state().view().screen_to_image(start, rect, now);
+    let d = Vec2::new(4.0, 2.0);
+    let pattern = [0.0, 2.0, 0.0, 2.0, 1.0, 0.0, 3.0, 0.0, 1.0, 1.0, 0.0, 2.0];
+    let mut p = start;
+    h.hover_at(p);
+    h.step();
+    h.drag_at(p);
+    h.step();
+    // Engage the drag (past egui's threshold) and the spring.
+    p += d * 2.0;
+    h.hover_at(p);
+    h.step();
+    h.step();
+    let mut track = vec![drawn_point(&h, grabbed)];
+    for _ in 0..3 {
+        for &k in &pattern {
+            if k > 0.0 {
+                p += d * k;
+                h.hover_at(p);
+            }
+            h.step();
+            track.push(drawn_point(&h, grabbed));
+        }
+    }
+    assert_no_reversal(&track, d);
+    let steps: Vec<f32> = track.windows(2).map(|w| (w[1] - w[0]).length()).collect();
+    // Unsmoothed, the steps would jump between 0 and 3|d| (13.4 px) from
+    // one frame to the next; eased, they change by a fraction of |d|.
+    for (i, s) in steps.iter().enumerate() {
+        assert!(*s > 1e-3, "frame {i} stood still: {steps:?}");
+    }
+    for (i, w) in steps.windows(2).enumerate() {
+        let change = (w[1] - w[0]).abs();
+        assert!(
+            change < 1.0,
+            "frame {i}: step changed by {change}: {steps:?}"
+        );
+    }
+    h.drop_at(p);
+    h.run();
+    // The grabbed point ends under the pointer.
+    assert!((drawn_point(&h, grabbed) - p).length() < 0.5);
+}

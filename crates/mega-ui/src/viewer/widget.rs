@@ -390,6 +390,7 @@ impl TiledViewer {
             self.view.finish_animation();
             self.needs_home = false;
         }
+        self.view.update(now);
         for c in std::mem::take(&mut self.commands) {
             match c {
                 Command::Home => self.view.fit(&self.geom, rect.size(), now),
@@ -477,7 +478,7 @@ impl TiledViewer {
         match self.tool {
             Tool::DrawRect => drawn = self.handle_draw(ui, response, rect, now),
             Tool::Navigate if response.dragged() => {
-                self.view.pan_by(response.drag_delta(), now);
+                self.view.pan_by(drag_delta(response), now);
             }
             Tool::Navigate => {}
         }
@@ -690,6 +691,17 @@ impl TiledViewer {
         if let Some(i) = overlay_buttons(ui, rect, &buttons) {
             self.commands.push(cmds[i]);
         }
+    }
+}
+
+/// Screen motion of a drag this frame. On the frame egui recognises the
+/// drag (after its movement threshold) this is the whole motion since the
+/// press, so the grabbed point stays under the pointer.
+pub(crate) fn drag_delta(response: &egui::Response) -> Vec2 {
+    if response.drag_started() {
+        response.total_drag_delta().unwrap_or_default()
+    } else {
+        response.drag_delta()
     }
 }
 

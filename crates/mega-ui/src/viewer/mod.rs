@@ -12,4 +12,4 @@ pub use view::{
     visible_tiles,
 };
 pub use widget::{Overlay, TiledViewer, Tool, ViewerResponse, tile_tint};
-pub(crate) use widget::{OverlayButton, overlay_buttons};
+pub(crate) use widget::{OverlayButton, drag_delta, overlay_buttons};

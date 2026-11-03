@@ -190,3 +190,53 @@ fn additive_layer_mesh_has_zero_alpha() {
         "selected item has no 2.5 px accent outline"
     );
 }
+
+/// Where item `label`'s label was drawn last frame.
+fn drawn_label(h: &Harness<'_, State>, label: &str) -> Pos2 {
+    h.output()
+        .shapes
+        .iter()
+        .find_map(|cs| match &cs.shape {
+            egui::Shape::Text(t) if t.galley.text() == label => Some(t.pos),
+            _ => None,
+        })
+        .expect("label drawn")
+}
+
+#[test]
+fn drag_eases_without_reversal() {
+    // Uneven pointer sampling (some frames without an event): the drawn
+    // canvas moves every frame, never back, and ends where the pointer took
+    // it.
+    let items = vec![item(1, [400.0, 400.0, 600.0, 600.0])];
+    let mut h = harness([0.0, 0.0, 1000.0, 1000.0], items);
+    h.run();
+    let p0 = drawn_label(&h, "1");
+    let d = Vec2::new(5.0, -3.0);
+    let mut p = Pos2::new(300.0, 300.0);
+    h.hover_at(p);
+    h.step();
+    h.drag_at(p);
+    h.step();
+    let mut track = Vec::new();
+    for k in [2.0, 0.0, 1.0, 3.0, 0.0, 0.0, 2.0, 1.0, 0.0, 2.0] {
+        if k > 0.0 {
+            p += d * k;
+            h.hover_at(p);
+        }
+        h.step();
+        track.push(drawn_label(&h, "1"));
+    }
+    h.drop_at(p);
+    h.run();
+    track.push(drawn_label(&h, "1"));
+    for (i, w) in track.windows(2).enumerate() {
+        let along = (w[1] - w[0]).dot(d);
+        assert!(along >= -1e-3, "frame {i} moved back: {track:?}");
+        if i + 2 < track.len() {
+            assert!(along > 1e-3, "frame {i} stood still: {track:?}");
+        }
+    }
+    let moved = drawn_label(&h, "1") - p0;
+    assert!((moved - d * 11.0).length() < 0.5, "{moved:?}");
+}
