@@ -69,8 +69,8 @@ pub const SII_COLOR: Color32 = Color32::from_rgb(0xe0, 0x70, 0x3a);
 
 /// Group colours. The first six are physical colours that well-known
 /// filter names get (see [`assign_group_colors`]): Hα / red, green, OIII
-/// cyan, SII, blue, luminance white. Other groups take the first entry no
-/// group uses yet, in first-seen order.
+/// cyan, SII, blue, luminance white. Other groups take the first of the
+/// remaining entries no group uses yet, in first-seen order (cycling).
 pub const GROUP_PALETTE: [Color32; 11] = [
     palette::HA_500,
     palette::GREEN_400,
@@ -84,6 +84,10 @@ pub const GROUP_PALETTE: [Color32; 11] = [
     Color32::from_rgb(0x9c, 0xc2, 0x3a), // lime
     Color32::from_rgb(0x6a, 0x8e, 0xd4), // periwinkle
 ];
+
+/// How many leading [`GROUP_PALETTE`] entries are physical colours, kept
+/// for well-known filter names.
+pub const PHYSICAL_SLOTS: usize = 6;
 
 /// The physical [`GROUP_PALETTE`] index of a well-known filter name
 /// (case-insensitive), if it is one.
@@ -120,7 +124,8 @@ pub fn save_group_colors(ui: &mut Value, map: &BTreeMap<String, usize>) {
 
 /// Give each of `names` (in first-seen order) without a colour in `map`
 /// one: its physical colour if it is a well-known filter name, else the
-/// first [`GROUP_PALETTE`] entry no group uses (cycling once all are used).
+/// first non-physical [`GROUP_PALETTE`] entry (after [`PHYSICAL_SLOTS`]) no
+/// group uses, cycling through those once all are used.
 /// Existing entries never change; [`UNGROUPED`] gets none. Whether `map`
 /// changed.
 pub fn assign_group_colors<'a>(
@@ -133,10 +138,13 @@ pub fn assign_group_colors<'a>(
             continue;
         }
         let index = physical_color(name).unwrap_or_else(|| {
+            // Physical colours stay free for the filters they name.
             let used: BTreeSet<usize> = map.values().copied().collect();
-            (0..GROUP_PALETTE.len())
+            let others = GROUP_PALETTE.len() - PHYSICAL_SLOTS;
+            let unknown = map.keys().filter(|n| physical_color(n).is_none()).count();
+            (PHYSICAL_SLOTS..GROUP_PALETTE.len())
                 .find(|i| !used.contains(i))
-                .unwrap_or(map.len() % GROUP_PALETTE.len())
+                .unwrap_or(PHYSICAL_SLOTS + unknown % others)
         });
         map.insert(name.to_string(), index);
         changed = true;

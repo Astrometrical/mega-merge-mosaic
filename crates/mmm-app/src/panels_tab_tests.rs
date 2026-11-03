@@ -489,6 +489,25 @@ fn group_colors_are_stable_and_physical() {
     assert_ne!(SII_COLOR, palette::HA_500);
     assert_eq!(c["L"], palette::TEXT_STRONG);
     assert!(!c.contains_key("No group"));
+    // An unknown name seen first takes no physical colour.
+    let mut map = BTreeMap::new();
+    assign_group_colors(&mut map, ["Foo"]);
+    assign_group_colors(&mut map, ["Ha"]);
+    let c = group_colors(&map, ["Foo", "Ha"]);
+    assert_eq!(c["Ha"], palette::HA_500);
+    assert_ne!(c["Foo"], c["Ha"]);
+    // Unknown names cycle through the non-physical colours only.
+    let many: Vec<String> = (0..12).map(|i| format!("X{i:02}")).collect();
+    let c = group_colors(&BTreeMap::new(), many.iter().map(String::as_str));
+    for name in &many {
+        assert!(
+            GROUP_PALETTE[PHYSICAL_SLOTS..].contains(&c[name]),
+            "{name} took a physical colour"
+        );
+    }
+    assert_ne!(c["X00"], c["X01"]);
+    let mut map = BTreeMap::new();
+    assert!(assign_group_colors(&mut map, ["Ha", "Foo"]));
     // Persisted in `ui`, next to whatever else is there.
     let mut ui = serde_json::json!({ "other": 1 });
     save_group_colors(&mut ui, &map);

@@ -1038,7 +1038,8 @@ views and export. No algorithm changed. Core additions are bookkeeping
   "N to sort" header; Move to places a panel manually or lets the rule decide.
   Group colours are stable and persisted in `ui.group_colors`: well-known
   filters get physical colours (Ha red, OIII cyan, SII orange-red `#E0703A`,
-  R/G/B, L white), other names take the first unused palette entry.
+  R/G/B, L white), other names take the first unused entry after the six
+  physical ones, cycling through those (never a physical colour).
 - **Plan tab (additions).** A View selector lists the groups and the
   compositions (hidden when grouping is off); compositions are keyed
   `comp:<name>` in `ui.plan_stretch`. Layers are additive. Clicking a panel
