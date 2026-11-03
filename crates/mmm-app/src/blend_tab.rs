@@ -393,13 +393,13 @@ impl BlendTab {
     /// blend the chosen groups first, or start one export job per group.
     fn export_ui(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
         let can_blend = self.can_blend(self.readiness(session));
-        // Blends of the view's groups queued or running: the export check
-        // maps the stores they may recreate.
+        // Blends of the dialog's groups queued or running (whatever view is
+        // showing now): the export check maps the stores they may recreate.
         let blending: BTreeSet<String> = self
-            .members
-            .iter()
+            .export
+            .groups()
+            .into_iter()
             .filter(|g| jobs.blend_pending(g))
-            .cloned()
             .collect();
         match self.export.ui(ctx, session, can_blend, &blending) {
             Some(ExportAction::BlendFirst(groups)) => {
@@ -495,6 +495,7 @@ impl BlendTab {
     /// known absent), and no given-up source is still mapped.
     fn can_blend(&self, readiness: Readiness) -> bool {
         readiness == Readiness::Analyzed
+            && self.export.idle()
             && !self.members.is_empty()
             && self.analyze_job.is_none()
             && self
@@ -1055,6 +1056,10 @@ impl BlendTab {
         groups: Vec<String>,
         rect: Option<[u64; 4]>,
     ) {
+        // The export check maps result stores a blend may recreate.
+        if !self.export.idle() {
+            return;
+        }
         for g in groups {
             let id = jobs.start_blend(session, &g, rect);
             self.blend_jobs.insert(id, g);
@@ -1122,6 +1127,11 @@ impl BlendTab {
                     egui::Button::new("Blend whole mosaic"),
                 )
                 .on_hover_text("Blend every group over the whole canvas")
+                .on_disabled_hover_text(if self.export.idle() {
+                    "Blending is not possible right now"
+                } else {
+                    "Waiting for the export check"
+                })
                 .clicked()
             {
                 self.blend_whole(session, jobs);
@@ -1133,7 +1143,9 @@ impl BlendTab {
                     egui::Button::new("Blend ROI"),
                 )
                 .on_hover_text("Blend the selected region of interest for this view's groups")
-                .on_disabled_hover_text(if has_roi {
+                .on_disabled_hover_text(if !self.export.idle() {
+                    "Waiting for the export check"
+                } else if has_roi {
                     "Blending is not possible right now"
                 } else {
                     "Select or draw a region of interest first"

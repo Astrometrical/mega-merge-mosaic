@@ -201,6 +201,32 @@ impl ExportDialog {
         self.picking.is_none() && !matches!(self.step, Step::Checking(..))
     }
 
+    /// Every group the dialog was opened for, chosen or not: the blends
+    /// that matter to the dialog are theirs, whatever view is showing.
+    pub fn groups(&self) -> Vec<String> {
+        self.groups.iter().map(|(g, _)| g.clone()).collect()
+    }
+
+    /// Pretend a check is running until `release` is dropped or sent (tests).
+    #[cfg(test)]
+    pub(crate) fn force_checking(
+        &mut self,
+        ctx: &egui::Context,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let task = Task::spawn("mmm-export-test-check", ctx, move || {
+            let _ = release.recv();
+            Err("test".to_string())
+        });
+        self.step = Step::Checking(
+            task.expect("spawn"),
+            Snapshot {
+                dests: Vec::new(),
+                format: self.format,
+            },
+        );
+    }
+
     /// The groups chosen, in order.
     fn chosen(&self) -> Vec<String> {
         self.groups

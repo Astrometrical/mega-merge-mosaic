@@ -522,6 +522,72 @@ fn export_dialog_warns_then_runs() {
 }
 
 #[test]
+fn no_blend_while_the_export_check_runs() {
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-during-check");
+    let mut tab = BlendTab::new();
+    tab.select("Ha".into());
+    let ctx = egui::Context::default();
+    for _ in 0..500 {
+        if tab.can_blend(Readiness::Analyzed) {
+            break;
+        }
+        tab.update(&ctx, &mut s, &jobs);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(tab.can_blend(Readiness::Analyzed), "enabled when idle");
+    tab.open_export(&s);
+    let (release, rx) = std::sync::mpsc::channel();
+    tab.export.force_checking(&ctx, rx);
+    assert!(!tab.export.idle());
+    assert!(!tab.can_blend(Readiness::Analyzed), "buttons disabled");
+    tab.blend_whole(&mut s, &mut jobs);
+    tab.blend_roi(&mut s, &mut jobs);
+    tab.blend_groups(&mut s, &mut jobs, vec!["Ha".into()], Some([0, 0, 64, 64]));
+    assert!(!jobs.busy(), "no blend job started during the check");
+    assert!(tab.blend_jobs.is_empty());
+    drop(release);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn export_refused_for_a_pending_blend_after_switching_view() {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-export-switch");
+    let gate = jobs.hold();
+    let mut tab = BlendTab::new();
+    tab.select("Ha".into());
+    tab.open_export(&s);
+    // Switch the view away from Ha; the dialog still has Ha.
+    tab.select("OIII".into());
+    jobs.start_blend(&mut s, "Ha", None);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .with_step_dt(0.01)
+        .build_ui_state(
+            |ui, st: &mut ExportState| {
+                st.tab.export_ui(ui.ctx(), &mut st.session, &mut st.jobs);
+            },
+            ExportState {
+                tab,
+                session: s,
+                jobs,
+                events: Vec::new(),
+            },
+        );
+    h.run_steps(2);
+    assert!(
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
+            .accesskit_node()
+            .is_disabled()
+    );
+    h.get_by_label_contains("Waiting for the blend of Ha");
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn absent_reason_hidden_while_reopening() {
     // A reason from an earlier open is not reported while the result is
     // being opened again (the shown text is "Opening the result…" then).
