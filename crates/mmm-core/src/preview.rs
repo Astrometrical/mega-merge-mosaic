@@ -40,7 +40,7 @@ use crate::analyze::InputSelect;
 use crate::formats::InputPanel;
 use crate::fsutil::write_atomic;
 use crate::job::JobCtl;
-use crate::mosaic::{FRAME_FILE, Fingerprint, Mosaic, fingerprint};
+use crate::mosaic::{Fingerprint, Mosaic, fingerprint};
 use crate::panel_reader::PanelReader;
 use crate::reference::{self, ReferenceFrame};
 use crate::{Error, Result};
@@ -49,6 +49,16 @@ use crate::{Error, Result};
 pub const PREVIEW_MAX_SIDE: u32 = 512;
 /// Directory, inside the session directory, holding cached previews.
 pub const PREVIEWS_DIR: &str = "previews";
+/// File, inside [`PREVIEWS_DIR`], holding the frame the previews were last
+/// placed in (see [`run_previews`]). Not the analysed frame
+/// ([`crate::mosaic::FRAME_FILE`]), which only analysis writes.
+pub const PREVIEW_FRAME_FILE: &str = "frame.mmm-frame.json";
+
+/// Where [`run_previews`] keeps the previews' frame for the session in
+/// `session_dir`.
+pub fn preview_frame_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(PREVIEWS_DIR).join(PREVIEW_FRAME_FILE)
+}
 
 /// A low-resolution preview of one panel, placed in the shared frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -648,7 +658,8 @@ fn read_preview(file: &Path) -> Result<(Preview, Option<ReferenceFrame>)> {
 pub struct PreviewPlan {
     /// The mosaic directory; previews are cached under [`PREVIEWS_DIR`].
     pub session_dir: PathBuf,
-    /// The shared reference frame file ([`FRAME_FILE`]).
+    /// Where the previews' frame is kept ([`preview_frame_path`]); never
+    /// the analysed frame ([`FRAME_FILE`](crate::mosaic::FRAME_FILE)).
     pub frame_path: PathBuf,
     /// Every panel, in configuration order, with the fingerprint recorded
     /// at its last analysis. Informational: the worker fingerprints each
@@ -663,7 +674,7 @@ pub struct PreviewPlan {
 pub fn plan_previews(m: &Mosaic) -> PreviewPlan {
     PreviewPlan {
         session_dir: m.dir.clone(),
-        frame_path: m.dir.join(FRAME_FILE),
+        frame_path: preview_frame_path(&m.dir),
         panels: m
             .config
             .panels
@@ -672,6 +683,19 @@ pub fn plan_previews(m: &Mosaic) -> PreviewPlan {
             .collect(),
         input: m.config.analyze.input,
     }
+}
+
+/// What a [`run_previews`] run achieved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewRun {
+    /// The per-panel failures `(path, message)`, in plan order.
+    pub failed: Vec<(PathBuf, String)>,
+    /// The frame the previews were placed in.
+    pub frame: ReferenceFrame,
+    /// Whether `frame` was derived from every panel (only such a frame is
+    /// saved to [`PreviewPlan::frame_path`], and only such a frame may be
+    /// compared with the analysed one).
+    pub complete: bool,
 }
 
 /// Most worker threads [`run_previews`] uses (each holds one panel).
@@ -685,8 +709,10 @@ const MAX_THREADS: usize = 4;
 ///    the input is not forced aligned, it derives over the panels with a
 ///    usable astrometric solution instead, and the others become per-panel
 ///    errors. Only a frame derived from every panel is saved to
-///    [`PreviewPlan::frame_path`], and only when it differs from the file
-///    there (atomically). Panels that cannot be opened are per-panel errors.
+///    [`PreviewPlan::frame_path`] (the previews' own frame file, never the
+///    analysed [`FRAME_FILE`](crate::mosaic::FRAME_FILE)), and only when
+///    it differs from the file there (atomically). Panels that cannot be
+///    opened are per-panel errors.
 /// 2. For each panel, loads its cached preview ([`cache_path`], reused only
 ///    when it was placed in the same frame) or builds it with
 ///    [`PREVIEW_MAX_SIDE`] and caches it, on a dedicated pool of at most
@@ -697,18 +723,18 @@ const MAX_THREADS: usize = 4;
 /// 3. Calls `on_ready` (from a pool thread) as each preview finishes, and
 ///    reports `("previews", done, total)` after every panel, failed or not.
 ///
-/// Returns the per-panel failures `(path, message)` in plan order; each is
-/// also logged. Whole-run failures — cancellation ([`Error::Cancelled`]),
+/// Returns the frame and the per-panel failures in plan order (each is
+/// also logged). Whole-run failures — cancellation ([`Error::Cancelled`]),
 /// a frame that cannot be derived, no pool — are the `Err`.
 pub fn run_previews(
     plan: &PreviewPlan,
     ctl: &JobCtl,
     on_ready: &(dyn Fn(Preview) + Sync),
-) -> Result<Vec<(PathBuf, String)>> {
+) -> Result<PreviewRun> {
     ctl.check()?;
     let total = plan.panels.len() as u64;
     let mut errors: Vec<(usize, PathBuf, String)> = Vec::new();
-    let frame = preview_frame(plan, ctl, &mut errors)?;
+    let (frame, complete) = preview_frame(plan, ctl, &mut errors)?;
     if crate::decoded::cache_dir().is_none() {
         crate::decoded::set_cache_dir(plan.session_dir.join(DECODED_DIR));
     }
@@ -751,20 +777,24 @@ pub fn run_previews(
     }
     let mut errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
     errors.sort_by_key(|e| e.0);
-    Ok(errors.into_iter().map(|(_, p, m)| (p, m)).collect())
+    Ok(PreviewRun {
+        failed: errors.into_iter().map(|(_, p, m)| (p, m)).collect(),
+        frame,
+        complete,
+    })
 }
 
 /// Decode cache directory, inside the session directory, that
 /// [`run_previews`] uses when none is set (the CLI's convention).
 const DECODED_DIR: &str = "decoded";
 
-/// The frame for a preview run (see [`run_previews`] step 1), recording
-/// panels left out of it in `errors`.
+/// The frame for a preview run (see [`run_previews`] step 1) and whether
+/// every panel was used, recording panels left out of it in `errors`.
 fn preview_frame(
     plan: &PreviewPlan,
     ctl: &JobCtl,
     errors: &mut Vec<(usize, PathBuf, String)>,
-) -> Result<ReferenceFrame> {
+) -> Result<(ReferenceFrame, bool)> {
     let mut opened: Vec<(usize, &PathBuf, InputPanel)> = Vec::new();
     for (k, (path, _)) in plan.panels.iter().enumerate() {
         ctl.check()?;
@@ -806,7 +836,7 @@ fn preview_frame(
     if complete && !ReferenceFrame::load(&plan.frame_path).is_ok_and(|on_disk| on_disk == frame) {
         frame.save(&plan.frame_path)?;
     }
-    Ok(frame)
+    Ok((frame, complete))
 }
 
 /// The cached preview of `path` in `frame`, or a freshly built (and
@@ -1046,8 +1076,9 @@ mod tests {
         let plan = plan_previews(&m);
         let collect = || {
             let got = std::sync::Mutex::new(Vec::new());
-            let errs =
-                run_previews(&plan, &JobCtl::none(), &|p| got.lock().unwrap().push(p)).unwrap();
+            let errs = run_previews(&plan, &JobCtl::none(), &|p| got.lock().unwrap().push(p))
+                .unwrap()
+                .failed;
             assert!(errs.is_empty(), "{errs:?}");
             let mut got = got.into_inner().unwrap();
             got.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1107,7 +1138,9 @@ mod tests {
         let mut edited = plan.clone();
         edited.panels.insert(0, (solved, None));
         let got = std::sync::Mutex::new(0usize);
-        let errs = run_previews(&edited, &JobCtl::none(), &|_| *got.lock().unwrap() += 1).unwrap();
+        let errs = run_previews(&edited, &JobCtl::none(), &|_| *got.lock().unwrap() += 1)
+            .unwrap()
+            .failed;
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(*got.lock().unwrap(), 3);
         assert!(matches!(

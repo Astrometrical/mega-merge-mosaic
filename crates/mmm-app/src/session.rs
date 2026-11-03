@@ -17,10 +17,12 @@ use mmm_core::reference::ReferenceFrame;
 pub struct OpenSession {
     /// The mosaic: its directory and configuration (`mosaic.json`).
     pub mosaic: Mosaic,
-    /// Canvas `(width, height)` of the shared reference frame, once an
-    /// analysis has derived one (read when opening, updated by the job
-    /// runner after each analysis).
-    pub canvas: Option<(u64, u64)>,
+    /// The analysed frame (`reference.mmm-frame.json`): the frame of the
+    /// last analysis, read when opening and updated by the job runner after
+    /// each analysis. Previews keep their own frame (see
+    /// `mmm_core::preview::preview_frame_path`); ROIs and blends use this
+    /// one.
+    pub frame: Option<ReferenceFrame>,
     /// The groups as last resolved (when opening, off the UI thread, and by
     /// each analysis); `None` if resolution failed.
     pub groups: Option<Groups>,
@@ -34,6 +36,12 @@ impl OpenSession {
     /// The display name: the folder name without `.mmm-session`.
     pub fn name(&self) -> String {
         session_name(&self.mosaic.dir)
+    }
+
+    /// Canvas `(width, height)` of the analysed frame, once an analysis has
+    /// derived one.
+    pub fn canvas(&self) -> Option<(u64, u64)> {
+        self.frame.as_ref().map(ReferenceFrame::canvas)
     }
 
     /// The number of processing groups: from the resolved groups, else the
@@ -134,15 +142,13 @@ fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
     }
     let lock = if lock { Some(take_lock(dir)?) } else { None };
     let mosaic = Mosaic::open(dir).map_err(|e| format!("Cannot open {shown}: {e}"))?;
-    // A missing or unreadable frame only means no canvas size to show yet.
-    let canvas = ReferenceFrame::load(&dir.join(FRAME_FILE))
-        .ok()
-        .map(|f| f.canvas());
+    // A missing or unreadable frame only means nothing analysed yet.
+    let frame = ReferenceFrame::load(&dir.join(FRAME_FILE)).ok();
     // Reads panel headers (Header rule): fine here, off the UI thread.
     let groups = mosaic.groups().ok();
     Ok(OpenSession {
         mosaic,
-        canvas,
+        frame,
         groups,
         lock,
     })
@@ -174,7 +180,7 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
     let lock = Some(take_lock(dir)?);
     Ok(OpenSession {
         mosaic,
-        canvas: None,
+        frame: None,
         groups: Some(Groups::default()),
         lock,
     })

@@ -241,8 +241,10 @@ A **mosaic session** (`mmm init`, 2026-11) wraps one such session per group:
                             # accepted check keys
   session.lock              # cross-process advisory lock (see phase 3)
   previews/<key>.mmmp       # cached panel previews (phase 3)
+  previews/frame.mmm-frame.json # the previews' frame (Plan; phase 3)
   decoded/                  # decode cache of the app (phase 3)
-  reference.mmm-frame.json  # the shared frame all groups adopt
+  reference.mmm-frame.json  # the analysed frame all groups adopt (written
+                            # only by analysis)
   groups/<dir>/             # an ordinary session in the layout above
   groups/<dir>/result.mmmt  # tiled result store (see "Standalone app groundwork");
                             # written by blend_group (the app), not `mmm run`
@@ -969,7 +971,7 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   or B × weight; overlaps within one group add up (a known limitation).
 - **Blend ROIs and composition views** (phase 3): ROIs live in `ui.rois`
   (name, note, sky corners when the frame has a WCS, canvas rect), are
-  reprojected through the current frame on a worker, and show their size
+  reprojected through the analysed frame on a worker, and show their size
   and the fraction of fresh level-0 tiles per group of the view. Blend ROI
   blends the selected ROI once per group of the view (not while the ROIs
   are being reprojected); Blend whole mosaic blends every group.
@@ -1009,13 +1011,30 @@ views and export. No algorithm changed. Core additions are bookkeeping
   in `<session>/previews/<hash of path, size, mtime>.mmmp` (JSON header + f32).
   Aligned panels are block means over the covered bbox; solved panels are a
   WCS warp. The reference frame is always re-derived header-only on a preview
-  run (cheap) and saved atomically only when it changed and the full panel set
-  was used, so previews never see a stale frame. `preview::footprint` gives
+  run (cheap) and saved atomically, only when it changed and the full panel
+  set was used, to **`previews/frame.mmm-frame.json`** (each cached preview's
+  header also records its frame), so previews never see a stale frame. `preview::footprint` gives
   a solved panel's outline from its header alone (aligned gives `None`), so
   Plan shows dashed outlines of 100+ panels before any preview exists.
   Compressed XISF and FITS panels are decoded once into `<session>/decoded`
   (the app points the decode cache there), which analysis reuses. Per-panel
   failures are logged; the run still finishes.
+- **Two frames.** `reference.mmm-frame.json` is the **analysed frame**: the
+  frame of the last analysis, written only by analysis (and `mmm init` /
+  `run`). Previews derive and keep their own frame
+  (`previews/frame.mmm-frame.json`) and never write the analysed one. Plan
+  places panels in the previews' frame (the analysed one until a complete
+  previews run has saved one); ROI reprojection, Blend ROI and blends use the
+  analysed frame, so adding panels never moves a persisted ROI before the
+  analysis that changes the blend's canvas. The app keeps the analysed frame
+  in memory (`OpenSession::frame`, read on open and after each analysis).
+  When a complete previews run's frame differs from the analysed frame and
+  nothing but exports is running (no analysis pending or running), the
+  pipeline marks every analysed group `needs_analyze` with
+  `mosaic::mark_needs_analyze` (busy-aware: it invalidates the newly marked
+  groups' stores, saves once, and is refused with nothing changed while a
+  store is held), so panel files changed on disk since the analysis are
+  caught; once per previews run.
 - **Automatic pipeline** (`pipeline.rs`). On open, and 1.5 s (`DEBOUNCE`) after
   the last input edit, it runs previews, then analysis when `ui.auto_analyze`
   (the "Auto-analyze" toggle, default on) is set, nothing else is running
@@ -1054,9 +1073,10 @@ views and export. No algorithm changed. Core additions are bookkeeping
   overlap bands look brighter (accepted for a rough preview).
 - **Blend ROIs** are sky-anchored: a rectangle drawn with the viewer's draw
   tool is stored as two opposite sky corners plus a canvas rect and is
-  reprojected through the current frame, so it follows the frame when panels
-  change (a rotated re-derive grows the box slightly; without a WCS the canvas
-  rect is used as stored). **Blend ROI** blends the selected ROI once per
+  reprojected through the analysed frame after each analysis, so it follows
+  the frame when the analysis of changed panels moves it (a rotated
+  re-derive grows the box slightly; without a WCS the canvas rect is used as
+  stored). **Blend ROI** blends the selected ROI once per
   group of the current view; **Blend whole mosaic** blends every group.
   Composition views in Blend mix the member groups' tiles; a member not blended
   yet adds nothing and is named above the image.

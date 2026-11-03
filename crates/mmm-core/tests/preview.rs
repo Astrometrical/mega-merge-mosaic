@@ -7,7 +7,9 @@ use std::sync::Mutex;
 
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{FRAME_FILE, Mosaic, MosaicConfig};
-use mmm_core::preview::{Preview, build_preview, footprint, plan_previews, run_previews};
+use mmm_core::preview::{
+    Preview, build_preview, footprint, plan_previews, preview_frame_path, run_previews,
+};
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::synth::{SynthWcs, write_xisf, write_xisf_solved};
 
@@ -111,9 +113,11 @@ fn footprint_matches_preview_rect() {
     let m = mosaic(&t.0, vec![a.clone(), b.clone()]);
     let plan = plan_previews(&m);
     let got = Mutex::new(Vec::<Preview>::new());
-    let errs = run_previews(&plan, &JobCtl::none(), &|p| got.lock().unwrap().push(p)).unwrap();
+    let errs = run_previews(&plan, &JobCtl::none(), &|p| got.lock().unwrap().push(p))
+        .unwrap()
+        .failed;
     assert!(errs.is_empty(), "{errs:?}");
-    let frame = ReferenceFrame::load(&m.dir.join(FRAME_FILE)).unwrap();
+    let frame = ReferenceFrame::load(&preview_frame_path(&m.dir)).unwrap();
     for p in got.into_inner().unwrap() {
         let f = footprint(&p.path, &frame).unwrap().expect("solved frame");
         let block = (p.rect[2] - p.rect[0]) / f64::from(p.width);
@@ -146,10 +150,14 @@ fn solved_preview_lands_in_frame() {
     let m = mosaic(&t.0, vec![a.clone(), b.clone()]);
     let plan = plan_previews(&m);
     let got = Mutex::new(Vec::<Preview>::new());
-    let errs = run_previews(&plan, &JobCtl::none(), &|p| got.lock().unwrap().push(p)).unwrap();
+    let errs = run_previews(&plan, &JobCtl::none(), &|p| got.lock().unwrap().push(p))
+        .unwrap()
+        .failed;
     assert!(errs.is_empty(), "{errs:?}");
-    // The frame was derived header-only and saved for later runs.
-    let frame = ReferenceFrame::load(&m.dir.join(FRAME_FILE)).unwrap();
+    // The frame was derived header-only and saved as the previews' frame;
+    // the analysed frame is analysis's alone.
+    let frame = ReferenceFrame::load(&preview_frame_path(&m.dir)).unwrap();
+    assert!(!m.dir.join(FRAME_FILE).exists());
     assert_eq!(frame.kind_name(), "solved");
     let mut got = got.into_inner().unwrap();
     got.sort_by(|x, y| x.path.cmp(&y.path));
@@ -223,7 +231,8 @@ fn previews_report_each() {
         assert!(p.width > 0 && p.height > 0);
         ready.lock().unwrap().push(p.path);
     })
-    .unwrap();
+    .unwrap()
+    .failed;
     assert!(errs.is_empty(), "{errs:?}");
     let mut ready = ready.into_inner().unwrap();
     ready.sort();
@@ -292,7 +301,9 @@ fn bad_panel_does_not_fail_run() {
     let progress = Mutex::new(Vec::<u64>::new());
     let obs = |_: &str, d: u64, _: u64| progress.lock().unwrap().push(d);
     let ctl = JobCtl::new(CancelToken::new(), Some(&obs));
-    let errs = run_previews(&plan, &ctl, &|p| ready.lock().unwrap().push(p.path)).unwrap();
+    let errs = run_previews(&plan, &ctl, &|p| ready.lock().unwrap().push(p.path))
+        .unwrap()
+        .failed;
     assert_eq!(
         errs.iter().map(|e| &e.0).collect::<Vec<_>>(),
         vec![&bad, &missing]
@@ -308,9 +319,8 @@ fn bad_panel_does_not_fail_run() {
     assert_eq!(ready, good);
     // Every panel, failed or not, counts toward progress.
     assert_eq!(progress.into_inner().unwrap().iter().max(), Some(&5));
-    // The frame derived without the unreadable panels is not saved as the
-    // mosaic's reference frame.
-    assert!(!m.dir.join(FRAME_FILE).exists());
+    // The frame derived without the unreadable panels is not saved.
+    assert!(!preview_frame_path(&m.dir).exists());
 
     // With a frame in place, a corrupt panel still fails alone.
     ReferenceFrame::Aligned {
@@ -318,10 +328,12 @@ fn bad_panel_does_not_fail_run() {
         height: 180,
         wcs: None,
     }
-    .save(&m.dir.join(FRAME_FILE))
+    .save(&preview_frame_path(&m.dir))
     .unwrap();
     let ready = Mutex::new(0usize);
-    let errs = run_previews(&plan, &JobCtl::none(), &|_| *ready.lock().unwrap() += 1).unwrap();
+    let errs = run_previews(&plan, &JobCtl::none(), &|_| *ready.lock().unwrap() += 1)
+        .unwrap()
+        .failed;
     assert_eq!(errs.len(), 2, "{errs:?}");
     assert_eq!(*ready.lock().unwrap(), 3);
 }
@@ -341,15 +353,16 @@ fn unsolved_panel_is_reported_not_fatal() {
     let errs = run_previews(&plan_previews(&m), &JobCtl::none(), &|p| {
         ready.lock().unwrap().push(p.path)
     })
-    .unwrap();
+    .unwrap()
+    .failed;
     assert_eq!(errs.len(), 1, "{errs:?}");
     assert_eq!(errs[0].0, u);
     assert!(errs[0].1.contains("astrometric solution"), "{errs:?}");
     let mut ready = ready.into_inner().unwrap();
     ready.sort();
     assert_eq!(ready, vec![a, b]);
-    // A frame derived from a subset is not the mosaic's frame.
-    assert!(!m.dir.join(FRAME_FILE).exists());
+    // A frame derived from a subset is not saved.
+    assert!(!preview_frame_path(&m.dir).exists());
 }
 
 #[test]
@@ -365,12 +378,17 @@ fn frame_grows_with_inputs() {
         let errs = run_previews(&plan_previews(m), &JobCtl::none(), &|p| {
             got.lock().unwrap().push(p)
         })
-        .unwrap();
+        .unwrap()
+        .failed;
         assert!(errs.is_empty(), "{errs:?}");
         got.into_inner().unwrap()
     };
     run(&m);
-    let old = ReferenceFrame::load(&m.dir.join(FRAME_FILE)).unwrap();
+    let old = ReferenceFrame::load(&preview_frame_path(&m.dir)).unwrap();
+    // The frame of the last analysis (as analysis saves it): previews
+    // never rewrite it, whatever their own frame becomes.
+    old.save(&m.dir.join(FRAME_FILE)).unwrap();
+    let analysed = std::fs::read(m.dir.join(FRAME_FILE)).unwrap();
     // C lies 700 px right of A: outside the old canvas.
     let c = t.0.join("c.xisf");
     solved_panel(&c, [200.0 - 700.0, 150.0]);
@@ -378,7 +396,13 @@ fn frame_grows_with_inputs() {
     let grouping = m.config.grouping.clone();
     mmm_core::mosaic::set_inputs(&mut m, panels, grouping).unwrap();
     let got = run(&m);
-    let new = ReferenceFrame::load(&m.dir.join(FRAME_FILE)).unwrap();
+    assert_eq!(
+        std::fs::read(m.dir.join(FRAME_FILE)).unwrap(),
+        analysed,
+        "a preview run rewrote the analysed frame"
+    );
+    let new = ReferenceFrame::load(&preview_frame_path(&m.dir)).unwrap();
+    assert_ne!(new, old);
     let (ow, _) = old.canvas();
     let (nw, nh) = new.canvas();
     assert!(nw >= ow + 600, "frame {ow} -> {nw} px wide");

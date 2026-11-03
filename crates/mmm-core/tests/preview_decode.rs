@@ -56,7 +56,8 @@ fn compressed_panels_decode_into_the_session_cache() {
     let errs = run_previews(&plan_previews(&m), &JobCtl::none(), &|p| {
         got.lock().unwrap().push(p)
     })
-    .unwrap();
+    .unwrap()
+    .failed;
     assert!(errs.is_empty(), "{errs:?}");
     let decoded = m.dir.join("decoded");
     assert_eq!(mmm_core::decoded::cache_dir(), Some(decoded.clone()));

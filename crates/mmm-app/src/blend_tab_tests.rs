@@ -693,3 +693,96 @@ fn export_snapshots_choices_and_confirms_overwrite() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&root2);
 }
+
+#[test]
+fn previews_do_not_move_persisted_rois() {
+    use mmm_core::mosaic::{FRAME_FILE, Mosaic, set_inputs};
+    use mmm_core::reference::ReferenceFrame;
+    use mmm_core::synth::{SynthWcs, write_xisf_solved};
+
+    use crate::rois::{Roi, load_rois, reproject, save_rois};
+
+    let root = temp_dir("blend-roi-frame");
+    let (w, h) = (200u64, 150u64);
+    let panel = |name: &str, refimg: [f64; 2]| {
+        let path = root.join(name);
+        let wcs = SynthWcs {
+            crval: [83.8, -5.4],
+            refimg,
+            cd: [[-1e-3, 0.0], [0.0, 1e-3]],
+        };
+        write_xisf_solved(&path, w, h, 1, &vec![0.1f32; (w * h) as usize], &wcs).unwrap();
+        path
+    };
+    let (a, b) = (
+        panel("a.xisf", [100.0, 75.0]),
+        panel("b.xisf", [40.0, 45.0]),
+    );
+    let mut mosaic = Mosaic::create(
+        &root.join("s.mmm-session"),
+        MosaicConfig::new(vec![a.clone(), b.clone()]),
+    )
+    .unwrap();
+    // The frame of the last analysis (as analysis saves it), and an ROI
+    // anchored on the sky in it.
+    let input = mosaic.config.analyze.input;
+    let analysed = mmm_core::reference::derive(&[a.clone(), b.clone()], input).unwrap();
+    analysed.save(&mosaic.dir.join(FRAME_FILE)).unwrap();
+    let roi = reproject(
+        &[Roi {
+            name: "ROI 1".into(),
+            note: String::new(),
+            sky: None,
+            canvas: [20, 20, 80, 60],
+        }],
+        Some(&analysed),
+    )
+    .remove(0);
+    assert!(roi.sky.is_some());
+    save_rois(&mut mosaic.config.ui, std::slice::from_ref(&roi));
+    // A panel added up and to the left: the panels' frame grows and its
+    // origin moves (no analysis yet).
+    let c = panel("c.xisf", [250.0, 200.0]);
+    let panels = MosaicConfig::new(vec![a.clone(), b.clone(), c.clone()]).panels;
+    let grouping = mosaic.config.grouping.clone();
+    set_inputs(&mut mosaic, panels, grouping).unwrap();
+    let grown = mmm_core::reference::derive(&[a, b, c], input).unwrap();
+    assert_ne!(grown, analysed);
+    assert_ne!(
+        reproject(std::slice::from_ref(&roi), Some(&grown))[0].canvas,
+        roi.canvas
+    );
+    let groups = mosaic.groups().ok();
+    let mut s = OpenSession {
+        mosaic,
+        frame: Some(analysed.clone()),
+        groups,
+        lock: None,
+    };
+    // The previews run in the panels' frame...
+    let mut jobs = JobRunner::new(egui::Context::default());
+    jobs.start_previews(&s);
+    crate::jobs::tests::drain(&mut jobs, &mut s);
+    assert_eq!(
+        ReferenceFrame::load(&s.mosaic.dir.join(FRAME_FILE)).unwrap(),
+        analysed,
+        "previews rewrote the analysed frame"
+    );
+    // ...and the Blend tab's ROI sync, on opening, keeps the ROI where the
+    // analysed frame puts it.
+    let ctx = egui::Context::default();
+    let mut tab = BlendTab::new();
+    tab.rois.load_once(&s.mosaic.config.ui);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        tab.update(&ctx, &mut s, &jobs);
+        if tab.rois.synced() && tab.rois.idle() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the ROI sync never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(tab.rois(), std::slice::from_ref(&roi));
+    assert_eq!(load_rois(&s.mosaic.config.ui), [roi]);
+    let _ = std::fs::remove_dir_all(&root);
+}

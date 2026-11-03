@@ -468,13 +468,16 @@ fn plan_places_solved_panels_before_previews() {
     let cfg = mmm_core::mosaic::MosaicConfig::new(paths.clone());
     let input = cfg.analyze.input;
     let mosaic = mmm_core::mosaic::Mosaic::create(&root.join("s.mmm-session"), cfg).unwrap();
-    // The frame as a previews run derives it (header-only), saved.
+    // The frame as a previews run derives it (header-only), saved as the
+    // previews' frame (Plan's; nothing has been analysed).
     let frame = mmm_core::reference::derive(&paths, input).unwrap();
-    frame.save(&mosaic.dir.join(FRAME_FILE)).unwrap();
+    frame
+        .save(&mmm_core::preview::preview_frame_path(&mosaic.dir))
+        .unwrap();
     let groups = mosaic.groups().ok();
     let s = OpenSession {
         mosaic,
-        canvas: None,
+        frame: None,
         groups,
         lock: None,
     };

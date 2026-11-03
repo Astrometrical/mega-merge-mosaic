@@ -13,7 +13,7 @@ pub(crate) fn two_group_session(root: &Path) -> OpenSession {
     let groups = mosaic.groups().ok();
     OpenSession {
         mosaic,
-        canvas: None,
+        frame: None,
         groups,
         lock: None,
     }

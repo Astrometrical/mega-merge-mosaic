@@ -10,9 +10,9 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
-    analyze_all, blend_group, invalidate_group, plan_analyze, plan_analyze_with, plan_blend,
-    run_analyze, run_blend, set_analyze_settings, set_blend_settings, set_group_override,
-    set_inputs, set_settings,
+    analyze_all, blend_group, invalidate_group, mark_needs_analyze, plan_analyze,
+    plan_analyze_with, plan_blend, run_analyze, run_blend, set_analyze_settings,
+    set_blend_settings, set_group_override, set_inputs, set_settings,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -1059,4 +1059,37 @@ fn plan_drops_needs_analyze_of_vanished_groups() {
     result.unwrap();
     m.apply_analyze(&outcome).unwrap();
     assert!(m.config.needs_analyze.is_empty());
+}
+
+#[test]
+fn mark_needs_analyze_stales_and_marks_once() {
+    let (_tmp, mut m) = blended_two_groups("mark-needs");
+    let oiii_valid = valid0(&m.result_path("OIII"));
+    assert!(oiii_valid > 0);
+    // Busy: nothing changes.
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let cfg = m.config.clone();
+    let held = TileStore::open(&m.result_path("Ha")).unwrap();
+    let err = mark_needs_analyze(&mut m, &["Ha".into(), "OIII".into()]).unwrap_err();
+    assert!(err.is_busy(), "{err}");
+    assert_eq!(m.config, cfg);
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+    assert_eq!(valid0(&m.result_path("OIII")), oiii_valid);
+    drop(held);
+    // Marks the named groups, stales their stores, saves.
+    mark_needs_analyze(&mut m, &["OIII".into()]).unwrap();
+    assert_eq!(valid0(&m.result_path("OIII")), 0);
+    assert!(valid0(&m.result_path("Ha")) > 0, "Ha left alone");
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(saved, m.config);
+    assert_eq!(
+        saved.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["OIII"]
+    );
+    // Already marked: a no-op, even with the store held.
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let held = TileStore::open(&m.result_path("OIII")).unwrap();
+    mark_needs_analyze(&mut m, &["OIII".into()]).unwrap();
+    drop(held);
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
 }

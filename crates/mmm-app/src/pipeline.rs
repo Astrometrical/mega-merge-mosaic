@@ -22,14 +22,20 @@
 //!   that failed) stay incomplete ([`Pipeline::previews_complete`]) until
 //!   the inputs change or [`Pipeline::request_previews`] asks again;
 //!   analysis may still follow them.
+//! - Previews keep their own frame; `reference.mmm-frame.json` is the
+//!   analysed frame ([`OpenSession::frame`]). When a complete previews run's
+//!   frame differs from it (panels changed on disk since the analysis) and
+//!   nothing but exports runs, every analysed group is marked as needing
+//!   analysis ([`mark_needs_analyze`]), once per previews run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mmm_core::mosaic::{Grouping, MosaicConfig};
+use mmm_core::mosaic::{Grouping, MosaicConfig, mark_needs_analyze};
 use mmm_core::preview::Preview;
+use mmm_core::reference::ReferenceFrame;
 use mmm_core::settings::{AnalyzeSettings, GroupOverride};
 
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner};
@@ -156,6 +162,9 @@ pub struct Pipeline {
     /// Automatic analysis was on at the last poll.
     auto_was: bool,
     previews: BTreeMap<PathBuf, Arc<Preview>>,
+    /// The frame of the current inputs' last complete previews run, and
+    /// whether it has been compared with the analysed frame yet.
+    previews_frame: Option<(ReferenceFrame, bool)>,
     generation: u64,
     /// An analysis started since [`Pipeline::take_started_analysis`].
     started_analysis: Option<u64>,
@@ -217,7 +226,12 @@ impl Pipeline {
             }
             match job.step {
                 // Cancelled previews are incomplete: run them again.
-                Step::Previews if finished => self.previews_for = Some(job.inputs),
+                Step::Previews if finished => {
+                    self.previews_for = Some(job.inputs);
+                    if let Some(frame) = jobs.take_previews_frame() {
+                        self.previews_frame = Some((frame, false));
+                    }
+                }
                 // The user's Cancel (or a failure) is final for these
                 // inputs; the previews stay incomplete.
                 Step::Previews => self.previews_cancelled_for = Some(job.inputs),
@@ -242,6 +256,7 @@ impl Pipeline {
             self.due = Some(now + delay);
             self.seen = Some(current.clone());
             self.previews.clear();
+            self.previews_frame = None;
             self.generation += 1;
             self.previews_for = None;
             self.previews_cancelled_for = None;
@@ -258,13 +273,14 @@ impl Pipeline {
         if self.job.is_some() {
             return;
         }
+        self.check_frame(session, jobs);
         if let Some(due) = self.due
             && now < due
         {
             ctx.request_repaint_after(due - now);
             return;
         }
-        if cfg.panels.is_empty() {
+        if session.mosaic.config.panels.is_empty() {
             return;
         }
         if self.previews_for.as_ref() != Some(&current)
@@ -290,6 +306,42 @@ impl Pipeline {
                 inputs: current,
             });
             self.started_analysis = Some(id);
+        }
+    }
+
+    /// Once nothing but exports runs (no analysis pending or running),
+    /// compare the previews' frame with the analysed frame, once per
+    /// previews run: when they differ (the panels changed on disk since the
+    /// analysis), every analysed group is marked as needing analysis. A
+    /// failure (a store held elsewhere) is logged, not retried.
+    fn check_frame(&mut self, session: &mut OpenSession, jobs: &JobRunner) {
+        let Some((frame, checked)) = &mut self.previews_frame else {
+            return;
+        };
+        if *checked || jobs.busy_except_exports() {
+            return;
+        }
+        *checked = true;
+        if session
+            .frame
+            .as_ref()
+            .is_none_or(|analysed| analysed == frame)
+        {
+            return;
+        }
+        let cfg = &session.mosaic.config;
+        let groups: Vec<String> = cfg
+            .group_dirs
+            .keys()
+            .filter(|g| !cfg.needs_analyze.contains(*g))
+            .cloned()
+            .collect();
+        if groups.is_empty() {
+            return;
+        }
+        tracing::info!("the panels' frame differs from the analysed frame: analysis needed");
+        if let Err(e) = mark_needs_analyze(&mut session.mosaic, &groups) {
+            tracing::warn!("could not mark the groups as needing analysis: {e}");
         }
     }
 
@@ -638,6 +690,64 @@ mod tests {
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert_eq!(p.previews().len(), 8);
         assert!(p.previews_complete());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_mismatch_marks_groups_needs_analyze() {
+        use mmm_core::mosaic::FRAME_FILE;
+        use mmm_core::preview::preview_frame_path;
+        use mmm_core::reference::ReferenceFrame;
+
+        let root = temp_dir("pipe-frame");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        assert!(valid0(&s.mosaic.result_path("Ha")) > 0);
+        // The panels changed on disk since that analysis: its frame no
+        // longer matches theirs (an analysed frame of another size).
+        let Some(ReferenceFrame::Aligned { width, height, wcs }) = s.frame.clone() else {
+            panic!("an aligned analysed frame");
+        };
+        let old = ReferenceFrame::Aligned {
+            width: width + 8,
+            height,
+            wcs,
+        };
+        old.save(&s.mosaic.dir.join(FRAME_FILE)).unwrap();
+        s.frame = Some(old.clone());
+        set_auto_analyze(&mut s, false).unwrap();
+        // Reopened: the previews find the mismatch and every group is
+        // marked (and its result staled); nothing is analysed.
+        let mut p = Pipeline::new();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        assert_eq!(
+            s.mosaic
+                .config
+                .needs_analyze
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["Ha", "OIII"]
+        );
+        assert_eq!(MosaicConfig::load(&s.mosaic.dir).unwrap(), s.mosaic.config);
+        assert_eq!(valid0(&s.mosaic.result_path("Ha")), 0);
+        assert_eq!(
+            ReferenceFrame::load(&s.mosaic.dir.join(FRAME_FILE)).unwrap(),
+            old,
+            "previews never write the analysed frame"
+        );
+        // Automatic analysis on: it runs, and the frames agree again.
+        set_auto_analyze(&mut s, true).unwrap();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        let previews = ReferenceFrame::load(&preview_frame_path(&s.mosaic.dir)).unwrap();
+        assert_eq!(s.frame.as_ref(), Some(&previews));
         let _ = std::fs::remove_dir_all(&root);
     }
 

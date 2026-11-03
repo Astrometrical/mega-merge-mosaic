@@ -47,8 +47,7 @@ use mmm_core::checks::{Check, Severity, SolutionKind, is_accepted, panel_facts};
 use mmm_core::formats::InputPanel;
 use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
-use mmm_core::preview::Preview;
-use mmm_core::preview::footprint;
+use mmm_core::preview::{Preview, footprint, preview_frame_path};
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 use mmm_core::stretch::{ChannelStats, StretchParams, apply, auto_stretch, channel_stats};
@@ -328,12 +327,15 @@ pub struct Layout {
     pub overlaps: BTreeMap<PathBuf, Vec<PathBuf>>,
 }
 
-/// Read the frame (`frame`) and the analyses of `groups` (their session
-/// directories). Blocking (worker thread); what cannot be read is left out
-/// and logged.
-pub fn load_layout(frame: &Path, groups: &[PathBuf]) -> Layout {
+/// Read the frame and the analyses of `groups` (their session
+/// directories). The frame is the previews' (`frames.0`), else, before any
+/// complete previews run, the analysed one (`frames.1`). Blocking (worker
+/// thread); what cannot be read is left out and logged.
+pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
     let mut out = Layout {
-        frame: ReferenceFrame::load(frame).ok(),
+        frame: ReferenceFrame::load(frames.0)
+            .or_else(|_| ReferenceFrame::load(frames.1))
+            .ok(),
         ..Layout::default()
     };
     for dir in groups {
@@ -998,9 +1000,12 @@ impl PlanTab {
             return;
         }
         self.layout_for = Some(key);
-        let frame = session.mosaic.dir.join(FRAME_FILE);
+        // Plan shows the panels where the previews put them: the previews'
+        // frame, not the analysed one.
+        let previews = preview_frame_path(&session.mosaic.dir);
+        let analysed_frame = session.mosaic.dir.join(FRAME_FILE);
         self.layout_task = Task::spawn("mmm-plan-layout", ctx, move || {
-            load_layout(&frame, &analysed)
+            load_layout((&previews, &analysed_frame), &analysed)
         });
     }
 
@@ -1267,7 +1272,7 @@ impl PlanTab {
     /// The canvas extent: the shared frame (stable as previews arrive), or
     /// the union of the drawn rects before the frame is known.
     fn extent(&self, session: &OpenSession, items: &[PlacedItem]) -> Option<[f64; 4]> {
-        if let Some((w, h)) = self.frame_canvas().or(session.canvas) {
+        if let Some((w, h)) = self.frame_canvas().or(session.canvas()) {
             return Some([0.0, 0.0, w as f64, h as f64]);
         }
         items.iter().map(|it| it.rect).reduce(|a, b| {

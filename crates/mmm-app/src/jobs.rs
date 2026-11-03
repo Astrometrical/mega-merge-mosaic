@@ -53,7 +53,7 @@ use mmm_core::mosaic::{
     AnalyzeOutcome, AnalyzePlan, BlendPlan, Grouping, Mosaic, PanelEntry, invalidate_group,
     plan_analyze_with, plan_blend, run_analyze, run_blend,
 };
-use mmm_core::preview::{Preview, PreviewPlan, plan_previews, run_previews};
+use mmm_core::preview::{Preview, PreviewPlan, PreviewRun, plan_previews, run_previews};
 use mmm_core::reference::ReferenceFrame;
 
 use crate::session::OpenSession;
@@ -163,11 +163,13 @@ enum Done {
     Analyze {
         outcome: AnalyzeOutcome,
         result: mmm_core::Result<()>,
-        canvas: Option<(u64, u64)>,
+        /// The analysed frame as saved by the run (or still on disk).
+        frame: Option<ReferenceFrame>,
     },
     Blend(mmm_core::Result<[u64; 4]>),
-    /// The previews run: per-panel failures, or why the whole run failed.
-    Previews(mmm_core::Result<Vec<(std::path::PathBuf, String)>>),
+    /// The previews run (its frame and per-panel failures), or why the
+    /// whole run failed.
+    Previews(mmm_core::Result<PreviewRun>),
     Export(mmm_core::Result<ExportReport>),
 }
 
@@ -175,7 +177,7 @@ enum Done {
 enum Msg {
     Progress(String, u64, u64),
     Preview(Arc<Preview>),
-    Done(Done),
+    Done(Box<Done>),
 }
 
 /// The running job.
@@ -236,6 +238,9 @@ pub struct JobRunner {
     labels: BTreeMap<u64, String>,
     /// Events raised outside `poll` (queued jobs cancelled), delivered by it.
     pending: Vec<JobEvent>,
+    /// The frame of the last previews run that finished with every panel,
+    /// until taken ([`JobRunner::take_previews_frame`]).
+    previews_frame: Option<ReferenceFrame>,
     #[cfg(test)]
     gate: Option<std::sync::Arc<tests::Gate>>,
 }
@@ -251,6 +256,7 @@ impl JobRunner {
             previous: None,
             labels: BTreeMap::new(),
             pending: Vec::new(),
+            previews_frame: None,
             #[cfg(test)]
             gate: None,
         }
@@ -439,7 +445,7 @@ impl JobRunner {
                 Ok(Msg::Preview(p)) => events.push(JobEvent::Preview(p)),
                 Ok(Msg::Done(done)) => {
                     let r = self.running.take().expect("running job");
-                    events.extend(self.finish(r, done, session));
+                    events.extend(self.finish(r, *done, session));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -533,6 +539,12 @@ impl JobRunner {
                 .queue
                 .iter()
                 .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
+    }
+
+    /// The frame of the last previews run that finished and used every
+    /// panel (set when its [`JobEvent::Finished`] is delivered), once.
+    pub fn take_previews_frame(&mut self) -> Option<ReferenceFrame> {
+        self.previews_frame.take()
     }
 
     /// Whether a job is running or queued.
@@ -643,13 +655,11 @@ impl JobRunner {
                         Planned::Resolve(m) => Done::Resolved(m.groups()),
                         Planned::Analyze(plan) => {
                             let (outcome, result) = run_analyze(plan, &ctl);
-                            let canvas = ReferenceFrame::load(&plan.frame_path)
-                                .ok()
-                                .map(|f| f.canvas());
+                            let frame = ReferenceFrame::load(&plan.frame_path).ok();
                             Done::Analyze {
                                 outcome,
                                 result,
-                                canvas,
+                                frame,
                             }
                         }
                         Planned::Blend(plan) => Done::Blend(run_blend(plan, &ctl)),
@@ -669,7 +679,7 @@ impl JobRunner {
                 };
                 // Everything the job held (store locks included) is
                 // released before the outcome is sent.
-                let _ = tx.send(Msg::Done(done));
+                let _ = tx.send(Msg::Done(Box::new(done)));
                 ctx.request_repaint();
             });
         match spawned {
@@ -730,10 +740,12 @@ impl JobRunner {
         }
         Some(match (done, &r.blend) {
             (Done::Resolved(_), _) => unreachable!("handled above"),
-            (Done::Previews(Ok(failed)), _) => {
-                if !failed.is_empty() {
-                    tracing::warn!("{name}: {} panel(s) have no preview", failed.len());
+            (Done::Previews(Ok(run)), _) => {
+                if !run.failed.is_empty() {
+                    tracing::warn!("{name}: {} panel(s) have no preview", run.failed.len());
                 }
+                // Only a frame of every panel says where the panels are.
+                self.previews_frame = run.complete.then_some(run.frame);
                 JobEvent::Finished { id, label: name }
             }
             (Done::Previews(Err(e)), _) if e.is_cancelled() => JobEvent::Cancelled { id },
@@ -750,12 +762,12 @@ impl JobRunner {
                 Done::Analyze {
                     outcome,
                     result,
-                    canvas,
+                    frame,
                 },
                 _,
             ) => {
-                if canvas.is_some() {
-                    session.canvas = canvas;
+                if frame.is_some() {
+                    session.frame = frame;
                 }
                 // Applied even when cancelled: the finished groups stay.
                 let applied = session.mosaic.apply_analyze(&outcome);
@@ -922,7 +934,7 @@ pub(crate) mod tests {
     #[test]
     fn blend_job_runs_and_applies() {
         let (root, mut s, mut r) = analyzed("job-blend");
-        assert_eq!(s.canvas, Some(CANVAS), "canvas from the reference frame");
+        assert_eq!(s.canvas(), Some(CANVAS), "canvas from the reference frame");
         assert!(s.mosaic.config.needs_analyze.is_empty());
         let id = r.start_blend(&mut s, "Ha", None);
         assert!(r.busy());

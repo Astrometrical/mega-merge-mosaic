@@ -379,7 +379,7 @@ impl Shell {
                 &views,
                 self.checks.counts(&session.mosaic.config),
                 // Plan reads the frame as soon as previews derive it.
-                session.canvas.or(self.plan.frame_canvas()),
+                session.canvas().or(self.plan.frame_canvas()),
                 session.group_count(),
                 self.sys.latest(),
             );

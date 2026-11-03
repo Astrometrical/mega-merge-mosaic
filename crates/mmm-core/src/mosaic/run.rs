@@ -524,6 +524,33 @@ pub fn invalidate_group(m: &Mosaic, group: &str) -> Result<()> {
     invalidate(&mut stores)
 }
 
+/// Mark `groups` in [`MosaicConfig::needs_analyze`] (owner thread), e.g.
+/// when the panels' frame no longer matches the analysed frame (files
+/// changed on disk). Each newly marked group's result store is invalidated
+/// (its tiles were blended from the analysis being replaced) and the
+/// configuration is saved once. Groups already marked are left alone; when
+/// all are, nothing is done.
+///
+/// Refused with nothing changed (in memory or on disk) with
+/// [`Error::Busy`] when a store to invalidate is held by a writer.
+pub fn mark_needs_analyze(m: &mut Mosaic, groups: &[String]) -> Result<()> {
+    let new: Vec<&String> = groups
+        .iter()
+        .filter(|g| !m.config.needs_analyze.contains(*g))
+        .collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<PathBuf> = new.iter().map(|g| m.result_path(g)).collect();
+    let mut stores = lock_stores(&paths)?;
+    let mut next = m.config.clone();
+    next.needs_analyze.extend(new.into_iter().cloned());
+    invalidate(&mut stores)?;
+    next.save(&m.dir)?;
+    m.config = next;
+    Ok(())
+}
+
 /// Every existing group result store under `<dir>/groups`.
 fn all_result_stores(m: &Mosaic) -> Result<Vec<PathBuf>> {
     let root = m.dir.join(GROUPS_DIR);
