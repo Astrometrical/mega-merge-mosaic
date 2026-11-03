@@ -55,7 +55,9 @@
 //!   and [`mosaic::blend_group`] (a group into its tiled result), each split
 //!   into plan / run / apply for background jobs ([`mosaic::plan_analyze`],
 //!   [`mosaic::run_blend`], ...), plus busy-aware settings edits
-//!   ([`mosaic::set_settings`]) that stale exactly the affected result stores.
+//!   ([`mosaic::set_settings`]) and input edits ([`mosaic::set_inputs`]) that
+//!   stale exactly the affected result stores, and a cross-process session
+//!   lock ([`mosaic::lock_session`]).
 //!   One writer per store is enforced (`Error::Busy`); the plan / run / apply
 //!   concurrency contract is in the [`mosaic`] module docs.
 //! - [`export`] — a group's blended result to FITS (WCS + `HISTORY`

@@ -5,6 +5,21 @@
 Groundwork for the standalone application; no change to any algorithm or
 to the output of existing commands.
 
+### Added (app phase 3)
+
+- **Panels, Plan and export in the app.** Panels tab (add files, optional
+  grouping with stable physical group colours), Plan tab (cached previews
+  placed in the shared frame, compositions, selection with Show in folder,
+  checks with Accept), automatic previews then analysis after edits, Blend
+  ROIs anchored to the sky, composition views in Blend, and export to
+  32-bit float FITS and TIFF with provenance and a stale/missing warning.
+- **`mmm export -s DIR --group G -o FILE [--format fits|tiff]`.**
+- **Cross-process session lock** (`session.lock`); `init`, `set`, `run` and
+  `export` refuse a session open elsewhere.
+- **Core:** `mosaic::set_inputs`, the `preview` and `export` modules.
+- Not yet: XISF export (needs an XISF writer in mpp-core); TIFF export uses a
+  temporary scratch file about the size of the image.
+
 ### Added
 
 - **Mosaic sessions.** `mmm init` creates a mosaic directory

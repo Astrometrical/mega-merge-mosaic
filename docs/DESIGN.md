@@ -239,6 +239,9 @@ A **mosaic session** (`mmm init`, 2026-11) wraps one such session per group:
                             # analyze/blend settings + per-group overrides,
                             # group_dirs (group name -> directory, persisted),
                             # accepted check keys
+  session.lock              # cross-process advisory lock (see phase 3)
+  previews/<key>.mmmp       # cached panel previews (phase 3)
+  decoded/                  # decode cache of the app (phase 3)
   reference.mmm-frame.json  # the shared frame all groups adopt
   groups/<dir>/             # an ordinary session in the layout above
   groups/<dir>/result.mmmt  # tiled result store (see "Standalone app groundwork");
@@ -974,5 +977,102 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   stretch) on the viewer's loader threads (`CompositeTileSource`); members
   must share one canvas, and a member not blended yet adds nothing and is
   named above the image.
-- **Not yet built:** export from the tile store, packaging and signing
-  (later plans). The Panels and Plan tabs are built (phase 3).
+- **Not yet built (phase 2 list, superseded):** export, Panels and Plan
+  tabs were built in phase 3, below.
+
+## Standalone app (phase 3, 2026-11)
+
+Phase 3 adds the Panels and Plan tabs, cached previews, an automatic
+preview-then-analysis pipeline, a checks engine, Blend ROIs, composition
+views and export. No algorithm changed. Core additions are bookkeeping
+(`set_inputs`, the lock), `preview` and `export`.
+
+- **Session lock.** A mosaic directory holds `session.lock`, an advisory
+  file lock (`File::try_lock`) taken for as long as a process uses the
+  session: the app while a session is open, and `mmm init`, `set`, `run` and
+  `export` for the length of the command (`check` is read-only and does not
+  lock). A second process gets `Error::Busy` with "is open in another window
+  or process". It is cross-process; the in-process one-writer-per-store rule
+  is unchanged. The app drops its lock before launching a child process for a
+  just-created session.
+- **`set_inputs`** (`mosaic::set_inputs`) edits the panel list, manual group
+  placements and the grouping rule. Like `set_settings` it is busy-aware: it
+  locks every group's store first, and a busy store refuses the edit with
+  nothing changed. An unchanged input is a no-op; otherwise every group is
+  marked `needs_analyze`, the change is recorded in provenance ("inputs"),
+  stores are invalidated and `mosaic.json` is saved once. A manual group
+  assignment survives a rule change. `plan_analyze_with` drops
+  `needs_analyze` entries for groups that no longer exist (`group_dirs` is
+  kept so caches stay stable if a name returns).
+- **Previews** (`mmm_core::preview`). One image per panel, at most 512 px
+  on the long side (`PREVIEW_MAX_SIDE`), placed in the shared frame and cached
+  in `<session>/previews/<hash of path, size, mtime>.mmmp` (JSON header + f32).
+  Aligned panels are block means over the covered bbox; solved panels are a
+  WCS warp. The reference frame is always re-derived header-only on a preview
+  run (cheap) and saved atomically only when it changed and the full panel set
+  was used, so previews never see a stale frame. `preview::footprint` gives
+  a solved panel's outline from its header alone (aligned gives `None`), so
+  Plan shows dashed outlines of 100+ panels before any preview exists.
+  Compressed XISF and FITS panels are decoded once into `<session>/decoded`
+  (the app points the decode cache there), which analysis reuses. Per-panel
+  failures are logged; the run still finishes.
+- **Automatic pipeline** (`pipeline.rs`). On open, and 1.5 s (`DEBOUNCE`) after
+  the last input edit, it runs previews, then analysis when `ui.auto_analyze`
+  (the "Auto-analyze" toggle, default on) is set, nothing else is running
+  (so it never cancels a user's blend) and some group needs it. The Panels tab
+  cancels running jobs before an edit and applies it once the runner is idle;
+  the pipeline waits while an edit is pending and re-runs a job that ended for
+  stale inputs. User cancels are final: a cancelled or failed previews run is
+  not retried, and an ended analysis is not restarted, until the inputs
+  change (or the user presses Resume / turns Auto-analyze back on). An
+  analysis still auto-starts after a cancelled previews run.
+- **Checks engine** (`checks.rs`). Runs `panel_facts`, input and file checks,
+  and analysis checks for every analysed, current group on a worker, on open,
+  when groups or panels change and after any pipeline job ends; the status
+  bar shows problems, notes and passed. Accepting a check adds its keys to
+  `accepted_checks` in `mosaic.json`; accepted problems stop counting.
+- **Panels tab.** Add files (picker, drag and drop, or a typed path with one
+  `*` in the file name; duplicates ignored), per-panel cards, Remove, and
+  grouping. Grouping is **off by default** (plain grid); turning it on shows
+  the header-key rule and one column per group, with **No group** first and an
+  "N to sort" header; Move to places a panel manually or lets the rule decide.
+  Group colours are stable and persisted in `ui.group_colors`: well-known
+  filters get physical colours (Ha red, OIII cyan, SII orange-red `#E0703A`,
+  R/G/B, L white), other names take the first unused palette entry.
+- **Plan tab (additions).** A View selector lists the groups and the
+  compositions (hidden when grouping is off); compositions are keyed
+  `comp:<name>` in `ui.plan_stretch`. Layers are additive. Clicking a panel
+  selects it: the side panel shows its path, **Show in folder**, Copy path,
+  header facts, overlapping panels and its checks (with Accept). Outline and
+  number toggles. When previews are incomplete and none are running, "Previews
+  paused" with **Resume** (`Pipeline::request_previews`). Textures are
+  released after Plan has been hidden 5 s. Overlap-handling is topmost-wins
+  in group views; compositions add overlapping previews of one group, so
+  overlap bands look brighter (accepted for a rough preview).
+- **Blend ROIs** are sky-anchored: a rectangle drawn with the viewer's draw
+  tool is stored as two opposite sky corners plus a canvas rect and is
+  reprojected through the current frame, so it follows the frame when panels
+  change (a rotated re-derive grows the box slightly; without a WCS the canvas
+  rect is used as stored). **Blend ROI** blends the selected ROI once per
+  group of the current view; **Blend whole mosaic** blends every group.
+  Composition views in Blend mix the member groups' tiles; a member not blended
+  yet adds nothing and is named above the image.
+- **Export.** `mmm_core::export` writes a group's result for the whole canvas
+  as linear 32-bit float, **unclamped**: FITS (WCS cards plus `HISTORY`
+  provenance: mmm version and the group's latest blend settings) or TIFF
+  (`ImageDescription` carries the same provenance). It reads the tile store
+  tile row by tile row without a writer lock; stale tiles are exported as
+  they are, missing tiles as zeros. `export_check` counts stale and missing
+  level-0 tiles first and both frontends warn (the app offers *Blend whole
+  mosaic first* or *Export anyway*). Output goes to `<out>.part` and is
+  renamed on success; failure or cancel leaves an existing destination
+  untouched. FITS uses the top-down WCS convention only. The TIFF writer
+  needs random access, so TIFF export stages a scratch file the size of the
+  image next to the output (about twice the disk, briefly); a cancelled TIFF
+  export finishes at disk speed before cleaning up. CLI: `mmm export`.
+  **XISF export is deferred**: formats live in mpp-core, which has no XISF
+  writer yet; the spec's XISF export is missing in v1 until it gains one
+  (and a streaming TIFF writer would remove the scratch file).
+- **Not yet built:** XISF export (needs an XISF writer in mpp-core), a
+  streaming TIFF writer, the Plan overlap-handling setting (group views are
+  topmost-wins), the FITS flipped-WCS option in export, packaging and signing.

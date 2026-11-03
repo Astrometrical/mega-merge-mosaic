@@ -121,7 +121,21 @@ target/release/mega-merge-mosaic [SESSION_DIR]
 target/release/mega-merge-mosaic --selftest [SESSION_DIR]   # renders a few frames, exits 0/1
 ```
 
-Currently it opens or creates mosaic sessions and shows the Blend tab. Under
+The workflow runs left to right across four steps:
+
+1. **Panels** — add panel files (picker, drag and drop, or a typed path).
+   Grouping (by FILTER or another header key) is off until you turn it on.
+2. **Plan** — see the panels placed in the shared frame from cached
+   low-resolution previews, check the plan, and compose a rough colour
+   preview from groups. Previews and analysis run automatically a moment
+   after any edit (an Auto-analyze toggle stops the analysis).
+3. **Blend** — a tiled, zoomable viewer with display stretch; blend the whole
+   mosaic or a sky-anchored region of interest (ROI).
+4. **Export** — write a group's blended result as 32-bit float FITS or TIFF
+   (linear, unclamped). It warns first if tiles are stale or missing. XISF
+   export is not available yet.
+
+A session can be open in only one window or process at a time. Under
 WSL the app selects Mesa's `d3d12` GL driver for GPU rendering (default WSLg
 falls back to software `llvmpipe`); set `GALLIUM_DRIVER` yourself to override.
 libEGL warnings on stderr such as "failed to get driver name for fd -1" are
@@ -218,6 +232,14 @@ Prints what the change makes stale (`none`, `reblend` or `reanalyze`).
 List the groups, then every check on the panels (and on the analysis of
 groups already analyzed) as problems, notes and a count of passed checks,
 with a suggested remedy for each.
+
+### `mmm export -s <DIR> --group <NAME> -o <FILE> [--format fits|tiff]`
+
+Write one group's blended result (the tiled result the app fills, not `mmm run`'s
+FITS) as a whole-canvas linear 32-bit float FITS (WCS and provenance) or TIFF.
+Prints a warning on stderr when tiles are stale or missing. Takes the session
+lock, so it is refused while the app has the session open. TIFF export briefly
+needs scratch disk about the size of the image.
 
 ### `mmm run -s <DIR> -o <OUTDIR> [options]`
 
