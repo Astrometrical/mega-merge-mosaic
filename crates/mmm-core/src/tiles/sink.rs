@@ -19,8 +19,9 @@ use super::{TileState, TileStore};
 /// complete tile row is written to the store (and its tiles marked valid)
 /// as soon as its last row arrives. Bands must arrive in order, as the
 /// blend delivers them. After each tile row is written, the parents over
-/// it are rebuilt ([`build_parents`]), so a parent becomes valid during the
-/// blend as soon as all its in-image children are.
+/// it are rebuilt ([`build_parents`]), so zoomed-out views follow the
+/// blend: a parent is rewritten (stale) with each new child and becomes
+/// valid as soon as all its in-image children are.
 pub struct TileSink<'a> {
     store: &'a mut TileStore,
     rect: [u64; 4],
@@ -191,17 +192,23 @@ impl RowSink for TileSink<'_> {
 /// as they were.
 ///
 /// Each parent pixel is the per-channel mean of its (up to four) child
-/// pixels that are covered — any channel non-zero — or zero if none are. A
-/// parent is written (and marked valid) only if every child tile inside the
-/// image is valid; otherwise it is left invalid.
+/// pixels that are covered — any channel non-zero — or zero if none are.
+/// Children are taken as they are, valid or stale (an ROI blend after a
+/// settings change leaves a parent on the ROI's edge with children of
+/// both kinds); a missing child (never written) is uncovered and costs no
+/// copy. The parent is written valid if every child tile inside the image
+/// is valid, otherwise stale ([`TileStore::write_tile_stale`]: complete,
+/// shown dimmed). A parent with no child to read is not written: it is
+/// invalidated (staying missing if it never was written).
 pub fn build_parents(store: &mut TileStore, rect: [u64; 4], ctl: &JobCtl) -> Result<()> {
     let g = store.geometry();
     let t = g.tile as usize;
     let nch = g.channels as usize;
     let tile_len = nch * t * t;
     // Children in quadrant order (dx, dy) = (0,0), (1,0), (0,1), (1,1);
-    // `None` = outside the child grid.
+    // `None` = outside the child grid, missing, or unreadable.
     let mut kids: [Option<Vec<f32>>; 4] = Default::default();
+    let mut spare: Vec<Vec<f32>> = Vec::new();
     let mut parent = vec![0.0f32; tile_len];
     let mut sums = vec![0.0f32; nch];
     for level in 1..g.levels() {
@@ -212,29 +219,37 @@ pub fn build_parents(store: &mut TileStore, rect: [u64; 4], ctl: &JobCtl) -> Res
                 ctl.check()?;
                 row = Some(ty);
             }
-            let child = |q: usize| {
+            let mut all_valid = true;
+            let mut any = false;
+            for (q, kid) in kids.iter_mut().enumerate() {
+                if let Some(buf) = kid.take() {
+                    spare.push(buf);
+                }
                 let (cx, cy) = (2 * tx + (q as u32 & 1), 2 * ty + (q as u32 >> 1));
-                (cx < cnx && cy < cny).then_some((cx, cy))
-            };
-            // Check every in-image child before copying any, so a parent
-            // with an invalid child costs no tile copies.
-            let mut all_valid = (0..4).all(|q| {
-                child(q).is_none_or(|(cx, cy)| store.state(level - 1, cx, cy) == TileState::Valid)
-            });
-            if all_valid {
-                for (q, kid) in kids.iter_mut().enumerate() {
-                    let Some((cx, cy)) = child(q) else {
-                        *kid = None;
-                        continue;
-                    };
-                    let buf = kid.get_or_insert_with(|| vec![0.0; tile_len]);
-                    if !store.read_tile(level - 1, cx, cy, buf) {
+                if cx >= cnx || cy >= cny {
+                    continue;
+                }
+                // Missing children are skipped without a copy.
+                if store.state(level - 1, cx, cy) == TileState::Missing {
+                    all_valid = false;
+                    continue;
+                }
+                let mut buf = spare.pop().unwrap_or_else(|| vec![0.0; tile_len]);
+                // Single writer, so no copy is torn; a child left mid-write
+                // by a crash has no complete copy and counts as missing.
+                match store.read_tile_any(level - 1, cx, cy, &mut buf) {
+                    Some(st) => {
+                        all_valid &= st == TileState::Valid;
+                        any = true;
+                        *kid = Some(buf);
+                    }
+                    None => {
                         all_valid = false;
-                        break;
+                        spare.push(buf);
                     }
                 }
             }
-            if !all_valid {
+            if !any {
                 let idx = store.raw.layout.index(level, tx, ty);
                 store.raw.invalidate(idx);
                 continue;
@@ -263,7 +278,11 @@ pub fn build_parents(store: &mut TileStore, rect: [u64; 4], ctl: &JobCtl) -> Res
                     }
                 }
             }
-            store.write_tile(level, tx, ty, &parent)?;
+            if all_valid {
+                store.write_tile(level, tx, ty, &parent)?;
+            } else {
+                store.write_tile_stale(level, tx, ty, &parent)?;
+            }
         }
     }
     Ok(())
@@ -281,11 +300,15 @@ pub fn build_parents(store: &mut TileStore, rect: [u64; 4], ctl: &JobCtl) -> Res
 /// rect) and then `("pyramid", 1, 1)` once the parents are built.
 ///
 /// The rect's tiles are invalidated (at every level) before blending, and
-/// each level-0 tile row is marked valid as soon as it is written. On any
-/// error — including cancellation through `ctl` — finished work is kept:
-/// level-0 tiles the run did not fully write are invalidated (they stay
-/// stale), then the parents over the rect are rebuilt, so a parent is valid
-/// exactly when all its in-image children are; then the error is returned.
+/// each level-0 tile row is marked valid as soon as it is written. Parents
+/// on the rect's edge (or over a not-yet-written row) are rebuilt from
+/// their children's current data, valid or stale, and left stale; a parent
+/// is valid exactly when all its in-image children are. On any error —
+/// including cancellation through `ctl` — finished work is kept: level-0
+/// tiles the run did not fully write are invalidated (they stay stale),
+/// the parents over finished rows are rebuilt by these rules, and parents
+/// over unfinished rows only keep their earlier (stale) data; then the
+/// error is returned.
 /// Errors if the store's geometry does not match `session.canvas`.
 #[allow(clippy::too_many_arguments)]
 pub fn blend_tiles(
@@ -334,7 +357,7 @@ pub fn blend_tiles(
         return Err(e);
     }
     // Any error from here on leaves the store consistent: every level-0
-    // tile is written, and a parent not yet rebuilt is still invalid.
+    // tile is written, and a parent not yet rebuilt is still stale.
     // The sink rebuilt the parents over every row it finished, so this
     // final pass normally has nothing left to do.
     let rest = [
@@ -355,9 +378,11 @@ pub fn blend_tiles(
 /// parents over rows `parents_built..written` only — the rows the sink
 /// wrote but did not get to rebuild parents over (its incremental rebuild
 /// was cancelled). Parents over earlier rows are already current, and
-/// parents over unfinished rows were invalidated by [`TileSink::new`] and
-/// stay so (a child of theirs is invalid), so a parent ends valid exactly
-/// when all its in-image children are, without re-reading finished tiles.
+/// parents wholly over unfinished rows were invalidated by
+/// [`TileSink::new`] and keep their earlier data, consistent with their
+/// (equally untouched) children; so every parent ends rebuilt from its
+/// children's current data, valid exactly when all its in-image children
+/// are, without re-reading finished tiles.
 fn keep_finished(store: &mut TileStore, rect: [u64; 4], written: u64, parents_built: u64) {
     let g = store.geometry();
     let done = (rect[1] + written).min(rect[3]);
@@ -403,20 +428,60 @@ mod tests {
     }
 
     #[test]
-    fn parent_with_invalid_child_copies_nothing() {
+    fn parent_skips_missing_children_and_stays_stale() {
+        let d = tmp("missing-kid");
+        let g = geometry(600, 420);
+        let mut store = TileStore::create(&d.join("s.mmmtile"), g).unwrap();
+        let t = g.tile as usize;
+        // Level-1 tile (0,0) has children (0,0) (1,0) (0,1) (1,1): two
+        // valid, one stale (written, then invalidated), one missing.
+        store.write_tile(0, 0, 0, &vec![0.5; g.tile_len()]).unwrap();
+        store.write_tile(0, 1, 0, &vec![0.5; g.tile_len()]).unwrap();
+        store
+            .write_tile(0, 0, 1, &vec![0.25; g.tile_len()])
+            .unwrap();
+        store.invalidate_rect([0, 256, 1, 257]);
+        assert_eq!(store.state(0, 0, 1), TileState::Stale);
+        let copies = store.copy_counter();
+        build_parents(&mut store, [0, 0, 512, 512], &JobCtl::none()).unwrap();
+        // Three present kids for level-1 (0,0), then that tile alone for
+        // level-2 (0,0) (its sibling level-1 (1,0) is missing).
+        assert_eq!(
+            copies.load(Ordering::Relaxed),
+            4,
+            "only present kids copied"
+        );
+        assert_eq!(store.state(1, 1, 0), TileState::Missing);
+        assert_eq!(store.state(2, 0, 0), TileState::Stale);
+        // Rebuilt from the best data, but not valid (a child is not).
+        let mut p = vec![0.0; g.tile_len()];
+        assert_eq!(store.read_tile_any(1, 0, 0, &mut p), Some(TileState::Stale));
+        // Top half from the valid kids, bottom-left from the stale one,
+        // bottom-right (the missing kid) uncovered.
+        assert_eq!(p[0], 0.5);
+        assert_eq!(p[(t - 1) / 2 * t + t - 1], 0.5);
+        assert_eq!(p[(t / 2) * t], 0.25);
+        assert_eq!(p[(t / 2) * t + t / 2], 0.0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn parent_with_only_missing_children_copies_nothing() {
         let d = tmp("nocopy");
         let g = geometry(600, 420);
         let mut store = TileStore::create(&d.join("s.mmmtile"), g).unwrap();
-        let data = vec![0.5; g.tile_len()];
-        // Level-1 tile (0,0) has children (0,0) (1,0) (0,1) (1,1); the last
-        // one, in copy order, stays invalid.
-        for (tx, ty) in [(0, 0), (1, 0), (0, 1)] {
-            store.write_tile(0, tx, ty, &data).unwrap();
-        }
         let copies = store.copy_counter();
-        build_parents(&mut store, [0, 0, 512, 512], &JobCtl::none()).unwrap();
-        assert!(!store.is_valid(1, 0, 0));
+        build_parents(&mut store, [0, 0, 600, 420], &JobCtl::none()).unwrap();
         assert_eq!(copies.load(Ordering::Relaxed), 0, "children copied");
+        for l in 1..g.levels() {
+            let (nx, ny) = g.tiles(l);
+            for ty in 0..ny {
+                for tx in 0..nx {
+                    assert_eq!(store.state(l, tx, ty), TileState::Missing);
+                }
+            }
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -5,6 +5,14 @@
 Groundwork for the standalone application; no change to any algorithm or
 to the output of existing commands.
 
+### Fixed
+
+- **Zoomed-out views of an ROI re-blend.** After a settings change, blending
+  an ROI updated only full-resolution tiles: parent (zoomed-out) tiles on
+  the ROI's edge kept their old pixels and stayed invalid. Parents are now
+  always rebuilt from their children's current data, valid or stale, and
+  shown dimmed until every child is current.
+
 ### Added (app)
 
 - **Blend settings in the app.** A Blend settings panel in the Blend tab

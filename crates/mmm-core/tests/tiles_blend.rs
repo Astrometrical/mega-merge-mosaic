@@ -17,7 +17,9 @@ use mmm_core::session::Session;
 use mmm_core::settings::BlendSettings;
 use mmm_core::surfaces::Surfaces;
 use mmm_core::synth::{SynthSpec, generate};
-use mmm_core::tiles::{TILE, TileGeometry, TileReader, TileStore, blend_tiles, build_parents};
+use mmm_core::tiles::{
+    TILE, TileGeometry, TileReader, TileState, TileStore, blend_tiles, build_parents,
+};
 
 /// Comparison tolerance (controller ruling: matches the existing
 /// `roi_matches_full_blend_subregion` tolerance).
@@ -541,4 +543,190 @@ fn build_parents_cancels() {
     assert!(err.is_cancelled(), "{err}");
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every tile at every level, read viewer-side: `(state, data)` per tile,
+/// level by level, row-major (`None` data for a missing or torn tile).
+fn snapshot(reader: &TileReader) -> Vec<Vec<(TileState, Option<Vec<f32>>)>> {
+    let g = reader.geometry();
+    (0..g.levels())
+        .map(|l| {
+            let (nx, ny) = g.tiles(l);
+            let mut tiles = Vec::new();
+            for ty in 0..ny {
+                for tx in 0..nx {
+                    let mut buf = tile_buf(g);
+                    let st = reader.state(l, tx, ty);
+                    let got = reader.read_tile_any(l, tx, ty, &mut buf);
+                    if let Some(s) = got {
+                        assert_eq!(s, st, "level {l} ({tx},{ty}) state changed");
+                    }
+                    tiles.push((st, got.map(|_| buf)));
+                }
+            }
+            tiles
+        })
+        .collect()
+}
+
+/// The covered mean of four children (quadrant order (0,0) (1,0) (0,1)
+/// (1,1); `None` = outside the grid or never written).
+fn covered_mean(g: TileGeometry, kids: [Option<&Vec<f32>>; 4]) -> Vec<f32> {
+    let t = g.tile as usize;
+    let nch = g.channels as usize;
+    let mut out = tile_buf(g);
+    for y in 0..t {
+        for x in 0..t {
+            let mut sums = vec![0.0f32; nch];
+            let mut n = 0;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (sx, sy) = (2 * x + dx, 2 * y + dy);
+                    let Some(kid) = kids[(sy / t) * 2 + sx / t] else {
+                        continue;
+                    };
+                    let (lx, ly) = (sx % t, sy % t);
+                    let v: Vec<f32> = (0..nch).map(|c| kid[(c * t + ly) * t + lx]).collect();
+                    if v.iter().any(|&s| s != 0.0) {
+                        n += 1;
+                        for c in 0..nch {
+                            sums[c] += v[c];
+                        }
+                    }
+                }
+            }
+            for c in 0..nch {
+                out[(c * t + y) * t + x] = if n > 0 { sums[c] / n as f32 } else { 0.0 };
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn roi_reblend_after_settings_change_updates_parents() {
+    // 5×4 level-0 tiles, 3×2 at level 1, 2×1 at level 2, 1×1 at level 3.
+    let fx = Fixture::new("roi-reblend", (1100, 900));
+    let path = fx.dir.join("r.mmmtile");
+    let mut store = TileStore::create(&path, fx.geometry()).unwrap();
+    let reader = TileReader::open(&path).unwrap();
+    let g = store.geometry();
+    assert_eq!(g.levels(), 4);
+    let old = BlendSettings::default();
+    fx.blend_tiles(&old, None, &mut store, &JobCtl::none())
+        .unwrap();
+    let before = snapshot(&reader);
+
+    // A settings change stales everything; then blend an ROI whose aligned
+    // rect (level-0 tiles x 1..3, y 1..3) straddles every level-1 parent
+    // boundary it touches.
+    store.invalidate_all();
+    let new = BlendSettings {
+        mode: BlendMode::Feather,
+        ..old.clone()
+    };
+    let r = fx
+        .blend_tiles(
+            &new,
+            Some([300, 300, 700, 600]),
+            &mut store,
+            &JobCtl::none(),
+        )
+        .unwrap();
+    assert_eq!(r, [256, 256, 768, 768]);
+    let after = snapshot(&reader);
+
+    // Level 0: the ROI's tiles valid with new data, the rest stale.
+    let (nx0, _) = g.tiles(0);
+    let mut changed0 = 0;
+    for (i, (st, data)) in after[0].iter().enumerate() {
+        let (tx, ty) = (i as u32 % nx0, i as u32 / nx0);
+        let inside = (1..3).contains(&tx) && (1..3).contains(&ty);
+        let want = if inside {
+            TileState::Valid
+        } else {
+            TileState::Stale
+        };
+        assert_eq!(*st, want, "level 0 ({tx},{ty})");
+        if data != &before[0][i].1 {
+            assert!(inside, "level 0 ({tx},{ty}) outside the ROI changed");
+            changed0 += 1;
+        }
+    }
+    assert!(changed0 > 0, "the new settings changed nothing");
+
+    // Every parent: the covered mean of its children's current data; valid
+    // exactly when every in-image child is.
+    for l in 1..g.levels() {
+        let (cnx, cny) = g.tiles(l - 1);
+        let (pnx, pny) = g.tiles(l);
+        let mut changed = 0;
+        for ty in 0..pny {
+            for tx in 0..pnx {
+                let kid = |q: u32| {
+                    let (cx, cy) = (2 * tx + (q & 1), 2 * ty + (q >> 1));
+                    (cx < cnx && cy < cny).then(|| &after[l as usize - 1][(cy * cnx + cx) as usize])
+                };
+                let all_valid = (0..4).all(|q| kid(q).is_none_or(|k| k.0 == TileState::Valid));
+                let kids = [0, 1, 2, 3].map(|q| kid(q).and_then(|k| k.1.as_ref()));
+                let want = covered_mean(g, kids);
+                let i = (ty * pnx + tx) as usize;
+                let (st, data) = &after[l as usize][i];
+                let want_st = if all_valid {
+                    TileState::Valid
+                } else {
+                    TileState::Stale
+                };
+                assert_eq!(*st, want_st, "level {l} ({tx},{ty}) state");
+                let data = data.as_ref().expect("parent has data");
+                for (j, (a, b)) in data.iter().zip(&want).enumerate() {
+                    assert!(
+                        (a - b).abs() <= TOL * b.abs().max(1.0),
+                        "level {l} ({tx},{ty}) sample {j}: {a} vs {b}"
+                    );
+                }
+                if Some(data) != before[l as usize][i].1.as_ref() {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(changed > 0, "no level-{l} parent picked up the ROI");
+    }
+}
+
+#[test]
+fn full_reblend_after_roi_restores_valid_pyramid() {
+    let fx = Fixture::new("roi-full", (1100, 900));
+    let path = fx.dir.join("f.mmmtile");
+    let mut store = TileStore::create(&path, fx.geometry()).unwrap();
+    let reader = TileReader::open(&path).unwrap();
+    let g = store.geometry();
+    let old = BlendSettings::default();
+    fx.blend_tiles(&old, None, &mut store, &JobCtl::none())
+        .unwrap();
+    let before = snapshot(&reader);
+    store.invalidate_all();
+    let new = BlendSettings {
+        mode: BlendMode::Feather,
+        ..old.clone()
+    };
+    fx.blend_tiles(
+        &new,
+        Some([300, 300, 700, 600]),
+        &mut store,
+        &JobCtl::none(),
+    )
+    .unwrap();
+    // Back to the old settings over the whole canvas: everything valid and
+    // identical to the first full blend.
+    store.invalidate_all();
+    fx.blend_tiles(&old, None, &mut store, &JobCtl::none())
+        .unwrap();
+    let after = snapshot(&reader);
+    for l in 0..g.levels() as usize {
+        for (i, ((st, data), (_, want))) in after[l].iter().zip(&before[l]).enumerate() {
+            assert_eq!(*st, TileState::Valid, "level {l} tile {i}");
+            assert_eq!(data, want, "level {l} tile {i} differs");
+        }
+    }
 }

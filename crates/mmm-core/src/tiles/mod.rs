@@ -35,7 +35,11 @@
 //! Each tile's state entry is a seqlock, accessed as [`AtomicU32`] through
 //! the mapping. The (single) writer bumps the sequence to odd and clears the
 //! valid bit (Release), writes the samples, then bumps the sequence to even
-//! and sets the valid bit (Release). Invalidation clears the valid bit
+//! and sets the valid bit (Release) — or, for [`TileStore::write_tile_stale`],
+//! leaves it clear: the tile then holds complete data but is
+//! [`TileState::Stale`] (the pyramid rebuild writes parents of not-yet-valid
+//! children so). The sequence skips 0 on wrap-around, so a written tile is
+//! never mistaken for a missing one. Invalidation clears the valid bit
 //! without touching the samples. A reader loads the entry (Relaxed, then an
 //! Acquire fence: read-only mappings only support Relaxed loads) — it
 //! must be even and valid — copies the samples, then (after an Acquire
@@ -106,8 +110,10 @@ const MAX_TILE: u32 = 65536;
 pub enum TileState {
     /// Never written (a zeroed entry): nothing to show.
     Missing,
-    /// Written before but invalidated since — its samples are a complete
-    /// earlier result, shown dimmed until a blend re-validates it. An entry
+    /// Written before but invalidated since, or written without being
+    /// marked valid ([`TileStore::write_tile_stale`]: a parent rebuilt from
+    /// children not all valid) — its samples are complete but not current,
+    /// shown dimmed until a blend re-validates it. An entry
     /// caught mid-write (odd sequence, or left odd by a crash) also reports
     /// `Stale`; [`TileStore::read_tile_any`] returns no copy for it.
     Stale,
@@ -477,7 +483,8 @@ pub struct TileStore {
     /// Whole-mapping flushes so far (tests check invalidation avoids them).
     #[cfg(test)]
     full_flushes: std::sync::atomic::AtomicUsize,
-    /// Successful [`TileStore::read_tile`] copies so far (tests count the
+    /// Successful [`TileStore::read_tile`] / [`TileStore::read_tile_any`]
+    /// copies so far (tests count the
     /// tile data the parent rebuild reads).
     #[cfg(test)]
     copies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -575,6 +582,23 @@ impl TileStore {
     /// # Panics
     /// If the level or tile is out of range.
     pub fn write_tile(&mut self, level: u32, tx: u32, ty: u32, data: &[f32]) -> Result<()> {
+        self.write(level, tx, ty, data, true)
+    }
+
+    /// [`Self::write_tile`], but leave the tile [`TileState::Stale`]: its
+    /// samples are complete (readable with [`Self::read_tile_any`]) but
+    /// not current. The parent rebuild uses this for a parent built from
+    /// children that are not all valid.
+    ///
+    /// # Panics
+    /// If the level or tile is out of range.
+    pub fn write_tile_stale(&mut self, level: u32, tx: u32, ty: u32, data: &[f32]) -> Result<()> {
+        self.write(level, tx, ty, data, false)
+    }
+
+    /// The seqlock write: odd sequence (valid bit clear) while the samples
+    /// are stored, then even, with the valid bit set if `valid`.
+    fn write(&mut self, level: u32, tx: u32, ty: u32, data: &[f32], valid: bool) -> Result<()> {
         let g = self.raw.layout.g;
         if data.len() != g.tile_len() {
             return Err(Error::compute(format!(
@@ -605,8 +629,13 @@ impl TileStore {
             let v = if x < vw && y < vh { v } else { 0.0 };
             s.store(v.to_bits().to_le(), Ordering::Relaxed);
         }
+        // Skip sequence 0 on wrap-around: a zeroed entry means "missing".
+        let done = match writing.wrapping_add(1) & SEQ {
+            0 => 2,
+            s => s,
+        };
         self.raw
-            .store_state(idx, (writing.wrapping_add(1) & SEQ) | VALID);
+            .store_state(idx, if valid { done | VALID } else { done });
         Ok(())
     }
 
@@ -635,7 +664,8 @@ impl TileStore {
         self.raw.tile_state(self.raw.layout.index(level, tx, ty))
     }
 
-    /// Counter of successful [`TileStore::read_tile`] copies, shareable
+    /// Counter of successful [`TileStore::read_tile`] /
+    /// [`TileStore::read_tile_any`] copies, shareable
     /// with an observer while the store is borrowed.
     #[cfg(test)]
     pub(crate) fn copy_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
@@ -657,8 +687,14 @@ impl TileStore {
         ty: u32,
         out: &mut [f32],
     ) -> Option<TileState> {
-        self.raw
-            .read_tile_any_with(self.raw.layout.index(level, tx, ty), out, || {})
+        let copied = self
+            .raw
+            .read_tile_any_with(self.raw.layout.index(level, tx, ty), out, || {});
+        #[cfg(test)]
+        if copied.is_some() {
+            self.copies.fetch_add(1, Ordering::Relaxed);
+        }
+        copied
     }
 
     /// Invalidate, at every level, the tiles covering `r` (level-0 coords).
@@ -1139,6 +1175,52 @@ mod tests {
             Some(TileState::Valid)
         );
         assert!(out.iter().all(|&v| v == 3.0));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn write_tile_stale_is_complete_but_not_valid() {
+        let p = tmp("write-stale");
+        let g = geom();
+        let mut s = TileStore::create(&p, g).unwrap();
+        let r = TileReader::open(&p).unwrap();
+        let idx = r.raw.layout.index(1, 0, 0);
+        let mut out = filled(g, 0.0);
+
+        // Written stale from missing: complete data, valid bit clear.
+        s.write_tile_stale(1, 0, 0, &filled(g, 1.0)).unwrap();
+        assert_eq!(s.state(1, 0, 0), TileState::Stale);
+        assert_eq!(r.state(1, 0, 0), TileState::Stale);
+        assert!(!s.is_valid(1, 0, 0));
+        assert!(!r.read_tile(1, 0, 0, &mut out));
+        assert_eq!(r.read_tile_any(1, 0, 0, &mut out), Some(TileState::Stale));
+        assert!(out.iter().all(|&v| v == 1.0));
+        // Same protocol as `write_tile`: the sequence advances by two.
+        assert_eq!(s.raw.load_state(idx), 2);
+
+        // A stale rewrite straddling a copy is rejected, valid or stale.
+        assert_eq!(
+            r.raw.read_tile_any_with(idx, &mut out, || {
+                s.write_tile_stale(1, 0, 0, &filled(g, 2.0)).unwrap();
+            }),
+            None
+        );
+        s.write_tile(1, 0, 0, &filled(g, 3.0)).unwrap();
+        assert!(!r.raw.read_tile_with(idx, &mut out, || {
+            s.write_tile_stale(1, 0, 0, &filled(g, 4.0)).unwrap();
+        }));
+        assert_eq!(
+            r.raw.read_tile_any_with(idx, &mut out, || {}),
+            Some(TileState::Stale)
+        );
+        assert!(out.iter().all(|&v| v == 4.0));
+
+        // Sequence wrap never lands on the "missing" entry 0.
+        s.raw.store_state(idx, SEQ - 1);
+        s.write_tile_stale(1, 0, 0, &filled(g, 5.0)).unwrap();
+        assert_ne!(s.raw.load_state(idx), 0);
+        assert_eq!(r.read_tile_any(1, 0, 0, &mut out), Some(TileState::Stale));
+        assert!(out.iter().all(|&v| v == 5.0));
         let _ = std::fs::remove_file(&p);
     }
 

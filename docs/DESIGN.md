@@ -827,22 +827,32 @@ below is UI-agnostic and the CLI is its first consumer.
   copies a tile only if the entry is valid and even before the copy and
   unchanged after it, so a copy straddling any rewrite or invalidation,
   including a full rewrite, is rejected. A crash mid-write leaves the entry
-  odd = invalid, and the next write recovers it. Samples are accessed as
+  odd = invalid, and the next write recovers it. `write_tile_stale` writes
+  under the same protocol but leaves the valid bit clear (complete data,
+  `Stale`); the sequence skips 0 on wrap so a written tile never reads as
+  missing. Samples are accessed as
   relaxed atomics so racing copies are never UB. `state()` reports a tile's
   `TileState` (`Missing` / `Stale` / `Valid`) from its entry alone, and
   `read_tile_any` copies a stale tile too under the same protocol, so the
   viewer can show stale tiles dimmed; `read_tile` accepts valid tiles only.
   `TileSink` is a `RowSink` that fills level 0 and, after each level-0 tile
-  row, runs `build_parents` over that row, so the upper levels fill in
-  during the blend (a parent is valid only when all its in-image children
-  are; the rebuild checks cancellation once per parent tile row), and
-  `blend_tiles` blends a canvas rect (an ROI re-blend invalidates only the
-  tiles it touches) cancellably. A cancelled or failed blend keeps its
-  finished work (spec §8): level-0 tiles it fully wrote stay valid, the
-  rest of the rect stays stale, and only the parents over rows the sink
-  wrote but had not yet rebuilt are rebuilt (the rest are already current
-  or stay invalid), so a late cancel re-reads no finished tiles. The
-  rebuild checks every in-image child's state before copying any. A store
+  row, runs `build_parents` over that row, so the upper levels follow the
+  blend. A parent is **always rebuilt from its children's current data**,
+  valid or stale (a missing child is uncovered and not copied; a parent with
+  no child to read is left unwritten), and written valid only when every
+  in-image child is valid, otherwise stale (`write_tile_stale`). So an ROI
+  re-blend after a settings change — every tile stale, the ROI's edges not
+  on parent boundaries — still shows its new data zoomed out: the edge
+  parents mix new and old children and stay dimmed. (Before, such a parent
+  was only invalidated, keeping its old pixels at every level.) The rebuild
+  checks cancellation once per parent tile row, and `blend_tiles` blends a
+  canvas rect (an ROI re-blend invalidates only the tiles it touches)
+  cancellably. A cancelled or failed blend keeps its finished work (spec
+  §8): level-0 tiles it fully wrote stay valid, the rest of the rect stays
+  stale, and only the parents over rows the sink wrote but had not yet
+  rebuilt are rebuilt (the rest are already current, or wholly over
+  unfinished rows and as stale as their untouched children), so a late
+  cancel re-reads no finished tiles. A store
   whose geometry no longer matches the analysis is dropped and recreated,
   as is a missing or unparseable one (`Error::Format`); any other open
   error is returned, never answered by truncating the file. Blending
