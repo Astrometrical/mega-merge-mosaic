@@ -17,6 +17,8 @@
 //!   group of the view (the job runner queues them; newer work wins per
 //!   group), once the ROIs follow the current frame; **Blend whole
 //!   mosaic** blends every group over the whole canvas.
+//! - **Export…** ([`crate::export`]) writes the view's groups' results to
+//!   FITS or TIFF as jobs, after warning about stale or missing tiles.
 //!
 //! Everything slow runs on background threads ([`Task`]): opening each
 //! result ([`open_result`]), the automatic display stretch statistics, the
@@ -73,6 +75,7 @@ use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
 
 use crate::compositions::{Composition, ViewKind, load_compositions};
+use crate::export::{ExportAction, ExportDialog, RfdSavePicker};
 use crate::jobs::{JobEvent, JobRunner};
 use crate::rois::{Roi, RoiPanel};
 use crate::session::OpenSession;
@@ -344,6 +347,8 @@ pub struct BlendTab {
     shown: bool,
     /// The session's ROIs and their workers.
     rois: RoiPanel,
+    /// The export dialog.
+    export: ExportDialog,
 }
 
 impl Default for BlendTab {
@@ -375,6 +380,29 @@ impl BlendTab {
                 .clamp(2, 8),
             shown: false,
             rois: RoiPanel::default(),
+            export: ExportDialog::new(Arc::new(RfdSavePicker)),
+        }
+    }
+
+    /// Open the export dialog for the view's groups.
+    pub fn open_export(&mut self, session: &OpenSession) {
+        self.export.open(session, self.members.clone());
+    }
+
+    /// Draw the export dialog (if open) and act on the user's decision:
+    /// blend the chosen groups first, or start one export job per group.
+    fn export_ui(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
+        let can_blend = self.can_blend(self.readiness(session));
+        match self.export.ui(ctx, session, can_blend) {
+            Some(ExportAction::BlendFirst(groups)) => {
+                self.blend_groups(session, jobs, groups, None);
+            }
+            Some(ExportAction::Export(dests, format)) => {
+                for (group, out) in dests {
+                    jobs.start_export(session, &group, out, format);
+                }
+            }
+            None => {}
         }
     }
 
@@ -421,6 +449,7 @@ impl BlendTab {
             && self.results.values().all(Member::idle)
             && self.health_task.is_none()
             && self.rois.idle()
+            && self.export.idle()
             && self
                 .viewer
                 .as_ref()
@@ -658,6 +687,7 @@ impl BlendTab {
         if let (Some(r), Some(canvas)) = (drawn, canvas) {
             self.on_drawn(session, r, canvas);
         }
+        self.export_ui(&ctx, session, jobs);
     }
 
     /// What the viewer's place says when there is nothing to draw.
@@ -1097,6 +1127,16 @@ impl BlendTab {
                 .clicked()
             {
                 self.blend_roi(session, jobs);
+            }
+            if ui
+                .add_enabled(
+                    has_group && !analyzing && !self.export.is_open(),
+                    egui::Button::new("Export…"),
+                )
+                .on_hover_text("Export this view's blended groups to FITS or TIFF")
+                .clicked()
+            {
+                self.open_export(session);
             }
             let views = jobs.views();
             if ui

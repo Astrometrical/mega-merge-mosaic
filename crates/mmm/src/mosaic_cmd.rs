@@ -1,5 +1,5 @@
-//! Mosaic-session commands: `init`, `set`, `check` and `run` over a mosaic
-//! directory (`mosaic.json`, see [`mmm_core::mosaic`]), plus the guard that
+//! Mosaic-session commands: `init`, `set`, `check`, `run` and `export` over
+//! a mosaic directory (`mosaic.json`, see [`mmm_core::mosaic`]), plus the guard that
 //! keeps the legacy single-session commands off such a directory.
 
 use std::path::{Path, PathBuf};
@@ -8,6 +8,7 @@ use anyhow::Context;
 use mmm_core::checks::{
     Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, panel_facts,
 };
+use mmm_core::export::{ExportFormat, export_group};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
@@ -159,6 +160,27 @@ pub(crate) struct RunArgs {
     /// flipped (reflected bottom-up) for readers that mirror annotations
     #[arg(long, default_value = "topdown")]
     wcs_frame: String,
+}
+
+/// `mmm export` arguments.
+#[derive(clap::Args, Clone, Debug)]
+pub(crate) struct ExportArgs {
+    /// Mosaic directory created by `mmm init`
+    #[arg(short, long)]
+    pub(crate) session: PathBuf,
+
+    /// Group whose blended result to export
+    #[arg(long)]
+    group: String,
+
+    /// Output file
+    #[arg(short, long)]
+    output: PathBuf,
+
+    /// Output format: fits (32-bit float, WCS and provenance) or tiff
+    /// (32-bit float)
+    #[arg(long, default_value = "fits")]
+    format: String,
 }
 
 /// Fail with directions when `session` is a mosaic directory: the legacy
@@ -479,6 +501,41 @@ pub(crate) fn run(a: &RunArgs) -> anyhow::Result<()> {
         outputs.push((name.clone(), out));
     }
     print_outputs_summary("run", &reference, &outputs);
+    Ok(())
+}
+
+fn parse_format(s: &str) -> anyhow::Result<ExportFormat> {
+    match s.to_ascii_lowercase().as_str() {
+        "fits" | "fit" => Ok(ExportFormat::Fits),
+        "tiff" | "tif" => Ok(ExportFormat::Tiff),
+        _ => anyhow::bail!("--format must be fits or tiff (got '{s}')"),
+    }
+}
+
+/// `mmm export`: write a group's blended result (its tiled store, as the
+/// app blends it) to one FITS or TIFF file covering the whole canvas.
+/// Stale tiles are exported as they are and missing ones as zeros, with a
+/// warning on stderr.
+pub(crate) fn export(a: &ExportArgs) -> anyhow::Result<()> {
+    let format = parse_format(&a.format)?;
+    let (m, _lock) = open_mosaic_locked(&a.session)?;
+    let report = export_group(&m.dir, &a.group, &a.output, format, &JobCtl::none())
+        .with_context(|| format!("group {}: export failed", a.group))?;
+    println!(
+        "exported group {}: {} ({}×{}, {} 32-bit float)",
+        a.group,
+        a.output.display(),
+        report.width,
+        report.height,
+        format.name()
+    );
+    println!(
+        "tiles: {} stale, {} missing",
+        report.stale_tiles, report.missing_tiles
+    );
+    if let Some(w) = report.warning() {
+        eprintln!("warning: {w}");
+    }
     Ok(())
 }
 

@@ -58,6 +58,10 @@
 //!   ([`mosaic::set_settings`]) that stale exactly the affected result stores.
 //!   One writer per store is enforced (`Error::Busy`); the plan / run / apply
 //!   concurrency contract is in the [`mosaic`] module docs.
+//! - [`export`] — a group's blended result to FITS (WCS + `HISTORY`
+//!   provenance) or 32-bit float TIFF, whole canvas, linear, read tile row
+//!   by tile row; [`export::export_check`] counts stale and missing tiles
+//!   first so a frontend can warn.
 //! - [`preview`] — cached low-resolution panel previews placed in the
 //!   shared reference frame (a block mean for aligned canvases, a WCS warp
 //!   for solved panels), built on a bounded pool before any analysis
@@ -92,6 +96,7 @@ pub mod checks;
 pub mod decoded;
 pub mod diag;
 pub mod error;
+pub mod export;
 pub mod flatten;
 pub mod formats;
 pub(crate) mod fsutil;

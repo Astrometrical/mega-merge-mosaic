@@ -375,3 +375,148 @@ fn composition_shows_blended_members() {
     assert_eq!(tab.shown_text(), None);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Answers the save dialog with a fixed path.
+struct FixedSave(std::path::PathBuf);
+
+impl crate::export::SavePicker for FixedSave {
+    fn pick_save(
+        &self,
+        _format: crate::export::ExportFormat,
+        _name: &str,
+    ) -> Option<std::path::PathBuf> {
+        Some(self.0.clone())
+    }
+}
+
+struct ExportState {
+    tab: BlendTab,
+    session: OpenSession,
+    jobs: JobRunner,
+    events: Vec<JobEvent>,
+}
+
+#[test]
+fn export_dialog_warns_then_runs() {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use mmm_core::formats::InputPanel;
+
+    use crate::start::tests::step_until;
+    use crate::testutil::CANVAS;
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-export-dialog");
+    // Only the top-left tile of Ha is blended: 5 of its 6 tiles missing.
+    jobs.start_blend(&mut s, "Ha", Some([0, 0, 256, 256]));
+    crate::jobs::tests::drain(&mut jobs, &mut s);
+    let picked = root.join("picked.fits");
+    let mut tab = BlendTab::new();
+    tab.select("Ha".into());
+    tab.export.set_picker(Arc::new(FixedSave(picked.clone())));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .with_step_dt(0.01)
+        .build_ui_state(
+            |ui, st: &mut ExportState| {
+                // The tab's background work (opening the result), then
+                // the dialog, as `BlendTab::ui` does each frame.
+                st.tab.update(ui.ctx(), &mut st.session, &st.jobs);
+                st.tab.export_ui(ui.ctx(), &mut st.session, &mut st.jobs);
+                let events = st.jobs.poll(&mut st.session);
+                for e in &events {
+                    st.tab.on_event(e);
+                }
+                st.events.extend(events);
+            },
+            ExportState {
+                tab,
+                session: s,
+                jobs,
+                events: Vec::new(),
+            },
+        );
+    // Wait until the result is checked (Blend becomes possible).
+    step_until(&mut h, |st| st.tab.can_blend(Readiness::Analyzed));
+    {
+        let st = h.state_mut();
+        st.tab.open_export(&st.session);
+    }
+    h.run_steps(2);
+    assert!(h.state().tab.export.is_open());
+
+    // Browse… fills the destination from the save dialog.
+    h.get_by_label("Browse…").click();
+    let want = picked.display().to_string();
+    step_until(&mut h, |st| st.tab.export.path() == want);
+
+    // Export checks first: the result is partly missing, so it warns.
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
+        .click();
+    step_until(&mut h, |st| st.tab.export.warning_shown());
+    h.get_by_label_contains("Ha: 5 missing tile(s)");
+    assert!(
+        !h.state().jobs.busy(),
+        "nothing runs before the user decides"
+    );
+    assert!(!picked.exists());
+
+    // "Blend whole mosaic first" blends the chosen groups; no export.
+    h.get_by_label("Blend whole mosaic first").click();
+    h.run_steps(1);
+    assert!(!h.state().tab.export.is_open());
+    let labels: Vec<String> = h
+        .state()
+        .jobs
+        .views()
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert_eq!(labels, ["Blend Ha"]);
+    step_until(&mut h, |st| {
+        !st.jobs.busy() && st.tab.can_blend(Readiness::Analyzed)
+    });
+    assert!(
+        h.state()
+            .events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { label, .. } if label == "Blend Ha"))
+    );
+
+    // Stale it all, then "Export anyway" runs the export as a job.
+    {
+        let st = h.state_mut();
+        mmm_core::mosaic::invalidate_group(&st.session.mosaic, "Ha").unwrap();
+        st.tab.open_export(&st.session);
+    }
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
+        .click();
+    step_until(&mut h, |st| st.tab.export.warning_shown());
+    h.get_by_label_contains("Ha: 6 stale tile(s)");
+    h.get_by_label("Export anyway").click();
+    h.run_steps(1);
+    assert!(!h.state().tab.export.is_open());
+    let labels: Vec<String> = h
+        .state()
+        .jobs
+        .views()
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert_eq!(labels, ["Export Ha"]);
+    step_until(&mut h, |st| !st.jobs.busy());
+    assert!(
+        h.state()
+            .events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { label, .. } if label == "Export Ha")),
+        "{:?}",
+        h.state().events
+    );
+    let p = InputPanel::open(&picked).unwrap();
+    assert_eq!(
+        (p.width(), p.height(), p.channels()),
+        (CANVAS.0, CANVAS.1, 3)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

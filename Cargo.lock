@@ -1529,6 +1529,7 @@ dependencies = [
  "sha2",
  "sha3",
  "thiserror 2.0.19",
+ "tiff",
  "zstd",
 ]
 

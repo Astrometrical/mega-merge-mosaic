@@ -336,6 +336,11 @@ enum Command {
     /// Analyze every group of a mosaic session onto one shared frame and
     /// blend each group to `OUTDIR/<group dir>.fits`
     Run(mosaic_cmd::RunArgs),
+
+    /// Export a mosaic session group's blended result to one FITS or TIFF
+    /// file (whole canvas, linear 32-bit float); warns when tiles are stale
+    /// or missing
+    Export(mosaic_cmd::ExportArgs),
 }
 
 fn parse_roi(s: &str) -> anyhow::Result<[u64; 4]> {
@@ -388,7 +393,8 @@ fn main() -> anyhow::Result<()> {
         | Command::Init(mosaic_cmd::InitArgs { session, .. })
         | Command::Set(mosaic_cmd::SetArgs { session, .. })
         | Command::Check(mosaic_cmd::CheckArgs { session, .. })
-        | Command::Run(mosaic_cmd::RunArgs { session, .. }) => {
+        | Command::Run(mosaic_cmd::RunArgs { session, .. })
+        | Command::Export(mosaic_cmd::ExportArgs { session, .. }) => {
             mmm_core::decoded::set_cache_dir(session.join("decoded"));
         }
         Command::Info { .. } | Command::Frame { .. } => {}
@@ -459,6 +465,7 @@ fn main() -> anyhow::Result<()> {
         Command::Set(args) => mosaic_cmd::set(&args),
         Command::Check(args) => mosaic_cmd::check(&args),
         Command::Run(args) => mosaic_cmd::run(&args),
+        Command::Export(args) => mosaic_cmd::export(&args),
     }
 }
 
@@ -649,45 +656,15 @@ fn panel_name(p: &mmm_core::session::PanelMeta) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// FITS cards describing the *input panel's* geometry or pointing. These
-/// must not pass through to a solved-session output: its canvas is a fresh
-/// [`mmm_core::align::MosaicFrame`], and the correct cards are emitted from
-/// that frame instead. Non-geometric metadata (EXPTIME, INSTRUME, …) still
-/// passes through from panel 0. astrometry.net's `IMAGEW`/`IMAGEH` describe
-/// the input panel's own pixel dimensions, not the blended output's.
-fn geometry_card(name: &str) -> bool {
-    let n = name.trim().to_ascii_uppercase();
-    matches!(
-        n.as_str(),
-        "RA" | "DEC"
-            | "OBJCTRA"
-            | "OBJCTDEC"
-            | "RADESYS"
-            | "EQUINOX"
-            | "EPOCH"
-            | "LONPOLE"
-            | "LATPOLE"
-            | "IMAGEW"
-            | "IMAGEH"
-    ) || [
-        "CRVAL", "CRPIX", "CDELT", "CROTA", "CTYPE", "CUNIT", "CD1_", "CD2_", "PC1_", "PC2_",
-        "PV1_", "PV2_", "A_", "B_", "AP_", "BP_",
-    ]
-    .iter()
-    .any(|p| n.starts_with(p))
-}
-
 fn blend_cmd(
     session_dir: &std::path::Path,
     output: &std::path::Path,
     png: Option<&std::path::Path>,
     cfg: &BlendConfig,
 ) -> anyhow::Result<()> {
-    use mmm_core::astrometry::{wcs_cards, wcs_cards_flipped};
     use mmm_core::blend::{BlendParams, blend, output_bbox};
-    use mmm_core::formats::InputPanel;
     use mmm_core::output::Tee;
-    use mmm_core::output::fits::{FitsSink, keywords_for_output};
+    use mmm_core::output::fits::{FitsSink, WcsPlacement, WcsSource, session_keywords};
     use mmm_core::output::png::PngSink;
 
     let BlendConfig {
@@ -719,47 +696,29 @@ fn blend_cmd(
     // Crop origin in output pixel units (best-effort for downsampled previews:
     // the WCS scale itself is not rewritten).
     let crop = (bbox[0] / ds, bbox[1] / ds);
-    // Panel-0 file for FITS keyword passthrough: for solved sessions the
-    // panel path is the reprojection cache, so the original input is used.
-    let p0 = &session.panels[0];
-    let ref_panel = InputPanel::open(p0.source.as_ref().unwrap_or(&p0.path))?;
-    let mut keywords = keywords_for_output(ref_panel.fits_keywords(), crop);
-    if session.frame.is_some() || ref_panel.format_name() == "FITS" {
-        // Solved session: the output canvas is a fresh frame — panel-0
-        // geometry/pointing cards would lie about it and are dropped. A
-        // bottom-up FITS reference panel's own CRPIX/CD cards would also
-        // pass through unreflected, so they are dropped too; fresh
-        // `wcs_cards` below (from `linear_wcs()`, already top-down) replace
-        // them.
-        keywords.retain(|kw| !geometry_card(&kw.name));
-    }
-    // Never pass the reference panel's own WCS cards through as-is (XISF
-    // keeps its solution in properties anyway, and a FITS one may be
-    // bottom-up); attach real WCS cards at full resolution instead, via
-    // `linear_wcs()` (downsampled previews would need a rescaled CD matrix
-    // — not worth lying about; skip them there). Solved sessions use the
-    // session's own mosaic frame, never panel-0 passthrough.
-    if ds == 1 {
-        let wcs = match &session.frame {
-            Some(frame) => {
+    // Panel-0 cards pass through (geometry cards dropped for solved
+    // sessions and FITS references); WCS cards are attached at full
+    // resolution only (downsampled previews would need a rescaled CD
+    // matrix — not worth lying about). See `session_keywords`.
+    let place = (ds == 1).then_some(WcsPlacement {
+        origin: (bbox[0], bbox[1]),
+        height: bbox[3] - bbox[1],
+        flipped: wcs_flip,
+    });
+    let (keywords, wcs_source) = session_keywords(&session, crop, place)?;
+    match wcs_source {
+        WcsSource::NotRequested => {}
+        WcsSource::SessionFrame | WcsSource::ReferencePanel => {
+            if wcs_source == WcsSource::SessionFrame {
                 println!("wcs: session mosaic frame (solved input)");
-                Some(frame.linear_wcs())
             }
-            None => ref_panel.linear_wcs(),
-        };
-        match wcs {
-            Some(wcs) => {
-                let (origin, out_h) = ((bbox[0], bbox[1]), bbox[3] - bbox[1]);
-                if wcs_flip {
-                    keywords.extend(wcs_cards_flipped(&wcs, origin, out_h));
-                    println!("wcs: cards attached (flipped bottom-up frame)");
-                } else {
-                    keywords.extend(wcs_cards(&wcs, origin, out_h));
-                    println!("wcs: cards attached");
-                }
+            if wcs_flip {
+                println!("wcs: cards attached (flipped bottom-up frame)");
+            } else {
+                println!("wcs: cards attached");
             }
-            None => println!("wcs: no astrometric solution found in panel 0"),
         }
+        WcsSource::Absent => println!("wcs: no astrometric solution found in panel 0"),
     }
     println!(
         "session: {} panels, canvas {}x{}x{}ch, output bbox [{},{})x[{},{})  ({:.2}s)",
@@ -1193,21 +1152,7 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, geometry_card, group_specs};
-
-    #[test]
-    fn geometry_card_drops_pointing_wcs_and_sip_and_imagewh() {
-        for name in [
-            "IMAGEW", "IMAGEH", "A_ORDER", "A_2_0", "AP_ORDER", "BP_1_1", "CRPIX1", "CD1_1",
-        ] {
-            assert!(geometry_card(name), "{name} should be a geometry card");
-        }
-        for name in [
-            "AIRMASS", "APTDIA", "BAYERPAT", "BZERO", "EXPTIME", "OBJECT",
-        ] {
-            assert!(!geometry_card(name), "{name} should not be a geometry card");
-        }
-    }
+    use super::{Cli, group_specs};
 
     fn batch_matches(args: &[&str]) -> clap::ArgMatches {
         let mut full = vec!["mmm", "batch"];

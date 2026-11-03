@@ -10,6 +10,7 @@ mod app;
 mod blend_tab;
 mod checks;
 mod compositions;
+mod export;
 mod jobs;
 mod panels_tab;
 mod pipeline;

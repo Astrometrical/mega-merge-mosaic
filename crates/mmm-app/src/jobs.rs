@@ -29,6 +29,11 @@
 //!   that group's queued blends; blends of other groups are kept and run
 //!   in order. Behind a running analysis it waits (its group cannot be
 //!   blended until the analysis is applied).
+//! - An export queues behind everything and cancels nothing; an analysis
+//!   cancels a running export and drops queued ones like any other job.
+//!   It reads its group's result through a [`mmm_core::tiles::TileReader`]
+//!   (never the store's writer lock); since one job runs at a time, no
+//!   blend can recreate the store under it.
 //!
 //! A queued job starts once `poll` has applied (or discarded) its
 //! predecessor's outcome; its worker joins the predecessor's thread before
@@ -41,6 +46,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mega_ui::jobs::JobView;
+use mmm_core::export::{ExportFormat, ExportReport, export_group};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
@@ -103,6 +109,15 @@ enum Kind {
         group: String,
         rect: Option<[u64; 4]>,
     },
+    Export(ExportJob),
+}
+
+/// An export of one group's blended result to a file.
+#[derive(Clone, Debug)]
+struct ExportJob {
+    group: String,
+    out: std::path::PathBuf,
+    format: ExportFormat,
 }
 
 /// A job waiting for the running one to end.
@@ -119,6 +134,11 @@ enum Planned {
     Analyze(AnalyzePlan),
     Blend(BlendPlan),
     Previews(PreviewPlan),
+    /// An export of a group of the mosaic in `dir`.
+    Export {
+        dir: std::path::PathBuf,
+        job: ExportJob,
+    },
 }
 
 /// What resolution was based on: the inputs of [`Mosaic::groups`].
@@ -148,6 +168,7 @@ enum Done {
     Blend(mmm_core::Result<[u64; 4]>),
     /// The previews run: per-panel failures, or why the whole run failed.
     Previews(mmm_core::Result<Vec<(std::path::PathBuf, String)>>),
+    Export(mmm_core::Result<ExportReport>),
 }
 
 /// Worker to UI thread.
@@ -319,7 +340,7 @@ impl JobRunner {
                 dropped.push(q.id);
                 false
             }
-            Kind::Blend { .. } | Kind::Analyze | Kind::Previews => true,
+            Kind::Blend { .. } | Kind::Analyze | Kind::Previews | Kind::Export(_) => true,
         });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
@@ -329,6 +350,31 @@ impl JobRunner {
                 group: group.to_string(),
                 rect,
             },
+        });
+        self.start_next(session);
+        id
+    }
+
+    /// Export `group`'s blended result to `out` as `format`; returns the
+    /// job id. Queues behind every other job and cancels nothing. Stale
+    /// tiles are exported as they are and missing ones as zeros (warn the
+    /// user first: [`mmm_core::export::export_check`]). Planning does no
+    /// I/O.
+    pub fn start_export(
+        &mut self,
+        session: &OpenSession,
+        group: &str,
+        out: std::path::PathBuf,
+        format: ExportFormat,
+    ) -> u64 {
+        let id = self.new_id(format!("Export {group}"));
+        self.queue.push_back(Queued {
+            id,
+            kind: Kind::Export(ExportJob {
+                group: group.to_string(),
+                out,
+                format,
+            }),
         });
         self.start_next(session);
         id
@@ -491,6 +537,10 @@ impl JobRunner {
                     plan_blend(&session.mosaic, group, *rect).map(Planned::Blend)
                 }
                 Kind::Previews => Ok(Planned::Previews(plan_previews(&session.mosaic))),
+                Kind::Export(job) => Ok(Planned::Export {
+                    dir: session.mosaic.dir.clone(),
+                    job: job.clone(),
+                }),
             };
             match planned {
                 Ok(planned) => self.spawn(q.id, planned),
@@ -508,11 +558,17 @@ impl JobRunner {
         let token = CancelToken::new();
         let blend = match &planned {
             Planned::Blend(plan) => Some(plan.clone()),
-            Planned::Analyze(_) | Planned::Resolve(_) | Planned::Previews(_) => None,
+            Planned::Analyze(_)
+            | Planned::Resolve(_)
+            | Planned::Previews(_)
+            | Planned::Export { .. } => None,
         };
         let resolving = match &planned {
             Planned::Resolve(m) => Some(GroupInputs::of(m)),
-            Planned::Analyze(_) | Planned::Blend(_) | Planned::Previews(_) => None,
+            Planned::Analyze(_)
+            | Planned::Blend(_)
+            | Planned::Previews(_)
+            | Planned::Export { .. } => None,
         };
         let previews = matches!(planned, Planned::Previews(_));
         let stage = if resolving.is_some() {
@@ -572,6 +628,9 @@ impl JobRunner {
                                 preview_ctx.request_repaint();
                             };
                             Done::Previews(run_previews(plan, &ctl, &on_ready))
+                        }
+                        Planned::Export { dir, job } => {
+                            Done::Export(export_group(dir, &job.group, &job.out, job.format, &ctl))
                         }
                     }
                 };
@@ -645,6 +704,14 @@ impl JobRunner {
             }
             (Done::Previews(Err(e)), _) if e.is_cancelled() => JobEvent::Cancelled { id },
             (Done::Previews(Err(e)), _) => failed(format!("{name}: {}", describe(&e))),
+            (Done::Export(Ok(report)), _) => {
+                if let Some(w) = report.warning() {
+                    tracing::warn!("{name}: {w}");
+                }
+                JobEvent::Finished { id, label: name }
+            }
+            (Done::Export(Err(e)), _) if e.is_cancelled() => JobEvent::Cancelled { id },
+            (Done::Export(Err(e)), _) => failed(format!("{name}: {}", describe(&e))),
             (
                 Done::Analyze {
                     outcome,

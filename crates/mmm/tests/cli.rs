@@ -677,3 +677,66 @@ fn check_reports_corrupt_group_analysis_and_continues() {
     assert!(!out.contains("group OIII:"), "{out}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn export_warns_on_stale() {
+    use mmm_core::job::JobCtl;
+    use mmm_core::mosaic::{Mosaic, analyze_all, blend_group};
+
+    let dir = tempdir("export-stale");
+    let m = init_two_groups(&dir);
+    // Blend both groups into their tiled results (as the app does), then
+    // stale Ha's only tile (the 240×180 canvas is one 256-px tile).
+    let mut mosaic = Mosaic::open(&m).unwrap();
+    analyze_all(&mut mosaic, &JobCtl::none()).unwrap();
+    blend_group(&mut mosaic, "Ha", None, &JobCtl::none()).unwrap();
+    blend_group(&mut mosaic, "OIII", None, &JobCtl::none()).unwrap();
+    TileStore::open(&mosaic.result_path("Ha"))
+        .unwrap()
+        .invalidate_rect([0, 0, 1, 1]);
+
+    let ha = dir.join("ha.fits");
+    let out = mmm()
+        .args(["export", "--group", "Ha", "-s"])
+        .arg(&m)
+        .arg("-o")
+        .arg(&ha)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1 stale, 0 missing"), "{stdout}");
+    assert!(
+        stderr.contains("warning:") && stderr.contains("1 stale tile"),
+        "{stderr}"
+    );
+    let p = InputPanel::open(&ha).unwrap();
+    assert_eq!((p.width(), p.height()), (240, 180));
+
+    // A fully blended group exports without a warning (TIFF here).
+    let oiii = dir.join("oiii.tif");
+    let out = mmm()
+        .args(["export", "--group", "OIII", "--format", "tiff", "-s"])
+        .arg(&m)
+        .arg("-o")
+        .arg(&oiii)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("warning"), "{stderr}");
+    assert!(oiii.is_file());
+    // A bad format is refused before anything is written.
+    let err = run_fail(
+        mmm()
+            .args(["export", "--group", "OIII", "--format", "png", "-s"])
+            .arg(&m)
+            .arg("-o")
+            .arg(dir.join("x.png")),
+    );
+    assert!(err.contains("--format must be fits or tiff"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
