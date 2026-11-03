@@ -14,19 +14,23 @@
 //!   pending the pipeline starts nothing (the tab cancels every job); once
 //!   it applies, the debounce starts again. A changed input also cancels
 //!   any pipeline job still running.
-//! - A pipeline job that fails, or that the user cancels, is not retried
-//!   until the inputs, the analysis settings or the groups to analyse
-//!   change (no retry loops).
+//! - An analysis that ends (finished, failed, or cancelled by the user),
+//!   whether the pipeline or the Blend tab started it, is not started
+//!   again automatically until the inputs, the analysis settings or the
+//!   groups to analyse change (no retry loops). Previews that end are not
+//!   repeated for the same inputs, unless they were cancelled: incomplete
+//!   previews run again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mmm_core::mosaic::{Grouping, MosaicConfig};
 use mmm_core::preview::Preview;
 use mmm_core::settings::{AnalyzeSettings, GroupOverride};
 
-use crate::jobs::{JobEvent, JobRunner};
+use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner};
 use crate::session::OpenSession;
 
 /// Wait after the last input edit before the pipeline starts again.
@@ -146,7 +150,7 @@ pub struct Pipeline {
     stalled: Option<Key>,
     /// Automatic analysis was on at the last poll.
     auto_was: bool,
-    previews: BTreeMap<PathBuf, Preview>,
+    previews: BTreeMap<PathBuf, Arc<Preview>>,
     generation: u64,
     /// An analysis started since [`Pipeline::take_started_analysis`].
     started_analysis: Option<u64>,
@@ -176,27 +180,39 @@ impl Pipeline {
         for event in events {
             let id = match event {
                 JobEvent::Preview(p) => {
-                    // Only panels still in the inputs (an earlier run's
-                    // late arrivals are dropped below anyway).
+                    // Only panels in the current inputs; the cache is
+                    // cleared below if the inputs changed.
                     if current.panels.iter().any(|(path, _)| path == &p.path) {
-                        self.previews.insert(p.path.clone(), p.clone());
+                        self.previews.insert(p.path.clone(), Arc::clone(p));
                     }
                     continue;
                 }
                 JobEvent::Finished { id, .. } | JobEvent::Cancelled { id } => *id,
                 JobEvent::Failed { id, .. } => *id,
             };
+            let cancelled = matches!(event, JobEvent::Cancelled { .. });
             let Some(job) = self.job.take_if(|j| j.id == id) else {
+                // An analysis started elsewhere (the Blend tab's Analyze):
+                // once it has ended, failed or been cancelled by the user,
+                // it is not repeated automatically either.
+                if !editing
+                    && self.seen.as_ref() == Some(&current)
+                    && jobs.label(id) == Some(ANALYZE_LABEL)
+                {
+                    self.stalled = Some(Key::of(cfg));
+                }
                 continue;
             };
             // Ended by an edit (pending, or the inputs moved on): the run
-            // starts again for the new inputs. Otherwise it is not
-            // repeated for these inputs (finished, failed, or cancelled by
-            // the user).
+            // starts again for the new inputs. Otherwise an analysis is
+            // not repeated for these inputs (finished, failed, or
+            // cancelled by the user).
             if editing || job.inputs != current {
                 continue;
             }
             match job.step {
+                // Cancelled previews are incomplete: run them again.
+                Step::Previews if cancelled => {}
                 Step::Previews => self.previews_for = Some(job.inputs),
                 Step::Analyze => self.stalled = Some(Key::of(cfg)),
             }
@@ -276,7 +292,7 @@ impl Pipeline {
     /// The previews received for the current inputs, by panel path (Plan
     /// reads these).
     #[allow(dead_code)] // read by the Plan tab (next task)
-    pub fn previews(&self) -> &BTreeMap<PathBuf, Preview> {
+    pub fn previews(&self) -> &BTreeMap<PathBuf, Arc<Preview>> {
         &self.previews
     }
 
@@ -491,6 +507,66 @@ mod tests {
         assert_eq!(s.mosaic.config.panels.len(), 6);
         assert!(s.mosaic.config.needs_analyze.is_empty());
         assert_eq!(valid0(&s.mosaic.result_path("Ha")), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn manual_analysis_cancelled_is_not_restarted() {
+        let root = temp_dir("pipe-manual");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        set_auto_analyze(&mut s, false).unwrap();
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        set_auto_analyze(&mut s, true).unwrap();
+        // The user analyses from the Blend tab before the pipeline polls,
+        // then cancels it.
+        let gate = r.hold();
+        let id = r.start_analyze(&mut s);
+        r.cancel(id);
+        gate.open();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        assert!(seen.events.contains(&JobEvent::Cancelled { id }));
+        for _ in 0..20 {
+            let events = r.poll(&mut s);
+            p.poll(
+                &egui::Context::default(),
+                t0,
+                &mut s,
+                &mut r,
+                &events,
+                false,
+            );
+            assert!(!r.busy(), "a cancelled analysis was restarted");
+        }
+        assert_eq!(p.step(), None);
+        assert_eq!(p.take_started_analysis(), None, "the pipeline analysed");
+        assert!(s.mosaic.config.group_dirs.is_empty(), "nothing analysed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_previews_run_again() {
+        let root = temp_dir("pipe-prev-cancel");
+        let mut s = two_group_session(&root);
+        set_auto_analyze(&mut s, false).unwrap();
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let t0 = Instant::now();
+        let ctx = egui::Context::default();
+        let gate = r.hold();
+        p.poll(&ctx, t0, &mut s, &mut r, &[], false);
+        assert_eq!(p.step(), Some(Step::Previews));
+        let first = r.views()[0].id;
+        r.cancel(first);
+        gate.open();
+        let mut seen = Seen::default();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, |p, r| {
+            p.step() == Some(Step::Previews) && r.views().first().is_some_and(|v| v.id != first)
+        });
+        assert!(seen.events.contains(&JobEvent::Cancelled { id: first }));
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        assert_eq!(p.previews().len(), 8);
         let _ = std::fs::remove_dir_all(&root);
     }
 

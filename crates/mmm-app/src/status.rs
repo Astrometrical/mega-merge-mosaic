@@ -1,7 +1,8 @@
 //! The status bar (spec §5): what is running and its progress on the
 //! left; the check counts, the canvas size with megapixels, the group
-//! count and this process's memory and CPU on the right. The memory/CPU readout is sampled
-//! by [`SysMonitor`] on its own thread, at most once per second.
+//! count and this process's memory and CPU on the right. The memory/CPU
+//! readout is sampled by [`SysMonitor`] on its own thread, at most once
+//! per second.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;

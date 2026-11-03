@@ -35,8 +35,8 @@
 //! running, so that wait never happens on the UI thread.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -70,8 +70,8 @@ const RESOLVING: &str = "Resolving groups…";
 /// [`JobRunner::poll`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobEvent {
-    /// A previews job finished one panel's preview.
-    Preview(Preview),
+    /// A previews job finished one panel's preview (shared, never copied).
+    Preview(Arc<Preview>),
     /// The job finished and its outcome was applied.
     Finished {
         /// Job id.
@@ -153,7 +153,7 @@ enum Done {
 /// Worker to UI thread.
 enum Msg {
     Progress(String, u64, u64),
-    Preview(Preview),
+    Preview(Arc<Preview>),
     Done(Done),
 }
 
@@ -568,7 +568,7 @@ impl JobRunner {
                             let preview_tx = tx.clone();
                             let preview_ctx = ctx.clone();
                             let on_ready = move |p: Preview| {
-                                let _ = preview_tx.send(Msg::Preview(p));
+                                let _ = preview_tx.send(Msg::Preview(Arc::new(p)));
                                 preview_ctx.request_repaint();
                             };
                             Done::Previews(run_previews(plan, &ctl, &on_ready))
