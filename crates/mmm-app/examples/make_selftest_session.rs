@@ -1,5 +1,6 @@
-//! Build an analysed and blended two-group (Ha + OIII) synthetic session for
-//! the app's self-test:
+//! Build an analysed and blended two-group (Ha + OIII, grouping on by the
+//! `FILTER` header) synthetic session with an HOO composition, for the
+//! app's self-test (Blend, then Plan's group and composition views):
 //!
 //! ```sh
 //! cargo run -p mmm-app --example make_selftest_session -- DIR
@@ -31,6 +32,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut m = synth_mosaic::two_group_mosaic(&root);
+    // An HOO composition for Plan (the app's `compositions` format).
+    m.config.ui = serde_json::json!({ "compositions": [{
+        "name": "HOO",
+        "channels": [["Ha", 1.0], ["OIII", 1.0], ["OIII", 1.0]],
+    }]});
+    if let Err(e) = m.save() {
+        eprintln!("cannot save the composition: {e}");
+        return ExitCode::FAILURE;
+    }
     let ctl = JobCtl::none();
     let groups = match analyze_all(&mut m, &ctl) {
         Ok(g) => g,

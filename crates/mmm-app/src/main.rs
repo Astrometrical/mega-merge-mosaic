@@ -9,11 +9,11 @@
 mod app;
 mod blend_tab;
 mod checks;
-#[allow(dead_code)] // used by the Plan tab (next task)
 mod compositions;
 mod jobs;
 mod panels_tab;
 mod pipeline;
+mod plan_tab;
 mod session;
 mod start;
 mod status;

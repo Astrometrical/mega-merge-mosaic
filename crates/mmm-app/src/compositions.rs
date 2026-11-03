@@ -2,14 +2,11 @@
 //! the three output channels (R, G, B) takes a group with a weight, or
 //! nothing. Stored in `MosaicConfig.ui` under [`COMPOSITIONS_KEY`].
 
-use std::collections::BTreeMap;
-
-use egui::{Color32, RichText};
+use egui::RichText;
 use mega_ui::theme::palette;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::panels_tab::{group_colors, load_group_colors};
 use crate::stretch_panel::channel_name;
 
 /// Key in `MosaicConfig.ui` of the compositions list.
@@ -43,10 +40,39 @@ pub enum ViewKind {
     Composition(usize),
 }
 
-/// The compositions saved in `ui` (none when absent or unreadable).
+/// The compositions saved in `ui` (none when absent or not a list). Each
+/// entry is read by itself: a malformed one, one without a name, or a
+/// repeat of an earlier name is skipped, and the rest are kept.
 pub fn load_compositions(ui: &Value) -> Vec<Composition> {
-    ui.get(COMPOSITIONS_KEY)
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    let Some(list) = ui.get(COMPOSITIONS_KEY).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Composition> = Vec::new();
+    for v in list {
+        match serde_json::from_value::<Composition>(v.clone()) {
+            Ok(c) if !c.name.trim().is_empty() && !out.iter().any(|o| o.name == c.name) => {
+                out.push(c)
+            }
+            Ok(c) => tracing::warn!("composition {:?} skipped: no or a repeated name", c.name),
+            Err(e) => tracing::warn!("a saved composition is unreadable and skipped: {e}"),
+        }
+    }
+    out
+}
+
+/// The `MosaicConfig.ui` key of composition `name`'s Plan display stretch
+/// (under [`crate::stretch_panel::PLAN_STRETCH_KEY`]); prefixed so it never
+/// collides with a group's, which is keyed by the group name.
+pub fn composition_stretch_key(name: &str) -> String {
+    format!("comp:{name}")
+}
+
+/// A name for a new composition that none of `taken` has:
+/// "Composition 1", "Composition 2", ….
+pub fn unique_composition_name(taken: &[String]) -> String {
+    (1..)
+        .map(|i| format!("Composition {i}"))
+        .find(|n| !taken.contains(n))
         .unwrap_or_default()
 }
 
@@ -61,24 +87,51 @@ pub fn save_compositions(ui: &mut Value, c: &[Composition]) {
     }
 }
 
-/// The default tint of each channel: its group's colour (see
-/// [`group_colors`]), `None` for an empty channel.
-pub fn channel_tints(ui: &Value, c: &Composition) -> [Option<Color32>; 3] {
-    let colors: BTreeMap<String, Color32> = group_colors(
-        &load_group_colors(ui),
-        c.channels.iter().flatten().map(|(g, _)| g.as_str()),
-    );
-    std::array::from_fn(|i| {
-        c.channels[i]
-            .as_ref()
-            .and_then(|(g, _)| colors.get(g).copied())
-    })
-}
-
 /// Editor of one composition (name, and a group and weight per channel);
-/// true if changed. `groups` are the groups to choose from.
-pub fn composition_editor(ui: &mut egui::Ui, c: &mut Composition, groups: &[String]) -> bool {
-    let mut changed = ui.text_edit_singleline(&mut c.name).changed();
+/// true if changed. `groups` are the groups to choose from; `others` are
+/// the names of the other compositions. The name is edited in a draft kept
+/// in egui memory and taken only when it is non-empty (trimmed) and none of
+/// `others`; otherwise the editor says why and the name stays as it was.
+pub fn composition_editor(
+    ui: &mut egui::Ui,
+    c: &mut Composition,
+    groups: &[String],
+    others: &[String],
+) -> bool {
+    let mut changed = false;
+    let id = ui.id().with("mmm-composition-name");
+    // (the name the draft was made for, the draft)
+    let mut draft: (String, String) = ui
+        .data(|d| d.get_temp(id))
+        .filter(|(for_name, _): &(String, String)| *for_name == c.name)
+        .unwrap_or_else(|| (c.name.clone(), c.name.clone()));
+    ui.horizontal(|ui| {
+        let label = ui.label(RichText::new("Name").color(palette::TEXT_BODY));
+        if ui
+            .text_edit_singleline(&mut draft.1)
+            .labelled_by(label.id)
+            .changed()
+        {
+            let name = draft.1.trim();
+            if !name.is_empty() && name != c.name && !others.iter().any(|o| o == name) {
+                c.name = name.to_string();
+                draft.0 = c.name.clone();
+                changed = true;
+            }
+        }
+    });
+    let name = draft.1.trim();
+    let problem = if name.is_empty() {
+        Some("A composition needs a name.")
+    } else if others.iter().any(|o| o == name) {
+        Some("Another composition has this name.")
+    } else {
+        None
+    };
+    if let Some(p) = problem {
+        ui.label(RichText::new(p).small().color(palette::HA_500));
+    }
+    ui.data_mut(|d| d.insert_temp(id, draft));
     for (i, slot) in c.channels.iter_mut().enumerate() {
         ui.push_id(i, |ui| {
             ui.horizontal(|ui| {
@@ -136,15 +189,98 @@ mod tests {
         let back = MosaicConfig::load(&dir).unwrap();
         assert_eq!(load_compositions(&back.ui), vec![a.clone(), b]);
         assert_eq!(back.ui["other"], 1);
-        // Tints follow the group colours; an empty channel has none.
-        let tints = channel_tints(&back.ui, &a);
-        assert!(tints.iter().all(Option::is_some));
-        assert_ne!(tints[0], tints[1]);
         // A non-object `ui` becomes one; unreadable data reads as none.
         let mut null = Value::Null;
         save_compositions(&mut null, &[a]);
         assert_eq!(load_compositions(&null).len(), 1);
         assert!(load_compositions(&serde_json::json!({ "compositions": 3 })).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compositions_load_leniently() {
+        let ui = serde_json::json!({ "compositions": [
+            { "name": "HOO", "channels": [["Ha", 1.0], ["OIII", 1.0], ["OIII", 1.0]] },
+            { "name": "broken", "channels": 7 },
+            42,
+            { "name": "  ", "channels": [null, null, null] },
+            { "name": "HOO", "channels": [null, null, null] },
+            { "name": "Ha only", "channels": [["Ha", 0.5], null, null] }
+        ]});
+        let names: Vec<String> = load_compositions(&ui).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["HOO", "Ha only"]);
+        assert_eq!(composition_stretch_key("Ha"), "comp:Ha");
+        assert_ne!(
+            composition_stretch_key("Ha"),
+            "Ha",
+            "a composition's stretch key never equals a group's"
+        );
+        let taken = vec!["Composition 1".to_string(), "Composition 3".to_string()];
+        assert_eq!(unique_composition_name(&taken), "Composition 2");
+    }
+
+    #[test]
+    fn composition_editor_edits_and_refuses_bad_names() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            c: Composition,
+            changes: usize,
+        }
+        let groups = vec!["Ha".to_string(), "OIII".to_string()];
+        let others = vec!["SHO".to_string()];
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(500.0, 400.0))
+            .build_ui_state(
+                move |ui, s: &mut State| {
+                    if composition_editor(ui, &mut s.c, &groups, &others) {
+                        s.changes += 1;
+                    }
+                },
+                State {
+                    c: Composition::new("New"),
+                    changes: 0,
+                },
+            );
+        h.run();
+        let name_field = |h: &mut egui_kittest::Harness<'_, State>| {
+            h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
+                .focus();
+            h.step();
+            h.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
+            h.step();
+        };
+        // A unique name is taken.
+        name_field(&mut h);
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
+            .type_text("HOO");
+        h.run();
+        assert_eq!(h.state().c.name, "HOO");
+        // Another composition's name is refused, with a reason.
+        name_field(&mut h);
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
+            .type_text("SHO");
+        h.run();
+        assert_eq!(h.state().c.name, "HOO");
+        h.get_by_label("Another composition has this name.");
+        // An empty name too.
+        name_field(&mut h);
+        h.key_press(egui::Key::Backspace);
+        h.run();
+        assert_eq!(h.state().c.name, "HOO");
+        h.get_by_label("A composition needs a name.");
+
+        // A group picked for R gets weight 1.
+        h.get_all_by_role(egui::accesskit::Role::ComboBox)
+            .next()
+            .unwrap()
+            .click();
+        h.run();
+        h.get_by_label("OIII").click();
+        h.run();
+        assert_eq!(h.state().c.channels[0], Some(("OIII".to_string(), 1.0)));
+        assert!(h.state().c.channels[1].is_none());
+        assert!(h.query_all_by_label("Weight").next().is_some());
+        assert!(h.state().changes >= 2);
     }
 }

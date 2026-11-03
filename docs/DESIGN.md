@@ -949,8 +949,18 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   Users can override by setting `GALLIUM_DRIVER` themselves. libEGL "failed to
   get driver name for fd -1" warnings on stderr are harmless.
 - **Self-test session.** `cargo run -p mmm-app --example make_selftest_session -- DIR`
-  builds a synthetic analysed and blended two-group session
-  (`DIR/m.mmm-session`) for `--selftest`. Automated checks launch the GUI only
-  through `--selftest`.
+  builds a synthetic analysed and blended two-group session with an HOO
+  composition (`DIR/m.mmm-session`) for `--selftest`, which visits Blend, then
+  Plan's first group and the composition, each once settled. Automated checks
+  launch the GUI only through `--selftest`.
+- **Plan tab (phase 3).** Previews (one ≤512 px image per panel, placed in the
+  shared frame) become RGBA8 through the Plan display stretch on a small
+  converter pool; the UI thread uploads at most 32 textures a frame. The
+  canvas extent is the frame canvas (read on a worker), so arriving previews
+  never reset the zoom; a panel without a preview yet is a dashed outline at
+  its analysed bbox. Plan stretches live in `ui.plan_stretch`, keyed by group
+  name or `comp:<name>` for a composition (names unique and non-empty).
+  Compositions draw each channel's group as additive layers tinted pure R, G
+  or B × weight; overlaps within one group add up (a known limitation).
 - **Not yet built:** Panels, Plan and ROI tabs, export from the tile store,
   packaging and signing (later plans).

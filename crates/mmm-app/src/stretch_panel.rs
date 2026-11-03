@@ -16,7 +16,6 @@ use serde_json::Value;
 pub const BLEND_STRETCH_KEY: &str = "blend_stretch";
 /// Key in `MosaicConfig.ui` of the Plan view's display stretches, by view
 /// name (a group or a composition).
-#[allow(dead_code)] // used by the Plan tab (next task)
 pub const PLAN_STRETCH_KEY: &str = "plan_stretch";
 
 /// What the panel shows and edits; the caller keeps it between frames.

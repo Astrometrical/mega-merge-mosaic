@@ -12,9 +12,11 @@ use mega_ui::theme::palette;
 
 use crate::blend_tab::BlendTab;
 use crate::checks::ChecksEngine;
+use crate::compositions::{ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
-use crate::pipeline::{Pipeline, auto_analyze, set_auto_analyze};
+use crate::pipeline::{Pipeline, Step, auto_analyze, set_auto_analyze};
+use crate::plan_tab::{PlanFeed, PlanTab};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::start::{RecentEntry, RfdPicker, StartAction, StartScreen, unix_now};
 use crate::status::{self, SysMonitor};
@@ -31,7 +33,7 @@ const NOTICE_TIME: Duration = Duration::from_secs(6);
 pub enum Tab {
     /// The panel files and their grouping.
     Panels,
-    /// The plan view (next phase).
+    /// Every panel in place, from its preview.
     Plan,
     /// Blend controls and the result viewer.
     Blend,
@@ -72,6 +74,8 @@ pub struct Shell {
     blend: BlendTab,
     /// The Panels tab (made afresh with each session).
     panels: PanelsTab,
+    /// The Plan tab (made afresh with each session).
+    plan: PlanTab,
     /// The panel file dialog used by the Panels tab.
     files_picker: Arc<dyn FilesPicker>,
     /// The automatic previews and analysis (made afresh with each session).
@@ -95,6 +99,7 @@ impl Shell {
             tab: Tab::Blend,
             blend: BlendTab::new(),
             panels: PanelsTab::new(Arc::new(RfdFilesPicker)),
+            plan: PlanTab::new(),
             files_picker: Arc::new(RfdFilesPicker),
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
@@ -121,14 +126,27 @@ impl Shell {
         &self.blend
     }
 
+    /// Show `tab`.
+    pub fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+    }
+
+    /// The Plan tab.
+    pub fn plan(&self) -> &PlanTab {
+        &self.plan
+    }
+
+    /// The Plan tab, to change its view.
+    pub fn plan_mut(&mut self) -> &mut PlanTab {
+        &mut self.plan
+    }
+
     /// The automatic pipeline (its previews feed Plan).
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }
 
     /// The checks engine.
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn checks(&self) -> &ChecksEngine {
         &self.checks
     }
@@ -138,6 +156,7 @@ impl Shell {
     pub fn flush_pending_saves(&mut self) {
         if let Some(session) = &self.session {
             self.blend.flush_save(session);
+            self.plan.flush_save(session);
         }
     }
 
@@ -225,6 +244,7 @@ impl Shell {
                     self.jobs = Some(JobRunner::new(ctx.clone()));
                     self.blend = BlendTab::new();
                     self.panels = PanelsTab::new(self.files_picker.clone());
+                    self.plan = PlanTab::new();
                     self.pipeline = Pipeline::new();
                     self.checks = ChecksEngine::new();
                 }
@@ -341,7 +361,8 @@ impl Shell {
                 ui,
                 &views,
                 self.checks.counts(&session.mosaic.config),
-                session.canvas,
+                // Plan reads the frame as soon as previews derive it.
+                session.canvas.or(self.plan.frame_canvas()),
                 session.group_count(),
                 self.sys.latest(),
             );
@@ -367,15 +388,32 @@ impl Shell {
         match (self.tab, self.session.as_mut(), self.jobs.as_mut()) {
             (Tab::Blend, Some(session), Some(jobs)) => self.blend.ui(ui, session, jobs),
             (Tab::Panels, Some(session), Some(jobs)) => self.panels.ui(ui, session, jobs),
-            _ => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("Coming in the next phase").color(palette::TEXT_MUTED),
-                        );
-                    });
-                });
+            (Tab::Plan, Some(session), Some(_)) => {
+                let now = Instant::now();
+                let feed = PlanFeed {
+                    previews: self.pipeline.previews(),
+                    generation: self.pipeline.generation(),
+                    complete: self.pipeline.previews_complete(),
+                    previews_busy: self.pipeline.step() == Some(Step::Previews)
+                        || self.pipeline.waiting(now),
+                    checks: self.checks.report(),
+                };
+                let out = self.plan.ui(ui, session, &feed);
+                if out.resume_previews {
+                    self.pipeline.request_previews();
+                }
+                for check in &out.accept {
+                    if let Err(message) = self.checks.accept(session, check) {
+                        tracing::warn!("{message}");
+                        self.notices.push(Notice {
+                            text: message,
+                            color: palette::HA_500,
+                            until: now + NOTICE_TIME,
+                        });
+                    }
+                }
             }
+            _ => {}
         }
         self.notices_ui(&ctx);
         let mut open = self.show_start;
@@ -451,7 +489,21 @@ struct SelfTest {
     timed_out: Arc<AtomicBool>,
     outcome: SelfTestOutcome,
     done: bool,
-    blend_logged: bool,
+    /// Where the session part of the test is.
+    phase: Phase,
+}
+
+/// The self-test's walk through the session's tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Waiting for the Blend tab to settle.
+    Blend,
+    /// Waiting for the Plan tab's first view to settle.
+    Plan,
+    /// Waiting for the Plan tab's first composition to settle.
+    PlanComposition,
+    /// Every tab visited.
+    Done,
 }
 
 impl SelfTest {
@@ -498,19 +550,50 @@ impl SelfTest {
                 );
             }
             Some(_) => {
-                self.session_frames >= SELFTEST_SESSION_FRAMES
-                    && shell.tab() == Tab::Blend
-                    && shell.blend().is_settled()
+                self.advance(shell);
+                self.phase == Phase::Done
             }
         };
-        if session_done && self.session.is_some() && !self.blend_logged {
-            self.blend_logged = true;
-            log_blend_tab(shell.blend());
-        }
         if self.frames >= SELFTEST_FRAMES && session_done {
             return self.finish(ctx, Ok(()));
         }
         ctx.request_repaint();
+    }
+
+    /// Visit Blend, then Plan (the first group, then the first
+    /// composition, if any), each once it has settled.
+    fn advance(&mut self, shell: &mut Shell) {
+        match self.phase {
+            Phase::Blend
+                if self.session_frames >= SELFTEST_SESSION_FRAMES
+                    && shell.tab() == Tab::Blend
+                    && shell.blend().is_settled() =>
+            {
+                log_blend_tab(shell.blend());
+                shell.set_tab(Tab::Plan);
+                self.phase = Phase::Plan;
+            }
+            Phase::Plan if shell.tab() == Tab::Plan && shell.plan().is_settled() => {
+                log_plan_tab(shell);
+                let has_composition = shell
+                    .session()
+                    .is_some_and(|s| !load_compositions(&s.mosaic.config.ui).is_empty());
+                self.phase = if has_composition {
+                    shell.plan_mut().select_view(ViewKind::Composition(0));
+                    Phase::PlanComposition
+                } else {
+                    Phase::Done
+                };
+            }
+            Phase::PlanComposition
+                if matches!(shell.plan().view(), Some(ViewKind::Composition(_)))
+                    && shell.plan().is_settled() =>
+            {
+                log_plan_tab(shell);
+                self.phase = Phase::Done;
+            }
+            _ => {}
+        }
     }
 
     fn finish(&mut self, ctx: &egui::Context, outcome: Result<(), String>) {
@@ -554,6 +637,31 @@ fn log_blend_tab(blend: &BlendTab) {
         Some(Err(e)) => tracing::info!("self-test: health unavailable: {e}"),
         None => tracing::info!("self-test: no health (group not analyzed)"),
     }
+}
+
+/// Log what the self-test's Plan tab shows.
+fn log_plan_tab(shell: &Shell) {
+    let plan = shell.plan();
+    let items = plan.items();
+    let textured = items.iter().filter(|i| !i.layers.is_empty()).count();
+    let layers: usize = items.iter().map(|i| i.layers.len()).sum();
+    tracing::info!(
+        "self-test: Plan tab shows {:?}: {} panels placed, {textured} with previews ({layers} layers), \
+         frame {:?}, display stretch {:?}",
+        plan.view(),
+        items.len(),
+        plan.frame_canvas(),
+        plan.stretch()
+    );
+    tracing::info!(
+        "self-test: {} previews in memory; checks {}",
+        shell.pipeline().previews().len(),
+        if shell.checks().running() {
+            "running"
+        } else {
+            "idle"
+        }
+    );
 }
 
 /// Log the GL renderer and version; an error without a GL context.
@@ -634,7 +742,7 @@ impl MmmApp {
             timed_out: selftest_watchdog(&cc.egui_ctx, SELFTEST_TIMEOUT, Some(SELFTEST_BACKSTOP)),
             outcome,
             done: false,
-            blend_logged: false,
+            phase: Phase::Blend,
         });
         MmmApp {
             shell,
@@ -850,7 +958,7 @@ mod tests {
             "auto stretch applied"
         );
         h.get_by_label("Automatic");
-        // The Panels tab shows the panels in their groups; Plan comes later.
+        // The Panels tab shows the panels in their groups.
         h.get_by_label("Panels").click();
         h.step();
         step_until(&mut h, |s| s.tab() == Tab::Panels);
@@ -860,9 +968,12 @@ mod tests {
             assert!(Instant::now() < deadline, "no OIII column");
             h.step();
         }
+        // Plan shows the first group's previews in place.
         h.get_by_label("Plan").click();
-        h.run();
-        h.get_by_label("Coming in the next phase");
+        h.step();
+        step_until(&mut h, |s| s.tab() == Tab::Plan && s.plan().is_settled());
+        assert_eq!(h.state().plan().items().len(), 4);
+        h.get_by_label("View");
         let actions: Vec<_> = h
             .state()
             .session()

@@ -130,7 +130,7 @@ impl ChecksEngine {
     }
 
     /// Ask for a run.
-    #[allow(dead_code)] // read by the Plan tab (next task)
+    #[allow(dead_code)] // used by the tests; no UI asks for a re-run yet
     pub fn request(&mut self) {
         self.dirty = true;
     }
@@ -186,13 +186,11 @@ impl ChecksEngine {
     }
 
     /// The last report, once a run has finished.
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn report(&self) -> Option<&ChecksReport> {
         self.report.as_ref()
     }
 
     /// A run is in progress.
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn running(&self) -> bool {
         self.task.is_some()
     }
@@ -218,7 +216,6 @@ impl ChecksEngine {
     /// Accept `check`: add its keys to the accepted checks and save
     /// `mosaic.json` (UI thread; module docs). The error is a message for
     /// the user; nothing changes then.
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn accept(&self, session: &mut OpenSession, check: &Check) -> Result<(), String> {
         let mut next = session.mosaic.config.clone();
         let before = next.accepted_checks.len();

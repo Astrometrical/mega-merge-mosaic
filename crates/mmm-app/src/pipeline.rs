@@ -294,21 +294,18 @@ impl Pipeline {
     }
 
     /// The pipeline stage running (or queued), if any.
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn step(&self) -> Option<Step> {
         self.job.as_ref().map(|j| j.step)
     }
 
     /// The previews received for the current inputs, by panel path (Plan
     /// reads these).
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn previews(&self) -> &BTreeMap<PathBuf, Arc<Preview>> {
         &self.previews
     }
 
     /// Changes whenever the preview cache is dropped (inputs changed), so a
     /// reader knows to drop what it derived from it.
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -316,7 +313,6 @@ impl Pipeline {
     /// Whether every preview of the current inputs has been run (the last
     /// previews run finished). False while they run, and after the user
     /// cancelled them or they failed.
-    #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn previews_complete(&self) -> bool {
         self.previews_for.is_some() && self.previews_for == self.seen
     }
@@ -324,10 +320,15 @@ impl Pipeline {
     /// Run the previews again (the user asked, e.g. after cancelling
     /// them): they start at the next poll once nothing else of the
     /// pipeline runs.
-    #[allow(dead_code)] // a Plan tab button (next task)
     pub fn request_previews(&mut self) {
         self.previews_cancelled_for = None;
         self.previews_for = None;
+    }
+
+    /// Whether the pipeline is waiting to start (the debounce after an
+    /// input edit, or the first poll) with no job of its own running.
+    pub fn waiting(&self, now: Instant) -> bool {
+        self.job.is_none() && self.due.is_some_and(|due| now < due)
     }
 
     /// The id of an analysis the pipeline started since the last call.
