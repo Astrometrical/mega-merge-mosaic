@@ -22,6 +22,7 @@ struct State {
     tab: PlanTab,
     session: OpenSession,
     previews: BTreeMap<PathBuf, Arc<Preview>>,
+    generation: u64,
     complete: bool,
     report: Option<ChecksReport>,
     resumed: usize,
@@ -36,7 +37,7 @@ fn harness(session: OpenSession) -> Harness<'static, State> {
             |ui, s: &mut State| {
                 let feed = PlanFeed {
                     previews: &s.previews,
-                    generation: 1,
+                    generation: s.generation,
                     complete: s.complete,
                     previews_busy: false,
                     checks: s.report.as_ref(),
@@ -49,6 +50,7 @@ fn harness(session: OpenSession) -> Harness<'static, State> {
                 tab: PlanTab::new(),
                 session,
                 previews: BTreeMap::new(),
+                generation: 1,
                 complete: false,
                 report: None,
                 resumed: 0,
@@ -59,7 +61,7 @@ fn harness(session: OpenSession) -> Harness<'static, State> {
 
 /// The panels of `group`, in configuration order.
 fn panels(s: &OpenSession, group: &str) -> Vec<PathBuf> {
-    group_panels(s, group)
+    group_members(s, &[]).remove(group).unwrap_or_default()
 }
 
 /// Small previews of `paths` in the session's frame.
@@ -168,6 +170,19 @@ fn plan_draws_partial_previews() {
     let (_, now) = h.state().tab.canvas.last_frame().unwrap();
     assert_eq!(h.state().tab.canvas.view().zoom(now), before);
     assert_eq!(h.state().tab.frame_canvas(), Some(crate::testutil::CANVAS));
+    // Hidden for a while: the textures go, and come back when shown.
+    h.state_mut()
+        .tab
+        .release_if_hidden(std::time::Instant::now() + RELEASE_AFTER * 2);
+    assert!(h.state().tab.textures.is_empty());
+    h.step();
+    step_until(&mut h, |s| s.tab.is_settled());
+    assert_eq!(textured(&h), 4);
+    // Shown recently: kept.
+    h.state_mut()
+        .tab
+        .release_if_hidden(std::time::Instant::now());
+    assert_eq!(h.state().tab.textures.len(), 4);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -239,6 +254,11 @@ fn selection_filters_checks() {
     step_until(&mut h, |s| s.tab.info.contains_key(&ha[0]));
     h.get_by_label("600 × 420 (0.3 MP)");
     h.get_by_label("None (registered)");
+    // New inputs (a generation): the header is read again.
+    h.state_mut().generation = 2;
+    h.step();
+    assert!(!h.state().tab.info.contains_key(&ha[0]));
+    step_until(&mut h, |s| s.tab.info.contains_key(&ha[0]));
     assert!(
         h.query_all_by_label("Ha_1.xisf").next().is_some(),
         "overlaps listed"
@@ -314,6 +334,10 @@ fn composition_view_uses_additive_layers() {
         })
         .count();
     assert_eq!(additive, 12, "4 red + 4 green + 4 blue layers");
+    // Numbers run across the view: unique.
+    let mut labels: Vec<u32> = items.iter().map(|i| i.label.parse().unwrap()).collect();
+    labels.sort_unstable();
+    assert_eq!(labels, (1..=8).collect::<Vec<_>>());
     // A three-channel stretch, keyed apart from any group's.
     assert_eq!(h.state().tab.stretch().map(<[_]>::len), Some(3));
     let _ = std::fs::remove_dir_all(&root);
@@ -420,4 +444,84 @@ fn show_in_folder_uses_the_platform_opener() {
     }
     #[cfg(target_os = "windows")]
     assert_eq!(c.get_program(), "explorer");
+}
+
+#[test]
+fn plan_places_solved_panels_before_previews() {
+    use mmm_core::synth::{SynthWcs, write_xisf_solved};
+    let root = temp_dir("plan-solved");
+    let (w, h) = (200u64, 150u64);
+    let paths: Vec<PathBuf> = [[100.0, 75.0], [40.0, 45.0]]
+        .iter()
+        .enumerate()
+        .map(|(k, refimg)| {
+            let path = root.join(format!("raw_{k}.xisf"));
+            let wcs = SynthWcs {
+                crval: [83.8, -5.4],
+                refimg: *refimg,
+                cd: [[-1e-3, 0.0], [0.0, 1e-3]],
+            };
+            write_xisf_solved(&path, w, h, 1, &vec![0.1f32; (w * h) as usize], &wcs).unwrap();
+            path
+        })
+        .collect();
+    let cfg = mmm_core::mosaic::MosaicConfig::new(paths.clone());
+    let input = cfg.analyze.input;
+    let mosaic = mmm_core::mosaic::Mosaic::create(&root.join("s.mmm-session"), cfg).unwrap();
+    // The frame as a previews run derives it (header-only), saved.
+    let frame = mmm_core::reference::derive(&paths, input).unwrap();
+    frame.save(&mosaic.dir.join(FRAME_FILE)).unwrap();
+    let groups = mosaic.groups().ok();
+    let s = OpenSession {
+        mosaic,
+        canvas: None,
+        groups,
+        lock: None,
+    };
+    let mut h = harness(s);
+    // No previews, no analysis: dashed outlines at the WCS footprints.
+    step_until(&mut h, |s| s.tab.items().len() == 2);
+    assert_eq!(h.state().tab.unplaced, 0);
+    for it in h.state().tab.items() {
+        assert!(it.layers.is_empty());
+        let want = mmm_core::preview::footprint(&it.path, &frame)
+            .unwrap()
+            .unwrap();
+        assert_eq!(it.rect, want);
+    }
+    let r: Vec<[f64; 4]> = h.state().tab.items().iter().map(|i| i.rect).collect();
+    // The second panel's reference pixel is (60, 30) px further left/up.
+    assert!((r[1][0] - r[0][0] - 60.0).abs() < 1.0, "{r:?}");
+    assert!((r[1][1] - r[0][1] - 30.0).abs() < 1.0, "{r:?}");
+    assert!(dashes(&h) > 0);
+    assert!(h.query_by_label_contains("not placed yet").is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn linked_auto_stretch_ignores_empty_channels() {
+    let p = Arc::new(Preview {
+        path: PathBuf::from("x"),
+        rect: [0.0, 0.0, 4.0, 1.0],
+        width: 4,
+        height: 1,
+        channels: 1,
+        data: vec![0.1, 0.12, 0.11, 0.3],
+    });
+    let sets = |linked| {
+        view_auto_stretch(
+            vec![
+                (vec![Arc::clone(&p)], Mode::Mono),
+                (Vec::new(), Mode::Mono),
+                (Vec::new(), Mode::Mono),
+            ],
+            linked,
+        )
+        .unwrap()
+    };
+    let unlinked = sets(false);
+    let linked = sets(true);
+    // Linked: the one channel with data sets the shared stretch.
+    assert_eq!(linked, vec![unlinked[0]; 3]);
+    assert_ne!(unlinked[0], unlinked[1]);
 }

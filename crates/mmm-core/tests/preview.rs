@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{FRAME_FILE, Mosaic, MosaicConfig};
-use mmm_core::preview::{Preview, build_preview, plan_previews, run_previews};
+use mmm_core::preview::{Preview, build_preview, footprint, plan_previews, run_previews};
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::synth::{SynthWcs, write_xisf, write_xisf_solved};
 
@@ -99,6 +99,40 @@ fn to_canvas(panel: &Path, frame: &ReferenceFrame, px: f64, py: f64) -> (f64, f6
     // Pixel centre in PixInsight image coordinates.
     let (ra, dec) = m.pixel_to_sky(px + 0.5, py + 0.5);
     frame.linear_wcs().sky_to_pixel(ra, dec)
+}
+
+#[test]
+fn footprint_matches_preview_rect() {
+    let t = TempDir::new("footprint");
+    let a = t.0.join("a.xisf");
+    let b = t.0.join("b.xisf");
+    solved_panel(&a, [200.0, 150.0]);
+    solved_panel(&b, [140.0, 110.0]);
+    let m = mosaic(&t.0, vec![a.clone(), b.clone()]);
+    let plan = plan_previews(&m);
+    let got = Mutex::new(Vec::<Preview>::new());
+    let errs = run_previews(&plan, &JobCtl::none(), &|p| got.lock().unwrap().push(p)).unwrap();
+    assert!(errs.is_empty(), "{errs:?}");
+    let frame = ReferenceFrame::load(&m.dir.join(FRAME_FILE)).unwrap();
+    for p in got.into_inner().unwrap() {
+        let f = footprint(&p.path, &frame).unwrap().expect("solved frame");
+        let block = (p.rect[2] - p.rect[0]) / f64::from(p.width);
+        for k in 0..4 {
+            assert!(
+                (f[k] - p.rect[k]).abs() <= block,
+                "{:?}: footprint {f:?} vs preview {:?}",
+                p.path,
+                p.rect
+            );
+        }
+    }
+    // An aligned frame needs a pixel scan: no header-only footprint.
+    let aligned = ReferenceFrame::Aligned {
+        width: 10,
+        height: 10,
+        wcs: None,
+    };
+    assert_eq!(footprint(&a, &aligned).unwrap(), None);
 }
 
 #[test]

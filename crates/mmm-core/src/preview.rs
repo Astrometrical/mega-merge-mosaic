@@ -394,6 +394,51 @@ impl Reduced {
     }
 }
 
+/// The footprint of a solved panel (`model`) in `frame`'s canvas pixels,
+/// `[x0, y0, x1, y1]`: its boundary forward-mapped (pixel → sky → frame).
+/// The frame's FITS coordinate is the canvas pixel coordinate (pixel `i`
+/// spans `[i, i + 1)`) under the placement law.
+fn solved_footprint(
+    path: &Path,
+    model: &crate::astrometry::WcsModel,
+    frame: &MosaicFrame,
+) -> Result<[f64; 4]> {
+    let flin = frame.linear_wcs();
+    let (mut fx0, mut fy0) = (f64::INFINITY, f64::INFINITY);
+    let (mut fx1, mut fy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (px, py) in boundary_samples(model.width as f64, model.height as f64) {
+        let (ra, dec) = model.pixel_to_sky(px, py);
+        let (x, y) = flin.sky_to_pixel(ra, dec);
+        fx0 = fx0.min(x);
+        fx1 = fx1.max(x);
+        fy0 = fy0.min(y);
+        fy1 = fy1.max(y);
+    }
+    if ![fx0, fx1, fy0, fy1].iter().all(|v| v.is_finite()) || fx1 <= fx0 || fy1 <= fy0 {
+        return Err(Error::format(
+            path,
+            "panel footprint cannot be placed in the reference frame",
+        ));
+    }
+    Ok([fx0, fy0, fx1, fy1])
+}
+
+/// Where the panel at `path` lies in `frame`, from its header only (no
+/// pixel data): for a solved frame, its WCS footprint in canvas pixels
+/// `[x0, y0, x1, y1]` (the extent [`build_preview`] gives it, to within one
+/// preview pixel); for an aligned frame `None`, since a full-canvas panel's
+/// covered area needs a pixel scan.
+pub fn footprint(path: &Path, frame: &ReferenceFrame) -> Result<Option<[f64; 4]>> {
+    let ReferenceFrame::Solved { frame } = frame else {
+        return Ok(None);
+    };
+    let panel = InputPanel::open(path)?;
+    let model = panel.wcs_model().map_err(|r| Error::format(path, r))?;
+    drop(panel);
+    model.ensure_grids();
+    solved_footprint(path, &model, frame).map(Some)
+}
+
 /// Solved raw panel: forward-map its footprint into the frame, then fill
 /// each preview pixel by the inverse mapping and a bilinear sample of a
 /// block-averaged copy of the panel.
@@ -420,25 +465,7 @@ fn solved_preview(
     drop(panel);
     model.ensure_grids();
     let flin = frame.linear_wcs();
-
-    // Footprint in canvas pixels: the frame's FITS coordinate is the canvas
-    // pixel coordinate (pixel i spans [i, i + 1)) under the placement law.
-    let (mut fx0, mut fy0) = (f64::INFINITY, f64::INFINITY);
-    let (mut fx1, mut fy1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for (px, py) in boundary_samples(model.width as f64, model.height as f64) {
-        let (ra, dec) = model.pixel_to_sky(px, py);
-        let (x, y) = flin.sky_to_pixel(ra, dec);
-        fx0 = fx0.min(x);
-        fx1 = fx1.max(x);
-        fy0 = fy0.min(y);
-        fy1 = fy1.max(y);
-    }
-    if ![fx0, fx1, fy0, fy1].iter().all(|v| v.is_finite()) || fx1 <= fx0 || fy1 <= fy0 {
-        return Err(Error::format(
-            path,
-            "panel footprint cannot be placed in the reference frame",
-        ));
-    }
+    let [fx0, fy0, fx1, fy1] = solved_footprint(path, &model, frame)?;
     let step = ((fx1 - fx0).max(fy1 - fy0) / max_side as f64).max(1.0);
     let pw = ((fx1 - fx0) / step).ceil().max(1.0) as usize;
     let ph = ((fy1 - fy0) / step).ceil().max(1.0) as usize;

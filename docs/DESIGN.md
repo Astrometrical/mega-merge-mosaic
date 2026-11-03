@@ -958,9 +958,11 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   converter pool; the UI thread uploads at most 32 textures a frame. The
   canvas extent is the frame canvas (read on a worker), so arriving previews
   never reset the zoom; a panel without a preview yet is a dashed outline at
-  its analysed bbox. Plan stretches live in `ui.plan_stretch`, keyed by group
+  its analysed bbox or, in a solved frame, at its header-only WCS footprint
+  (`preview::footprint`, found on a worker once per previews generation).
+  Textures are dropped after Plan has been hidden 5 s and rebuilt on return. Plan stretches live in `ui.plan_stretch`, keyed by group
   name or `comp:<name>` for a composition (names unique and non-empty).
   Compositions draw each channel's group as additive layers tinted pure R, G
   or B × weight; overlaps within one group add up (a known limitation).
-- **Not yet built:** Panels, Plan and ROI tabs, export from the tile store,
-  packaging and signing (later plans).
+- **Not yet built:** Blend ROIs, export from the tile store, packaging and
+  signing (later plans). The Panels and Plan tabs are built (phase 3).

@@ -296,6 +296,7 @@ impl Shell {
             self.blend.track_analysis(id);
         }
         self.checks.poll(ctx, session, jobs, &events);
+        self.plan.release_if_hidden(now);
     }
 
     /// The open session (the Panels, Plan and Blend tabs build on this).

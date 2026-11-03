@@ -13,9 +13,13 @@
 //!   selected panel's header ([`read_info`]) are each read on a worker too.
 //! - **Placement.** A panel is drawn at its preview's rect. Until its
 //!   preview arrives it is drawn as a dashed outline where the last
-//!   analysis placed it, if it has been analysed. The canvas extent is the
-//!   shared frame's canvas, which does not move as previews arrive (so the
-//!   user's zoom is kept).
+//!   analysis placed it or, failing that, at its header-only WCS footprint
+//!   in a solved frame ([`load_footprints`], once per previews generation
+//!   and frame). The canvas extent is the shared frame's canvas, which does
+//!   not move as previews arrive (so the user's zoom is kept).
+//! - **Memory.** The textures are dropped once the tab has been hidden for
+//!   [`RELEASE_AFTER`] ([`PlanTab::release_if_hidden`]) and rebuilt from the
+//!   in-memory previews when it is shown again.
 //! - **Stretch.** One display stretch per view, independent of Blend's:
 //!   automatic (recomputed as previews arrive and once they are all in)
 //!   until the user sets one, which is saved in `MosaicConfig.ui` under
@@ -44,9 +48,10 @@ use mmm_core::formats::InputPanel;
 use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::preview::Preview;
+use mmm_core::preview::footprint;
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
-use mmm_core::stretch::{StretchParams, apply, auto_stretch, channel_stats};
+use mmm_core::stretch::{ChannelStats, StretchParams, apply, auto_stretch, channel_stats};
 
 use crate::blend_tab::{Debounce, Poll, Task, group_names};
 use crate::checks::ChecksReport;
@@ -67,6 +72,8 @@ pub const MAX_UPLOADS_PER_FRAME: usize = 32;
 const STATS_MAX_SAMPLES: usize = 1 << 20;
 /// Width of the side panel.
 const SIDE_WIDTH: f32 = 300.0;
+/// The Plan textures are dropped once the tab has been hidden this long.
+pub const RELEASE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 /// Most preview converter threads.
 const MAX_CONVERTERS: usize = 4;
 /// The display channel colours of a composition (R, G, B).
@@ -271,36 +278,50 @@ fn sample_planes(previews: &[Arc<Preview>], mode: Mode, channels: usize) -> (Vec
 
 /// The automatic display stretch of a view (worker thread). `sets`: per
 /// stretch entry group, its previews and how they are shown — one Native
-/// set for a group view, three Mono sets (R, G, B) for a composition.
+/// set for a group view, three Mono sets (R, G, B) for a composition. An
+/// entry with no previews (an empty composition channel) gets the stretch
+/// of zero statistics and, when `linked`, takes no part in the shared
+/// stretch, which every entry then gets.
 fn view_auto_stretch(
     sets: Vec<(Vec<Arc<Preview>>, Mode)>,
     linked: bool,
 ) -> Option<Vec<StretchParams>> {
-    let mut stats = Vec::new();
+    let zero = ChannelStats {
+        median: 0.0,
+        mad: 0.0,
+    };
+    // Per stretch entry: its statistics, `None` with no previews.
+    let mut stats: Vec<Option<ChannelStats>> = Vec::new();
     for (previews, mode) in &sets {
         let channels = match mode {
             Mode::Native => view_channels(previews.iter()),
             Mode::Mono => 1,
         };
-        if channels == 0 {
-            stats.push(mmm_core::stretch::ChannelStats {
-                median: 0.0,
-                mad: 0.0,
-            });
+        if previews.is_empty() || channels == 0 {
+            stats.push(None);
             continue;
         }
         let (planar, n) = sample_planes(previews, *mode, channels);
-        stats.extend(channel_stats(&planar, n, channels));
+        stats.extend(channel_stats(&planar, n, channels).into_iter().map(Some));
     }
-    (!stats.is_empty()).then(|| auto_stretch(&stats, linked))
+    if stats.is_empty() {
+        return None;
+    }
+    let present: Vec<ChannelStats> = stats.iter().flatten().copied().collect();
+    if linked && !present.is_empty() {
+        let shared = auto_stretch(&present, true)[0];
+        return Some(vec![shared; stats.len()]);
+    }
+    let all: Vec<ChannelStats> = stats.iter().map(|s| s.unwrap_or(zero)).collect();
+    Some(auto_stretch(&all, linked))
 }
 
 /// The shared frame's canvas and what the last analyses say about the
 /// panels.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layout {
-    /// Canvas `(width, height)` of the shared frame, if it has been derived.
-    pub canvas: Option<(u64, u64)>,
+    /// The shared frame, if it has been derived.
+    pub frame: Option<ReferenceFrame>,
     /// Each analysed panel's content bbox in the frame, by panel file.
     pub rects: BTreeMap<PathBuf, [f64; 4]>,
     /// Each analysed panel's overlapping panels (in its group).
@@ -312,7 +333,7 @@ pub struct Layout {
 /// and logged.
 pub fn load_layout(frame: &Path, groups: &[PathBuf]) -> Layout {
     let mut out = Layout {
-        canvas: ReferenceFrame::load(frame).ok().map(|f| f.canvas()),
+        frame: ReferenceFrame::load(frame).ok(),
         ..Layout::default()
     };
     for dir in groups {
@@ -349,6 +370,23 @@ pub fn load_layout(frame: &Path, groups: &[PathBuf]) -> Layout {
         }
     }
     out
+}
+
+/// Each of `panels`' header-only footprint in `frame` (solved frames only;
+/// see [`footprint`]). Blocking (worker thread): reads headers; a panel
+/// whose footprint cannot be found is left out.
+pub fn load_footprints(frame: &ReferenceFrame, panels: &[PathBuf]) -> BTreeMap<PathBuf, [f64; 4]> {
+    panels
+        .iter()
+        .filter_map(|p| match footprint(p, frame) {
+            Ok(Some(r)) => Some((p.clone(), r)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!("Plan: no footprint for {}: {e}", p.display());
+                None
+            }
+        })
+        .collect()
 }
 
 /// Header facts of a panel for the side panel.
@@ -433,6 +471,8 @@ pub struct ItemSnapshot {
     pub layers: Vec<(Color32, bool)>,
     /// Outline colour (Hα for a panel with an unaccepted problem).
     pub outline: Color32,
+    /// The panel number shown.
+    pub label: String,
 }
 
 /// What the automatic stretch was last computed for.
@@ -457,15 +497,40 @@ struct LayoutKey {
     provenance: usize,
 }
 
-/// A group drawn in a view: its name and, per layer, the composition
-/// slot (`None` in a group view) and the tint.
-type DrawnGroup = (String, Vec<(Option<usize>, Color32)>);
+/// A group drawn in a view.
+struct DrawnGroup {
+    /// The group's name.
+    name: String,
+    /// Its panels, in configuration order.
+    panels: Vec<PathBuf>,
+    /// Per layer: the composition slot (`None` in a group view) and tint.
+    layers: Vec<(Option<usize>, Color32)>,
+}
+
+/// Each group's panels in configuration order (from the resolved groups,
+/// once per frame); every panel under each name when the groups are
+/// unknown.
+pub fn group_members(session: &OpenSession, names: &[String]) -> BTreeMap<String, Vec<PathBuf>> {
+    match &session.groups {
+        Some(g) => g.processing_groups().into_iter().collect(),
+        None => {
+            let all: Vec<PathBuf> = session
+                .mosaic
+                .config
+                .panels
+                .iter()
+                .map(|p| p.path.clone())
+                .collect();
+            names.iter().map(|n| (n.clone(), all.clone())).collect()
+        }
+    }
+}
 
 /// The view resolved for a frame.
 struct ViewSpec {
     /// Stretch and texture identity (group name, or `comp:<name>`).
     key: String,
-    /// Per drawn group: its name and, per layer, `(slot, tint)`.
+    /// The groups drawn, in order.
     groups: Vec<DrawnGroup>,
     /// Channels of the stretch.
     channels: usize,
@@ -499,6 +564,15 @@ pub struct PlanTab {
     layout: Layout,
     layout_task: Option<Task<Layout>>,
     layout_for: Option<LayoutKey>,
+    /// Header-only footprints of the panels in the frame (solved frames).
+    footprints: BTreeMap<PathBuf, [f64; 4]>,
+    footprint_task: Option<Task<BTreeMap<PathBuf, [f64; 4]>>>,
+    /// The previews generation and frame the footprints were found for.
+    footprints_for: Option<(u64, ReferenceFrame)>,
+    /// The previews generation the header facts belong to.
+    info_generation: u64,
+    /// When the tab was last drawn (textures are dropped once hidden).
+    last_shown: Option<Instant>,
     info: BTreeMap<PathBuf, Result<PanelInfo, String>>,
     info_task: Option<Task<(PathBuf, Result<PanelInfo, String>)>>,
     last_items: Vec<ItemSnapshot>,
@@ -540,6 +614,11 @@ impl PlanTab {
             layout: Layout::default(),
             layout_task: None,
             layout_for: None,
+            footprints: BTreeMap::new(),
+            footprint_task: None,
+            footprints_for: None,
+            info_generation: 0,
+            last_shown: None,
             info: BTreeMap::new(),
             info_task: None,
             last_items: Vec::new(),
@@ -582,9 +661,24 @@ impl PlanTab {
         self.stretch.as_deref()
     }
 
+    /// Drop the textures (and pending conversions) if the tab has not been
+    /// drawn for [`RELEASE_AFTER`]; they are rebuilt from the previews when
+    /// it is shown again. Call every frame.
+    pub fn release_if_hidden(&mut self, now: Instant) {
+        if self
+            .last_shown
+            .is_some_and(|t| now.saturating_duration_since(t) > RELEASE_AFTER)
+            && (!self.textures.is_empty() || !self.requested.is_empty())
+        {
+            self.textures.clear();
+            self.textures_for = None;
+            self.new_epoch();
+        }
+    }
+
     /// The shared frame's canvas, once read.
     pub fn frame_canvas(&self) -> Option<(u64, u64)> {
-        self.layout.canvas
+        self.layout.frame.as_ref().map(ReferenceFrame::canvas)
     }
 
     /// True once the last frame had every preview in (complete), each drawn
@@ -614,8 +708,16 @@ impl PlanTab {
     ) -> PlanOutput {
         let ctx = ui.ctx().clone();
         let mut out = PlanOutput::default();
+        self.last_shown = Some(Instant::now());
+        if self.info_generation != feed.generation {
+            // The panel files may have changed: read their headers again.
+            self.info_generation = feed.generation;
+            self.info.clear();
+        }
         let grouping = session.mosaic.config.grouping.enabled;
         let groups = group_names(session);
+        // Group membership, once per frame.
+        let members = group_members(session, &groups);
         let compositions = if grouping {
             load_compositions(&session.mosaic.config.ui)
         } else {
@@ -629,7 +731,7 @@ impl PlanTab {
         if !valid {
             self.view = groups.first().cloned().map(ViewKind::Group);
         }
-        let spec = self.view_spec(session, &groups, &compositions, feed);
+        let spec = self.view_spec(session, &groups, &members, &compositions, feed);
         self.update(&ctx, session, feed, spec.as_ref());
 
         egui::Panel::top("plan-toolbar").show(ui, |ui| {
@@ -707,6 +809,7 @@ impl PlanTab {
         }
         self.settled = feed.complete
             && self.layout_task.is_none()
+            && self.footprint_task.is_none()
             && self.auto.is_none()
             && self.info_task.is_none()
             && self.uploads.is_empty()
@@ -720,9 +823,11 @@ impl PlanTab {
         &self,
         session: &OpenSession,
         groups: &[String],
+        members: &BTreeMap<String, Vec<PathBuf>>,
         compositions: &[Composition],
         feed: &PlanFeed<'_>,
     ) -> Option<ViewSpec> {
+        let panels_of = |g: &str| members.get(g).cloned().unwrap_or_default();
         let colors = group_colors(
             &load_group_colors(&session.mosaic.config.ui),
             groups.iter().map(String::as_str),
@@ -734,13 +839,17 @@ impl PlanTab {
                 } else {
                     Color32::WHITE
                 };
-                let panels = group_panels(session, g);
+                let panels = panels_of(g);
                 let channels = view_channels(panels.iter().filter_map(|p| feed.previews.get(p)));
                 // Colour previews are drawn in their own colours.
                 let tint = if channels >= 3 { Color32::WHITE } else { tint };
                 Some(ViewSpec {
                     key: g.clone(),
-                    groups: vec![(g.clone(), vec![(None, tint)])],
+                    groups: vec![DrawnGroup {
+                        name: g.clone(),
+                        panels,
+                        layers: vec![(None, tint)],
+                    }],
                     channels,
                     mapping: Vec::new(),
                 })
@@ -751,9 +860,13 @@ impl PlanTab {
                 for (slot, ch) in c.channels.iter().enumerate() {
                     let Some((g, w)) = ch else { continue };
                     let tint = scale_color(CHANNEL_COLORS[slot], *w);
-                    match drawn.iter_mut().find(|(n, _)| n == g) {
-                        Some((_, layers)) => layers.push((Some(slot), tint)),
-                        None => drawn.push((g.clone(), vec![(Some(slot), tint)])),
+                    match drawn.iter_mut().find(|d| &d.name == g) {
+                        Some(d) => d.layers.push((Some(slot), tint)),
+                        None => drawn.push(DrawnGroup {
+                            name: g.clone(),
+                            panels: panels_of(g),
+                            layers: vec![(Some(slot), tint)],
+                        }),
                     }
                 }
                 Some(ViewSpec {
@@ -781,6 +894,7 @@ impl PlanTab {
     ) {
         self.poll_tasks();
         self.start_layout(ctx, session, feed);
+        self.start_footprints(ctx, session, feed);
         let Some(spec) = spec else {
             self.view_key = None;
             return;
@@ -806,8 +920,8 @@ impl PlanTab {
             self.uploads.clear();
             self.new_epoch();
         }
-        self.start_auto(ctx, session, feed, spec);
-        self.start_conversions(ctx, session, feed, spec);
+        self.start_auto(ctx, feed, spec);
+        self.start_conversions(ctx, feed, spec);
         self.take_conversions(ctx);
     }
 
@@ -823,6 +937,16 @@ impl PlanTab {
                     self.layout_task = None;
                     tracing::warn!("Plan: reading the layout failed (see the log)");
                 }
+            }
+        }
+        if let Some(task) = &self.footprint_task {
+            match task.poll() {
+                Poll::Pending => {}
+                Poll::Done(f) => {
+                    self.footprint_task = None;
+                    self.footprints = f;
+                }
+                Poll::Lost => self.footprint_task = None,
             }
         }
         if let Some(task) = &self.info_task {
@@ -880,28 +1004,61 @@ impl PlanTab {
         });
     }
 
-    /// Compute the automatic stretch when the view's previews have changed
-    /// enough (unless the user set one).
-    fn start_auto(
+    /// Find the panels' header-only footprints once per previews generation
+    /// and frame (solved frames; an aligned frame has none to find).
+    fn start_footprints(
         &mut self,
         ctx: &egui::Context,
         session: &OpenSession,
         feed: &PlanFeed<'_>,
-        spec: &ViewSpec,
     ) {
+        let Some(frame) = self.layout.frame.clone() else {
+            return;
+        };
+        let key = (feed.generation, frame);
+        if self.footprint_task.is_some() || self.footprints_for.as_ref() == Some(&key) {
+            return;
+        }
+        let frame = key.1.clone();
+        self.footprints_for = Some(key);
+        if !matches!(frame, ReferenceFrame::Solved { .. }) {
+            self.footprints.clear();
+            return;
+        }
+        let panels: Vec<PathBuf> = session
+            .mosaic
+            .config
+            .panels
+            .iter()
+            .map(|p| p.path.clone())
+            .collect();
+        self.footprint_task = Task::spawn("mmm-plan-footprints", ctx, move || {
+            load_footprints(&frame, &panels)
+        });
+    }
+
+    /// Compute the automatic stretch when the view's previews have changed
+    /// enough (unless the user set one).
+    fn start_auto(&mut self, ctx: &egui::Context, feed: &PlanFeed<'_>, spec: &ViewSpec) {
         if self.manual || self.auto.is_some() {
             return;
         }
         let of = |g: &str| -> Vec<Arc<Preview>> {
-            group_panels(session, g)
+            spec.groups
                 .iter()
-                .filter_map(|p| feed.previews.get(p).cloned())
-                .collect()
+                .find(|d| d.name == g)
+                .map(|d| {
+                    d.panels
+                        .iter()
+                        .filter_map(|p| feed.previews.get(p).cloned())
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         let sets: Vec<(Vec<Arc<Preview>>, Mode)> = if spec.mapping.is_empty() {
             spec.groups
                 .iter()
-                .map(|(g, _)| (of(g), Mode::Native))
+                .map(|d| (of(&d.name), Mode::Native))
                 .collect()
         } else {
             spec.mapping
@@ -933,13 +1090,7 @@ impl PlanTab {
 
     /// Send the view's previews without a texture (in this epoch) to the
     /// converter.
-    fn start_conversions(
-        &mut self,
-        ctx: &egui::Context,
-        session: &OpenSession,
-        feed: &PlanFeed<'_>,
-        spec: &ViewSpec,
-    ) {
+    fn start_conversions(&mut self, ctx: &egui::Context, feed: &PlanFeed<'_>, spec: &ViewSpec) {
         let Some(stretch) = self.stretch.clone() else {
             return;
         };
@@ -950,12 +1101,12 @@ impl PlanTab {
             }
         }
         let Some(conv) = &self.converter else { return };
-        for (g, layers) in &spec.groups {
-            for path in group_panels(session, g) {
-                let Some(preview) = feed.previews.get(&path) else {
+        for d in &spec.groups {
+            for path in &d.panels {
+                let Some(preview) = feed.previews.get(path) else {
                     continue;
                 };
-                for (slot, _) in layers {
+                for (slot, _) in &d.layers {
                     let key = TexKey {
                         path: path.clone(),
                         slot: *slot,
@@ -1043,10 +1194,21 @@ impl PlanTab {
         let mut snaps = Vec::new();
         self.unplaced = 0;
         self.missing_layers = 0;
-        for (g, layers) in &spec.groups {
-            for (n, path) in group_panels(session, g).into_iter().enumerate() {
+        // Numbers run across the view (unique in a composition too).
+        let mut number = 0;
+        for d in &spec.groups {
+            for path in &d.panels {
+                let path = path.clone();
+                number += 1;
                 let preview = feed.previews.get(&path);
-                let rect = match (preview, self.layout.rects.get(&path)) {
+                // Preview, else where analysis put it, else the header
+                // footprint (solved frames); dashed until the preview.
+                let known = self
+                    .layout
+                    .rects
+                    .get(&path)
+                    .or_else(|| self.footprints.get(&path));
+                let rect = match (preview, known) {
                     (Some(p), _) => p.rect,
                     (None, Some(r)) => *r,
                     (None, None) => {
@@ -1056,7 +1218,7 @@ impl PlanTab {
                 };
                 let mut drawn = Vec::new();
                 if preview.is_some() {
-                    for (slot, tint) in layers {
+                    for (slot, tint) in &d.layers {
                         let key = TexKey {
                             path: path.clone(),
                             slot: *slot,
@@ -1085,13 +1247,14 @@ impl PlanTab {
                     rect,
                     layers: drawn.iter().map(|l| (l.tint, l.additive)).collect(),
                     outline,
+                    label: number.to_string(),
                 });
                 items.push(PlacedItem {
                     id: id as u64,
                     rect,
                     layers: drawn,
                     outline,
-                    label: format!("{}", n + 1),
+                    label: number.to_string(),
                     marker: flag.then_some(palette::HA_500),
                     selected: self.selected.as_ref() == Some(&path),
                 });
@@ -1104,7 +1267,7 @@ impl PlanTab {
     /// The canvas extent: the shared frame (stable as previews arrive), or
     /// the union of the drawn rects before the frame is known.
     fn extent(&self, session: &OpenSession, items: &[PlacedItem]) -> Option<[f64; 4]> {
-        if let Some((w, h)) = self.layout.canvas.or(session.canvas) {
+        if let Some((w, h)) = self.frame_canvas().or(session.canvas) {
             return Some([0.0, 0.0, w as f64, h as f64]);
         }
         items.iter().map(|it| it.rect).reduce(|a, b| {
@@ -1170,7 +1333,7 @@ impl PlanTab {
             ui.checkbox(&mut self.show_outlines, "Outlines")
                 .on_hover_text("Panel outlines");
             ui.checkbox(&mut self.show_numbers, "Numbers")
-                .on_hover_text("Panel numbers, in each group");
+                .on_hover_text("Panel numbers");
             ui.separator();
             let total = session.mosaic.config.panels.len();
             if total > 0 && !feed.complete {
@@ -1457,26 +1620,6 @@ impl PlanTab {
         } else if let Some(wait) = self.save.wait(now) {
             ctx.request_repaint_after(wait);
         }
-    }
-}
-
-/// The panels of `group` in configuration order (every panel when the
-/// groups are unknown).
-fn group_panels(session: &OpenSession, group: &str) -> Vec<PathBuf> {
-    match &session.groups {
-        Some(g) => g
-            .processing_groups()
-            .into_iter()
-            .find(|(n, _)| n == group)
-            .map(|(_, p)| p)
-            .unwrap_or_default(),
-        None => session
-            .mosaic
-            .config
-            .panels
-            .iter()
-            .map(|p| p.path.clone())
-            .collect(),
     }
 }
 
