@@ -18,8 +18,10 @@
 //!   whether the pipeline or the Blend tab started it, is not started
 //!   again automatically until the inputs, the analysis settings or the
 //!   groups to analyse change (no retry loops). Previews that end are not
-//!   repeated for the same inputs, unless they were cancelled: incomplete
-//!   previews run again.
+//!   repeated for the same inputs either. Previews the user cancelled (or
+//!   that failed) stay incomplete ([`Pipeline::previews_complete`]) until
+//!   the inputs change or [`Pipeline::request_previews`] asks again;
+//!   analysis may still follow them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -143,8 +145,11 @@ pub struct Pipeline {
     /// When the next run may start.
     due: Option<Instant>,
     job: Option<Job>,
-    /// The inputs whose previews have been run.
+    /// The inputs whose previews have all been run (finished).
     previews_for: Option<Inputs>,
+    /// The inputs whose previews the user cancelled (or that failed): not
+    /// run again until the inputs change or previews are requested.
+    previews_cancelled_for: Option<Inputs>,
     /// An automatic analysis ended with this key: not again until it
     /// changes.
     stalled: Option<Key>,
@@ -190,7 +195,7 @@ impl Pipeline {
                 JobEvent::Finished { id, .. } | JobEvent::Cancelled { id } => *id,
                 JobEvent::Failed { id, .. } => *id,
             };
-            let cancelled = matches!(event, JobEvent::Cancelled { .. });
+            let finished = matches!(event, JobEvent::Finished { .. });
             let Some(job) = self.job.take_if(|j| j.id == id) else {
                 // An analysis started elsewhere (the Blend tab's Analyze):
                 // once it has ended, failed or been cancelled by the user,
@@ -212,8 +217,10 @@ impl Pipeline {
             }
             match job.step {
                 // Cancelled previews are incomplete: run them again.
-                Step::Previews if cancelled => {}
-                Step::Previews => self.previews_for = Some(job.inputs),
+                Step::Previews if finished => self.previews_for = Some(job.inputs),
+                // The user's Cancel (or a failure) is final for these
+                // inputs; the previews stay incomplete.
+                Step::Previews => self.previews_cancelled_for = Some(job.inputs),
                 Step::Analyze => self.stalled = Some(Key::of(cfg)),
             }
         }
@@ -237,6 +244,7 @@ impl Pipeline {
             self.previews.clear();
             self.generation += 1;
             self.previews_for = None;
+            self.previews_cancelled_for = None;
             if let Some(job) = &self.job {
                 jobs.cancel(job.id);
             }
@@ -259,7 +267,9 @@ impl Pipeline {
         if cfg.panels.is_empty() {
             return;
         }
-        if self.previews_for.as_ref() != Some(&current) {
+        if self.previews_for.as_ref() != Some(&current)
+            && self.previews_cancelled_for.as_ref() != Some(&current)
+        {
             let id = jobs.start_previews(session);
             self.job = Some(Job {
                 id,
@@ -301,6 +311,23 @@ impl Pipeline {
     #[allow(dead_code)] // read by the Plan tab (next task)
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Whether every preview of the current inputs has been run (the last
+    /// previews run finished). False while they run, and after the user
+    /// cancelled them or they failed.
+    #[allow(dead_code)] // read by the Plan tab (next task)
+    pub fn previews_complete(&self) -> bool {
+        self.previews_for.is_some() && self.previews_for == self.seen
+    }
+
+    /// Run the previews again (the user asked, e.g. after cancelling
+    /// them): they start at the next poll once nothing else of the
+    /// pipeline runs.
+    #[allow(dead_code)] // a Plan tab button (next task)
+    pub fn request_previews(&mut self) {
+        self.previews_cancelled_for = None;
+        self.previews_for = None;
     }
 
     /// The id of an analysis the pipeline started since the last call.
@@ -403,6 +430,7 @@ mod tests {
         assert_eq!(seen.started, ["Previews", "Analyze"]);
         assert_eq!(seen.previews, 8, "each preview delivered");
         assert_eq!(p.previews().len(), 8);
+        assert!(p.previews_complete());
         assert!(
             p.previews()
                 .keys()
@@ -546,27 +574,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn cancelled_previews_run_again() {
-        let root = temp_dir("pipe-prev-cancel");
-        let mut s = two_group_session(&root);
-        set_auto_analyze(&mut s, false).unwrap();
-        let (mut p, mut r) = (Pipeline::new(), runner());
-        let t0 = Instant::now();
-        let ctx = egui::Context::default();
+    /// A session with automatic analysis off whose first previews run the
+    /// user cancelled; returns the cancelled job's id.
+    fn cancel_first_previews(
+        p: &mut Pipeline,
+        s: &mut OpenSession,
+        r: &mut JobRunner,
+        t0: Instant,
+        seen: &mut Seen,
+    ) -> u64 {
+        set_auto_analyze(s, false).unwrap();
         let gate = r.hold();
-        p.poll(&ctx, t0, &mut s, &mut r, &[], false);
+        p.poll(&egui::Context::default(), t0, s, r, &[], false);
         assert_eq!(p.step(), Some(Step::Previews));
         let first = r.views()[0].id;
         r.cancel(first);
         gate.open();
-        let mut seen = Seen::default();
-        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, |p, r| {
-            p.step() == Some(Step::Previews) && r.views().first().is_some_and(|v| v.id != first)
-        });
+        run_until(p, s, r, t0, false, seen, idle);
         assert!(seen.events.contains(&JobEvent::Cancelled { id: first }));
+        first
+    }
+
+    #[test]
+    fn user_cancelled_previews_stay_cancelled() {
+        let root = temp_dir("pipe-prev-cancel");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        cancel_first_previews(&mut p, &mut s, &mut r, t0, &mut seen);
+        for _ in 0..20 {
+            let events = r.poll(&mut s);
+            p.poll(
+                &egui::Context::default(),
+                t0,
+                &mut s,
+                &mut r,
+                &events,
+                false,
+            );
+            assert!(!r.busy(), "cancelled previews were restarted");
+        }
+        assert_eq!(seen.started, ["Previews"]);
+        assert!(!p.previews_complete());
+        assert_eq!(p.step(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn request_previews_restarts_after_cancel() {
+        let root = temp_dir("pipe-prev-request");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        let first = cancel_first_previews(&mut p, &mut s, &mut r, t0, &mut seen);
+        p.request_previews();
+        p.poll(&egui::Context::default(), t0, &mut s, &mut r, &[], false);
+        assert_eq!(p.step(), Some(Step::Previews));
+        assert_ne!(r.views()[0].id, first);
+        assert!(!p.previews_complete(), "running");
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert_eq!(p.previews().len(), 8);
+        assert!(p.previews_complete());
         let _ = std::fs::remove_dir_all(&root);
     }
 
