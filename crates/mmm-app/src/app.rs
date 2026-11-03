@@ -58,6 +58,16 @@ struct Notice {
     until: Instant,
 }
 
+/// The tab a session opens on: Panels while it has no panels (adding
+/// them is the first step), else Plan.
+fn default_tab(session: &OpenSession) -> Tab {
+    if session.mosaic.config.panels.is_empty() {
+        Tab::Panels
+    } else {
+        Tab::Plan
+    }
+}
+
 /// The window contents: start screen or open session.
 pub struct Shell {
     /// The start screen (also shown over an open session to open another).
@@ -95,8 +105,8 @@ impl Shell {
             jobs: None,
             sys: SysMonitor::start(),
             notices: Vec::new(),
-            // The Blend tab is the one that works in this phase.
-            tab: Tab::Blend,
+            // Set when a session opens (`default_tab`).
+            tab: Tab::Plan,
             blend: BlendTab::new(),
             panels: PanelsTab::new(Arc::new(RfdFilesPicker)),
             plan: PlanTab::new(),
@@ -245,6 +255,7 @@ impl Shell {
                     // Compressed panels decode to disk once, shared by
                     // previews and analysis (one session per process).
                     mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
+                    self.tab = default_tab(&opened);
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
                     self.blend = BlendTab::new();
@@ -571,6 +582,10 @@ impl SelfTest {
     /// Visit Blend, then Plan (the first group, then the first
     /// composition, if any), each once it has settled.
     fn advance(&mut self, shell: &mut Shell) {
+        if self.phase == Phase::Blend && shell.tab() != Tab::Blend {
+            // A session opens on Plan (or Panels); the walk starts at Blend.
+            shell.set_tab(Tab::Blend);
+        }
         match self.phase {
             Phase::Blend
                 if self.session_frames >= SELFTEST_SESSION_FRAMES
@@ -865,6 +880,8 @@ mod tests {
         assert_eq!(h.state().start.recent()[0].path, dir);
         // The form is cleared for the next New mosaic….
         assert_eq!(h.state().start.new_parent(), None);
+        // A session without panels opens on the Panels tab.
+        assert_eq!(h.state().tab(), Tab::Panels);
         let _ = std::fs::remove_dir_all(&parent);
     }
 
@@ -965,8 +982,12 @@ mod tests {
         h.get_by_label("0 problems");
         h.get_by_label("8 notes");
         h.get_by_label("0 passed");
+        // A session with panels opens on the Plan tab.
+        assert_eq!(h.state().tab(), Tab::Plan);
         // The Blend tab shows the first group, Ha; it was never blended.
-        assert_eq!(h.state().tab(), Tab::Blend);
+        h.get_by_label("Blend").click();
+        h.step();
+        step_until(&mut h, |s| s.tab() == Tab::Blend);
         assert_eq!(h.state().blend().group(), Some("Ha"));
         step_until(&mut h, |s| s.blend().absent().is_some());
         h.get_by_label("Not blended yet.");
