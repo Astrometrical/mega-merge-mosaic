@@ -520,3 +520,17 @@ fn export_dialog_warns_then_runs() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn absent_reason_hidden_while_reopening() {
+    // A reason from an earlier open is not reported while the result is
+    // being opened again (the shown text is "Opening the result…" then).
+    let mut tab = BlendTab::new();
+    tab.select("Ha".into());
+    let m = member(&mut tab, "Ha");
+    m.absent = Some("Cannot read the group's analysis: gone".into());
+    m.reopen = true;
+    assert_eq!(tab.absent(), None);
+    member(&mut tab, "Ha").reopen = false;
+    assert_eq!(tab.absent(), Some("Cannot read the group's analysis: gone"));
+}

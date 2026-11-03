@@ -422,9 +422,15 @@ impl BlendTab {
         self.member()?.source.as_ref()
     }
 
-    /// Why the shown group has no result, if it has none.
+    /// Why the shown group has no result, if it has none. `None` while its
+    /// result is being opened (again): a reason from an earlier open may no
+    /// longer hold, and the tab shows "Opening the result…" meanwhile.
     pub fn absent(&self) -> Option<&str> {
-        self.member()?.absent.as_deref()
+        let m = self.member()?;
+        if m.opening.is_some() || m.reopen {
+            return None;
+        }
+        m.absent.as_deref()
     }
 
     /// The group's health, once computed.
