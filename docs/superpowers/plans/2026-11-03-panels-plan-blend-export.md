@@ -321,3 +321,63 @@
 **Files:** `docs/DESIGN.md` ("Standalone app (phase 3)": session lock, `set_inputs`, previews, the automatic pipeline, checks, Plan/Panels/ROIs/compositions, export, the XISF-export follow-up), `README.md` (app section: the workflow across the tabs; `mmm export`), `CHANGELOG.md`, `CLAUDE.md` (layout lines for the new modules if needed), `lib.rs` API map.
 - [ ] Write the docs and check them against the code and `--help`. Run the full check, including `cargo doc --no-deps`.
 - [ ] Commit `docs: standalone app phase 3`.
+
+## Outcome and carried follow-ups (2026-11-03)
+
+Executed on `feat/app-tabs` (subagent-driven: a review per task, a
+whole-branch review, then one fix wave). Rulings against the spec or plan:
+
+- **Export formats:** FITS and TIFF only. XISF export waits for an XISF
+  writer in mpp-core.
+- **TIFF export:** it writes an image-sized scratch file first, and a
+  cancel during encoding runs to completion before the file is deleted.
+  This is accepted under "no disk budget"; a streaming TIFF writer in
+  mpp-core would remove it.
+- **FITS export:** top-down WCS only.
+- **Plan previews:** one image of at most 512 px per panel, not a pyramid.
+  - In composition views, overlapping previews of the same group add
+    together, so overlaps look brighter. The overlap-handling setting is
+    deferred.
+  - Solved panels are drawn as dashed outlines at their header-only
+    footprints before their previews arrive.
+- **Two frames:**
+  - `previews/frame.mmm-frame.json` is the preview frame. Plan uses it.
+  - `reference.mmm-frame.json` is the frame of the last analysis. ROIs and
+    Blend use it.
+  - When the two differ and no analysis is pending, every group is marked
+    `needs_analyze`.
+- **User cancels are final.** A cancelled analysis or previews run is not
+  restarted until the inputs change or the user asks again.
+- **Group colours:** persisted per name. Well-known filters get physical
+  colours (SII is #E0703A).
+- **Blend whole mosaic** blends every group. A blend from an ROI covers
+  the groups in the current view.
+- **Export and edits:** editing panels never cancels an export. Export is
+  disabled while a blend of any chosen group is pending.
+
+Open, load-bearing, surfaced for a decision (the final fix wave's
+re-review):
+
+- A blend can still be started while an export dialog's check holds a
+  result store mapped. If that blend recreates the store because its
+  geometry changed, the process can SIGBUS (crash).
+- The dialog's "blend pending" set is taken from the current view's
+  members, not from the dialog's chosen groups.
+
+Smallest fix: `can_blend` returns false while the export dialog is not
+idle, and the pending-blend set is built from the dialog's chosen groups.
+
+Carried follow-ups:
+
+- Clicking Analyze cancels a running export. Editing panels does not.
+- Unknown group names saved before the colour fix may still hold
+  physical colour slots.
+- Plan draws analysed bboxes inside the preview frame, so they are offset
+  until re-analysis.
+- Preview memory (about 3 MB per OSC panel) is not budgeted.
+- The cross-window recent list is last-writer-wins.
+- The rfd dialog needs zenity or an xdg portal on WSLg.
+- Export hardening:
+  - a `.part`/`.scratch` file left behind on panic (needs an RAII guard);
+  - no test for cancelling during TIFF encoding.
+- `blend_tab.rs` and `panels_tab.rs` are large and could be split.
