@@ -250,8 +250,8 @@ pub struct PanelsEdit {
 pub enum Applied {
     /// Applied and saved.
     Done,
-    /// Jobs were running: they were cancelled, and the edit waits for the
-    /// runner to be idle.
+    /// Jobs (other than exports) were running: they were cancelled, and
+    /// the edit waits for them to end.
     Queued(PanelsEdit),
     /// A result store was held (by another program): try again later.
     Busy(PanelsEdit),
@@ -276,10 +276,12 @@ impl PanelsEdit {
 
     /// Apply with [`set_inputs`], or, while any job runs, cancel every job
     /// and hand the edit back to wait for the runner to be idle (newer work
-    /// wins). Owner (UI) thread.
+    /// wins). Exports are spared and not waited for: they read the result
+    /// without a writer lock and write stale tiles as they are. Owner (UI)
+    /// thread.
     pub fn apply(self, session: &mut OpenSession, jobs: &mut JobRunner) -> Applied {
-        if jobs.busy() {
-            jobs.cancel_all();
+        if jobs.busy_except_exports() {
+            jobs.cancel_all_but_exports();
             return Applied::Queued(self);
         }
         match set_inputs(
@@ -735,10 +737,10 @@ impl PanelsTab {
                 Poll::Lost => self.expanding = None,
             }
         }
-        if self.pending.is_some() && jobs.busy() {
+        if self.pending.is_some() && jobs.busy_except_exports() {
             // Newer work wins, also over jobs started after the edit was
-            // queued (cancelling again is harmless).
-            jobs.cancel_all();
+            // queued (cancelling again is harmless); exports are spared.
+            jobs.cancel_all_but_exports();
         } else if self.pending.is_some() {
             let now = Instant::now();
             match self.retry_at {

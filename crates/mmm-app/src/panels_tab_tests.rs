@@ -559,3 +559,51 @@ fn queued_edit_cancels_jobs_started_later() {
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn panels_edit_spares_exports() {
+    use crate::jobs::JobEvent;
+    use crate::jobs::tests::{analyzed, drain};
+    use mmm_core::export::ExportFormat;
+
+    let (root, mut s, mut jobs) = analyzed("panels-edit-export");
+    jobs.start_blend(&mut s, "Ha", None);
+    drain(&mut jobs, &mut s);
+    // A blend runs (held) with an export queued behind it.
+    let first = jobs.hold();
+    let blend = jobs.start_blend(&mut s, "OIII", None);
+    let out = root.join("ha.fits");
+    let export = jobs.start_export(&s, "Ha", out.clone(), ExportFormat::Fits);
+    let mut edit = PanelsEdit::of(&s);
+    edit.panels.pop();
+    // The edit cancels the blend but not the export, and waits for the
+    // blend only.
+    let Applied::Queued(edit) = edit.apply(&mut s, &mut jobs) else {
+        panic!("the edit should wait for the blend");
+    };
+    let labels: Vec<String> = jobs.views().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, ["Blend OIII", "Export Ha"], "export kept");
+    let second = jobs.hold();
+    first.open();
+    let mut events = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while jobs.views().first().map(|v| v.label.as_str()) != Some("Export Ha") {
+        assert!(std::time::Instant::now() < deadline, "the export never ran");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        events.extend(jobs.poll(&mut s));
+    }
+    // A running export does not hold the edit back.
+    assert!(matches!(edit.apply(&mut s, &mut jobs), Applied::Done));
+    assert_eq!(s.mosaic.config.panels.len(), 7);
+    second.open();
+    events.extend(drain(&mut jobs, &mut s));
+    assert!(events.contains(&JobEvent::Cancelled { id: blend }));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { id, .. } if *id == export)),
+        "{events:?}"
+    );
+    assert!(out.is_file());
+    let _ = std::fs::remove_dir_all(&root);
+}

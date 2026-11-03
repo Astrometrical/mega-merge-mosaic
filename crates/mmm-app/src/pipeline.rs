@@ -11,8 +11,8 @@
 //!   groups never analysed) start an analysis while no job runs, unless
 //!   automatic analysis is paused ([`auto_analyze`], `ui.auto_analyze`).
 //! - An input edit is coordinated with the Panels tab: while one is
-//!   pending the pipeline starts nothing (the tab cancels every job); once
-//!   it applies, the debounce starts again. A changed input also cancels
+//!   pending the pipeline starts nothing (the tab cancels every job but
+//!   exports); once it applies, the debounce starts again. A changed input also cancels
 //!   any pipeline job still running.
 //! - An analysis that ends (finished, failed, or cancelled by the user),
 //!   whether the pipeline or the Blend tab started it, is not started

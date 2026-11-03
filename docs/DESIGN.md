@@ -1020,7 +1020,9 @@ views and export. No algorithm changed. Core additions are bookkeeping
   the last input edit, it runs previews, then analysis when `ui.auto_analyze`
   (the "Auto-analyze" toggle, default on) is set, nothing else is running
   (so it never cancels a user's blend) and some group needs it. The Panels tab
-  cancels running jobs before an edit and applies it once the runner is idle;
+  cancels running jobs before an edit and applies it once they have stopped;
+  exports are spared and not waited for (they read the result without a
+  writer lock and write stale tiles as they are);
   the pipeline waits while an edit is pending and re-runs a job that ended for
   stale inputs. User cancels are final: a cancelled or failed previews run is
   not retried, and an ended analysis is not restarted, until the inputs

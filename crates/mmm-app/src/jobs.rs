@@ -190,6 +190,8 @@ struct Running {
     resolving: Option<GroupInputs>,
     /// A previews job (analysis queues behind it rather than cancel it).
     previews: bool,
+    /// An export job (input edits spare it).
+    export: bool,
     stage: String,
     done: u64,
     total: u64,
@@ -392,15 +394,33 @@ impl JobRunner {
         }
     }
 
-    /// Cancel every job: the running one winds down (reported by
-    /// [`JobRunner::poll`] when it has), queued ones are dropped at once.
-    pub fn cancel_all(&mut self) {
-        if let Some(r) = &self.running {
+    /// Cancel every job but exports: the running one winds down (reported
+    /// by [`JobRunner::poll`] when it has), queued ones are dropped at once.
+    /// For input edits, which exports tolerate (they write stale tiles as
+    /// they are).
+    pub fn cancel_all_but_exports(&mut self) {
+        if let Some(r) = self.running.as_ref().filter(|r| !r.export) {
             r.token.cancel();
         }
-        let dropped: Vec<u64> = self.queue.drain(..).map(|q| q.id).collect();
+        let mut dropped = Vec::new();
+        self.queue.retain(|q| {
+            let keep = matches!(q.kind, Kind::Export(_));
+            if !keep {
+                dropped.push(q.id);
+            }
+            keep
+        });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+    }
+
+    /// Whether a job other than an export is running or queued.
+    pub fn busy_except_exports(&self) -> bool {
+        self.running.as_ref().is_some_and(|r| !r.export)
+            || self
+                .queue
+                .iter()
+                .any(|q| !matches!(q.kind, Kind::Export(_)))
     }
 
     /// Take progress and outcomes from the workers, apply outcomes to
@@ -571,6 +591,7 @@ impl JobRunner {
             | Planned::Export { .. } => None,
         };
         let previews = matches!(planned, Planned::Previews(_));
+        let export = matches!(planned, Planned::Export { .. });
         let stage = if resolving.is_some() {
             RESOLVING
         } else {
@@ -649,6 +670,7 @@ impl JobRunner {
                     blend,
                     resolving,
                     previews,
+                    export,
                     stage: stage.into(),
                     done: 0,
                     total: 0,
