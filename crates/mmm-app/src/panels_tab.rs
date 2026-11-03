@@ -16,9 +16,14 @@
 //! Every edit (add, remove, move, rule) builds a new panel list and
 //! grouping, a [`PanelsEdit`], and [`PanelsEdit::apply`]s it with
 //! [`set_inputs`]. While a job runs (it may hold a result store) the edit
-//! cancels every job and waits; [`PanelsTab::poll`] applies it once the
-//! runner is idle, and a newer edit replaces a waiting one (newer work
-//! wins). The tab shows the waiting edit as if applied. `set_inputs` saves
+//! cancels every job and waits; [`PanelsTab::poll`] cancels any job
+//! started meanwhile too and applies the edit once the runner is idle, and
+//! a newer edit replaces a waiting one (newer work wins). Picked, dropped
+//! and typed paths are normalised on a worker before the duplicate check.
+//!
+//! Group colours ([`group_colors`]) are assigned when groups resolve and
+//! kept in `MosaicConfig.ui` ([`GROUP_COLORS_KEY`]); they are saved with the
+//! next `mosaic.json` save. The tab shows the waiting edit as if applied. `set_inputs` saves
 //! `mosaic.json` and invalidates the stores' state tables on the UI thread:
 //! the documented exception to "no file I/O on the UI thread".
 
@@ -34,6 +39,7 @@ use mmm_core::checks::{CheckCode, PanelFacts, input_checks, panel_facts};
 use mmm_core::formats::InputPanel;
 use mmm_core::mosaic::grouping::{Groups, header_value, resolve_groups};
 use mmm_core::mosaic::{GroupRule, Grouping, MosaicConfig, PanelEntry, UNGROUPED, set_inputs};
+use serde_json::Value;
 
 use crate::blend_tab::{Poll, Task};
 use crate::jobs::JobRunner;
@@ -53,28 +59,104 @@ const CARD_SIZE: Vec2 = Vec2::new(236.0, 52.0);
 /// Width of a group column (card plus padding).
 const COLUMN_WIDTH: f32 = 260.0;
 
-/// Group colours, in order of assignment: Hα red, OIII green and OIII blue
-/// (the brand accents), then further hues of like weight.
-pub const GROUP_PALETTE: [Color32; 8] = [
+/// Key in `MosaicConfig.ui` of the group colours: group name to an index
+/// in [`GROUP_PALETTE`], assigned once (first seen) and then kept.
+pub const GROUP_COLORS_KEY: &str = "group_colors";
+
+/// Sulphur II: a warm orange-red, clearly apart from Hα's crimson
+/// ([`palette::HA_500`]) so SII and Hα groups never look alike.
+pub const SII_COLOR: Color32 = Color32::from_rgb(0xe0, 0x70, 0x3a);
+
+/// Group colours. The first six are physical colours that well-known
+/// filter names get (see [`assign_group_colors`]): Hα / red, green, OIII
+/// cyan, SII, blue, luminance white. Other groups take the first entry no
+/// group uses yet, in first-seen order.
+pub const GROUP_PALETTE: [Color32; 11] = [
     palette::HA_500,
     palette::GREEN_400,
-    palette::ACCENT_500,
+    palette::ACCENT_400,
+    SII_COLOR,
+    palette::ACCENT_600,
+    palette::TEXT_STRONG,
     Color32::from_rgb(0xd4, 0xa2, 0x2a), // amber
     Color32::from_rgb(0x8e, 0x6a, 0xd4), // violet
     Color32::from_rgb(0xc8, 0x4a, 0x9e), // magenta
     Color32::from_rgb(0x9c, 0xc2, 0x3a), // lime
-    Color32::from_rgb(0xd4, 0x6a, 0x2a), // orange
+    Color32::from_rgb(0x6a, 0x8e, 0xd4), // periwinkle
 ];
 
-/// The colour of each named group: [`GROUP_PALETTE`] in name order
-/// ([`UNGROUPED`] has none), so a group keeps its colour while the set of
-/// groups is unchanged, and the same groups always get the same colours.
-pub fn group_colors<'a>(names: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, Color32> {
-    let sorted: BTreeSet<&str> = names.into_iter().filter(|n| *n != UNGROUPED).collect();
-    sorted
+/// The physical [`GROUP_PALETTE`] index of a well-known filter name
+/// (case-insensitive), if it is one.
+fn physical_color(name: &str) -> Option<usize> {
+    match name.to_ascii_lowercase().as_str() {
+        "ha" | "h" | "halpha" | "h-alpha" | "r" | "red" => Some(0),
+        "g" | "green" => Some(1),
+        "oiii" | "o3" | "o" => Some(2),
+        "sii" | "s2" | "s" => Some(3),
+        "b" | "blue" => Some(4),
+        "l" | "lum" => Some(5),
+        _ => None,
+    }
+}
+
+/// The persisted group colours in `ui` (`MosaicConfig.ui`); empty when
+/// absent or unreadable.
+pub fn load_group_colors(ui: &Value) -> BTreeMap<String, usize> {
+    ui.get(GROUP_COLORS_KEY)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Store `map` as the group colours in `ui`, keeping everything else there
+/// (a `ui` that is not a JSON object becomes one).
+pub fn save_group_colors(ui: &mut Value, map: &BTreeMap<String, usize>) {
+    if !ui.is_object() {
+        *ui = Value::Object(Default::default());
+    }
+    if let (Some(obj), Ok(v)) = (ui.as_object_mut(), serde_json::to_value(map)) {
+        obj.insert(GROUP_COLORS_KEY.to_string(), v);
+    }
+}
+
+/// Give each of `names` (in first-seen order) without a colour in `map`
+/// one: its physical colour if it is a well-known filter name, else the
+/// first [`GROUP_PALETTE`] entry no group uses (cycling once all are used).
+/// Existing entries never change; [`UNGROUPED`] gets none. Whether `map`
+/// changed.
+pub fn assign_group_colors<'a>(
+    map: &mut BTreeMap<String, usize>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let mut changed = false;
+    for name in names {
+        if name == UNGROUPED || map.contains_key(name) {
+            continue;
+        }
+        let index = physical_color(name).unwrap_or_else(|| {
+            let used: BTreeSet<usize> = map.values().copied().collect();
+            (0..GROUP_PALETTE.len())
+                .find(|i| !used.contains(i))
+                .unwrap_or(map.len() % GROUP_PALETTE.len())
+        });
+        map.insert(name.to_string(), index);
+        changed = true;
+    }
+    changed
+}
+
+/// The colour of each of `names` (as [`assign_group_colors`] would give
+/// them on top of the persisted `map`); [`UNGROUPED`] has none. For every
+/// view showing groups (Panels, Plan, Blend).
+pub fn group_colors<'a>(
+    map: &BTreeMap<String, usize>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, Color32> {
+    let names: Vec<&str> = names.into_iter().filter(|n| *n != UNGROUPED).collect();
+    let mut map = map.clone();
+    assign_group_colors(&mut map, names.iter().copied());
+    names
         .into_iter()
-        .enumerate()
-        .map(|(i, n)| (n.to_string(), GROUP_PALETTE[i % GROUP_PALETTE.len()]))
+        .map(|n| (n.to_string(), GROUP_PALETTE[map[n] % GROUP_PALETTE.len()]))
         .collect()
 }
 
@@ -355,6 +437,23 @@ fn columns(shown: &PanelsEdit, resolved: Option<(&PanelsEdit, &Groups)>) -> Colu
     out
 }
 
+/// The named groups of `groups` in the order their first panel appears in
+/// `inputs` ([`UNGROUPED`] left out).
+fn first_seen<'a>(inputs: &PanelsEdit, groups: &'a Groups) -> Vec<&'a str> {
+    let by_path: BTreeMap<&Path, &str> = groups
+        .groups
+        .iter()
+        .flat_map(|(n, ps)| ps.iter().map(move |p| (p.as_path(), n.as_str())))
+        .collect();
+    let mut seen = BTreeSet::new();
+    inputs
+        .panels
+        .iter()
+        .filter_map(|p| by_path.get(p.path.as_path()).copied())
+        .filter(|n| *n != UNGROUPED && seen.insert(*n))
+        .collect()
+}
+
 /// The file name of `path`, for cards.
 fn file_name(path: &Path) -> String {
     path.file_name()
@@ -451,8 +550,10 @@ enum Action {
 /// The Panels tab's state for the open session.
 pub struct PanelsTab {
     picker: Arc<dyn FilesPicker>,
-    /// The file dialog, while open.
+    /// The file dialog, while open (its paths come back normalised).
     picking: Option<Task<Option<Vec<PathBuf>>>>,
+    /// Dropped files being normalised.
+    normalizing: Vec<Task<Vec<PathBuf>>>,
     /// The typed-path field.
     path_text: String,
     /// A typed path being expanded.
@@ -493,6 +594,7 @@ impl PanelsTab {
         PanelsTab {
             picker,
             picking: None,
+            normalizing: Vec::new(),
             path_text: String::new(),
             expanding: None,
             rule_text: None,
@@ -572,7 +674,24 @@ impl PanelsTab {
                 .collect()
         });
         if !dropped.is_empty() {
-            self.add_paths(dropped, session, jobs);
+            // Normalised (symlinks resolved) off the UI thread before the
+            // duplicate check, as picked and typed paths are.
+            let task = Task::spawn("mmm-drop-paths", ctx, move || {
+                dropped.iter().map(|p| normalize(p)).collect()
+            });
+            self.normalizing.extend(task);
+        }
+        let mut normalized = Vec::new();
+        self.normalizing.retain(|task| match task.poll() {
+            Poll::Pending => true,
+            Poll::Done(paths) => {
+                normalized.push(paths);
+                false
+            }
+            Poll::Lost => false,
+        });
+        for paths in normalized {
+            self.add_paths(paths, session, jobs);
         }
         if let Some(task) = &self.picking {
             match task.poll() {
@@ -602,7 +721,11 @@ impl PanelsTab {
                 Poll::Lost => self.expanding = None,
             }
         }
-        if self.pending.is_some() && !jobs.busy() {
+        if self.pending.is_some() && jobs.busy() {
+            // Newer work wins, also over jobs started after the edit was
+            // queued (cancelling again is harmless).
+            jobs.cancel_all();
+        } else if self.pending.is_some() {
             let now = Instant::now();
             match self.retry_at {
                 Some(at) if at > now => ctx.request_repaint_after(at - now),
@@ -626,11 +749,24 @@ impl PanelsTab {
                     self.resolving = None;
                     self.infos.extend(r.infos);
                     self.filters_differ = r.filters_differ;
+                    if r.inputs.grouping.enabled {
+                        // Saved with the next edit or small save (the
+                        // UI-thread exception); kept in memory until then.
+                        let ui = &mut session.mosaic.config.ui;
+                        let mut assigned = load_group_colors(ui);
+                        if assign_group_colors(&mut assigned, first_seen(&r.inputs, &r.groups)) {
+                            save_group_colors(ui, &assigned);
+                        }
+                    }
                     self.resolved = Some((r.inputs, r.groups));
                 }
                 Poll::Lost => {
+                    // Try again on the next poll rather than leave cards
+                    // "Sorting…" for good.
                     self.resolving = None;
-                    tracing::warn!("reading the panel headers stopped unexpectedly");
+                    self.attempted = None;
+                    tracing::warn!("reading the panel headers stopped unexpectedly; retrying");
+                    ctx.request_repaint();
                 }
             }
         }
@@ -702,6 +838,7 @@ impl PanelsTab {
         let grouped = shown.grouping.enabled;
         let cols = grouped.then(|| columns(&shown, self.resolved.as_ref().map(|(i, g)| (i, g))));
 
+        let assigned = load_group_colors(&session.mosaic.config.ui);
         let mut edit: Option<PanelsEdit> = None;
         egui::Panel::top("panels-toolbar").show(ui, |ui| {
             ui.add_space(4.0);
@@ -740,7 +877,7 @@ impl PanelsTab {
                     return;
                 }
                 match &cols {
-                    Some(cols) => self.columns_ui(ui, cols),
+                    Some(cols) => self.columns_ui(ui, cols, &assigned),
                     None => self.grid_ui(ui, &shown),
                 }
             });
@@ -772,7 +909,10 @@ impl PanelsTab {
                 .clicked()
             {
                 let picker = self.picker.clone();
-                self.picking = Task::spawn("mmm-pick-files", ctx, move || picker.pick_files());
+                self.picking = Task::spawn("mmm-pick-files", ctx, move || {
+                    let picked = picker.pick_files()?;
+                    Some(picked.iter().map(|p| normalize(p)).collect())
+                });
             }
             let label = ui.label(RichText::new("Add path").color(palette::TEXT_MUTED));
             let field = ui
@@ -789,7 +929,7 @@ impl PanelsTab {
                 let text = self.path_text.clone();
                 self.expanding = Task::spawn("mmm-expand-path", ctx, move || expand_typed(&text));
             }
-            if self.picking.is_some() || self.expanding.is_some() {
+            if self.picking.is_some() || self.expanding.is_some() || !self.normalizing.is_empty() {
                 ui.spinner();
             }
             ui.separator();
@@ -1082,8 +1222,13 @@ impl PanelsTab {
     }
 
     /// Group columns: "No group" first, then each group in name order.
-    fn columns_ui(&mut self, ui: &mut egui::Ui, cols: &Columns) {
-        let colors = group_colors(cols.groups.keys().map(String::as_str));
+    fn columns_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        cols: &Columns,
+        assigned: &BTreeMap<String, usize>,
+    ) {
+        let colors = group_colors(assigned, cols.groups.keys().map(String::as_str));
         self.order = cols
             .ungrouped
             .iter()
@@ -1232,7 +1377,7 @@ impl PanelsTab {
 
     /// Files are being picked or a typed path expanded.
     fn adding(&self) -> bool {
-        self.picking.is_some() || self.expanding.is_some()
+        self.picking.is_some() || self.expanding.is_some() || !self.normalizing.is_empty()
     }
 
     fn filters_differ(&self) -> bool {

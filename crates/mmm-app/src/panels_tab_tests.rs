@@ -1,5 +1,6 @@
 //! Tests of the Panels tab (a `#[path]` child of `panels_tab.rs`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -130,13 +131,20 @@ fn add_files_dedupes() {
     step_until(&mut h, |s| s.session.mosaic.config.panels.len() == 2);
     assert_eq!(h.state().panel_names(), ["a.xisf", "b.xisf"]);
 
-    // Dropped files: duplicates and non-panel files are ignored.
-    h.input_mut().dropped_files = [b.clone(), c.clone(), files.join("notes.txt")]
+    // Dropped files: duplicates (also through a symlink) and non-panel
+    // files are ignored.
+    let link = root.join("link-to-a.xisf");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    #[cfg(not(unix))]
+    let link = a.clone();
+    h.input_mut().dropped_files = [b.clone(), link, c.clone(), files.join("notes.txt")]
         .into_iter()
         .map(|path| Arc::new(Dropped(path)) as egui::DroppedFileHandle)
         .collect();
     h.step();
     step_until(&mut h, |s| s.session.mosaic.config.panels.len() == 3);
+    step_until(&mut h, |s| s.settled() && !s.tab.adding());
     assert_eq!(h.state().panel_names(), ["a.xisf", "b.xisf", "c.fits"]);
 
     // A typed pattern adds only the new match.
@@ -266,11 +274,6 @@ fn no_group_column_first() {
     assert_eq!(h.state().session.mosaic.config.grouping.rule, rule);
     step_until(&mut h, |s| s.settled());
     h.get_by_label("9 to sort");
-    // Groups get the first palette colours in name order.
-    let colors = group_colors(["OIII", "Ha"]);
-    assert_eq!(colors["Ha"], GROUP_PALETTE[0]);
-    assert_eq!(colors["OIII"], GROUP_PALETTE[1]);
-    assert_eq!(GROUP_PALETTE[0], palette::HA_500);
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -354,6 +357,14 @@ fn add_to_new_group_creates_group() {
         .cloned()
         .collect();
     assert_eq!(names, ["Ha", "OIII", "Red"]);
+    // Colours were assigned on resolve, and saved with the edit.
+    let saved = load_group_colors(&on_disk(s).ui);
+    assert_eq!(saved.keys().collect::<Vec<_>>(), ["Ha", "OIII"]);
+    let now = load_group_colors(&s.session.mosaic.config.ui);
+    assert_eq!(now.keys().collect::<Vec<_>>(), ["Ha", "OIII", "Red"]);
+    let colors = group_colors(&now, ["Ha", "OIII", "Red"]);
+    assert_eq!(colors["Ha"], palette::HA_500);
+    assert_eq!(colors["OIII"], palette::ACCENT_400);
     h.get_by_label("Red");
     assert_eq!(
         h.query_all_by_label("Group name").count(),
@@ -448,6 +459,84 @@ fn edit_while_job_running_is_queued_then_applied() {
         "no analysis started here"
     );
     assert!(!s.jobs.busy());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn group_colors_are_stable_and_physical() {
+    let mut map = BTreeMap::new();
+    assert!(assign_group_colors(&mut map, ["Ha", "Foo"]));
+    assert!(!assign_group_colors(&mut map, ["Foo", "Ha"]), "unchanged");
+    let before = group_colors(&map, ["Ha", "Foo"]);
+    assert_eq!(before["Ha"], palette::HA_500);
+    // A group that sorts first changes no colour already given.
+    assert!(assign_group_colors(&mut map, ["Aaa", "Ha", "Foo"]));
+    let after = group_colors(&map, ["Aaa", "Ha", "Foo"]);
+    assert_eq!(after["Ha"], before["Ha"]);
+    assert_eq!(after["Foo"], before["Foo"]);
+    assert_ne!(after["Aaa"], after["Foo"]);
+    // Physical colours for well-known names, whatever the order.
+    let c = group_colors(
+        &BTreeMap::new(),
+        ["Blue", "Green", "Red", "oiii", "SII", "L", "No group"],
+    );
+    assert_eq!(c["Blue"], palette::ACCENT_600);
+    assert_eq!(c["Green"], palette::GREEN_400);
+    assert_eq!(c["Red"], palette::HA_500);
+    assert_eq!(c["oiii"], palette::ACCENT_400);
+    assert_eq!(c["SII"], SII_COLOR);
+    assert_ne!(SII_COLOR, palette::HA_500);
+    assert_eq!(c["L"], palette::TEXT_STRONG);
+    assert!(!c.contains_key("No group"));
+    // Persisted in `ui`, next to whatever else is there.
+    let mut ui = serde_json::json!({ "other": 1 });
+    save_group_colors(&mut ui, &map);
+    assert_eq!(load_group_colors(&ui), map);
+    assert_eq!(ui["other"], 1);
+}
+
+#[test]
+fn queued_edit_cancels_jobs_started_later() {
+    let root = temp_dir("panels-requeue");
+    let mut session = two_group_session(&root);
+    let mut jobs = runner();
+    let gate = jobs.hold();
+    jobs.start_analyze(&mut session);
+    let mut h = harness(session, vec![], jobs);
+    step_until(&mut h, |s| s.tab.resolved_current(&s.session));
+    h.get_by_label("Ha_0.xisf").click();
+    steps(&mut h);
+    h.get_by_label("Remove").click();
+    steps(&mut h);
+    assert!(h.state().tab.pending().is_some());
+    // Another job starts before the queued edit could apply...
+    let later = {
+        let s = h.state_mut();
+        let gate = s.jobs.hold();
+        let id = s.jobs.start_analyze(&mut s.session);
+        (id, gate)
+    };
+    gate.open();
+    later.1.open();
+    // ...and is cancelled too: the edit applies, no analysis ran.
+    step_until(&mut h, |s| !s.jobs.busy() && s.settled());
+    let s = h.state();
+    assert_eq!(s.session.mosaic.config.panels.len(), 7);
+    let actions: Vec<_> = s
+        .session
+        .mosaic
+        .config
+        .provenance
+        .iter()
+        .map(|p| p.action.as_str())
+        .collect();
+    assert_eq!(actions, ["inputs"]);
+    assert!(
+        s.session.mosaic.config.group_dirs.is_empty(),
+        "never analysed"
+    );
+    let _ = later.0;
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
