@@ -17,6 +17,10 @@
 //!   group of the view (the job runner queues them; newer work wins per
 //!   group), once the ROIs follow the current frame; **Blend whole
 //!   mosaic** blends every group over the whole canvas.
+//! - **Blend settings** ([`crate::blend_settings`]): the mosaic-wide
+//!   analyze and blend settings, staged and applied with their cost shown
+//!   first. While its tile count runs or an edit waits to apply, Blend is
+//!   disabled; an applied edit reloads the view's (now stale) tiles.
 //! - **Export…** ([`crate::export`]) writes the view's groups' results to
 //!   FITS or TIFF as jobs, after warning about stale or missing tiles.
 //!
@@ -70,10 +74,12 @@ use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
+use mmm_core::settings::ChangeImpact;
 use mmm_core::stretch::StretchParams;
 use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
 
+use crate::blend_settings::SettingsPanel;
 use crate::compositions::{Composition, ViewKind, load_compositions};
 use crate::export::{ExportAction, ExportDialog, RfdSavePicker};
 use crate::jobs::{JobEvent, JobRunner};
@@ -349,6 +355,8 @@ pub struct BlendTab {
     rois: RoiPanel,
     /// The export dialog.
     export: ExportDialog,
+    /// The Blend settings panel.
+    settings: SettingsPanel,
 }
 
 impl Default for BlendTab {
@@ -381,6 +389,7 @@ impl BlendTab {
             shown: false,
             rois: RoiPanel::default(),
             export: ExportDialog::new(Arc::new(RfdSavePicker)),
+            settings: SettingsPanel::new(),
         }
     }
 
@@ -464,6 +473,8 @@ impl BlendTab {
             && self.health_task.is_none()
             && self.rois.idle()
             && self.export.idle()
+            && self.settings.idle()
+            && !self.settings.has_pending()
             && self
                 .viewer
                 .as_ref()
@@ -496,6 +507,8 @@ impl BlendTab {
     fn can_blend(&self, readiness: Readiness) -> bool {
         readiness == Readiness::Analyzed
             && self.export.idle()
+            && self.settings.idle()
+            && !self.settings.has_pending()
             && !self.members.is_empty()
             && self.analyze_job.is_none()
             && self
@@ -514,6 +527,7 @@ impl BlendTab {
 
     /// React to a job that ended (from [`JobRunner::poll`]).
     pub fn on_event(&mut self, event: &JobEvent) {
+        self.settings.on_event(event);
         let (id, finished) = match event {
             JobEvent::Finished { id, .. } => (*id, true),
             JobEvent::Cancelled { id } | JobEvent::Failed { id, .. } => (*id, false),
@@ -543,6 +557,44 @@ impl BlendTab {
             }
             self.rois.want_fresh = true;
         }
+    }
+
+    /// A settings edit waits for the jobs to stop (or a busy store): the
+    /// automatic pipeline starts nothing meanwhile.
+    pub fn settings_pending(&self) -> bool {
+        self.settings.has_pending()
+    }
+
+    /// The Blend settings panel's background work and waiting edit (see
+    /// [`SettingsPanel::poll`]). Call every frame after the runner's poll,
+    /// whichever tab is shown; the impact when an edit was applied.
+    pub fn poll_settings(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) -> Option<ChangeImpact> {
+        let applied = self.settings.poll(ctx, session, jobs);
+        if let Some(impact) = applied {
+            self.on_settings_applied(impact);
+        }
+        applied
+    }
+
+    /// Settings were applied: the view's results went stale (their tiles
+    /// load again to show it), and ROI freshness and health are computed
+    /// again (health depends on the feather).
+    fn on_settings_applied(&mut self, impact: ChangeImpact) {
+        if impact == ChangeImpact::None {
+            return;
+        }
+        for m in self.results.values() {
+            if let Some(src) = &m.source {
+                src.bump();
+            }
+        }
+        self.rois.want_fresh = true;
+        self.want_health = true;
     }
 
     /// Give up every member's source and the viewer.
@@ -659,6 +711,10 @@ impl BlendTab {
             .exact_size(SIDE_WIDTH)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(impact) = self.settings.ui(ui, session, jobs) {
+                        self.on_settings_applied(impact);
+                    }
+                    ui.add_space(12.0);
                     self.member_picker(ui);
                     self.stretch_ui(ui, session);
                     ui.add_space(16.0);
@@ -1056,8 +1112,10 @@ impl BlendTab {
         groups: Vec<String>,
         rect: Option<[u64; 4]>,
     ) {
-        // The export check maps result stores a blend may recreate.
-        if !self.export.idle() {
+        // The export check and the settings tile count map result stores
+        // a blend may recreate; a settings edit waiting to apply would
+        // cancel the blend anyway.
+        if !self.export.idle() || !self.settings.idle() || self.settings.has_pending() {
             return;
         }
         for g in groups {

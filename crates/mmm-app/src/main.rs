@@ -7,6 +7,7 @@
 //! checks launch the GUI.
 
 mod app;
+mod blend_settings;
 mod blend_tab;
 mod checks;
 mod compositions;

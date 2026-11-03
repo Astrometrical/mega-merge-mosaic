@@ -852,3 +852,43 @@ fn previews_do_not_move_persisted_rois() {
     assert_eq!(load_rois(&s.mosaic.config.ui), [roi]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn settings_edit_waits_for_blends_and_blocks_blending() {
+    use crate::blend_settings::SettingsEdit;
+    use mmm_core::settings::ChangeImpact;
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-settings-wait");
+    let ctx = egui::Context::default();
+    let mut tab = BlendTab::new();
+    tab.select("Ha".into());
+    member(&mut tab, "Ha").reopen = false;
+    assert!(tab.can_blend(Readiness::Analyzed));
+    let gate = jobs.hold();
+    tab.blend_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
+    let mut e = SettingsEdit::of(&s.mosaic.config);
+    e.blend.feather_px = 128.0;
+    tab.settings.stage(e, &s.mosaic.config);
+    assert_eq!(tab.settings.apply(&mut s, &mut jobs), None);
+    // Waiting for the blend to stop: no blend may start meanwhile, and the
+    // shell keeps the pipeline from starting anything.
+    assert!(tab.settings_pending());
+    assert!(!tab.can_blend(Readiness::Analyzed));
+    gate.open();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut applied = None;
+    while applied.is_none() {
+        assert!(Instant::now() < deadline, "never applied");
+        for e in jobs.poll(&mut s) {
+            tab.on_event(&e);
+        }
+        applied = tab.poll_settings(&ctx, &mut s, &mut jobs);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(applied, Some(ChangeImpact::Reblend));
+    assert_eq!(s.mosaic.config.blend.feather_px, 128.0);
+    assert!(!tab.settings_pending());
+    // The view's results, ROI freshness and health are looked at again.
+    assert!(tab.rois.want_fresh && tab.want_health);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -13,7 +13,9 @@
 //! - An input edit is coordinated with the Panels tab: while one is
 //!   pending the pipeline starts nothing (the tab cancels every job but
 //!   exports); once it applies, the debounce starts again. A changed input also cancels
-//!   any pipeline job still running.
+//!   any pipeline job still running. A Blend settings edit waiting to
+//!   apply ([`crate::blend_settings`]) counts as an edit too; once a global
+//!   one applies, the groups it marked are analysed again.
 //! - An analysis that ends (finished, failed, or cancelled by the user),
 //!   whether the pipeline or the Blend tab started it, is not started
 //!   again automatically until the inputs, the analysis settings or the
@@ -775,6 +777,44 @@ mod tests {
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert_eq!(seen.started, ["Previews", "Analyze"]);
         assert_eq!(s.mosaic.config.group_dirs.len(), 2);
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn settings_changes_reanalyse_only_when_global() {
+        use crate::blend_settings::{SettingsEdit, SettingsPanel};
+        use mmm_core::photometry::GainMode;
+        use mmm_core::settings::ChangeImpact;
+
+        let root = temp_dir("pipe-settings");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let t0 = Instant::now();
+        let mut seen = Seen::default();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        let mut panel = SettingsPanel::new();
+
+        // Blend-local: nothing reruns.
+        let mut e = SettingsEdit::of(&s.mosaic.config);
+        e.blend.feather_px = 100.0;
+        panel.stage(e, &s.mosaic.config);
+        assert_eq!(panel.apply(&mut s, &mut r), Some(ChangeImpact::Reblend));
+        for _ in 0..20 {
+            run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        }
+        assert_eq!(seen.started, ["Previews", "Analyze"]);
+
+        // Global: the pipeline analyses again by itself.
+        let mut e = SettingsEdit::of(&s.mosaic.config);
+        e.analyze.gain = GainMode::Unity;
+        panel.stage(e, &s.mosaic.config);
+        assert_eq!(panel.apply(&mut s, &mut r), Some(ChangeImpact::Reanalyze));
+        assert_eq!(s.mosaic.config.needs_analyze.len(), 2);
+        p.poll(&egui::Context::default(), t0, &mut s, &mut r, &[], false);
+        assert_eq!(p.step(), Some(Step::Analyze));
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert!(s.mosaic.config.needs_analyze.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

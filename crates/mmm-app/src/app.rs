@@ -282,9 +282,10 @@ impl Shell {
         let now = Instant::now();
         let until = now + NOTICE_TIME;
         let events = jobs.poll(session);
-        // An edit waiting when the events were taken: jobs it cancelled
+        // An edit (panels or Blend settings) waiting when the events were
+        // taken: jobs it cancelled
         // are restarted by the pipeline, not given up.
-        let editing = self.panels.has_pending();
+        let editing = self.panels.has_pending() || self.blend.settings_pending();
         for event in &events {
             self.blend.on_event(event);
             let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
@@ -305,7 +306,8 @@ impl Shell {
             self.notices.push(Notice { text, color, until });
         }
         self.panels.poll(ctx, session, jobs);
-        let editing = editing || self.panels.has_pending();
+        self.blend.poll_settings(ctx, session, jobs);
+        let editing = editing || self.panels.has_pending() || self.blend.settings_pending();
         self.pipeline
             .poll(ctx, now, session, jobs, &events, editing);
         if let Some(id) = self.pipeline.take_started_analysis() {
