@@ -11,12 +11,16 @@ use egui::{Color32, RichText};
 use mega_ui::theme::palette;
 
 use crate::blend_tab::BlendTab;
-use crate::jobs::{JobEvent, JobRunner};
+use crate::checks::ChecksEngine;
+use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
+use crate::pipeline::{Pipeline, auto_analyze, set_auto_analyze};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::start::{RecentEntry, RfdPicker, StartAction, StartScreen, unix_now};
 use crate::status::{self, SysMonitor};
 
+/// Directory, inside the session, where compressed panels are decoded.
+const DECODED_DIR: &str = "decoded";
 /// eframe storage key of the recent sessions.
 const RECENT_KEY: &str = "recent_sessions";
 /// How long a job notice stays on screen.
@@ -70,6 +74,10 @@ pub struct Shell {
     panels: PanelsTab,
     /// The panel file dialog used by the Panels tab.
     files_picker: Arc<dyn FilesPicker>,
+    /// The automatic previews and analysis (made afresh with each session).
+    pipeline: Pipeline,
+    /// The checks (made afresh with each session).
+    checks: ChecksEngine,
 }
 
 impl Shell {
@@ -88,6 +96,8 @@ impl Shell {
             blend: BlendTab::new(),
             panels: PanelsTab::new(Arc::new(RfdFilesPicker)),
             files_picker: Arc::new(RfdFilesPicker),
+            pipeline: Pipeline::new(),
+            checks: ChecksEngine::new(),
         }
     }
 
@@ -109,6 +119,18 @@ impl Shell {
     /// The Blend tab.
     pub fn blend(&self) -> &BlendTab {
         &self.blend
+    }
+
+    /// The automatic pipeline (its previews feed Plan).
+    #[allow(dead_code)] // read by the Plan tab (next task)
+    pub fn pipeline(&self) -> &Pipeline {
+        &self.pipeline
+    }
+
+    /// The checks engine.
+    #[allow(dead_code)] // read by the Plan tab (next task)
+    pub fn checks(&self) -> &ChecksEngine {
+        &self.checks
     }
 
     /// Save anything held back by a rate limit (the display stretch), e.g.
@@ -196,10 +218,15 @@ impl Shell {
                 } else {
                     tracing::info!("opened session {}", dir.display());
                     self.start.record_opened(&dir, unix_now());
+                    // Compressed panels decode to disk once, shared by
+                    // previews and analysis (one session per process).
+                    mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
                     self.blend = BlendTab::new();
                     self.panels = PanelsTab::new(self.files_picker.clone());
+                    self.pipeline = Pipeline::new();
+                    self.checks = ChecksEngine::new();
                 }
             }
             Err(message) => {
@@ -209,34 +236,53 @@ impl Shell {
         }
     }
 
-    /// Apply finished jobs and post a notice for each, then let the Panels
-    /// tab take its background work and apply a waiting edit.
+    /// Apply finished jobs and post a notice for each, let the Panels tab
+    /// take its background work and apply a waiting edit, then run the
+    /// automatic pipeline and the checks.
     fn poll_jobs(&mut self, ctx: &egui::Context) {
         let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
             return;
         };
-        let until = Instant::now() + NOTICE_TIME;
-        for event in jobs.poll(session) {
-            self.blend.on_event(&event);
-            let name = |id| jobs.label(id).unwrap_or("Job").to_string();
+        let now = Instant::now();
+        let until = now + NOTICE_TIME;
+        let events = jobs.poll(session);
+        // An edit waiting when the events were taken: jobs it cancelled
+        // are restarted by the pipeline, not given up.
+        let editing = self.panels.has_pending();
+        for event in &events {
+            self.blend.on_event(event);
+            let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
             let (text, color) = match event {
+                // Previews run by themselves and often: no notices but
+                // failures.
+                JobEvent::Preview(_) => continue,
+                JobEvent::Finished { label, .. } if label == PREVIEWS_LABEL => continue,
+                JobEvent::Cancelled { id } if name(id) == PREVIEWS_LABEL => continue,
                 JobEvent::Finished { label, .. } => {
                     (format!("{label} finished"), palette::GREEN_300)
                 }
                 JobEvent::Cancelled { id } => {
                     (format!("{} cancelled", name(id)), palette::TEXT_BODY)
                 }
-                JobEvent::Failed { message, .. } => (message, palette::HA_500),
+                JobEvent::Failed { message, .. } => (message.clone(), palette::HA_500),
             };
             self.notices.push(Notice { text, color, until });
         }
         self.panels.poll(ctx, session, jobs);
+        let editing = editing || self.panels.has_pending();
+        self.pipeline
+            .poll(ctx, now, session, jobs, &events, editing);
+        if let Some(id) = self.pipeline.take_started_analysis() {
+            self.blend.track_analysis(id);
+        }
+        self.checks.poll(ctx, session, jobs, &events);
     }
 
     /// The open session (the Panels, Plan and Blend tabs build on this).
     fn session_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(session) = &self.session else { return };
+        let mut toggled = None;
         egui::Panel::top("session-bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -252,6 +298,16 @@ impl Shell {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Open another…").clicked() {
                         self.show_start = true;
+                    }
+                    let mut auto = auto_analyze(&session.mosaic.config);
+                    if ui
+                        .checkbox(&mut auto, "Auto-analyze")
+                        .on_hover_text(
+                            "Analyze by itself when the panels, grouping or settings change",
+                        )
+                        .changed()
+                    {
+                        toggled = Some(auto);
                     }
                 });
             });
@@ -284,11 +340,23 @@ impl Shell {
             status::show(
                 ui,
                 &views,
+                self.checks.counts(&session.mosaic.config),
                 session.canvas,
                 session.group_count(),
                 self.sys.latest(),
             );
         });
+        if let Some(on) = toggled
+            && let Some(session) = self.session.as_mut()
+            && let Err(message) = set_auto_analyze(session, on)
+        {
+            tracing::warn!("{message}");
+            self.notices.push(Notice {
+                text: message,
+                color: palette::HA_500,
+                until: Instant::now() + NOTICE_TIME,
+            });
+        }
         egui::Panel::top("session-tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
@@ -734,16 +802,28 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.step();
         step_until(&mut h, |s| s.session().is_some());
-        h.get_by_label("Ready");
         h.get_by_label("2 groups");
-        h.get_by_label("Analyze").click();
-        h.step();
-        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.get_by_label("Auto-analyze");
+        // The pipeline previews the panels, then analyses them by itself.
+        step_until(&mut h, |s| {
+            s.session().unwrap().mosaic.config.group_dirs.len() == 2
+                && !s.jobs.as_ref().unwrap().busy()
+        });
         h.run();
+        assert_eq!(h.state().pipeline().previews().len(), 8);
         h.get_by_label("Analyze finished");
         h.get_by_label("Ready");
         h.get_by_label("Canvas 600 × 420 (0.3 MP)");
         h.get_by_label("2 groups");
+        // The checks (unsolved registered panels: a note each).
+        step_until(&mut h, |s| {
+            s.checks().report().is_some() && !s.checks().running()
+        });
+        h.run();
+        h.get_by_label("Checks:");
+        h.get_by_label("0 problems");
+        h.get_by_label("8 notes");
+        h.get_by_label("0 passed");
         // The Blend tab shows the first group, Ha; it was never blended.
         assert_eq!(h.state().tab(), Tab::Blend);
         assert_eq!(h.state().blend().group(), Some("Ha"));

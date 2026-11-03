@@ -1033,3 +1033,30 @@ fn manual_group_survives_rule_change() {
     assert_eq!(saved.panels[0].manual_group.as_deref(), Some("Custom"));
     assert_eq!(saved.grouping, Grouping::default());
 }
+
+#[test]
+fn plan_drops_needs_analyze_of_vanished_groups() {
+    let (_tmp, mut m) = blended_two_groups("inputs-vanished");
+    // Every panel moves to one hand-made group: Ha and OIII no longer
+    // resolve, but set_inputs marked them.
+    let mut panels = m.config.panels.clone();
+    for p in &mut panels {
+        p.manual_group = Some("Custom".into());
+    }
+    let grouping = m.config.grouping.clone();
+    set_inputs(&mut m, panels, grouping).unwrap();
+    assert_eq!(m.config.needs_analyze.len(), 2);
+    let plan = plan_analyze(&mut m).unwrap();
+    assert_eq!(
+        m.config.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Custom"]
+    );
+    // The vanished groups keep their directories (stable caches).
+    let dirs: Vec<&String> = m.config.group_dirs.keys().collect();
+    assert_eq!(dirs, ["Custom", "Ha", "OIII"]);
+    assert_eq!(MosaicConfig::load(&m.dir).unwrap(), m.config);
+    let (outcome, result) = run_analyze(&plan, &JobCtl::none());
+    result.unwrap();
+    m.apply_analyze(&outcome).unwrap();
+    assert!(m.config.needs_analyze.is_empty());
+}

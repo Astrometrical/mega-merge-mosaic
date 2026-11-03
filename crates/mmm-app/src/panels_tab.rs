@@ -615,6 +615,12 @@ impl PanelsTab {
         }
     }
 
+    /// An edit is waiting for the jobs to stop (or a busy store); the
+    /// automatic pipeline starts nothing meanwhile.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// The inputs as shown: the waiting edit, else the session's.
     fn shown(&self, session: &OpenSession) -> PanelsEdit {
         self.pending

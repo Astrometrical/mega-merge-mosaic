@@ -1,6 +1,6 @@
 //! The status bar (spec §5): what is running and its progress on the
-//! left; the canvas size with megapixels, the group count and this
-//! process's memory and CPU on the right. The memory/CPU readout is sampled
+//! left; the check counts, the canvas size with megapixels, the group
+//! count and this process's memory and CPU on the right. The memory/CPU readout is sampled
 //! by [`SysMonitor`] on its own thread, at most once per second.
 
 use std::sync::{Arc, Mutex, Weak};
@@ -9,6 +9,8 @@ use std::time::Duration;
 use mega_ui::jobs::JobView;
 use mega_ui::status::{StatusItem, status_bar};
 use mega_ui::theme::palette;
+
+use crate::checks::CheckCounts;
 
 /// How often [`SysMonitor`] samples the process.
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
@@ -156,15 +158,34 @@ pub fn job_items(jobs: &[JobView]) -> Vec<StatusItem> {
     ]
 }
 
-/// The right side: canvas (when known), group count, memory and CPU (once
-/// sampled).
+/// `n` and `noun`, plural unless `n` is 1 (`"1 problem"`, `"2 notes"`).
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The check counts, coloured: "Checks: N problems · N notes · N passed".
+pub fn check_items(c: CheckCounts) -> Vec<StatusItem> {
+    let item = |text: String, color| StatusItem { text, color };
+    vec![
+        item("Checks:".into(), None),
+        item(count(c.problems, "problem"), Some(palette::HA_500)),
+        item("·".into(), None),
+        item(count(c.notes, "note"), Some(palette::ACCENT_400)),
+        item("·".into(), None),
+        item(format!("{} passed", c.passed), Some(palette::GREEN_300)),
+    ]
+}
+
+/// The right side: check counts (once checked), canvas (when known), group
+/// count, memory and CPU (once sampled).
 pub fn right_items(
+    checks: Option<CheckCounts>,
     canvas: Option<(u64, u64)>,
     groups: usize,
     sys: Option<SysSnapshot>,
 ) -> Vec<StatusItem> {
     let item = |text: String| StatusItem { text, color: None };
-    let mut items = Vec::new();
+    let mut items = checks.map(check_items).unwrap_or_default();
     if let Some((w, h)) = canvas {
         items.push(item(format!("Canvas {}", format_canvas(w, h))));
     }
@@ -183,11 +204,16 @@ pub fn right_items(
 pub fn show(
     ui: &mut egui::Ui,
     jobs: &[JobView],
+    checks: Option<CheckCounts>,
     canvas: Option<(u64, u64)>,
     groups: usize,
     sys: Option<SysSnapshot>,
 ) {
-    status_bar(ui, &job_items(jobs), &right_items(canvas, groups, sys));
+    status_bar(
+        ui,
+        &job_items(jobs),
+        &right_items(checks, canvas, groups, sys),
+    );
 }
 
 #[cfg(test)]
@@ -237,20 +263,41 @@ mod tests {
             rss: 300 * 1024 * 1024,
             cpu: 12.4,
         };
-        let texts: Vec<String> = right_items(Some((9255, 18310)), 2, Some(snap))
-            .into_iter()
-            .map(|i| i.text)
-            .collect();
+        let counts = CheckCounts {
+            problems: 2,
+            notes: 1,
+            passed: 5,
+        };
+        let items = right_items(Some(counts), Some((9255, 18310)), 2, Some(snap));
+        let colors: Vec<_> = items[..6].iter().map(|i| i.color).collect();
+        assert_eq!(
+            colors,
+            [
+                None,
+                Some(palette::HA_500),
+                None,
+                Some(palette::ACCENT_400),
+                None,
+                Some(palette::GREEN_300)
+            ]
+        );
+        let texts: Vec<String> = items.into_iter().map(|i| i.text).collect();
         assert_eq!(
             texts,
             [
+                "Checks:",
+                "2 problems",
+                "·",
+                "1 note",
+                "·",
+                "5 passed",
                 "Canvas 9 255 × 18 310 (169 MP)",
                 "2 groups",
                 "RAM 300 MB",
                 "CPU 12%"
             ]
         );
-        let texts: Vec<String> = right_items(None, 1, None)
+        let texts: Vec<String> = right_items(None, None, 1, None)
             .into_iter()
             .map(|i| i.text)
             .collect();

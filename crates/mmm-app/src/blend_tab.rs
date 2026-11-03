@@ -363,11 +363,19 @@ impl BlendTab {
             && self.retired.is_empty()
     }
 
+    /// Treat analysis job `id`, started elsewhere (the automatic
+    /// pipeline), as this tab's: Analyze is disabled until it ends, and
+    /// the result and health are checked again then.
+    pub fn track_analysis(&mut self, id: u64) {
+        self.analyze_job = Some(id);
+    }
+
     /// React to a job that ended (from [`JobRunner::poll`]).
     pub fn on_event(&mut self, event: &JobEvent) {
         let (id, finished) = match event {
             JobEvent::Finished { id, .. } => (*id, true),
             JobEvent::Cancelled { id } | JobEvent::Failed { id, .. } => (*id, false),
+            JobEvent::Preview(_) => return,
         };
         if self.analyze_job == Some(id) {
             // The canvas may have changed: check the result again.

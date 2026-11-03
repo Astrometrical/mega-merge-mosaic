@@ -18,8 +18,13 @@
 //!
 //! At most one job runs at a time; newer requests queue behind it:
 //!
-//! - A new analysis cancels the running job (whatever it is) and replaces
-//!   everything queued: it re-stales every group anyway.
+//! - A new analysis cancels the running job and replaces everything
+//!   queued: it re-stales every group anyway. Panel previews are the
+//!   exception: they hold no result store and feed the analysis's decode
+//!   cache, so the analysis queues behind them instead.
+//! - New previews cancel running previews and replace queued ones; they
+//!   queue behind any other job. Each preview is delivered as it finishes
+//!   ([`JobEvent::Preview`]).
 //! - A new blend cancels a running blend of the same group and replaces
 //!   that group's queued blends; blends of other groups are kept and run
 //!   in order. Behind a running analysis it waits (its group cannot be
@@ -42,6 +47,7 @@ use mmm_core::mosaic::{
     AnalyzeOutcome, AnalyzePlan, BlendPlan, Grouping, Mosaic, PanelEntry, invalidate_group,
     plan_analyze_with, plan_blend, run_analyze, run_blend,
 };
+use mmm_core::preview::{Preview, PreviewPlan, plan_previews, run_previews};
 use mmm_core::reference::ReferenceFrame;
 
 use crate::session::OpenSession;
@@ -50,7 +56,9 @@ use crate::session::OpenSession;
 pub const PROGRESS_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
 /// Label of an analysis job.
-const ANALYZE_LABEL: &str = "Analyze";
+pub const ANALYZE_LABEL: &str = "Analyze";
+/// Label of a previews job.
+pub const PREVIEWS_LABEL: &str = "Previews";
 /// Stage shown while a cancelled job winds down.
 const CANCELLING: &str = "Cancelling…";
 /// Stage shown for a queued job.
@@ -58,9 +66,12 @@ const WAITING: &str = "Waiting…";
 /// Stage shown while an analysis resolves its groups.
 const RESOLVING: &str = "Resolving groups…";
 
-/// How a job ended, as reported by [`JobRunner::poll`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// How a job ended (or, for previews, what it delivered), as reported by
+/// [`JobRunner::poll`].
+#[derive(Clone, Debug, PartialEq)]
 pub enum JobEvent {
+    /// A previews job finished one panel's preview.
+    Preview(Preview),
     /// The job finished and its outcome was applied.
     Finished {
         /// Job id.
@@ -87,6 +98,7 @@ pub enum JobEvent {
 #[derive(Clone, Debug)]
 enum Kind {
     Analyze,
+    Previews,
     Blend {
         group: String,
         rect: Option<[u64; 4]>,
@@ -106,6 +118,7 @@ enum Planned {
     Resolve(Box<Mosaic>),
     Analyze(AnalyzePlan),
     Blend(BlendPlan),
+    Previews(PreviewPlan),
 }
 
 /// What resolution was based on: the inputs of [`Mosaic::groups`].
@@ -133,11 +146,14 @@ enum Done {
         canvas: Option<(u64, u64)>,
     },
     Blend(mmm_core::Result<[u64; 4]>),
+    /// The previews run: per-panel failures, or why the whole run failed.
+    Previews(mmm_core::Result<Vec<(std::path::PathBuf, String)>>),
 }
 
 /// Worker to UI thread.
 enum Msg {
     Progress(String, u64, u64),
+    Preview(Preview),
     Done(Done),
 }
 
@@ -151,6 +167,8 @@ struct Running {
     blend: Option<BlendPlan>,
     /// While resolving groups: the inputs the resolution is based on.
     resolving: Option<GroupInputs>,
+    /// A previews job (analysis queues behind it rather than cancel it).
+    previews: bool,
     stage: String,
     done: u64,
     total: u64,
@@ -216,7 +234,8 @@ impl JobRunner {
     }
 
     /// Analyze every group; returns the job id. Cancels the running job and
-    /// replaces anything queued (newer work wins).
+    /// replaces anything queued (newer work wins), except previews: the
+    /// analysis waits for them.
     ///
     /// The groups are resolved on a worker first ("Resolving groups…").
     /// Planning then happens on the UI thread: it marks and saves
@@ -226,15 +245,51 @@ impl JobRunner {
     /// the analysis itself runs on the worker.
     pub fn start_analyze(&mut self, session: &mut OpenSession) -> u64 {
         let id = self.new_id(ANALYZE_LABEL.into());
-        if let Some(r) = &self.running {
+        if let Some(r) = self.running.as_ref().filter(|r| !r.previews) {
             r.token.cancel();
         }
-        let dropped: Vec<u64> = self.queue.drain(..).map(|q| q.id).collect();
+        let mut dropped = Vec::new();
+        self.queue.retain(|q| {
+            let keep = matches!(q.kind, Kind::Previews);
+            if !keep {
+                dropped.push(q.id);
+            }
+            keep
+        });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
         self.queue.push_back(Queued {
             id,
             kind: Kind::Analyze,
+        });
+        self.start_next(session);
+        id
+    }
+
+    /// Build (or load from the session's cache) every panel's preview in
+    /// the shared frame; returns the job id. Each preview is delivered by
+    /// [`JobRunner::poll`] as [`JobEvent::Preview`] when it finishes (the
+    /// UI is repainted for each). Cancels running previews and replaces
+    /// queued ones (newer work wins); behind any other job it waits.
+    /// Planning reads nothing (the worker reads the panels).
+    pub fn start_previews(&mut self, session: &OpenSession) -> u64 {
+        let id = self.new_id(PREVIEWS_LABEL.into());
+        if let Some(r) = self.running.as_ref().filter(|r| r.previews) {
+            r.token.cancel();
+        }
+        let mut dropped = Vec::new();
+        self.queue.retain(|q| {
+            let keep = !matches!(q.kind, Kind::Previews);
+            if !keep {
+                dropped.push(q.id);
+            }
+            keep
+        });
+        self.pending
+            .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+        self.queue.push_back(Queued {
+            id,
+            kind: Kind::Previews,
         });
         self.start_next(session);
         id
@@ -264,7 +319,7 @@ impl JobRunner {
                 dropped.push(q.id);
                 false
             }
-            Kind::Blend { .. } | Kind::Analyze => true,
+            Kind::Blend { .. } | Kind::Analyze | Kind::Previews => true,
         });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
@@ -315,6 +370,7 @@ impl JobRunner {
                     r.total = total;
                     r.updates += 1;
                 }
+                Ok(Msg::Preview(p)) => events.push(JobEvent::Preview(p)),
                 Ok(Msg::Done(done)) => {
                     let r = self.running.take().expect("running job");
                     events.extend(self.finish(r, done, session));
@@ -342,6 +398,7 @@ impl JobRunner {
                 JobEvent::Finished { label, .. } => tracing::info!("{label} finished"),
                 JobEvent::Cancelled { id } => tracing::info!("{} cancelled", self.name(*id)),
                 JobEvent::Failed { message, .. } => tracing::warn!("{message}"),
+                JobEvent::Preview(_) => {}
             }
         }
         events
@@ -423,7 +480,7 @@ impl JobRunner {
 
     /// Start queued jobs until one runs (or the queue is empty); a job that
     /// cannot be planned fails at once.
-    fn start_next(&mut self, session: &mut OpenSession) {
+    fn start_next(&mut self, session: &OpenSession) {
         while self.running.is_none() {
             let Some(q) = self.queue.pop_front() else {
                 return;
@@ -433,6 +490,7 @@ impl JobRunner {
                 Kind::Blend { group, rect } => {
                     plan_blend(&session.mosaic, group, *rect).map(Planned::Blend)
                 }
+                Kind::Previews => Ok(Planned::Previews(plan_previews(&session.mosaic))),
             };
             match planned {
                 Ok(planned) => self.spawn(q.id, planned),
@@ -450,12 +508,13 @@ impl JobRunner {
         let token = CancelToken::new();
         let blend = match &planned {
             Planned::Blend(plan) => Some(plan.clone()),
-            Planned::Analyze(_) | Planned::Resolve(_) => None,
+            Planned::Analyze(_) | Planned::Resolve(_) | Planned::Previews(_) => None,
         };
         let resolving = match &planned {
             Planned::Resolve(m) => Some(GroupInputs::of(m)),
-            Planned::Analyze(_) | Planned::Blend(_) => None,
+            Planned::Analyze(_) | Planned::Blend(_) | Planned::Previews(_) => None,
         };
+        let previews = matches!(planned, Planned::Previews(_));
         let stage = if resolving.is_some() {
             RESOLVING
         } else {
@@ -505,6 +564,15 @@ impl JobRunner {
                             }
                         }
                         Planned::Blend(plan) => Done::Blend(run_blend(plan, &ctl)),
+                        Planned::Previews(plan) => {
+                            let preview_tx = tx.clone();
+                            let preview_ctx = ctx.clone();
+                            let on_ready = move |p: Preview| {
+                                let _ = preview_tx.send(Msg::Preview(p));
+                                preview_ctx.request_repaint();
+                            };
+                            Done::Previews(run_previews(plan, &ctl, &on_ready))
+                        }
                     }
                 };
                 // Everything the job held (store locks included) is
@@ -521,6 +589,7 @@ impl JobRunner {
                     handle,
                     blend,
                     resolving,
+                    previews,
                     stage: stage.into(),
                     done: 0,
                     total: 0,
@@ -568,6 +637,14 @@ impl JobRunner {
         }
         Some(match (done, &r.blend) {
             (Done::Resolved(_), _) => unreachable!("handled above"),
+            (Done::Previews(Ok(failed)), _) => {
+                if !failed.is_empty() {
+                    tracing::warn!("{name}: {} panel(s) have no preview", failed.len());
+                }
+                JobEvent::Finished { id, label: name }
+            }
+            (Done::Previews(Err(e)), _) if e.is_cancelled() => JobEvent::Cancelled { id },
+            (Done::Previews(Err(e)), _) => failed(format!("{name}: {}", describe(&e))),
             (
                 Done::Analyze {
                     outcome,
@@ -1065,6 +1142,71 @@ pub(crate) mod tests {
         let cached = s.groups.as_ref().unwrap();
         assert_eq!(cached.groups.keys().collect::<Vec<_>>(), ["OIII", "Red"]);
         assert_eq!(s.group_count(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The events other than previews, and the number of previews.
+    fn split_previews(events: Vec<JobEvent>) -> (Vec<JobEvent>, usize) {
+        let (previews, ended): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|e| matches!(e, JobEvent::Preview(_)));
+        (ended, previews.len())
+    }
+
+    #[test]
+    fn previews_stream_and_analysis_waits_for_them() {
+        let root = temp_dir("job-previews");
+        let mut s = two_group_session(&root);
+        let mut r = runner();
+        let gate = r.hold();
+        let first = r.start_previews(&s);
+        // Newer previews replace running ones...
+        let previews = r.start_previews(&s);
+        // ...but an analysis waits for them rather than cancel them.
+        let analyze = r.start_analyze(&mut s);
+        let views = r.views();
+        assert_eq!(views.len(), 3);
+        assert_eq!(
+            (views[0].id, views[0].stage.as_str()),
+            (first, "Cancelling…")
+        );
+        assert_eq!(
+            (views[1].id, views[1].label.as_str()),
+            (previews, "Previews")
+        );
+        assert_eq!(
+            (views[2].id, views[2].stage.as_str()),
+            (analyze, "Waiting…")
+        );
+        gate.open();
+        let (ended, n) = split_previews(drain(&mut r, &mut s));
+        assert_eq!(
+            ended,
+            vec![
+                JobEvent::Cancelled { id: first },
+                JobEvent::Finished {
+                    id: previews,
+                    label: "Previews".into()
+                },
+                JobEvent::Finished {
+                    id: analyze,
+                    label: "Analyze".into()
+                },
+            ]
+        );
+        assert!(n >= 8, "every panel's preview delivered ({n})");
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        // Cached now: a second run loads them all again.
+        let again = r.start_previews(&s);
+        let (ended, n) = split_previews(drain(&mut r, &mut s));
+        assert_eq!(
+            ended,
+            vec![JobEvent::Finished {
+                id: again,
+                label: "Previews".into()
+            }]
+        );
+        assert_eq!(n, 8);
         let _ = std::fs::remove_dir_all(&root);
     }
 

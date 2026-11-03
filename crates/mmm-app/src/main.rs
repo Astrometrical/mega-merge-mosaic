@@ -8,8 +8,10 @@
 
 mod app;
 mod blend_tab;
+mod checks;
 mod jobs;
 mod panels_tab;
+mod pipeline;
 mod session;
 mod start;
 mod status;

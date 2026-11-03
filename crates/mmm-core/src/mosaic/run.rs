@@ -239,7 +239,8 @@ pub struct AnalyzeOutcome {
 /// [`MosaicConfig::needs_analyze`] and its result store, if any, is
 /// invalidated — its tiles were blended from the analysis being replaced —
 /// so an interrupted run leaves the groups it did not finish refused by
-/// [`plan_blend`]. Then the configuration is saved.
+/// [`plan_blend`]. Marks of groups that no longer resolve are dropped
+/// (their `group_dirs` entries are kept). Then the configuration is saved.
 ///
 /// If any group's store is held by a writer ([`Error::Busy`]), nothing is
 /// changed (in memory or on disk) and the busy error is returned.
@@ -269,6 +270,12 @@ pub fn plan_analyze_with(m: &mut Mosaic, resolved: Groups) -> Result<AnalyzePlan
         .collect();
     let paths: Vec<PathBuf> = groups.iter().map(|g| g.result_path.clone()).collect();
     let mut stores = lock_stores(&paths)?;
+    // Groups that no longer resolve (a rule or manual-group change) can
+    // never be analysed: drop their marks. Their directories stay in
+    // `group_dirs`, so caches stay stable if the name comes back.
+    next.config
+        .needs_analyze
+        .retain(|name| groups.iter().any(|g| &g.name == name));
     next.config
         .needs_analyze
         .extend(groups.iter().map(|g| g.name.clone()));
