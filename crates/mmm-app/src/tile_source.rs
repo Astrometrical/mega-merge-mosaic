@@ -147,6 +147,17 @@ impl MosaicTileSource {
         self.coarse_stats().map(|s| auto_stretch(&s, linked))
     }
 
+    /// Level-0 tiles meeting canvas rect `r`: `(valid, total)`. Reads tile
+    /// states only (cheap); call off the UI thread all the same.
+    pub fn fresh_counts(&self, r: [u64; 4]) -> (usize, usize) {
+        let tiles = self.tiles.tiles_in_rect(0, r);
+        let valid = tiles
+            .iter()
+            .filter(|&&(tx, ty)| self.reader.state(0, tx, ty) == TileState::Valid)
+            .count();
+        (valid, tiles.len())
+    }
+
     /// Visible size of tile `(tx, ty)` at `level` (edge tiles are cropped).
     fn visible(&self, level: u32, tx: u32, ty: u32) -> (usize, usize) {
         let t = u64::from(self.tiles.tile);
@@ -235,6 +246,173 @@ pub fn tile_image(
         }
     }
     ColorImage::new([w, h], pixels)
+}
+
+/// The fraction of tiles that are valid, from `(valid, total)` counts;
+/// `None` when there are no tiles.
+pub fn fresh_fraction((valid, total): (usize, usize)) -> Option<f64> {
+    (total > 0).then(|| valid as f64 / total as f64)
+}
+
+/// Colour of each composition channel (R, G, B) at weight 1.
+const CHANNEL_TINTS: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// A composition view (spec §5.3) as a [`TileSource`]: each mapped group's
+/// [`MosaicTileSource`] tile is fetched (through that group's own Blend
+/// display stretch) on the loader thread and mixed additively, tinted by
+/// its channel's colour times the weight, as the Plan composition layers
+/// are. A group mapped to several channels is fetched once with the summed
+/// tint.
+///
+/// **Store recreation.** The composite holds every member's reader: all of
+/// them must be released (the composite dropped by the viewer's loaders)
+/// before any member's store may be recreated; the Blend tab tracks each
+/// member it gives up (see `blend_tab`).
+pub struct CompositeTileSource {
+    /// Each distinct member and its summed RGB tint.
+    members: Vec<(Arc<MosaicTileSource>, [f32; 3])>,
+    geometry: PyramidGeometry,
+}
+
+impl CompositeTileSource {
+    /// Mix `channels` (R, G, B: a member source and its weight, or
+    /// nothing). Every member must share one canvas and tile size (one
+    /// shared frame); otherwise, or with nothing mapped, the reason is
+    /// returned for the user.
+    pub fn new(channels: &[Option<(Arc<MosaicTileSource>, f32)>]) -> Result<Self, String> {
+        let mut members: Vec<(Arc<MosaicTileSource>, [f32; 3])> = Vec::new();
+        for (slot, ch) in channels.iter().enumerate().take(CHANNEL_TINTS.len()) {
+            let Some((src, w)) = ch else { continue };
+            let tint = CHANNEL_TINTS[slot].map(|c| c * w);
+            match members.iter_mut().find(|(m, _)| Arc::ptr_eq(m, src)) {
+                Some((_, t)) => {
+                    for (a, b) in t.iter_mut().zip(tint) {
+                        *a += b;
+                    }
+                }
+                None => members.push((src.clone(), tint)),
+            }
+        }
+        let Some((first, _)) = members.first() else {
+            return Err("This composition maps no groups.".into());
+        };
+        let g0 = first.tile_geometry();
+        let size = |g: TileGeometry| format!("{} × {}", g.width, g.height);
+        if let Some((other, _)) = members.iter().find(|(m, _)| {
+            let g = m.tile_geometry();
+            (g.width, g.height, g.tile) != (g0.width, g0.height, g0.tile)
+        }) {
+            return Err(format!(
+                "The groups of this composition are on different canvases ({} and {}); \
+                 analyze them together so they share one frame.",
+                size(g0),
+                size(other.tile_geometry())
+            ));
+        }
+        Ok(CompositeTileSource {
+            geometry: first.geometry(),
+            members,
+        })
+    }
+
+    /// Distinct member sources.
+    #[cfg(test)]
+    pub fn members(&self) -> usize {
+        self.members.len()
+    }
+}
+
+impl TileSource for CompositeTileSource {
+    fn geometry(&self) -> PyramidGeometry {
+        self.geometry
+    }
+
+    fn generation(&self) -> u64 {
+        self.members
+            .iter()
+            .map(|(m, _)| m.generation())
+            .fold(0, u64::wrapping_add)
+    }
+
+    fn fetch(&self, key: TileKey) -> Fetched {
+        let mut mix: Option<Mix> = None;
+        let mut stale = false;
+        for (m, tint) in &self.members {
+            let img = match m.fetch(key) {
+                Fetched::Valid(img) => img,
+                Fetched::Stale(img) => {
+                    stale = true;
+                    img
+                }
+                Fetched::Missing => continue,
+            };
+            mix.get_or_insert_with(|| Mix::new(img.size))
+                .add(&img, *tint);
+        }
+        let Some(mix) = mix else {
+            return Fetched::Missing;
+        };
+        let img = mix.image();
+        if stale {
+            Fetched::Stale(img)
+        } else {
+            Fetched::Valid(img)
+        }
+    }
+}
+
+/// An additive RGB mix of display-ready tiles of one size.
+struct Mix {
+    size: [usize; 2],
+    sum: Vec<[f32; 3]>,
+    /// Some member has data at the pixel.
+    opaque: Vec<bool>,
+}
+
+impl Mix {
+    fn new(size: [usize; 2]) -> Self {
+        let n = size[0] * size[1];
+        Mix {
+            size,
+            sum: vec![[0.0; 3]; n],
+            opaque: vec![false; n],
+        }
+    }
+
+    /// Add `img` times `tint` per channel; transparent (no-data) pixels add
+    /// nothing.
+    fn add(&mut self, img: &ColorImage, tint: [f32; 3]) {
+        if img.size != self.size {
+            return; // cannot happen with one geometry
+        }
+        for ((s, o), p) in self.sum.iter_mut().zip(&mut self.opaque).zip(&img.pixels) {
+            if p.a() == 0 {
+                continue;
+            }
+            *o = true;
+            for (c, v) in [p.r(), p.g(), p.b()].into_iter().enumerate() {
+                s[c] += f32::from(v) * tint[c];
+            }
+        }
+    }
+
+    /// The mix, saturated at white; transparent where no member has data.
+    fn image(&self) -> ColorImage {
+        let byte = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+        let pixels = self
+            .sum
+            .iter()
+            .zip(&self.opaque)
+            .map(|(s, &o)| {
+                if o {
+                    Color32::from_rgb(byte(s[0]), byte(s[1]), byte(s[2]))
+                } else {
+                    Color32::TRANSPARENT
+                }
+            })
+            .collect();
+        ColorImage::new(self.size, pixels)
+    }
 }
 
 /// What [`open_result`] found for a group.
@@ -435,6 +613,111 @@ mod tests {
         );
         drop(store);
     }
+    #[test]
+    fn roi_fresh_fraction() {
+        let path = temp_dir("tsrc-fresh").join("result.mmmt");
+        let mut store = TileStore::create(&path, geom(1)).unwrap();
+        let data = vec![0.5f32; T * T];
+        // Level 0 is 3 × 2 tiles: (0,0) valid, (1,0) stale, the rest missing.
+        store.write_tile(0, 0, 0, &data).unwrap();
+        store.write_tile(0, 1, 0, &data).unwrap();
+        store.invalidate_rect([256, 0, 512, 256]);
+        let src = MosaicTileSource::open(&path, None).unwrap();
+        // An ROI inside tile (0,0) only: all fresh.
+        assert_eq!(src.fresh_counts([10, 10, 100, 100]), (1, 1));
+        // Across (0,0) and (1,0): half.
+        assert_eq!(src.fresh_counts([200, 10, 300, 100]), (1, 2));
+        // The whole canvas: one of six.
+        assert_eq!(src.fresh_counts([0, 0, 600, 300]), (1, 6));
+        // Empty or off-canvas rects have no tiles.
+        assert_eq!(src.fresh_counts([700, 0, 800, 10]), (0, 0));
+        assert_eq!(fresh_fraction((1, 2)), Some(0.5));
+        assert_eq!(fresh_fraction((0, 0)), None);
+        drop(store);
+    }
+
+    #[test]
+    fn composite_source_mixes_channels() {
+        let root = temp_dir("tsrc-composite");
+        // Two mono groups on one 600 × 300 canvas: Ha 0.5, OIII 0.25 in
+        // tile (0,0); Ha is stale in tile (1,0); tile (2,0) has only OIII.
+        let open = |name: &str, v: f32, g: TileGeometry| {
+            let path = root.join(format!("{name}.mmmt"));
+            let mut store = TileStore::create(&path, g).unwrap();
+            store.write_tile(0, 0, 0, &vec![v; T * T]).unwrap();
+            (path, store)
+        };
+        let (ha_path, mut ha_store) = open("ha", 0.5, geom(1));
+        ha_store.write_tile(0, 1, 0, &vec![0.5f32; T * T]).unwrap();
+        ha_store.invalidate_rect([256, 0, 512, 256]);
+        let (oiii_path, mut oiii_store) = open("oiii", 0.25, geom(1));
+        oiii_store
+            .write_tile(0, 1, 0, &vec![0.25f32; T * T])
+            .unwrap();
+        oiii_store
+            .write_tile(0, 2, 0, &vec![0.25f32; T * T])
+            .unwrap();
+        let ha = Arc::new(MosaicTileSource::open(&ha_path, None).unwrap());
+        let oiii = Arc::new(MosaicTileSource::open(&oiii_path, None).unwrap());
+
+        // HOO-like: R ← Ha × 1, G ← OIII × 1, B ← OIII × 0.5.
+        let channels = [
+            Some((ha.clone(), 1.0)),
+            Some((oiii.clone(), 1.0)),
+            Some((oiii.clone(), 0.5)),
+        ];
+        let comp = CompositeTileSource::new(&channels).unwrap();
+        assert_eq!(comp.geometry(), ha.geometry());
+        // OIII is fetched once, for both channels.
+        assert_eq!(comp.members(), 2);
+        let px = |f: Fetched| match f {
+            Fetched::Valid(img) | Fetched::Stale(img) => img.pixels[0],
+            Fetched::Missing => panic!("missing"),
+        };
+        // 0.5 → 128, 0.25 → 64 (linear stretch), mixed per channel.
+        assert_eq!(px(comp.fetch(key(0, 0, 0))), Color32::from_rgb(128, 64, 32));
+        assert!(matches!(comp.fetch(key(0, 0, 0)), Fetched::Valid(_)));
+        // Any stale member makes the tile stale.
+        assert!(matches!(comp.fetch(key(0, 1, 0)), Fetched::Stale(_)));
+        // A member without the tile adds nothing; the rest still show.
+        assert_eq!(px(comp.fetch(key(0, 2, 0))), Color32::from_rgb(0, 64, 32));
+        // No member has it: missing.
+        assert!(matches!(comp.fetch(key(0, 0, 1)), Fetched::Missing));
+
+        // Each member keeps its own display stretch; the generation is the
+        // sum of the members'.
+        let g0 = comp.generation();
+        assert_eq!(g0, ha.generation() + oiii.generation());
+        ha.set_stretch(vec![StretchParams {
+            black: 0.0,
+            white: 0.5,
+            midtones: 0.5,
+        }]);
+        assert!(comp.generation() > g0);
+        assert_eq!(px(comp.fetch(key(0, 0, 0))), Color32::from_rgb(255, 64, 32));
+        // Weights above 1 saturate.
+        let bright = [Some((oiii.clone(), 2.0)), None, None];
+        let comp2 = CompositeTileSource::new(&bright).unwrap();
+        assert_eq!(px(comp2.fetch(key(0, 0, 0))).r(), 128);
+
+        // Different geometries cannot be mixed: an explanation instead.
+        let mut other = geom(1);
+        other.width = 640;
+        let (odd_path, odd_store) = open("odd", 0.5, other);
+        let odd = Arc::new(MosaicTileSource::open(&odd_path, None).unwrap());
+        let why = CompositeTileSource::new(&[Some((ha.clone(), 1.0)), Some((odd, 1.0)), None])
+            .err()
+            .expect("mismatch refused");
+        assert!(
+            why.contains("600 × 300") && why.contains("640 × 300"),
+            "{why}"
+        );
+        // And nothing mapped: nothing to show.
+        assert!(CompositeTileSource::new(&[None, None, None]).is_err());
+        drop((ha_store, oiii_store, odd_store));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn result_is_kept_open_only_when_it_matches_the_analysis() {
         use mmm_core::job::JobCtl;

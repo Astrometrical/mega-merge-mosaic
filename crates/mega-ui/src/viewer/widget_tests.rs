@@ -519,3 +519,125 @@ fn double_click_zooms_in_about_point() {
     let after = h.state().view().screen_to_image(p, rect, now);
     assert!((before.0 - after.0).abs() < 1e-3 && (before.1 - after.1).abs() < 1e-3);
 }
+
+/// Viewer plus what it last reported.
+struct Drawing {
+    viewer: TiledViewer,
+    drawn: Vec<[f64; 4]>,
+}
+
+fn drawing_harness(viewer: TiledViewer) -> Harness<'static, Drawing> {
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut Drawing| {
+                if let Some(r) = s.viewer.show(ui).drawn_rect {
+                    s.drawn.push(r);
+                }
+            },
+            Drawing {
+                viewer,
+                drawn: Vec::new(),
+            },
+        )
+}
+
+fn drag(h: &mut Harness<'static, Drawing>, from: Pos2, to: Pos2) {
+    h.drag_at(from);
+    h.step();
+    h.hover_at(Pos2::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0));
+    h.step();
+    h.hover_at(to);
+    h.step();
+    h.drop_at(to);
+    h.run();
+}
+
+#[test]
+fn drawn_rect_reported_in_image_coords() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    h.run();
+    assert_eq!(h.state().viewer.tool(), Tool::Navigate);
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.run();
+    let (c0, z0) = centre_zoom(&h.state().viewer);
+    let (rect, now) = h.state().viewer.last_frame().unwrap();
+    // Dragged up-left: the rect is normalised.
+    let (a, b) = (Pos2::new(700.0, 500.0), Pos2::new(300.0, 200.0));
+    let ia = h.state().viewer.view().screen_to_image(a, rect, now);
+    let ib = h.state().viewer.view().screen_to_image(b, rect, now);
+    drag(&mut h, a, b);
+    // Drawing never pans or zooms.
+    let (c1, z1) = centre_zoom(&h.state().viewer);
+    assert_eq!((c0, z0), (c1, z1));
+    assert_eq!(h.state().drawn.len(), 1, "one rect per drag");
+    let r = h.state().drawn[0];
+    let want = [ib.0, ib.1, ia.0, ia.1];
+    for i in 0..4 {
+        assert!((r[i] - want[i]).abs() < 1e-6, "{r:?} vs {want:?}");
+    }
+    // The tool returns to Navigate: the next drag pans.
+    assert_eq!(h.state().viewer.tool(), Tool::Navigate);
+    drag(&mut h, a, b);
+    assert_eq!(h.state().drawn.len(), 1);
+    assert_ne!(centre_zoom(&h.state().viewer).0, c0);
+
+    // A drag off the image is clamped to it.
+    h.state_mut().viewer.home();
+    h.run();
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.run();
+    drag(&mut h, Pos2::new(5.0, 5.0), Pos2::new(500.0, 400.0));
+    let r = h.state().drawn[1];
+    assert!(
+        r[0] == 0.0 && r[1] == 0.0 && r[2] > 0.0 && r[3] > 0.0,
+        "{r:?}"
+    );
+
+    // Esc cancels a drag in progress, and the tool.
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.run();
+    h.drag_at(a);
+    h.step();
+    h.hover_at(Pos2::new(600.0, 400.0));
+    h.step();
+    h.key_press(egui::Key::Escape);
+    h.step();
+    h.drop_at(b);
+    h.run();
+    assert_eq!(h.state().drawn.len(), 2, "cancelled drag reported");
+    assert_eq!(h.state().viewer.tool(), Tool::Navigate);
+}
+
+#[test]
+fn overlays_drawn_and_zoom_to_rect() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    h.state_mut().viewer.set_overlays(vec![Overlay {
+        rect: [1000.0, 1000.0, 3000.0, 2000.0],
+        color: Color32::RED,
+        label: "ROI 1".into(),
+        dashed: false,
+    }]);
+    h.run();
+    let labelled = h
+        .output()
+        .shapes
+        .iter()
+        .any(|cs| matches!(&cs.shape, egui::Shape::Text(t) if t.galley.text() == "ROI 1"));
+    assert!(labelled, "overlay label painted");
+    h.state_mut()
+        .viewer
+        .zoom_to_rect([1000.0, 1000.0, 3000.0, 2000.0]);
+    h.run();
+    let (c, z) = centre_zoom(&h.state().viewer);
+    assert!(
+        (c.0 - 2000.0).abs() < 1e-3 && (c.1 - 1500.0).abs() < 1e-3,
+        "{c:?}"
+    );
+    let (rect, _) = h.state().viewer.last_frame().unwrap();
+    let want = (f64::from(rect.width()) / 2000.0).min(f64::from(rect.height()) / 1000.0);
+    assert!((z - want).abs() < 1e-6, "{z} vs {want}");
+}

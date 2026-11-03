@@ -126,6 +126,11 @@ impl Shell {
         &self.blend
     }
 
+    /// The Blend tab, mutably.
+    pub fn blend_mut(&mut self) -> &mut BlendTab {
+        &mut self.blend
+    }
+
     /// Show `tab`.
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
@@ -499,6 +504,8 @@ struct SelfTest {
 enum Phase {
     /// Waiting for the Blend tab to settle.
     Blend,
+    /// Waiting for the Blend tab's first composition to settle.
+    BlendComposition,
     /// Waiting for the Plan tab's first view to settle.
     Plan,
     /// Waiting for the Plan tab's first composition to settle.
@@ -571,15 +578,25 @@ impl SelfTest {
                     && shell.blend().is_settled() =>
             {
                 log_blend_tab(shell.blend());
+                if has_composition(shell) {
+                    shell.blend_mut().select_view(ViewKind::Composition(0));
+                    self.phase = Phase::BlendComposition;
+                } else {
+                    shell.set_tab(Tab::Plan);
+                    self.phase = Phase::Plan;
+                }
+            }
+            Phase::BlendComposition
+                if matches!(shell.blend().view(), Some(ViewKind::Composition(_)))
+                    && shell.blend().is_settled() =>
+            {
+                log_blend_tab(shell.blend());
                 shell.set_tab(Tab::Plan);
                 self.phase = Phase::Plan;
             }
             Phase::Plan if shell.tab() == Tab::Plan && shell.plan().is_settled() => {
                 log_plan_tab(shell);
-                let has_composition = shell
-                    .session()
-                    .is_some_and(|s| !load_compositions(&s.mosaic.config.ui).is_empty());
-                self.phase = if has_composition {
+                self.phase = if has_composition(shell) {
                     shell.plan_mut().select_view(ViewKind::Composition(0));
                     Phase::PlanComposition
                 } else {
@@ -608,8 +625,23 @@ impl SelfTest {
     }
 }
 
+/// Whether the open session has a composition.
+fn has_composition(shell: &Shell) -> bool {
+    shell
+        .session()
+        .is_some_and(|s| !load_compositions(&s.mosaic.config.ui).is_empty())
+}
+
 /// Log what the self-test's Blend tab shows.
 fn log_blend_tab(blend: &BlendTab) {
+    tracing::info!(
+        "self-test: Blend tab view {:?}: {}; {} ROIs",
+        blend.view(),
+        blend
+            .shown_text()
+            .unwrap_or_else(|| "viewer shown".to_string()),
+        blend.rois().len()
+    );
     let group = blend.group().unwrap_or("(none)");
     match (blend.source(), blend.absent()) {
         (Some(src), _) => {

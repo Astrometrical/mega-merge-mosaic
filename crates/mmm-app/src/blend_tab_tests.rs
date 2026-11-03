@@ -55,12 +55,20 @@ fn stretch_persisted_per_group_in_ui() {
     assert!(!d.due(t0 + 3 * SAVE_INTERVAL), "nothing new to save");
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// The member state of `group`.
+fn member<'a>(tab: &'a mut BlendTab, group: &str) -> &'a mut Member {
+    tab.results.get_mut(group).expect("a member of the view")
+}
+
 #[test]
 fn blend_disabled_until_result_checked_and_reader_released() {
     use mmm_core::tiles::{TileGeometry, TileStore};
 
     let mut tab = BlendTab::new();
-    tab.group = Some("Ha".into());
+    tab.select("Ha".into());
+    // Not checked yet: the result is still to be opened.
+    assert!(!tab.can_blend(Readiness::Analyzed));
+    member(&mut tab, "Ha").reopen = false;
     assert!(tab.can_blend(Readiness::Analyzed));
     assert!(!tab.can_blend(Readiness::NeedsAnalyze));
     assert!(!tab.can_blend(Readiness::NotAnalyzed));
@@ -71,36 +79,71 @@ fn blend_disabled_until_result_checked_and_reader_released() {
     assert!(!tab.can_blend(Readiness::Analyzed));
     // Its end asks for a check of the result: still disabled.
     tab.on_event(&JobEvent::Cancelled { id: 7 });
-    assert!(tab.analyze_job.is_none() && tab.reopen);
+    assert!(tab.analyze_job.is_none() && member(&mut tab, "Ha").reopen);
     assert!(!tab.can_blend(Readiness::Analyzed));
-    tab.reopen = false;
+    member(&mut tab, "Ha").reopen = false;
 
     // A given-up source still mapped (by a loader thread, say).
-    let path = temp_dir("blend-retired").join("result.mmmt");
+    let root = temp_dir("blend-retired");
     let g = TileGeometry {
         width: 300,
         height: 200,
         channels: 1,
         tile: 256,
     };
-    drop(TileStore::create(&path, g).unwrap());
-    let held = Arc::new(MosaicTileSource::open(&path, None).unwrap());
-    tab.source = Some(held.clone());
-    tab.retire();
-    assert!(tab.source.is_none() && tab.viewer.is_none());
+    let store = |name: &str| {
+        let path = root.join(name);
+        drop(TileStore::create(&path, g).unwrap());
+        Arc::new(MosaicTileSource::open(&path, None).unwrap())
+    };
+    let held = store("ha.mmmt");
+    member(&mut tab, "Ha").source = Some(held.clone());
+    tab.retire_all();
+    assert!(tab.source().is_none() && tab.viewer.is_none());
     tab.retired.retain(|w| w.strong_count() > 0);
     assert!(!tab.can_blend(Readiness::Analyzed));
     drop(held);
     tab.retired.retain(|w| w.strong_count() > 0);
     assert!(tab.can_blend(Readiness::Analyzed));
 
+    // A composite holds every member's reader: none of the view's groups
+    // may blend until it has been dropped, after all members are given up.
+    let ha = store("ha2.mmmt");
+    let oiii = store("oiii.mmmt");
+    tab.apply_view(
+        ViewKind::Composition(0),
+        vec!["Ha".to_string(), "OIII".to_string()],
+    );
+    for (name, src) in [("Ha", &ha), ("OIII", &oiii)] {
+        let m = member(&mut tab, name);
+        m.reopen = false;
+        m.source = Some(src.clone());
+    }
+    let composite = Arc::new(
+        CompositeTileSource::new(&[Some((ha.clone(), 1.0)), Some((oiii.clone(), 1.0)), None])
+            .unwrap(),
+    );
+    drop((ha, oiii));
+    // Only OIII is given up (say its result went out of date), but the
+    // composite still maps it.
+    let m = tab.results.get_mut("OIII").unwrap();
+    m.retire(&mut tab.retired);
+    tab.retired.retain(|w| w.strong_count() > 0);
+    assert!(!tab.can_blend(Readiness::Analyzed));
+    drop(composite);
+    tab.retired.retain(|w| w.strong_count() > 0);
+    assert!(tab.retired.is_empty());
+
     // A blend that ends with no result open asks for an open.
-    tab.blend_job = Some(9);
+    tab.select("Ha".into());
+    member(&mut tab, "Ha").reopen = false;
+    tab.blend_jobs.insert(9, "Ha".into());
     tab.on_event(&JobEvent::Finished {
         id: 9,
         label: "Blend Ha".into(),
     });
-    assert!(tab.blend_job.is_none() && tab.reopen && tab.want_health);
+    assert!(tab.blend_jobs.is_empty() && member(&mut tab, "Ha").reopen && tab.want_health);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -117,15 +160,19 @@ fn no_open_while_shown_groups_blend_is_unstarted() {
     for g in ["Ha", "OIII"] {
         tab.select(g.into());
         tab.update(&ctx, &mut s, &jobs);
-        assert!(tab.opening.is_none(), "{g}: opened during its blend");
-        assert!(tab.reopen, "{g}: open forgotten");
+        assert!(
+            member(&mut tab, g).opening.is_none(),
+            "{g}: opened during its blend"
+        );
+        assert!(member(&mut tab, g).reopen, "{g}: open forgotten");
     }
 
     // Once the blends end, the deferred open happens.
     gate.open();
     crate::jobs::tests::drain(&mut jobs, &mut s);
     tab.update(&ctx, &mut s, &jobs);
-    assert!(tab.opening.is_some() && !tab.reopen);
+    let m = member(&mut tab, "OIII");
+    assert!(m.opening.is_some() && !m.reopen);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -171,26 +218,112 @@ fn linked_auto_without_statistics_falls_back_to_automatic() {
     };
     drop(TileStore::create(&path, g).unwrap());
     let mut tab = BlendTab::new();
-    tab.group = Some("Ha".into());
-    tab.source = Some(Arc::new(MosaicTileSource::open(&path, None).unwrap()));
-    tab.linked = true;
+    tab.select("Ha".into());
+    let m = member(&mut tab, "Ha");
+    m.reopen = false;
+    m.source = Some(Arc::new(MosaicTileSource::open(&path, None).unwrap()));
+    m.linked = true;
     tab.auto_now(&ctx, &mut s);
-    assert!(tab.manual && tab.save_auto_result);
+    let m = member(&mut tab, "Ha");
+    assert!(m.manual && m.save_auto_result);
     let deadline = Instant::now() + Duration::from_secs(30);
-    while tab.auto.is_some() {
+    while member(&mut tab, "Ha").auto.is_some() {
         assert!(Instant::now() < deadline, "auto stretch never ended");
         std::thread::sleep(Duration::from_millis(2));
         tab.poll_auto(&mut s);
     }
     // Nothing was saved, so the stretch is automatic again...
     assert_eq!(saved_stretch(&s.mosaic.config.ui, "Ha"), None);
-    assert!(!tab.manual, "left manual with no saved stretch");
+    assert!(
+        !member(&mut tab, "Ha").manual,
+        "left manual with no saved stretch"
+    );
     // ...and the next finished blend stretches automatically.
-    tab.blend_job = Some(3);
+    tab.blend_jobs.insert(3, "Ha".into());
     tab.on_event(&JobEvent::Finished {
         id: 3,
         label: "Blend Ha".into(),
     });
-    assert!(tab.want_auto);
+    assert!(member(&mut tab, "Ha").want_auto);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roi_blend_starts_one_blend_per_view_group() {
+    use crate::compositions::{Composition, ViewKind, save_compositions};
+    use crate::testutil::CANVAS;
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-roi-groups");
+    let mut hoo = Composition::new("HOO");
+    hoo.channels = [
+        Some(("Ha".into(), 1.0)),
+        Some(("OIII".into(), 1.0)),
+        Some(("OIII".into(), 0.5)),
+    ];
+    save_compositions(&mut s.mosaic.config.ui, &[hoo]);
+    let mut tab = BlendTab::new();
+    tab.set_view(&s, ViewKind::Composition(0));
+    assert_eq!(tab.members, ["Ha", "OIII"]);
+    assert_eq!(
+        tab.group(),
+        Some("Ha"),
+        "the first member's stretch is shown"
+    );
+
+    // A drawn rect becomes "ROI 1" in whole canvas pixels, selected and
+    // saved in the session's ui.
+    tab.on_drawn(&mut s, [10.4, 20.0, 299.5, 200.0], CANVAS);
+    assert_eq!(tab.rois.len(), 1);
+    assert_eq!(tab.rois[0].name, "ROI 1");
+    assert_eq!(tab.rois[0].canvas, [10, 20, 300, 200]);
+    assert_eq!(tab.roi_selected, Some(0));
+    assert!(tab.save.pending() && tab.want_roi_sync);
+    assert_eq!(
+        crate::rois::load_rois(&s.mosaic.config.ui),
+        tab.rois,
+        "kept in ui"
+    );
+    tab.on_drawn(&mut s, [0.0, 0.0, 50.0, 50.0], CANVAS);
+    assert_eq!(tab.rois[1].name, "ROI 2");
+    assert_eq!(tab.roi_selected, Some(1));
+    tab.roi_selected = Some(0);
+
+    // Blend ROI: one blend of the ROI for each group of the view.
+    let gate = jobs.hold();
+    tab.blend_roi(&mut s, &mut jobs);
+    let labels: Vec<String> = jobs.views().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, ["Blend Ha", "Blend OIII"]);
+    let mut groups: Vec<&String> = tab.blend_jobs.values().collect();
+    groups.sort();
+    assert_eq!(groups, ["Ha", "OIII"]);
+    gate.open();
+    for e in crate::jobs::tests::drain(&mut jobs, &mut s) {
+        assert!(matches!(e, JobEvent::Finished { .. }), "{e:?}");
+        tab.on_event(&e);
+    }
+    assert!(tab.blend_jobs.is_empty());
+    let blends: Vec<_> = s
+        .mosaic
+        .config
+        .provenance
+        .iter()
+        .filter(|p| p.action == "blend")
+        .map(|p| (p.group.clone(), p.detail["rect"].clone()))
+        .collect();
+    assert_eq!(blends.len(), 2);
+    // Each blend covered the ROI (recorded tile-aligned: 256-px tiles).
+    for (_, rect) in &blends {
+        assert_eq!(*rect, serde_json::json!([0, 0, 512, 256]));
+    }
+
+    // A group view blends just that group.
+    tab.set_view(&s, ViewKind::Group("OIII".into()));
+    assert_eq!(tab.members, ["OIII"]);
+    let gate = jobs.hold();
+    tab.blend_roi(&mut s, &mut jobs);
+    let labels: Vec<String> = jobs.views().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, ["Blend OIII"]);
+    gate.open();
+    crate::jobs::tests::drain(&mut jobs, &mut s);
     let _ = std::fs::remove_dir_all(&root);
 }

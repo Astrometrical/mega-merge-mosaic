@@ -14,6 +14,7 @@ mod jobs;
 mod panels_tab;
 mod pipeline;
 mod plan_tab;
+mod rois;
 mod session;
 mod start;
 mod status;

@@ -11,8 +11,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use egui::{
-    Color32, Event, MouseWheelUnit, Pos2, Rect, Sense, Stroke, TextureHandle, TextureId,
-    TextureOptions, Ui, Vec2,
+    Align2, Color32, Event, FontId, MouseWheelUnit, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
+    TextureHandle, TextureId, TextureOptions, Ui, Vec2,
 };
 
 use super::cache::{DEFAULT_CAPACITY, TileCache};
@@ -27,12 +27,46 @@ const SCROLL_ZOOM_PER_NOTCH: f64 = 1.2;
 const STALE_BRIGHTNESS: f32 = 0.55;
 /// Screen spacing of the stale hatch lines, in points.
 const HATCH_SPACING: f32 = 10.0;
+/// Stroke width of an overlay rectangle, in points.
+const OVERLAY_STROKE: f32 = 1.5;
+/// Dash and gap lengths of a dashed overlay, in points.
+const OVERLAY_DASH: (f32, f32) = (6.0, 4.0);
+
+/// What a primary-button drag does in the viewer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tool {
+    /// Drag pans (the default).
+    #[default]
+    Navigate,
+    /// Drag draws a rectangle, reported on release as
+    /// [`ViewerResponse::drawn_rect`]; Esc cancels. The tool returns to
+    /// [`Tool::Navigate`] after a rect is drawn or cancelled.
+    DrawRect,
+}
+
+/// A rectangle drawn over the image, in image coordinates (level-0
+/// pixels).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Overlay {
+    /// `[x0, y0, x1, y1]` in image coordinates.
+    pub rect: [f64; 4],
+    /// Stroke and label colour.
+    pub color: Color32,
+    /// Text drawn at the top-left corner (none if empty).
+    pub label: String,
+    /// Dashed rather than solid outline.
+    pub dashed: bool,
+}
 
 /// What the viewer reports back each frame.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewerResponse {
     /// Image point (level-0 pixels) under the pointer, if hovered.
     pub hovered_image_pos: Option<(f64, f64)>,
+    /// A rectangle the user finished drawing this frame with
+    /// [`Tool::DrawRect`]: `[x0, y0, x1, y1]` in image coordinates,
+    /// normalised (`x0 <= x1`, `y0 <= y1`) and clamped to the image.
+    pub drawn_rect: Option<[f64; 4]>,
 }
 
 /// Tint a tile is drawn with: white for `Valid`, ~55% grey for `Stale`,
@@ -192,11 +226,13 @@ struct CachedTile {
 enum Command {
     Home,
     Zoom(f64),
+    ZoomTo([f64; 4]),
 }
 
-/// Deep-zoom viewer over a [`TileSource`]: drag pans, the scroll wheel zooms
-/// about the cursor, double-click zooms in 2x, and `+` / `−` / `Home`
-/// buttons sit top-left.
+/// Deep-zoom viewer over a [`TileSource`]: drag pans (or draws a rectangle
+/// with [`Tool::DrawRect`]), the scroll wheel zooms about the cursor,
+/// double-click zooms in 2x, and `+` / `−` / `Home` buttons sit top-left.
+/// [`Overlay`] rectangles are drawn over the image.
 pub struct TiledViewer {
     source: Arc<dyn TileSource>,
     geom: PyramidGeometry,
@@ -210,6 +246,11 @@ pub struct TiledViewer {
     commands: Vec<Command>,
     pixels_per_point: f32,
     last_frame: Option<(Rect, f64)>,
+    tool: Tool,
+    /// The rectangle being drawn: its fixed corner and the current one, in
+    /// image coordinates.
+    drawing: Option<((f64, f64), (f64, f64))>,
+    overlays: Vec<Overlay>,
 }
 
 impl TiledViewer {
@@ -238,6 +279,9 @@ impl TiledViewer {
             commands: Vec::new(),
             pixels_per_point: 1.0,
             last_frame: None,
+            tool: Tool::Navigate,
+            drawing: None,
+            overlays: Vec::new(),
         }
     }
 
@@ -278,6 +322,28 @@ impl TiledViewer {
     /// Zoom out 2x about the viewport centre.
     pub fn zoom_out(&mut self) {
         self.commands.push(Command::Zoom(0.5));
+    }
+
+    /// Animate so `rect` (`[x0, y0, x1, y1]`, image coordinates) fills the
+    /// viewport.
+    pub fn zoom_to_rect(&mut self, rect: [f64; 4]) {
+        self.commands.push(Command::ZoomTo(rect));
+    }
+
+    /// What a drag does from now on (a rectangle being drawn is dropped).
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        self.drawing = None;
+    }
+
+    /// The current tool.
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    /// Replace the rectangles drawn over the image.
+    pub fn set_overlays(&mut self, overlays: Vec<Overlay>) {
+        self.overlays = overlays;
     }
 
     /// Viewport rect and `ui.input().time` of the last frame shown, for
@@ -328,9 +394,10 @@ impl TiledViewer {
             match c {
                 Command::Home => self.view.fit(&self.geom, rect.size(), now),
                 Command::Zoom(f) => self.view.zoom_by(f, rect.center(), rect, now),
+                Command::ZoomTo(r) => self.view.zoom_to_rect(r, rect.size(), now),
             }
         }
-        self.handle_input(ui, &response, rect, now);
+        let drawn_rect = self.handle_input(ui, &response, rect, now);
 
         let generation = self.source.generation();
         let wanted = self.wanted_tiles(rect, now);
@@ -338,6 +405,7 @@ impl TiledViewer {
         self.request(&wanted, generation);
         let backlog = self.receive(ui.ctx());
         self.paint(&ui.painter_at(rect), rect, now, generation);
+        self.paint_overlays(&ui.painter_at(rect), rect, now);
         self.overlay_buttons(ui, rect);
 
         // Loaders wake the UI when a tile arrives; repaint here only for
@@ -349,14 +417,70 @@ impl TiledViewer {
             hovered_image_pos: response
                 .hover_pos()
                 .map(|p| self.view.screen_to_image(p, rect, now)),
+            drawn_rect,
         }
     }
 
-    fn handle_input(&mut self, ui: &Ui, response: &egui::Response, rect: Rect, now: f64) {
-        if response.dragged() {
-            self.view.pan_by(response.drag_delta(), now);
+    /// Image point under screen point `p`, clamped to the image.
+    fn clamped_image_pos(&self, p: Pos2, rect: Rect, now: f64) -> (f64, f64) {
+        let (x, y) = self.view.screen_to_image(p, rect, now);
+        (
+            x.clamp(0.0, self.geom.width as f64),
+            y.clamp(0.0, self.geom.height as f64),
+        )
+    }
+
+    /// Follow a [`Tool::DrawRect`] drag; returns the rect once released.
+    fn handle_draw(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        rect: Rect,
+        now: f64,
+    ) -> Option<[f64; 4]> {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ui.ctx().egui_wants_keyboard_input() {
+            self.set_tool(Tool::Navigate);
+            return None;
         }
-        if response.double_clicked()
+        if response.drag_started()
+            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        {
+            let a = self.clamped_image_pos(origin, rect, now);
+            self.drawing = Some((a, a));
+        }
+        if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+            let at = self.clamped_image_pos(p, rect, now);
+            if let Some((_, end)) = &mut self.drawing {
+                *end = at;
+            }
+        }
+        if response.drag_stopped()
+            && let Some((a, b)) = self.drawing.take()
+        {
+            self.tool = Tool::Navigate;
+            return Some([a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)]);
+        }
+        None
+    }
+
+    fn handle_input(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        rect: Rect,
+        now: f64,
+    ) -> Option<[f64; 4]> {
+        let mut drawn = None;
+        match self.tool {
+            Tool::DrawRect => drawn = self.handle_draw(ui, response, rect, now),
+            Tool::Navigate if response.dragged() => {
+                self.view.pan_by(response.drag_delta(), now);
+            }
+            Tool::Navigate => {}
+        }
+        if self.tool == Tool::Navigate
+            && drawn.is_none()
+            && response.double_clicked()
             && let Some(p) = response.interact_pointer_pos()
         {
             self.view.zoom_by(2.0, p, rect, now);
@@ -380,6 +504,59 @@ impl TiledViewer {
                 let factor = SCROLL_ZOOM_PER_NOTCH.powf(f64::from(notches));
                 self.view.zoom_by(factor, p, rect, now);
             }
+        }
+        drawn
+    }
+
+    /// The overlays, and the rectangle being drawn.
+    fn paint_overlays(&self, painter: &egui::Painter, rect: Rect, now: f64) {
+        let screen = |r: [f64; 4]| {
+            Rect::from_two_pos(
+                self.view.image_to_screen((r[0], r[1]), rect, now),
+                self.view.image_to_screen((r[2], r[3]), rect, now),
+            )
+        };
+        for o in &self.overlays {
+            let r = screen(o.rect);
+            if !r.intersects(rect) {
+                continue;
+            }
+            let stroke = Stroke::new(OVERLAY_STROKE, o.color);
+            if o.dashed {
+                let ring = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                    r.left_top(),
+                ];
+                painter.extend(Shape::dashed_line(
+                    &ring,
+                    stroke,
+                    OVERLAY_DASH.0,
+                    OVERLAY_DASH.1,
+                ));
+            } else {
+                painter.rect_stroke(r, 0.0, stroke, StrokeKind::Inside);
+            }
+            if !o.label.is_empty() {
+                painter.text(
+                    r.left_top() + Vec2::new(4.0, 2.0),
+                    Align2::LEFT_TOP,
+                    &o.label,
+                    FontId::proportional(13.0),
+                    o.color,
+                );
+            }
+        }
+        if let Some((a, b)) = self.drawing {
+            let r = screen([a.0, a.1, b.0, b.1]);
+            painter.rect_stroke(
+                r,
+                0.0,
+                Stroke::new(OVERLAY_STROKE, palette::ACCENT_400),
+                StrokeKind::Inside,
+            );
         }
     }
 
