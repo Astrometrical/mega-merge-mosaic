@@ -793,7 +793,6 @@ fn drag_after_scroll_zoom_never_reverses() {
     let step = Vec2::new(5.0, 2.0);
     let track = drag_track(&mut h, cursor, step, 20, 0, under);
     assert_no_reversal(&track, step);
-    eprintln!("{track:?}");
     let moved = *track.last().unwrap() - cursor;
     assert!((moved - step * 20.0).length() < 0.5, "{moved:?}");
     let from = cursor + step * 20.0;

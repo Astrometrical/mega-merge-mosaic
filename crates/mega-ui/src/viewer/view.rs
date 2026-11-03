@@ -128,29 +128,35 @@ impl Spring {
 /// Viewport onto an image: centre (image pixels) and zoom (screen pixels per
 /// image pixel), all eased by [`Spring`]s. Zoom animates in log space.
 ///
-/// The view is stored as an **anchor**: an image point drawn at a screen
-/// offset (from the viewport centre) that is itself a pair of springs, so the
-/// centre at time `t` is `anchor - offset(t) / zoom(t)`. Every motion is
-/// expressed in that one form, so the drawn view is a single smooth function
-/// of time with no second source of truth to disagree with:
+/// The centre is shown in one of two forms, so that the drawn view is always
+/// a single smooth function of time:
 ///
-/// - a drag moves the offset springs' *targets* by the drag, so the image
-///   eases after the pointer (OpenSeadragon's `panBy`);
-/// - a zoom about a point re-anchors on the image point under it, so that
-///   point stays under the cursor throughout the zoom (OpenSeadragon's
-///   `zoomBy` with a reference point), and a pan still in flight carries on
-///   from there, moving the anchored point with it;
-/// - an animated fit anchors on the target centre and eases its offset to
-///   zero.
+/// - **Anchored** (pointer motion): an image point drawn at a screen offset
+///   (from the viewport centre) that is itself a pair of springs, so the
+///   centre at time `t` is `anchor - offset(t) / zoom(t)`. A drag moves the
+///   offset springs' *targets* by the drag, so the image eases after the
+///   pointer (OpenSeadragon's `panBy`). A zoom about a point re-anchors on
+///   the image point under it, so that point stays under the cursor
+///   throughout the zoom (OpenSeadragon's `zoomBy` with a reference point),
+///   and a pan still in flight carries on from there, moving the anchored
+///   point with it.
+/// - **Gliding** (fit, home, zoom to a rect): the centre springs in image
+///   space from where it is to the target, with the same easing progress as
+///   the zoom, so it stays between the two throughout. A drag during a glide
+///   moves the glide's target.
 ///
-/// Once the zoom has settled, [`View::update`] folds the offset back into
-/// the anchor without moving the view.
+/// Once the zoom has settled, [`View::update`] folds an anchor offset back
+/// into the anchor, and a finished glide into a plain centre, without moving
+/// the view.
 #[derive(Clone, Debug)]
 pub struct View {
     /// Image point drawn at the screen offset `(off_x, off_y)`.
     anchor: (f64, f64),
     off_x: Spring,
     off_y: Spring,
+    /// Image-space centre springs of a glide in progress; while set, they
+    /// define the centre (the anchor is unused).
+    glide: Option<(Spring, Spring)>,
     ln_zoom: Spring,
     min_zoom: f64,
 }
@@ -168,6 +174,7 @@ impl View {
             anchor: (0.0, 0.0),
             off_x: Spring::new(0.0),
             off_y: Spring::new(0.0),
+            glide: None,
             ln_zoom: Spring::new(0.0),
             min_zoom: 1e-9,
         }
@@ -193,28 +200,48 @@ impl View {
         let z = z.min(MAX_ZOOM);
         self.min_zoom = z / 2.0;
         let c = (image_rect[0] + w / 2.0, image_rect[1] + h / 2.0);
-        self.animate_to(c, z, now);
+        self.glide_to(c, z, now);
     }
 
-    /// Animate to centre `c` at zoom `z` (already clamped): anchor on `c`
-    /// and ease its screen offset to zero while the zoom eases to `z`.
-    fn animate_to(&mut self, c: (f64, f64), z: f64, now: f64) {
-        self.reanchor(c, now);
-        self.off_x.spring_to(0.0, now);
-        self.off_y.spring_to(0.0, now);
+    /// Glide to centre `c` at zoom `z` (already clamped): the centre and the
+    /// zoom spring together from `now`, the centre in image space.
+    fn glide_to(&mut self, c: (f64, f64), z: f64, now: f64) {
+        let from = self.centre(now);
+        if !(from.0.is_finite() && from.1.is_finite() && c.0.is_finite() && c.1.is_finite()) {
+            return;
+        }
+        let spring = |a: f64, b: f64| Spring {
+            start: a,
+            target: b,
+            start_time: now,
+        };
+        self.glide = Some((spring(from.0, c.0), spring(from.1, c.1)));
         self.ln_zoom.spring_to(z.ln(), now);
     }
 
-    /// Re-anchor on image point `p` without moving the view at `now`: the
-    /// offset springs restart (at `now`) from where `p` is drawn, keeping
-    /// the travel of a pan still in flight.
-    fn reanchor(&mut self, p: (f64, f64), now: f64) {
+    /// End a glide at `now`: anchor on the centre shown, at zero offset.
+    fn end_glide(&mut self, now: f64) {
+        if self.glide.is_some() {
+            let c = self.centre(now);
+            self.glide = None;
+            self.anchor = c;
+            self.off_x.reset_to(0.0);
+            self.off_y.reset_to(0.0);
+        }
+    }
+
+    /// Re-anchor on image point `p` without moving the view at `now` (a
+    /// glide ends there): the offset springs restart from where `p` is
+    /// drawn, keeping the travel of a pan still in flight. False (nothing
+    /// changed) if `p` is not drawn at a finite position.
+    fn reanchor(&mut self, p: (f64, f64), now: f64) -> bool {
         let z = self.zoom(now);
         let c = self.centre(now);
         let at = ((p.0 - c.0) * z, (p.1 - c.1) * z);
         if !(at.0.is_finite() && at.1.is_finite()) {
-            return;
+            return false;
         }
+        self.end_glide(now);
         let rest = (
             self.off_x.target - self.off_x.value(now),
             self.off_y.target - self.off_y.value(now),
@@ -230,13 +257,24 @@ impl View {
             target: at.1 + rest.1,
             start_time: now,
         };
+        true
     }
 
-    /// Advance to `now`: once the zoom has settled, the anchor is folded
-    /// back into a plain centre (the view does not move; a pan still easing
-    /// carries on unchanged). Call once per frame, before input.
+    /// Advance to `now`: once the zoom has settled, a finished glide becomes
+    /// a plain centre and an anchor offset is folded back into the anchor
+    /// (the view does not move; a pan still easing carries on unchanged).
+    /// Call once per frame, before input.
     pub fn update(&mut self, now: f64) {
-        if !self.ln_zoom.is_settled(now) || (self.off_x.start == 0.0 && self.off_y.start == 0.0) {
+        if !self.ln_zoom.is_settled(now) {
+            return;
+        }
+        if let Some((gx, gy)) = self.glide {
+            if gx.is_settled(now) && gy.is_settled(now) {
+                self.end_glide(now);
+            }
+            return;
+        }
+        if self.off_x.start == 0.0 && self.off_y.start == 0.0 {
             return;
         }
         // offset(t) = start + (target - start) f(t), so shifting the anchor
@@ -252,6 +290,11 @@ impl View {
 
     /// Jump every spring to its target, ending any animation.
     pub fn finish_animation(&mut self) {
+        if let Some((gx, gy)) = self.glide.take() {
+            self.anchor = (gx.target, gy.target);
+            self.off_x.reset_to(0.0);
+            self.off_y.reset_to(0.0);
+        }
         self.off_x.reset_to(self.off_x.target);
         self.off_y.reset_to(self.off_y.target);
         self.ln_zoom.reset_to(self.ln_zoom.target);
@@ -269,6 +312,9 @@ impl View {
 
     /// Current centre in image pixels at `now`.
     pub fn centre(&self, now: f64) -> (f64, f64) {
+        if let Some((gx, gy)) = &self.glide {
+            return (gx.value(now), gy.value(now));
+        }
         let z = self.zoom(now);
         (
             self.anchor.0 - self.off_x.value(now) / z,
@@ -278,11 +324,18 @@ impl View {
 
     /// True when no spring is still animating.
     pub fn is_settled(&self, now: f64) -> bool {
-        self.off_x.is_settled(now) && self.off_y.is_settled(now) && self.ln_zoom.is_settled(now)
+        let glide = self
+            .glide
+            .is_none_or(|(gx, gy)| gx.is_settled(now) && gy.is_settled(now));
+        glide
+            && self.off_x.is_settled(now)
+            && self.off_y.is_settled(now)
+            && self.ln_zoom.is_settled(now)
     }
 
     /// Jump to `centre` and `zoom` (clamped) with no animation.
     pub fn set_view(&mut self, centre: (f64, f64), zoom: f64, _now: f64) {
+        self.glide = None;
         self.anchor = centre;
         self.off_x.reset_to(0.0);
         self.off_y.reset_to(0.0);
@@ -295,23 +348,38 @@ impl View {
 
     /// Multiply the target zoom by `factor`, keeping the image point under
     /// `about_screen` fixed there throughout the animation (it moves only
-    /// with a pan still in flight).
+    /// with a pan still in flight). A no-op at a zoom limit.
     pub fn zoom_by(&mut self, factor: f64, about_screen: Pos2, screen_rect: Rect, now: f64) {
         let new_z = self.clamp_zoom(self.zoom_target() * factor);
         if !new_z.is_finite() || new_z <= 0.0 {
             return;
         }
+        if (new_z.ln() - self.ln_zoom.target).abs() < 1e-12 {
+            return; // at a zoom limit: leave any pan in flight alone
+        }
         let p = self.screen_to_image(about_screen, screen_rect, now);
-        self.reanchor(p, now);
-        self.ln_zoom.spring_to(new_z.ln(), now);
+        if self.reanchor(p, now) {
+            self.ln_zoom.spring_to(new_z.ln(), now);
+        }
     }
 
     /// Drag the image by `screen_delta` screen pixels. The view eases after
     /// the pointer: the drag accumulates into the offset springs' targets,
     /// so a stream of drag events becomes one smooth motion. An in-flight
-    /// zoom keeps running, its anchored point carried along by the drag.
+    /// zoom keeps running, its anchored point carried along by the drag; a
+    /// glide's target moves by the drag (at the target zoom).
     pub fn pan_by(&mut self, screen_delta: Vec2, now: f64) {
         let (dx, dy) = (f64::from(screen_delta.x), f64::from(screen_delta.y));
+        let z = self.zoom_target();
+        if let Some((gx, gy)) = &mut self.glide {
+            if dx != 0.0 {
+                gx.spring_to(gx.target - dx / z, now);
+            }
+            if dy != 0.0 {
+                gy.spring_to(gy.target - dy / z, now);
+            }
+            return;
+        }
         if dx != 0.0 {
             self.off_x.spring_to(self.off_x.target + dx, now);
         }
@@ -330,7 +398,7 @@ impl View {
             (image_rect[0] + image_rect[2]) / 2.0,
             (image_rect[1] + image_rect[3]) / 2.0,
         );
-        self.animate_to(c, z, now);
+        self.glide_to(c, z, now);
     }
 
     /// Image point -> screen position, for the view at `now`.
@@ -501,6 +569,75 @@ mod tests {
         v.pan_by(Vec2::new(50.0, 0.0), 10.2);
         let p2 = at(&v, 20.0);
         assert!((p0.0 - p2.0 - 200.0 / z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fit_from_deep_far_pan_stays_between_start_and_target() {
+        let g = geom();
+        let mut v = View::new();
+        v.fit(&g, SCREEN, 0.0);
+        v.finish_animation();
+        // Deep in, far from the fit centre (zoom 8, a corner of the image).
+        v.set_view((500.0, 500.0), MAX_ZOOM, 1.0);
+        let from = v.centre(1.0);
+        v.fit(&g, SCREEN, 1.0);
+        let to = (35_000.0, 24_000.0);
+        for i in 0..=48 {
+            let t = 1.0 + f64::from(i) * ANIMATION_TIME / 48.0;
+            v.update(t);
+            let c = v.centre(t);
+            for k in 0..2 {
+                let (a, b, x) = [(from.0, to.0, c.0), (from.1, to.1, c.1)][k];
+                assert!(
+                    x >= a.min(b) - 1e-6 && x <= a.max(b) + 1e-6,
+                    "t={t}: centre {c:?} outside {from:?}..{to:?}"
+                );
+            }
+        }
+        let t = 1.0 + ANIMATION_TIME;
+        assert_eq!(v.centre(t), to);
+        v.update(t + 1.0);
+        assert_eq!(v.centre(t + 1.0), to);
+        assert!(v.is_settled(t));
+    }
+
+    #[test]
+    fn drag_during_fit_moves_its_target() {
+        let g = geom();
+        let mut v = View::new();
+        v.set_view((500.0, 500.0), 1.0, 0.0);
+        v.fit(&g, SCREEN, 0.0);
+        v.pan_by(Vec2::new(100.0, 0.0), 0.3);
+        let z = v.zoom_target();
+        let c = v.centre(10.0);
+        assert!((c.0 - (35_000.0 - 100.0 / z)).abs() < 1e-6, "{c:?}");
+        assert!((c.1 - 24_000.0).abs() < 1e-6);
+        // A zoom mid-glide takes over at the view shown.
+        let mut v = View::new();
+        v.set_view((500.0, 500.0), 1.0, 0.0);
+        v.fit(&g, SCREEN, 0.0);
+        let p = Pos2::new(700.0, 200.0);
+        let under = v.screen_to_image(p, rect(), 0.3);
+        v.zoom_by(1.2, p, rect(), 0.3);
+        let at = v.screen_to_image(p, rect(), 0.3);
+        assert!((at.0 - under.0).abs() < 1e-6 && (at.1 - under.1).abs() < 1e-6);
+        let later = v.screen_to_image(p, rect(), 10.0);
+        assert!((later.0 - under.0).abs() < 1e-6 && (later.1 - under.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_at_limit_keeps_pan_easing() {
+        let g = geom();
+        let mut v = View::new();
+        v.fit(&g, SCREEN, 0.0);
+        v.set_view((1000.0, 1000.0), MAX_ZOOM, 0.0);
+        v.pan_by(Vec2::new(100.0, 0.0), 1.0);
+        let before = v.clone();
+        v.zoom_by(1.2, Pos2::new(10.0, 10.0), rect(), 1.1);
+        for t in [1.1, 1.5, 3.0] {
+            assert_eq!(v.centre(t), before.centre(t));
+            assert_eq!(v.zoom(t), before.zoom(t));
+        }
     }
 
     #[test]
