@@ -1067,7 +1067,12 @@ views and export. No algorithm changed. Core additions are bookkeeping
   tile row by tile row without a writer lock; stale tiles are exported as
   they are, missing tiles as zeros. `export_check` counts stale and missing
   level-0 tiles first and both frontends warn (the app offers *Blend whole
-  mosaic first* or *Export anyway*). Output goes to `<out>.part` and is
+  mosaic first* or *Export anyway*). The app's Export is disabled while a
+  blend of a chosen group is queued or running (the check maps the store the
+  blend may recreate); it takes the groups, destinations and format when
+  pressed (later edits in the dialog do not change that export) and lists
+  destinations that exist already, exporting over them only after an
+  explicit *Overwrite*. Output goes to `<out>.part` and is
   renamed on success; failure or cancel leaves an existing destination
   untouched. FITS uses the top-down WCS convention only. The TIFF writer
   needs random access, so TIFF export stages a scratch file the size of the

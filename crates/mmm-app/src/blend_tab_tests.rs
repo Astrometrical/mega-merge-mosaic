@@ -534,3 +534,162 @@ fn absent_reason_hidden_while_reopening() {
     member(&mut tab, "Ha").reopen = false;
     assert_eq!(tab.absent(), Some("Cannot read the group's analysis: gone"));
 }
+
+/// The export dialog alone, as the Blend tab drives it: the user's
+/// decisions are collected, nothing is started.
+struct DialogState {
+    dialog: crate::export::ExportDialog,
+    session: OpenSession,
+    jobs: JobRunner,
+    blending: std::collections::BTreeSet<String>,
+    actions: Vec<crate::export::ExportAction>,
+}
+
+fn dialog_harness(
+    session: OpenSession,
+    jobs: JobRunner,
+    groups: Vec<String>,
+) -> egui_kittest::Harness<'static, DialogState> {
+    let mut dialog = crate::export::ExportDialog::new(Arc::new(FixedSave(Default::default())));
+    dialog.open(&session, groups);
+    egui_kittest::Harness::builder()
+        .with_size(egui::vec2(900.0, 700.0))
+        .with_step_dt(0.01)
+        .build_ui_state(
+            |ui, st: &mut DialogState| {
+                st.jobs.poll(&mut st.session);
+                st.blending = st
+                    .session
+                    .mosaic
+                    .config
+                    .group_dirs
+                    .keys()
+                    .filter(|g| st.jobs.blend_pending(g))
+                    .cloned()
+                    .collect();
+                let can_blend = true;
+                if let Some(a) = st.dialog.ui(ui.ctx(), &st.session, can_blend, &st.blending) {
+                    st.actions.push(a);
+                }
+            },
+            DialogState {
+                dialog,
+                session,
+                jobs,
+                blending: Default::default(),
+                actions: Vec::new(),
+            },
+        )
+}
+
+fn export_button<'h>(h: &'h egui_kittest::Harness<'static, DialogState>) -> egui_kittest::Node<'h> {
+    use egui_kittest::kittest::Queryable;
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
+}
+
+fn export_disabled(h: &egui_kittest::Harness<'static, DialogState>) -> bool {
+    use egui_kittest::kittest::NodeT;
+    export_button(h).accesskit_node().is_disabled()
+}
+
+#[test]
+fn export_disabled_while_a_chosen_group_blends() {
+    use crate::start::tests::step_until;
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-export-blending");
+    let gate = jobs.hold();
+    jobs.start_blend(&mut s, "Ha", None);
+    jobs.start_blend(&mut s, "OIII", None);
+    let mut h = dialog_harness(s, jobs, vec!["Ha".into()]);
+    {
+        let st = h.state_mut();
+        st.dialog
+            .set_path(&root.join("ha.fits").display().to_string());
+    }
+    h.run_steps(2);
+    // Ha's blend runs: no check (it maps the store the blend may recreate).
+    assert!(export_disabled(&h));
+    export_button(&h).click();
+    h.run_steps(2);
+    assert!(h.state().dialog.idle(), "no check started");
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    h.run_steps(2);
+    assert!(!export_disabled(&h));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn export_snapshots_choices_and_confirms_overwrite() {
+    use egui_kittest::kittest::Queryable;
+
+    use crate::export::{ExportAction, ExportFormat};
+    use crate::start::tests::step_until;
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-export-overwrite");
+    jobs.start_blend(&mut s, "Ha", None);
+    jobs.start_blend(&mut s, "OIII", None);
+    crate::jobs::tests::drain(&mut jobs, &mut s);
+
+    // One group to an existing file: confirm first, listing it.
+    let dest = root.join("ha.fits");
+    std::fs::write(&dest, b"keep").unwrap();
+    let mut h = dialog_harness(s, jobs, vec!["Ha".into()]);
+    h.state_mut().dialog.set_path(&dest.display().to_string());
+    h.run_steps(2);
+    export_button(&h).click();
+    step_until(&mut h, |st| st.dialog.overwrite_shown());
+    h.get_by_label_contains(&dest.display().to_string());
+    // Back: nothing decided, the file untouched.
+    h.get_by_label("Back").click();
+    h.run();
+    assert!(h.state().actions.is_empty());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"keep");
+    // Again, then change the choices while the confirmation shows: the
+    // export uses what was checked.
+    export_button(&h).click();
+    step_until(&mut h, |st| st.dialog.overwrite_shown());
+    {
+        let st = h.state_mut();
+        st.dialog
+            .set_path(&root.join("other.tif").display().to_string());
+        st.dialog.set_format(ExportFormat::Tiff);
+    }
+    h.get_by_label("Overwrite").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().actions,
+        [ExportAction::Export(
+            vec![("Ha".to_string(), dest.clone())],
+            ExportFormat::Fits
+        )]
+    );
+    drop(h);
+
+    // Several groups: the derived names are checked too.
+    let (root2, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-export-overwrite2");
+    jobs.start_blend(&mut s, "Ha", None);
+    jobs.start_blend(&mut s, "OIII", None);
+    crate::jobs::tests::drain(&mut jobs, &mut s);
+    let tag = s.mosaic.config.group_dirs["OIII"].clone();
+    let existing = root2.join(format!("m-{tag}.fits"));
+    std::fs::write(&existing, b"keep").unwrap();
+    let mut h = dialog_harness(s, jobs, vec!["Ha".into(), "OIII".into()]);
+    h.state_mut()
+        .dialog
+        .set_path(&root2.join("m.fits").display().to_string());
+    h.run_steps(2);
+    export_button(&h).click();
+    step_until(&mut h, |st| st.dialog.overwrite_shown());
+    h.get_by_label_contains(&existing.display().to_string());
+    assert!(
+        h.query_by_label_contains(&root2.join("m-Ha").display().to_string())
+            .is_none(),
+        "only existing files are listed"
+    );
+    h.get_by_label("Overwrite").click();
+    h.run_steps(2);
+    assert!(matches!(&h.state().actions[..], [ExportAction::Export(d, _)] if d.len() == 2));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
+}

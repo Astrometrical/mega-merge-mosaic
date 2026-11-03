@@ -7,14 +7,20 @@
 //! destination names a pattern: each group goes to `<stem>-<group>.<ext>`.
 //!
 //! **Export** first counts each group's stale and missing tiles
-//! ([`export_check`], on a background thread: it maps the stores). A
-//! complete result is exported at once; otherwise the dialog warns with
-//! the counts and offers **Blend whole mosaic first** (blends the chosen
-//! groups over the whole canvas; export again once it is done) or
-//! **Export anyway** (stale tiles as they are, missing ones as zeros). The
-//! exports themselves run as jobs ([`crate::jobs::JobRunner::start_export`])
-//! with progress and cancel.
+//! ([`export_check`], on a background thread: it maps the stores), and
+//! looks for destination files that exist already. It is disabled while a
+//! blend of a chosen group is queued or running (the blend may recreate
+//! the store the check maps). The groups, destinations and format are
+//! taken when Export is pressed; later edits in the dialog do not change
+//! that export. Existing destinations are listed and need an explicit
+//! **Overwrite**. A complete result is then exported at once; otherwise
+//! the dialog warns with the counts and offers **Blend whole mosaic
+//! first** (blends the chosen groups over the whole canvas; export again
+//! once it is done) or **Export anyway** (stale tiles as they are, missing
+//! ones as zeros). The exports themselves run as jobs
+//! ([`crate::jobs::JobRunner::start_export`]) with progress and cancel.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -59,13 +65,35 @@ pub enum ExportAction {
     Export(Vec<(String, PathBuf)>, ExportFormat),
 }
 
-/// Each chosen group's tile counts, or why they could not be read.
-type CheckResult = Result<Vec<(String, ExportReport)>, String>;
+/// What a check found: each chosen group's tile counts and the
+/// destinations that exist already.
+struct Checked {
+    reports: Vec<(String, ExportReport)>,
+    existing: Vec<PathBuf>,
+}
 
-/// The answer to the stale/missing warning.
+/// What a check found, or why the results could not be read.
+type CheckResult = Result<Checked, String>;
+
+/// The export as chosen when Export was pressed: each group's destination
+/// and the format.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    dests: Vec<(String, PathBuf)>,
+    format: ExportFormat,
+}
+
+impl Snapshot {
+    fn action(&self) -> ExportAction {
+        ExportAction::Export(self.dests.clone(), self.format)
+    }
+}
+
+/// The answer to the stale/missing warning or the overwrite question.
 enum Choice {
     BlendFirst,
     ExportAnyway,
+    Overwrite,
     Back,
 }
 
@@ -73,10 +101,12 @@ enum Choice {
 enum Step {
     /// Choosing groups, format and destination.
     Choose,
-    /// Counting stale and missing tiles.
-    Checking(Task<CheckResult>),
+    /// Counting stale and missing tiles, and looking for existing files.
+    Checking(Task<CheckResult>, Snapshot),
+    /// Some destinations exist: overwrite them? Then the counts decide.
+    Overwrite(Vec<PathBuf>, Vec<(String, ExportReport)>, Snapshot),
     /// The result is incomplete: the counts, per group.
-    Warn(Vec<(String, ExportReport)>),
+    Warn(Vec<(String, ExportReport)>, Snapshot),
 }
 
 /// The export dialog's state.
@@ -142,15 +172,33 @@ impl ExportDialog {
         &self.path
     }
 
+    /// Set the destination as if typed.
+    #[cfg(test)]
+    pub fn set_path(&mut self, path: &str) {
+        self.path = path.to_string();
+    }
+
+    /// Set the format as if chosen.
+    #[cfg(test)]
+    pub fn set_format(&mut self, format: ExportFormat) {
+        self.format = format;
+    }
+
+    /// Whether the overwrite confirmation is shown.
+    #[cfg(test)]
+    pub fn overwrite_shown(&self) -> bool {
+        matches!(self.step, Step::Overwrite(..))
+    }
+
     /// Whether the stale/missing warning is shown.
     #[cfg(test)]
     pub fn warning_shown(&self) -> bool {
-        matches!(self.step, Step::Warn(_))
+        matches!(self.step, Step::Warn(..))
     }
 
     /// Nothing pending (no save dialog or check running).
     pub fn idle(&self) -> bool {
-        self.picking.is_none() && !matches!(self.step, Step::Checking(_))
+        self.picking.is_none() && !matches!(self.step, Step::Checking(..))
     }
 
     /// The groups chosen, in order.
@@ -163,18 +211,20 @@ impl ExportDialog {
     }
 
     /// Draw the dialog (if open); the user's decision, once made.
-    /// `can_blend` enables "Blend whole mosaic first".
+    /// `can_blend` enables "Blend whole mosaic first"; `blending` are the
+    /// groups with a blend queued or running (Export waits for them).
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
         session: &OpenSession,
         can_blend: bool,
+        blending: &BTreeSet<String>,
     ) -> Option<ExportAction> {
         if !self.open {
             return None;
         }
         self.poll_picker();
-        let mut action = self.poll_check(session);
+        let mut action = self.poll_check();
         let mut open = true;
         egui::Window::new("Export")
             .open(&mut open)
@@ -183,22 +233,33 @@ impl ExportDialog {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 let decided = match &self.step {
-                    Step::Warn(reports) => {
-                        let reports = reports.clone();
-                        match self.warn_ui(ui, &reports, can_blend) {
+                    Step::Warn(reports, snap) => {
+                        let (reports, snap) = (reports.clone(), snap.clone());
+                        match warn_ui(ui, &reports, can_blend) {
                             Some(Choice::BlendFirst) => Some(ExportAction::BlendFirst(
                                 reports.into_iter().map(|(g, _)| g).collect(),
                             )),
-                            Some(Choice::ExportAnyway) => Some(self.export_action(session)),
+                            Some(Choice::ExportAnyway) => Some(snap.action()),
                             Some(Choice::Back) => {
                                 self.step = Step::Choose;
                                 None
                             }
-                            None => None,
+                            Some(Choice::Overwrite) | None => None,
                         }
                     }
-                    Step::Choose | Step::Checking(_) => {
-                        self.choose_ui(ui, session);
+                    Step::Overwrite(existing, reports, snap) => match overwrite_ui(ui, existing) {
+                        Some(Choice::Overwrite) => {
+                            let (reports, snap) = (reports.clone(), snap.clone());
+                            self.decide(reports, snap)
+                        }
+                        Some(Choice::Back) => {
+                            self.step = Step::Choose;
+                            None
+                        }
+                        Some(Choice::BlendFirst | Choice::ExportAnyway) | None => None,
+                    },
+                    Step::Choose | Step::Checking(..) => {
+                        self.choose_ui(ui, session, blending);
                         None
                     }
                 };
@@ -241,19 +302,20 @@ impl ExportDialog {
         }
     }
 
-    /// Take the check's answer: export at once when complete, else warn.
-    fn poll_check(&mut self, session: &OpenSession) -> Option<ExportAction> {
-        let Step::Checking(task) = &self.step else {
+    /// Take the check's answer: confirm overwriting existing files first,
+    /// then [`ExportDialog::decide`].
+    fn poll_check(&mut self) -> Option<ExportAction> {
+        let Step::Checking(task, snap) = &self.step else {
             return None;
         };
         match task.poll() {
             Poll::Pending => None,
-            Poll::Done(Ok(reports)) => {
-                if reports.iter().all(|(_, r)| r.is_complete()) {
-                    self.step = Step::Choose;
-                    Some(self.export_action(session))
+            Poll::Done(Ok(checked)) => {
+                let snap = snap.clone();
+                if checked.existing.is_empty() {
+                    self.decide(checked.reports, snap)
                 } else {
-                    self.step = Step::Warn(reports);
+                    self.step = Step::Overwrite(checked.existing, checked.reports, snap);
                     None
                 }
             }
@@ -270,22 +332,25 @@ impl ExportDialog {
         }
     }
 
-    /// Each chosen group's destination.
-    fn export_action(&self, session: &OpenSession) -> ExportAction {
-        let chosen = self.chosen();
-        let dests = targets(
-            Path::new(self.path.trim()),
-            &chosen,
-            self.format,
-            &session.mosaic.config.group_dirs,
-        );
-        ExportAction::Export(dests, self.format)
+    /// Export at once when every result is complete, else warn.
+    fn decide(
+        &mut self,
+        reports: Vec<(String, ExportReport)>,
+        snap: Snapshot,
+    ) -> Option<ExportAction> {
+        if reports.iter().all(|(_, r)| r.is_complete()) {
+            self.step = Step::Choose;
+            Some(snap.action())
+        } else {
+            self.step = Step::Warn(reports, snap);
+            None
+        }
     }
 
     /// Groups, format, destination and the Export button (which starts
-    /// the check).
-    fn choose_ui(&mut self, ui: &mut egui::Ui, session: &OpenSession) {
-        let checking = matches!(self.step, Step::Checking(_));
+    /// the check; disabled while a chosen group in `blending` blends).
+    fn choose_ui(&mut self, ui: &mut egui::Ui, session: &OpenSession, blending: &BTreeSet<String>) {
+        let checking = matches!(self.step, Step::Checking(..));
         ui.label(RichText::new("Groups").strong());
         for (g, on) in &mut self.groups {
             ui.checkbox(on, g.as_str());
@@ -343,8 +408,20 @@ impl ExportDialog {
         if let Some(e) = &self.error {
             ui.label(RichText::new(e).color(palette::HA_500));
         }
+        let busy: Vec<&String> = chosen.iter().filter(|g| blending.contains(*g)).collect();
+        if !busy.is_empty() {
+            let names: Vec<&str> = busy.iter().map(|g| g.as_str()).collect();
+            ui.label(
+                RichText::new(format!(
+                    "Waiting for the blend of {} to end.",
+                    names.join(", ")
+                ))
+                .color(palette::TEXT_MUTED),
+            );
+        }
         ui.add_space(8.0);
-        let ready = !chosen.is_empty() && !self.path.trim().is_empty() && !checking;
+        let ready =
+            !chosen.is_empty() && !self.path.trim().is_empty() && !checking && busy.is_empty();
         let mut clicked = false;
         ui.horizontal(|ui| {
             clicked = ui.add_enabled(ready, egui::Button::new("Export")).clicked();
@@ -353,13 +430,15 @@ impl ExportDialog {
                 ui.label(RichText::new("Checking the results…").color(palette::TEXT_MUTED));
             }
         });
-        if clicked {
+        if clicked && ready {
             self.start_check(ui.ctx(), session, chosen);
         }
     }
 
-    /// Count the chosen groups' stale and missing tiles on a worker (it
-    /// maps the stores); the destination folder is checked there too.
+    /// Take the chosen groups, destinations and format, then count the
+    /// groups' stale and missing tiles on a worker (it maps the stores);
+    /// the destination folder and existing destination files are checked
+    /// there too.
     fn start_check(&mut self, ctx: &egui::Context, session: &OpenSession, chosen: Vec<String>) {
         self.error = None;
         let config = &session.mosaic.config;
@@ -367,6 +446,15 @@ impl ExportDialog {
             self.error = Some(format!("{g} has not been analysed and blended yet."));
             return;
         }
+        let snap = Snapshot {
+            dests: targets(
+                Path::new(self.path.trim()),
+                &chosen,
+                self.format,
+                &config.group_dirs,
+            ),
+            format: self.format,
+        };
         let results: Vec<(String, PathBuf)> = chosen
             .iter()
             .map(|g| (g.clone(), session.mosaic.result_path(g)))
@@ -375,66 +463,94 @@ impl ExportDialog {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
+        let dests: Vec<PathBuf> = snap.dests.iter().map(|(_, p)| p.clone()).collect();
         let task = Task::spawn("mmm-export-check", ctx, move || {
             if !folder.as_os_str().is_empty() && !folder.is_dir() {
                 return Err(format!("The folder {} does not exist.", folder.display()));
             }
-            results
+            let reports = results
                 .into_iter()
                 .map(|(g, path)| {
                     export_check(&path)
                         .map(|r| (g.clone(), r))
                         .map_err(|e| format!("{g}: {e}"))
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()?;
+            let existing = dests.into_iter().filter(|p| p.exists()).collect();
+            Ok(Checked { reports, existing })
         });
         match task {
-            Some(t) => self.step = Step::Checking(t),
+            Some(t) => self.step = Step::Checking(t, snap),
             None => self.error = Some("Cannot start a worker thread.".into()),
         }
     }
+}
 
-    /// The stale/missing warning and the user's choice.
-    fn warn_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        reports: &[(String, ExportReport)],
-        can_blend: bool,
-    ) -> Option<Choice> {
-        ui.label(
-            RichText::new("The blended result is not up to date.")
-                .strong()
-                .color(palette::HA_500),
-        );
-        for (g, r) in reports.iter().filter(|(_, r)| !r.is_complete()) {
-            ui.label(counts_text(g, r));
-        }
-        ui.label(
-            RichText::new(
-                "Stale tiles are exported as they are; missing tiles are exported as zeros.",
-            )
-            .color(palette::TEXT_MUTED),
-        );
-        ui.add_space(8.0);
-        let mut choice = None;
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(can_blend, egui::Button::new("Blend whole mosaic first"))
-                .on_hover_text("Blend these groups over the whole canvas, then export again")
-                .on_disabled_hover_text("Blending is not possible right now")
-                .clicked()
-            {
-                choice = Some(Choice::BlendFirst);
-            }
-            if ui.button("Export anyway").clicked() {
-                choice = Some(Choice::ExportAnyway);
-            }
-            if ui.button("Back").clicked() {
-                choice = Some(Choice::Back);
-            }
-        });
-        choice
+/// The overwrite question: the existing files and the user's choice.
+fn overwrite_ui(ui: &mut egui::Ui, existing: &[PathBuf]) -> Option<Choice> {
+    ui.label(
+        RichText::new(if existing.len() == 1 {
+            "This file exists already:"
+        } else {
+            "These files exist already:"
+        })
+        .strong()
+        .color(palette::HA_500),
+    );
+    for p in existing {
+        ui.label(p.display().to_string());
     }
+    ui.label(RichText::new("Exporting replaces them.").color(palette::TEXT_MUTED));
+    ui.add_space(8.0);
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        if ui.button("Overwrite").clicked() {
+            choice = Some(Choice::Overwrite);
+        }
+        if ui.button("Back").clicked() {
+            choice = Some(Choice::Back);
+        }
+    });
+    choice
+}
+
+/// The stale/missing warning and the user's choice.
+fn warn_ui(
+    ui: &mut egui::Ui,
+    reports: &[(String, ExportReport)],
+    can_blend: bool,
+) -> Option<Choice> {
+    ui.label(
+        RichText::new("The blended result is not up to date.")
+            .strong()
+            .color(palette::HA_500),
+    );
+    for (g, r) in reports.iter().filter(|(_, r)| !r.is_complete()) {
+        ui.label(counts_text(g, r));
+    }
+    ui.label(
+        RichText::new("Stale tiles are exported as they are; missing tiles are exported as zeros.")
+            .color(palette::TEXT_MUTED),
+    );
+    ui.add_space(8.0);
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(can_blend, egui::Button::new("Blend whole mosaic first"))
+            .on_hover_text("Blend these groups over the whole canvas, then export again")
+            .on_disabled_hover_text("Blending is not possible right now")
+            .clicked()
+        {
+            choice = Some(Choice::BlendFirst);
+        }
+        if ui.button("Export anyway").clicked() {
+            choice = Some(Choice::ExportAnyway);
+        }
+        if ui.button("Back").clicked() {
+            choice = Some(Choice::Back);
+        }
+    });
+    choice
 }
 
 /// The file name suggested for `groups`: the group's name for one, else

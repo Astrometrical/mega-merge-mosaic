@@ -57,7 +57,7 @@
 //! Another program (the `mmm` CLI) recreating the store while it is shown
 //! is not guarded against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -393,7 +393,15 @@ impl BlendTab {
     /// blend the chosen groups first, or start one export job per group.
     fn export_ui(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
         let can_blend = self.can_blend(self.readiness(session));
-        match self.export.ui(ctx, session, can_blend) {
+        // Blends of the view's groups queued or running: the export check
+        // maps the stores they may recreate.
+        let blending: BTreeSet<String> = self
+            .members
+            .iter()
+            .filter(|g| jobs.blend_pending(g))
+            .cloned()
+            .collect();
+        match self.export.ui(ctx, session, can_blend, &blending) {
             Some(ExportAction::BlendFirst(groups)) => {
                 self.blend_groups(session, jobs, groups, None);
             }

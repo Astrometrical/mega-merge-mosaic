@@ -523,6 +523,18 @@ impl JobRunner {
                 .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
     }
 
+    /// Whether a blend of `group` is queued or running (whatever its
+    /// progress): it may (re)create or write the group's result store.
+    pub fn blend_pending(&self, group: &str) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.blend.as_ref().is_some_and(|p| p.group == group))
+            || self
+                .queue
+                .iter()
+                .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
+    }
+
     /// Whether a job is running or queued.
     pub fn busy(&self) -> bool {
         self.running.is_some() || !self.queue.is_empty()
