@@ -559,8 +559,17 @@ impl BlendTab {
         }
     }
 
-    /// A settings edit waits for the jobs to stop (or a busy store): the
-    /// automatic pipeline starts nothing meanwhile.
+    /// A global settings edit waits to apply, or jobs cancelled for one
+    /// have not all been reported ([`SettingsPanel::editing`]): the
+    /// automatic pipeline starts nothing meanwhile and restarts what was
+    /// cancelled.
+    pub fn settings_editing(&self, session: &OpenSession) -> bool {
+        self.settings.editing(&session.mosaic.config)
+    }
+
+    /// A settings edit waits for the jobs in its way to stop (or a busy
+    /// store).
+    #[cfg(test)]
     pub fn settings_pending(&self) -> bool {
         self.settings.has_pending()
     }

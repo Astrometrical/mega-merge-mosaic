@@ -16,9 +16,15 @@
 //!   runs no blend may start ([`SettingsPanel::idle`]), so the count's
 //!   [`TileReader`] never maps a store a blend recreates.
 //! - **Applying** uses [`set_settings`] with the pending-edit pattern of
-//!   the Panels tab: while jobs (other than exports) run they are cancelled
-//!   and the edit waits until the runner is idle; a store held elsewhere
-//!   ([`mmm_core::Error::Busy`]) retries after [`BUSY_RETRY`].
+//!   the Panels tab: the jobs in the way are cancelled and the edit waits
+//!   until they have stopped — blends only for a blend-local change
+//!   ([`set_settings`] needs just the stores' writer locks), every job but
+//!   exports for a global one; a store held elsewhere
+//!   ([`mmm_core::Error::Busy`]) retries after [`BUSY_RETRY`]. Jobs
+//!   cancelled for a global edit count as cancelled *for an edit*
+//!   ([`SettingsPanel::editing`]) until every one has been reported, even
+//!   if the edit is reverted meanwhile, so the automatic pipeline restarts
+//!   its work instead of taking them for the user's cancels.
 //! - **Changed since the last blend.** A field whose shown value differs
 //!   from the settings the last blend used (from provenance; see
 //!   [`last_blend`]) is marked with a dot in the accent colour.
@@ -36,7 +42,7 @@ use egui::RichText;
 use mega_ui::theme::palette;
 use mmm_core::analyze::InputSelect;
 use mmm_core::blend::BlendMode;
-use mmm_core::mosaic::{MosaicConfig, set_settings};
+use mmm_core::mosaic::{MosaicConfig, result_store_paths, set_settings};
 use mmm_core::photometry::GainMode;
 use mmm_core::settings::{
     AnalyzeSettings, BlendSettings, ChangeImpact, analyze_change, blend_change,
@@ -179,19 +185,9 @@ pub fn count_tiles(paths: &[PathBuf]) -> (usize, usize) {
     (valid, total)
 }
 
-/// The result stores of every analysed group of `session`.
-fn result_paths(session: &OpenSession) -> Vec<PathBuf> {
-    session
-        .mosaic
-        .config
-        .group_dirs
-        .keys()
-        .map(|g| session.mosaic.result_path(g))
-        .collect()
-}
-
-/// What applying an edit costs, for the user.
-pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>) -> String {
+/// What applying an edit costs, for the user. `auto`: automatic analysis
+/// is on (a global change then reruns it by itself).
+pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>, auto: bool) -> String {
     let tiles = match counts {
         None => " (counting tiles…)".to_string(),
         Some((_, 0)) => String::new(),
@@ -202,8 +198,11 @@ pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>) -> String
         ChangeImpact::Reblend => {
             format!("Existing results go stale; reblend to see the change{tiles}.")
         }
-        ChangeImpact::Reanalyze => {
+        ChangeImpact::Reanalyze if auto => {
             format!("Analysis reruns and every result goes stale{tiles}.")
+        }
+        ChangeImpact::Reanalyze => {
+            format!("Analysis will need to rerun and every result goes stale{tiles}.")
         }
     }
 }
@@ -282,6 +281,9 @@ pub struct SettingsPanel {
     count_task: Option<Task<(usize, usize)>>,
     /// The counts are out of date.
     stale_counts: bool,
+    /// Jobs were cancelled for a global edit and have not all been
+    /// reported yet (kept across a Revert; see the module docs).
+    cancelled_for_edit: bool,
 }
 
 impl SettingsPanel {
@@ -293,10 +295,44 @@ impl SettingsPanel {
         }
     }
 
-    /// An applied edit waits for the jobs to stop (or a busy store); the
-    /// automatic pipeline starts nothing meanwhile and no blend may start.
+    /// An applied edit waits for the jobs to stop (or a busy store); no
+    /// blend may start meanwhile.
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// For the automatic pipeline: a global edit waits to apply, or jobs
+    /// cancelled for one (even one reverted since) have not all been
+    /// reported. The pipeline starts nothing meanwhile and restarts what
+    /// the edit cancelled rather than taking it for a user's cancel.
+    pub fn editing(&self, cfg: &MosaicConfig) -> bool {
+        self.cancelled_for_edit
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|e| e.impact(cfg) == ChangeImpact::Reanalyze)
+    }
+
+    /// Cancel the jobs in the way of `edit`: every blend for a blend-local
+    /// edit, every job but exports for a global one. True if any had to be
+    /// (the edit then waits for them to stop).
+    fn cancel_for(
+        &mut self,
+        edit: &SettingsEdit,
+        cfg: &MosaicConfig,
+        jobs: &mut JobRunner,
+    ) -> bool {
+        if edit.impact(cfg) == ChangeImpact::Reanalyze {
+            if jobs.busy_except_exports() {
+                jobs.cancel_all_but_exports();
+                self.cancelled_for_edit = true;
+                return true;
+            }
+        } else if jobs.blending() {
+            jobs.cancel_blends();
+            return true;
+        }
+        false
     }
 
     /// No tile count is running (a blend may start: see the module docs).
@@ -368,9 +404,9 @@ impl SettingsPanel {
         self.submit(edit, session, jobs)
     }
 
-    /// Apply `edit` with [`set_settings`], or, while jobs other than
-    /// exports run, cancel them and keep it waiting (newer work wins). The
-    /// impact when it was applied now.
+    /// Apply `edit` with [`set_settings`], or, while jobs in its way run,
+    /// cancel them and keep it waiting (newer work wins; see
+    /// [`SettingsPanel::cancel_for`]). The impact when it was applied now.
     fn submit(
         &mut self,
         edit: SettingsEdit,
@@ -380,8 +416,7 @@ impl SettingsPanel {
         self.pending = None;
         self.retry_at = None;
         self.error = None;
-        if jobs.busy_except_exports() {
-            jobs.cancel_all_but_exports();
+        if self.cancel_for(&edit, &session.mosaic.config, jobs) {
             self.pending = Some(edit);
             return None;
         }
@@ -432,32 +467,40 @@ impl SettingsPanel {
                 Poll::Lost => self.count_task = None,
             }
         }
+        // Every job cancelled for an edit has been reported (by the
+        // runner's poll this frame, before the shell read `editing`).
+        if self.cancelled_for_edit && !jobs.busy_except_exports() && !jobs.has_undelivered() {
+            self.cancelled_for_edit = false;
+        }
         let mut applied = None;
-        if self.pending.is_some() && jobs.busy_except_exports() {
+        if let Some(edit) = self.pending.clone() {
             // Newer work wins, also over jobs started after the edit was
             // queued; exports are spared.
-            jobs.cancel_all_but_exports();
-        } else if self.pending.is_some() {
-            let now = Instant::now();
-            match self.retry_at {
-                Some(at) if at > now => ctx.request_repaint_after(at - now),
-                _ => {
-                    let edit = self.pending.take().expect("pending edit");
-                    applied = self.submit(edit, session, jobs);
+            if !self.cancel_for(&edit, &session.mosaic.config, jobs) {
+                let now = Instant::now();
+                match self.retry_at {
+                    Some(at) if at > now => ctx.request_repaint_after(at - now),
+                    _ => {
+                        self.pending = None;
+                        applied = self.submit(edit, session, jobs);
+                    }
                 }
             }
         }
         // Counted only while nothing but exports runs (no blend can
         // recreate a store under the count's mapping) and only when a
-        // draft needs the cost.
+        // draft needs the cost. The stores are listed on the worker: the
+        // ones `set_settings` invalidates.
         if self.stale_counts
             && self.draft.is_some()
             && self.count_task.is_none()
             && !jobs.busy_except_exports()
         {
             self.stale_counts = false;
-            let paths = result_paths(session);
-            self.count_task = Task::spawn("mmm-settings-count", ctx, move || count_tiles(&paths));
+            let dir = session.mosaic.dir.clone();
+            self.count_task = Task::spawn("mmm-settings-count", ctx, move || {
+                count_tiles(&result_store_paths(&dir).unwrap_or_default())
+            });
         }
         applied
     }
@@ -612,9 +655,13 @@ impl SettingsPanel {
             };
             ui.add_space(4.0);
             ui.label(
-                RichText::new(cost_text(impact, counts))
-                    .small()
-                    .color(palette::TEXT_BODY),
+                RichText::new(cost_text(
+                    impact,
+                    counts,
+                    crate::pipeline::auto_analyze(&session.mosaic.config),
+                ))
+                .small()
+                .color(palette::TEXT_BODY),
             );
             ui.horizontal(|ui| {
                 if ui

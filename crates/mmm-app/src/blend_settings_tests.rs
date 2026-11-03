@@ -172,6 +172,23 @@ fn invalid_feather_is_rejected() {
         .unwrap_or_default()
         .to_string();
     assert!(err.starts_with("Feather must be"), "{err}");
+    // NaN parses as a float too; the core refuses it.
+    h.key_press(egui::Key::Backspace);
+    h.step();
+    h.get_by_role_and_label(Role::TextInput, "Feather (px)")
+        .type_text("NaN");
+    h.run_steps(2);
+    assert_eq!(value(&h, Role::TextInput, "Feather (px)"), "NaN");
+    let err = h
+        .state()
+        .panel
+        .feather_error()
+        .unwrap_or_default()
+        .to_string();
+    assert!(err.contains("finite"), "{err}");
+    // The refused value is never staged (the draft keeps the last valid one).
+    let draft = h.state().panel.draft().map(|d| d.blend.feather_px);
+    assert!(draft.is_none_or(f32::is_finite), "{draft:?}");
     // Another change is staged, but Apply stays disabled.
     {
         let st = h.state_mut();
@@ -274,6 +291,42 @@ fn apply_during_a_blend_cancels_it_and_applies_when_idle() {
 }
 
 #[test]
+fn blend_local_edit_spares_a_running_analysis() {
+    let (root, mut s, mut jobs) = analyzed("settings-spare-analysis");
+    let ctx = egui::Context::default();
+    let gate = jobs.hold();
+    let analysis = jobs.start_analyze(&mut s);
+    let mut panel = SettingsPanel::new();
+    let mut e = SettingsEdit::of(&s.mosaic.config);
+    e.blend.feather_px = 100.0;
+    panel.stage(e, &s.mosaic.config);
+    // Blend-local: only blends are in the way, and none runs.
+    assert_eq!(panel.apply(&mut s, &mut jobs), Some(ChangeImpact::Reblend));
+    assert!(!panel.editing(&s.mosaic.config));
+    // A blend queued behind the analysis is cancelled by the next one...
+    jobs.start_blend(&mut s, "Ha", None);
+    let mut e = SettingsEdit::of(&s.mosaic.config);
+    e.blend.feather_px = 50.0;
+    panel.stage(e, &s.mosaic.config);
+    assert_eq!(panel.apply(&mut s, &mut jobs), None);
+    assert!(panel.has_pending() && !panel.editing(&s.mosaic.config));
+    let mut events = jobs.poll(&mut s);
+    assert_eq!(
+        panel.poll(&ctx, &mut s, &mut jobs),
+        Some(ChangeImpact::Reblend)
+    );
+    assert_eq!(s.mosaic.config.blend.feather_px, 50.0);
+    // ...but the analysis runs on.
+    gate.open();
+    events.extend(drain(&mut jobs, &mut s));
+    assert!(events.contains(&JobEvent::Finished {
+        id: analysis,
+        label: "Analyze".into()
+    }));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn changed_marker_follows_the_last_blend() {
     let (root, mut h) = harness("settings-marker");
     let marks = |h: &Harness<'static, State>| h.query_all_by_label(CHANGED_MARK).count();
@@ -343,14 +396,19 @@ fn last_blend_reads_provenance() {
 #[test]
 fn cost_text_says_what_goes_stale() {
     assert_eq!(
-        cost_text(ChangeImpact::Reblend, Some((3, 12))),
+        cost_text(ChangeImpact::Reblend, Some((3, 12)), true),
         "Existing results go stale; reblend to see the change (3 of 12 tiles)."
     );
     assert_eq!(
-        cost_text(ChangeImpact::Reanalyze, Some((0, 0))),
+        cost_text(ChangeImpact::Reanalyze, Some((0, 0)), true),
         "Analysis reruns and every result goes stale."
     );
-    assert!(cost_text(ChangeImpact::Reblend, None).contains("counting"));
+    // Automatic analysis off: the user runs it.
+    assert_eq!(
+        cost_text(ChangeImpact::Reanalyze, Some((2, 6)), false),
+        "Analysis will need to rerun and every result goes stale (2 of 6 tiles)."
+    );
+    assert!(cost_text(ChangeImpact::Reblend, None, true).contains("counting"));
     assert_eq!(
         count_tiles(&[PathBuf::from("/nonexistent/result.mmmt")]),
         (0, 0)

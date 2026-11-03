@@ -179,9 +179,13 @@ impl Pipeline {
     }
 
     /// Take the ended jobs from `events`, notice input edits, and start the
-    /// next stage when due. `editing`: the Panels tab has an edit waiting
-    /// (or had one when `events` were taken). Call every frame after the
-    /// runner's and the Panels tab's polls; `now` is the frame time.
+    /// next stage when due. `editing`: the Panels tab has an edit waiting,
+    /// or a global Blend settings edit waits or has jobs it cancelled still
+    /// to be reported ([`crate::blend_settings::SettingsPanel::editing`]) —
+    /// now or when `events` were taken. Jobs ending while editing are
+    /// restarted, not taken for the user's cancels. Call every frame after
+    /// the runner's, the Panels tab's and the Blend settings' polls; `now`
+    /// is the frame time.
     pub fn poll(
         &mut self,
         ctx: &egui::Context,
@@ -816,6 +820,76 @@ mod tests {
         assert_eq!(p.step(), Some(Step::Analyze));
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert!(s.mosaic.config.needs_analyze.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reverted_settings_edit_restarts_the_cancelled_analysis() {
+        use crate::blend_settings::{SettingsEdit, SettingsPanel};
+        use mmm_core::photometry::GainMode;
+
+        let root = temp_dir("pipe-settings-revert");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let ctx = egui::Context::default();
+        let t0 = Instant::now();
+        // Previews first, with the analysis held back.
+        set_auto_analyze(&mut s, false).unwrap();
+        let mut seen = Seen::default();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        let gate = r.hold();
+        set_auto_analyze(&mut s, true).unwrap();
+        p.poll(&ctx, t0, &mut s, &mut r, &[], false);
+        assert_eq!(p.step(), Some(Step::Analyze));
+        let first = p.take_started_analysis().unwrap();
+
+        // A global edit cancels the automatic analysis, then is reverted
+        // before the cancel has been reported.
+        let mut panel = SettingsPanel::new();
+        let mut e = SettingsEdit::of(&s.mosaic.config);
+        e.analyze.gain = GainMode::Unity;
+        panel.stage(e, &s.mosaic.config);
+        assert_eq!(panel.apply(&mut s, &mut r), None);
+        assert!(panel.editing(&s.mosaic.config));
+        panel.revert();
+        assert!(panel.editing(&s.mosaic.config), "until the cancel lands");
+        gate.open();
+
+        // The shell's order: runner, then `editing`, then the panel, then
+        // the pipeline.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut ended = Vec::new();
+        let mut again = None;
+        let mut t = t0;
+        loop {
+            let events = r.poll(&mut s);
+            let editing = panel.editing(&s.mosaic.config);
+            panel.poll(&ctx, &mut s, &mut r);
+            let editing = editing || panel.editing(&s.mosaic.config);
+            p.poll(&ctx, t, &mut s, &mut r, &events, editing);
+            ended.extend(events);
+            again = again.or(p.take_started_analysis());
+            if let Some(id) = again
+                && ended.contains(&JobEvent::Finished {
+                    id,
+                    label: "Analyze".into(),
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "analysis never re-run: {ended:?}"
+            );
+            // Simulated time moves on, past the debounce.
+            t += Duration::from_millis(200);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(ended.contains(&JobEvent::Cancelled { id: first }));
+        assert_ne!(again, Some(first));
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_eq!(s.mosaic.config.group_dirs.len(), 2);
+        assert_eq!(s.mosaic.config.analyze.gain, GainMode::Fit, "reverted");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

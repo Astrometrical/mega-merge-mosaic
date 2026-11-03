@@ -330,6 +330,14 @@ impl JobRunner {
     /// other groups are left to run, this one queueing behind them, and it
     /// waits behind a running or queued analysis. Planned (on the UI
     /// thread, no I/O) when it starts.
+    ///
+    /// A blend may recreate (truncate) its group's store, which would fault
+    /// (SIGBUS) any [`mmm_core::tiles::TileReader`] still mapping it. The
+    /// runner does not check that: callers must not start a blend while a
+    /// reader outside the job runner maps the store — the Blend tab gates
+    /// it on its tracked sources, the export check and the Blend settings
+    /// tile count (see [`crate::blend_tab`] and
+    /// [`crate::blend_settings`]).
     pub fn start_blend(
         &mut self,
         session: &mut OpenSession,
@@ -418,6 +426,41 @@ impl JobRunner {
         });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+    }
+
+    /// Cancel every blend: the running one winds down (reported by
+    /// [`JobRunner::poll`] when it has), queued ones are dropped at once.
+    /// For blend-local settings edits, which only need the stores' writer
+    /// locks.
+    pub fn cancel_blends(&mut self) {
+        if let Some(r) = self.running.as_ref().filter(|r| r.blend.is_some()) {
+            r.token.cancel();
+        }
+        let mut dropped = Vec::new();
+        self.queue.retain(|q| {
+            let keep = !matches!(q.kind, Kind::Blend { .. });
+            if !keep {
+                dropped.push(q.id);
+            }
+            keep
+        });
+        self.pending
+            .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+    }
+
+    /// Whether a blend is running or queued.
+    pub fn blending(&self) -> bool {
+        self.running.as_ref().is_some_and(|r| r.blend.is_some())
+            || self
+                .queue
+                .iter()
+                .any(|q| matches!(q.kind, Kind::Blend { .. }))
+    }
+
+    /// Whether events raised outside [`JobRunner::poll`] (queued jobs
+    /// cancelled) wait to be delivered by its next call.
+    pub fn has_undelivered(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// Whether a job other than an export is running or queued.

@@ -553,7 +553,14 @@ pub fn mark_needs_analyze(m: &mut Mosaic, groups: &[String]) -> Result<()> {
 
 /// Every existing group result store under `<dir>/groups`.
 fn all_result_stores(m: &Mosaic) -> Result<Vec<PathBuf>> {
-    let root = m.dir.join(GROUPS_DIR);
+    result_store_paths(&m.dir)
+}
+
+/// Every existing group result store under `<dir>/groups` of the mosaic
+/// directory `dir`: exactly the stores [`set_settings`] and [`set_inputs`]
+/// invalidate. Reads the directory (blocking).
+pub fn result_store_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let root = dir.join(GROUPS_DIR);
     let entries = match std::fs::read_dir(&root) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

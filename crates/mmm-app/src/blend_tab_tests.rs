@@ -854,6 +854,37 @@ fn previews_do_not_move_persisted_rois() {
 }
 
 #[test]
+fn no_blend_while_the_settings_tile_count_runs() {
+    use crate::blend_settings::SettingsEdit;
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-settings-count");
+    jobs.start_blend(&mut s, "Ha", None);
+    crate::jobs::tests::drain(&mut jobs, &mut s);
+    let ctx = egui::Context::default();
+    let mut tab = BlendTab::new();
+    tab.select("Ha".into());
+    member(&mut tab, "Ha").reopen = false;
+    let mut e = SettingsEdit::of(&s.mosaic.config);
+    e.blend.feather_px = 128.0;
+    tab.settings.stage(e, &s.mosaic.config);
+    // The draft needs its cost: the count starts (its TileReader maps the
+    // stores a blend may recreate).
+    tab.poll_settings(&ctx, &mut s, &mut jobs);
+    assert!(!tab.settings.idle());
+    assert!(!tab.can_blend(Readiness::Analyzed));
+    tab.blend_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
+    assert!(!jobs.busy(), "no blend started during the count");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !tab.settings.idle() {
+        assert!(Instant::now() < deadline, "the count never ended");
+        std::thread::sleep(Duration::from_millis(2));
+        tab.poll_settings(&ctx, &mut s, &mut jobs);
+    }
+    assert!(tab.can_blend(Readiness::Analyzed));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn settings_edit_waits_for_blends_and_blocks_blending() {
     use crate::blend_settings::SettingsEdit;
     use mmm_core::settings::ChangeImpact;

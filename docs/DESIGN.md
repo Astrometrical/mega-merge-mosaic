@@ -1126,17 +1126,26 @@ Edits are **staged**: nothing changes until **Apply**; **Revert** discards
 the draft (and an edit still waiting to apply). While a draft differs, the
 panel states its cost: "Existing results go stale; reblend to see the
 change (N of M tiles)" or "Analysis reruns and every result goes stale
-(N of M tiles)", N being the valid level-0 tiles of the existing group
-results and M their total. The counts are read on a worker with
-`TileReader`s, started only while no job but an export runs; while a count
-runs no blend may start, so no store is recreated under its mapping.
+(N of M tiles)" ("Analysis will need to rerun…" with Auto-analyze off),
+N being the valid level-0 tiles of the existing group results and M their
+total — the stores `set_settings` invalidates
+(`mosaic::result_store_paths`, listed on the worker). The counts are read
+on a worker with `TileReader`s, started only while no job but an export
+runs; while a count runs no blend may start, so no store is recreated
+under its mapping (`JobRunner::start_blend` documents that callers own
+this gate).
 
-**Apply** follows the Panels tab's pending-edit pattern: with jobs other
-than exports running it cancels them and waits; the shell polls the panel
-every frame and applies through `set_settings` once the runner is idle
-(busy store: retried every 500 ms). While an edit waits, Blend is disabled
-and the pipeline counts it as an edit (starts nothing, re-runs what the
-cancel interrupted). A blend-local apply stales every result (shown dimmed
+**Apply** follows the Panels tab's pending-edit pattern, cancelling only
+the jobs in the way: every blend for a blend-local change (`set_settings`
+needs only the stores' writer locks; a running analysis continues), every
+job but exports for a global one. The shell polls the panel every frame
+and applies through `set_settings` once those have stopped (busy store:
+retried every 500 ms). While an edit waits, Blend is disabled. A global
+edit counts as an edit for the pipeline (`SettingsPanel::editing`: it
+starts nothing and re-runs what the cancel interrupted) from the cancel
+until every cancelled job has been reported — also when the edit is
+reverted meanwhile, so the cancels are never taken for the user's and the
+automatic work restarts. A blend-local apply stales every result (shown dimmed
 and hatched) and the user reblends an ROI or the whole mosaic; a global
 apply also marks every analysed group `needs_analyze`, so the automatic
 pipeline analyses again (Blend is refused until it has).
