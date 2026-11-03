@@ -273,20 +273,27 @@ fn roi_blend_starts_one_blend_per_view_group() {
     // A drawn rect becomes "ROI 1" in whole canvas pixels, selected and
     // saved in the session's ui.
     tab.on_drawn(&mut s, [10.4, 20.0, 299.5, 200.0], CANVAS);
-    assert_eq!(tab.rois.len(), 1);
-    assert_eq!(tab.rois[0].name, "ROI 1");
-    assert_eq!(tab.rois[0].canvas, [10, 20, 300, 200]);
-    assert_eq!(tab.roi_selected, Some(0));
-    assert!(tab.save.pending() && tab.want_roi_sync);
+    let rois = tab.rois.rois();
+    assert_eq!(rois.len(), 1);
+    assert_eq!(rois[0].name, "ROI 1");
+    assert_eq!(rois[0].canvas, [10, 20, 300, 200]);
+    assert_eq!(tab.rois.selected, Some(0));
+    assert!(tab.save.pending() && tab.rois.want_sync && tab.rois.want_fresh);
     assert_eq!(
         crate::rois::load_rois(&s.mosaic.config.ui),
-        tab.rois,
+        tab.rois.rois(),
         "kept in ui"
     );
     tab.on_drawn(&mut s, [0.0, 0.0, 50.0, 50.0], CANVAS);
-    assert_eq!(tab.rois[1].name, "ROI 2");
-    assert_eq!(tab.roi_selected, Some(1));
-    tab.roi_selected = Some(0);
+    assert_eq!(tab.rois.rois()[1].name, "ROI 2");
+    assert_eq!(tab.rois.selected, Some(1));
+    tab.rois.selected = Some(0);
+
+    // Not while the ROIs are being reprojected (the rect may be from an
+    // older frame).
+    tab.blend_roi(&mut s, &mut jobs);
+    assert!(!jobs.busy() && tab.blend_jobs.is_empty());
+    tab.rois.want_sync = false;
 
     // Blend ROI: one blend of the ROI for each group of the view.
     let gate = jobs.hold();
@@ -316,7 +323,7 @@ fn roi_blend_starts_one_blend_per_view_group() {
         assert_eq!(*rect, serde_json::json!([0, 0, 512, 256]));
     }
 
-    // A group view blends just that group.
+    // A group view blends just that group's ROI...
     tab.set_view(&s, ViewKind::Group("OIII".into()));
     assert_eq!(tab.members, ["OIII"]);
     let gate = jobs.hold();
@@ -325,5 +332,46 @@ fn roi_blend_starts_one_blend_per_view_group() {
     assert_eq!(labels, ["Blend OIII"]);
     gate.open();
     crate::jobs::tests::drain(&mut jobs, &mut s);
+    // ...but "Blend whole mosaic" blends every group (spec §5.4).
+    let gate = jobs.hold();
+    tab.blend_whole(&mut s, &mut jobs);
+    let labels: Vec<String> = jobs.views().into_iter().map(|v| v.label).collect();
+    assert_eq!(labels, ["Blend Ha", "Blend OIII"]);
+    gate.open();
+    crate::jobs::tests::drain(&mut jobs, &mut s);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn composition_shows_blended_members() {
+    use crate::compositions::{Composition, ViewKind, load_compositions, save_compositions};
+
+    let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("blend-partial-comp");
+    jobs.start_blend(&mut s, "Ha", None);
+    crate::jobs::tests::drain(&mut jobs, &mut s);
+    let mut hoo = Composition::new("HOO");
+    hoo.channels = [
+        Some(("Ha".into(), 1.0)),
+        Some(("OIII".into(), 1.0)),
+        Some(("OIII".into(), 0.5)),
+    ];
+    save_compositions(&mut s.mosaic.config.ui, &[hoo]);
+    let compositions = load_compositions(&s.mosaic.config.ui);
+    let ctx = egui::Context::default();
+    let mut tab = BlendTab::new();
+    tab.set_view(&s, ViewKind::Composition(0));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !tab.results.values().all(Member::idle) {
+        assert!(Instant::now() < deadline, "results never opened");
+        std::thread::sleep(Duration::from_millis(2));
+        tab.update(&ctx, &mut s, &jobs);
+    }
+    tab.sync_viewer(&compositions);
+    // OIII was never blended: Ha shows, and OIII is named.
+    assert!(tab.results["Ha"].source.is_some());
+    assert!(tab.results["OIII"].source.is_none());
+    assert!(tab.viewer.is_some(), "the blended member is shown");
+    assert_eq!(tab.member_notes(), ["OIII: Not blended yet."]);
+    assert_eq!(tab.shown_text(), None);
     let _ = std::fs::remove_dir_all(&root);
 }

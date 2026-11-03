@@ -978,6 +978,7 @@ mod tests {
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
         h.run();
         h.get_by_label("Blend Ha finished");
+        h.get_by_label("Blend OIII finished");
         // The result opens with an automatic display stretch, and the
         // viewer settles with its tiles loaded.
         step_until(&mut h, |s| {
@@ -1017,7 +1018,8 @@ mod tests {
             .iter()
             .map(|p| p.action.clone())
             .collect();
-        assert_eq!(actions, ["analyze", "blend"]);
+        // "Blend whole mosaic" blends every group.
+        assert_eq!(actions, ["analyze", "blend", "blend"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

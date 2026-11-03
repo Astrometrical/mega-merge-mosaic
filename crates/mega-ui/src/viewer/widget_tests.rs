@@ -596,19 +596,34 @@ fn drawn_rect_reported_in_image_coords() {
         "{r:?}"
     );
 
-    // Esc cancels a drag in progress, and the tool.
+    // Esc cancels a drag in progress, and the tool; the rest of that drag
+    // does not pan.
     h.state_mut().viewer.set_tool(Tool::DrawRect);
     h.run();
+    let before = centre_zoom(&h.state().viewer);
     h.drag_at(a);
     h.step();
     h.hover_at(Pos2::new(600.0, 400.0));
     h.step();
     h.key_press(egui::Key::Escape);
     h.step();
+    // Still held, moving on: this must not pan.
+    h.hover_at(Pos2::new(450.0, 300.0));
+    h.step();
+    h.hover_at(b);
+    h.step();
     h.drop_at(b);
     h.run();
     assert_eq!(h.state().drawn.len(), 2, "cancelled drag reported");
     assert_eq!(h.state().viewer.tool(), Tool::Navigate);
+    assert_eq!(
+        centre_zoom(&h.state().viewer),
+        before,
+        "cancelled drag panned"
+    );
+    // The next drag pans again.
+    drag(&mut h, a, b);
+    assert_ne!(centre_zoom(&h.state().viewer).0, before.0);
 }
 
 #[test]

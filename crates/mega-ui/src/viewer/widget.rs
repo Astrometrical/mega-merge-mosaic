@@ -438,7 +438,10 @@ impl TiledViewer {
         rect: Rect,
         now: f64,
     ) -> Option<[f64; 4]> {
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ui.ctx().egui_wants_keyboard_input() {
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc && !ui.ctx().egui_wants_keyboard_input() {
+            // egui aborts the drag in progress on Escape too, so the rest
+            // of it is not a pan.
             self.set_tool(Tool::Navigate);
             return None;
         }

@@ -967,9 +967,12 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
 - **Blend ROIs and composition views** (phase 3): ROIs live in `ui.rois`
   (name, note, sky corners when the frame has a WCS, canvas rect), are
   reprojected through the current frame on a worker, and show their size
-  and the fraction of fresh level-0 tiles. Blend ROI blends the selected
-  ROI once per group of the view. Composition views mix each member
-  group's tiles (through its own Blend stretch) on the viewer's loader
-  threads (`CompositeTileSource`); members must share one canvas.
+  and the fraction of fresh level-0 tiles per group of the view. Blend ROI
+  blends the selected ROI once per group of the view (not while the ROIs
+  are being reprojected); Blend whole mosaic blends every group.
+  Composition views mix each member group's tiles (through its own Blend
+  stretch) on the viewer's loader threads (`CompositeTileSource`); members
+  must share one canvas, and a member not blended yet adds nothing and is
+  named above the image.
 - **Not yet built:** export from the tile store, packaging and signing
   (later plans). The Panels and Plan tabs are built (phase 3).

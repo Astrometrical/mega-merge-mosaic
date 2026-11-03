@@ -5,16 +5,18 @@
 //!   [`crate::compositions`]). A composition view mixes its groups' results
 //!   in a [`CompositeTileSource`], each through that group's own Blend
 //!   display stretch; the side panel's stretch and health are those of one
-//!   member ("Stretch of"). Groups on different canvases cannot be mixed:
+//!   member ("Stretch of"). A group not blended yet adds nothing and is
+//!   named above the image; groups on different canvases cannot be mixed:
 //!   the view says why instead.
 //! - **ROIs** ([`crate::rois`]): drawn on the canvas with the viewer's draw
 //!   tool ("+ new ROI"), named, noted, selected (the viewer zooms to it)
 //!   and deleted; kept in `MosaicConfig.ui`. Reading the frame and
 //!   reprojecting them (sky ↔ canvas) and counting how many of an ROI's
-//!   level-0 tiles are fresh run on workers. **Blend ROI** starts one blend
-//!   of the selected ROI per group of the view (the job runner queues them;
-//!   newer work wins per group); **Blend whole mosaic** blends the view's
-//!   groups over the whole canvas.
+//!   level-0 tiles are fresh (per group of the view) run on workers
+//!   ([`RoiPanel`]). **Blend ROI** starts one blend of the selected ROI per
+//!   group of the view (the job runner queues them; newer work wins per
+//!   group), once the ROIs follow the current frame; **Blend whole
+//!   mosaic** blends every group over the whole canvas.
 //!
 //! Everything slow runs on background threads ([`Task`]): opening each
 //! result ([`open_result`]), the automatic display stretch statistics, the
@@ -60,12 +62,11 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 use mega_ui::theme::palette;
-use mega_ui::viewer::{Overlay, TileSource, TiledViewer, Tool};
+use mega_ui::viewer::{TileSource, TiledViewer};
 use mmm_core::health::{Health, health};
 use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
-use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 use mmm_core::stretch::StretchParams;
 use mmm_core::surfaces::Surfaces;
@@ -73,17 +74,13 @@ use serde_json::Value;
 
 use crate::compositions::{Composition, ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner};
-use crate::rois::{
-    Roi, canvas_rect, load_rois, reproject, roi_size_text, save_rois, unique_roi_name,
-};
+use crate::rois::{Roi, RoiPanel};
 use crate::session::OpenSession;
 use crate::stretch_panel::{
     BLEND_STRETCH_KEY, StretchChange, StretchState, channel_name, save_stretch_at,
     saved_stretch_at, stretch_panel,
 };
-use crate::tile_source::{
-    CompositeTileSource, MosaicTileSource, Opened, fresh_fraction, open_result,
-};
+use crate::tile_source::{CompositeTileSource, MosaicTileSource, Opened, open_result};
 
 /// Key in `MosaicConfig.ui` of the Blend view's display stretches, by group.
 pub const STRETCH_KEY: &str = BLEND_STRETCH_KEY;
@@ -315,9 +312,6 @@ impl Member {
 /// one of them changes.
 type ShownKey = (Vec<usize>, Vec<Option<(String, u32)>>);
 
-/// `(valid, total)` level-0 tiles of each ROI rect.
-type FreshCounts = Vec<([u64; 4], (usize, usize))>;
-
 /// The Blend tab's state for the open session.
 pub struct BlendTab {
     /// The view shown: a group or a composition.
@@ -348,20 +342,8 @@ pub struct BlendTab {
     loader_threads: usize,
     /// Drawn at least once.
     shown: bool,
-    /// The session's ROIs (`ui.rois`), loaded on the first frame.
-    rois: Vec<Roi>,
-    rois_loaded: bool,
-    /// The selected ROI.
-    roi_selected: Option<usize>,
-    /// A pending reprojection of the ROIs through the current frame: the
-    /// list it started from and the result.
-    roi_sync: Option<Task<(Vec<Roi>, Vec<Roi>)>>,
-    want_roi_sync: bool,
-    /// `(valid, total)` level-0 tiles of each ROI rect, over the view's
-    /// groups.
-    fresh: BTreeMap<[u64; 4], (usize, usize)>,
-    fresh_task: Option<Task<FreshCounts>>,
-    want_fresh: bool,
+    /// The session's ROIs and their workers.
+    rois: RoiPanel,
 }
 
 impl Default for BlendTab {
@@ -392,14 +374,7 @@ impl BlendTab {
                 .map_or(4, |n| n.get())
                 .clamp(2, 8),
             shown: false,
-            rois: Vec::new(),
-            rois_loaded: false,
-            roi_selected: None,
-            roi_sync: None,
-            want_roi_sync: false,
-            fresh: BTreeMap::new(),
-            fresh_task: None,
-            want_fresh: false,
+            rois: RoiPanel::default(),
         }
     }
 
@@ -431,7 +406,7 @@ impl BlendTab {
 
     /// The session's ROIs.
     pub fn rois(&self) -> &[Roi] {
-        &self.rois
+        self.rois.rois()
     }
 
     fn member(&self) -> Option<&Member> {
@@ -445,8 +420,7 @@ impl BlendTab {
         self.shown
             && self.results.values().all(Member::idle)
             && self.health_task.is_none()
-            && self.roi_sync.is_none()
-            && self.fresh_task.is_none()
+            && self.rois.idle()
             && self
                 .viewer
                 .as_ref()
@@ -509,7 +483,7 @@ impl BlendTab {
                 m.reopen = true;
             }
             self.want_health = true;
-            self.want_roi_sync = true;
+            self.rois.want_sync = true;
         } else if let Some(group) = self.blend_jobs.remove(&id) {
             if let Some(m) = self.results.get_mut(&group) {
                 match &m.source {
@@ -523,7 +497,7 @@ impl BlendTab {
             if self.group.as_ref() == Some(&group) {
                 self.want_health = true;
             }
-            self.want_fresh = true;
+            self.rois.want_fresh = true;
         }
     }
 
@@ -559,8 +533,7 @@ impl BlendTab {
             self.want_health = true;
         }
         if self.view.as_ref() != Some(&view) {
-            self.fresh.clear();
-            self.want_fresh = true;
+            self.rois.view_changed();
         }
         self.view = Some(view);
         self.members = members;
@@ -569,8 +542,7 @@ impl BlendTab {
     /// Show `view` from the next frame on (its groups are resolved then).
     pub fn select_view(&mut self, view: ViewKind) {
         if self.view.as_ref() != Some(&view) {
-            self.fresh.clear();
-            self.want_fresh = true;
+            self.rois.view_changed();
             self.view = Some(view);
         }
     }
@@ -612,11 +584,7 @@ impl BlendTab {
     pub fn ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession, jobs: &mut JobRunner) {
         let ctx = ui.ctx().clone();
         self.shown = true;
-        if !self.rois_loaded {
-            self.rois_loaded = true;
-            self.rois = load_rois(&session.mosaic.config.ui);
-            self.want_roi_sync = true;
-        }
+        self.rois.load_once(&session.mosaic.config.ui);
         let groups = group_names(session);
         let compositions = load_compositions(&session.mosaic.config.ui);
         match self.resolve_view(&groups, &compositions) {
@@ -650,7 +618,12 @@ impl BlendTab {
                     self.member_picker(ui);
                     self.stretch_ui(ui, session);
                     ui.add_space(16.0);
-                    self.rois_ui(ui, session);
+                    if self
+                        .rois
+                        .ui(ui, &mut session.mosaic.config.ui, self.viewer.as_mut())
+                    {
+                        self.save.touch();
+                    }
                     ui.add_space(16.0);
                     let r = self
                         .group
@@ -660,12 +633,18 @@ impl BlendTab {
                 });
             });
         let canvas = self.view_canvas();
-        let overlays = self.overlays();
+        let overlays = self.rois.overlays();
+        let notes = self.member_notes();
         let mut drawn = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| match &mut self.viewer {
                 Some(viewer) => {
+                    // A composition shows its blended groups; the others
+                    // are named here.
+                    for n in &notes {
+                        ui.label(RichText::new(n).small().color(palette::TEXT_MUTED));
+                    }
                     viewer.set_overlays(overlays);
                     drawn = viewer.show(ui).drawn_rect;
                 }
@@ -689,6 +668,9 @@ impl BlendTab {
         if self.members.is_empty() {
             return "This composition maps no groups.".into();
         }
+        if let Some(why) = &self.view_problem {
+            return why.clone();
+        }
         let single = self.members.len() == 1;
         for g in &self.members {
             let Some(m) = self.results.get(g) else {
@@ -705,7 +687,29 @@ impl BlendTab {
                 };
             }
         }
-        self.view_problem.clone().unwrap_or_default()
+        String::new()
+    }
+
+    /// In a composition view, a note for each group without an open
+    /// result ("OIII: Not blended yet.").
+    fn member_notes(&self) -> Vec<String> {
+        if self.members.len() < 2 {
+            return Vec::new();
+        }
+        self.members
+            .iter()
+            .filter_map(|g| {
+                let m = self.results.get(g)?;
+                if m.source.is_some() {
+                    return None;
+                }
+                let why = match &m.absent {
+                    Some(why) if m.opening.is_none() && !m.reopen => why.as_str(),
+                    _ => "opening the result…",
+                };
+                Some(format!("{g}: {why}"))
+            })
+            .collect()
     }
 
     /// The view's canvas size (from its open results).
@@ -718,28 +722,6 @@ impl BlendTab {
                 (g.width, g.height)
             })
             .next()
-    }
-
-    /// The ROIs as viewer overlays: the selected one solid in the accent
-    /// colour, the others dashed.
-    fn overlays(&self) -> Vec<Overlay> {
-        self.rois
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let selected = self.roi_selected == Some(i);
-                Overlay {
-                    rect: r.canvas.map(|v| v as f64),
-                    color: if selected {
-                        palette::ACCENT_400
-                    } else {
-                        palette::TEXT_BODY
-                    },
-                    label: r.name.clone(),
-                    dashed: !selected,
-                }
-            })
-            .collect()
     }
 
     fn readiness(&self, session: &OpenSession) -> Readiness {
@@ -759,7 +741,9 @@ impl BlendTab {
         }
         self.follow_blend(ctx, jobs);
         self.poll_auto(session);
-        self.poll_rois(session);
+        if self.rois.poll(&mut session.mosaic.config.ui) {
+            self.save.touch();
+        }
         if let Some(task) = &self.health_task {
             match task.poll() {
                 Poll::Pending => {}
@@ -811,7 +795,18 @@ impl BlendTab {
                 });
             }
         }
-        self.start_roi_tasks(ctx, session);
+        let members = self
+            .members
+            .iter()
+            .map(|g| {
+                (
+                    g.clone(),
+                    self.results.get(g).and_then(|m| m.source.clone()),
+                )
+            })
+            .collect();
+        self.rois
+            .start_tasks(ctx, session.mosaic.dir.join(FRAME_FILE), members);
         let now = Instant::now();
         if self.save.due(now) {
             self.save.saved(now);
@@ -889,8 +884,10 @@ impl BlendTab {
         }
         let source_of = |g: &String| self.results.get(g).and_then(|m| m.source.clone());
         self.view_problem = None;
+        // A group view needs its result; a composition shows the members
+        // that have one (a missing member adds nothing to a tile).
         let wanted: Option<Arc<dyn TileSource>> = match &self.view {
-            _ if key.0.contains(&0) || key.0.is_empty() => None,
+            _ if key.0.iter().all(|&p| p == 0) => None,
             Some(ViewKind::Group(g)) => source_of(g).map(|s| s as Arc<dyn TileSource>),
             Some(ViewKind::Composition(i)) => {
                 let channels: Vec<Option<(Arc<MosaicTileSource>, f32)>> = compositions
@@ -918,7 +915,7 @@ impl BlendTab {
             (Some(src), Some(v)) => v.set_source(src),
             (Some(src), None) => self.viewer = Some(TiledViewer::new(src, self.loader_threads)),
         }
-        self.want_fresh = true;
+        self.rois.want_fresh = true;
     }
 
     /// Follow the running blend of a group of the view: bump its source's
@@ -943,7 +940,7 @@ impl BlendTab {
             None if m.opening.is_none() => m.reopen = true,
             None => {}
         }
-        self.want_fresh = true;
+        self.rois.want_fresh = true;
     }
 
     /// Apply finished automatic stretches (unless the user has set one
@@ -979,140 +976,42 @@ impl BlendTab {
         }
     }
 
-    /// A rectangle drawn on the canvas (image coordinates of a
-    /// `canvas`-sized result) becomes a new ROI, selected and saved; its
-    /// sky corners follow from the ROI sync.
+    /// A rectangle drawn on the canvas becomes a new ROI, selected and
+    /// saved (debounced).
     fn on_drawn(&mut self, session: &mut OpenSession, r: [f64; 4], canvas: (u64, u64)) {
-        let Some(rect) = canvas_rect(r, canvas) else {
-            return;
-        };
-        let taken: Vec<String> = self.rois.iter().map(|r| r.name.clone()).collect();
-        self.rois.push(Roi {
-            name: unique_roi_name(&taken),
-            note: String::new(),
-            sky: None,
-            canvas: rect,
-        });
-        self.roi_selected = Some(self.rois.len() - 1);
-        self.rois_changed(session);
-        self.want_roi_sync = true;
-    }
-
-    /// The ROI list changed: keep it in the session's `ui` and save soon.
-    fn rois_changed(&mut self, session: &mut OpenSession) {
-        save_rois(&mut session.mosaic.config.ui, &self.rois);
-        self.save.touch();
-        self.want_fresh = true;
-    }
-
-    /// Start the ROI sync (frame read and reprojection) and freshness
-    /// counts on workers when asked for.
-    fn start_roi_tasks(&mut self, ctx: &egui::Context, session: &OpenSession) {
-        if self.want_roi_sync && self.roi_sync.is_none() {
-            self.want_roi_sync = false;
-            if !self.rois.is_empty() {
-                let snapshot = self.rois.clone();
-                let path = session.mosaic.dir.join(FRAME_FILE);
-                self.roi_sync = Task::spawn("mmm-roi-sync", ctx, move || {
-                    let frame = ReferenceFrame::load(&path).ok();
-                    let out = reproject(&snapshot, frame.as_ref());
-                    (snapshot, out)
-                });
-            }
-        }
-        if self.want_fresh && self.fresh_task.is_none() {
-            self.want_fresh = false;
-            let sources: Vec<Arc<MosaicTileSource>> = self
-                .members
-                .iter()
-                .filter_map(|g| self.results.get(g)?.source.clone())
-                .collect();
-            let rects: Vec<[u64; 4]> = self.rois.iter().map(|r| r.canvas).collect();
-            if sources.is_empty() || rects.is_empty() {
-                self.fresh.clear();
-            } else {
-                // The task holds the sources: a member given up meanwhile
-                // stays tracked in `retired` until it ends.
-                self.fresh_task = Task::spawn("mmm-roi-fresh", ctx, move || {
-                    rects
-                        .into_iter()
-                        .map(|r| {
-                            let n = sources.iter().fold((0, 0), |(v, t), s| {
-                                let (sv, st) = s.fresh_counts(r);
-                                (v + sv, t + st)
-                            });
-                            (r, n)
-                        })
-                        .collect()
-                });
-            }
-        }
-    }
-
-    /// Apply finished ROI sync and freshness tasks.
-    fn poll_rois(&mut self, session: &mut OpenSession) {
-        if let Some(task) = &self.roi_sync {
-            match task.poll() {
-                Poll::Pending => {}
-                Poll::Lost => self.roi_sync = None,
-                Poll::Done((snapshot, out)) => {
-                    self.roi_sync = None;
-                    // Apply to the ROIs still as they were (the user may
-                    // have drawn or deleted meanwhile); names and notes
-                    // are the user's and stay.
-                    let mut changed = false;
-                    for roi in &mut self.rois {
-                        let Some(j) = snapshot
-                            .iter()
-                            .position(|s| s.sky == roi.sky && s.canvas == roi.canvas)
-                        else {
-                            continue;
-                        };
-                        if (out[j].sky, out[j].canvas) != (roi.sky, roi.canvas) {
-                            roi.sky = out[j].sky;
-                            roi.canvas = out[j].canvas;
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        self.rois_changed(session);
-                    }
-                }
-            }
-        }
-        if let Some(task) = &self.fresh_task {
-            match task.poll() {
-                Poll::Pending => {}
-                Poll::Lost => self.fresh_task = None,
-                Poll::Done(counts) => {
-                    self.fresh_task = None;
-                    self.fresh = counts.into_iter().collect();
-                }
-            }
+        if self.rois.on_drawn(&mut session.mosaic.config.ui, r, canvas) {
+            self.save.touch();
         }
     }
 
     /// Blend the selected ROI for each group of the view (newer work wins
-    /// per group in the job runner).
+    /// per group in the job runner). Not while the ROIs are being
+    /// reprojected: the rect may still be from an older frame.
     fn blend_roi(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
-        let Some(rect) = self
-            .roi_selected
-            .and_then(|i| self.rois.get(i))
-            .map(|r| r.canvas)
-        else {
+        if !self.rois.synced() {
+            return;
+        }
+        let Some(rect) = self.rois.selected_rect() else {
             return;
         };
-        self.blend_view(session, jobs, Some(rect));
+        self.blend_groups(session, jobs, self.members.clone(), Some(rect));
     }
 
-    /// Blend `rect` (`None`: the whole canvas) of every group of the view.
-    fn blend_view(
+    /// Blend every group of the mosaic over the whole canvas (spec §5.4).
+    fn blend_whole(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        let groups = group_names(session);
+        self.blend_groups(session, jobs, groups, None);
+    }
+
+    /// Blend `rect` (`None`: the whole canvas) of each of `groups`.
+    fn blend_groups(
         &mut self,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
+        groups: Vec<String>,
         rect: Option<[u64; 4]>,
     ) {
-        for g in self.members.clone() {
+        for g in groups {
             let id = jobs.start_blend(session, &g, rect);
             self.blend_jobs.insert(id, g);
         }
@@ -1170,16 +1069,25 @@ impl BlendTab {
                 self.analyze_job = Some(jobs.start_analyze(session));
             }
             let can_blend = self.can_blend(readiness);
+            let all_ready = groups
+                .iter()
+                .all(|g| group_readiness(session, g) == Readiness::Analyzed);
             if ui
-                .add_enabled(can_blend, egui::Button::new("Blend whole mosaic"))
-                .on_hover_text("Blend this view's groups over the whole canvas")
+                .add_enabled(
+                    can_blend && all_ready,
+                    egui::Button::new("Blend whole mosaic"),
+                )
+                .on_hover_text("Blend every group over the whole canvas")
                 .clicked()
             {
-                self.blend_view(session, jobs, None);
+                self.blend_whole(session, jobs);
             }
-            let has_roi = self.roi_selected.is_some_and(|i| i < self.rois.len());
+            let has_roi = self.rois.selected_rect().is_some();
             if ui
-                .add_enabled(can_blend && has_roi, egui::Button::new("Blend ROI"))
+                .add_enabled(
+                    can_blend && has_roi && self.rois.synced(),
+                    egui::Button::new("Blend ROI"),
+                )
                 .on_hover_text("Blend the selected region of interest for this view's groups")
                 .on_disabled_hover_text(if has_roi {
                     "Blending is not possible right now"
@@ -1305,93 +1213,6 @@ impl BlendTab {
         m.auto = Task::spawn("mmm-auto-stretch", ctx, move || src.auto(linked));
         // A linked result is saved when it arrives (see `poll_auto`).
         m.save_auto_result = linked && m.auto.is_some();
-    }
-
-    /// The ROI list: new, select (zooms to it), rename, note, delete; each
-    /// with its size and how fresh the view's result is there.
-    fn rois_ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession) {
-        ui.label(RichText::new("Regions of interest").color(palette::TEXT_STRONG));
-        let drawing = self
-            .viewer
-            .as_ref()
-            .is_some_and(|v| v.tool() == Tool::DrawRect);
-        if ui
-            .add_enabled(
-                self.viewer.is_some() && !drawing,
-                egui::Button::new("+ new ROI"),
-            )
-            .on_hover_text("Drag a rectangle on the image")
-            .on_disabled_hover_text("Shown once there is a result to draw on")
-            .clicked()
-            && let Some(v) = &mut self.viewer
-        {
-            v.set_tool(Tool::DrawRect);
-        }
-        let muted = |ui: &mut egui::Ui, t: &str| {
-            ui.label(RichText::new(t).small().color(palette::TEXT_MUTED));
-        };
-        if drawing {
-            muted(ui, "Drag on the image to draw; Esc cancels.");
-        }
-        if self.rois.is_empty() {
-            muted(ui, "None yet.");
-            return;
-        }
-        let mut select = None;
-        let mut delete = None;
-        let mut edited = false;
-        for i in 0..self.rois.len() {
-            let selected = self.roi_selected == Some(i);
-            ui.push_id(("roi", i), |ui| {
-                let roi = &mut self.rois[i];
-                if ui.selectable_label(selected, &roi.name).clicked() {
-                    select = Some(i);
-                }
-                let fresh = match self.fresh.get(&roi.canvas).copied().map(fresh_fraction) {
-                    _ if self.viewer.is_none() => "not blended".to_string(),
-                    None => "…".to_string(),
-                    Some(None) => "no tiles".to_string(),
-                    Some(Some(f)) if f >= 1.0 => "fresh".to_string(),
-                    Some(Some(f)) => format!("stale ({:.0}% fresh)", (f * 100.0).floor()),
-                };
-                muted(ui, &format!("{} · {fresh}", roi_size_text(roi.canvas)));
-                if selected {
-                    ui.horizontal(|ui| {
-                        let l = ui.label(RichText::new("Name").color(palette::TEXT_BODY));
-                        edited |= ui
-                            .text_edit_singleline(&mut roi.name)
-                            .labelled_by(l.id)
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        let l = ui.label(RichText::new("Note").color(palette::TEXT_BODY));
-                        edited |= ui
-                            .text_edit_singleline(&mut roi.note)
-                            .labelled_by(l.id)
-                            .changed();
-                    });
-                    if ui.button("Delete").clicked() {
-                        delete = Some(i);
-                    }
-                } else if !roi.note.is_empty() {
-                    muted(ui, &roi.note);
-                }
-            });
-        }
-        if let Some(i) = select {
-            self.roi_selected = Some(i);
-            if let Some(v) = &mut self.viewer {
-                v.zoom_to_rect(self.rois[i].canvas.map(|c| c as f64));
-            }
-        }
-        if let Some(i) = delete {
-            self.rois.remove(i);
-            self.roi_selected = None;
-            edited = true;
-        }
-        if edited {
-            self.rois_changed(session);
-        }
     }
 
     fn health_ui(&self, ui: &mut egui::Ui, readiness: Readiness) {
