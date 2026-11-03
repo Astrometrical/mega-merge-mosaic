@@ -130,7 +130,12 @@ The workflow runs left to right across four steps:
    preview from groups. Previews and analysis run automatically a moment
    after any edit (an Auto-analyze toggle stops the analysis).
 3. **Blend** — a tiled, zoomable viewer with display stretch; blend the whole
-   mosaic or a sky-anchored region of interest (ROI).
+   mosaic or a sky-anchored region of interest (ROI). The **Blend settings**
+   panel edits the mosaic-wide `mmm` options (mode, feather, defect veto,
+   flatten; input, surface, gain). Changes are staged and say what they
+   cost before you **Apply**: blend options only make the existing result
+   stale (reblend to see them), analysis options rerun the analysis.
+   Options changed since the last blend are marked with a dot.
 4. **Export** — write a group's blended result as 32-bit float FITS or TIFF
    (linear, unclamped). It warns first if tiles are stale or missing. XISF
    export is not available yet.

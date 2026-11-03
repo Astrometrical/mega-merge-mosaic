@@ -5,6 +5,15 @@
 Groundwork for the standalone application; no change to any algorithm or
 to the output of existing commands.
 
+### Added (app)
+
+- **Blend settings in the app.** A Blend settings panel in the Blend tab
+  edits the mosaic-wide options (mode, feather, defect veto, flatten as
+  blend-local; input, surface, gain as global). Edits are staged with Apply
+  and Revert, state their cost first ("N of M tiles" go stale, or analysis
+  reruns), wait for running jobs to stop, and mark options changed since the
+  last blend. Groups with CLI overrides are named.
+
 ### Added (app phase 3)
 
 - **Panels, Plan and export in the app.** Panels tab (add files, optional
