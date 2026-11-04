@@ -47,6 +47,11 @@ impl<V> TileCache<V> {
             .is_some_and(|s| s.generation == generation)
     }
 
+    /// The generation `key` is cached at, if any (no LRU touch).
+    pub(crate) fn generation_of(&self, key: TileKey) -> Option<u64> {
+        self.map.get(&key).map(|s| s.generation)
+    }
+
     /// The cached entry for `key` at any generation, with that generation;
     /// marks it most recently used.
     pub(crate) fn get(&mut self, key: TileKey) -> Option<(u64, &V)> {
@@ -122,6 +127,8 @@ mod tests {
         c.insert(k(0), 1, "old");
         assert!(c.has_current(k(0), 1));
         assert!(!c.has_current(k(0), 2));
+        assert_eq!(c.generation_of(k(0)), Some(1));
+        assert_eq!(c.generation_of(k(1)), None);
         assert_eq!(c.get(k(0)), Some((1, &"old")));
         c.insert(k(0), 2, "new");
         assert_eq!(c.get(k(0)), Some((2, &"new")));

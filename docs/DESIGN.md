@@ -947,7 +947,12 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
 - **Viewer.** Reads the memory-mapped tile store while a blend writes it,
   picks a pyramid level from the zoom, shows stale tiles dimmed, and falls
   back to coarser ancestors while tiles load on loader threads (which wake
-  the UI with `request_repaint`).
+  the UI with `request_repaint`). Superseded work never delays current
+  work: the loader queue holds only the newest wanted set (uncached tiles
+  coarse to fine, then refreshes finest first), and each frame takes every
+  finished fetch but uploads at most 32 textures, current generation first;
+  a superseded result is uploaded only if it beats the cached fallback and
+  budget remains, otherwise it is dropped (never backlogged).
 - **Display stretch is CPU, per visible tile**, on the loader threads, not a
   GPU shader. This keeps the viewer renderer-agnostic and needs no paint
   callbacks; cost is screen-size work per slider change (may lag on 4K). A GPU

@@ -29,8 +29,12 @@ struct TestSource {
 
 impl TestSource {
     fn new(w: u64, h: u64) -> Arc<Self> {
+        Self::with_tile(w, h, 256)
+    }
+
+    fn with_tile(w: u64, h: u64, tile: u32) -> Arc<Self> {
         Arc::new(Self {
-            geom: PyramidGeometry::new(w, h, 256),
+            geom: PyramidGeometry::new(w, h, tile),
             generation: AtomicU64::new(1),
             all: Mutex::new(None),
             overrides: Mutex::new(HashMap::new()),
@@ -879,4 +883,80 @@ fn irregular_pointer_deltas_are_smoothed() {
     h.run();
     // The grabbed point ends under the pointer.
     assert!((drawn_point(&h, grabbed) - p).length() < 0.5);
+}
+
+/// Drawn-level tiles not yet cached at `generation`.
+fn fine_not_current(h: &mut Harness<'static, TiledViewer>, generation: u64) -> usize {
+    let (rect, now) = h.state().last_frame().unwrap();
+    let (_, fine) = h.state().fine_tiles(rect, now);
+    let v = h.state_mut();
+    fine.iter()
+        .filter(|&&k| !v.cache.has_current(k, generation))
+        .count()
+}
+
+#[test]
+fn superseded_results_never_delay_current_tiles() {
+    // Small tiles: far more wanted tiles than one frame's upload budget,
+    // like a 1080p viewer at 256-pixel tiles.
+    let src = TestSource::with_tile(20_000, 20_000, 128);
+    let mut h = harness(TiledViewer::new_synchronous(src.clone()));
+    h.run();
+    let (rect, now) = h.state().last_frame().unwrap();
+    let wanted = h.state().wanted_tiles(rect, now).len();
+    assert!(wanted > 2 * MAX_UPLOADS_PER_FRAME, "{wanted}");
+    assert!(wanted < DEFAULT_CAPACITY / 2, "{wanted}"); // no eviction churn
+    // A slider drag: a new generation every frame.
+    for _ in 0..30 {
+        src.bump();
+        h.step();
+    }
+    // Once it stops, the drawn tiles reach the final generation within
+    // about one upload cycle of the wanted set, not a backlog of every
+    // superseded generation's results.
+    let last = src.generation();
+    let cycle = wanted.div_ceil(MAX_UPLOADS_PER_FRAME) + 2;
+    let mut frames = 0;
+    while fine_not_current(&mut h, last) > 0 {
+        assert!(frames < 10 * cycle, "not settled after {frames} frames");
+        h.step();
+        frames += 1;
+    }
+    assert!(frames <= cycle, "{frames} frames > {cycle}");
+}
+
+#[test]
+fn rapid_generations_bound_fetches() {
+    // Loaders stuck in a slow fetch while the generation changes many
+    // times: superseded requests are dropped unfetched.
+    let src = Arc::new(GatedSource {
+        inner: TestSource::new(20_000, 20_000),
+        gate: Mutex::new(()),
+    });
+    let threads = 2;
+    let gate = src.gate.lock().unwrap();
+    let mut h = harness(TiledViewer::new(src.clone(), threads));
+    h.step();
+    let (rect, now) = h.state().last_frame().unwrap();
+    let wanted = h.state().wanted_tiles(rect, now).len();
+    for _ in 0..50 {
+        src.inner.bump();
+        h.step();
+    }
+    drop(gate);
+    let last = src.generation();
+    for _ in 0..4000 {
+        h.step();
+        if !h.state().is_loading() && fine_not_current(&mut h, last) == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(fine_not_current(&mut h, last), 0);
+    // The first generation's in-flight fetches plus the final set.
+    let fetched = src.inner.fetched().len();
+    assert!(
+        fetched <= wanted + threads,
+        "{fetched} > {wanted} + {threads}"
+    );
 }

@@ -2,10 +2,15 @@
 //!
 //! Tiles are fetched from a [`TileSource`] on background loader threads; the
 //! UI thread only queues requests, uploads finished tiles (bounded per frame)
-//! and draws. While a fine tile is not loaded, the nearest loaded ancestor's
+//! and draws. Superseded work is dropped as early as possible: the queue
+//! holds only the newest wanted set (older requests are never fetched), and
+//! a finished tile of a superseded generation never takes upload budget
+//! from the current one (at most it replaces an older fallback, and is
+//! dropped once over budget). While a fine tile is not loaded, the nearest loaded ancestor's
 //! sub-rect stands in for it, so zooming never shows holes.
 
-use std::collections::{HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -241,6 +246,8 @@ pub struct TiledViewer {
     cache: TileCache<CachedTile>,
     /// Requests queued, in flight or awaiting upload.
     requested: HashSet<Request>,
+    /// Finished fetches not uploaded yet: the newest per tile.
+    arrived: HashMap<TileKey, (u64, Fetched)>,
     /// Snap to the home view on the next frame (first frame, new geometry).
     needs_home: bool,
     commands: Vec<Command>,
@@ -275,6 +282,7 @@ impl TiledViewer {
             view: View::new(),
             cache: TileCache::new(DEFAULT_CAPACITY),
             requested: HashSet::new(),
+            arrived: HashMap::new(),
             needs_home: true,
             commands: Vec::new(),
             pixels_per_point: 1.0,
@@ -297,6 +305,7 @@ impl TiledViewer {
         self.source = source;
         self.cache.clear();
         self.requested.clear();
+        self.arrived.clear();
     }
 
     /// The current view.
@@ -404,7 +413,7 @@ impl TiledViewer {
         let wanted = self.wanted_tiles(rect, now);
         self.loader.set_ctx(ui.ctx());
         self.request(&wanted, generation);
-        let backlog = self.receive(ui.ctx());
+        let backlog = self.receive(ui.ctx(), generation);
         self.paint(&ui.painter_at(rect), rect, now, generation);
         self.paint_overlays(&ui.painter_at(rect), rect, now);
         self.overlay_buttons(ui, rect);
@@ -564,30 +573,71 @@ impl TiledViewer {
         }
     }
 
+    /// Fetch and upload order of `key`: tiles with nothing cached first,
+    /// coarse to fine (coverage), then refreshes of cached tiles, finest
+    /// first (a cached fine tile is what shows; its ancestors are only
+    /// fallbacks).
+    fn priority(&self, key: TileKey) -> (bool, i64) {
+        let level = i64::from(key.level);
+        match self.cache.generation_of(key) {
+            None => (false, -level),
+            Some(_) => (true, level),
+        }
+    }
+
     /// Replace the loader queue with the wanted tiles not yet loaded at
-    /// `generation` (requests no longer wanted are dropped unfetched).
+    /// `generation` (requests no longer wanted, or of an older generation,
+    /// are dropped unfetched), in [`Self::priority`] order.
     fn request(&mut self, wanted: &[TileKey], generation: u64) {
         for r in self.loader.take_queue() {
             self.requested.remove(&r);
         }
-        let new: Vec<Request> = wanted
+        let mut new: Vec<Request> = wanted
             .iter()
             .map(|&k| (k, generation))
             .filter(|r| !self.cache.has_current(r.0, generation) && !self.requested.contains(r))
             .collect();
+        new.sort_by_key(|r| self.priority(r.0)); // stable: keeps the grid order
         self.requested.extend(new.iter().copied());
         self.loader.set_queue(new);
     }
 
-    /// Upload finished tiles, at most [`MAX_UPLOADS_PER_FRAME`] textures.
-    /// Returns true if the cap was hit (more results may be waiting).
-    fn receive(&mut self, ctx: &egui::Context) -> bool {
+    /// Take every finished fetch and upload at most
+    /// [`MAX_UPLOADS_PER_FRAME`] textures: the current `generation` first
+    /// (in [`Self::priority`] order), then superseded results newer than
+    /// what is cached (a better fallback). Current results over budget wait
+    /// for the next frame; superseded ones over budget are dropped, so they
+    /// never pile up ahead of current work. Returns true if results wait.
+    fn receive(&mut self, ctx: &egui::Context, generation: u64) -> bool {
+        // Draining is cheap (no upload): keep only the newest per tile.
+        while let Ok((key, g, fetched)) = self.loader.rx.try_recv() {
+            if self.arrived.get(&key).is_some_and(|(old, _)| *old > g) {
+                self.requested.remove(&(key, g));
+                continue;
+            }
+            if let Some((old, _)) = self.arrived.insert(key, (g, fetched))
+                && old != g
+            {
+                self.requested.remove(&(key, old));
+            }
+        }
+        let mut order: Vec<Request> = self.arrived.iter().map(|(&k, &(g, _))| (k, g)).collect();
+        order.sort_by_key(|&(k, g)| (g != generation, Reverse(g), self.priority(k), k));
         let mut uploads = 0;
-        while uploads < MAX_UPLOADS_PER_FRAME {
-            let Ok((key, generation, fetched)) = self.loader.rx.try_recv() else {
-                break;
+        for (key, g) in order {
+            let costs = !matches!(self.arrived.get(&key), Some((_, Fetched::Missing)));
+            let fits = !costs || uploads < MAX_UPLOADS_PER_FRAME;
+            if !fits && g == generation {
+                continue; // current: next frame
+            }
+            let Some((_, fetched)) = self.arrived.remove(&key) else {
+                continue;
             };
-            self.requested.remove(&(key, generation));
+            self.requested.remove(&(key, g));
+            let newer = self.cache.generation_of(key).is_none_or(|c| c < g);
+            if !fits || !newer {
+                continue; // superseded and over budget, or no better
+            }
             let mut upload = |img: egui::ColorImage| {
                 uploads += 1;
                 let name = format!("tile-{}-{}-{}", key.level, key.tx, key.ty);
@@ -607,9 +657,9 @@ impl TiledViewer {
                     stale: false,
                 },
             };
-            self.cache.insert(key, generation, tile);
+            self.cache.insert(key, g, tile);
         }
-        uploads >= MAX_UPLOADS_PER_FRAME
+        !self.arrived.is_empty()
     }
 
     /// Image rect (level-0 pixels) covered by `key`.

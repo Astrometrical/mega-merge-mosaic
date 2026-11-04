@@ -528,3 +528,52 @@ fn linked_auto_stretch_ignores_empty_channels() {
     assert_eq!(linked, vec![unlinked[0]; 3]);
     assert_ne!(unlinked[0], unlinked[1]);
 }
+
+#[test]
+fn converter_drops_superseded_epochs() {
+    // A stretch slider drag: a new epoch per frame, each resending every
+    // conversion. Superseded jobs are skipped unconverted, so the work is
+    // about one epoch's worth, not one per step.
+    let ctx = egui::Context::default();
+    let conv = Converter::start(&ctx).expect("converter");
+    let side = 256u32;
+    let preview = Arc::new(Preview {
+        path: PathBuf::from("p.xisf"),
+        rect: [0.0, 0.0, f64::from(side), f64::from(side)],
+        width: side,
+        height: side,
+        channels: 3,
+        data: vec![0.25; 3 * (side * side) as usize],
+    });
+    let jobs = 16usize;
+    let epochs = 200u64;
+    for epoch in 1..=epochs {
+        conv.epoch.store(epoch, Ordering::Relaxed);
+        for i in 0..jobs {
+            let job = ConvertJob {
+                epoch,
+                key: TexKey {
+                    path: PathBuf::from(format!("{i}")),
+                    slot: None,
+                },
+                preview: Arc::clone(&preview),
+                mode: Mode::Native,
+                stretch: vec![crate::tile_source::LINEAR; 3],
+            };
+            conv.tx.send(job).unwrap();
+        }
+    }
+    let mut total = 0;
+    let mut current = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while current < jobs {
+        assert!(std::time::Instant::now() < deadline, "{current} of {jobs}");
+        if let Ok((epoch, _, _)) = conv.rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            total += 1;
+            current += usize::from(epoch == epochs);
+        }
+    }
+    // The final epoch plus whatever was mid-conversion when epochs moved.
+    let bound = jobs + 2 * MAX_CONVERTERS;
+    assert!(total <= bound, "{total} conversions > {bound}");
+}

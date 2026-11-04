@@ -7,6 +7,11 @@ to the output of existing commands.
 
 ### Fixed
 
+- **Display stretch slider lag.** Dragging a stretch slider in the Blend
+  view queued every intermediate stretch's tiles for upload (more finished
+  per frame than the 32 uploaded), so the final stretch appeared only after
+  that backlog drained. Superseded tiles are now dropped instead, and the
+  view settles on the final stretch within one load cycle.
 - **Zoomed-out views of an ROI re-blend.** After a settings change, blending
   an ROI updated only full-resolution tiles: parent (zoomed-out) tiles on
   the ROI's edge kept their old pixels and stayed invalid. Parents are now
