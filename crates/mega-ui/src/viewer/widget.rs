@@ -6,8 +6,13 @@
 //! holds only the newest wanted set (older requests are never fetched), and
 //! a finished tile of a superseded generation never takes upload budget
 //! from the current one (at most it replaces an older fallback, and is
-//! dropped once over budget). While a fine tile is not loaded, the nearest loaded ancestor's
-//! sub-rect stands in for it, so zooming never shows holes.
+//! dropped once over budget). While a fine tile is not loaded, the nearest
+//! loaded ancestor's sub-rect stands in for it, so zooming never shows
+//! holes.
+//!
+//! The tile cache grows with the wanted set (1.5x, from 512 up to
+//! [`MAX_CAPACITY`](super::cache::MAX_CAPACITY) tiles, about 512 MB of GPU textures at 256-pixel
+//! tiles) so a large viewport never evicts tiles it still draws.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -411,6 +416,8 @@ impl TiledViewer {
 
         let generation = self.source.generation();
         let wanted = self.wanted_tiles(rect, now);
+        self.cache
+            .ensure_capacity(DEFAULT_CAPACITY.max(wanted.len() * 3 / 2));
         self.loader.set_ctx(ui.ctx());
         self.request(&wanted, generation);
         let backlog = self.receive(ui.ctx(), generation);
@@ -576,12 +583,13 @@ impl TiledViewer {
     /// Fetch and upload order of `key`: tiles with nothing cached first,
     /// coarse to fine (coverage), then refreshes of cached tiles, finest
     /// first (a cached fine tile is what shows; its ancestors are only
-    /// fallbacks).
-    fn priority(&self, key: TileKey) -> (bool, i64) {
+    /// fallbacks), longest stale first within a level (so a long drag
+    /// refreshes every tile in turn, not the same top rows each frame).
+    fn priority(&self, key: TileKey) -> (bool, i64, u64) {
         let level = i64::from(key.level);
         match self.cache.generation_of(key) {
-            None => (false, -level),
-            Some(_) => (true, level),
+            None => (false, -level, 0),
+            Some(g) => (true, level, g),
         }
     }
 

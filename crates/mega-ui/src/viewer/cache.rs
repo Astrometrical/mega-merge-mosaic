@@ -6,6 +6,9 @@ use super::TileKey;
 
 /// Default cache capacity, in tiles.
 pub const DEFAULT_CAPACITY: usize = 512;
+/// Most tiles the cache ever grows to (see [`TileCache::ensure_capacity`]):
+/// about 512 MB of GPU textures at 256-pixel RGBA8 tiles (256 KB each).
+pub const MAX_CAPACITY: usize = 2048;
 
 struct Slot<V> {
     generation: u64,
@@ -32,6 +35,13 @@ impl<V> TileCache<V> {
             map: HashMap::new(),
             lru: BTreeMap::new(),
         }
+    }
+
+    /// Grow to hold at least `n` tiles (at most [`MAX_CAPACITY`]); never
+    /// shrinks. The viewer sizes the cache to its wanted set so a large
+    /// viewport does not evict tiles it still draws.
+    pub(crate) fn ensure_capacity(&mut self, n: usize) {
+        self.capacity = self.capacity.max(n.min(MAX_CAPACITY));
     }
 
     /// Number of cached tiles.
@@ -138,5 +148,20 @@ mod tests {
         assert_eq!(c.len(), 1);
         c.clear();
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn capacity_grows_to_a_ceiling_and_never_shrinks() {
+        let mut c = TileCache::new(1);
+        c.ensure_capacity(3);
+        for i in 0..3 {
+            c.insert(k(i), 1, ());
+        }
+        assert_eq!(c.len(), 3);
+        c.ensure_capacity(1);
+        c.insert(k(3), 1, ());
+        assert_eq!(c.len(), 3);
+        c.ensure_capacity(usize::MAX);
+        assert_eq!(c.capacity, MAX_CAPACITY);
     }
 }

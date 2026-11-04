@@ -960,3 +960,60 @@ fn rapid_generations_bound_fetches() {
         "{fetched} > {wanted} + {threads}"
     );
 }
+
+#[test]
+fn wanted_set_beyond_default_capacity_settles() {
+    // A 4K-like viewport: more wanted tiles than the default cache holds.
+    let src = TestSource::with_tile(20_000, 20_000, 64);
+    let mut h = harness(TiledViewer::new_synchronous(src.clone()));
+    let (rect, now) = {
+        h.step();
+        h.state().last_frame().unwrap()
+    };
+    let wanted = h.state().wanted_tiles(rect, now).len();
+    assert!(wanted > DEFAULT_CAPACITY, "{wanted}");
+    let g = src.generation();
+    for _ in 0..200 {
+        if !h.state().is_loading() && fine_not_current(&mut h, g) == 0 {
+            break;
+        }
+        h.step();
+    }
+    assert!(!h.state().is_loading());
+    assert_eq!(fine_not_current(&mut h, g), 0);
+    // Idle: nothing is fetched again.
+    let before = src.fetched().len();
+    for _ in 0..10 {
+        h.step();
+    }
+    assert_eq!(src.fetched().len(), before);
+}
+
+#[test]
+fn long_drag_refreshes_every_drawn_tile() {
+    // Only one upload budget of refreshes per frame: across a drag, the
+    // longest-stale tiles go first, so none stays at the first stretch.
+    let src = TestSource::with_tile(20_000, 20_000, 128);
+    let mut h = harness(TiledViewer::new_synchronous(src.clone()));
+    h.run();
+    let first = src.generation();
+    let (rect, now) = h.state().last_frame().unwrap();
+    let (_, fine) = h.state().fine_tiles(rect, now);
+    assert!(fine.len() > 2 * MAX_UPLOADS_PER_FRAME, "{}", fine.len());
+    let frames = fine.len().div_ceil(MAX_UPLOADS_PER_FRAME) + 1;
+    for _ in 0..frames {
+        src.bump();
+        h.step();
+    }
+    let v = h.state_mut();
+    let stuck = fine
+        .iter()
+        .filter(|&&k| v.cache.generation_of(k) == Some(first))
+        .count();
+    assert_eq!(
+        stuck,
+        0,
+        "{stuck} of {} drawn tiles never refreshed",
+        fine.len()
+    );
+}

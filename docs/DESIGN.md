@@ -952,7 +952,11 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   coarse to fine, then refreshes finest first), and each frame takes every
   finished fetch but uploads at most 32 textures, current generation first;
   a superseded result is uploaded only if it beats the cached fallback and
-  budget remains, otherwise it is dropped (never backlogged).
+  budget remains, otherwise it is dropped (never backlogged). Refreshes of
+  one level go longest-stale first, so a long drag cycles through every
+  tile. The tile cache grows with the wanted set (1.5x, 512 up to 2048
+  tiles, about 512 MB of GPU textures at 256-pixel RGBA8 tiles; it never
+  shrinks), so a 4K viewport does not evict tiles it still draws.
 - **Display stretch is CPU, per visible tile**, on the loader threads, not a
   GPU shader. This keeps the viewer renderer-agnostic and needs no paint
   callbacks; cost is screen-size work per slider change (may lag on 4K). A GPU

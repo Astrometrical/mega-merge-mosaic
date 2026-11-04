@@ -147,9 +147,18 @@ struct Converter {
 impl Converter {
     fn start(ctx: &egui::Context) -> Option<Self> {
         let (tx, jobs) = mpsc::channel::<ConvertJob>();
+        Self::start_on(ctx, tx, jobs, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Start the threads on `jobs` (fed by `tx`) at `epoch`.
+    fn start_on(
+        ctx: &egui::Context,
+        tx: Sender<ConvertJob>,
+        jobs: Receiver<ConvertJob>,
+        epoch: Arc<AtomicU64>,
+    ) -> Option<Self> {
         let (done, rx) = mpsc::channel::<Converted>();
         let jobs = Arc::new(Mutex::new(jobs));
-        let epoch = Arc::new(AtomicU64::new(0));
         let threads = std::thread::available_parallelism()
             .map_or(2, |n| n.get() / 2)
             .clamp(1, MAX_CONVERTERS);
