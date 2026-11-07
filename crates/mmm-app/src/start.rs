@@ -579,20 +579,39 @@ pub(crate) mod tests {
 
     /// A fresh, canonical temp folder; `tag` must be unique per test.
     pub(crate) fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mmm-app-{tag}-{}", std::process::id()));
+        fresh_dir(&std::env::temp_dir(), tag)
+    }
+
+    /// [`temp_dir`] for [`relative_to_cwd`], in the workspace's `target`: no
+    /// relative path crosses Windows drives, and the temp folder can be on
+    /// another drive than the checkout (it is on GitHub's Windows runners).
+    pub(crate) fn temp_dir_near_cwd(tag: &str) -> PathBuf {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
+        fresh_dir(&target, tag)
+    }
+
+    fn fresh_dir(parent: &Path, tag: &str) -> PathBuf {
+        let d = parent.join(format!("mmm-app-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.canonicalize().unwrap()
     }
 
-    /// `path` (absolute) as a path relative to the current directory.
+    /// `path` (canonical, on the current directory's drive) as a path
+    /// relative to the current directory.
     pub(crate) fn relative_to_cwd(path: &Path) -> PathBuf {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let shared = cwd
+            .components()
+            .zip(path.components())
+            .take_while(|(a, b)| a == b)
+            .count();
         let mut rel = PathBuf::new();
-        for _ in cwd.components().skip(1) {
+        for _ in cwd.components().skip(shared) {
             rel.push("..");
         }
-        rel.join(path.strip_prefix("/").unwrap())
+        rel.extend(path.components().skip(shared));
+        rel
     }
 
     /// Step `harness` until `done` holds (bounded: background threads).

@@ -133,9 +133,12 @@ fn add_files_dedupes() {
 
     // Dropped files: duplicates (also through a symlink) and non-panel
     // files are ignored.
-    let link = root.join("link-to-a.xisf");
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let link = {
+        let link = root.join("link-to-a.xisf");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        link
+    };
     #[cfg(not(unix))]
     let link = a.clone();
     h.input_mut().dropped_files = [b.clone(), link, c.clone(), files.join("notes.txt")]

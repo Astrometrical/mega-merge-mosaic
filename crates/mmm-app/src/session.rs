@@ -245,7 +245,7 @@ pub fn open_in_new_process(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::start::tests::{relative_to_cwd, temp_dir};
+    use crate::start::tests::{relative_to_cwd, temp_dir, temp_dir_near_cwd};
 
     #[test]
     fn create_then_open_roundtrip() {
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn relative_paths_become_absolute() {
-        let root = temp_dir("relative");
+        let root = temp_dir_near_cwd("relative");
         let dir = root.join("Rel.mmm-session");
         let rel = relative_to_cwd(&dir);
         assert!(rel.is_relative());

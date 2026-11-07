@@ -843,7 +843,9 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::*;
-    use crate::start::tests::{StubPicker, relative_to_cwd, step_until, temp_dir};
+    use crate::start::tests::{
+        StubPicker, relative_to_cwd, step_until, temp_dir, temp_dir_near_cwd,
+    };
 
     const CANVAS_W: u64 = crate::testutil::CANVAS.0;
 
@@ -922,7 +924,7 @@ mod tests {
 
     #[test]
     fn relative_path_is_absolute_and_reopen_refused() {
-        let root = temp_dir("shell-relative");
+        let root = temp_dir_near_cwd("shell-relative");
         let dir = root.join("Rel.mmm-session");
         crate::session::create_blocking(&dir).unwrap();
         let rel = relative_to_cwd(&dir);
