@@ -306,6 +306,14 @@ fn busy_session_is_not_the_hero() {
             .accesskit_node()
             .is_disabled()
     );
+    let before = std::fs::read(busy.join(CONFIG_FILE)).unwrap();
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.get_by_role(Role::MultilineTextInput)
+        .type_text("mine now");
+    pause(&mut h, 1.5);
+    assert_eq!(h.state().screen.notes.text, "");
+    assert_eq!(std::fs::read(busy.join(CONFIG_FILE)).unwrap(), before);
     let _ = std::fs::remove_dir_all(&root);
 }
 
