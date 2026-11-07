@@ -116,6 +116,7 @@ pub mod pyramid;
 pub mod reference;
 pub mod seam;
 pub mod session;
+pub mod session_summary;
 pub mod settings;
 pub mod stretch;
 pub mod summary;
