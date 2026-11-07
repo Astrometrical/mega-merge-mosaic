@@ -10,21 +10,12 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use egui::RichText;
 use mega_ui::brand::{self, BrandImages, LockupSize};
 use mega_ui::theme::palette;
-use serde::{Deserialize, Serialize};
 
 use crate::session::{SESSION_EXT, session_name};
 
-/// How many recent sessions are remembered.
-pub const MAX_RECENT: usize = 10;
+mod recent;
 
-/// A recently opened session, persisted through eframe storage.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecentEntry {
-    /// The session folder.
-    pub path: PathBuf,
-    /// When it was last opened, in seconds since the Unix epoch.
-    pub last_opened: u64,
-}
+pub use recent::{Library, RecentEntry};
 
 /// What the user asked the start screen for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +65,7 @@ struct NewForm {
 /// The start screen's state.
 pub struct StartScreen {
     picker: Arc<dyn FolderPicker>,
-    recent: Vec<RecentEntry>,
+    library: Library,
     missing: HashSet<PathBuf>,
     check: Option<Receiver<HashSet<PathBuf>>>,
     checked: bool,
@@ -91,11 +82,10 @@ pub struct StartScreen {
 impl StartScreen {
     /// A start screen listing `recent` (most recent first), with `picker`
     /// for the file dialogs.
-    pub fn new(mut recent: Vec<RecentEntry>, picker: Arc<dyn FolderPicker>) -> Self {
-        recent.truncate(MAX_RECENT);
+    pub fn new(recent: Vec<RecentEntry>, picker: Arc<dyn FolderPicker>) -> Self {
         StartScreen {
             picker,
-            recent,
+            library: Library::new(recent),
             missing: HashSet::new(),
             check: None,
             checked: false,
@@ -112,21 +102,13 @@ impl StartScreen {
 
     /// The recent sessions, most recent first.
     pub fn recent(&self) -> &[RecentEntry] {
-        &self.recent
+        self.library.entries()
     }
 
     /// Put `path` at the top of the recent sessions, opened at `now`
     /// (seconds since the Unix epoch).
     pub fn record_opened(&mut self, path: &Path, now: u64) {
-        self.recent.retain(|e| e.path != path);
-        self.recent.insert(
-            0,
-            RecentEntry {
-                path: path.to_path_buf(),
-                last_opened: now,
-            },
-        );
-        self.recent.truncate(MAX_RECENT);
+        self.library.record_opened(path, now);
         self.missing.remove(path);
     }
 
@@ -214,7 +196,12 @@ impl StartScreen {
     fn poll_background(&mut self, ctx: &egui::Context) {
         if !self.checked {
             self.checked = true;
-            let paths: Vec<PathBuf> = self.recent.iter().map(|e| e.path.clone()).collect();
+            let paths: Vec<PathBuf> = self
+                .library
+                .entries()
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
@@ -401,7 +388,7 @@ impl StartScreen {
     }
 
     fn recent_list(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<StartAction> {
-        if self.recent.is_empty() {
+        if self.library.entries().is_empty() {
             return None;
         }
         ui.label(RichText::new("Recent").color(palette::TEXT_STRONG));
@@ -409,7 +396,7 @@ impl StartScreen {
         let now = unix_now();
         let mut action = None;
         let mut remove = None;
-        for entry in &self.recent {
+        for entry in self.library.entries().to_vec() {
             let missing = self.missing.contains(&entry.path);
             let (name_color, text_color) = if missing {
                 (palette::TEXT_SUBTLE, palette::TEXT_SUBTLE)
@@ -445,7 +432,7 @@ impl StartScreen {
             ui.add_space(6.0);
         }
         if let Some(path) = remove {
-            self.recent.retain(|e| e.path != path);
+            self.library.remove(&path);
             self.missing.remove(&path);
         }
         action
@@ -598,6 +585,7 @@ pub(crate) mod tests {
         RecentEntry {
             path: path.to_path_buf(),
             last_opened: 1_700_000_000,
+            pinned: false,
         }
     }
 
