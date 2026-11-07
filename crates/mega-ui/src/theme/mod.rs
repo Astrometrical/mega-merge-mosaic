@@ -137,6 +137,15 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Dark, style::style());
 }
 
+/// Whether [`apply`]'s fonts are in use on `ctx`. Fonts set by `apply`
+/// take effect on the next frame, and egui panics if a widget asks for a
+/// family that isn't bound yet (e.g. [`fonts::semibold`]). Apps call
+/// `apply` before their first frame; test harnesses that build their own
+/// context check this and skip drawing for one frame.
+pub fn is_applied(ctx: &egui::Context) -> bool {
+    ctx.fonts(|f| f.definitions().families.contains_key(&fonts::semibold()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +213,20 @@ mod tests {
         let tint = Tone::Problem.tint();
         assert_eq!(tint.a(), 20);
         assert_eq!(Tone::from(Severity::Note), Tone::Warning);
+    }
+
+    #[test]
+    fn is_applied_once_fonts_have_loaded() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        assert!(!is_applied(&ctx));
+        apply(&ctx);
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        assert!(is_applied(&ctx));
     }
 
     #[test]
