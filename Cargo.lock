@@ -1542,6 +1542,7 @@ dependencies = [
  "egui_kittest",
  "png 0.17.16",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
