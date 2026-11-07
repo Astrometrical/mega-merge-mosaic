@@ -344,7 +344,7 @@ impl Shell {
             self.plan.view_key().map(str::to_string),
         );
         let counts = self.checks.counts(&session.mosaic.config);
-        self.summary.poll(session, counts, last_view);
+        self.summary.poll(ctx, session, counts, last_view);
     }
 
     /// The open session (the Panels, Plan and Blend tabs build on this).

@@ -148,9 +148,12 @@ impl SummaryWriter {
     }
 
     /// Take a finished write's outcome, notice changed inputs, and start a
-    /// write when dirty and none is running. Cheap; call every frame.
+    /// write when dirty and none is running. Cheap; call every frame. A
+    /// finished write asks `ctx` for one repaint, so a change that landed
+    /// meanwhile is flushed by the next frame's poll even when idle.
     pub fn poll(
         &mut self,
+        ctx: &egui::Context,
         session: &OpenSession,
         checks: Option<CheckCounts>,
         last_view: Option<String>,
@@ -194,6 +197,7 @@ impl SummaryWriter {
         let groups = session.groups.clone();
         let stamps = self.stamps.clone();
         let last = self.last.clone();
+        let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("mmm-summary".into())
@@ -217,16 +221,19 @@ impl SummaryWriter {
                 );
                 if last.as_ref().is_some_and(|l| same_facts(l, &summary)) {
                     let _ = tx.send(None);
+                    ctx.request_repaint();
                     return;
                 }
                 summary.written_at = unix_now();
                 match write_summary(&mosaic.dir, &summary) {
                     Ok(()) => {
                         let _ = tx.send(Some(summary));
+                        ctx.request_repaint();
                     }
                     Err(e) => {
                         tracing::warn!("cannot write the session summary: {e}");
                         let _ = tx.send(None);
+                        ctx.request_repaint();
                     }
                 }
             });
@@ -348,11 +355,11 @@ mod tests {
     }
 
     /// Poll `w` until no write runs and nothing is dirty, for up to 10 s.
-    fn settle(w: &mut SummaryWriter, s: &OpenSession) {
+    fn settle(w: &mut SummaryWriter, ctx: &egui::Context, s: &OpenSession) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         for _ in 0..3 {
             loop {
-                w.poll(s, None, None);
+                w.poll(ctx, s, None, None);
                 if !w.busy() {
                     break;
                 }
@@ -367,22 +374,24 @@ mod tests {
         let root = temp_dir("summary-poll");
         let s = crate::testutil::two_group_session(&root);
         let dir = s.mosaic.dir.clone();
+        let ctx = egui::Context::default();
         let mut w = SummaryWriter::new(None);
         w.record_blend("Ha", 111);
         w.record_export("Ha", 222);
-        settle(&mut w, &s);
+        settle(&mut w, &ctx, &s);
         let written = read_summary(&dir).unwrap();
         assert_eq!(written.groups[0].name, "Ha");
         assert_eq!(written.groups[0].blended_at, Some(111));
         assert_eq!(written.groups[0].exported_at, Some(222));
         assert_eq!(w.writes, 1);
+        assert!(ctx.has_requested_repaint(), "a finished write repaints");
         // Nothing changed: marking dirty and polling again writes nothing.
         w.mark_dirty();
-        settle(&mut w, &s);
+        settle(&mut w, &ctx, &s);
         assert_eq!(w.writes, 1, "unchanged facts are not rewritten");
         // A real change is written.
         w.record_blend("OIII", 333);
-        settle(&mut w, &s);
+        settle(&mut w, &ctx, &s);
         assert_eq!(w.writes, 2);
         assert_eq!(read_summary(&dir).unwrap().groups[1].blended_at, Some(333));
         let _ = std::fs::remove_dir_all(&root);
