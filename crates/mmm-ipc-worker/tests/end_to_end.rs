@@ -1367,7 +1367,9 @@ fn files_mode_announces_compressed_panel_decodes() {
         loop {
             match read_worker_frame(&mut child_stdout) {
                 Ok(Some(WorkerMsg::Progress { stage, done, total })) => {
-                    if stage.starts_with("Decoding compressed (zstd+sh) XISF panel") {
+                    if stage.starts_with("Decoding Float32 XISF panel")
+                        && stage.contains("(zstd+sh compressed)")
+                    {
                         assert_eq!((done, total), (1, 1), "a completed line");
                         notices.push(stage);
                     }

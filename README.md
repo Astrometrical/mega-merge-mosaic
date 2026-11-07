@@ -336,9 +336,12 @@ just scales accordingly — see the 2× drizzle row in the performance table.
   tile-compressed FITS (`.fz`), image data in extension
   HDUs, non-TAN projections, and TPV/PV distortion.
 - **Compressed XISF** panels are decoded once into the session directory
-  (`<session>/decoded/`, the uncompressed size: about 2 GB per full-canvas
-  colour panel) and reused by later runs; a notice on stderr says when this
+  (`<session>/decoded/`, the uncompressed size in the panel's own sample
+  format: about 2 GB per full-canvas Float32 colour panel, half that for
+  UInt16) and reused by later runs; a notice on stderr says when this
   happens. Without a session (`mmm info --stats`) they decode into memory.
+  Uncompressed panels of any sample format are read in place, with no
+  cache.
 - **Output:** 32-bit float FITS (plus autostretched 8-bit PNG previews).
 - **Linear data** is expected end-to-end; zero is the no-data sentinel
   (registered panels must keep their hard zero padding).

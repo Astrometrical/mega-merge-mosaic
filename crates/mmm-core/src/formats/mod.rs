@@ -120,9 +120,10 @@ impl InputPanel {
         }
     }
     /// The XISF panel when its planes are mapped zero-copy from the file;
-    /// `None` for FITS and for XISF panels that need decoding (compressed,
-    /// non-Float32, …), which read through
-    /// [`crate::panel_reader::PanelReader`] (backed by the decode cache).
+    /// `None` for FITS and for XISF panels whose stored samples are not
+    /// normalised f32 in place (compressed, UInt16, …), which read through
+    /// [`crate::panel_reader::PanelReader`] (converted on read, from the
+    /// decode cache when the block is compressed).
     pub fn as_xisf(&self) -> Option<&XisfPanel> {
         match self {
             Self::Xisf(p) if p.is_mapped() => Some(p),

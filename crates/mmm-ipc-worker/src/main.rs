@@ -188,7 +188,7 @@ fn run() -> mmm_core::Result<()> {
         Box::new(std::io::stdout()),
     )?;
 
-    // Files-mode XISF panels that cannot be mapped (compressed WBPP masters,
+    // Files-mode XISF panels that cannot be read in place (compressed WBPP masters,
     // …) are decoded once into the job's session. Announce each decode on
     // the PixInsight console: a Progress frame whose stage the host prints
     // verbatim (no protocol change), as one completed line.

@@ -270,8 +270,9 @@ fn lanczos3(t: f64) -> f64 {
 /// Rayon-parallel over output rows; the mapping is evaluated exactly per
 /// pixel. Errors when the panel's footprint misses the canvas entirely.
 ///
-/// XISF panels gather their source planes as an mmap'd zero-copy slice each;
-/// other formats stream through [`reproject_from_reader`], which materializes
+/// XISF panels mapped zero-copy gather their source planes as an mmap'd
+/// slice each; every other panel (FITS, or an XISF whose samples are
+/// converted on read) streams through [`reproject_from_reader`], which materializes
 /// the same planes from a [`PanelReader`] first and then shares this
 /// function's resampling core (`reproject_core`). The same core also serves
 /// IPC-served panels through that function.

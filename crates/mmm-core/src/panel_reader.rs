@@ -5,7 +5,9 @@
 //! store. Reprojected panels (phase 5) live as cropped caches in the session
 //! directory: raw planar f32 little-endian with the bbox's dimensions
 //! (`channels` planes × bbox height × bbox width, row-major top-down), also
-//! mmap'd. [`PanelReader::row`] presents both in canvas coordinates so the
+//! mmap'd. XISF samples that are not normalised f32 (UInt16, a `bounds`
+//! other than 0:1) and FITS panels are converted a band at a time.
+//! [`PanelReader::row`] presents all of them in canvas coordinates so the
 //! analyze scan and the blender never care which storage they are reading.
 
 use std::fs::File;
@@ -13,6 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use mpp_core::formats::SampleFormat;
+use mpp_core::formats::xisf::NativePlanes;
 use serde::{Deserialize, Serialize};
 
 use crate::band_cache::BandCache;
@@ -30,6 +34,11 @@ use crate::{Error, Result};
 /// trip to amortize (unlike IPC); 16 rows matches `blend`'s per-thread
 /// slice of a 256-row band.
 pub const FITS_BAND_ROWS: usize = 16;
+
+/// Rows per converted XISF band (see `NativeBacking` below): the same
+/// per-thread buffer as a FITS panel's, for the same reason — converting a
+/// stored sample is a multiply, with no per-call round trip to amortize.
+pub const XISF_BAND_ROWS: usize = FITS_BAND_ROWS;
 
 /// How a panel's pixel data is stored on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -67,8 +76,56 @@ pub enum PanelStorage {
 enum Backing {
     Xisf(XisfPanel),
     Cache(Mmap),
+    Native(NativeBacking),
     Ipc(IpcBacking),
     Fits(FitsBacking),
+}
+
+/// An XISF panel's samples in their stored format — in the file's own
+/// mapping, or in its decoded copy ([`crate::decoded`]) — converted to f32
+/// band-wise into the shared per-thread cache, as FITS rows are.
+struct NativeBacking {
+    panel: XisfPanel,
+    /// The decoded copy; `None` when the file's own block is native.
+    decoded: Option<Mmap>,
+    cache: BandCache,
+}
+
+impl NativeBacking {
+    /// Wraps `panel` and, when its block is not native in place, its
+    /// `decoded` copy, checked here once against the panel's geometry.
+    fn new(panel: XisfPanel, decoded: Option<Mmap>) -> Result<NativeBacking> {
+        if let Some(m) = &decoded {
+            panel.native_planes_in(m)?;
+        }
+        let canvas = (panel.width(), panel.height(), panel.channels());
+        Ok(NativeBacking {
+            cache: BandCache::new(canvas, XISF_BAND_ROWS),
+            panel,
+            decoded,
+        })
+    }
+
+    fn planes(&self) -> NativePlanes<'_> {
+        match &self.decoded {
+            None => self.panel.native_planes(),
+            Some(m) => self.panel.native_planes_in(m).ok(),
+        }
+        .expect("native planes checked at open")
+    }
+
+    /// One channel row of the panel, converting a fresh band on a cache miss.
+    fn row(&self, c: u64, y: u64) -> Option<(u64, &[f32])> {
+        self.cache.row(c, y, |y0, y1, buf| {
+            let planes = self.planes();
+            let (w, bh) = (planes.width() as usize, (y1 - y0) as usize);
+            for k in 0..planes.channels() {
+                let plane = &mut buf[k as usize * bh * w..(k as usize + 1) * bh * w];
+                planes.decode_rows(k, y0, bh, plane);
+            }
+            Ok(())
+        })
+    }
 }
 
 /// FITS rows decoded band-wise into the shared per-thread cache (see
@@ -104,15 +161,34 @@ impl FitsBacking {
 }
 
 /// The backing for an opened XISF panel: its own mmap when the planes are
-/// mapped zero-copy, else its planes decoded once into the session decode
-/// cache ([`crate::decoded`]) and mapped from there — the same raw planar
-/// layout a cropped cache uses, spanning the whole image.
+/// mapped zero-copy; its stored samples converted on read when its block is
+/// native in place (uncompressed, planar, little-endian) but not normalised
+/// f32; else its samples decoded once into the session decode cache
+/// ([`crate::decoded`]) and mapped from there — served as a cropped cache's
+/// raw planar f32 when they are normalised Float32 (a WBPP master), else
+/// converted on read.
 fn xisf_backing(x: XisfPanel) -> Result<Backing> {
     if x.is_mapped() {
-        Ok(Backing::Xisf(x))
-    } else {
-        Ok(Backing::Cache(crate::decoded::decoded_planes(&x)?))
+        return Ok(Backing::Xisf(x));
     }
+    if x.native_planes().is_some() {
+        return Ok(Backing::Native(NativeBacking::new(x, None)?));
+    }
+    let decoded = crate::decoded::decoded_planes(&x)?;
+    if normalised_f32(&x) {
+        Ok(Backing::Cache(decoded))
+    } else {
+        Ok(Backing::Native(NativeBacking::new(x, Some(decoded))?))
+    }
+}
+
+/// Whether `x`'s stored samples are the normalised values themselves:
+/// Float32 in 0:1 with no `offset`, so its decoded copy needs no conversion.
+fn normalised_f32(x: &XisfPanel) -> bool {
+    let h = x.header();
+    h.sample_format == SampleFormat::Float32
+        && h.effective_bounds() == (0.0, 1.0)
+        && h.offset == 0.0
 }
 
 /// Validates that an already-opened full-canvas panel's own geometry
@@ -251,15 +327,17 @@ impl PanelReader {
         }
     }
 
-    /// The first producer error latched while reading a band-cached (IPC- or
-    /// FITS-backed) panel, if any; always `None` for backings that can't
-    /// fail after `open` (mmap'd XISF/cache). Callers check this after a
+    /// The first producer error latched while reading a band-cached (IPC-,
+    /// FITS- or converted XISF-backed) panel, if any; always `None` for
+    /// backings that can't fail after `open` (mmap'd XISF/cache, and a
+    /// converted XISF's conversion cannot fail either). Callers check this after a
     /// scan/blend stage completes, since [`Self::row`] can't surface a
     /// [`Result`] through its `Option` signature.
     pub fn backing_error(&self) -> Option<Error> {
         match &self.backing {
             Backing::Ipc(ipc) => ipc.ipc_error(),
             Backing::Fits(f) => f.cache.error(),
+            Backing::Native(n) => n.cache.error(),
             Backing::Xisf(_) | Backing::Cache(_) => None,
         }
     }
@@ -278,7 +356,7 @@ impl PanelReader {
     /// canvas coordinates — `slice[i]` is canvas pixel `x0 + i`. Canvas rows
     /// outside the storage bbox return `None`.
     ///
-    /// For band-cached backings (IPC, FITS), a returned slice is valid only
+    /// For band-cached backings (IPC, FITS, converted XISF), a returned slice is valid only
     /// until the next `row` call on the same thread that lands in a
     /// different band; hold at most the rows of one band at a time — the
     /// pipeline's readers collect one row's channels and drop them before
@@ -297,6 +375,7 @@ impl PanelReader {
                 let start = c as usize * bw * bh + (canvas_y - y0) as usize * bw;
                 Some((x0, &plane[start..start + bw]))
             }
+            Backing::Native(n) => n.row(c, canvas_y),
             Backing::Ipc(ipc) => ipc.row(c, canvas_y),
             Backing::Fits(f) => f.row(c, canvas_y),
         }
@@ -315,6 +394,13 @@ impl PanelReader {
                 // No mmap to advise; bands are already fetched sequentially
                 // through the per-thread cache in `IpcBacking`.
             }
+            Backing::Native(n) => match &n.decoded {
+                None => n.panel.advise_sequential(),
+                Some(_m) => {
+                    #[cfg(unix)]
+                    let _ = _m.advise(memmap2::Advice::Sequential);
+                }
+            },
             Backing::Fits(f) => f.panel.advise_sequential(),
         }
     }
@@ -408,6 +494,121 @@ mod tests {
             matches!(r.backing, Backing::Xisf(_)),
             "served from its own mmap"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Writes a 40x150 RGB panel (rows across several bands) in
+    /// `sample_format` from its little-endian `data`, zstd+sh compressed
+    /// with `item`-byte shuffling or uncompressed.
+    fn native_panel(
+        path: &Path,
+        sample_format: &'static str,
+        data: Vec<u8>,
+        attrs: &str,
+        item: Option<usize>,
+    ) {
+        use mpp_core::formats::xisf_codec::Codec;
+        use mpp_core::testkit::{BlockSpec, ImageSpec, XisfBuilder};
+        XisfBuilder {
+            images: vec![ImageSpec {
+                geometry: (40, 150, 3),
+                sample_format,
+                data,
+                attrs: format!(r#"{attrs} colorSpace="RGB""#),
+                children: String::new(),
+                block: BlockSpec {
+                    codec: item.map(|i| (Codec::Zstd, Some(i), 1 << 20)),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        }
+        .write(path);
+    }
+
+    fn uint16_samples() -> Vec<u16> {
+        (0..40 * 150 * 3u32)
+            .map(|i| (i * 7919 % 65536) as u16)
+            .collect()
+    }
+
+    /// Every channel row's bits, channel-major.
+    fn all_rows(r: &PanelReader) -> Vec<Vec<u32>> {
+        (0..3)
+            .flat_map(|c| (0..150).map(move |y| (c, y)))
+            .map(|(c, y)| {
+                let (x0, row) = r.row(c, y).expect("in range");
+                assert_eq!(x0, 0);
+                row.iter().map(|v| v.to_bits()).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_uncompressed_uint16_panel_is_converted_in_place() {
+        let dir = tmpdir("u16raw");
+        let v = uint16_samples();
+        let path = dir.join("raw.xisf");
+        native_panel(
+            &path,
+            "UInt16",
+            v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+            "",
+            None,
+        );
+        let r = PanelReader::open_file(&path).unwrap();
+        assert!(
+            matches!(&r.backing, Backing::Native(n) if n.decoded.is_none()),
+            "read from its own mapping, no decode"
+        );
+        r.advise_sequential();
+        for (k, row) in all_rows(&r).iter().enumerate() {
+            for (x, &bits) in row.iter().enumerate() {
+                let want = v[k * 40 + x] as f32 / 65535.0;
+                assert!((f32::from_bits(bits) - want).abs() < 1e-6, "row {k} x {x}");
+            }
+        }
+        assert!(r.backing_error().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_compressed_uint16_panel_reads_as_its_uncompressed_twin() {
+        let dir = tmpdir("u16cmp");
+        let bytes: Vec<u8> = uint16_samples()
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let (cmp, raw) = (dir.join("cmp.xisf"), dir.join("raw.xisf"));
+        native_panel(&cmp, "UInt16", bytes.clone(), "", Some(2));
+        native_panel(&raw, "UInt16", bytes, "", None);
+        let a = PanelReader::open_file(&cmp).unwrap();
+        assert!(
+            matches!(&a.backing, Backing::Native(n) if n.decoded.is_some()),
+            "converted from its decoded copy"
+        );
+        let b = PanelReader::open_file(&raw).unwrap();
+        assert_eq!(all_rows(&a), all_rows(&b));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_float32_panel_with_wide_bounds_is_rescaled_never_served_raw() {
+        // Its stored samples are not the normalised values, so neither the
+        // file nor its decoded copy may be served zero-copy.
+        let dir = tmpdir("wide");
+        let v: Vec<f32> = (0..40 * 150 * 3u32)
+            .map(|i| (i % 97) as f32 / 48.5)
+            .collect();
+        for item in [None, Some(4)] {
+            let path = dir.join(format!("wide-{item:?}.xisf"));
+            let bytes = v.iter().flat_map(|s| s.to_le_bytes()).collect();
+            native_panel(&path, "Float32", bytes, r#" bounds="0:2""#, item);
+            let r = PanelReader::open_file(&path).unwrap();
+            assert!(matches!(r.backing, Backing::Native(_)), "{item:?}");
+            let halved: Vec<u32> = v.iter().map(|s| (s / 2.0).to_bits()).collect();
+            assert_eq!(all_rows(&r).concat(), halved, "{item:?}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

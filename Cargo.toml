@@ -21,7 +21,7 @@ mmm-core = { path = "crates/mmm-core" }
 # Pinned by rev; bump it deliberately. For co-development against a local
 # ../mega-pixel-processor checkout, override it in a (gitignored)
 # .cargo/config.toml -- see docs/DESIGN.md "Dependency on mpp-core".
-mpp-core = { git = "https://github.com/Astrometrical/mega-pixel-processor", rev = "3b7190e5fbf8ff6cd34c351096be59a24f89d24c", default-features = false }
+mpp-core = { git = "https://github.com/Astrometrical/mega-pixel-processor", rev = "40ae9745188f9ae0741f8b98e005676a2ce21687", default-features = false }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }

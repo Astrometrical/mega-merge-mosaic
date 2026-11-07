@@ -21,7 +21,8 @@ follow. Cross-platform; CPU-parallel via rayon now, wgpu compute later.
   is needed for uncompressed inputs; the source file *is* the random-access
   store. **Compressed inputs** (WBPP writes compressed masters, 2026) are
   decoded once into the session's decode cache and mapped from there — see
-  "Formats come from mpp-core" below.
+  "Formats come from mpp-core" below. An uncompressed integer panel (or one
+  whose `bounds` are not 0:1) is mapped too and converted on read.
 - Data may be raw stacks: no gradient removal, no color calibration. Panel
   background levels genuinely differ (2× between adjacent panels observed).
 
@@ -224,8 +225,9 @@ phase-3/4 guarantees and the pyramid's mid-frequency benefit are preserved
                       # + frame_imposed when a shared reference frame was adopted
   panels/<id>/summary.bin   # L8 planes: mean[ch] + coverage, f32
   panels/<id>/aligned.bin   # solved input only: reprojection cache (planar f32)
-  decoded/<key>.f32         # decode cache: non-mappable (e.g. compressed) XISF
-                            # panels decoded once, planar f32; deletable
+  decoded/<key>.<u16|f32|…> # decode cache: compressed, big-endian or interleaved
+                            # XISF panels decoded once, planar little-endian
+                            # in their own sample format; deletable
   analysis/overlap_graph.json
   analysis/photometry.json  # per-edge fits + global gains/offsets per channel
 <name>.mmm-frame.json # shared reference frame (mmm frame / batch), outside any session
@@ -565,7 +567,8 @@ Files path); spec:
 
 - **Reader** (`formats/fits.rs`): primary HDU, NAXIS 2/3 planar, BITPIX
   8/16/32/−32/−64; rows decoded on demand into the per-thread band cache
-  (`band_cache.rs`, shared with the IPC backing). Integer data normalized to
+  (`band_cache.rs`, shared with the IPC backing and with XISF panels
+  converted on read). Integer data normalized to
   [0, 1] by the type range after BZERO/BSCALE; NaN/Inf/BLANK → 0; negative
   integer samples → 0; float samples keep their sign.
   Extension HDUs, fpack, BITPIX 64 refused by name.
@@ -630,13 +633,29 @@ The value types crossing the PixInsight IPC (`FitsKeyword`, `XisfProperty`,
 `PropertyValue`) are mpp's, serde-identical to the former mmm ones
 (`tests/wire_golden.rs` pins the form in both repos).
 
-- **Decode cache.** An uncompressed full-canvas Float32 panel is still read
-  from its own mmap. Any other XISF panel is decoded once (`crate::decoded`)
-  into `<session>/decoded/<key>.f32` — written under a temporary name and
-  renamed, keyed by canonical path, size, mtime, image id and block checksum
-  — and served through `PanelReader`'s existing `Cache` backing, so analyze,
-  reprojection and blending are unchanged. Cost: time on first use and as
-  much disk as the decoded panel (a 2 GB panel → 2 GB cache).
+- **Decode cache.** An uncompressed full-canvas Float32 panel in 0:1 is
+  still read from its own mmap. Any other XISF panel that is uncompressed,
+  planar and little-endian (UInt8/16/32, Float64, a `bounds` other than 0:1,
+  an unaligned attachment) is read from its own mmap too, its samples
+  converted to f32 a band at a time through mpp-core's `NativePlanes`
+  (`PanelReader`'s `Native` backing, on the band cache FITS uses), to
+  `decode_into`'s exact values. Only a compressed, big-endian or interleaved
+  panel is decoded once (`crate::decoded`) into
+  `<session>/decoded/<key>.<u16|f32|…>`, planar and little-endian in its own
+  sample format — written under a temporary name and renamed, keyed by a
+  layout tag, canonical path, size, mtime, image id and block checksum.
+  Normalised Float32 (a WBPP master) is served from it through
+  `PanelReader`'s `Cache` backing as before, so analyze, reprojection and
+  blending are unchanged; anything else is converted on read like the
+  in-place case. Cost: time on first use and as much disk as the panel's
+  uncompressed samples (a 2 GB Float32 panel → 2 GB cache; a UInt16 one
+  half that). The layout tag (2026-10-30) means 1.7.0's caches, which held
+  normalised f32 for every format, are never read: a session from 1.7.0
+  decodes its compressed panels once more and leaves the old files behind
+  in `decoded/` (deletable). Known cost: a block read in place that
+  carries a checksum is hashed on every open, as the zero-copy Float32
+  block always was; 1.7.0 hashed an uncompressed integer panel once, at
+  its decode.
 - **Notice.** Every decode is announced: the CLI prints a boxed notice on
   stderr; the PixInsight worker sends it as a completed `Progress` frame,
   whose stage text the module prints verbatim on the console — no protocol

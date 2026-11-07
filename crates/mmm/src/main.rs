@@ -1074,13 +1074,18 @@ fn info_panel(path: &std::path::Path, stats: bool) -> anyhow::Result<()> {
                 .checksum
                 .as_ref()
                 .map_or("none", |c| c.algorithm.name());
+            let pixels = if x.is_mapped() {
+                "mapped (zero-copy)".to_string()
+            } else if x.native_planes().is_some() {
+                format!("{:?} in place, converted on read", h.sample_format)
+            } else {
+                format!(
+                    "{:?} decoded on first use (session decode cache)",
+                    h.sample_format
+                )
+            };
             println!(
-                "  XISF block: compression {compression}  checksum {checksum}  pixels {}",
-                if x.is_mapped() {
-                    "mapped (zero-copy)"
-                } else {
-                    "decoded on first use (session decode cache)"
-                }
+                "  XISF block: compression {compression}  checksum {checksum}  pixels {pixels}"
             );
         }
         InputPanel::Fits(f) => {

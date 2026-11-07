@@ -1,9 +1,10 @@
 //! Per-thread band cache shared by every [`crate::panel_reader::PanelReader`]
 //! backing that cannot hand out zero-copy rows (IPC-served and FITS
-//! panels). Rows are produced a *band* (`band_rows` canvas rows, all
-//! channels, planar) at a time into a buffer owned by the calling thread,
-//! because the producers are expensive per call (a blocking IPC round trip;
-//! a byte-swapping decode) and must not serialize concurrent callers.
+//! panels, and XISF panels whose samples are converted on read). Rows are
+//! produced a *band* (`band_rows` canvas rows, all channels, planar) at a
+//! time into a buffer owned by the calling thread, because the producers
+//! are expensive per call (a blocking IPC round trip; a byte-swapping
+//! decode) and must not serialize concurrent callers.
 
 use std::cell::UnsafeCell;
 use std::sync::Mutex;
@@ -212,7 +213,7 @@ impl BandCache {
     /// behavior; see the `unsafe impl Sync` justification above the type).
     /// A future backing that implements `fetch` as a closure over something
     /// more than a plain data source (an IPC link, a decoder) must uphold
-    /// this the same way `IpcBacking` and `FitsBacking` do today: `fetch`
+    /// this the same way `IpcBacking`, `FitsBacking` and `NativeBacking` do today: `fetch`
     /// touches only its own producer, never `self.cache`.
     pub(crate) fn row<F>(&self, c: u64, canvas_y: u64, fetch: F) -> Option<(u64, &[f32])>
     where

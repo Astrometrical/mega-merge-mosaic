@@ -3,7 +3,8 @@
 ## Unreleased
 
 Groundwork for the standalone application; no change to any algorithm or
-to the output of existing commands.
+to the output of existing commands, apart from the XISF decode notice and
+`mmm info` wording described under Changed.
 
 ### Fixed
 
@@ -75,6 +76,21 @@ to the output of existing commands.
 - **Concurrency hardening in `mmm-core`:** one writer per tile store
   (`Error::Busy`), busy-aware settings edits, `plan_analyze_with`,
   `invalidate_group`.
+
+### Changed
+
+- **The decode cache keeps each panel's own sample format.** A compressed
+  UInt16 panel is cached at its uncompressed size, half the former f32
+  copy, and converted to 32-bit float on read. An uncompressed panel of any
+  sample format (UInt8/16/32, Float64, or Float32 whose `bounds` aren't
+  `0:1`) is read in place with no cache, where 1.7.0 decoded it. Pixel
+  values are unchanged.
+- A session from 1.7.0 decodes its compressed panels once more: the cache
+  files 1.7.0 wrote are never read and can be deleted from
+  `<session>/decoded/`.
+- The decode notice names the sample format and the reason, for example
+  `Decoding Float32 XISF panel … (zstd+sh compressed) to …`, and `mmm info`
+  says how each XISF panel's pixels are read.
 
 ## 1.7.0 — 2026-10-29
 

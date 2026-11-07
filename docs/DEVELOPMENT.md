@@ -124,12 +124,6 @@ Seed list at open-sourcing time (file GitHub issues as these are picked up):
 - **`Error` enum needs a non-file variant before 1.0.** Both variants carry
   a `PathBuf`; validation errors with no natural file currently borrow a
   context path (`crates/mmm-core/src/error.rs`).
-- **FITS input not yet supported** — XISF only (FITS is output-only). The
-  `mmm info` help string still says "FITS/XISF"; fix alongside.
-- **Compressed XISF input not supported** — the reader mmaps the
-  uncompressed monolithic attachment directly; compressed inputs will need
-  a one-time decompress into a tile cache.
-- **SampleFormat: Float32 only** — UInt16/Float64 XISF inputs are rejected.
 - **GPU (wgpu) path** — planned; CPU/rayon only today.
 - **GUI** — planned; `mmm-core` is structured for it (see the API map in
   `crates/mmm-core/src/lib.rs`).

@@ -331,7 +331,7 @@ fn analyze_reads_compressed_xisf_and_says_so() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "analyze failed:\n{stderr}");
     assert!(
-        stderr.contains("Decoding compressed (zstd+sh) XISF panel a_00.xisf"),
+        stderr.contains("Decoding Float32 XISF panel a_00.xisf (zstd+sh compressed)"),
         "the decode is announced:\n{stderr}"
     );
     let cached: Vec<_> = std::fs::read_dir(session.join("decoded"))
@@ -352,7 +352,7 @@ fn analyze_reads_compressed_xisf_and_says_so() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "blend failed:\n{stderr}");
     assert!(
-        !stderr.contains("Decoding compressed"),
+        !stderr.contains("Decoding Float32 XISF panel"),
         "cache re-used:\n{stderr}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
@@ -738,5 +738,46 @@ fn export_warns_on_stale() {
             .arg(dir.join("x.png")),
     );
     assert!(err.contains("--format must be fits or tiff"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn info_says_how_each_xisf_panel_is_read() {
+    use mpp_core::formats::xisf_codec::Codec;
+    use mpp_core::testkit::{BlockSpec, ImageSpec, XisfBuilder};
+    let dir = tempdir("info-read");
+    let write = |name: &str, codec| {
+        let path = dir.join(name);
+        XisfBuilder {
+            images: vec![ImageSpec {
+                geometry: (8, 6, 1),
+                sample_format: "UInt16",
+                data: (0..48u16).flat_map(|v| (v * 1000).to_le_bytes()).collect(),
+                attrs: String::new(),
+                children: String::new(),
+                block: BlockSpec {
+                    codec,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        }
+        .write(&path);
+        path
+    };
+    let raw = write("raw.xisf", None);
+    let cmp = write("cmp.xisf", Some((Codec::Zstd, Some(2), 1 << 20)));
+    let out = run(mmm().arg("info").arg(&raw).arg("--stats"));
+    assert!(
+        out.contains("pixels UInt16 in place, converted on read"),
+        "{out}"
+    );
+    // 1000/65535 and 47000/65535: the samples normalised on read.
+    assert!(out.contains("min 0.015259  max 0.717174"), "{out}");
+    let out = run(mmm().arg("info").arg(&cmp));
+    assert!(
+        out.contains("pixels UInt16 decoded on first use (session decode cache)"),
+        "{out}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
