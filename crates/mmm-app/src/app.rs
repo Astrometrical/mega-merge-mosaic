@@ -13,7 +13,7 @@ use mega_ui::theme::palette;
 use crate::blend_tab::BlendTab;
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
-use crate::jobs::{JobEvent, JobRunner, JobTarget, PREVIEWS_LABEL};
+use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
 use crate::pipeline::{Pipeline, Step, auto_analyze, set_auto_analyze};
 use crate::plan_tab::{PlanFeed, PlanTab};
@@ -332,22 +332,11 @@ impl Shell {
         let editing = self.panels.has_pending() || self.blend.settings_editing(session);
         for event in &events {
             self.blend.on_event(event);
-            match event {
-                JobEvent::Finished { id, .. } => {
-                    self.summary.mark_dirty();
-                    match jobs.target(*id) {
-                        Some((JobTarget::Blend, group)) => {
-                            self.summary.record_blend(group, unix_now())
-                        }
-                        Some((JobTarget::Export, group)) => {
-                            self.summary.record_export(group, unix_now())
-                        }
-                        None => {}
-                    }
-                }
-                JobEvent::Failed { .. } => self.summary.mark_dirty(),
-                JobEvent::Preview(_) | JobEvent::Cancelled { .. } => {}
-            }
+            let target = match event {
+                JobEvent::Finished { id, .. } => jobs.target(*id),
+                _ => None,
+            };
+            self.summary.on_job_event(event, target, unix_now());
             let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
             let (text, color) = match event {
                 // Previews run by themselves and often: no notices but

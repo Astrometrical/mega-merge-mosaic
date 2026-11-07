@@ -3,12 +3,14 @@
 //! session's facts without opening it.
 //!
 //! [`SummaryWriter::poll`] runs each frame. It notices changes to what the
-//! summary shows (panels, groups, checks, canvas, last view) by itself, and
-//! the Shell marks it dirty when a job ends (a result changed). The work
+//! summary shows (panels, groups, checks, canvas, last view) and to the
+//! settings the results depend on (a settings edit marks them stale) by
+//! itself, and the Shell marks it dirty when a job ends, cancelled ones
+//! included ([`SummaryWriter::on_job_event`]: a result changed). The work
 //! (classifying each group's result store, writing the file) runs on a
 //! background thread; the UI thread does no file I/O.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -17,8 +19,10 @@ use mmm_core::mosaic::grouping::Groups;
 use mmm_core::session_summary::{
     GroupSummary, ResultState, SUMMARY_FORMAT, SessionSummary, result_state, write_summary,
 };
+use mmm_core::settings::{AnalyzeSettings, BlendSettings, GroupOverride};
 
 use crate::checks::CheckCounts;
+use crate::jobs::{JobEvent, JobTarget};
 use crate::session::OpenSession;
 use crate::start::unix_now;
 
@@ -67,8 +71,8 @@ pub fn summarize(
     }
 }
 
-/// What the summary shows apart from result states: a change to any of it
-/// marks the writer dirty.
+/// What the summary shows apart from result states, and the settings those
+/// states depend on: a change to any of it marks the writer dirty.
 #[derive(Clone, PartialEq)]
 struct Inputs {
     panels: usize,
@@ -76,6 +80,30 @@ struct Inputs {
     checks: Option<CheckCounts>,
     canvas: Option<(u64, u64)>,
     last_view: Option<String>,
+    settings: Settings,
+}
+
+/// The settings the group results depend on. Applying an edit
+/// ([`mmm_core::mosaic::set_settings`], a CLI override, an analysis
+/// planned) marks results stale on disk without any job ending, so a
+/// change here re-reads every group's result state.
+#[derive(Clone, PartialEq)]
+struct Settings {
+    analyze: AnalyzeSettings,
+    blend: BlendSettings,
+    overrides: BTreeMap<String, GroupOverride>,
+    needs_analyze: BTreeSet<String>,
+}
+
+impl Settings {
+    fn of(cfg: &MosaicConfig) -> Self {
+        Settings {
+            analyze: cfg.analyze.clone(),
+            blend: cfg.blend.clone(),
+            overrides: cfg.group_overrides.clone(),
+            needs_analyze: cfg.needs_analyze.clone(),
+        }
+    }
 }
 
 /// Writes the session's summary in the background when it has changed.
@@ -147,6 +175,27 @@ impl SummaryWriter {
         self.dirty = true;
     }
 
+    /// Note a job event: a finished blend or export (`target`) stamps its
+    /// group at `at` (unix seconds); a job that ended marks the writer
+    /// dirty (its result may have changed). A cancelled one too: discarding
+    /// a cancelled blend may invalidate its store (`jobs::discard_blend`),
+    /// and on Windows a store a blend holds reads as no result until the
+    /// blend lets go of it (see [`mmm_core::tiles::FileTileReader`]).
+    pub fn on_job_event(&mut self, event: &JobEvent, target: Option<(JobTarget, &str)>, at: u64) {
+        match event {
+            JobEvent::Finished { .. } => {
+                self.mark_dirty();
+                match target {
+                    Some((JobTarget::Blend, group)) => self.record_blend(group, at),
+                    Some((JobTarget::Export, group)) => self.record_export(group, at),
+                    None => {}
+                }
+            }
+            JobEvent::Failed { .. } | JobEvent::Cancelled { .. } => self.mark_dirty(),
+            JobEvent::Preview(_) => {}
+        }
+    }
+
     /// Take a finished write's outcome, notice changed inputs, and start a
     /// write when dirty and none is running. Cheap; call every frame. A
     /// finished write asks `ctx` for one repaint, so a change that landed
@@ -184,6 +233,7 @@ impl SummaryWriter {
             checks,
             canvas: session.canvas(),
             last_view,
+            settings: Settings::of(&session.mosaic.config),
         };
         if self.inputs.as_ref() != Some(&inputs) {
             self.inputs = Some(inputs.clone());
@@ -247,6 +297,8 @@ impl SummaryWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mmm_core::job::JobCtl;
+    use mmm_core::mosaic::{analyze_all, blend_group, invalidate_group, set_settings};
     use mmm_core::session_summary::read_summary;
 
     use crate::start::tests::temp_dir;
@@ -394,6 +446,54 @@ mod tests {
         settle(&mut w, &ctx, &s);
         assert_eq!(w.writes, 2);
         assert_eq!(read_summary(&dir).unwrap().groups[1].blended_at, Some(333));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A two-group session in `root`, analysed, with Ha blended.
+    fn ha_merged(root: &std::path::Path) -> OpenSession {
+        let mut s = crate::testutil::two_group_session(root);
+        s.groups = Some(analyze_all(&mut s.mosaic, &JobCtl::none()).unwrap());
+        blend_group(&mut s.mosaic, "Ha", None, &JobCtl::none()).unwrap();
+        s
+    }
+
+    /// The result state the written summary gives group `i`.
+    fn written_result(s: &OpenSession, i: usize) -> ResultState {
+        read_summary(&s.mosaic.dir).unwrap().groups[i].result
+    }
+
+    #[test]
+    fn settings_change_rewrites_stale_results() {
+        let root = temp_dir("summary-settings");
+        let mut s = ha_merged(&root);
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Complete);
+        // A blend-local change marks every result stale (no job ends).
+        let mut blend = s.mosaic.config.blend.clone();
+        blend.feather_px *= 2.0;
+        let analyze = s.mosaic.config.analyze.clone();
+        set_settings(&mut s.mosaic, analyze, blend).unwrap();
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Stale);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_job_rewrites_the_summary() {
+        let root = temp_dir("summary-cancelled");
+        let s = ha_merged(&root);
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Complete);
+        // A cancelled blend whose settings were superseded invalidates its
+        // store (`jobs::discard_blend`), then reports Cancelled.
+        invalidate_group(&s.mosaic, "Ha").unwrap();
+        w.on_job_event(&JobEvent::Cancelled { id: 1 }, None, 0);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Stale);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
