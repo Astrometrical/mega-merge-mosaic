@@ -239,11 +239,14 @@ impl Pending {
     }
 }
 
-/// Open `dir` in a new window: a new process of this executable (one
-/// session per window, spec §3). The child is reaped on a helper thread.
-pub fn open_in_new_process(dir: &Path) -> std::io::Result<()> {
+/// Open `session` in a new window: a new process of this executable (one
+/// session per window, spec §3); with `None` it starts on the start
+/// screen. The child is reaped on a helper thread.
+pub fn open_in_new_process(session: Option<&Path>) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    let mut child = std::process::Command::new(exe).arg(dir).spawn()?;
+    let mut command = std::process::Command::new(exe);
+    command.args(session);
+    let mut child = command.spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });

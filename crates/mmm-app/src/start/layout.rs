@@ -14,9 +14,9 @@ use mega_ui::brand::{BrandImages, LockupSize, lockup};
 use mega_ui::groups::{GROUP_PALETTE, physical_color};
 use mega_ui::icons;
 use mega_ui::theme::Tone;
-use mega_ui::theme::palette::{SURFACE_700, SURFACE_900, TEXT_EMPHASIS};
+use mega_ui::theme::palette::{SURFACE_900, TEXT_EMPHASIS};
 use mega_ui::theme::text::{Type, text};
-use mega_ui::theme::tokens::{CONTROL_HEIGHT, CONTROL_HEIGHT_LARGE, radius, space};
+use mega_ui::theme::tokens::{CONTROL_HEIGHT, CONTROL_HEIGHT_LARGE, space};
 use mega_ui::widgets::{
     ButtonKind, CARD_HEIGHT, CARD_WIDTH, MegaButton, SessionCardData, chip, icon_button_of,
     notes_field, overline, session_card, status, text_input,
@@ -26,7 +26,7 @@ use mmm_core::mosaic::SINGLE_GROUP;
 use super::facts::{Availability, CardFacts};
 use super::{
     Cmd, DialogPurpose, Drawn, StartScreen, Thumb, ago, card_look, count, display_path,
-    expand_home, new_session_dir, status_line, unix_now,
+    expand_home, status_line, unix_now,
 };
 use crate::session::SESSION_EXT;
 
@@ -226,7 +226,6 @@ impl StartScreen {
             });
         });
         self.typed_row(ui, enabled, out);
-        self.new_form_ui(ui, enabled, out);
         self.messages(ui);
     }
 
@@ -383,7 +382,12 @@ impl StartScreen {
             return;
         }
         ui.add_enabled_ui(enabled, |ui| {
-            let label = ui.label(text(Type::Small, "Session folder"));
+            let caption = if self.no_dialog {
+                "No dialog? Type a path"
+            } else {
+                "Session folder"
+            };
+            let label = ui.label(text(Type::Small, caption));
             ui.horizontal(|ui| {
                 let hint = format!("/path/to/Name.{SESSION_EXT}");
                 let field = stable(ui, Id::new("mmm-start-typed-path"), |ui| {
@@ -404,62 +408,6 @@ impl StartScreen {
                 }
             });
         });
-    }
-
-    /// The New mosaic form (parent folder and name), while open.
-    fn new_form_ui(&mut self, ui: &mut Ui, enabled: bool, out: &mut Drawn) {
-        let Some(form) = &mut self.new_form else {
-            return;
-        };
-        let mut browse = false;
-        ui.add_enabled_ui(enabled, |ui| {
-            egui::Frame::group(ui.style())
-                .fill(SURFACE_700)
-                .corner_radius(radius::CARD)
-                .inner_margin(space::M)
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = space::S;
-                    ui.label(text(Type::Heading, "Create a new mosaic"));
-                    let label = ui.label(text(Type::Small, "Parent folder"));
-                    ui.horizontal(|ui| {
-                        stable(ui, Id::new("mmm-start-new-parent"), |ui| {
-                            text_input(ui, &mut form.parent, "")
-                        })
-                        .labelled_by(label.id);
-                        browse = ui
-                            .add(MegaButton::new(ButtonKind::Secondary, "Browse…"))
-                            .clicked();
-                    });
-                    let label = ui.label(text(Type::Small, "Name"));
-                    stable(ui, Id::new("mmm-start-new-name"), |ui| {
-                        text_input(ui, &mut form.name, "e.g. Orion")
-                    })
-                    .labelled_by(label.id);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(MegaButton::new(ButtonKind::Primary, "Create"))
-                            .clicked()
-                        {
-                            out.cmds
-                                .push(match new_session_dir(&form.parent, &form.name) {
-                                    Ok(dir) => Cmd::Create(dir),
-                                    Err(e) => Cmd::Error(e),
-                                });
-                        }
-                        if ui
-                            .add(MegaButton::new(ButtonKind::Quiet, "Cancel"))
-                            .clicked()
-                        {
-                            out.cmds.push(Cmd::CancelNew);
-                        }
-                    });
-                    let note = format!("Creates NAME.{SESSION_EXT} in the parent folder.");
-                    ui.label(text(Type::Small, note));
-                });
-        });
-        if browse {
-            out.cmds.push(Cmd::Dialog(DialogPurpose::NewParent));
-        }
     }
 
     /// Progress (an open, a dialog), the error and the notice.
@@ -541,7 +489,6 @@ impl StartScreen {
                 let column = vec2(width, 0.0);
                 ui.allocate_ui_with_layout(column, Layout::top_down(Align::Min), |ui| {
                     self.typed_row(ui, enabled, out);
-                    self.new_form_ui(ui, enabled, out);
                     self.messages(ui);
                 });
             });

@@ -55,19 +55,32 @@ pub enum StartAction {
     Create(PathBuf),
 }
 
-/// Picks a folder with a native dialog. Called on a background thread.
-pub trait FolderPicker: Send + Sync {
+/// The native dialogs the start screen uses. Called on a background
+/// thread.
+pub trait SessionDialogs: Send + Sync {
     /// Show a folder dialog titled `title`; `None` when cancelled or when
     /// no dialog is available.
     fn pick_folder(&self, title: &str) -> Option<PathBuf>;
+
+    /// Show the save dialog of a new mosaic: the path chosen (the folder
+    /// to create, with or without the `.mmm-session` extension); `None`
+    /// when cancelled or when no dialog is available.
+    fn pick_new_session(&self) -> Option<PathBuf>;
 }
 
-/// The native dialog through `rfd`.
-pub struct RfdPicker;
+/// The native dialogs through `rfd`.
+pub struct RfdDialogs;
 
-impl FolderPicker for RfdPicker {
+impl SessionDialogs for RfdDialogs {
     fn pick_folder(&self, title: &str) -> Option<PathBuf> {
         rfd::FileDialog::new().set_title(title).pick_folder()
+    }
+
+    fn pick_new_session(&self) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .set_title("New mosaic")
+            .set_file_name("Untitled")
+            .save_file()
     }
 }
 
@@ -75,7 +88,8 @@ impl FolderPicker for RfdPicker {
 #[derive(Clone, PartialEq, Eq)]
 enum DialogPurpose {
     Open,
-    NewParent,
+    /// The folder of a new session.
+    NewSession,
     /// The new folder of the missing session listed at this path.
     Locate(PathBuf),
 }
@@ -84,13 +98,6 @@ enum DialogPurpose {
 struct Dialog {
     purpose: DialogPurpose,
     rx: Receiver<Option<PathBuf>>,
-}
-
-/// The **New mosaic** form.
-#[derive(Default)]
-struct NewForm {
-    parent: String,
-    name: String,
 }
 
 /// A facts loader and how many results it still owes.
@@ -103,15 +110,12 @@ struct Loading {
 enum Cmd {
     Select(PathBuf),
     Open(PathBuf),
-    Create(PathBuf),
     TogglePin(PathBuf),
     Remove(PathBuf),
     Dialog(DialogPurpose),
     NewMosaic,
-    CancelNew,
     TypePath,
     ShowAll(bool),
-    Error(String),
 }
 
 /// What drawing one frame collected.
@@ -124,7 +128,7 @@ struct Drawn {
 
 /// The start screen's state.
 pub struct StartScreen {
-    picker: Arc<dyn FolderPicker>,
+    dialogs: Arc<dyn SessionDialogs>,
     /// How sessions' facts are read in tests (else [`facts::load_facts`]).
     load: Option<LoadFacts>,
     library: Library,
@@ -155,6 +159,8 @@ pub struct StartScreen {
     all_sessions: bool,
     search: String,
     typed_open: bool,
+    /// The typed-path row is shown because a dialog gave no answer.
+    no_dialog: bool,
     focus_typed: bool,
     /// Layout memory: where the session block's contents ended.
     block_bottom: f32,
@@ -163,24 +169,24 @@ pub struct StartScreen {
     /// Layout memory: the first-run button row's width.
     first_run_row: f32,
     typed_path: String,
-    new_form: Option<NewForm>,
     dialog: Option<Dialog>,
     busy: Option<String>,
     error: Option<String>,
     notice: Option<String>,
-    pending_open: Option<PathBuf>,
+    /// An open or create chosen in a dialog, taken by the next frame.
+    pending_open: Option<StartAction>,
     brand: Option<BrandImages>,
 }
 
 impl StartScreen {
-    /// A start screen listing `recent` (most recent first), with `picker`
+    /// A start screen listing `recent` (most recent first), with `dialogs`
     /// for the file dialogs.
-    pub fn new(recent: Vec<RecentEntry>, picker: Arc<dyn FolderPicker>) -> Self {
+    pub fn new(recent: Vec<RecentEntry>, dialogs: Arc<dyn SessionDialogs>) -> Self {
         let loader_threads = std::thread::available_parallelism()
             .map_or(2, |n| n.get())
             .clamp(2, 4);
         StartScreen {
-            picker,
+            dialogs,
             load: None,
             library: Library::new(recent),
             facts: HashMap::new(),
@@ -203,12 +209,12 @@ impl StartScreen {
             all_sessions: false,
             search: String::new(),
             typed_open: false,
+            no_dialog: false,
             focus_typed: false,
             block_bottom: 0.0,
             block_height: 0.0,
             first_run_row: 0.0,
             typed_path: String::new(),
-            new_form: None,
             dialog: None,
             busy: None,
             error: None,
@@ -246,17 +252,6 @@ impl StartScreen {
     /// disabled meanwhile.
     pub fn set_busy(&mut self, label: Option<String>) {
         self.busy = label;
-    }
-
-    /// Close the New mosaic form (after a successful Create).
-    pub fn clear_new_form(&mut self) {
-        self.new_form = None;
-    }
-
-    /// The parent folder typed or picked in the New mosaic form, if open.
-    #[cfg(test)]
-    pub fn new_parent(&self) -> Option<&str> {
-        self.new_form.as_ref().map(|f| f.parent.as_str())
     }
 
     /// The error shown, if any.
@@ -299,8 +294,8 @@ impl StartScreen {
         let mut drawn = Drawn::default();
         self.draw(ui, target.as_deref(), now, &mut drawn);
 
-        // A folder picked in the Open… dialog.
-        let mut action = self.pending_open.take().map(StartAction::Open);
+        // A folder picked in the Open… or New mosaic dialog.
+        let mut action = self.pending_open.take();
         for cmd in drawn.cmds {
             if let Some(a) = self.apply(&ctx, cmd) {
                 action = Some(a);
@@ -399,7 +394,6 @@ impl StartScreen {
         match cmd {
             Cmd::Select(path) => self.selected = Some(path),
             Cmd::Open(path) => return Some(StartAction::Open(path)),
-            Cmd::Create(path) => return Some(StartAction::Create(path)),
             Cmd::TogglePin(path) => {
                 let pinned = self
                     .library
@@ -417,17 +411,12 @@ impl StartScreen {
                 }
             }
             Cmd::Dialog(purpose) => self.start_dialog(ctx, purpose),
-            Cmd::NewMosaic => {
-                self.new_form.get_or_insert_with(NewForm::default);
-                self.start_dialog(ctx, DialogPurpose::NewParent);
-            }
-            Cmd::CancelNew => self.new_form = None,
+            Cmd::NewMosaic => self.start_dialog(ctx, DialogPurpose::NewSession),
             Cmd::TypePath => {
                 self.typed_open = true;
                 self.focus_typed = true;
             }
             Cmd::ShowAll(on) => self.all_sessions = on,
-            Cmd::Error(message) => self.set_error(Some(message)),
         }
         None
     }
@@ -533,12 +522,11 @@ impl StartScreen {
                 // Shown in the typed-path field too, for retrying.
                 self.typed_path = path.display().to_string();
                 self.notice = None;
-                self.pending_open = Some(path);
+                self.pending_open = Some(StartAction::Open(path));
             }
-            (DialogPurpose::NewParent, Ok(Some(path))) => {
-                self.new_form.get_or_insert_with(NewForm::default).parent =
-                    path.display().to_string();
+            (DialogPurpose::NewSession, Ok(Some(path))) => {
                 self.notice = None;
+                self.pending_open = Some(StartAction::Create(with_session_ext(path)));
             }
             (DialogPurpose::Locate(old), Ok(Some(new))) => {
                 self.library.relocate(&old, &new);
@@ -552,28 +540,30 @@ impl StartScreen {
                 }
                 self.notice = None;
             }
-            (_, Ok(None)) => {
-                self.notice =
-                    Some("No folder chosen. If no dialog appeared, use More → Type a path…".into());
-            }
-            (_, Err(())) => {
-                self.notice =
-                    Some("The file dialog is unavailable here. Use More → Type a path…".into());
+            // Cancelled, or no dialog here: the typed path always works.
+            (_, Ok(None) | Err(())) => {
+                self.notice = None;
+                self.typed_open = true;
+                self.no_dialog = true;
+                self.focus_typed = true;
             }
         }
     }
 
     fn start_dialog(&mut self, ctx: &egui::Context, purpose: DialogPurpose) {
         let title = match purpose {
-            DialogPurpose::Open => "Open a mosaic session (.mmm-session folder)",
-            DialogPurpose::NewParent => "Choose where to create the new mosaic",
-            DialogPurpose::Locate(_) => "Locate the session (.mmm-session folder)",
+            DialogPurpose::Open => Some("Open a mosaic session (.mmm-session folder)"),
+            DialogPurpose::NewSession => None,
+            DialogPurpose::Locate(_) => Some("Locate the session (.mmm-session folder)"),
         };
         let (tx, rx) = mpsc::channel();
-        let picker = Arc::clone(&self.picker);
+        let dialogs = Arc::clone(&self.dialogs);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let picked = picker.pick_folder(title);
+            let picked = match title {
+                Some(title) => dialogs.pick_folder(title),
+                None => dialogs.pick_new_session(),
+            };
             let _ = tx.send(picked);
             ctx.request_repaint();
         });
@@ -694,23 +684,18 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-/// The folder for a new session called `name` under `parent`.
-fn new_session_dir(parent: &str, name: &str) -> Result<PathBuf, String> {
-    let parent = parent.trim();
-    let name = name.trim();
-    if parent.is_empty() {
-        return Err("Choose a parent folder for the new mosaic.".into());
-    }
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
-        return Err("Give the new mosaic a name (no slashes).".into());
-    }
+/// `path` with the session extension appended when it lacks it.
+fn with_session_ext(path: PathBuf) -> PathBuf {
     let suffix = format!(".{SESSION_EXT}");
-    let file = if name.ends_with(&suffix) {
-        name.to_string()
-    } else {
-        format!("{name}{suffix}")
-    };
-    Ok(expand_home(parent).join(file))
+    let named = path
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().ends_with(&suffix));
+    if named {
+        return path;
+    }
+    let mut full = path.into_os_string();
+    full.push(suffix);
+    PathBuf::from(full)
 }
 
 /// The tests and the shared start-screen test helpers live in `tests.rs`.

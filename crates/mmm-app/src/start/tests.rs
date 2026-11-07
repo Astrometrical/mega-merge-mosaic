@@ -14,12 +14,27 @@ use mmm_core::mosaic::{CONFIG_FILE, MosaicConfig, lock_session};
 use super::*;
 use crate::session::{notes, save_notes_blocking, session_name};
 
-/// A picker that answers with a fixed folder, never a real dialog.
+/// Dialogs that answer every question with a fixed path (`None`: they are
+/// cancelled), never a real dialog.
 pub(crate) struct StubPicker(pub Option<PathBuf>);
 
-impl FolderPicker for StubPicker {
+impl SessionDialogs for StubPicker {
     fn pick_folder(&self, _title: &str) -> Option<PathBuf> {
         self.0.clone()
+    }
+
+    fn pick_new_session(&self) -> Option<PathBuf> {
+        self.0.clone()
+    }
+}
+
+/// A launcher that records the windows it was asked for.
+#[derive(Default)]
+pub(crate) struct RecordingLauncher(pub std::sync::Mutex<Vec<Option<PathBuf>>>);
+
+impl crate::app::Launcher for RecordingLauncher {
+    fn open_window(&self, session: Option<&Path>) {
+        self.0.lock().unwrap().push(session.map(Path::to_path_buf));
     }
 }
 
