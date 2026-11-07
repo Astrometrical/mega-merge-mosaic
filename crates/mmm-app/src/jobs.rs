@@ -100,6 +100,15 @@ pub enum JobEvent {
     },
 }
 
+/// The kind of job that works on one group's result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobTarget {
+    /// A blend of the group.
+    Blend,
+    /// An export of the group's result.
+    Export,
+}
+
 /// What a queued job will do.
 #[derive(Clone, Debug)]
 enum Kind {
@@ -236,6 +245,8 @@ pub struct JobRunner {
     previous: Option<JoinHandle<()>>,
     /// Every job's label, by id (for notices about ended jobs).
     labels: BTreeMap<u64, String>,
+    /// Blend and export jobs' group, by id (see [`JobRunner::target`]).
+    targets: BTreeMap<u64, (JobTarget, String)>,
     /// Events raised outside `poll` (queued jobs cancelled), delivered by it.
     pending: Vec<JobEvent>,
     /// The frame of the last previews run that finished with every panel,
@@ -255,6 +266,7 @@ impl JobRunner {
             queue: VecDeque::new(),
             previous: None,
             labels: BTreeMap::new(),
+            targets: BTreeMap::new(),
             pending: Vec::new(),
             previews_frame: None,
             #[cfg(test)]
@@ -345,6 +357,8 @@ impl JobRunner {
         rect: Option<[u64; 4]>,
     ) -> u64 {
         let id = self.new_id(format!("Blend {group}"));
+        self.targets
+            .insert(id, (JobTarget::Blend, group.to_string()));
         if let Some(r) = &self.running
             && r.blend.as_ref().is_some_and(|p| p.group == group)
         {
@@ -384,6 +398,8 @@ impl JobRunner {
         format: ExportFormat,
     ) -> u64 {
         let id = self.new_id(format!("Export {group}"));
+        self.targets
+            .insert(id, (JobTarget::Export, group.to_string()));
         self.queue.push_back(Queued {
             id,
             kind: Kind::Export(ExportJob {
@@ -593,6 +609,12 @@ impl JobRunner {
     /// Whether a job is running or queued.
     pub fn busy(&self) -> bool {
         self.running.is_some() || !self.queue.is_empty()
+    }
+
+    /// What blend or export job `id` was for: its kind and group (also after
+    /// it ended); `None` for any other job.
+    pub fn target(&self, id: u64) -> Option<(JobTarget, &str)> {
+        self.targets.get(&id).map(|(t, g)| (*t, g.as_str()))
     }
 
     /// The label of job `id` (also after it ended).

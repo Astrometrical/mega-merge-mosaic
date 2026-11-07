@@ -486,6 +486,7 @@ fn plan_places_solved_panels_before_previews() {
         frame: None,
         groups,
         lock: None,
+        summary: None,
     };
     let mut h = harness(s);
     // No previews, no analysis: dashed outlines at the WCS footprints.

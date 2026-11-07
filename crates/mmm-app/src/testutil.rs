@@ -16,6 +16,7 @@ pub(crate) fn two_group_session(root: &Path) -> OpenSession {
         frame: None,
         groups,
         lock: None,
+        summary: None,
     }
 }
 

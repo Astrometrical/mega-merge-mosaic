@@ -13,13 +13,14 @@ use mega_ui::theme::palette;
 use crate::blend_tab::BlendTab;
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
-use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
+use crate::jobs::{JobEvent, JobRunner, JobTarget, PREVIEWS_LABEL};
 use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
 use crate::pipeline::{Pipeline, Step, auto_analyze, set_auto_analyze};
 use crate::plan_tab::{PlanFeed, PlanTab};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::start::{RecentEntry, RfdPicker, StartAction, StartScreen, unix_now};
 use crate::status::{self, SysMonitor};
+use crate::summary_writer::SummaryWriter;
 
 /// Directory, inside the session, where compressed panels are decoded.
 const DECODED_DIR: &str = "decoded";
@@ -92,6 +93,9 @@ pub struct Shell {
     pipeline: Pipeline,
     /// The checks (made afresh with each session).
     checks: ChecksEngine,
+    /// Keeps the session's `summary.json` current (made afresh with each
+    /// session).
+    summary: SummaryWriter,
 }
 
 impl Shell {
@@ -113,6 +117,7 @@ impl Shell {
             files_picker: Arc::new(RfdFilesPicker),
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
+            summary: SummaryWriter::new(None),
         }
     }
 
@@ -256,6 +261,7 @@ impl Shell {
                     // previews and analysis (one session per process).
                     mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
                     self.tab = default_tab(&opened);
+                    self.summary = SummaryWriter::new(opened.summary.clone());
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
                     self.blend = BlendTab::new();
@@ -288,6 +294,22 @@ impl Shell {
         let editing = self.panels.has_pending() || self.blend.settings_editing(session);
         for event in &events {
             self.blend.on_event(event);
+            match event {
+                JobEvent::Finished { id, .. } => {
+                    self.summary.mark_dirty();
+                    match jobs.target(*id) {
+                        Some((JobTarget::Blend, group)) => {
+                            self.summary.record_blend(group, unix_now())
+                        }
+                        Some((JobTarget::Export, group)) => {
+                            self.summary.record_export(group, unix_now())
+                        }
+                        None => {}
+                    }
+                }
+                JobEvent::Failed { .. } => self.summary.mark_dirty(),
+                JobEvent::Preview(_) | JobEvent::Cancelled { .. } => {}
+            }
             let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
             let (text, color) = match event {
                 // Previews run by themselves and often: no notices but
@@ -315,6 +337,17 @@ impl Shell {
         }
         self.checks.poll(ctx, session, jobs, &events);
         self.plan.release_if_hidden(now);
+        // The last view: the Blend tab's when it has one, else the Plan's.
+        let last_view = self
+            .blend
+            .view_key()
+            .or(self.plan.view_key())
+            .map(str::to_string);
+        let counts = self.checks.counts(&session.mosaic.config);
+        self.summary.poll(session, counts, last_view);
+        if self.summary.busy() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     /// The open session (the Panels, Plan and Blend tabs build on this).
@@ -894,6 +927,27 @@ mod tests {
         // A session without panels opens on the Panels tab.
         assert_eq!(h.state().tab(), Tab::Panels);
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn shell_writes_summary_after_opening() {
+        use mmm_core::session_summary::{SUMMARY_FILE, read_summary};
+        let root = temp_dir("shell-summary");
+        let opened = crate::testutil::two_group_session(&root);
+        let dir = opened.mosaic.dir.clone();
+        let panels = opened.mosaic.config.panels.len();
+        let mut h = harness(StubPicker(None));
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        step_until(&mut h, |_| dir.join(SUMMARY_FILE).is_file());
+        let summary = read_summary(&dir).unwrap();
+        assert_eq!(summary.panels, panels);
+        let names: Vec<_> = summary.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Ha", "OIII"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

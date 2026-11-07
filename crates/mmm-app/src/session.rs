@@ -11,6 +11,7 @@ use mmm_core::mosaic::{
     lock_session,
 };
 use mmm_core::reference::ReferenceFrame;
+use mmm_core::session_summary::{SessionSummary, read_summary};
 
 /// A mosaic session open in this window.
 #[derive(Debug)]
@@ -30,6 +31,9 @@ pub struct OpenSession {
     /// `None` only for a check made to hand the session to a new process.
     #[allow(dead_code)] // held for its Drop, never read
     pub lock: Option<SessionLock>,
+    /// The session's `summary.json` as found when opening (`None` if absent
+    /// or unreadable); seeds the summary writer's blend and export stamps.
+    pub summary: Option<SessionSummary>,
 }
 
 impl OpenSession {
@@ -146,11 +150,13 @@ fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
     let frame = ReferenceFrame::load(&dir.join(FRAME_FILE)).ok();
     // Reads panel headers (Header rule): fine here, off the UI thread.
     let groups = mosaic.groups().ok();
+    let summary = read_summary(dir);
     Ok(OpenSession {
         mosaic,
         frame,
         groups,
         lock,
+        summary,
     })
 }
 
@@ -183,6 +189,7 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
         frame: None,
         groups: Some(Groups::default()),
         lock,
+        summary: None,
     })
 }
 

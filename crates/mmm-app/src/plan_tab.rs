@@ -698,6 +698,11 @@ impl PlanTab {
         self.settled
     }
 
+    /// The shown view's stretch key (a group name, or a composition's key).
+    pub fn view_key(&self) -> Option<&str> {
+        self.view_key.as_deref()
+    }
+
     /// Save a pending (rate-limited) display stretch or composition change
     /// now (the window is closing). A small `mosaic.json` write.
     pub fn flush_save(&mut self, session: &OpenSession) {

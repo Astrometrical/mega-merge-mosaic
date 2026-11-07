@@ -21,6 +21,7 @@ mod session;
 mod start;
 mod status;
 mod stretch_panel;
+mod summary_writer;
 #[cfg(test)]
 mod synth_mosaic;
 #[cfg(test)]

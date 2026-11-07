@@ -652,6 +652,15 @@ impl BlendTab {
         }
     }
 
+    /// The view's key: the group's name, for a group view; `None` before a
+    /// view is chosen, and for a composition (the Plan tab keys those).
+    pub fn view_key(&self) -> Option<&str> {
+        match self.view.as_ref()? {
+            ViewKind::Group(g) => Some(g),
+            ViewKind::Composition(_) => None,
+        }
+    }
+
     /// What the viewer's place says instead of an image, if it has no
     /// image to show.
     pub fn shown_text(&self) -> Option<String> {
