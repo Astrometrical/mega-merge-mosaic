@@ -5,6 +5,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use super::*;
+use crate::theme::palette::SURFACE_900;
 use crate::theme::tokens::KEN_BURNS_ZOOM;
 use crate::viewer::ImageTileSource;
 use crate::viewer::{Fetched, PyramidGeometry, TileKey, TileSource};
@@ -270,4 +271,87 @@ fn crossfade_swaps_after_the_hold_when_tiles_never_come() {
     assert_eq!(label(&h).as_deref(), Some("Ha"));
     frames(&mut h, 12.5);
     assert_eq!(label(&h).as_deref(), Some("OIII"));
+}
+
+/// Every mesh painted in the last frame.
+fn meshes(h: &Harness<'_, State>) -> Vec<egui::Mesh> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Mesh>) {
+        match shape {
+            egui::Shape::Mesh(m) => out.push((**m).clone()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for c in &h.output().shapes {
+        walk(&c.shape, &mut out);
+    }
+    out
+}
+
+/// Whether a feather ramp lies on `edge`: a mesh whose vertices there are
+/// opaque page colour and whose others are transparent.
+fn has_ramp(meshes: &[egui::Mesh], edge: impl Fn(egui::Pos2) -> bool) -> bool {
+    meshes.iter().any(|m| {
+        let on: Vec<_> = m.vertices.iter().filter(|v| edge(v.pos)).collect();
+        let off = m.vertices.len() - on.len();
+        m.vertices.len() == 4
+            && on.len() == 2
+            && off == 2
+            && on.iter().all(|v| v.color == SURFACE_900)
+            && m.vertices
+                .iter()
+                .filter(|v| !edge(v.pos))
+                .all(|v| v.color == Color32::TRANSPARENT)
+    })
+}
+
+#[test]
+fn image_edges_off_the_window_edge_are_feathered() {
+    // The harness image runs from a third of the width to the right and
+    // bottom edges of the window: only its left edge is feathered.
+    let mut h = harness(two_views(), true);
+    frames(&mut h, 0.0);
+    let m = meshes(&h);
+    let ramps = |m: &[egui::Mesh]| -> Vec<(egui::Pos2, egui::Pos2)> {
+        m.iter()
+            .filter(|m| m.vertices.len() == 4)
+            .filter(|m| m.vertices.iter().filter(|v| v.color == SURFACE_900).count() == 2)
+            .filter(|m| {
+                m.vertices
+                    .iter()
+                    .filter(|v| v.color == Color32::TRANSPARENT)
+                    .count()
+                    == 2
+            })
+            .map(|m| (m.vertices[0].pos, m.vertices[2].pos))
+            .collect()
+    };
+    let r = ramps(&m);
+    assert_eq!(r.len(), 1, "{r:?}");
+    // Opaque at the image's left edge, clear to its right.
+    assert!(r[0].1.x > r[0].0.x);
+
+    // An image inset from the bottom and right is feathered there too.
+    let mut stage = HeroStage::new_synchronous();
+    stage.set_reduced_motion(true);
+    stage.set_views(two_views(), 0, 0.0);
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(900.0, 500.0))
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                let image = Rect::from_min_max(pos2(300.0, -10.0), pos2(850.0, 400.0));
+                s.stage.show(ui, image, 0.0);
+            },
+            State { stage, now: 0.0 },
+        );
+    h.run_steps(3);
+    let m = meshes(&h);
+    assert!(has_ramp(&m, |p| (p.y - 400.0).abs() < 0.5));
+    assert!(has_ramp(&m, |p| (p.x - 850.0).abs() < 0.5));
+    // The top overhangs the window: no ramp there.
+    assert!(!has_ramp(&m, |p| (p.y + 10.0).abs() < 0.5));
 }

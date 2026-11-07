@@ -1260,9 +1260,9 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   thread, the availability (`Missing` for a gone folder or unplugged
   drive, `Busy`, `Unreadable` for a corrupt or newer `mosaic.json`, else
   `Available`), the state (no panels, plan ready, merged, merged and
-  exported, re-merge needed), group colours and notes. A session on a dead
-  network path only stalls its own worker, never the screen; it shows
-  "Missing" once its probe gives up.
+  exported, re-merge needed), group colours and notes. Facts load on a pool
+  of 4 workers (`FACTS_WORKERS`), so a session on a dead network path stalls
+  one worker, never the screen or the other cards.
 - **The hero loader** (`start::hero_views`): a merged session gives one
   view per group with a result, read live from its store through
   `MosaicTileSource::open_plain`, plus each saved composition whose groups
@@ -1270,14 +1270,20 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   one). A planned, unmerged session gives one picture per group, rendered
   from its cached previews (`preview::load_cached_previews`,
   `render_overview`) through the saved Plan stretch. Otherwise, no views
-  and a line saying why. Every failure degrades to fewer views, never a
-  panic.
+  and a line saying why (a session whose state is unknown: "Nothing to
+  show yet — resume to build the preview"). Every failure degrades to fewer
+  views, never a panic. The image area's edges feather into the page
+  (`HeroStage` paints page-colour ramps on every edge not at the window's
+  edge), so no hard line shows.
 - **Load order.** The first frame draws at once with no facts. The default
   hero candidate's facts load first, then its hero views (so the first
   image is on screen in under a second with a warm disk), then the other
   cards' facts, and card thumbnails only once the hero has drawn. The
   default hero is the most recently opened session that is `Available`: a
-  missing, busy or unreadable one never is. Hero dwell is 8 s and the
+  missing, busy or unreadable one never is. A newest session whose facts
+  haven't arrived stays the candidate for `FACTS_WAIT_S` (about 1 s); after
+  that the hero falls back to the most recent session known to be
+  available, so a folder that never answers never holds up the screen. Hero dwell is 8 s and the
   crossfade 2 s; with reduced motion (probed in the background) views cut
   and don't drift.
 - **`FileTileReader`** (`mmm_core::tiles`): the tile reader for a store
@@ -1304,5 +1310,6 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   (`crates/mmm-app/tests/snapshots/start_screen.png`, from
   `start::snapshot_tests`: a merged, an empty and a missing session, the
   stage held still). The start-screen reference shows the machine's temp
-  path in the hero's details line, so it differs on another machine;
-  refresh it there with `UPDATE_SNAPSHOTS=1`.
+  path in the hero's details line (the home directory is shown as `~`, so
+  no user name, but the temp location and separators are the OS's), so it
+  differs on another OS; refresh it there with `UPDATE_SNAPSHOTS=1`.

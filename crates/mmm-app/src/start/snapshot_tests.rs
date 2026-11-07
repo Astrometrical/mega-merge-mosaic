@@ -13,15 +13,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use egui_kittest::Harness;
 use mmm_core::job::JobCtl;
 use mmm_core::mosaic::{analyze_all, blend_group};
 use mmm_core::session_summary::{result_state, write_summary};
 
+use super::hero::Thumb;
 use super::*;
-use crate::start::tests::{StubPicker, entry_at, session, step_until, temp_dir};
+use crate::start::tests::{StubPicker, entry_at, session, step_until};
 use crate::summary_writer::summarize;
 use crate::testutil::{CANVAS, two_group_session};
 
@@ -60,7 +60,11 @@ fn merged(root: &Path) -> PathBuf {
 #[test]
 #[ignore = "image snapshot: needs a GPU; run with --ignored"]
 fn start_screen_snapshot() {
-    let root = temp_dir("start-snapshot");
+    // A fixed folder (no process id): the screen shows the session's path.
+    let root = std::env::temp_dir().join("mmm-start-snapshot");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
     let merged_dir = merged(&root);
     let planned = session(&root, "Veil Nebula");
     let gone = root.join("Rosette.mmm-session");
@@ -74,6 +78,8 @@ fn start_screen_snapshot() {
         entry_at(&gone, ago(30)),
     ];
     let screen = StartScreen::new(recent, Arc::new(StubPicker(None)));
+    // Edge to edge, as the app draws it (no panel margin): the harness
+    // insets its ui by 8 points, so draw into the whole screen instead.
     let mut h = Harness::builder()
         .wgpu()
         .with_size(egui::vec2(1280.0, 800.0))
@@ -81,23 +87,29 @@ fn start_screen_snapshot() {
         .with_max_steps(64)
         .build_ui_state(
             |ui, s: &mut StartScreen| {
-                if crate::testutil::themed(ui) {
-                    let _ = s.ui(ui);
-                }
+                let screen = ui.ctx().content_rect();
+                ui.scope_builder(egui::UiBuilder::new().max_rect(screen), |ui| {
+                    ui.set_clip_rect(screen);
+                    if crate::testutil::themed(ui) {
+                        ui.painter()
+                            .rect_filled(screen, 0.0, mega_ui::theme::palette::SURFACE_900);
+                        let _ = s.ui(ui);
+                    }
+                });
             },
             screen,
         );
-    // Facts, the reduced-motion probe and the hero's first tiles arrive on
-    // background threads.
+    // Wait for everything the image shows: the facts, the reduced-motion
+    // probe, the hero's first tiles with no more loading, and the merged
+    // session's card thumbnail. Then hold the stage still.
     step_until(&mut h, |s| {
-        !s.checking_recent() && s.motion.is_none() && s.stage.first_image_drawn()
+        !s.checking_recent()
+            && s.motion.is_none()
+            && s.stage.first_image_drawn()
+            && !s.stage.is_loading()
+            && matches!(s.thumbs.get(&merged_dir), Some(Thumb::Ready(Some(_))))
     });
-    // Hold the stage still, then let the tiles settle at their final level.
     h.state_mut().stage.set_reduced_motion(true);
-    for _ in 0..25 {
-        h.step();
-        std::thread::sleep(Duration::from_millis(20));
-    }
     h.run();
     h.snapshot("start_screen");
     let _ = std::fs::remove_dir_all(&root);

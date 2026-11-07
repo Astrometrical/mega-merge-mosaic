@@ -138,6 +138,11 @@ impl HeroStage {
             .any(TiledViewer::has_drawn_tiles)
     }
 
+    /// True while any shown view still has tile requests in flight.
+    pub fn is_loading(&self) -> bool {
+        self.viewers.iter().flatten().any(TiledViewer::is_loading)
+    }
+
     /// True while two views are drawn at once.
     pub fn is_crossfading(&self) -> bool {
         self.crossfading
@@ -295,6 +300,7 @@ impl HeroStage {
             }
         }
 
+        paint_feather(ui, full, image_rect);
         paint_gradients(ui, full);
 
         if n == 0 {
@@ -391,6 +397,77 @@ impl HeroStage {
         } else if multiple || eff - self.since < HERO_DWELL_S + HERO_CROSSFADE_S {
             ui.ctx().request_repaint();
         }
+    }
+}
+
+/// Fraction of the image's width feathered on its left and right edges.
+const FEATHER_SIDE: f32 = 0.15;
+/// Fraction of the image's height feathered on its bottom edge.
+const FEATHER_BOTTOM: f32 = 0.20;
+/// Fraction of the image's height feathered on its top edge.
+const FEATHER_TOP: f32 = 0.08;
+
+/// Fade the image area's edges into the page: a ramp of the page colour,
+/// opaque at the edge and clear inward, on every edge of `image` that is
+/// not at the edge of `full` (the window), so no hard line shows wherever
+/// the image is placed.
+fn paint_feather(ui: &Ui, full: Rect, image: Rect) {
+    if image.width() <= 0.0 || image.height() <= 0.0 {
+        return;
+    }
+    let opaque = SURFACE_900;
+    let clear = Color32::TRANSPARENT;
+    let painter = ui.painter();
+    let ramp = |outer: [egui::Pos2; 2], inner: [egui::Pos2; 2]| {
+        let mut m = Mesh::default();
+        m.colored_vertex(outer[0], opaque);
+        m.colored_vertex(outer[1], opaque);
+        m.colored_vertex(inner[0], clear);
+        m.colored_vertex(inner[1], clear);
+        m.add_triangle(0, 1, 2);
+        m.add_triangle(1, 2, 3);
+        painter.add(Shape::mesh(m));
+    };
+    let eps = 0.5;
+    if image.left() > full.left() + eps {
+        let d = image.width() * FEATHER_SIDE;
+        ramp(
+            [image.left_top(), image.left_bottom()],
+            [
+                pos2(image.left() + d, image.top()),
+                pos2(image.left() + d, image.bottom()),
+            ],
+        );
+    }
+    if image.right() < full.right() - eps {
+        let d = image.width() * FEATHER_SIDE;
+        ramp(
+            [image.right_top(), image.right_bottom()],
+            [
+                pos2(image.right() - d, image.top()),
+                pos2(image.right() - d, image.bottom()),
+            ],
+        );
+    }
+    if image.bottom() < full.bottom() - eps {
+        let d = image.height() * FEATHER_BOTTOM;
+        ramp(
+            [image.left_bottom(), image.right_bottom()],
+            [
+                pos2(image.left(), image.bottom() - d),
+                pos2(image.right(), image.bottom() - d),
+            ],
+        );
+    }
+    if image.top() > full.top() + eps {
+        let d = image.height() * FEATHER_TOP;
+        ramp(
+            [image.left_top(), image.right_top()],
+            [
+                pos2(image.left(), image.top() + d),
+                pos2(image.right(), image.top() + d),
+            ],
+        );
     }
 }
 

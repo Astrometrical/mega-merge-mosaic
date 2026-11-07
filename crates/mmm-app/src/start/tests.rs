@@ -615,3 +615,40 @@ fn ago_reads_naturally() {
     assert_eq!(ago(10_000, 10_000 - 120), "2 minutes ago");
     assert_eq!(ago(200_000, 200_000 - 86_400), "1 day ago");
 }
+
+#[test]
+fn display_path_abbreviates_the_home_directory() {
+    let sep = std::path::MAIN_SEPARATOR;
+    let home = Path::new("home").join("ann");
+    let home = Path::new(std::path::MAIN_SEPARATOR_STR).join(home);
+    let under = home.join("Astro").join("Orion.mmm-session");
+    assert_eq!(
+        abbreviate_home(&under, Some(&home)),
+        format!("~{sep}Astro{sep}Orion.mmm-session")
+    );
+    // Only whole components count, and the home itself is `~`.
+    assert_eq!(abbreviate_home(&home, Some(&home)), "~");
+    let sibling = Path::new(std::path::MAIN_SEPARATOR_STR)
+        .join("home")
+        .join("annette");
+    assert_eq!(
+        abbreviate_home(&sibling, Some(&home)),
+        sibling.display().to_string()
+    );
+    // No home, or a bare root for one: the path as it is.
+    let root = Path::new(std::path::MAIN_SEPARATOR_STR);
+    assert_eq!(abbreviate_home(&under, None), under.display().to_string());
+    assert_eq!(
+        abbreviate_home(&under, Some(root)),
+        under.display().to_string()
+    );
+    // Windows' verbatim prefix goes first.
+    #[cfg(windows)]
+    assert_eq!(
+        abbreviate_home(
+            Path::new(r"\\?\C:\Users\ann\Astro"),
+            Some(Path::new(r"C:\Users\ann"))
+        ),
+        r"~\Astro"
+    );
+}

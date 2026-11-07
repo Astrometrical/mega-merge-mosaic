@@ -665,15 +665,41 @@ fn count(n: usize, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
-/// `path` for display: without Windows' `\\?\` verbatim prefix.
+/// `path` for display: without Windows' `\\?\` verbatim prefix, and with
+/// the user's home directory written as `~`.
 fn display_path(path: &Path) -> String {
+    // Windows' own variable first: a Unix-style `HOME` (Git Bash) is not
+    // a path the folders there are under.
+    let (first, second) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    let home = std::env::var_os(first)
+        .or_else(|| std::env::var_os(second))
+        .map(PathBuf::from);
+    abbreviate_home(path, home.as_deref())
+}
+
+/// [`display_path`] with the home directory given: a `path` under `home`
+/// shows as `~` followed by the rest (in the platform's separator).
+fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
     let s = path.display().to_string();
-    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+    let plain = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{unc}")
     } else if let Some(local) = s.strip_prefix(r"\\?\") {
         local.to_string()
     } else {
         s
+    };
+    // A bare root as "home" would turn every path into `~...`.
+    let Some(home) = home.filter(|h| h.components().count() > 1) else {
+        return plain;
+    };
+    match Path::new(&plain).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        Err(_) => plain,
     }
 }
 
