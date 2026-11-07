@@ -1251,8 +1251,10 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   `mmm_core::session_summary`): panel and group counts, each group's result
   state and blend/export stamps, check counts, canvas size and the view last
   shown. The app keeps it current (`summary_writer::SummaryWriter`, written
-  atomically in the background whenever a fact changes) so the start screen
-  can show a session without opening it. It is advisory: `read_summary`
+  atomically in the background whenever a fact changes: what it shows, the
+  settings the results depend on (a settings edit marks results stale with
+  no job running), or a job ending, cancelled ones included) so the start
+  screen can show a session without opening it. It is advisory: `read_summary`
   returns `None` for a file that is absent, corrupt or from a newer mmm
   (`SUMMARY_FORMAT`), and the card then falls back to what `mosaic.json`
   and the cached previews say.
