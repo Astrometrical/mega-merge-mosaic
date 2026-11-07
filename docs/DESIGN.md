@@ -1274,9 +1274,17 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   `render_overview`) through the saved Plan stretch. Otherwise, no views
   and a line saying why (a session whose state is unknown: "Nothing to
   show yet — resume to build the preview"). Every failure degrades to fewer
-  views, never a panic. The image area's edges feather into the page
-  (`HeroStage` paints page-colour ramps on every edge not at the window's
-  edge), so no hard line shows.
+  views, never a panic. Each view fills its image area (a cover fit, as
+  the web's `DziHeroLayer` does), whatever the mosaic's aspect: a portrait
+  mosaic in the landscape area is cropped top and bottom, never shown as a
+  narrow strip. The drift (zoom from the cover fit to `KEN_BURNS_ZOOM`
+  times it, alternating in and out per view, with a pan of up to 2 % of
+  the view that grows with the zoom and takes at most half the margin the
+  zoom opens) stays inside the image, so the image's own edges never show
+  (only a zoom past the viewer's `MAX_ZOOM`, an image far smaller than its
+  area, could). The image area's edges feather into the page (`HeroStage`
+  paints page-colour ramps on every edge not at the window's edge), so no
+  hard line shows.
 - **Load order.** The first frame draws at once with no facts. The default
   hero candidate's facts load first, then its hero views (so the first
   image is on screen in under a second with a warm disk), then the other
@@ -1314,7 +1322,8 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   shelf, then by last opened.
 - **Testing.** Tests build sessions in temp folders from `testutil` /
   `synth_mosaic`, never from `test_data/`. The gallery (`mega_ui::gallery`)
-  has Starfield, Hero stage and Session cards sections. Two ignored image
+  has Starfield, Hero stage (a landscape and a portrait mosaic, the latter
+  with its panel seams showing the crop) and Session cards sections. Two ignored image
   snapshots need a GPU: the gallery's
   (`crates/mega-ui/tests/snapshots/`) and the real start screen's
   (`crates/mmm-app/tests/snapshots/start_screen.png`, from

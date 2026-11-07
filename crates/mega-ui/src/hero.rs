@@ -1,23 +1,35 @@
 //! The start screen's hero: a starfield with the selected session's mosaic
 //! drifting slowly behind it, crossfading between views, under gradients
 //! that keep the text on the left readable.
+//!
+//! Each view fills its image area (a cover fit, as the web's hero does),
+//! whatever the mosaic's aspect: a portrait mosaic in a landscape area is
+//! cropped top and bottom rather than shown as a narrow strip with hard
+//! edges. The drift (zoom from the cover fit by [`KEN_BURNS_ZOOM`], pan by
+//! 2 % of the view) stays inside the image, so no image edge ever shows;
+//! the image area's own edges feather into the page.
 
 use std::sync::Arc;
 
-use egui::{Align, Color32, Layout, Mesh, Rect, Shape, Ui, UiBuilder, pos2, vec2};
+use egui::{Align, Color32, Layout, Mesh, Rect, Shape, Ui, UiBuilder, Vec2, pos2, vec2};
 
 use crate::icons;
 use crate::starfield::Starfield;
 use crate::theme::palette::{SURFACE_900, TEXT_EMPHASIS};
 use crate::theme::text::{Type, text};
 use crate::theme::tokens::{CONTROL_HEIGHT, HERO_CROSSFADE_S, HERO_DWELL_S, KEN_BURNS_ZOOM, space};
-use crate::viewer::{PyramidGeometry, TileSource, TiledViewer, View};
+use crate::viewer::{PyramidGeometry, TileSource, TiledViewer};
 use crate::widgets::{ButtonKind, icon_button_of};
 
 /// Seed of the hero's starfield.
 const STARFIELD_SEED: u64 = 42;
-/// Pan of the drift over a view's time on screen, as a fraction of the view.
+/// Pan of the drift at its zoomed-in end, as a fraction of the view.
+///
+/// The pan follows the zoom (none at the cover fit), and at most half of
+/// the margin the zoom opens on each side, so the view never leaves the
+/// image.
 const PAN_FRACTION: f64 = 0.02;
+const _: () = assert!(PAN_FRACTION <= (KEN_BURNS_ZOOM - 1.0) / 2.0);
 /// How long before its fade starts the next view begins loading.
 const PRELOAD_S: f64 = 2.0;
 /// The longest a swap waits for the incoming view's first tiles.
@@ -177,12 +189,6 @@ impl HeroStage {
         if fresh {
             self.viewers[i] = Some(self.make_viewer(i));
         }
-        // The fitted camera the drift starts from.
-        let mut base = View::new();
-        base.fit(&self.geoms[i], rect.size(), 0.0);
-        base.finish_animation();
-        let (bz, bc) = (base.zoom(0.0), base.centre(0.0));
-
         let progress = if self.reduced_motion {
             0.0
         } else {
@@ -191,13 +197,8 @@ impl HeroStage {
         // Alternate direction per view: even zoom in, odd zoom out.
         let forward = i.is_multiple_of(2);
         let along = if forward { progress } else { 1.0 - progress };
-        let zoom = bz * (1.0 + (KEN_BURNS_ZOOM - 1.0) * along);
         let dir = if forward { 1.0 } else { -1.0 };
-        let visible_w = f64::from(rect.width()) / zoom;
-        let centre = (
-            bc.0 + dir * PAN_FRACTION * visible_w * (progress - 0.5),
-            bc.1,
-        );
+        let (zoom, centre) = drift_camera(&self.geoms[i], rect.size(), along, dir);
 
         let viewer = self.viewers[i].as_mut().expect("viewer just built");
         viewer.set_opacity(opacity);
@@ -398,6 +399,32 @@ impl HeroStage {
             ui.ctx().request_repaint();
         }
     }
+}
+
+/// The drift's camera (zoom, centre in image pixels) for an image of
+/// `geom` in an area of `screen` points, `along` (0 to 1) the way from
+/// the cover fit to [`KEN_BURNS_ZOOM`] times it, panning towards `dir`
+/// (+1 right, -1 left).
+///
+/// The cover fit fills the area (the larger of the two axis fits), so the
+/// view never shows past the image across the pan; along it, the pan of
+/// [`PAN_FRACTION`] of the view at full zoom grows with the zoom and is
+/// at most half the margin the zoom opens (and clamped to it besides).
+/// Only a zoom above the viewer's [`MAX_ZOOM`](crate::viewer::MAX_ZOOM)
+/// (an image far smaller than its area) can show an edge.
+fn drift_camera(geom: &PyramidGeometry, screen: Vec2, along: f64, dir: f64) -> (f64, (f64, f64)) {
+    let (w, h) = (geom.width as f64, geom.height as f64);
+    let cover = (f64::from(screen.x) / w).max(f64::from(screen.y) / h);
+    let cover = if cover.is_finite() && cover > 0.0 {
+        cover
+    } else {
+        1.0
+    };
+    let zoom = cover * (1.0 + (KEN_BURNS_ZOOM - 1.0) * along);
+    let visible_w = f64::from(screen.x) / zoom;
+    let margin = ((w - visible_w) / 2.0).max(0.0);
+    let pan = (dir * PAN_FRACTION * visible_w * along).clamp(-margin, margin);
+    (zoom, (w / 2.0 + pan, h / 2.0))
 }
 
 /// Fraction of the image's width feathered on its left and right edges.

@@ -198,6 +198,107 @@ fn an_odd_view_starts_on_its_drift_camera() {
     assert!((ratio - KEN_BURNS_ZOOM).abs() < 1e-6, "{ratio}");
 }
 
+/// A one-colour view of `size` pixels.
+fn sized(label: &str, size: [usize; 2]) -> HeroView {
+    HeroView {
+        label: label.to_string(),
+        source: Arc::new(ImageTileSource::new(
+            ColorImage::new(size, vec![Color32::GRAY; size[0] * size[1]]),
+            256,
+        )),
+    }
+}
+
+/// A 900 × 500 harness drawing `views` (from `start`) into the fixed image
+/// area `image`.
+fn harness_in(
+    views: Vec<HeroView>,
+    start: usize,
+    reduced: bool,
+    image: Rect,
+) -> Harness<'static, State> {
+    let mut stage = HeroStage::new_synchronous();
+    stage.set_reduced_motion(reduced);
+    stage.set_views(views, start, 0.0);
+    Harness::builder()
+        .with_size(Vec2::new(900.0, 500.0))
+        .build_ui_state(
+            move |ui, s: &mut State| {
+                if crate::testutil::themed(ui) {
+                    s.stage.show(ui, image, s.now);
+                }
+            },
+            State { stage, now: 0.0 },
+        )
+}
+
+/// The image area of [`harness_in`] tests: the right two thirds of the
+/// window (600 × 500).
+fn area() -> Rect {
+    Rect::from_min_max(pos2(300.0, 0.0), pos2(900.0, 500.0))
+}
+
+/// Every drawn view's visible image rect lies within its image: the image
+/// covers the whole area, so none of its edges shows.
+fn assert_covered(h: &Harness<'_, State>, when: &str) {
+    let s = &h.state().stage;
+    let mut drawn = 0;
+    for (i, v) in s.viewers.iter().enumerate() {
+        let Some((rect, t)) = v.as_ref().and_then(TiledViewer::last_frame) else {
+            continue;
+        };
+        drawn += 1;
+        let v = v.as_ref().expect("viewer");
+        let (w, ht) = (s.geoms[i].width as f64, s.geoms[i].height as f64);
+        let [x0, y0, x1, y1] = v.view().visible_image_rect(rect, t);
+        let eps = 1e-6 * w.max(ht);
+        assert!(
+            x0 >= -eps && y0 >= -eps && x1 <= w + eps && y1 <= ht + eps,
+            "{when}, view {i}: shows [{x0:.2}, {y0:.2}, {x1:.2}, {y1:.2}] of {w} × {ht}"
+        );
+    }
+    assert!(drawn > 0, "{when}: nothing drawn");
+}
+
+#[test]
+fn portrait_image_covers_a_landscape_area() {
+    // A portrait mosaic (9255 × 18310 has this aspect) in a landscape area.
+    for reduced in [false, true] {
+        // Even views zoom in, odd ones zoom out.
+        for start in [0, 1] {
+            let views = vec![sized("Ha", [250, 500]), sized("OIII", [250, 500])];
+            let mut h = harness_in(views, start, reduced, area());
+            // Through the dwell and the crossfade into the next view.
+            for step in 0..=24 {
+                let t = f64::from(step) * 0.5;
+                frames(&mut h, t);
+                assert_covered(&h, &format!("reduced {reduced}, start {start}, {t} s"));
+            }
+        }
+    }
+}
+
+#[test]
+fn matching_aspect_keeps_its_drift() {
+    // The image has the area's aspect: the cover zoom is the fit zoom, and
+    // the drift zooms by KEN_BURNS_ZOOM from it as before, within the image.
+    let views = vec![sized("Ha", [1200, 1000]), sized("OIII", [1200, 1000])];
+    let mut h = harness_in(views, 0, false, area());
+    let zoom = |h: &Harness<'_, State>| {
+        let s = &h.state().stage;
+        let v = s.viewers[s.current].as_ref().expect("viewer");
+        let (_, t) = v.last_frame().expect("shown");
+        v.view().zoom(t)
+    };
+    frames(&mut h, 0.0);
+    assert!((zoom(&h) - 0.5).abs() < 1e-9, "{}", zoom(&h));
+    assert_covered(&h, "start");
+    frames(&mut h, 5.0);
+    let halfway = 1.0 + (KEN_BURNS_ZOOM - 1.0) / 2.0;
+    assert!((zoom(&h) / 0.5 - halfway).abs() < 1e-9, "{}", zoom(&h));
+    assert_covered(&h, "halfway");
+}
+
 /// A source that serves no tiles until `open` is set.
 struct Gated {
     inner: ImageTileSource,

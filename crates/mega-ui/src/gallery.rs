@@ -37,6 +37,7 @@ pub struct GalleryState {
     brand: Option<BrandImages>,
     starfield: Starfield,
     hero: Option<HeroStage>,
+    portrait_hero: Option<HeroStage>,
     card_thumbs: Option<[TextureHandle; 2]>,
 }
 
@@ -75,6 +76,7 @@ impl Default for GalleryState {
             brand: None,
             starfield: Starfield::new(7),
             hero: None,
+            portrait_hero: None,
             card_thumbs: None,
         }
     }
@@ -133,12 +135,34 @@ fn gradient_image(size: [usize; 2], a: Color32, b: Color32) -> ColorImage {
     ColorImage::new(size, pixels)
 }
 
-/// A hero stage over two generated gradients, frozen at time zero so the
-/// gallery (and its snapshots) stay still.
-fn gallery_hero() -> HeroStage {
+/// [`gradient_image`] with faint seams between `cols` × `rows` panels,
+/// which show how much of the mosaic the hero crops.
+fn panel_grid_image(size: [usize; 2], a: Color32, b: Color32, grid: [usize; 2]) -> ColorImage {
+    let mut img = gradient_image(size, a, b);
+    let [w, h] = size;
+    let seam = |p: Color32| p.lerp_to_gamma(Color32::WHITE, 0.35);
+    for y in 0..h {
+        for x in 0..w {
+            let on_col = (1..grid[0]).any(|c| x.abs_diff(c * w / grid[0]) < 1);
+            let on_row = (1..grid[1]).any(|r| y.abs_diff(r * h / grid[1]) < 1);
+            if on_col || on_row {
+                img.pixels[y * w + x] = seam(img.pixels[y * w + x]);
+            }
+        }
+    }
+    img
+}
+
+/// A hero stage over two generated gradients of `size` pixels with seams
+/// between `grid` panels, frozen at time zero so the gallery (and its
+/// snapshots) stay still.
+fn gallery_hero(size: [usize; 2], grid: [usize; 2]) -> HeroStage {
     let view = |label: &str, a: Color32, b: Color32| HeroView {
         label: label.to_string(),
-        source: Arc::new(ImageTileSource::new(gradient_image([640, 480], a, b), 256)),
+        source: Arc::new(ImageTileSource::new(
+            panel_grid_image(size, a, b, grid),
+            256,
+        )),
     };
     let mut stage = HeroStage::new_synchronous();
     stage.set_views(
@@ -150,6 +174,21 @@ fn gallery_hero() -> HeroStage {
         0.0,
     );
     stage
+}
+
+/// Draw `hero` as the start screen does, in a 1000 × 320 strip whose right
+/// two thirds are the image area.
+fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1000.0, 320.0), Sense::hover());
+    let image = Rect::from_min_max(
+        egui::pos2(rect.left() + rect.width() / 3.0, rect.top()),
+        rect.max,
+    );
+    // Constant time keeps the stage on its first view, mid-drift.
+    ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+        ui.set_clip_rect(rect);
+        hero.show(ui, image, 0.0);
+    });
 }
 
 /// Draw the gallery.
@@ -369,17 +408,20 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
         });
 
         section(ui, "Hero stage", |ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(1000.0, 320.0), Sense::hover());
-            let image = Rect::from_min_max(
-                egui::pos2(rect.left() + rect.width() / 3.0, rect.top()),
-                rect.max,
-            );
-            let hero = state.hero.get_or_insert_with(gallery_hero);
-            // Constant time keeps the stage on its first view, mid-drift.
-            ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                ui.set_clip_rect(rect);
-                hero.show(ui, image, 0.0);
-            });
+            let hero = state
+                .hero
+                .get_or_insert_with(|| gallery_hero([640, 480], [1, 1]));
+            hero_section(ui, hero);
+        });
+
+        // A portrait mosaic of 2 × 4 panels (the aspect of 9255 × 18310) in
+        // the landscape image area: it fills the area, cropped top and
+        // bottom, with no hard edges.
+        section(ui, "Hero stage · portrait mosaic", |ui| {
+            let hero = state
+                .portrait_hero
+                .get_or_insert_with(|| gallery_hero([243, 480], [2, 4]));
+            hero_section(ui, hero);
         });
 
         section(ui, "Session cards", |ui| {
