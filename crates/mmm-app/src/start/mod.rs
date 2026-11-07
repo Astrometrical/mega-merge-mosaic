@@ -15,6 +15,8 @@ use crate::session::{SESSION_EXT, session_name};
 
 #[allow(dead_code)] // wired into the start screen in a later task
 mod facts;
+#[allow(dead_code)] // wired into the start screen in a later task
+mod hero_views;
 mod recent;
 
 pub use recent::{Library, RecentEntry};

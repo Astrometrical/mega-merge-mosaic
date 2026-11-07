@@ -1,6 +1,9 @@
 //! The Blend tab's tile source: a group's tiled result store
 //! (`result.mmmt`) read through a [`TileReader`], display-stretched to RGBA
-//! on the viewer's loader threads.
+//! on the viewer's loader threads. The start screen reads the same stores
+//! through a [`FileTileReader`] instead ([`MosaicTileSource::open_plain`]):
+//! plain positioned reads, never a mapping, so a store another process
+//! recreates under it cannot fault it.
 //!
 //! The display stretch runs on the CPU, per tile, on the loader threads
 //! (spec §8 trade-off): it keeps the viewer backend-agnostic for the later
@@ -25,7 +28,7 @@ use egui::{Color32, ColorImage};
 use mega_ui::viewer::{Fetched, PyramidGeometry, TileKey, TileSource};
 use mmm_core::session::Session;
 use mmm_core::stretch::{ChannelStats, StretchParams, apply, auto_stretch, channel_stats};
-use mmm_core::tiles::{TileGeometry, TileReader, TileState};
+use mmm_core::tiles::{FileTileReader, TileGeometry, TileRead, TileReader, TileState};
 
 /// Copies of a tile torn by a concurrent write tried before giving up (the
 /// next generation bump fetches it again).
@@ -42,7 +45,7 @@ pub const LINEAR: StretchParams = StretchParams {
 
 /// A group's result store as a [`TileSource`], with a display stretch.
 pub struct MosaicTileSource {
-    reader: TileReader,
+    reader: Box<dyn TileRead>,
     tiles: TileGeometry,
     geometry: PyramidGeometry,
     /// Per-channel stretch; locked only to swap or clone the `Arc` (never
@@ -52,9 +55,9 @@ pub struct MosaicTileSource {
 }
 
 impl MosaicTileSource {
-    /// Wrap `reader`. `stretch` (one entry per channel) defaults to
-    /// [`LINEAR`]; a wrong-length stretch is ignored too.
-    pub fn new(reader: TileReader, stretch: Option<Vec<StretchParams>>) -> Self {
+    /// Wrap `reader` (mapped or plain). `stretch` (one entry per channel)
+    /// defaults to [`LINEAR`]; a wrong-length stretch is ignored too.
+    pub fn new(reader: impl TileRead + 'static, stretch: Option<Vec<StretchParams>>) -> Self {
         let tiles = reader.geometry();
         let channels = tiles.channels as usize;
         let stretch = stretch
@@ -63,15 +66,25 @@ impl MosaicTileSource {
         MosaicTileSource {
             geometry: PyramidGeometry::new(tiles.width, tiles.height, tiles.tile),
             tiles,
-            reader,
+            reader: Box::new(reader),
             stretch: Mutex::new(Arc::new(stretch)),
             generation: AtomicU64::new(0),
         }
     }
 
-    /// Open the store at `path` (blocking: call off the UI thread).
+    /// Open the store at `path` memory-mapped ([`TileReader`]), as the Blend
+    /// tab does: no store recreation may happen while it is open (module
+    /// docs). Blocking: call off the UI thread.
     pub fn open(path: &Path, stretch: Option<Vec<StretchParams>>) -> mmm_core::Result<Self> {
         Ok(Self::new(TileReader::open(path)?, stretch))
+    }
+
+    /// Open the store at `path` through plain positioned reads
+    /// ([`FileTileReader`]), never mapped: a store recreated under it by
+    /// another process reads as missing tiles, never a fault. The start
+    /// screen's reader. Blocking: call off the UI thread.
+    pub fn open_plain(path: &Path, stretch: Option<Vec<StretchParams>>) -> mmm_core::Result<Self> {
+        Ok(Self::new(FileTileReader::open(path)?, stretch))
     }
 
     /// The store's geometry.
@@ -226,12 +239,25 @@ pub fn tile_image(
     channels: usize,
     stretch: &[StretchParams],
 ) -> ColorImage {
-    let plane = tile * tile;
+    planar_image(planar, tile * tile, tile, (w, h), channels, stretch)
+}
+
+/// [`tile_image`]'s conversion for any planar layout: the visible `w × h`
+/// corner of `channels` planes of `plane` samples each, whose rows are
+/// `stride` samples apart.
+pub fn planar_image(
+    planar: &[f32],
+    plane: usize,
+    stride: usize,
+    (w, h): (usize, usize),
+    channels: usize,
+    stretch: &[StretchParams],
+) -> ColorImage {
     let byte = |c: usize, v: f32| (apply(&stretch[c], v) * 255.0).round() as u8;
     let mut pixels = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
-            let i = y * tile + x;
+            let i = y * stride + x;
             if (0..channels).all(|c| planar[c * plane + i] == 0.0) {
                 pixels.push(Color32::TRANSPARENT);
             } else if channels >= 3 {
@@ -257,6 +283,30 @@ pub fn fresh_fraction((valid, total): (usize, usize)) -> Option<f64> {
 /// Colour of each composition channel (R, G, B) at weight 1.
 const CHANNEL_TINTS: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
+/// The distinct members of a composition's `channels` (R, G, B: a member
+/// and its weight, or nothing), in first-mapped order, each with its RGB
+/// tint: its channel's colour times the weight, summed over every channel
+/// it is mapped to. `same` tells whether two members are one.
+pub fn channel_tints<T: Clone>(
+    channels: &[Option<(T, f32)>],
+    same: impl Fn(&T, &T) -> bool,
+) -> Vec<(T, [f32; 3])> {
+    let mut members: Vec<(T, [f32; 3])> = Vec::new();
+    for (slot, ch) in channels.iter().enumerate().take(CHANNEL_TINTS.len()) {
+        let Some((member, w)) = ch else { continue };
+        let tint = CHANNEL_TINTS[slot].map(|c| c * w);
+        match members.iter_mut().find(|(m, _)| same(m, member)) {
+            Some((_, t)) => {
+                for (a, b) in t.iter_mut().zip(tint) {
+                    *a += b;
+                }
+            }
+            None => members.push((member.clone(), tint)),
+        }
+    }
+    members
+}
+
 /// A composition view (spec §5.3) as a [`TileSource`]: each mapped group's
 /// [`MosaicTileSource`] tile is fetched (through that group's own Blend
 /// display stretch) on the loader thread and mixed additively, tinted by
@@ -280,19 +330,7 @@ impl CompositeTileSource {
     /// shared frame); otherwise, or with nothing mapped, the reason is
     /// returned for the user.
     pub fn new(channels: &[Option<(Arc<MosaicTileSource>, f32)>]) -> Result<Self, String> {
-        let mut members: Vec<(Arc<MosaicTileSource>, [f32; 3])> = Vec::new();
-        for (slot, ch) in channels.iter().enumerate().take(CHANNEL_TINTS.len()) {
-            let Some((src, w)) = ch else { continue };
-            let tint = CHANNEL_TINTS[slot].map(|c| c * w);
-            match members.iter_mut().find(|(m, _)| Arc::ptr_eq(m, src)) {
-                Some((_, t)) => {
-                    for (a, b) in t.iter_mut().zip(tint) {
-                        *a += b;
-                    }
-                }
-                None => members.push((src.clone(), tint)),
-            }
-        }
+        let members = channel_tints(channels, Arc::ptr_eq);
         let Some((first, _)) = members.first() else {
             return Err("This composition maps no groups.".into());
         };
@@ -361,8 +399,10 @@ impl TileSource for CompositeTileSource {
     }
 }
 
-/// An additive RGB mix of display-ready tiles of one size.
-struct Mix {
+/// An additive RGB mix of display-ready images of one size, each tinted
+/// per channel: how a composition mixes its groups (tiles here, the start
+/// screen's overview pictures in `start::hero_views`).
+pub struct Mix {
     size: [usize; 2],
     sum: Vec<[f32; 3]>,
     /// Some member has data at the pixel.
@@ -370,7 +410,8 @@ struct Mix {
 }
 
 impl Mix {
-    fn new(size: [usize; 2]) -> Self {
+    /// An empty (transparent) mix of `size` images.
+    pub fn new(size: [usize; 2]) -> Self {
         let n = size[0] * size[1];
         Mix {
             size,
@@ -380,8 +421,8 @@ impl Mix {
     }
 
     /// Add `img` times `tint` per channel; transparent (no-data) pixels add
-    /// nothing.
-    fn add(&mut self, img: &ColorImage, tint: [f32; 3]) {
+    /// nothing, and an image of another size is ignored.
+    pub fn add(&mut self, img: &ColorImage, tint: [f32; 3]) {
         if img.size != self.size {
             return; // cannot happen with one geometry
         }
@@ -397,7 +438,7 @@ impl Mix {
     }
 
     /// The mix, saturated at white; transparent where no member has data.
-    fn image(&self) -> ColorImage {
+    pub fn image(&self) -> ColorImage {
         let byte = |v: f32| v.round().clamp(0.0, 255.0) as u8;
         let pixels = self
             .sum
@@ -515,6 +556,42 @@ mod tests {
         assert!(matches!(src.fetch(key(9, 0, 0)), Fetched::Missing));
         assert!(matches!(src.fetch(key(0, 7, 0)), Fetched::Missing));
         drop(store);
+    }
+
+    #[test]
+    fn plain_source_reads_like_the_mapped_one() {
+        let path = temp_dir("tsrc-plain").join("result.mmmt");
+        let mut store = TileStore::create(&path, geom(1)).unwrap();
+        let data = vec![0.5f32; T * T];
+        store.write_tile(0, 0, 0, &data).unwrap();
+        store.write_tile(0, 1, 0, &data).unwrap();
+        store.write_tile(0, 2, 1, &data).unwrap();
+        store.invalidate_rect([256, 0, 512, 256]);
+        // On Windows the writer's file lock refuses plain reads while it
+        // is held (they read as errors, never a fault): close it first.
+        drop(store);
+        let mapped = MosaicTileSource::open(&path, None).unwrap();
+        let plain = MosaicTileSource::open_plain(&path, None).unwrap();
+        assert_eq!(plain.tile_geometry(), mapped.tile_geometry());
+        assert_eq!(plain.geometry(), mapped.geometry());
+        let image = |f: Fetched| match f {
+            Fetched::Valid(img) => Some((true, img)),
+            Fetched::Stale(img) => Some((false, img)),
+            Fetched::Missing => None,
+        };
+        for k in [
+            key(0, 0, 0),
+            key(0, 1, 0),
+            key(0, 2, 0),
+            key(0, 2, 1),
+            key(9, 0, 0),
+        ] {
+            assert_eq!(image(plain.fetch(k)), image(mapped.fetch(k)), "{k:?}");
+        }
+        assert_eq!(
+            plain.fresh_counts([0, 0, 600, 300]),
+            mapped.fresh_counts([0, 0, 600, 300])
+        );
     }
 
     #[test]
