@@ -10,6 +10,7 @@ pub mod brand;
 pub mod checks;
 pub mod gallery;
 pub mod groups;
+pub mod hero;
 pub mod icons;
 pub mod jobs;
 pub mod motion;

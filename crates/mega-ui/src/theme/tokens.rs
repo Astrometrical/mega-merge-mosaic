@@ -35,3 +35,11 @@ pub const CONTROL_HEIGHT_LARGE: f32 = 38.0;
 pub const HOVER_FADE_S: f32 = 0.1;
 /// Opacity of disabled widgets.
 pub const DISABLED_ALPHA: f32 = 0.4;
+
+/// Hero slideshow: seconds each view is shown before the crossfade starts.
+pub const HERO_DWELL_S: f64 = 8.0;
+/// Hero slideshow: crossfade length, in seconds.
+pub const HERO_CROSSFADE_S: f64 = 2.0;
+/// Hero slideshow: zoom factor the drift reaches over a view's time on
+/// screen.
+pub const KEN_BURNS_ZOOM: f64 = 1.08;

@@ -267,6 +267,8 @@ pub struct TiledViewer {
     presentation: bool,
     /// See [`TiledViewer::set_opacity`].
     opacity: f32,
+    /// Set once any tile has been painted.
+    drawn_any: bool,
 }
 
 impl TiledViewer {
@@ -301,6 +303,7 @@ impl TiledViewer {
             overlays: Vec::new(),
             presentation: false,
             opacity: 1.0,
+            drawn_any: false,
         }
     }
 
@@ -342,6 +345,11 @@ impl TiledViewer {
     /// The view, for a camera driven by code.
     pub fn view_mut(&mut self) -> &mut View {
         &mut self.view
+    }
+
+    /// True once any tile has been painted.
+    pub fn has_drawn_tiles(&self) -> bool {
+        self.drawn_any
     }
 
     /// True while tile requests are queued, in flight or awaiting upload.
@@ -773,6 +781,7 @@ impl TiledViewer {
             let dim = stale && !self.presentation;
             let tint = if dim { stale_tint() } else { Color32::WHITE };
             painter.image(tex, screen, uv, tint.gamma_multiply(self.opacity));
+            self.drawn_any = true;
             if dim {
                 hatch(&painter.with_clip_rect(screen.intersect(rect)), screen);
             }

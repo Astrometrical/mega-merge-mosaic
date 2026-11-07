@@ -156,9 +156,14 @@ pub fn focus_ring(ui: &Ui, response: &Response, corner: u8) {
 /// A square secondary button showing only `glyph`; `tooltip` is shown on
 /// hover and is its accessible label.
 pub fn icon_button(glyph: char, tooltip: &str) -> MegaButton {
+    icon_button_of(ButtonKind::Secondary, glyph, tooltip)
+}
+
+/// Like [`icon_button`], in the given `kind` (e.g. ghost over imagery).
+pub fn icon_button_of(kind: ButtonKind, glyph: char, tooltip: &str) -> MegaButton {
     MegaButton {
         square: true,
-        ..MegaButton::new(ButtonKind::Secondary, tooltip).icon(glyph)
+        ..MegaButton::new(kind, tooltip).icon(glyph)
     }
 }
 
