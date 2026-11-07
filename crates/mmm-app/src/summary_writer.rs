@@ -87,6 +87,9 @@ pub struct SummaryWriter {
     inputs: Option<Inputs>,
     /// The running write: the summary it wrote, or `None` if unchanged.
     running: Option<Receiver<Option<SessionSummary>>>,
+    /// How many summaries have been written (for tests).
+    #[cfg(test)]
+    writes: usize,
 }
 
 /// Equal facts, ignoring when they were written.
@@ -115,6 +118,8 @@ impl SummaryWriter {
             last: previous,
             inputs: None,
             running: None,
+            #[cfg(test)]
+            writes: 0,
         }
     }
 
@@ -123,7 +128,9 @@ impl SummaryWriter {
         self.dirty = true;
     }
 
-    /// True while a write runs (the caller should keep polling).
+    /// True while a write runs. A change that lands meanwhile is picked up
+    /// by the next poll (any later frame; no repaint is forced for it).
+    #[cfg(test)]
     pub fn busy(&self) -> bool {
         self.running.is_some()
     }
@@ -152,6 +159,10 @@ impl SummaryWriter {
             match rx.try_recv() {
                 Ok(written) => {
                     if written.is_some() {
+                        #[cfg(test)]
+                        {
+                            self.writes += 1;
+                        }
                         self.last = written;
                     }
                     self.running = None;
@@ -229,6 +240,9 @@ impl SummaryWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mmm_core::session_summary::read_summary;
+
+    use crate::start::tests::temp_dir;
 
     fn paths(names: &[&str]) -> Vec<PathBuf> {
         names.iter().map(PathBuf::from).collect()
@@ -331,5 +345,46 @@ mod tests {
         assert_eq!(s.groups[1].exported_at, Some(200));
         assert_eq!(s.groups[0].blended_at, Some(300));
         assert_eq!(s.groups[0].exported_at, Some(100));
+    }
+
+    /// Poll `w` until no write runs and nothing is dirty, for up to 10 s.
+    fn settle(w: &mut SummaryWriter, s: &OpenSession) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for _ in 0..3 {
+            loop {
+                w.poll(s, None, None);
+                if !w.busy() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "write never landed");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn poll_writes_stamps_and_skips_unchanged() {
+        let root = temp_dir("summary-poll");
+        let s = crate::testutil::two_group_session(&root);
+        let dir = s.mosaic.dir.clone();
+        let mut w = SummaryWriter::new(None);
+        w.record_blend("Ha", 111);
+        w.record_export("Ha", 222);
+        settle(&mut w, &s);
+        let written = read_summary(&dir).unwrap();
+        assert_eq!(written.groups[0].name, "Ha");
+        assert_eq!(written.groups[0].blended_at, Some(111));
+        assert_eq!(written.groups[0].exported_at, Some(222));
+        assert_eq!(w.writes, 1);
+        // Nothing changed: marking dirty and polling again writes nothing.
+        w.mark_dirty();
+        settle(&mut w, &s);
+        assert_eq!(w.writes, 1, "unchanged facts are not rewritten");
+        // A real change is written.
+        w.record_blend("OIII", 333);
+        settle(&mut w, &s);
+        assert_eq!(w.writes, 2);
+        assert_eq!(read_summary(&dir).unwrap().groups[1].blended_at, Some(333));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

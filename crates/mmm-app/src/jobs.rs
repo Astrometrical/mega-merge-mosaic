@@ -997,6 +997,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn blend_and_export_jobs_know_their_group() {
+        let (root, mut s, mut r) = analyzed("job-target");
+        let blend = r.start_blend(&mut s, "Ha", None);
+        let out = root.join("o.fits");
+        let export = r.start_export(&s, "OIII", out, ExportFormat::Fits);
+        assert_eq!(r.target(blend), Some((JobTarget::Blend, "Ha")));
+        assert_eq!(r.target(export), Some((JobTarget::Export, "OIII")));
+        assert_eq!(r.target(9999), None);
+        let _ = drain(&mut r, &mut s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn blend_job_runs_and_applies() {
         let (root, mut s, mut r) = analyzed("job-blend");
         assert_eq!(s.canvas(), Some(CANVAS), "canvas from the reference frame");

@@ -337,17 +337,14 @@ impl Shell {
         }
         self.checks.poll(ctx, session, jobs, &events);
         self.plan.release_if_hidden(now);
-        // The last view: the Blend tab's when it has one, else the Plan's.
-        let last_view = self
-            .blend
-            .view_key()
-            .or(self.plan.view_key())
-            .map(str::to_string);
+        // The last view: that of the active tab (Blend or Plan), else the other's.
+        let last_view = pick_view_key(
+            self.tab,
+            self.blend.view_key(&session.mosaic.config.ui),
+            self.plan.view_key().map(str::to_string),
+        );
         let counts = self.checks.counts(&session.mosaic.config);
         self.summary.poll(session, counts, last_view);
-        if self.summary.busy() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
     }
 
     /// The open session (the Panels, Plan and Blend tabs build on this).
@@ -500,6 +497,16 @@ impl Shell {
                     });
                 }
             });
+    }
+}
+
+/// The view last shown for the summary: the Blend tab's key while it is the
+/// active tab, otherwise the Plan tab's; the other tab's when the active
+/// one has none.
+fn pick_view_key(tab: Tab, blend: Option<String>, plan: Option<String>) -> Option<String> {
+    match tab {
+        Tab::Blend => blend.or(plan),
+        Tab::Plan | Tab::Panels => plan.or(blend),
     }
 }
 
@@ -948,6 +955,16 @@ mod tests {
         let names: Vec<_> = summary.groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, ["Ha", "OIII"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn last_view_follows_the_active_tab() {
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(pick_view_key(Tab::Blend, s("Ha"), s("OIII")), s("Ha"));
+        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), s("OIII")), s("OIII"));
+        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), None), s("Ha"));
+        assert_eq!(pick_view_key(Tab::Blend, None, s("OIII")), s("OIII"));
+        assert_eq!(pick_view_key(Tab::Panels, None, None), None);
     }
 
     #[test]

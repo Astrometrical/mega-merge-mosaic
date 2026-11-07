@@ -80,7 +80,7 @@ use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
 
 use crate::blend_settings::SettingsPanel;
-use crate::compositions::{Composition, ViewKind, load_compositions};
+use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::export::{ExportAction, ExportDialog, RfdSavePicker};
 use crate::jobs::{JobEvent, JobRunner};
 use crate::rois::{Roi, RoiPanel};
@@ -652,12 +652,15 @@ impl BlendTab {
         }
     }
 
-    /// The view's key: the group's name, for a group view; `None` before a
-    /// view is chosen, and for a composition (the Plan tab keys those).
-    pub fn view_key(&self) -> Option<&str> {
+    /// The view's stretch key, as the Plan tab keys it: the group's name, or
+    /// [`composition_stretch_key`] of the composition's name (read from `ui`,
+    /// the session's UI settings). `None` before a view is chosen.
+    pub fn view_key(&self, ui: &Value) -> Option<String> {
         match self.view.as_ref()? {
-            ViewKind::Group(g) => Some(g),
-            ViewKind::Composition(_) => None,
+            ViewKind::Group(g) => Some(g.clone()),
+            ViewKind::Composition(i) => load_compositions(ui)
+                .get(*i)
+                .map(|c| composition_stretch_key(&c.name)),
         }
     }
 
