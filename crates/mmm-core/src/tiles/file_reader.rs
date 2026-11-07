@@ -4,7 +4,8 @@
 //! [`TileReader`](super::TileReader) memory-maps the store, so truncating the
 //! file under it faults the reader. [`FileTileReader`] never maps the file: it
 //! uses positioned reads, so a store that is truncated or rebuilt under it
-//! just yields `Missing` / `None` for the affected tiles.
+//! just yields `Missing` / `None` for the affected tiles. On Windows the
+//! same holds for a store any writer holds (see [`FileTileReader`]).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -34,6 +35,20 @@ pub trait TileRead: Send + Sync {
 /// per-tile seqlock protocol as [`TileReader`](super::TileReader). A short
 /// read, an I/O error or an out-of-range tile reads as `Missing` / `None`;
 /// it never panics and never faults.
+///
+/// **On Windows a held store reads as missing.** The writer lock a
+/// [`TileStore`](super::TileStore) takes is mandatory there, not advisory:
+/// while any `TileStore` holds the store (a blend, an invalidation, a
+/// settings edit; in another process or in the reader's own), every read
+/// through this reader fails (os error 33, a lock violation), so every
+/// tile is `Missing`, every copy `None`, and [`FileTileReader::open`]
+/// fails. Reads succeed again once the writer lets go. So the start
+/// screen's hero shows no tiles while another process blends that
+/// session, and `session_summary::result_state` reads a store being
+/// written as having no result; the app rewrites its summary after every
+/// job ends, once the store is released. (The mapped
+/// [`TileReader`](super::TileReader) is not affected: mappings bypass the
+/// lock.)
 pub struct FileTileReader {
     layout: Layout,
     file: Mutex<File>,
@@ -210,6 +225,78 @@ mod tests {
             }
         }
         drop(s2);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn file_reader_survives_recreation_after_the_writer_closes() {
+        // As above, but the new store's writer lets go before the reads, so
+        // they reach the file on every OS (on Windows a held store refuses
+        // them: see `file_reader_waits_for_the_writer_on_windows`).
+        let p = tmp("recreate-closed");
+        let g = geom(1000, 600);
+        let len = g.tile_len();
+        {
+            let mut s = TileStore::create(&p, g).unwrap();
+            s.write_tile(0, 0, 0, &vec![1.0; len]).unwrap();
+        }
+        let r = FileTileReader::open(&p).unwrap();
+        let g2 = geom(300, 300);
+        {
+            let mut s2 = TileStore::create(&p, g2).unwrap();
+            s2.write_tile(0, 0, 0, &vec![2.0; g2.tile_len()]).unwrap();
+        }
+        let mut out = vec![0.0; len];
+        for l in 0..g.levels() {
+            let (nx, ny) = g.tiles(l);
+            for ty in 0..ny {
+                for tx in 0..nx {
+                    let _ = r.state(l, tx, ty);
+                    // Either nothing, or a complete tile; never a panic.
+                    if r.read_tile_any(l, tx, ty, &mut out).is_some() {
+                        assert!(out.iter().all(|&v| v == out[0]), "torn tile");
+                    }
+                }
+            }
+        }
+        // A reader opened afresh reads the new store.
+        let fresh = FileTileReader::open(&p).unwrap();
+        assert_eq!(TileRead::geometry(&fresh), g2);
+        let mut out = vec![0.0; g2.tile_len()];
+        assert_eq!(
+            fresh.read_tile_any(0, 0, 0, &mut out),
+            Some(TileState::Valid)
+        );
+        assert!(out.iter().all(|&v| v == 2.0));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn file_reader_waits_for_the_writer_on_windows() {
+        let p = tmp("held");
+        let g = geom(1000, 600);
+        let len = g.tile_len();
+        {
+            let mut s = TileStore::create(&p, g).unwrap();
+            s.write_tile(0, 0, 0, &vec![1.0; len]).unwrap();
+        }
+        let r = FileTileReader::open(&p).unwrap();
+        let mut out = vec![0.0; len];
+        let held = TileStore::open(&p).unwrap();
+        let during = (r.state(0, 0, 0), r.read_tile_any(0, 0, 0, &mut out));
+        if cfg!(windows) {
+            // The writer's lock is mandatory there: every read through
+            // another handle fails (os error 33), so the tile reads as
+            // missing, as does opening a reader.
+            assert_eq!(during, (TileState::Missing, None));
+            assert!(FileTileReader::open(&p).is_err());
+        } else {
+            // Advisory elsewhere: reads go on.
+            assert_eq!(during, (TileState::Valid, Some(TileState::Valid)));
+        }
+        drop(held);
+        assert_eq!(r.read_tile_any(0, 0, 0, &mut out), Some(TileState::Valid));
+        assert!(out.iter().all(|&v| v == 1.0));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 

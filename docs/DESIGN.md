@@ -1310,7 +1310,16 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   and a short read, an I/O error or an out-of-range tile reads as
   missing; it never faults. Live reads from the start screen use it, never
   `TileReader`, because a mapping of a truncated or replaced file raises a
-  fatal fault.
+  fatal fault. **On Windows a held store reads as missing:** a
+  `TileStore`'s writer lock is mandatory there, so while any `TileStore`
+  holds the store (a blend, an invalidation or a settings edit, in another
+  process or the reader's own) every `FileTileReader` read fails (os error
+  33) and opening one fails; reads succeed again once the writer lets go.
+  So the hero shows no tiles while another process blends the session, and
+  `session_summary::result_state` reads a store being written as `None`.
+  That is why the summary writer is marked dirty on every job end,
+  cancelled ones included (the store has been released by then), and
+  re-reads the results whenever the settings change.
 - **The lock probe** (`mosaic::session_busy`): opens `.lock` without
   creating it and tries a shared lock, released at once. It is the only time
   the start screen touches a session's lock, and an error other than
