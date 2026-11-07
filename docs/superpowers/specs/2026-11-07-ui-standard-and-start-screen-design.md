@@ -207,8 +207,12 @@ or drops it if faking it looks worse.
 ### 4.6 Icons
 
 **Lucide**, embedded as an icon font. It's the published `lucide-static`
-font; the licence is ISC. It goes in as a fallback to the UI family so
-icons sit inside text. Its outline style with 2 px rounded strokes
+font; the licence is ISC. *(Built differently, 2026-11-07: it was meant
+to go in as a fallback to the UI family so icons could sit inside text,
+but Inter has its own glyphs in the private-use range Lucide uses, and
+Lucide has digits, so no single fallback chain works. Icons are drawn only
+in a Lucide-only family, through `icons::font` and `icons::rich`.)* Its
+outline style with 2 px rounded strokes
 matches the Heroicons-style line icons on the web. `mega-ui` exposes
 named constants for the glyphs we use. If the font proves unworkable in
 egui 0.36, the fallback is Lucide SVGs through egui's image loading,
