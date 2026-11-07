@@ -71,7 +71,9 @@
 //! - [`preview`] — cached low-resolution panel previews placed in the
 //!   shared reference frame (a block mean for aligned canvases, a WCS warp
 //!   for solved panels), built on a bounded pool before any analysis
-//!   ([`preview::plan_previews`] / [`preview::run_previews`]).
+//!   ([`preview::plan_previews`] / [`preview::run_previews`]); cached ones
+//!   are read back and drawn as one plan picture with
+//!   [`preview::load_cached_previews`] / [`preview::render_overview`].
 //! - [`checks`] — structured input, file and analysis checks (severity, code,
 //!   affected groups, remedy) and the accepted-warning bookkeeping, as data
 //!   for a UI or `mmm check`.
