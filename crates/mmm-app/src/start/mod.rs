@@ -11,8 +11,10 @@
 //! reduced-motion probe run on background threads that this module polls
 //! every frame. Load order (spec §5.4):
 //! the hero candidate's facts first, its views as soon as they arrive,
-//! and card thumbnails only once the hero has drawn ([`hero`]). Notes are
-//! saved a pause after typing ([`notes`]); drawing is in [`layout`].
+//! and card thumbnails only once the hero has drawn ([`hero`]). Once
+//! settled, the default hero stays put ([`StartScreen::default_hero`]).
+//! Notes are saved a pause after typing ([`notes`]); drawing is in
+//! [`layout`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,7 +43,8 @@ pub use recent::{Library, RecentEntry};
 /// Seconds after the screen starts during which a session whose facts
 /// haven't arrived may still be the default hero; after that, one whose
 /// folder doesn't answer (e.g. on a dead network share) gives way to the
-/// most recent available one.
+/// most recent available one. The default hero then stays put (see
+/// [`StartScreen::default_hero`]).
 const FACTS_WAIT_S: f64 = 1.0;
 /// Status and hero line of a session that cannot be read.
 const UNREADABLE: &str = "Can't read this session";
@@ -141,6 +144,8 @@ pub struct StartScreen {
     reload: Vec<PathBuf>,
     /// The card the user clicked (else the default hero is shown).
     selected: Option<PathBuf>,
+    /// The default hero once settled (see [`StartScreen::default_hero`]).
+    latched: Option<PathBuf>,
     /// When the screen first drew (egui time).
     started_at: Option<f64>,
     /// The time of the frame being drawn (egui time).
@@ -195,6 +200,7 @@ impl StartScreen {
             started: false,
             reload: Vec::new(),
             selected: None,
+            latched: None,
             started_at: None,
             clock: 0.0,
             stage: HeroStage::new(loader_threads),
@@ -239,6 +245,9 @@ impl StartScreen {
         self.facts.remove(path);
         self.reload.push(path.to_path_buf());
         self.selected = None;
+        if self.latched.as_deref() == Some(path) {
+            self.latched = None;
+        }
         self.drop_hero();
         self.stop_thumbnails();
     }
@@ -277,6 +286,8 @@ impl StartScreen {
         // Polled before anything starts: the first pass draws without facts.
         self.poll_background(&ctx);
         self.start_background(&ctx);
+        let used = ui.input(|i| i.events.iter().any(is_user_input));
+        self.latch_hero(used);
         if self.brand.is_none() {
             self.brand = Some(BrandImages::load(
                 &ctx,
@@ -338,6 +349,47 @@ impl StartScreen {
         }
     }
 
+    /// The hero when no card is selected: the latched session while it is
+    /// listed and not known to be unavailable, else [`Self::pick_default`].
+    ///
+    /// Once settled the default hero doesn't move, so what the user is
+    /// reading (name, notes, the session **Resume** opens) never jumps to
+    /// another session. It latches when [`Self::pick_default`] gives a
+    /// session whose facts show it available, or, at the user's input
+    /// (a press, a key, a scroll: [`is_user_input`]) while it gives one
+    /// whose facts are still on their way, that one. It changes again only
+    /// if the latched session turns out missing, busy or unreadable, is
+    /// removed, or is opened ([`Self::record_opened`]); a selected card
+    /// shows instead of it meanwhile.
+    fn default_hero(&self) -> Option<PathBuf> {
+        match &self.latched {
+            Some(p) if self.keeps_latch(p) => Some(p.clone()),
+            _ => self.pick_default(),
+        }
+    }
+
+    /// Whether the latched session `path` stays the default hero: still
+    /// listed, and not known to be unavailable.
+    fn keeps_latch(&self, path: &Path) -> bool {
+        self.library.entries().iter().any(|e| e.path == path)
+            && self
+                .facts
+                .get(path)
+                .is_none_or(|f| f.availability == Availability::Available)
+    }
+
+    /// Settle the default hero (see [`Self::default_hero`]); `used`: the
+    /// user used the screen this frame.
+    fn latch_hero(&mut self, used: bool) {
+        if self.latched.as_deref().is_some_and(|p| self.keeps_latch(p)) {
+            return;
+        }
+        self.latched = self.pick_default().filter(|p| match self.facts.get(p) {
+            Some(f) => f.availability == Availability::Available,
+            None => used,
+        });
+    }
+
     /// The most recently opened session whose facts show it available. For
     /// [`FACTS_WAIT_S`] after the screen starts, one whose facts haven't
     /// arrived may be it too (they usually come at once); after that it
@@ -345,7 +397,7 @@ impl StartScreen {
     /// another session is available. With none available, the most recent
     /// session whose facts are pending, else the most recent one, so the
     /// block can say why.
-    fn default_hero(&self) -> Option<PathBuf> {
+    fn pick_default(&self) -> Option<PathBuf> {
         let by_recency = self.library.by_recency();
         // Some(available), or None while the facts are pending.
         let available = |e: &RecentEntry| {
@@ -646,6 +698,20 @@ fn card_look(facts: Option<&CardFacts>) -> (Option<(Tone, String)>, bool) {
         (tone, label.to_string())
     });
     (status, f.availability == Availability::Missing)
+}
+
+/// Whether `event` is the user using the screen: a press, a key, typed
+/// text or a scroll. Pointer movement is not: the window may open under
+/// the cursor, and a stray move must not settle the default hero on a
+/// session whose folder hasn't answered yet.
+fn is_user_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::PointerButton { pressed: true, .. }
+            | egui::Event::Key { pressed: true, .. }
+            | egui::Event::Text(_)
+            | egui::Event::MouseWheel { .. }
+    )
 }
 
 /// Seconds since the Unix epoch.

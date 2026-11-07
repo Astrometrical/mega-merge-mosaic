@@ -151,6 +151,22 @@ fn stuck_harness(recent: Vec<RecentEntry>) -> Harness<'static, Screen> {
     harness_with(state)
 }
 
+/// Facts as usual, except that a session named "Slow…" answers only after
+/// 3 s (well after the facts wait).
+fn slow_share(entry: &RecentEntry) -> facts::CardFacts {
+    if session_name(&entry.path).starts_with("Slow") {
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    facts::load_facts(entry)
+}
+
+/// [`harness`] whose facts come from [`slow_share`].
+fn slow_harness(recent: Vec<RecentEntry>) -> Harness<'static, Screen> {
+    let mut state = Screen::new(recent, StubPicker(None));
+    state.screen = state.screen.with_facts_loader(slow_share);
+    harness_with(state)
+}
+
 /// A recent entry for `path`, opened at `t`.
 pub(crate) fn entry_at(path: &Path, t: u64) -> RecentEntry {
     RecentEntry {
@@ -398,6 +414,70 @@ fn unreachable_newest_is_not_the_hero() {
     double_click(&mut h, "Next");
     h.run();
     assert_eq!(h.state().actions, vec![StartAction::Open(next.clone())]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn settled_hero_stays_when_a_newer_session_answers() {
+    let root = temp_dir("start-latch-wait");
+    let slow = session(&root, "Slow share");
+    let next = session(&root, "Next");
+    let mut h = slow_harness(vec![entry_at(&slow, 300), entry_at(&next, 200)]);
+    // After the facts wait the hero settles on the available session...
+    step_until(&mut h, |s| s.screen.hero() == Some(next.clone()));
+    // ...and stays there when the newest answers, available, later.
+    step_until(&mut h, |s| s.screen.facts_known() == 2);
+    pause(&mut h, 0.5);
+    assert_eq!(h.state().screen.hero(), Some(next.clone()));
+    h.get_by_role_and_label(Role::Label, "Next");
+    h.get_by_label("Resume session").click();
+    h.run();
+    assert_eq!(h.state().actions, vec![StartAction::Open(next.clone())]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn input_settles_the_hero_before_the_wait_ends() {
+    let root = temp_dir("start-latch-input");
+    let slow = session(&root, "Slow share");
+    let next = session(&root, "Next");
+    let mut h = slow_harness(vec![entry_at(&slow, 300), entry_at(&next, 200)]);
+    while h.state().frames == 0 {
+        h.step();
+    }
+    assert_eq!(h.state().screen.hero(), Some(slow.clone()));
+    // The user uses the screen while the newest's facts are on their way:
+    // the hero shown stays, past the wait...
+    h.key_press(egui::Key::F1);
+    h.step();
+    pause(&mut h, 1.5);
+    assert_eq!(h.state().screen.hero(), Some(slow.clone()));
+    // ...and once its facts arrive.
+    step_until(&mut h, |s| s.screen.facts_known() == 2);
+    h.run();
+    assert_eq!(h.state().screen.hero(), Some(slow.clone()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn settled_hero_gives_way_when_it_becomes_unavailable() {
+    let root = temp_dir("start-latch-busy");
+    let newest = session(&root, "Newest");
+    let older = session(&root, "Older");
+    let mut h = harness(vec![entry_at(&newest, 300), entry_at(&older, 200)]);
+    settle(&mut h);
+    pause(&mut h, 1.2);
+    assert_eq!(h.state().screen.hero(), Some(newest.clone()));
+    // Opened in another window: its facts are read again, and it is busy.
+    let _lock = lock_session(&newest).unwrap();
+    h.state_mut().screen.reload.push(newest.clone());
+    step_until(&mut h, |s| {
+        s.screen
+            .facts
+            .get(&newest)
+            .is_some_and(|f| f.availability == facts::Availability::Busy)
+    });
+    assert_eq!(h.state().screen.hero(), Some(older.clone()));
     let _ = std::fs::remove_dir_all(&root);
 }
 

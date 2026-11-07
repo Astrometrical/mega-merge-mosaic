@@ -1283,9 +1283,17 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   missing, busy or unreadable one never is. A newest session whose facts
   haven't arrived stays the candidate for `FACTS_WAIT_S` (about 1 s); after
   that the hero falls back to the most recent session known to be
-  available, so a folder that never answers never holds up the screen. Hero dwell is 8 s and the
-  crossfade 2 s; with reduced motion (probed in the background) views cut
-  and don't drift.
+  available, so a folder that never answers never holds up the screen.
+  Once settled the default hero stays put, so the name, notes and
+  **Resume** target the user is reading never jump: it latches as soon as
+  the pick is a session whose facts show it available (at the latest when
+  the wait ends), or at the user's first press, key or scroll (not a mere
+  pointer move: the window may open under the cursor) even while the
+  pick's facts are still on their way. It moves again only if the latched
+  session turns out missing, busy or unreadable, is removed or is opened;
+  a newer session answering late doesn't take over. Hero dwell is 8 s and
+  the crossfade 2 s; with reduced motion (probed in the background) views
+  cut and don't drift.
 - **`FileTileReader`** (`mmm_core::tiles`): the tile reader for a store
   another process may recreate. It follows the same per-tile seqlock
   protocol as the memory-mapped `TileReader` but uses positioned file reads,
