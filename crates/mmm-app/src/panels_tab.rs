@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
+use mega_ui::groups::physical_color;
+pub use mega_ui::groups::{GROUP_PALETTE, PHYSICAL_SLOTS, SII_COLOR};
 use mega_ui::theme::palette;
 use mmm_core::checks::{CheckCode, PanelFacts, input_checks, panel_facts};
 use mmm_core::formats::InputPanel;
@@ -62,46 +64,6 @@ const COLUMN_WIDTH: f32 = 260.0;
 /// Key in `MosaicConfig.ui` of the group colours: group name to an index
 /// in [`GROUP_PALETTE`], assigned once (first seen) and then kept.
 pub const GROUP_COLORS_KEY: &str = "group_colors";
-
-/// Sulphur II: a warm orange-red, clearly apart from Hα's crimson
-/// ([`palette::HA_500`]) so SII and Hα groups never look alike.
-pub const SII_COLOR: Color32 = Color32::from_rgb(0xe0, 0x70, 0x3a);
-
-/// Group colours. The first six are physical colours that well-known
-/// filter names get (see [`assign_group_colors`]): Hα / red, green, OIII
-/// cyan, SII, blue, luminance white. Other groups take the first of the
-/// remaining entries no group uses yet, in first-seen order (cycling).
-pub const GROUP_PALETTE: [Color32; 11] = [
-    palette::HA_500,
-    palette::GREEN_400,
-    palette::ACCENT_400,
-    SII_COLOR,
-    palette::ACCENT_600,
-    palette::TEXT_STRONG,
-    Color32::from_rgb(0xd4, 0xa2, 0x2a), // amber
-    Color32::from_rgb(0x8e, 0x6a, 0xd4), // violet
-    Color32::from_rgb(0xc8, 0x4a, 0x9e), // magenta
-    Color32::from_rgb(0x9c, 0xc2, 0x3a), // lime
-    Color32::from_rgb(0x6a, 0x8e, 0xd4), // periwinkle
-];
-
-/// How many leading [`GROUP_PALETTE`] entries are physical colours, kept
-/// for well-known filter names.
-pub const PHYSICAL_SLOTS: usize = 6;
-
-/// The physical [`GROUP_PALETTE`] index of a well-known filter name
-/// (case-insensitive), if it is one.
-fn physical_color(name: &str) -> Option<usize> {
-    match name.to_ascii_lowercase().as_str() {
-        "ha" | "h" | "halpha" | "h-alpha" | "r" | "red" => Some(0),
-        "g" | "green" => Some(1),
-        "oiii" | "o3" | "o" => Some(2),
-        "sii" | "s2" | "s" => Some(3),
-        "b" | "blue" => Some(4),
-        "l" | "lum" => Some(5),
-        _ => None,
-    }
-}
 
 /// The persisted group colours in `ui` (`MosaicConfig.ui`); empty when
 /// absent or unreadable.

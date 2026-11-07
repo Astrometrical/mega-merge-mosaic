@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod checks;
+pub mod groups;
 pub mod icons;
 pub mod jobs;
 pub mod plan;
