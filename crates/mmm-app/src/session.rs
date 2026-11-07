@@ -12,6 +12,7 @@ use mmm_core::mosaic::{
 };
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::session_summary::{SessionSummary, read_summary};
+use serde_json::Value;
 
 /// A mosaic session open in this window.
 #[derive(Debug)]
@@ -247,6 +248,49 @@ pub fn open_in_new_process(dir: &Path) -> std::io::Result<()> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// The key in a session's `ui` JSON holding its free-text notes.
+#[allow(dead_code)] // used by the start screen, a later task
+pub const NOTES_KEY: &str = "notes";
+
+/// The notes stored in `ui` (empty when there are none).
+#[allow(dead_code)] // used by the start screen, a later task
+pub fn notes(ui: &Value) -> String {
+    ui.get(NOTES_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Store `text` as the notes in `ui`, keeping everything else there (a `ui`
+/// that is not a JSON object becomes one).
+#[allow(dead_code)] // used by the start screen, a later task
+pub fn set_notes(ui: &mut Value, text: &str) {
+    if !ui.is_object() {
+        *ui = Value::Object(Default::default());
+    }
+    if let Some(obj) = ui.as_object_mut() {
+        obj.insert(NOTES_KEY.to_string(), Value::String(text.to_string()));
+    }
+}
+
+/// Save `text` as the notes of the session in `dir`, without opening it:
+/// takes the session lock for the write only. A session open elsewhere is
+/// refused (`Err(busy_message)`) so its configuration is never overwritten.
+/// Blocking file I/O: call from a background thread.
+#[allow(dead_code)] // used by the start screen, a later task
+pub fn save_notes_blocking(dir: &Path, text: &str) -> Result<(), String> {
+    let _lock = lock_session(dir).map_err(|e| {
+        if e.is_busy() {
+            busy_message(dir)
+        } else {
+            e.to_string()
+        }
+    })?;
+    let mut cfg = MosaicConfig::load(dir).map_err(|e| e.to_string())?;
+    set_notes(&mut cfg.ui, text);
+    cfg.save(dir).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

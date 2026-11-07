@@ -13,6 +13,8 @@ use mega_ui::theme::palette;
 
 use crate::session::{SESSION_EXT, session_name};
 
+#[allow(dead_code)] // wired into the start screen in a later task
+mod facts;
 mod recent;
 
 pub use recent::{Library, RecentEntry};
