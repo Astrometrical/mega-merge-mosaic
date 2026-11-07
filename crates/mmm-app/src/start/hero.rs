@@ -61,11 +61,34 @@ enum ThumbJob {
 pub(super) type ThumbResults = Receiver<(PathBuf, Option<ColorImage>)>;
 
 impl StartScreen {
-    /// Let go of the hero's views (and their open stores); it is built
-    /// again for the target on a later frame.
+    /// Let go of the hero's views (and their open stores) and of a build
+    /// under way; the hero is built again for the target on a later frame.
     pub(super) fn drop_hero(&mut self) {
         self.shown = None;
+        self.hero_build = None;
         self.clear_stage(0.0);
+    }
+
+    /// New facts arrived for `path`: a hero shown or being built from its
+    /// older facts (e.g. from before it was opened elsewhere) is dropped.
+    pub(super) fn hero_outdated(&mut self, path: &Path) {
+        let building = self.hero_build.as_ref().is_some_and(|b| b.path == path);
+        let shown = self.shown.as_ref().is_some_and(|s| s.path == path);
+        if building || shown {
+            self.drop_hero();
+        }
+    }
+
+    /// Stop building thumbnails; those not built yet load again later.
+    pub(super) fn stop_thumbnails(&mut self) {
+        self.thumb_rx = None;
+        self.thumbs.retain(|_, t| matches!(t, Thumb::Ready(_)));
+    }
+
+    /// Whether the hero is done loading: it has drawn an image, or has
+    /// nothing to draw (for the self-test).
+    pub fn hero_loaded(&self) -> bool {
+        self.stage.first_image_drawn() || self.shown.as_ref().is_some_and(|s| !s.has_views)
     }
 
     /// The label of the hero's view on screen, once it has drawn an image
@@ -75,11 +98,6 @@ impl StartScreen {
             .first_image_drawn()
             .then(|| self.stage.current_label())
             .flatten()
-    }
-
-    /// Whether the hero stage shows `path`'s session.
-    pub(super) fn shows(&self, path: &Path) -> bool {
-        self.shown.as_ref().is_some_and(|s| s.path == path)
     }
 
     /// Empty the stage: no views, no line.

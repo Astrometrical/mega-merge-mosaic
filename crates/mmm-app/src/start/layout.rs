@@ -14,7 +14,7 @@ use mega_ui::brand::{BrandImages, LockupSize, lockup};
 use mega_ui::groups::{GROUP_PALETTE, physical_color};
 use mega_ui::icons;
 use mega_ui::theme::Tone;
-use mega_ui::theme::palette::{SURFACE_700, TEXT_EMPHASIS};
+use mega_ui::theme::palette::{SURFACE_700, SURFACE_900, TEXT_EMPHASIS};
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{CONTROL_HEIGHT, CONTROL_HEIGHT_LARGE, radius, space};
 use mega_ui::widgets::{
@@ -59,19 +59,19 @@ impl StartScreen {
     /// the hero and the block show.
     pub(super) fn draw(&mut self, ui: &mut Ui, target: Option<&Path>, now: f64, out: &mut Drawn) {
         let full = ui.max_rect();
-        if self.library.entries().is_empty() {
-            let image = image_rect(full, None);
-            ui.scope_builder(UiBuilder::new().max_rect(full), |ui| {
-                self.stage.show(ui, image, now);
-            });
-            self.first_run(ui, full, out);
-            return;
-        }
+        let first_run = self.library.entries().is_empty();
         let bottom = self.bottom_area(full);
-        let image = image_rect(full, Some(bottom.top()));
+        let image = image_rect(full, (!first_run).then_some(bottom.top()));
+        // The night sky the starfield and the image sit on, whatever the
+        // screen is drawn in.
+        ui.painter().rect_filled(full, 0.0, SURFACE_900);
         ui.scope_builder(UiBuilder::new().max_rect(full), |ui| {
             self.stage.show(ui, image, now);
         });
+        if first_run {
+            self.first_run(ui, full, out);
+            return;
+        }
         if let Some(images) = &self.brand {
             let at = full.min + Vec2::splat(space::XXL);
             let rect = Rect::from_min_size(at, vec2(full.width() - 2.0 * space::XXL, LARGE_LOGO_H));
@@ -84,8 +84,13 @@ impl StartScreen {
         if let Some(target) = target {
             let left = full.left() + space::XXL;
             let width = BLOCK_MAX_WIDTH.min(full.width() - 2.0 * space::XXL);
-            let top = full.top() + BLOCK_TOP * full.height();
-            let end = (bottom.top() - space::L).max(top + CONTROL_HEIGHT_LARGE);
+            // A quarter down, or higher when the window is too short for
+            // the block, but under the lockup; it scrolls if still short.
+            let end = bottom.top() - space::L;
+            let top = (full.top() + BLOCK_TOP * full.height())
+                .min(end - self.block_height)
+                .max(full.top() + space::XXL + LARGE_LOGO_H + space::L);
+            let end = end.max(top + CONTROL_HEIGHT_LARGE);
             let rect = Rect::from_min_max(pos2(left, top), pos2(left + width, end));
             self.block(ui, rect, target, now, out);
         }
@@ -122,16 +127,17 @@ impl StartScreen {
                 .max_rect(rect)
                 .layout(Layout::top_down(Align::Min)),
         );
-        let mut bottom = rect.top();
+        let mut height = 0.0;
         ScrollArea::vertical()
             .id_salt("start-block")
             .max_height(rect.height())
             .auto_shrink([false, true])
             .show(&mut child, |ui| {
                 self.block_contents(ui, target, now, out);
-                bottom = ui.min_rect().bottom();
+                height = ui.min_rect().height();
             });
-        self.block_bottom = bottom;
+        self.block_height = height;
+        self.block_bottom = rect.top() + height;
     }
 
     /// Overline, name, when opened and where, chips, status, checks,
@@ -166,7 +172,9 @@ impl StartScreen {
         if available || busy {
             // A busy session's notes belong to the other window: read-only.
             let editable = available && self.notes.loaded && enabled;
-            let r = stable(ui, "mmm-start-notes", |ui| {
+            // One id per session: undo never brings another session's text.
+            let id = Id::new("mmm-start-notes").with(target);
+            let r = stable(ui, id, |ui| {
                 notes_field(ui, &mut self.notes.text, NOTES_HINT, editable)
             });
             let r = if busy {
@@ -273,7 +281,7 @@ impl StartScreen {
             if ui.add(back).clicked() {
                 out.cmds.push(Cmd::ShowAll(false));
             }
-            stable(ui, "mmm-start-search", |ui| {
+            stable(ui, Id::new("mmm-start-search"), |ui| {
                 text_input(ui, &mut self.search, "Search sessions and notes")
             });
         });
@@ -378,7 +386,7 @@ impl StartScreen {
             let label = ui.label(text(Type::Small, "Session folder"));
             ui.horizontal(|ui| {
                 let hint = format!("/path/to/Name.{SESSION_EXT}");
-                let field = stable(ui, "mmm-start-typed-path", |ui| {
+                let field = stable(ui, Id::new("mmm-start-typed-path"), |ui| {
                     text_input(ui, &mut self.typed_path, &hint)
                 })
                 .labelled_by(label.id);
@@ -414,7 +422,7 @@ impl StartScreen {
                     ui.label(text(Type::Heading, "Create a new mosaic"));
                     let label = ui.label(text(Type::Small, "Parent folder"));
                     ui.horizontal(|ui| {
-                        stable(ui, "mmm-start-new-parent", |ui| {
+                        stable(ui, Id::new("mmm-start-new-parent"), |ui| {
                             text_input(ui, &mut form.parent, "")
                         })
                         .labelled_by(label.id);
@@ -423,7 +431,7 @@ impl StartScreen {
                             .clicked();
                     });
                     let label = ui.label(text(Type::Small, "Name"));
-                    stable(ui, "mmm-start-new-name", |ui| {
+                    stable(ui, Id::new("mmm-start-new-name"), |ui| {
                         text_input(ui, &mut form.name, "e.g. Orion")
                     })
                     .labelled_by(label.id);
@@ -639,9 +647,8 @@ fn image_rect(full: Rect, shelf_top: Option<f32>) -> Rect {
 /// Run `add` in a child ui with the explicit id `id`, so the text field it
 /// adds keeps its id (and the keyboard focus) when widgets above it come
 /// and go, e.g. when a session's facts arrive.
-fn stable<R>(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.scope_builder(UiBuilder::new().id(Id::new(id)), add)
-        .inner
+fn stable<R>(ui: &mut Ui, id: Id, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.scope_builder(UiBuilder::new().id(id), add).inner
 }
 
 /// The large lockup's width: logo, gap and name image.

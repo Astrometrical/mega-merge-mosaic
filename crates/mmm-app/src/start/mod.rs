@@ -146,6 +146,8 @@ pub struct StartScreen {
     focus_typed: bool,
     /// Layout memory: where the session block's contents ended.
     block_bottom: f32,
+    /// Layout memory: the height of the session block's contents.
+    block_height: f32,
     /// Layout memory: the first-run button row's width.
     first_run_row: f32,
     typed_path: String,
@@ -188,6 +190,7 @@ impl StartScreen {
             typed_open: false,
             focus_typed: false,
             block_bottom: 0.0,
+            block_height: 0.0,
             first_run_row: 0.0,
             typed_path: String::new(),
             new_form: None,
@@ -207,12 +210,15 @@ impl StartScreen {
 
     /// Put `path` at the top of the recent sessions, opened at `now`
     /// (seconds since the Unix epoch). The hero lets go of its tiles (the
-    /// session now open may write them) and the facts are read again.
+    /// session now open may write them), and the session's facts are read
+    /// again: until they say otherwise, it is not known to be available.
     pub fn record_opened(&mut self, path: &Path, now: u64) {
         self.library.record_opened(path, now);
+        self.facts.remove(path);
         self.reload.push(path.to_path_buf());
         self.selected = None;
         self.drop_hero();
+        self.stop_thumbnails();
     }
 
     /// True while recent sessions' facts are still loading.
@@ -280,7 +286,10 @@ impl StartScreen {
             }
         }
         // Opening a session whose notes are being saved waits for the save:
-        // both take the session lock.
+        // both take the session lock. A newer request replaces a waiting one.
+        if action.is_some() {
+            self.held = None;
+        }
         if let Some(StartAction::Open(path)) = &action
             && self.notes_pending(path)
         {
@@ -467,11 +476,7 @@ impl StartScreen {
         if !self.library.entries().iter().any(|e| e.path == f.path) {
             return;
         }
-        // New facts for the session on show (e.g. opened elsewhere since):
-        // build its hero again.
-        if self.shows(&f.path) {
-            self.drop_hero();
-        }
+        self.hero_outdated(&f.path);
         self.facts.insert(f.path.clone(), f);
     }
 

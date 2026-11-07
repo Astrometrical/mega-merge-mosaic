@@ -602,19 +602,20 @@ impl SelfTest {
         }
         if let Some(dir) = &self.session {
             // The session (the start screen's hero) opens once the hero
-            // has drawn, or after a while.
-            let hero = shell.start.hero_image();
+            // has loaded, or after a while.
+            let loaded = shell.start.hero_loaded();
             let waited = self.frames >= SELFTEST_HERO_FRAMES;
-            if !self.session_requested
-                && self.frames >= SELFTEST_START_FRAMES
-                && (hero.is_some() || waited)
+            if !self.session_requested && self.frames >= SELFTEST_START_FRAMES && (loaded || waited)
             {
-                match hero {
-                    Some(label) => tracing::info!(
-                        "self-test: start screen hero shows {label:?}, {} ms after launch",
-                        self.started.elapsed().as_millis()
-                    ),
-                    None => tracing::warn!("self-test: start screen hero drew nothing"),
+                let ms = self.started.elapsed().as_millis();
+                match shell.start.hero_image() {
+                    Some(label) => {
+                        tracing::info!(
+                            "self-test: start screen hero shows {label:?}, {ms} ms after launch"
+                        )
+                    }
+                    None if loaded => tracing::info!("self-test: start screen hero has no image"),
+                    None => tracing::warn!("self-test: start screen hero drew nothing in {ms} ms"),
                 }
                 self.session_requested = true;
                 shell.request(Request::Open(dir.clone()), ctx);
@@ -928,6 +929,9 @@ mod tests {
         let shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(picker)));
         Harness::builder()
             .with_size(egui::vec2(1000.0, 800.0))
+            // The start screen's background work (facts, hero, thumbnails)
+            // asks for a repaint as each piece finishes.
+            .with_max_steps(64)
             .build_ui_state(
                 |ui, s: &mut Shell| {
                     if crate::testutil::themed(ui) {

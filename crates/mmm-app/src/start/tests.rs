@@ -102,6 +102,9 @@ fn harness_with(state: Screen) -> Harness<'static, Screen> {
         // Short steps: a click takes three, and a double-click must fit
         // egui's 0.3 s window.
         .with_step_dt(0.02)
+        // Background work (facts, hero, thumbnails) asks for a repaint as
+        // each piece finishes, so `run` may take more than a few steps.
+        .with_max_steps(64)
         .build_ui_state(
             |ui, s: &mut Screen| {
                 if crate::testutil::themed(ui) {
@@ -303,6 +306,26 @@ fn busy_session_is_not_the_hero() {
             .accesskit_node()
             .is_disabled()
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn opened_session_stops_being_the_hero() {
+    let root = temp_dir("start-reopen");
+    let older = session(&root, "Older");
+    let newest = session(&root, "Newest");
+    let mut h = harness(vec![entry_at(&older, 100), entry_at(&newest, 200)]);
+    settle(&mut h);
+    assert_eq!(h.state().screen.hero(), Some(newest.clone()));
+    // Opened (here, or in another process), then shown again ("Open
+    // another…"): its facts are read again, and it is busy now.
+    let _lock = lock_session(&older).unwrap();
+    h.state_mut().screen.record_opened(&older, unix_now());
+    settle(&mut h);
+    assert_eq!(h.state().screen.hero(), Some(newest.clone()));
+    assert_eq!(h.state().screen.recent()[0].path, older);
+    let open_elsewhere = Some((Tone::Neutral, "Open in another window".to_string()));
+    assert_eq!(h.state().screen.card_look(&older), (open_elsewhere, false));
     let _ = std::fs::remove_dir_all(&root);
 }
 
