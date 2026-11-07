@@ -35,6 +35,8 @@ pub enum CardState {
     NoPanels,
     /// Analysed (previews exist) but not merged.
     PlanReady,
+    /// Some groups merged, the others without a result yet.
+    PartlyMerged,
     /// Every group merged.
     Merged,
     /// Every group merged and exported since.
@@ -46,7 +48,10 @@ pub enum CardState {
 }
 
 /// The card state from the panel count, whether previews exist and the
-/// session summary (if any).
+/// session summary (if any). A stale or partial group makes it
+/// [`CardState::ReMergeNeeded`] whatever the others are; then every group
+/// complete is merged, and some complete (the rest without a result)
+/// [`CardState::PartlyMerged`].
 pub fn card_state(
     panels: usize,
     has_previews: bool,
@@ -73,6 +78,9 @@ pub fn card_state(
             } else {
                 CardState::Merged
             };
+        }
+        if groups.iter().any(|g| g.result == ResultState::Complete) {
+            return CardState::PartlyMerged;
         }
     }
     if has_previews {
@@ -334,6 +342,15 @@ mod tests {
         assert_eq!(card_state(3, true, Some(&merged)), Merged);
         let unexported = summary(vec![group(ResultState::Complete, Some(1), None)]);
         assert_eq!(card_state(3, false, Some(&unexported)), Merged);
+        // Some groups merged and the rest not yet, previews or not.
+        let unmerged = || group(ResultState::None, None, None);
+        let partly = summary(vec![done(1, 2), unmerged()]);
+        assert_eq!(card_state(3, true, Some(&partly)), PartlyMerged);
+        assert_eq!(card_state(3, false, Some(&partly)), PartlyMerged);
+        // A stale or partial group still comes first.
+        let stale = group(ResultState::Stale, None, None);
+        let partly_stale = summary(vec![done(1, 2), unmerged(), stale]);
+        assert_eq!(card_state(3, true, Some(&partly_stale)), ReMergeNeeded);
         let none = summary(vec![group(ResultState::None, None, None)]);
         assert_eq!(card_state(3, true, Some(&none)), PlanReady);
         assert_eq!(card_state(3, true, None), PlanReady);

@@ -156,6 +156,33 @@ fn merged_session_has_a_view_per_group() {
 }
 
 #[test]
+fn partly_merged_session_shows_its_merged_groups() {
+    let root = temp_dir("hero-partly");
+    let mut m = two_group_session(&root).mosaic;
+    let groups = analyze_all(&mut m, &JobCtl::none()).unwrap();
+    run_previews(&plan_previews(&m), &JobCtl::none(), &|_| {}).unwrap();
+    // Ha merged, OIII not yet.
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    write_summary_of(&m, &groups, None);
+    let facts = facts_of(&m.dir);
+    assert_eq!(facts.state, CardState::PartlyMerged);
+    let hero = build_hero(&facts);
+    // The merged group's full-resolution result, read live, rather than
+    // every group's low-resolution plan picture.
+    assert_eq!(labels(&hero), ["Ha · 4 panels"]);
+    assert_eq!(hero.message, None);
+    let g = hero.views[0].source.geometry();
+    assert_eq!((g.width, g.height), CANVAS);
+    let tile = hero.views[0].source.fetch(TileKey {
+        level: 0,
+        tx: 0,
+        ty: 0,
+    });
+    assert!(matches!(tile, Fetched::Valid(_)), "{tile:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn composition_view_is_added() {
     let root = temp_dir("hero-comp");
     let dir = merged_session(&root, Some("comp:HOO"));

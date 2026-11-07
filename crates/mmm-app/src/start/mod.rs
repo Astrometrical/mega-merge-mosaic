@@ -678,6 +678,7 @@ fn status_line(f: &CardFacts) -> Option<(Tone, &'static str)> {
                 Tone::Warning,
                 "Panels changed since the last merge — re-merge needed",
             ),
+            CardState::PartlyMerged => (Tone::Info, "Partly merged"),
             CardState::PlanReady => (Tone::Info, "Plan ready"),
             CardState::NoPanels => (Tone::Neutral, "No panels yet"),
             CardState::Unknown => return None,

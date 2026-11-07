@@ -717,6 +717,26 @@ fn first_run_offers_new_and_open() {
 }
 
 #[test]
+fn partly_merged_status_reads_so() {
+    let f = facts::CardFacts {
+        path: PathBuf::from("p.mmm-session"),
+        name: "p".into(),
+        availability: facts::Availability::Available,
+        panels: Some(8),
+        groups: Vec::new(),
+        group_colors: Default::default(),
+        state: facts::CardState::PartlyMerged,
+        problems: None,
+        notes_count: None,
+        notes: String::new(),
+        summary: None,
+    };
+    assert_eq!(status_line(&f), Some((Tone::Info, "Partly merged")));
+    let partly = Some((Tone::Info, "Partly merged".to_string()));
+    assert_eq!(card_look(Some(&f)), (partly, false));
+}
+
+#[test]
 fn ago_reads_naturally() {
     assert_eq!(ago(100, 90), "just now");
     assert_eq!(ago(10_000, 10_000 - 120), "2 minutes ago");

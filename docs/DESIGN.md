@@ -1259,16 +1259,18 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
 - **The facts loader** (`start::facts`): per recent session, off the UI
   thread, the availability (`Missing` for a gone folder or unplugged
   drive, `Busy`, `Unreadable` for a corrupt or newer `mosaic.json`, else
-  `Available`), the state (no panels, plan ready, merged, merged and
-  exported, re-merge needed), group colours and notes. Facts load on a pool
-  of 4 workers (`FACTS_WORKERS`), so a session on a dead network path stalls
+  `Available`), the state, group colours and notes. The states are no
+  panels, plan ready, partly merged (some groups merged, the rest without a
+  result), merged, merged and exported, and re-merge needed (any stale or
+  partial group, whatever the others). Facts load on a pool of 4 workers (`FACTS_WORKERS`), so a session on a dead network path stalls
   one worker, never the screen or the other cards.
-- **The hero loader** (`start::hero_views`): a merged session gives one
-  view per group with a result, read live from its store through
+- **The hero loader** (`start::hero_views`): a session with any group
+  result (merged, partly merged or needing a re-merge) gives one view per
+  group with a result, read live from its store through
   `MosaicTileSource::open_plain`, plus each saved composition whose groups
   all have a result, each through its saved Blend stretch (else an automatic
-  one). A planned, unmerged session gives one picture per group, rendered
-  from its cached previews (`preview::load_cached_previews`,
+  one). A planned session with no group result gives one picture per
+  group, rendered from its cached previews (`preview::load_cached_previews`,
   `render_overview`) through the saved Plan stretch. Otherwise, no views
   and a line saying why (a session whose state is unknown: "Nothing to
   show yet — resume to build the preview"). Every failure degrades to fewer

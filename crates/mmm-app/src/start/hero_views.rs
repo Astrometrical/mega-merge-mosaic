@@ -1,10 +1,11 @@
 //! What the start screen's hero shows for a recent session, and the small
 //! thumbnail of a view for its shelf card.
 //!
-//! - **Merged** (re-merge needed included): one view per group with a
-//!   result, read live from its store, plus each saved composition whose
-//!   groups all have one ([`CompositeTileSource`]). Each group shows
-//!   through its saved Blend display stretch, else the automatic one.
+//! - **Merged** (partly merged and re-merge needed included: any group
+//!   with a result): one view per group with a result, read live from its
+//!   store, plus each saved composition whose groups all have one
+//!   ([`CompositeTileSource`]). Each group shows through its saved Blend
+//!   display stretch, else the automatic one.
 //! - **Planned, not merged:** one view per group drawn from its cached
 //!   previews ([`render_overview`]) into an in-memory picture
 //!   ([`ImageTileSource`]), through the saved Plan display stretch, else
@@ -103,20 +104,26 @@ pub fn build_hero(facts: &CardFacts) -> HeroData {
     if session_busy(&facts.path) {
         return HeroData::without_views(BUSY_MESSAGE);
     }
-    let planned = match facts.state {
+    match facts.state {
         CardState::NoPanels => return HeroData::without_views(EMPTY_MESSAGE),
         CardState::Unknown => return HeroData::without_views(NOTHING_MESSAGE),
-        CardState::Merged | CardState::MergedExported | CardState::ReMergeNeeded => false,
-        CardState::PlanReady => true,
-    };
+        CardState::PlanReady
+        | CardState::PartlyMerged
+        | CardState::Merged
+        | CardState::MergedExported
+        | CardState::ReMergeNeeded => {}
+    }
     let Ok(m) = Mosaic::open(&facts.path) else {
         return HeroData::without_views(UNREADABLE_MESSAGE);
     };
     let summary = facts.summary.as_ref();
-    let keyed = if planned {
-        planned_views(&m, summary)
-    } else {
+    // Any group with a result shows its full-resolution tiles; the plan's
+    // pictures only while no group has one.
+    let merged = summary.is_some_and(|s| s.groups.iter().any(|g| g.result != ResultState::None));
+    let keyed = if merged {
         merged_views(&m, summary)
+    } else {
+        planned_views(&m, summary)
     };
     // Never a blank hero without a reason.
     if keyed.is_empty() {
