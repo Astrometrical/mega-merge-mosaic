@@ -7,6 +7,7 @@ use std::sync::Arc;
 use egui::accesskit::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
+use mega_ui::groups::SII_COLOR;
 use mmm_core::mosaic::{MosaicConfig, PanelEntry};
 
 use super::*;

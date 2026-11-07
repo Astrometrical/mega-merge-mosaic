@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
 use mega_ui::groups::physical_color;
-pub use mega_ui::groups::{GROUP_PALETTE, PHYSICAL_SLOTS, SII_COLOR};
+pub use mega_ui::groups::{GROUP_PALETTE, PHYSICAL_SLOTS};
 use mega_ui::theme::palette;
 use mmm_core::checks::{CheckCode, PanelFacts, input_checks, panel_facts};
 use mmm_core::formats::InputPanel;
