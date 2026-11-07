@@ -339,7 +339,7 @@ impl Drop for ShmSegment {
 /// mirroring the POSIX [`ShmSegment`]: the host `create`s a named mapping and
 /// the worker `attach`es to the same name. The name carried in the JSON `Init`
 /// message is the POSIX-style `/name`; both sides normalize it identically to a
-/// Windows object name (see [`win_object_name`]).
+/// Windows object name (see `win_object_name`).
 #[cfg(windows)]
 #[derive(Debug)]
 pub struct ShmSegment {
