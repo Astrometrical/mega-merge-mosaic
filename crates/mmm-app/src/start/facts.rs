@@ -88,8 +88,6 @@ pub struct CardFacts {
     pub path: PathBuf,
     /// Display name of the session.
     pub name: String,
-    /// When it was last opened (unix seconds).
-    pub last_opened: u64,
     /// Whether it can be used.
     pub availability: Availability,
     /// Panel count, when the configuration was read.
@@ -126,7 +124,6 @@ pub fn load_facts(entry: &RecentEntry) -> CardFacts {
     let mut f = CardFacts {
         path: dir.clone(),
         name: session_name(dir),
-        last_opened: entry.last_opened,
         availability: Availability::Available,
         panels: None,
         groups: Vec::new(),
@@ -249,7 +246,6 @@ mod tests {
         assert_eq!(f.availability, Availability::Available);
         assert_eq!(f.panels, Some(s.mosaic.config.panels.len()));
         assert_eq!(f.notes, "");
-        assert_eq!(f.last_opened, 7);
         assert_eq!(f.name, "m");
     }
 

@@ -19,6 +19,9 @@ pub const CARD_WIDTH: f32 = 220.0;
 pub const CARD_THUMB_HEIGHT: f32 = 96.0;
 /// Height of the title and status area under the thumbnail.
 const BODY_HEIGHT: f32 = 58.0;
+/// Card height, in points: the thumbnail band and the title and status
+/// area.
+pub const CARD_HEIGHT: f32 = CARD_THUMB_HEIGHT + BODY_HEIGHT;
 /// Border width of a selected card.
 const SELECTED_BORDER: f32 = 2.0;
 /// Size of the pin glyph.
@@ -46,7 +49,7 @@ pub struct SessionCardData<'a> {
 /// A session card of [`CARD_WIDTH`]: thumbnail band, title, status line.
 /// Senses click and double-click; the title is its accessible label.
 pub fn session_card(ui: &mut Ui, card: &SessionCardData) -> Response {
-    let size = Vec2::new(CARD_WIDTH, CARD_THUMB_HEIGHT + BODY_HEIGHT);
+    let size = Vec2::new(CARD_WIDTH, CARD_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, card.title));
     if !ui.is_rect_visible(rect) {

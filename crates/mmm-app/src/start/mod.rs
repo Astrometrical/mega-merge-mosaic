@@ -1,25 +1,44 @@
-//! Start screen (spec §5.1): branding, **New mosaic…**, **Open…**, the
-//! recent sessions, and a typed-path field that always works, even where
-//! no file dialog is available (e.g. WSLg without a desktop portal).
+//! Start screen (spec §5): the most recently opened available session as
+//! a full-window hero, its details and **Resume session** on the left, a
+//! shelf of recent sessions along the bottom, an "All sessions" grid with
+//! a search, and a first-run screen. A typed path (behind "More") always
+//! works, even where no file dialog is available (e.g. WSLg without a
+//! desktop portal).
+//!
+//! The screen never opens a session, and the UI thread does no file I/O:
+//! card facts ([`FactsLoader`]), the hero's views
+//! ([`hero_views::build_hero`]), card thumbnails, notes saves and the
+//! reduced-motion probe run on background threads that this module polls
+//! every frame. Load order (spec §5.4):
+//! the hero candidate's facts first, its views as soon as they arrive,
+//! and card thumbnails only once the hero has drawn ([`hero`]). Notes are
+//! saved a pause after typing ([`notes`]); drawing is in [`layout`].
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use egui::RichText;
-use mega_ui::brand::{self, BrandImages, LockupSize};
-use mega_ui::theme::palette;
+use mega_ui::brand::{self, BrandImages};
+use mega_ui::hero::HeroStage;
+use mega_ui::theme::Tone;
 
 use crate::session::{SESSION_EXT, session_name};
 
-#[allow(dead_code)] // wired into the start screen in a later task
 mod facts;
-#[allow(dead_code)] // wired into the start screen in a later task
+mod hero;
 mod hero_views;
+mod layout;
+mod notes;
 mod recent;
 
+use facts::{Availability, CardFacts, CardState, FactsLoader};
+use hero::{HeroBuild, Shown, Thumb, ThumbResults};
+use notes::{NotesEditor, NotesSave};
 pub use recent::{Library, RecentEntry};
+
+/// Status and hero line of a session that cannot be read.
+const UNREADABLE: &str = "Can't read this session";
 
 /// What the user asked the start screen for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,10 +66,12 @@ impl FolderPicker for RfdPicker {
 }
 
 /// What an open file dialog is for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum DialogPurpose {
     Open,
     NewParent,
+    /// The new folder of the missing session listed at this path.
+    Locate(PathBuf),
 }
 
 /// A file dialog running on a background thread.
@@ -66,13 +87,67 @@ struct NewForm {
     name: String,
 }
 
+/// A facts loader and how many results it still owes.
+struct Loading {
+    loader: FactsLoader,
+    left: usize,
+}
+
+/// What the user did while the screen was drawn, applied afterwards.
+enum Cmd {
+    Select(PathBuf),
+    Open(PathBuf),
+    Create(PathBuf),
+    TogglePin(PathBuf),
+    Remove(PathBuf),
+    Dialog(DialogPurpose),
+    NewMosaic,
+    CancelNew,
+    TypePath,
+    ShowAll(bool),
+    Error(String),
+}
+
+/// What drawing one frame collected.
+#[derive(Default)]
+struct Drawn {
+    cmds: Vec<Cmd>,
+    /// Cards on screen, which want thumbnails.
+    thumbs: Vec<PathBuf>,
+}
+
 /// The start screen's state.
 pub struct StartScreen {
     picker: Arc<dyn FolderPicker>,
     library: Library,
-    missing: HashSet<PathBuf>,
-    check: Option<Receiver<HashSet<PathBuf>>>,
-    checked: bool,
+    facts: HashMap<PathBuf, CardFacts>,
+    loading: Vec<Loading>,
+    /// The first frame started the facts loader and the motion probe.
+    started: bool,
+    /// Sessions whose facts must be read again.
+    reload: Vec<PathBuf>,
+    /// The card the user clicked (else the default hero is shown).
+    selected: Option<PathBuf>,
+    stage: HeroStage,
+    shown: Option<Shown>,
+    hero_build: Option<HeroBuild>,
+    thumbs: HashMap<PathBuf, Thumb>,
+    thumb_rx: Option<ThumbResults>,
+    notes: NotesEditor,
+    saves: Vec<NotesSave>,
+    /// Saves waiting for an earlier save of the same session.
+    queued_saves: Vec<(PathBuf, String)>,
+    /// An open waiting for that session's notes to be saved first.
+    held: Option<StartAction>,
+    motion: Option<Receiver<bool>>,
+    all_sessions: bool,
+    search: String,
+    typed_open: bool,
+    focus_typed: bool,
+    /// Layout memory: where the session block's contents ended.
+    block_bottom: f32,
+    /// Layout memory: the first-run button row's width.
+    first_run_row: f32,
     typed_path: String,
     new_form: Option<NewForm>,
     dialog: Option<Dialog>,
@@ -87,12 +162,33 @@ impl StartScreen {
     /// A start screen listing `recent` (most recent first), with `picker`
     /// for the file dialogs.
     pub fn new(recent: Vec<RecentEntry>, picker: Arc<dyn FolderPicker>) -> Self {
+        let loader_threads = std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .clamp(2, 4);
         StartScreen {
             picker,
             library: Library::new(recent),
-            missing: HashSet::new(),
-            check: None,
-            checked: false,
+            facts: HashMap::new(),
+            loading: Vec::new(),
+            started: false,
+            reload: Vec::new(),
+            selected: None,
+            stage: HeroStage::new(loader_threads),
+            shown: None,
+            hero_build: None,
+            thumbs: HashMap::new(),
+            thumb_rx: None,
+            notes: NotesEditor::default(),
+            saves: Vec::new(),
+            queued_saves: Vec::new(),
+            held: None,
+            motion: None,
+            all_sessions: false,
+            search: String::new(),
+            typed_open: false,
+            focus_typed: false,
+            block_bottom: 0.0,
+            first_run_row: 0.0,
             typed_path: String::new(),
             new_form: None,
             dialog: None,
@@ -110,16 +206,19 @@ impl StartScreen {
     }
 
     /// Put `path` at the top of the recent sessions, opened at `now`
-    /// (seconds since the Unix epoch).
+    /// (seconds since the Unix epoch). The hero lets go of its tiles (the
+    /// session now open may write them) and the facts are read again.
     pub fn record_opened(&mut self, path: &Path, now: u64) {
         self.library.record_opened(path, now);
-        self.missing.remove(path);
+        self.reload.push(path.to_path_buf());
+        self.selected = None;
+        self.drop_hero();
     }
 
-    /// True while the background check of which recent paths exist runs.
+    /// True while recent sessions' facts are still loading.
     #[cfg(test)]
     pub fn checking_recent(&self) -> bool {
-        !self.checked || self.check.is_some()
+        !self.started || !self.loading.is_empty() || !self.reload.is_empty()
     }
 
     /// Show `label` with a spinner (or nothing, with `None`); actions are
@@ -155,7 +254,10 @@ impl StartScreen {
     /// Draw the screen; returns what the user asked for, if anything.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<StartAction> {
         let ctx = ui.ctx().clone();
+        let now = ui.input(|i| i.time);
+        // Polled before anything starts: the first pass draws without facts.
         self.poll_background(&ctx);
+        self.start_background(&ctx);
         if self.brand.is_none() {
             self.brand = Some(BrandImages::load(
                 &ctx,
@@ -163,32 +265,36 @@ impl StartScreen {
                 "Mega Merge Mosaic",
             ));
         }
+        let target = self.target();
+        self.update_hero(&ctx, target.as_deref(), now);
+        self.sync_notes(&ctx, target.as_deref());
+
+        let mut drawn = Drawn::default();
+        self.draw(ui, target.as_deref(), now, &mut drawn);
+
         // A folder picked in the Open… dialog.
         let mut action = self.pending_open.take().map(StartAction::Open);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let width = ui.available_width().min(640.0);
-            let pad = ((ui.available_width() - width) / 2.0).max(0.0);
-            ui.horizontal(|ui| {
-                ui.add_space(pad);
-                ui.vertical(|ui| {
-                    ui.set_width(width);
-                    ui.add_space(48.0);
-                    self.header(ui);
-                    ui.add_space(32.0);
-                    let enabled = self.busy.is_none() && self.dialog.is_none();
-                    ui.add_enabled_ui(enabled, |ui| {
-                        if let Some(a) = self.actions(&ctx, ui) {
-                            action = Some(a);
-                        }
-                    });
-                    self.messages(ui);
-                    ui.add_space(24.0);
-                    if let Some(a) = self.recent_list(ui, enabled) {
-                        action = Some(a);
-                    }
-                });
-            });
-        });
+        for cmd in drawn.cmds {
+            if let Some(a) = self.apply(&ctx, cmd) {
+                action = Some(a);
+            }
+        }
+        // Opening a session whose notes are being saved waits for the save:
+        // both take the session lock.
+        if let Some(StartAction::Open(path)) = &action
+            && self.notes_pending(path)
+        {
+            self.notes.save_now = true;
+            self.held = action.take();
+        }
+        self.save_notes_when_due(&ctx, now);
+        if action.is_none()
+            && let Some(StartAction::Open(path)) = &self.held
+            && !self.notes_pending(path)
+        {
+            action = self.held.take();
+        }
+        self.request_thumbnails(&ctx, &drawn.thumbs, target.as_deref(), now);
         if action.is_some() {
             self.notice = None;
             self.error = None;
@@ -196,35 +302,152 @@ impl StartScreen {
         action
     }
 
-    /// Collect finished background work (file dialogs, the recent check).
-    fn poll_background(&mut self, ctx: &egui::Context) {
-        if !self.checked {
-            self.checked = true;
-            let paths: Vec<PathBuf> = self
-                .library
-                .entries()
-                .iter()
-                .map(|e| e.path.clone())
-                .collect();
+    /// The session the hero and the block show: the selected card, else
+    /// the default hero.
+    fn target(&self) -> Option<PathBuf> {
+        let listed = |p: &PathBuf| self.library.entries().iter().any(|e| e.path == *p);
+        match &self.selected {
+            Some(s) if listed(s) => Some(s.clone()),
+            _ => self.default_hero(),
+        }
+    }
+
+    /// The most recently opened session whose facts show it available, or
+    /// whose facts have not arrived yet (until they do, it may be). With
+    /// none available, the most recent session, so the block can say why.
+    fn default_hero(&self) -> Option<PathBuf> {
+        let by_recency = self.library.by_recency();
+        by_recency
+            .iter()
+            .find(|e| {
+                self.facts
+                    .get(&e.path)
+                    .is_none_or(|f| f.availability == Availability::Available)
+            })
+            .or(by_recency.first())
+            .map(|e| e.path.clone())
+    }
+
+    /// The display name of `path`'s session.
+    fn name_of(&self, path: &Path) -> String {
+        self.facts
+            .get(path)
+            .map_or_else(|| session_name(path), |f| f.name.clone())
+    }
+
+    /// Whether actions are allowed (no open under way, no dialog up).
+    fn enabled(&self) -> bool {
+        self.busy.is_none() && self.dialog.is_none()
+    }
+
+    /// Apply one thing the user did; an action for the app, if it is one.
+    fn apply(&mut self, ctx: &egui::Context, cmd: Cmd) -> Option<StartAction> {
+        ctx.request_repaint();
+        match cmd {
+            Cmd::Select(path) => self.selected = Some(path),
+            Cmd::Open(path) => return Some(StartAction::Open(path)),
+            Cmd::Create(path) => return Some(StartAction::Create(path)),
+            Cmd::TogglePin(path) => {
+                let pinned = self
+                    .library
+                    .entries()
+                    .iter()
+                    .any(|e| e.path == path && e.pinned);
+                self.library.set_pinned(&path, !pinned);
+            }
+            Cmd::Remove(path) => {
+                self.library.remove(&path);
+                self.facts.remove(&path);
+                self.thumbs.remove(&path);
+                if self.selected.as_ref() == Some(&path) {
+                    self.selected = None;
+                }
+            }
+            Cmd::Dialog(purpose) => self.start_dialog(ctx, purpose),
+            Cmd::NewMosaic => {
+                self.new_form.get_or_insert_with(NewForm::default);
+                self.start_dialog(ctx, DialogPurpose::NewParent);
+            }
+            Cmd::CancelNew => self.new_form = None,
+            Cmd::TypePath => {
+                self.typed_open = true;
+                self.focus_typed = true;
+            }
+            Cmd::ShowAll(on) => self.all_sessions = on,
+            Cmd::Error(message) => self.set_error(Some(message)),
+        }
+        None
+    }
+
+    /// On the first frame, start loading every session's facts (the hero
+    /// candidate first) and probing reduced motion; later, reload facts
+    /// asked for.
+    fn start_background(&mut self, ctx: &egui::Context) {
+        if !self.started {
+            self.started = true;
+            self.reload.clear();
+            let entries: Vec<RecentEntry> =
+                self.library.by_recency().into_iter().cloned().collect();
+            let first = entries.first().map(|e| e.path.clone());
+            self.spawn_facts(entries, first, ctx);
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let missing = paths.into_iter().filter(|p| !p.is_dir()).collect();
-                let _ = tx.send(missing);
+                let _ = tx.send(mega_ui::motion::reduced_motion());
                 ctx.request_repaint();
             });
-            self.check = Some(rx);
+            self.motion = Some(rx);
+        } else if !self.reload.is_empty() {
+            let paths = std::mem::take(&mut self.reload);
+            let entries = self
+                .library
+                .entries()
+                .iter()
+                .filter(|e| paths.contains(&e.path))
+                .cloned()
+                .collect();
+            self.spawn_facts(entries, None, ctx);
         }
-        if let Some(rx) = &self.check {
+    }
+
+    fn spawn_facts(
+        &mut self,
+        entries: Vec<RecentEntry>,
+        first: Option<PathBuf>,
+        ctx: &egui::Context,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let left = entries.len();
+        let loader = FactsLoader::spawn(entries, first, ctx);
+        self.loading.push(Loading { loader, left });
+    }
+
+    /// Collect finished background work.
+    fn poll_background(&mut self, ctx: &egui::Context) {
+        let mut arrived = Vec::new();
+        for l in &mut self.loading {
+            let got = l.loader.poll();
+            l.left = l.left.saturating_sub(got.len());
+            arrived.extend(got);
+        }
+        self.loading.retain(|l| l.left > 0);
+        for f in arrived {
+            self.facts_arrived(f);
+        }
+        if let Some(rx) = &self.motion {
             match rx.try_recv() {
-                Ok(missing) => {
-                    self.missing = missing;
-                    self.check = None;
+                Ok(on) => {
+                    self.stage.set_reduced_motion(on);
+                    self.motion = None;
                 }
-                Err(TryRecvError::Disconnected) => self.check = None,
+                Err(TryRecvError::Disconnected) => self.motion = None,
                 Err(TryRecvError::Empty) => {}
             }
         }
+        self.poll_thumbnails(ctx);
+        self.poll_saves(ctx);
         if let Some(dialog) = &self.dialog {
             let picked = match dialog.rx.try_recv() {
                 Ok(picked) => Some(Ok(picked)),
@@ -232,11 +455,24 @@ impl StartScreen {
                 Err(TryRecvError::Empty) => None,
             };
             if let Some(picked) = picked {
-                let purpose = dialog.purpose;
+                let purpose = dialog.purpose.clone();
                 self.dialog = None;
                 self.dialog_done(purpose, picked);
             }
         }
+    }
+
+    fn facts_arrived(&mut self, f: CardFacts) {
+        // Forgotten while loading.
+        if !self.library.entries().iter().any(|e| e.path == f.path) {
+            return;
+        }
+        // New facts for the session on show (e.g. opened elsewhere since):
+        // build its hero again.
+        if self.shows(&f.path) {
+            self.drop_hero();
+        }
+        self.facts.insert(f.path.clone(), f);
     }
 
     fn dialog_done(&mut self, purpose: DialogPurpose, picked: Result<Option<PathBuf>, ()>) {
@@ -252,13 +488,25 @@ impl StartScreen {
                     path.display().to_string();
                 self.notice = None;
             }
+            (DialogPurpose::Locate(old), Ok(Some(new))) => {
+                self.library.relocate(&old, &new);
+                for p in [&old, &new] {
+                    self.facts.remove(p);
+                    self.thumbs.remove(p);
+                }
+                self.reload.push(new.clone());
+                if self.selected.as_ref() == Some(&old) {
+                    self.selected = Some(new);
+                }
+                self.notice = None;
+            }
             (_, Ok(None)) => {
                 self.notice =
-                    Some("No folder chosen. If no dialog appeared, type the path instead.".into());
+                    Some("No folder chosen. If no dialog appeared, use More → Type a path…".into());
             }
             (_, Err(())) => {
                 self.notice =
-                    Some("The file dialog is unavailable here. Type the path instead.".into());
+                    Some("The file dialog is unavailable here. Use More → Type a path…".into());
             }
         }
     }
@@ -267,6 +515,7 @@ impl StartScreen {
         let title = match purpose {
             DialogPurpose::Open => "Open a mosaic session (.mmm-session folder)",
             DialogPurpose::NewParent => "Choose where to create the new mosaic",
+            DialogPurpose::Locate(_) => "Locate the session (.mmm-session folder)",
         };
         let (tx, rx) = mpsc::channel();
         let picker = Arc::clone(&self.picker);
@@ -279,168 +528,61 @@ impl StartScreen {
         self.notice = None;
         self.dialog = Some(Dialog { purpose, rx });
     }
+}
 
-    fn header(&self, ui: &mut egui::Ui) {
-        let Some(images) = &self.brand else { return };
-        brand::lockup(ui, images, LockupSize::Large);
+/// Test accessors.
+#[cfg(test)]
+impl StartScreen {
+    /// How many sessions' facts have arrived.
+    pub(crate) fn facts_known(&self) -> usize {
+        self.facts.len()
     }
 
-    fn actions(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) -> Option<StartAction> {
-        let mut action = None;
-        ui.horizontal(|ui| {
-            if ui.button(RichText::new("New mosaic…").size(16.0)).clicked() {
-                self.new_form.get_or_insert_with(NewForm::default);
-                self.start_dialog(ctx, DialogPurpose::NewParent);
-            }
-            if ui.button(RichText::new("Open…").size(16.0)).clicked() {
-                self.start_dialog(ctx, DialogPurpose::Open);
-            }
-        });
-        ui.add_space(12.0);
-
-        // Typed-path fallback: always present (Review Focus 5).
-        ui.horizontal(|ui| {
-            let label = ui.label(RichText::new("Session folder").color(palette::TEXT_BODY));
-            let field = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.typed_path)
-                        .hint_text("/path/to/Name.mmm-session")
-                        .desired_width(ui.available_width() - 70.0),
-                )
-                .labelled_by(label.id);
-            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Open").clicked() || entered) && !self.typed_path.trim().is_empty() {
-                action = Some(StartAction::Open(expand_home(self.typed_path.trim())));
-            }
-        });
-
-        if let Some(form) = &mut self.new_form {
-            let mut browse = false;
-            let mut cancel = false;
-            ui.add_space(16.0);
-            egui::Frame::group(ui.style())
-                .fill(palette::SURFACE_700)
-                .show(ui, |ui| {
-                    ui.label(RichText::new("New mosaic").color(palette::TEXT_STRONG));
-                    egui::Grid::new("new-mosaic").num_columns(2).show(ui, |ui| {
-                        let label = ui.label("Parent folder");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut form.parent).desired_width(360.0),
-                            )
-                            .labelled_by(label.id);
-                            browse = ui.button("Browse…").clicked();
-                        });
-                        ui.end_row();
-                        let label = ui.label("Name");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut form.name)
-                                .hint_text("e.g. Orion")
-                                .desired_width(360.0),
-                        )
-                        .labelled_by(label.id);
-                        ui.end_row();
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() {
-                            match new_session_dir(&form.parent, &form.name) {
-                                Ok(dir) => action = Some(StartAction::Create(dir)),
-                                Err(e) => self.error = Some(e),
-                            }
-                        }
-                        cancel = ui.button("Cancel").clicked();
-                    });
-                    ui.label(
-                        RichText::new(format!(
-                            "Creates NAME.{SESSION_EXT} in the parent folder; add panels \
-                             with `mmm init` for now."
-                        ))
-                        .small()
-                        .color(palette::TEXT_MUTED),
-                    );
-                });
-            if browse {
-                self.start_dialog(ctx, DialogPurpose::NewParent);
-            }
-            if cancel {
-                self.new_form = None;
-            }
-        }
-        action
+    /// The session the hero and the session block show.
+    pub(crate) fn hero(&self) -> Option<PathBuf> {
+        self.target()
     }
 
-    fn messages(&self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        if let Some(label) = &self.busy {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new(label).color(palette::TEXT_BODY));
-            });
-        }
-        if self.dialog.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Waiting for the file dialog…").color(palette::TEXT_MUTED));
-            });
-        }
-        if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(palette::HA_400));
-        }
-        if let Some(n) = &self.notice {
-            ui.label(RichText::new(n).color(palette::TEXT_MUTED));
-        }
+    /// The status line and dimming of `path`'s card.
+    pub(crate) fn card_look(&self, path: &Path) -> (Option<(Tone, String)>, bool) {
+        card_look(self.facts.get(path))
     }
+}
 
-    fn recent_list(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<StartAction> {
-        if self.library.entries().is_empty() {
-            return None;
-        }
-        ui.label(RichText::new("Recent").color(palette::TEXT_STRONG));
-        ui.separator();
-        let now = unix_now();
-        let mut action = None;
-        let mut remove = None;
-        for entry in self.library.entries().to_vec() {
-            let missing = self.missing.contains(&entry.path);
-            let (name_color, text_color) = if missing {
-                (palette::TEXT_SUBTLE, palette::TEXT_SUBTLE)
-            } else {
-                (palette::ACCENT_400, palette::TEXT_MUTED)
-            };
-            ui.horizontal(|ui| {
-                let name =
-                    egui::Button::new(RichText::new(session_name(&entry.path)).color(name_color))
-                        .frame(false);
-                if ui.add_enabled(enabled && !missing, name).clicked() {
-                    action = Some(StartAction::Open(entry.path.clone()));
-                }
-                if missing {
-                    ui.label(RichText::new("missing").small().color(palette::HA_400));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if missing && ui.small_button("Remove").clicked() {
-                        remove = Some(entry.path.clone());
-                    }
-                    ui.label(
-                        RichText::new(ago(now, entry.last_opened))
-                            .small()
-                            .color(text_color),
-                    );
-                });
-            });
-            ui.label(
-                RichText::new(entry.path.display().to_string())
-                    .small()
-                    .color(text_color),
-            );
-            ui.add_space(6.0);
-        }
-        if let Some(path) = remove {
-            self.library.remove(&path);
-            self.missing.remove(&path);
-        }
-        action
-    }
+/// The status line of a session: its availability, else its state
+/// (`None` when nothing is known).
+fn status_line(f: &CardFacts) -> Option<(Tone, &'static str)> {
+    Some(match &f.availability {
+        Availability::Missing => (Tone::Problem, "Missing"),
+        Availability::Busy => (Tone::Neutral, "Open in another window"),
+        Availability::Unreadable(_) => (Tone::Problem, UNREADABLE),
+        Availability::Available => match f.state {
+            CardState::Merged => (Tone::Success, "Merged"),
+            CardState::MergedExported => (Tone::Success, "Merged · exported"),
+            CardState::ReMergeNeeded => (
+                Tone::Warning,
+                "Panels changed since the last merge — re-merge needed",
+            ),
+            CardState::PlanReady => (Tone::Info, "Plan ready"),
+            CardState::NoPanels => (Tone::Neutral, "No panels yet"),
+            CardState::Unknown => return None,
+        },
+    })
+}
+
+/// A card's status (the block's, shortened to fit) and whether it is
+/// dimmed (a missing session).
+fn card_look(facts: Option<&CardFacts>) -> (Option<(Tone, String)>, bool) {
+    let Some(f) = facts else {
+        return (None, false);
+    };
+    let status = status_line(f).map(|(tone, label)| {
+        let stale =
+            f.availability == Availability::Available && f.state == CardState::ReMergeNeeded;
+        let label = if stale { "Re-merge needed" } else { label };
+        (tone, label.to_string())
+    });
+    (status, f.availability == Availability::Missing)
 }
 
 /// Seconds since the Unix epoch.
@@ -463,6 +605,23 @@ fn ago(now: u64, then: u64) -> String {
         _ => (s / 31_536_000, "year"),
     };
     format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+/// "1 panel", "3 panels".
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// `path` for display: without Windows' `\\?\` verbatim prefix.
+fn display_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(local) = s.strip_prefix(r"\\?\") {
+        local.to_string()
+    } else {
+        s
+    }
 }
 
 /// Expand a leading `~` to the home directory.
@@ -496,142 +655,6 @@ fn new_session_dir(parent: &str, name: &str) -> Result<PathBuf, String> {
     Ok(expand_home(parent).join(file))
 }
 
+/// The tests and the shared start-screen test helpers live in `tests.rs`.
 #[cfg(test)]
-pub(crate) mod tests {
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
-
-    use super::*;
-
-    /// A picker that answers with a fixed folder, never a real dialog.
-    pub(crate) struct StubPicker(pub Option<PathBuf>);
-
-    impl FolderPicker for StubPicker {
-        fn pick_folder(&self, _title: &str) -> Option<PathBuf> {
-            self.0.clone()
-        }
-    }
-
-    /// A fresh, canonical temp folder; `tag` must be unique per test.
-    pub(crate) fn temp_dir(tag: &str) -> PathBuf {
-        fresh_dir(&std::env::temp_dir(), tag)
-    }
-
-    /// [`temp_dir`] for [`relative_to_cwd`], in the workspace's `target`: no
-    /// relative path crosses Windows drives, and the temp folder can be on
-    /// another drive than the checkout (it is on GitHub's Windows runners).
-    pub(crate) fn temp_dir_near_cwd(tag: &str) -> PathBuf {
-        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
-        fresh_dir(&target, tag)
-    }
-
-    fn fresh_dir(parent: &Path, tag: &str) -> PathBuf {
-        let d = parent.join(format!("mmm-app-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.canonicalize().unwrap()
-    }
-
-    /// `path` (canonical, on the current directory's drive) as a path
-    /// relative to the current directory.
-    pub(crate) fn relative_to_cwd(path: &Path) -> PathBuf {
-        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let shared = cwd
-            .components()
-            .zip(path.components())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let mut rel = PathBuf::new();
-        for _ in cwd.components().skip(shared) {
-            rel.push("..");
-        }
-        rel.extend(path.components().skip(shared));
-        rel
-    }
-
-    /// Step `harness` until `done` holds (bounded: background threads).
-    pub(crate) fn step_until<S>(harness: &mut Harness<'_, S>, done: impl Fn(&S) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done(harness.state()) {
-            assert!(Instant::now() < deadline, "timed out waiting for the UI");
-            harness.step();
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        harness.step();
-    }
-
-    struct Screen {
-        screen: StartScreen,
-        actions: Vec<StartAction>,
-    }
-
-    fn harness(recent: Vec<RecentEntry>) -> Harness<'static, Screen> {
-        let state = Screen {
-            screen: StartScreen::new(recent, Arc::new(StubPicker(None))),
-            actions: Vec::new(),
-        };
-        Harness::builder()
-            .with_size(egui::vec2(1000.0, 800.0))
-            .build_ui_state(
-                |ui, s: &mut Screen| {
-                    if crate::testutil::themed(ui) {
-                        s.actions.extend(s.screen.ui(ui));
-                    }
-                },
-                state,
-            )
-    }
-
-    fn entry(path: &Path) -> RecentEntry {
-        RecentEntry {
-            path: path.to_path_buf(),
-            last_opened: 1_700_000_000,
-            pinned: false,
-        }
-    }
-
-    #[test]
-    fn typed_path_opens_session() {
-        let dir = temp_dir("typed").join("Orion.mmm-session");
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut h = harness(Vec::new());
-        h.run();
-        let field = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Session folder");
-        field.focus();
-        h.step();
-        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Session folder")
-            .type_text(dir.to_str().unwrap());
-        h.step();
-        h.key_press(egui::Key::Enter);
-        h.run();
-        assert_eq!(h.state().actions, vec![StartAction::Open(dir.clone())]);
-        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
-    }
-
-    #[test]
-    fn recent_list_marks_missing() {
-        let root = temp_dir("recent");
-        let present = root.join("Present.mmm-session");
-        std::fs::create_dir_all(&present).unwrap();
-        let gone = root.join("Gone.mmm-session");
-        let mut h = harness(vec![entry(&present), entry(&gone)]);
-        h.step();
-        step_until(&mut h, |s| !s.screen.checking_recent());
-        h.run();
-        h.get_by_label("Present");
-        h.get_by_label("Gone");
-        assert_eq!(h.query_all_by_label("missing").count(), 1);
-        h.get_by_label_contains(&gone.display().to_string());
-        // The missing entry is not openable; the present one is.
-        h.get_by_label("Gone").click();
-        h.run();
-        assert!(h.state().actions.is_empty());
-        h.get_by_label("Present").click();
-        h.run();
-        assert_eq!(h.state().actions, vec![StartAction::Open(present.clone())]);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}
+pub(crate) mod tests;

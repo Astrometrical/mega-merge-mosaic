@@ -35,7 +35,6 @@ impl Library {
     }
 
     /// Entries for the shelf: pinned first, then newest opened first.
-    #[allow(dead_code)] // used by the start screen rewrite
     pub fn shelf_order(&self) -> Vec<&RecentEntry> {
         let mut v: Vec<&RecentEntry> = self.entries.iter().collect();
         v.sort_by_key(|e| (!e.pinned, std::cmp::Reverse(e.last_opened)));
@@ -43,7 +42,6 @@ impl Library {
     }
 
     /// Entries newest opened first, ignoring pins (for choosing the hero).
-    #[allow(dead_code)] // used by the start screen rewrite
     pub fn by_recency(&self) -> Vec<&RecentEntry> {
         let mut v: Vec<&RecentEntry> = self.entries.iter().collect();
         v.sort_by_key(|e| std::cmp::Reverse(e.last_opened));
@@ -71,7 +69,6 @@ impl Library {
     }
 
     /// Pin or unpin `path`, if listed.
-    #[allow(dead_code)] // used by the start screen rewrite
     pub fn set_pinned(&mut self, path: &Path, pinned: bool) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
             e.pinned = pinned;
@@ -85,7 +82,6 @@ impl Library {
 
     /// Point the entry for `old` at `new`, keeping its pin and time. Any
     /// other entry already listed at `new` is dropped.
-    #[allow(dead_code)] // used by the start screen rewrite
     pub fn relocate(&mut self, old: &Path, new: &Path) {
         if old == new || !self.entries.iter().any(|e| e.path == old) {
             return;

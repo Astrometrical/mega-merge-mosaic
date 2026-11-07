@@ -251,11 +251,9 @@ pub fn open_in_new_process(dir: &Path) -> std::io::Result<()> {
 }
 
 /// The key in a session's `ui` JSON holding its free-text notes.
-#[allow(dead_code)] // used by the start screen, a later task
 pub const NOTES_KEY: &str = "notes";
 
 /// The notes stored in `ui` (empty when there are none).
-#[allow(dead_code)] // used by the start screen, a later task
 pub fn notes(ui: &Value) -> String {
     ui.get(NOTES_KEY)
         .and_then(Value::as_str)
@@ -265,7 +263,6 @@ pub fn notes(ui: &Value) -> String {
 
 /// Store `text` as the notes in `ui`, keeping everything else there (a `ui`
 /// that is not a JSON object becomes one).
-#[allow(dead_code)] // used by the start screen, a later task
 pub fn set_notes(ui: &mut Value, text: &str) {
     if !ui.is_object() {
         *ui = Value::Object(Default::default());
@@ -279,7 +276,6 @@ pub fn set_notes(ui: &mut Value, text: &str) {
 /// takes the session lock for the write only. A session open elsewhere is
 /// refused (`Err(busy_message)`) so its configuration is never overwritten.
 /// Blocking file I/O: call from a background thread.
-#[allow(dead_code)] // used by the start screen, a later task
 pub fn save_notes_blocking(dir: &Path, text: &str) -> Result<(), String> {
     let _lock = lock_session(dir).map_err(|e| {
         if e.is_busy() {

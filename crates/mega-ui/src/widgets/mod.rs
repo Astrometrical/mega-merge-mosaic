@@ -17,7 +17,7 @@ pub use notes::notes_field;
 pub use progress::{progress, progress_bar};
 pub use property::{property_grid, property_row, property_row_numeric, property_row_ui};
 pub use segmented::segmented;
-pub use session_card::{CARD_THUMB_HEIGHT, CARD_WIDTH, SessionCardData, session_card};
+pub use session_card::{CARD_HEIGHT, CARD_THUMB_HEIGHT, CARD_WIDTH, SessionCardData, session_card};
 pub use status_line::{overline, status};
 pub use text_input::text_input;
 pub use toast::{MAX_TOASTS, TOAST_LIFETIME_S, Toast, ToastEvent, ToastId, Toasts};

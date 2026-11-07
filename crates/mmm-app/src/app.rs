@@ -201,7 +201,9 @@ impl Shell {
         self.poll(&ctx);
         self.poll_jobs(&ctx);
         if self.session.is_none() {
-            egui::CentralPanel::default().show(ui, |ui| {
+            // The start screen's hero fills the window: no panel margin.
+            let frame = egui::Frame::NONE.fill(palette::SURFACE_900);
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| {
                 if let Some(action) = self.start.ui(ui) {
                     self.request(to_request(action), &ctx);
                 }
@@ -467,10 +469,13 @@ impl Shell {
         self.notices_ui(&ctx);
         let mut open = self.show_start;
         let mut action = None;
+        // A fixed size: the start screen fills whatever it is given.
+        let size = (ctx.content_rect().size() * 0.85).max(egui::vec2(640.0, 440.0));
         egui::Window::new("Open another session")
             .open(&mut open)
             .collapsible(false)
-            .default_width(680.0)
+            .resizable(false)
+            .fixed_size(size)
             .show(&ctx, |ui| action = self.start.ui(ui));
         self.show_start = open;
         if let Some(action) = action {
@@ -532,6 +537,8 @@ pub type SelfTestOutcome = Arc<Mutex<Option<Result<(), String>>>>;
 const SELFTEST_FRAMES: u32 = 30;
 /// Frames rendered with the start screen before a given session is opened.
 const SELFTEST_START_FRAMES: u32 = 5;
+/// Most frames the start screen waits for its hero's first image.
+const SELFTEST_HERO_FRAMES: u32 = 600;
 /// Frames rendered with the session open, at least.
 const SELFTEST_SESSION_FRAMES: u32 = 10;
 /// Give up on a self-test after this long.
@@ -541,6 +548,8 @@ const SELFTEST_BACKSTOP: Duration = Duration::from_secs(10);
 
 /// `--selftest` state: render a fixed number of frames, then close.
 struct SelfTest {
+    /// When the app started.
+    started: Instant,
     frames: u32,
     session_frames: u32,
     session: Option<PathBuf>,
@@ -592,7 +601,21 @@ impl SelfTest {
             return self.finish(ctx, Err("timed out".into()));
         }
         if let Some(dir) = &self.session {
-            if !self.session_requested && self.frames >= SELFTEST_START_FRAMES {
+            // The session (the start screen's hero) opens once the hero
+            // has drawn, or after a while.
+            let hero = shell.start.hero_image();
+            let waited = self.frames >= SELFTEST_HERO_FRAMES;
+            if !self.session_requested
+                && self.frames >= SELFTEST_START_FRAMES
+                && (hero.is_some() || waited)
+            {
+                match hero {
+                    Some(label) => tracing::info!(
+                        "self-test: start screen hero shows {label:?}, {} ms after launch",
+                        self.started.elapsed().as_millis()
+                    ),
+                    None => tracing::warn!("self-test: start screen hero drew nothing"),
+                }
                 self.session_requested = true;
                 shell.request(Request::Open(dir.clone()), ctx);
             }
@@ -821,10 +844,20 @@ impl MmmApp {
         mega_ui::theme::apply(&cc.egui_ctx);
         let recent: Vec<RecentEntry> = match (&selftest, cc.storage) {
             (None, Some(storage)) => eframe::get_value(storage, RECENT_KEY).unwrap_or_default(),
+            // The self-test's session is the start screen's hero first.
+            (Some(_), _) => initial
+                .iter()
+                .map(|path| RecentEntry {
+                    path: path.clone(),
+                    last_opened: unix_now(),
+                    pinned: false,
+                })
+                .collect(),
             _ => Vec::new(),
         };
         let shell = Shell::new(StartScreen::new(recent, Arc::new(RfdPicker)));
         let selftest = selftest.map(|outcome| SelfTest {
+            started: Instant::now(),
             frames: 0,
             session_frames: 0,
             session: initial.clone(),
@@ -868,6 +901,8 @@ impl eframe::App for MmmApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // `save` runs first only with persistence storage available.
         self.shell.flush_pending_saves();
+        // Notes typed on the start screen less than a pause ago.
+        self.shell.start.flush_notes();
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -904,6 +939,14 @@ mod tests {
     }
 
     fn type_into(h: &mut Harness<'static, Shell>, field: &str, text: &str) {
+        let role = egui::accesskit::Role::TextInput;
+        // The typed path lives behind More → Type a path….
+        if field == "Session folder" && h.query_by_role_and_label(role, field).is_none() {
+            h.get_by_label("More").click();
+            h.run();
+            h.get_by_label("Type a path…").click();
+            h.run();
+        }
         h.get_by_role_and_label(egui::accesskit::Role::TextInput, field)
             .focus();
         h.step();
@@ -917,7 +960,7 @@ mod tests {
         let parent = temp_dir("new");
         let mut h = harness(StubPicker(Some(parent.clone())));
         h.run();
-        h.get_by_label("New mosaic…").click();
+        h.get_by_label("New mosaic").click();
         // The (stub) dialog answers on a background thread.
         step_until(&mut h, |s| {
             s.start.new_parent() == Some(parent.display().to_string().as_str())
@@ -929,7 +972,7 @@ mod tests {
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert!(dir.join("mosaic.json").is_file());
         assert_eq!(h.state().start.recent()[0].path, dir);
-        // The form is cleared for the next New mosaic….
+        // The form is cleared for the next New mosaic.
         assert_eq!(h.state().start.new_parent(), None);
         // A session without panels opens on the Panels tab.
         assert_eq!(h.state().tab(), Tab::Panels);
