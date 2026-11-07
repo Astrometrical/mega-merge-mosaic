@@ -24,7 +24,7 @@ use mega_ui::brand::{self, BrandImages};
 use mega_ui::hero::HeroStage;
 use mega_ui::theme::Tone;
 
-use crate::session::{SESSION_EXT, session_name};
+use crate::session::{SESSION_EXT, normalize, session_name};
 
 mod facts;
 mod hero;
@@ -555,12 +555,17 @@ impl StartScreen {
         }
     }
 
+    /// Show the dialog for `purpose` on a background thread. A located
+    /// session's path is normalised there (it reads the disk), as every
+    /// opened session's is ([`normalize`]), so its entry matches the one
+    /// recorded when it is resumed.
     fn start_dialog(&mut self, ctx: &egui::Context, purpose: DialogPurpose) {
         let title = match purpose {
             DialogPurpose::Open => Some("Open a mosaic session (.mmm-session folder)"),
             DialogPurpose::NewSession => None,
             DialogPurpose::Locate(_) => Some("Locate the session (.mmm-session folder)"),
         };
+        let locate = matches!(purpose, DialogPurpose::Locate(_));
         let (tx, rx) = mpsc::channel();
         let dialogs = Arc::clone(&self.dialogs);
         let ctx = ctx.clone();
@@ -568,6 +573,11 @@ impl StartScreen {
             let picked = match title {
                 Some(title) => dialogs.pick_folder(title),
                 None => dialogs.pick_new_session(),
+            };
+            let picked = if locate {
+                picked.map(|p| normalize(&p))
+            } else {
+                picked
             };
             let _ = tx.send(picked);
             ctx.request_repaint();

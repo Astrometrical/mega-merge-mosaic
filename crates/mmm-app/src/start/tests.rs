@@ -552,6 +552,33 @@ fn missing_card_can_be_located() {
 }
 
 #[test]
+fn located_session_is_listed_canonically() {
+    // The dialog answers with a path that is not canonical (here relative).
+    let root = temp_dir_near_cwd("start-locate-canonical");
+    let moved = session(&root, "Moved");
+    let gone = root.join("Gone.mmm-session");
+    let picker = StubPicker(Some(relative_to_cwd(&moved)));
+    let pinned = RecentEntry {
+        pinned: true,
+        ..entry(&gone)
+    };
+    let mut h = harness_with(Screen::new(vec![pinned], picker));
+    settle(&mut h);
+    h.get_by_label("Locate…").click();
+    step_until(&mut h, |s| s.screen.recent()[0].path != gone);
+    settle(&mut h);
+    // Resumed, the session is recorded as the app records every opened
+    // one (normalised): still one entry, still pinned.
+    let opened = crate::session::normalize(&moved);
+    h.state_mut().screen.record_opened(&opened, unix_now());
+    let recent = h.state().screen.recent();
+    assert_eq!(recent.len(), 1, "{recent:?}");
+    assert_eq!(recent[0].path, opened);
+    assert!(recent[0].pinned, "the pin is kept");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn all_sessions_searches_names_and_notes() {
     let root = temp_dir("start-all");
     let a = session(&root, "Alpha");
