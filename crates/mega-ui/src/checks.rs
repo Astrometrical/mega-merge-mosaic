@@ -1,14 +1,21 @@
-//! Checks list: problems and notes as cards with a severity bar, passed
-//! checks collapsed into one green summary line.
+//! Checks list: problems and notes as tinted rows with a severity icon
+//! and bar, passed checks collapsed into one expandable summary row.
 
 use egui::{
-    Align, CollapsingHeader, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Stroke, Ui,
+    Align, Align2, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, Pos2, Rect,
+    RichText, Sense, TextStyle, Ui, Vec2, collapsing_header::CollapsingState,
 };
 
-use crate::theme::{Severity, palette, severity_color};
+use crate::icons;
+use crate::theme::palette;
+use crate::theme::tokens::{radius, space};
+use crate::theme::{Severity, Tone};
+use crate::widgets::{ButtonKind, MegaButton};
 
-/// Width of a card's severity bar, in points.
-const BAR_WIDTH: f32 = 3.0;
+/// Width of a row's severity bar, in points.
+const BAR_WIDTH: f32 = 2.0;
+/// Size of a row's severity icon, in points.
+const ICON_SIZE: f32 = 15.0;
 
 /// One check result to show.
 #[derive(Clone, Debug, PartialEq)]
@@ -32,11 +39,12 @@ pub enum CheckAction {
     Accept(usize),
 }
 
-/// Show `items` under `heading`: problems, then notes, as cards with a
-/// severity bar (an "Accept" button on acceptable, unaccepted problems),
-/// then the passed checks as one collapsed green summary line. With
-/// `show_all`, a "Show all" checkbox sits beside the heading; the caller
-/// does the filtering it stands for. Returns the actions taken this frame.
+/// Show `items` under `heading`: problems, then notes, as tinted rows with
+/// a severity icon and bar (an "Accept" button on acceptable, unaccepted
+/// problems), then the passed checks as one collapsed summary row that
+/// expands to list them. With `show_all`, a "Show all" checkbox sits beside
+/// the heading; the caller does the filtering it stands for. Returns the
+/// actions taken this frame.
 pub fn checks_list(
     ui: &mut Ui,
     heading: &str,
@@ -59,8 +67,8 @@ pub fn checks_list(
     for severity in [Severity::Problem, Severity::Note] {
         for (i, item) in items.iter().enumerate() {
             if item.severity == severity {
-                card(ui, i, item, &mut actions);
-                ui.add_space(4.0);
+                row(ui, i, item, &mut actions);
+                ui.add_space(space::XS);
             }
         }
     }
@@ -69,62 +77,69 @@ pub fn checks_list(
         .filter(|c| c.severity == Severity::Passed)
         .collect();
     if !passed.is_empty() {
-        let n = passed.len();
-        let summary = format!("{n} check{} passed", if n == 1 { "" } else { "s" });
-        let green = severity_color(Severity::Passed);
-        CollapsingHeader::new(RichText::new(summary).color(green))
-            .id_salt(("mega-ui-checks-passed", heading))
-            .default_open(false)
-            .show(ui, |ui| {
-                for c in passed {
-                    ui.label(RichText::new(&c.title).color(green));
-                    if !c.detail.is_empty() {
-                        ui.label(RichText::new(&c.detail).small().color(palette::TEXT_MUTED));
-                    }
-                }
-            });
+        passed_section(ui, heading, &passed);
     }
     actions
 }
 
-/// One problem or note card; `index` is the item's index in the caller's
+/// Paint `glyph` with its top-left at `pos`.
+fn paint_icon(ui: &Ui, pos: Pos2, glyph: char, color: Color32) {
+    ui.painter().text(
+        pos,
+        Align2::LEFT_TOP,
+        glyph,
+        FontId::proportional(ICON_SIZE),
+        color,
+    );
+}
+
+/// One problem or note row; `index` is the item's index in the caller's
 /// slice.
-fn card(ui: &mut Ui, index: usize, item: &CheckItem, actions: &mut Vec<CheckAction>) {
-    let bar = if item.accepted {
-        palette::TEXT_SUBTLE
+fn row(ui: &mut Ui, index: usize, item: &CheckItem, actions: &mut Vec<CheckAction>) {
+    let tone = Tone::from(item.severity);
+    let (bar, fill, icon_color) = if item.accepted {
+        (
+            palette::TEXT_SUBTLE,
+            Color32::TRANSPARENT,
+            palette::TEXT_SUBTLE,
+        )
     } else {
-        severity_color(item.severity)
+        (tone.accent(), tone.tint(), tone.color())
     };
+    let left = BAR_WIDTH + space::S + ICON_SIZE + space::S;
     let frame = Frame::new()
-        .fill(palette::SURFACE_700)
-        .stroke(Stroke::new(1.0, palette::BORDER))
-        .corner_radius(4)
+        .fill(fill)
+        .corner_radius(CornerRadius {
+            ne: radius::CONTROL,
+            se: radius::CONTROL,
+            ..CornerRadius::ZERO
+        })
         .inner_margin(Margin {
-            left: 12,
-            right: 8,
+            left: left as i8,
+            right: space::S as i8,
             top: 6,
             bottom: 6,
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(&item.title)
-                    .strong()
-                    .color(palette::TEXT_STRONG),
-            );
+            ui.label(RichText::new(&item.title).color(palette::TEXT_EMPHASIS));
             if !item.detail.is_empty() {
-                ui.label(RichText::new(&item.detail).color(palette::TEXT_BODY));
+                ui.label(
+                    RichText::new(&item.detail)
+                        .text_style(TextStyle::Small)
+                        .color(palette::TEXT_MUTED),
+                );
             }
             if item.severity == Severity::Problem {
                 if item.accepted {
                     ui.label(
                         RichText::new("Accepted")
-                            .small()
+                            .text_style(TextStyle::Small)
                             .color(palette::TEXT_SUBTLE),
                     );
                 } else if item.acceptable
                     && ui
-                        .button("Accept")
+                        .add(MegaButton::new(ButtonKind::Quiet, "Accept"))
                         .on_hover_text(
                             "Accept this problem: it stays listed but is no longer flagged",
                         )
@@ -137,13 +152,58 @@ fn card(ui: &mut Ui, index: usize, item: &CheckItem, actions: &mut Vec<CheckActi
     let r = frame.response.rect;
     ui.painter().rect_filled(
         Rect::from_min_max(r.min, Pos2::new(r.min.x + BAR_WIDTH, r.max.y)),
-        CornerRadius {
-            nw: 4,
-            sw: 4,
-            ..CornerRadius::ZERO
-        },
+        CornerRadius::ZERO,
         bar,
     );
+    if let Some(glyph) = tone.icon() {
+        paint_icon(
+            ui,
+            Pos2::new(r.min.x + BAR_WIDTH + space::S, r.min.y + 7.0),
+            glyph,
+            icon_color,
+        );
+    }
+}
+
+/// The passed checks: a summary row (tick, "N checks passed", chevron)
+/// that expands to list each one.
+fn passed_section(ui: &mut Ui, heading: &str, passed: &[&CheckItem]) {
+    let n = passed.len();
+    let summary = format!("{n} check{} passed", if n == 1 { "" } else { "s" });
+    let id = ui.make_persistent_id(("mega-ui-checks-passed", heading));
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    let header = ui
+        .horizontal(|ui| {
+            let (icon, _) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), Sense::hover());
+            paint_icon(ui, icon.min, icons::CHECK, palette::GREEN_300);
+            let label = ui.add(
+                Label::new(RichText::new(&summary).color(palette::TEXT_BODY)).sense(Sense::click()),
+            );
+            let (chev, _) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), Sense::hover());
+            let glyph = if state.is_open() {
+                icons::CHEVRON_DOWN
+            } else {
+                icons::CHEVRON_RIGHT
+            };
+            paint_icon(ui, chev.min, glyph, palette::TEXT_MUTED);
+            label
+        })
+        .inner;
+    if header.clicked() {
+        state.toggle(ui);
+    }
+    state.show_body_unindented(ui, |ui| {
+        for c in passed {
+            ui.label(RichText::new(&c.title).color(palette::TEXT_BODY));
+            if !c.detail.is_empty() {
+                ui.label(
+                    RichText::new(&c.detail)
+                        .text_style(TextStyle::Small)
+                        .color(palette::TEXT_MUTED),
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -206,6 +266,38 @@ mod tests {
         h.get_by_label("Show all").click();
         h.run();
         assert!(h.state().show_all);
+    }
+
+    /// Every text run painted in the last frame.
+    fn painted_text(h: &Harness<'static, State>) -> String {
+        fn walk(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => out.push_str(t.galley.text()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for c in &h.output().shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn severity_rows_carry_their_icon() {
+        let mut h = harness(vec![
+            check(Severity::Problem, "Broken", true, false),
+            check(Severity::Note, "Worth knowing", false, false),
+            check(Severity::Passed, "Fine", false, false),
+        ]);
+        h.run();
+        let text = painted_text(&h);
+        assert!(text.contains(crate::icons::CIRCLE_X), "problem icon");
+        assert!(text.contains(crate::icons::TRIANGLE_ALERT), "note icon");
+        assert!(text.contains(crate::icons::CHECK), "passed icon");
+        h.get_by_label("Broken");
+        h.get_by_label("1 check passed");
     }
 
     #[test]
