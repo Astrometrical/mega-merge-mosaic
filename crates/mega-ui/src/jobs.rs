@@ -2,6 +2,8 @@
 
 use egui::Ui;
 
+use crate::widgets::{ButtonKind, MegaButton, progress};
+
 /// Display snapshot of one running job.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobView {
@@ -26,28 +28,29 @@ pub enum JobAction {
     Cancel(u64),
 }
 
-/// Draw each job with a progress bar and optional Cancel button.
+/// Draw each job as a progress row (readout "N%" when the total is
+/// known, else the stage), with an optional Cancel button.
 pub fn job_panel(ui: &mut Ui, jobs: &[JobView]) -> Vec<JobAction> {
     let mut actions = Vec::new();
     for job in jobs {
+        let (fraction, readout) = if job.total > 0 {
+            let f = (job.done as f32 / job.total as f32).clamp(0.0, 1.0);
+            (Some(f), format!("{}%", (f * 100.0).round() as u32))
+        } else {
+            (None, job.stage.clone())
+        };
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(&job.label).color(crate::theme::palette::TEXT_STRONG));
-            ui.label(egui::RichText::new(&job.stage).color(crate::theme::palette::TEXT_MUTED));
-        });
-        ui.horizontal(|ui| {
-            let mut bar = if job.total > 0 {
-                egui::ProgressBar::new((job.done as f32 / job.total as f32).clamp(0.0, 1.0))
-            } else {
-                egui::ProgressBar::new(0.0)
-            }
-            .fill(crate::theme::palette::ACCENT_500);
-            if job.total > 0 {
-                bar = bar.show_percentage();
-            }
-            // Leave room for the Cancel button (a bare bar fills the row).
+            // Leave room for the Cancel button (a bare row fills the width).
             let room = if job.cancellable { 80.0 } else { 0.0 };
-            ui.add(bar.desired_width((ui.available_width() - room).max(60.0)));
-            if job.cancellable && ui.button("Cancel").clicked() {
+            let width = (ui.available_width() - room).max(60.0);
+            ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                progress(ui, &job.label, fraction, &readout);
+            });
+            if job.cancellable
+                && ui
+                    .add(MegaButton::new(ButtonKind::Quiet, "Cancel"))
+                    .clicked()
+            {
                 actions.push(JobAction::Cancel(job.id));
             }
         });
@@ -62,6 +65,26 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     #[test]
+    fn job_panel_readout_is_percentage() {
+        let jobs = [JobView {
+            id: 1,
+            label: "Blend".into(),
+            stage: "Seams".into(),
+            done: 3,
+            total: 10,
+            cancellable: false,
+        }];
+        let mut harness = Harness::new_ui(|ui| {
+            if crate::testutil::themed(ui) {
+                job_panel(ui, &jobs);
+            }
+        });
+        harness.run();
+        harness.get_by_label("Blend");
+        harness.get_by_label("30%");
+    }
+
+    #[test]
     fn job_panel_cancel_returns_action() {
         let jobs = [JobView {
             id: 7,
@@ -72,7 +95,11 @@ mod tests {
             cancellable: true,
         }];
         let mut actions = Vec::new();
-        let mut harness = Harness::new_ui(|ui| actions.extend(job_panel(ui, &jobs)));
+        let mut harness = Harness::new_ui(|ui| {
+            if crate::testutil::themed(ui) {
+                actions.extend(job_panel(ui, &jobs));
+            }
+        });
         harness.run();
         harness.get_by_label("Cancel").click();
         harness.run();
