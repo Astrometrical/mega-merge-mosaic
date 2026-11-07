@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 use mega_ui::hero::HeroView;
@@ -16,9 +17,9 @@ use super::facts::{Availability, CardFacts};
 use super::hero_views::{HeroData, build_hero, thumbnail};
 use super::{StartScreen, UNREADABLE};
 
-/// Seconds after the hero's views are set before card thumbnails load even
-/// if no tile has been drawn: a hero whose tiles never come must not hold
-/// the thumbnails back for ever.
+/// Seconds after the screen starts before card thumbnails load even if the
+/// hero hasn't settled: a hero that never loads (its tiles never come, or
+/// its session's folder never answers) must not hold them back for ever.
 const THUMBS_WAIT_MAX_S: f64 = 2.0;
 
 /// Most thumbnails one background batch builds.
@@ -35,8 +36,6 @@ pub(super) struct Shown {
     path: PathBuf,
     /// Whether it got views (else the stage shows a line saying why).
     has_views: bool,
-    /// When its views were set (egui time).
-    at: f64,
     /// The view its card thumbnail comes from: the one shown first.
     thumb_source: Option<Arc<dyn TileSource>>,
 }
@@ -161,25 +160,30 @@ impl StartScreen {
         self.shown = Some(Shown {
             path,
             has_views,
-            at: now,
             thumb_source,
         });
     }
 
-    /// Whether the hero is done loading, so thumbnails may: it has drawn
-    /// its first image, has nothing to draw, or has waited long enough.
-    fn hero_settled(&self, target: Option<&Path>, now: f64) -> bool {
-        let Some(target) = target else { return true };
-        self.shown.as_ref().is_some_and(|s| {
-            s.path == target
-                && (!s.has_views
-                    || self.stage.first_image_drawn()
-                    || now - s.at >= THUMBS_WAIT_MAX_S)
-        })
+    /// Seconds until thumbnails may load: zero once the hero for `target`
+    /// has drawn its first image or has nothing to draw, or once
+    /// [`THUMBS_WAIT_MAX_S`] have passed since the screen started.
+    fn thumbs_wait(&self, target: Option<&Path>, now: f64) -> f64 {
+        let settled = match target {
+            None => true,
+            Some(target) => self.shown.as_ref().is_some_and(|s| {
+                s.path == target && (!s.has_views || self.stage.first_image_drawn())
+            }),
+        };
+        if settled {
+            return 0.0;
+        }
+        let since_start = self.started_at.map_or(0.0, |t| now - t);
+        (THUMBS_WAIT_MAX_S - since_start).max(0.0)
     }
 
     /// Start building thumbnails for the cards on screen that lack one,
-    /// once the hero has settled; one batch at a time.
+    /// once the hero has settled (or waited long enough: a frame is
+    /// scheduled for then); one batch at a time.
     pub(super) fn request_thumbnails(
         &mut self,
         ctx: &egui::Context,
@@ -187,7 +191,21 @@ impl StartScreen {
         target: Option<&Path>,
         now: f64,
     ) {
-        if self.thumb_rx.is_some() || !self.hero_settled(target, now) {
+        if self.thumb_rx.is_some() {
+            return;
+        }
+        let needed = wanted.iter().any(|p| {
+            !self.thumbs.contains_key(p)
+                && self
+                    .facts
+                    .get(p)
+                    .is_some_and(|f| f.availability == Availability::Available)
+        });
+        let wait = self.thumbs_wait(target, now);
+        if !needed || wait > 0.0 {
+            if needed {
+                ctx.request_repaint_after(Duration::from_secs_f64(wait));
+            }
             return;
         }
         let mut jobs = Vec::new();

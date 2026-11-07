@@ -12,7 +12,7 @@ use mega_ui::theme::Tone;
 use mmm_core::mosaic::{CONFIG_FILE, MosaicConfig, lock_session};
 
 use super::*;
-use crate::session::{notes, save_notes_blocking};
+use crate::session::{notes, save_notes_blocking, session_name};
 
 /// A picker that answers with a fixed folder, never a real dialog.
 pub(crate) struct StubPicker(pub Option<PathBuf>);
@@ -117,6 +117,22 @@ fn harness_with(state: Screen) -> Harness<'static, Screen> {
             },
             state,
         )
+}
+
+/// Facts as usual, except that a session named "Stuck…" never answers
+/// (like a folder on a dead network share).
+fn stuck_share(entry: &RecentEntry) -> facts::CardFacts {
+    if session_name(&entry.path).starts_with("Stuck") {
+        std::thread::sleep(Duration::from_secs(120));
+    }
+    facts::load_facts(entry)
+}
+
+/// [`harness`] whose facts come from [`stuck_share`].
+fn stuck_harness(recent: Vec<RecentEntry>) -> Harness<'static, Screen> {
+    let mut state = Screen::new(recent, StubPicker(None));
+    state.screen = state.screen.with_facts_loader(stuck_share);
+    harness_with(state)
 }
 
 /// A recent entry for `path`, opened at `t`.
@@ -334,6 +350,62 @@ fn opened_session_stops_being_the_hero() {
     assert_eq!(h.state().screen.recent()[0].path, older);
     let open_elsewhere = Some((Tone::Neutral, "Open in another window".to_string()));
     assert_eq!(h.state().screen.card_look(&older), (open_elsewhere, false));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn unreachable_newest_is_not_the_hero() {
+    let root = temp_dir("start-stuck");
+    let stuck = session(&root, "Stuck share");
+    let next = session(&root, "Next");
+    let mut h = stuck_harness(vec![entry_at(&stuck, 300), entry_at(&next, 200)]);
+    while h.state().frames == 0 {
+        h.step();
+    }
+    // At first the newest is shown: its facts may come at any moment.
+    assert_eq!(h.state().first_pass, Some((0, Some(stuck.clone()))));
+    step_until(&mut h, |s| s.screen.facts_known() == 1);
+    // A frame is due without any input: the hero is chosen again soon.
+    let delay = h.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+    assert!(delay <= Duration::from_secs(1), "{delay:?}");
+    // After about a second, the next available session takes over.
+    step_until(&mut h, |s| s.screen.hero() == Some(next.clone()));
+    h.run();
+    h.get_by_role_and_label(Role::Label, "Next");
+    h.get_by_label("CONTINUE WHERE YOU LEFT OFF");
+    assert!(
+        !h.get_by_label("Resume session")
+            .accesskit_node()
+            .is_disabled()
+    );
+    pause(&mut h, 0.5);
+    double_click(&mut h, "Next");
+    h.run();
+    assert_eq!(h.state().actions, vec![StartAction::Open(next.clone())]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn thumbnails_load_while_the_hero_is_stuck() {
+    let root = temp_dir("start-stuck-thumbs");
+    let stuck = session(&root, "Stuck share");
+    let a = session(&root, "Alpha");
+    let b = session(&root, "Beta");
+    let recent = vec![entry_at(&stuck, 300), entry_at(&a, 200), entry_at(&b, 100)];
+    let mut h = stuck_harness(recent);
+    while h.state().frames == 0 {
+        h.step();
+    }
+    // The user picks the stuck session: its hero never loads...
+    h.get_by_role_and_label(Role::Button, "Stuck share").click();
+    h.run();
+    // ...and the other cards' thumbnails load anyway, a little later.
+    step_until(&mut h, |s| {
+        [&a, &b]
+            .iter()
+            .all(|p| matches!(s.screen.thumbs.get(*p), Some(Thumb::Ready(_))))
+    });
+    assert_eq!(h.state().screen.hero(), Some(stuck.clone()));
     let _ = std::fs::remove_dir_all(&root);
 }
 

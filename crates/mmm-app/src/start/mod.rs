@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use mega_ui::brand::{self, BrandImages};
 use mega_ui::hero::HeroStage;
@@ -32,11 +33,16 @@ mod layout;
 mod notes;
 mod recent;
 
-use facts::{Availability, CardFacts, CardState, FactsLoader};
+use facts::{Availability, CardFacts, CardState, FactsLoader, LoadFacts};
 use hero::{HeroBuild, Shown, Thumb, ThumbResults};
 use notes::{NotesEditor, NotesSave};
 pub use recent::{Library, RecentEntry};
 
+/// Seconds after the screen starts during which a session whose facts
+/// haven't arrived may still be the default hero; after that, one whose
+/// folder doesn't answer (e.g. on a dead network share) gives way to the
+/// most recent available one.
+const FACTS_WAIT_S: f64 = 1.0;
 /// Status and hero line of a session that cannot be read.
 const UNREADABLE: &str = "Can't read this session";
 
@@ -119,6 +125,8 @@ struct Drawn {
 /// The start screen's state.
 pub struct StartScreen {
     picker: Arc<dyn FolderPicker>,
+    /// How sessions' facts are read in tests (else [`facts::load_facts`]).
+    load: Option<LoadFacts>,
     library: Library,
     facts: HashMap<PathBuf, CardFacts>,
     loading: Vec<Loading>,
@@ -128,6 +136,10 @@ pub struct StartScreen {
     reload: Vec<PathBuf>,
     /// The card the user clicked (else the default hero is shown).
     selected: Option<PathBuf>,
+    /// When the screen first drew (egui time).
+    started_at: Option<f64>,
+    /// The time of the frame being drawn (egui time).
+    clock: f64,
     stage: HeroStage,
     shown: Option<Shown>,
     hero_build: Option<HeroBuild>,
@@ -169,12 +181,15 @@ impl StartScreen {
             .clamp(2, 4);
         StartScreen {
             picker,
+            load: None,
             library: Library::new(recent),
             facts: HashMap::new(),
             loading: Vec::new(),
             started: false,
             reload: Vec::new(),
             selected: None,
+            started_at: None,
+            clock: 0.0,
             stage: HeroStage::new(loader_threads),
             shown: None,
             hero_build: None,
@@ -261,6 +276,8 @@ impl StartScreen {
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<StartAction> {
         let ctx = ui.ctx().clone();
         let now = ui.input(|i| i.time);
+        self.clock = now;
+        self.started_at.get_or_insert(now);
         // Polled before anything starts: the first pass draws without facts.
         self.poll_background(&ctx);
         self.start_background(&ctx);
@@ -272,6 +289,10 @@ impl StartScreen {
             ));
         }
         let target = self.target();
+        if let Some(wait) = self.facts_wait_left() {
+            // The default hero may change then, with no input to wake us.
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        }
         self.update_hero(&ctx, target.as_deref(), now);
         self.sync_notes(&ctx, target.as_deref());
 
@@ -321,20 +342,43 @@ impl StartScreen {
         }
     }
 
-    /// The most recently opened session whose facts show it available, or
-    /// whose facts have not arrived yet (until they do, it may be). With
-    /// none available, the most recent session, so the block can say why.
+    /// The most recently opened session whose facts show it available. For
+    /// [`FACTS_WAIT_S`] after the screen starts, one whose facts haven't
+    /// arrived may be it too (they usually come at once); after that it
+    /// gives way, so a folder that never answers is never the hero while
+    /// another session is available. With none available, the most recent
+    /// session whose facts are pending, else the most recent one, so the
+    /// block can say why.
     fn default_hero(&self) -> Option<PathBuf> {
         let by_recency = self.library.by_recency();
-        by_recency
+        // Some(available), or None while the facts are pending.
+        let available = |e: &RecentEntry| {
+            self.facts
+                .get(&e.path)
+                .map(|f| f.availability == Availability::Available)
+        };
+        let pick = if self.facts_wait_left().is_some() {
+            by_recency.iter().find(|e| available(e) != Some(false))
+        } else {
+            by_recency
+                .iter()
+                .find(|e| available(e) == Some(true))
+                .or_else(|| by_recency.iter().find(|e| available(e).is_none()))
+        };
+        pick.or(by_recency.first()).map(|e| e.path.clone())
+    }
+
+    /// While sessions whose facts are pending may still be the default hero
+    /// (see [`FACTS_WAIT_S`]), the seconds left; `None` once that is over or
+    /// when every session's facts are in.
+    fn facts_wait_left(&self) -> Option<f64> {
+        let left = FACTS_WAIT_S - (self.clock - self.started_at?);
+        let pending = self
+            .library
+            .entries()
             .iter()
-            .find(|e| {
-                self.facts
-                    .get(&e.path)
-                    .is_none_or(|f| f.availability == Availability::Available)
-            })
-            .or(by_recency.first())
-            .map(|e| e.path.clone())
+            .any(|e| !self.facts.contains_key(&e.path));
+        (left > 0.0 && pending).then_some(left)
     }
 
     /// The display name of `path`'s session.
@@ -429,7 +473,10 @@ impl StartScreen {
             return;
         }
         let left = entries.len();
-        let loader = FactsLoader::spawn(entries, first, ctx);
+        let loader = match self.load {
+            Some(load) => FactsLoader::spawn_with(entries, first, ctx, load),
+            None => FactsLoader::spawn(entries, first, ctx),
+        };
         self.loading.push(Loading { loader, left });
     }
 
@@ -538,6 +585,12 @@ impl StartScreen {
 /// Test accessors.
 #[cfg(test)]
 impl StartScreen {
+    /// Read sessions' facts with `load` instead of [`facts::load_facts`].
+    pub(crate) fn with_facts_loader(mut self, load: LoadFacts) -> Self {
+        self.load = Some(load);
+        self
+    }
+
     /// How many sessions' facts have arrived.
     pub(crate) fn facts_known(&self) -> usize {
         self.facts.len()

@@ -2,9 +2,10 @@
 //! session's size, groups, state and notes, read without ever taking the
 //! session lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use mmm_core::mosaic::{MosaicConfig, is_mosaic_dir, session_busy};
 use mmm_core::preview::PREVIEWS_DIR;
@@ -167,32 +168,56 @@ pub fn load_facts(entry: &RecentEntry) -> CardFacts {
     f
 }
 
-/// Loads [`CardFacts`] on one background thread, the hero session first.
+/// How the facts of one entry are read: [`load_facts`], or a stand-in in
+/// tests (e.g. one that stalls like a dead network share).
+pub type LoadFacts = fn(&RecentEntry) -> CardFacts;
+
+/// How many threads load facts at once: a session on an unreachable path
+/// (a dead network share can stall for tens of seconds) holds up one of
+/// them, not the whole list.
+const FACTS_WORKERS: usize = 4;
+
+/// Loads [`CardFacts`] on a few background threads that take entries from
+/// one queue, the hero session first.
 pub struct FactsLoader {
     rx: Receiver<CardFacts>,
 }
 
 impl FactsLoader {
-    /// Start loading `entries`: `first` (when it is among them) before the
-    /// rest, in order, requesting a repaint on `ctx` after each result.
+    /// Start loading `entries`: `first` (when it is among them) taken
+    /// first, then the rest in order, requesting a repaint on `ctx` after
+    /// each result. Results arrive as they finish, so a slow entry doesn't
+    /// hold back the ones after it.
     pub fn spawn(entries: Vec<RecentEntry>, first: Option<PathBuf>, ctx: &egui::Context) -> Self {
+        Self::spawn_with(entries, first, ctx, load_facts)
+    }
+
+    /// [`FactsLoader::spawn`], reading each entry's facts with `load`.
+    pub fn spawn_with(
+        entries: Vec<RecentEntry>,
+        first: Option<PathBuf>,
+        ctx: &egui::Context,
+        load: LoadFacts,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        let mut entries = entries;
-        if let Some(first) = first
-            && let Some(i) = entries.iter().position(|e| e.path == first)
-        {
-            let hero = entries.remove(i);
-            entries.insert(0, hero);
-        }
-        std::thread::spawn(move || {
-            for entry in entries {
-                if tx.send(load_facts(&entry)).is_err() {
-                    return;
+        let workers = FACTS_WORKERS.min(entries.len());
+        let queue = Arc::new(Mutex::new(load_order(entries, first)));
+        for _ in 0..workers {
+            let (queue, tx, ctx) = (Arc::clone(&queue), tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                loop {
+                    let next = queue
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .pop_front();
+                    let Some(entry) = next else { return };
+                    if tx.send(load(&entry)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
-            }
-        });
+            });
+        }
         FactsLoader { rx }
     }
 
@@ -200,6 +225,18 @@ impl FactsLoader {
     pub fn poll(&mut self) -> Vec<CardFacts> {
         self.rx.try_iter().collect()
     }
+}
+
+/// `entries` in the order they are loaded: `first` (when it is among them)
+/// at the front, then the rest as given.
+fn load_order(mut entries: Vec<RecentEntry>, first: Option<PathBuf>) -> VecDeque<RecentEntry> {
+    if let Some(first) = first
+        && let Some(i) = entries.iter().position(|e| e.path == first)
+    {
+        let hero = entries.remove(i);
+        entries.insert(0, hero);
+    }
+    entries.into()
 }
 
 #[cfg(test)]
@@ -331,24 +368,69 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(CONFIG_FILE)).unwrap(), before);
     }
 
-    #[test]
-    fn hero_facts_arrive_first() {
-        let root = temp_dir("hero_first");
-        let entries: Vec<RecentEntry> = (0..5)
-            .map(|i| entry(&root.join(format!("s{i}.mmm-session"))))
-            .collect();
-        let mut loader = FactsLoader::spawn(
-            entries.clone(),
-            Some(entries[3].path.clone()),
-            &egui::Context::default(),
-        );
+    /// Facts of `entry`, stalling for files named `stuck*` (like a folder
+    /// on a dead network share) and slow for `slow*` ones.
+    fn stalling(entry: &RecentEntry) -> CardFacts {
+        let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with("stuck") {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+        } else if name.starts_with("slow") {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        load_facts(entry)
+    }
+
+    /// Poll `loader` until `n` results came, or `secs` passed.
+    fn collect(loader: &mut FactsLoader, n: usize, secs: u64) -> Vec<CardFacts> {
         let mut got = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while got.len() < 5 {
-            assert!(std::time::Instant::now() < deadline, "timed out");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while got.len() < n && std::time::Instant::now() < deadline {
             got.extend(loader.poll());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(got[0].path, entries[3].path);
+        got
+    }
+
+    #[test]
+    fn hero_candidate_is_dequeued_first() {
+        let entries: Vec<RecentEntry> = (0..5)
+            .map(|i| entry(Path::new(&format!("s{i}.mmm-session"))))
+            .collect();
+        let order: Vec<PathBuf> = load_order(entries.clone(), Some(entries[3].path.clone()))
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(order, [3, 0, 1, 2, 4].map(|i| entries[i].path.clone()));
+    }
+
+    #[test]
+    fn hero_facts_arrive_first() {
+        // Slow sessions ahead of the hero in the list don't keep it waiting.
+        let root = temp_dir("hero_first");
+        let entries: Vec<RecentEntry> = ["slow0", "slow1", "slow2", "hero", "slow4"]
+            .iter()
+            .map(|n| entry(&root.join(format!("{n}.mmm-session"))))
+            .collect();
+        let hero = entries[3].path.clone();
+        let ctx = egui::Context::default();
+        let mut loader = FactsLoader::spawn_with(entries, Some(hero.clone()), &ctx, stalling);
+        let got = collect(&mut loader, 5, 10);
+        assert_eq!(got.len(), 5, "timed out");
+        assert_eq!(got[0].path, hero);
+    }
+
+    #[test]
+    fn a_stuck_entry_does_not_hold_up_the_rest() {
+        let root = temp_dir("facts_stuck");
+        let entries: Vec<RecentEntry> = ["stuck", "s1", "s2", "s3", "s4"]
+            .iter()
+            .map(|n| entry(&root.join(format!("{n}.mmm-session"))))
+            .collect();
+        let stuck = entries[0].path.clone();
+        let ctx = egui::Context::default();
+        let mut loader = FactsLoader::spawn_with(entries, Some(stuck.clone()), &ctx, stalling);
+        let got = collect(&mut loader, 4, 5);
+        assert_eq!(got.len(), 4, "the others' facts arrive while one is stuck");
+        assert!(got.iter().all(|f| f.path != stuck));
     }
 }
