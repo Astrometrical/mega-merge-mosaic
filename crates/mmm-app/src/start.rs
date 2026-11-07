@@ -440,7 +440,7 @@ impl StartScreen {
             });
         }
         if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(palette::HA_500));
+            ui.label(RichText::new(e).color(palette::HA_400));
         }
         if let Some(n) = &self.notice {
             ui.label(RichText::new(n).color(palette::TEXT_MUTED));
@@ -471,7 +471,7 @@ impl StartScreen {
                     action = Some(StartAction::Open(entry.path.clone()));
                 }
                 if missing {
-                    ui.label(RichText::new("missing").small().color(palette::HA_500));
+                    ui.label(RichText::new("missing").small().color(palette::HA_400));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if missing && ui.small_button("Remove").clicked() {

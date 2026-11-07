@@ -129,7 +129,7 @@ pub fn composition_editor(
         None
     };
     if let Some(p) = problem {
-        ui.label(RichText::new(p).small().color(palette::HA_500));
+        ui.label(RichText::new(p).small().color(palette::HA_400));
     }
     ui.data_mut(|d| d.insert_temp(id, draft));
     for (i, slot) in c.channels.iter_mut().enumerate() {

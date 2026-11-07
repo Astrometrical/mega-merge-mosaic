@@ -1387,7 +1387,7 @@ impl BlendTab {
                             "Flagged edges",
                             format!("{flagged} of {}", h.seams.len()),
                             if flagged > 0 {
-                                palette::HA_500
+                                palette::HA_400
                             } else {
                                 palette::GREEN_300
                             },

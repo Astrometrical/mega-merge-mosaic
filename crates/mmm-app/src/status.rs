@@ -169,9 +169,9 @@ pub fn check_items(c: CheckCounts) -> Vec<StatusItem> {
     let item = |text: String, color| StatusItem { text, color };
     vec![
         item("Checks:".into(), None),
-        item(count(c.problems, "problem"), Some(palette::HA_500)),
+        item(count(c.problems, "problem"), Some(palette::HA_400)),
         item("·".into(), None),
-        item(count(c.notes, "note"), Some(palette::ACCENT_400)),
+        item(count(c.notes, "note"), Some(palette::SII_400)),
         item("·".into(), None),
         item(format!("{} passed", c.passed), Some(palette::GREEN_300)),
     ]
@@ -275,9 +275,9 @@ mod tests {
             colors,
             [
                 None,
-                Some(palette::HA_500),
+                Some(palette::HA_400),
                 None,
-                Some(palette::ACCENT_400),
+                Some(palette::SII_400),
                 None,
                 Some(palette::GREEN_300)
             ]

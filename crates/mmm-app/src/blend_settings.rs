@@ -629,7 +629,7 @@ impl SettingsPanel {
             }
         }
         if let Some(e) = &self.feather_error {
-            ui.label(RichText::new(e).small().color(palette::HA_500));
+            ui.label(RichText::new(e).small().color(palette::HA_400));
         }
 
         let mut applied = None;
@@ -692,7 +692,7 @@ impl SettingsPanel {
         }
         if let Some(e) = self.error.clone() {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(e).small().color(palette::HA_500));
+                ui.label(RichText::new(e).small().color(palette::HA_400));
                 if ui.small_button("Dismiss").clicked() {
                     self.error = None;
                 }

@@ -301,7 +301,7 @@ impl Shell {
                 JobEvent::Cancelled { id } => {
                     (format!("{} cancelled", name(id)), palette::TEXT_BODY)
                 }
-                JobEvent::Failed { message, .. } => (message.clone(), palette::HA_500),
+                JobEvent::Failed { message, .. } => (message.clone(), palette::HA_400),
             };
             self.notices.push(Notice { text, color, until });
         }
@@ -367,7 +367,7 @@ impl Shell {
             }
             if let Some(e) = self.start.error().map(str::to_string) {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(e).color(palette::HA_500));
+                    ui.label(RichText::new(e).color(palette::HA_400));
                     if ui.small_button("Dismiss").clicked() {
                         self.start.set_error(None);
                     }
@@ -393,7 +393,7 @@ impl Shell {
             tracing::warn!("{message}");
             self.notices.push(Notice {
                 text: message,
-                color: palette::HA_500,
+                color: palette::HA_400,
                 until: Instant::now() + NOTICE_TIME,
             });
         }
@@ -426,7 +426,7 @@ impl Shell {
                         tracing::warn!("{message}");
                         self.notices.push(Notice {
                             text: message,
-                            color: palette::HA_500,
+                            color: palette::HA_400,
                             until: now + NOTICE_TIME,
                         });
                     }

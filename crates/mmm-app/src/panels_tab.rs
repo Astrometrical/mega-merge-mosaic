@@ -816,7 +816,7 @@ impl PanelsTab {
                 };
                 (format!("{w} × {h} · {ch}"), palette::TEXT_BODY)
             }
-            Some(Err(e)) => (format!("Unreadable: {e}"), palette::HA_500),
+            Some(Err(e)) => (format!("Unreadable: {e}"), palette::HA_400),
         }
     }
 
@@ -1063,7 +1063,7 @@ impl PanelsTab {
         }
         if let Some(e) = self.error.clone() {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(e).color(palette::HA_500));
+                ui.label(RichText::new(e).color(palette::HA_400));
                 if ui.small_button("Dismiss").clicked() {
                     self.error = None;
                 }

@@ -432,7 +432,7 @@ impl ExportDialog {
             );
         }
         if let Some(e) = &self.error {
-            ui.label(RichText::new(e).color(palette::HA_500));
+            ui.label(RichText::new(e).color(palette::HA_400));
         }
         let busy: Vec<&String> = chosen.iter().filter(|g| blending.contains(*g)).collect();
         if !busy.is_empty() {
@@ -521,7 +521,7 @@ fn overwrite_ui(ui: &mut egui::Ui, existing: &[PathBuf]) -> Option<Choice> {
             "These files exist already:"
         })
         .strong()
-        .color(palette::HA_500),
+        .color(palette::HA_400),
     );
     for p in existing {
         ui.label(p.display().to_string());
@@ -549,7 +549,7 @@ fn warn_ui(
     ui.label(
         RichText::new("The blended result is not up to date.")
             .strong()
-            .color(palette::HA_500),
+            .color(palette::HA_400),
     );
     for (g, r) in reports.iter().filter(|(_, r)| !r.is_complete()) {
         ui.label(counts_text(g, r));

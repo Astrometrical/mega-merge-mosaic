@@ -1552,7 +1552,7 @@ impl PlanTab {
                 ui.label(RichText::new("Shown once analysed.").color(palette::TEXT_MUTED));
             }
             Some(o) if o.is_empty() => {
-                ui.label(RichText::new("No other panel").color(palette::HA_500));
+                ui.label(RichText::new("No other panel").color(palette::HA_400));
             }
             Some(o) => {
                 for p in o {
