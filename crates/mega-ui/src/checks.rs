@@ -2,13 +2,13 @@
 //! and bar, passed checks collapsed into one expandable summary row.
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
-    Sense, TextStyle, Ui, Vec2, collapsing_header::CollapsingState,
+    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Sense,
+    TextStyle, Ui, Vec2, collapsing_header::CollapsingState,
 };
 
 use crate::icons;
 use crate::theme::palette;
-use crate::theme::tokens::{radius, space};
+use crate::theme::tokens::{CONTROL_HEIGHT, radius, space};
 use crate::theme::{Severity, Tone};
 use crate::widgets::{ButtonKind, MegaButton};
 
@@ -169,19 +169,23 @@ fn passed_section(ui: &mut Ui, heading: &str, passed: &[&CheckItem]) {
     let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let header = ui
         .horizontal(|ui| {
-            let (icon, _) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), Sense::hover());
-            paint_icon(ui, icon.min, icons::CHECK, palette::GREEN_300);
-            let label = ui.add(
-                Label::new(RichText::new(&summary).color(palette::TEXT_BODY)).sense(Sense::click()),
+            ui.spacing_mut().item_spacing.x = space::XS;
+            // As tall as the button beside it, the tick centred in it.
+            let (icon, _) =
+                ui.allocate_exact_size(Vec2::new(ICON_SIZE, CONTROL_HEIGHT), Sense::hover());
+            ui.painter().text(
+                icon.left_center(),
+                Align2::LEFT_CENTER,
+                icons::CHECK,
+                icons::font(ICON_SIZE),
+                palette::GREEN_300,
             );
-            let (chev, _) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), Sense::hover());
             let glyph = if state.is_open() {
                 icons::CHEVRON_DOWN
             } else {
                 icons::CHEVRON_RIGHT
             };
-            paint_icon(ui, chev.min, glyph, palette::TEXT_MUTED);
-            label
+            ui.add(MegaButton::new(ButtonKind::Quiet, &summary).trailing_icon(glyph))
         })
         .inner;
     if header.clicked() {
@@ -313,6 +317,41 @@ mod tests {
         assert!(text.contains(crate::icons::CHECK), "passed icon");
         h.get_by_label("Broken");
         h.get_by_label("1 check passed");
+    }
+
+    #[test]
+    fn passed_summary_is_a_button() {
+        let mut h = harness(vec![
+            check(Severity::Passed, "Pass one", false, false),
+            check(Severity::Passed, "Pass two", false, false),
+        ]);
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "2 checks passed")
+            .click();
+        h.run();
+        h.get_by_label("Pass one");
+    }
+
+    #[test]
+    fn passed_tick_lines_up_with_its_summary() {
+        let mut h = harness(vec![check(Severity::Passed, "Pass one", false, false)]);
+        h.run();
+        let button = h.get_by_label("1 check passed").rect();
+        let tick = h
+            .output()
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text().contains(crate::icons::CHECK) => {
+                    Some(t.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .expect("the tick is painted");
+        assert!(
+            (tick.center().y - button.center().y).abs() < 3.0,
+            "tick {tick:?} beside summary {button:?}"
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! large sizes; icon buttons.
 
 use egui::{
-    Color32, CornerRadius, FontId, Response, Stroke, TextStyle, Ui, Vec2, Widget, WidgetInfo,
-    WidgetType,
+    Color32, CornerRadius, FontId, Response, Stroke, StrokeKind, TextStyle, Ui, Vec2, Widget,
+    WidgetInfo, WidgetType,
     style::WidgetVisuals,
     text::{LayoutJob, TextFormat},
 };
@@ -42,10 +42,11 @@ fn looks(kind: ButtonKind) -> [StateLook; 3] {
     let s = |fill, stroke, text| StateLook { fill, stroke, text };
     let none = Color32::TRANSPARENT;
     match kind {
+        // Darker than the web's 500/400 so white text stays AA.
         ButtonKind::Primary => [
-            s(ACCENT_500, ACCENT_500, ON_ACCENT),
-            s(ACCENT_400, ACCENT_400, ON_ACCENT),
             s(ACCENT_600, ACCENT_600, ON_ACCENT),
+            s(ACCENT_550, ACCENT_550, ON_ACCENT),
+            s(ACCENT_700, ACCENT_700, ON_ACCENT),
         ],
         ButtonKind::Secondary => [
             s(SURFACE_700, BORDER, TEXT_EMPHASIS),
@@ -100,6 +101,7 @@ pub struct MegaButton {
     kind: ButtonKind,
     text: String,
     icon: Option<char>,
+    trailing: Option<char>,
     large: bool,
     square: bool,
 }
@@ -111,6 +113,7 @@ impl MegaButton {
             kind,
             text: text.into(),
             icon: None,
+            trailing: None,
             large: false,
             square: false,
         }
@@ -128,6 +131,25 @@ impl MegaButton {
     pub fn icon(mut self, glyph: char) -> Self {
         self.icon = Some(glyph);
         self
+    }
+
+    /// Show the icon `glyph` after the text (e.g. a disclosure chevron).
+    pub fn trailing_icon(mut self, glyph: char) -> Self {
+        self.trailing = Some(glyph);
+        self
+    }
+}
+
+/// Paint the keyboard focus ring (2 pt accent, just outside `response`'s
+/// rect) when `response` has focus. Every focusable Mega widget shows it.
+pub fn focus_ring(ui: &Ui, response: &Response, corner: u8) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(2.0),
+            CornerRadius::same(corner + 2),
+            Stroke::new(2.0, ACCENT_400),
+            StrokeKind::Outside,
+        );
     }
 }
 
@@ -161,11 +183,16 @@ impl Widget for MegaButton {
         }
         if !self.square {
             let gap = if self.icon.is_some() { space::S } else { 0.0 };
+            let size = text_font.size;
             job.append(
                 &self.text,
                 gap,
                 TextFormat::simple(text_font, Color32::PLACEHOLDER),
             );
+            if let Some(g) = self.trailing {
+                let format = TextFormat::simple(icons::font(size + 1.0), Color32::PLACEHOLDER);
+                job.append(&g.to_string(), space::XS, format);
+            }
         }
         let [idle, hovered, pressed] = looks(self.kind);
         let enabled = ui.is_enabled();
@@ -184,6 +211,7 @@ impl Widget for MegaButton {
                 ui.add(egui::Button::new(job).min_size(min))
             })
             .inner;
+        focus_ring(ui, &response, radius::CONTROL);
         let text = self.text;
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &text));
         if self.square {

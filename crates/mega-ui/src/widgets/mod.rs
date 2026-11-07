@@ -10,7 +10,7 @@ pub mod status_line;
 pub mod text_input;
 pub mod toast;
 
-pub use button::{ButtonKind, MegaButton, icon_button};
+pub use button::{ButtonKind, MegaButton, focus_ring, icon_button};
 pub use chip::{CHIP_MAX_WIDTH, chip};
 pub use notes::notes_field;
 pub use progress::{progress, progress_bar};

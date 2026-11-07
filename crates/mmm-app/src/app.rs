@@ -855,8 +855,7 @@ mod tests {
             .with_size(egui::vec2(1000.0, 800.0))
             .build_ui_state(
                 |ui, s: &mut Shell| {
-                    // As the app does before its first frame.
-                    if mega_ui::theme::ensure_applied(ui.ctx()) {
+                    if crate::testutil::themed(ui) {
                         s.ui(ui);
                     }
                 },

@@ -106,3 +106,36 @@ fn icon_renders_in_the_icon_font() {
     }
     assert!(found, "the plus glyph was painted");
 }
+
+#[test]
+fn primary_button_text_meets_aa_in_every_state() {
+    for state in looks(ButtonKind::Primary) {
+        let c = crate::theme::contrast_ratio(state.text, state.fill);
+        assert!(c >= 4.5, "{:?} on {:?}: {c:.2}:1", state.text, state.fill);
+    }
+}
+
+/// Whether the last frame painted a 2 pt accent ring around `rect`.
+fn has_focus_ring(h: &Harness<'static, State>, rect: egui::Rect) -> bool {
+    h.output().shapes.iter().any(|c| match &c.shape {
+        egui::Shape::Rect(r) => {
+            r.stroke.width >= 2.0
+                && r.stroke.color == crate::theme::palette::ACCENT_400
+                && r.rect.contains_rect(rect)
+        }
+        _ => false,
+    })
+}
+
+#[test]
+fn keyboard_focus_shows_an_accent_ring() {
+    for kind in [ButtonKind::Primary, ButtonKind::Quiet, ButtonKind::Ghost] {
+        let mut h = harness(move |ui| ui.add(MegaButton::new(kind, "Merge")));
+        h.run();
+        let rect = h.state().rect.unwrap();
+        assert!(!has_focus_ring(&h, rect), "{kind:?}: no ring before focus");
+        h.get_by_label("Merge").focus();
+        h.run();
+        assert!(has_focus_ring(&h, rect), "{kind:?}: ring when focused");
+    }
+}

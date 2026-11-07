@@ -5,8 +5,9 @@
 use std::time::Duration;
 
 use egui::{
-    Align2, Area, Color32, Context, CornerRadius, Frame, Id, Margin, Order, Pos2, RichText, Sense,
-    Shadow, Stroke, TextStyle, Vec2,
+    Align2, Area, Color32, Context, CornerRadius, Frame, Id, Margin, Order, Pos2, Sense, Shadow,
+    Stroke, TextStyle, Vec2,
+    text::{LayoutJob, TextFormat, TextWrapping},
 };
 
 use crate::theme::Tone;
@@ -140,15 +141,31 @@ impl Toasts {
                                         t.toast.tone.color(),
                                     );
                                 }
+                                // Room for the text: the row minus the icon,
+                                // the gaps and the action button.
+                                let gap = ui.spacing().item_spacing.x;
+                                let action_w = t.toast.action.as_ref().map_or(0.0, |a| {
+                                    let font = TextStyle::Button.resolve(ui.style());
+                                    let w = ui
+                                        .painter()
+                                        .layout_no_wrap(a.clone(), font, TEXT_MUTED)
+                                        .size()
+                                        .x;
+                                    w + 2.0 * ui.spacing().button_padding.x + gap
+                                });
+                                let text_w = (ui.available_width() - action_w).max(80.0);
                                 ui.vertical(|ui| {
+                                    ui.set_width(text_w);
                                     ui.spacing_mut().item_spacing.y = 2.0;
-                                    ui.label(RichText::new(&t.toast.title).color(TEXT_EMPHASIS));
+                                    clamped(
+                                        ui,
+                                        &t.toast.title,
+                                        TextStyle::Body,
+                                        TEXT_EMPHASIS,
+                                        text_w,
+                                    );
                                     if let Some(d) = &t.toast.detail {
-                                        ui.label(
-                                            RichText::new(d)
-                                                .text_style(TextStyle::Small)
-                                                .color(TEXT_MUTED),
-                                        );
+                                        clamped(ui, d, TextStyle::Small, TEXT_MUTED, text_w);
                                     }
                                 });
                                 if let Some(a) = &t.toast.action {
@@ -184,6 +201,30 @@ impl Toasts {
             ctx.request_repaint_after(Duration::from_secs_f64(next.max(0.0)));
         }
         events
+    }
+}
+
+/// Most rows a toast's title or detail takes before it is cut with "…".
+const MAX_ROWS: usize = 2;
+
+/// `text` in `style` and `color`, wrapped to `width` and cut to
+/// [`MAX_ROWS`] with "…"; the full text is on hover and is the accessible
+/// label.
+fn clamped(ui: &mut egui::Ui, text: &str, style: TextStyle, color: Color32, width: f32) {
+    let font = style.resolve(ui.style());
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat::simple(font, color));
+    job.wrap = TextWrapping {
+        max_width: width,
+        max_rows: MAX_ROWS,
+        break_anywhere: false,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+    let cut = galley.elided;
+    let response = ui.add(egui::Label::new(galley));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    if cut {
+        response.on_hover_text(text);
     }
 }
 

@@ -22,8 +22,18 @@ pub mod widgets;
 #[cfg(test)]
 pub(crate) mod testutil {
     /// Install the theme on `ui`'s context; `false` (draw nothing this
-    /// frame) until its fonts are in use, which is one frame later.
+    /// frame) until its fonts are in use, which is one frame later. Keeps
+    /// egui_kittest's deterministic settings (no animations, no cursor
+    /// blink), which the theme's style would otherwise replace.
     pub fn themed(ui: &mut egui::Ui) -> bool {
-        crate::theme::ensure_applied(ui.ctx())
+        let ready = crate::theme::ensure_applied(ui.ctx());
+        if !ready {
+            ui.ctx().all_styles_mut(|s| {
+                s.animation_time = 0.0;
+                s.scroll_animation = egui::style::ScrollAnimation::none();
+                s.visuals.text_cursor.blink = false;
+            });
+        }
+        ready
     }
 }

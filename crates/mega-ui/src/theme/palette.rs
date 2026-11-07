@@ -21,8 +21,18 @@ pub const FILL_MUTED: Color32 = Color32::from_rgb(0x77, 0x77, 0x77);
 pub const ACCENT_400: Color32 = Color32::from_rgb(0x4e, 0xbc, 0xd4);
 /// OIII accent, primary (`#2A95AB`, web `accent-500`).
 pub const ACCENT_500: Color32 = Color32::from_rgb(0x2a, 0x95, 0xab);
-/// OIII accent, dark (`#1D7588`, web `accent-600`).
+/// OIII accent, dark (`#1D7588`, web `accent-600`). The primary button
+/// fill: white text on it is ~5.3:1.
 pub const ACCENT_600: Color32 = Color32::from_rgb(0x1d, 0x75, 0x88);
+/// Primary button hover (`#1F7F93`, new in the Mega apps): lighter than
+/// [`ACCENT_600`] yet still AA with white text (~4.6:1), which the web's
+/// `accent-400` hover is not.
+pub const ACCENT_550: Color32 = Color32::from_rgb(0x1f, 0x7f, 0x93);
+/// Primary button pressed (`#175F6E`, new in the Mega apps).
+pub const ACCENT_700: Color32 = Color32::from_rgb(0x17, 0x5f, 0x6e);
+/// Selection fill: selected tabs, highlighted text (`#123E48`, new in the
+/// Mega apps); [`ACCENT_400`] text on it is ~5.2:1.
+pub const ACCENT_800: Color32 = Color32::from_rgb(0x12, 0x3e, 0x48);
 /// H-alpha red, for problem fills, borders and bars (`#C83050`, web
 /// `ha-500`). Fails AA as small text: use [`HA_400`] for text.
 pub const HA_500: Color32 = Color32::from_rgb(0xc8, 0x30, 0x50);
@@ -73,6 +83,9 @@ mod tests {
         assert_eq!(rgb(ACCENT_400), (0x4e, 0xbc, 0xd4));
         assert_eq!(rgb(ACCENT_500), (0x2a, 0x95, 0xab));
         assert_eq!(rgb(ACCENT_600), (0x1d, 0x75, 0x88));
+        assert_eq!(rgb(ACCENT_550), (0x1f, 0x7f, 0x93));
+        assert_eq!(rgb(ACCENT_700), (0x17, 0x5f, 0x6e));
+        assert_eq!(rgb(ACCENT_800), (0x12, 0x3e, 0x48));
         assert_eq!(rgb(HA_500), (0xc8, 0x30, 0x50));
         assert_eq!(rgb(HA_400), (0xe0, 0x5a, 0x76));
         assert_eq!(rgb(SII_300), (0xf5, 0xc7, 0x6a));

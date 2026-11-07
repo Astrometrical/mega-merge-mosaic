@@ -104,3 +104,61 @@ fn toast_pushed_after_idle_still_shows() {
     h.run();
     h.get_by_label("Export finished");
 }
+
+#[test]
+fn long_toast_stays_compact() {
+    let title = "Export of the Carina Nebula SHO composite and every group finished \
+                 after re-merging the stale tiles left by the two panels added since";
+    let detail = "/astro/carina/export/carina-Ha.xisf · /astro/carina/export/carina-OIII.xisf ·                   /astro/carina/export/carina-SII.xisf · /astro/carina/export/carina-SHO.tiff";
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(720.0, 480.0))
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if crate::testutil::themed(ui) {
+                    let now = s.now;
+                    s.events.extend(s.toasts.show(ui.ctx(), now));
+                }
+            },
+            State::default(),
+        );
+    h.run();
+    for _ in 0..3 {
+        h.state_mut().toasts.push(
+            Toast {
+                tone: Tone::Success,
+                title: title.to_owned(),
+                detail: Some(detail.to_owned()),
+                action: Some("Show".to_owned()),
+            },
+            0.0,
+        );
+    }
+    h.run();
+    let row = 17.0;
+    for node in h.query_all_by_label(title) {
+        let r = node.rect();
+        assert!(
+            r.height() <= 2.0 * row + 2.0,
+            "title at most two rows: {r:?}"
+        );
+        assert!(
+            r.left() >= 720.0 - 16.0 - 340.0 - 1.0 && r.right() <= 720.0 - 16.0 + 1.0,
+            "{r:?}"
+        );
+    }
+    for node in h.query_all_by_label(detail) {
+        let r = node.rect();
+        assert!(
+            r.height() <= 2.0 * 16.0 + 2.0,
+            "detail at most two rows: {r:?}"
+        );
+    }
+    for node in h.query_all_by_label("Show") {
+        let r = node.rect();
+        assert!(
+            r.right() <= 720.0 - 16.0 + 1.0,
+            "action stays inside the toast: {r:?}"
+        );
+    }
+    assert_eq!(h.query_all_by_label(title).count(), 3);
+}

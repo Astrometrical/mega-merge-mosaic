@@ -8,6 +8,13 @@ use super::palette::*;
 use super::text::{OVERLINE_SIZE, Type};
 use super::tokens::{CONTROL_HEIGHT, DISABLED_ALPHA, HOVER_FADE_S, radius, space};
 
+/// Minimum height of interactive rows (checkboxes, menu items, horizontal
+/// and grid rows): about a line of body text.
+const INTERACT_HEIGHT: f32 = 22.0;
+/// Height of one row of 13 pt button text (Inter), used to pad buttons up
+/// to [`CONTROL_HEIGHT`].
+const BUTTON_TEXT_ROW: f32 = 16.0;
+
 /// The Mega apps' egui style (dark).
 pub fn style() -> Style {
     let mut s = Style {
@@ -34,9 +41,12 @@ pub fn style() -> Style {
     .into();
 
     let sp = &mut s.spacing;
-    sp.item_spacing = vec2(space::S, space::S);
-    sp.button_padding = vec2(space::M, 6.0);
-    sp.interact_size = vec2(40.0, CONTROL_HEIGHT);
+    // `interact_size.y` is also the minimum height of every horizontal
+    // row, grid row, checkbox and menu item, so keep it near text height;
+    // buttons reach CONTROL_HEIGHT through their padding instead.
+    sp.item_spacing = vec2(space::S, space::XS);
+    sp.button_padding = vec2(space::M, (CONTROL_HEIGHT - BUTTON_TEXT_ROW) / 2.0);
+    sp.interact_size = vec2(40.0, INTERACT_HEIGHT);
     sp.window_margin = Margin::same(space::L as i8);
     sp.menu_margin = Margin::same(space::S as i8);
     sp.indent = space::L;
@@ -57,9 +67,13 @@ pub fn style() -> Style {
     v.warn_fg_color = SII_400;
     v.error_fg_color = HA_400;
     v.disabled_alpha = DISABLED_ALPHA;
-    v.selection.bg_fill = ACCENT_600;
-    // egui outlines a focused text edit with the selection stroke.
-    v.selection.stroke = Stroke::new(2.0, ACCENT_500);
+    // egui paints selected buttons' text and highlighted text in the
+    // selection stroke colour on the selection fill, and outlines a
+    // focused text edit with the stroke: keep the pair AA.
+    v.selection.bg_fill = ACCENT_800;
+    v.selection.stroke = Stroke::new(2.0, ACCENT_400);
+    // Placeholder and other weak text: the web's caption tier.
+    v.weak_text_color = Some(TEXT_SUBTLE);
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = SURFACE_800;
@@ -128,13 +142,65 @@ mod tests {
     #[test]
     fn density_and_radius_match_spec() {
         let s = style();
-        assert_eq!(s.spacing.interact_size.y, 30.0);
         assert_eq!(
             s.visuals.widgets.inactive.corner_radius,
             CornerRadius::same(6)
         );
         assert_eq!(s.visuals.window_corner_radius, CornerRadius::same(8));
         assert_eq!(s.animation_time, 0.1);
+    }
+
+    #[test]
+    fn controls_are_30_high_but_rows_stay_dense() {
+        use egui_kittest::Harness;
+        #[derive(Default)]
+        struct Rects {
+            button: Option<egui::Rect>,
+            row: Option<egui::Rect>,
+            checkbox: Option<egui::Rect>,
+        }
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(400.0, 300.0))
+            .build_ui_state(
+                |ui, r: &mut Rects| {
+                    if !crate::testutil::themed(ui) {
+                        return;
+                    }
+                    r.button = Some(ui.button("Merge").rect);
+                    r.row = Some(ui.horizontal(|ui| ui.label("Canvas")).response.rect);
+                    let mut on = true;
+                    r.checkbox = Some(ui.checkbox(&mut on, "Outlines").rect);
+                },
+                Rects::default(),
+            );
+        h.run();
+        let r = h.state();
+        let (b, row, cb) = (r.button.unwrap(), r.row.unwrap(), r.checkbox.unwrap());
+        assert!((b.height() - 30.0).abs() < 1.0, "plain button {b:?}");
+        assert!(row.height() <= 24.0, "a text row hugs its text: {row:?}");
+        assert!(cb.height() <= 24.0, "a checkbox row stays compact: {cb:?}");
+    }
+
+    #[test]
+    fn selection_text_meets_aa() {
+        // egui draws selected buttons' text and highlighted text in the
+        // selection stroke colour, on the selection fill.
+        let v = style().visuals;
+        let c = super::super::contrast_ratio(v.selection.stroke.color, v.selection.bg_fill);
+        assert!(c >= 4.5, "selection text {c:.2}:1");
+    }
+
+    #[test]
+    fn placeholder_text_meets_aa() {
+        let v = style().visuals;
+        assert_eq!(v.weak_text_color, Some(palette::TEXT_SUBTLE));
+        for bg in [
+            palette::SURFACE_900,
+            palette::SURFACE_800,
+            palette::SURFACE_700,
+        ] {
+            assert!(super::super::contrast_ratio(v.weak_text_color(), bg) >= 4.5);
+        }
     }
 
     #[test]

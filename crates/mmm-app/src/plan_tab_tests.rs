@@ -31,12 +31,11 @@ struct State {
 
 fn harness(session: OpenSession) -> Harness<'static, State> {
     Harness::builder()
-        .with_size(egui::vec2(1200.0, 1100.0))
+        .with_size(egui::vec2(1200.0, 800.0))
         .with_step_dt(0.01)
         .build_ui_state(
             |ui, s: &mut State| {
-                // As the app does before its first frame.
-                if !mega_ui::theme::ensure_applied(ui.ctx()) {
+                if !crate::testutil::themed(ui) {
                     return;
                 }
                 let feed = PlanFeed {
@@ -268,6 +267,9 @@ fn selection_filters_checks() {
         "overlaps listed"
     );
     // Accept goes to the shell.
+    // The side panel scrolls; bring Accept into view as a user would.
+    h.get_by_label("Accept").scroll_to_me();
+    h.run();
     h.get_by_label("Accept").click();
     h.run();
     assert_eq!(h.state().accepted.len(), 1);
