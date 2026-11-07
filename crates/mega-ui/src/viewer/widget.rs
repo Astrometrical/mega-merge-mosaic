@@ -263,6 +263,10 @@ pub struct TiledViewer {
     /// image coordinates.
     drawing: Option<((f64, f64), (f64, f64))>,
     overlays: Vec<Overlay>,
+    /// See [`TiledViewer::set_presentation`].
+    presentation: bool,
+    /// See [`TiledViewer::set_opacity`].
+    opacity: f32,
 }
 
 impl TiledViewer {
@@ -295,6 +299,8 @@ impl TiledViewer {
             tool: Tool::Navigate,
             drawing: None,
             overlays: Vec::new(),
+            presentation: false,
+            opacity: 1.0,
         }
     }
 
@@ -316,6 +322,26 @@ impl TiledViewer {
     /// The current view.
     pub fn view(&self) -> &View {
         &self.view
+    }
+
+    /// Presentation mode: the viewer only senses hover (no pan, zoom,
+    /// double-click or drawing), shows no overlay buttons, fills no
+    /// background and draws stale tiles at full brightness. For a camera
+    /// driven by code through [`TiledViewer::view_mut`].
+    pub fn set_presentation(&mut self, on: bool) {
+        self.presentation = on;
+        self.drawing = None;
+    }
+
+    /// Multiply every tile's tint alpha by `opacity` (0 to 1), for
+    /// crossfades.
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity.clamp(0.0, 1.0);
+    }
+
+    /// The view, for a camera driven by code.
+    pub fn view_mut(&mut self) -> &mut View {
+        &mut self.view
     }
 
     /// True while tile requests are queued, in flight or awaiting upload.
@@ -391,7 +417,12 @@ impl TiledViewer {
 
     /// Draw the viewer filling `ui`'s available space and handle input.
     pub fn show(&mut self, ui: &mut Ui) -> ViewerResponse {
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let sense = if self.presentation {
+            Sense::hover()
+        } else {
+            Sense::click_and_drag()
+        };
+        let (rect, response) = ui.allocate_exact_size(ui.available_size(), sense);
         let now = ui.input(|i| i.time);
         self.pixels_per_point = ui.ctx().pixels_per_point();
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
@@ -412,7 +443,11 @@ impl TiledViewer {
                 Command::ZoomTo(r) => self.view.zoom_to_rect(r, rect.size(), now),
             }
         }
-        let drawn_rect = self.handle_input(ui, &response, rect, now);
+        let drawn_rect = if self.presentation {
+            None
+        } else {
+            self.handle_input(ui, &response, rect, now)
+        };
 
         let generation = self.source.generation();
         let wanted = self.wanted_tiles(rect, now);
@@ -423,7 +458,9 @@ impl TiledViewer {
         let backlog = self.receive(ui.ctx(), generation);
         self.paint(&ui.painter_at(rect), rect, now, generation);
         self.paint_overlays(&ui.painter_at(rect), rect, now);
-        self.overlay_buttons(ui, rect);
+        if !self.presentation {
+            self.overlay_buttons(ui, rect);
+        }
 
         // Loaders wake the UI when a tile arrives; repaint here only for
         // motion, pending commands and an upload backlog.
@@ -715,7 +752,9 @@ impl TiledViewer {
     /// Coarse to fine: each visible tile of the drawn level shows itself or
     /// the matching sub-rect of its nearest loaded ancestor.
     fn paint(&mut self, painter: &egui::Painter, rect: Rect, now: f64, generation: u64) {
-        painter.rect_filled(rect, 0.0, palette::SURFACE_900);
+        if !self.presentation {
+            painter.rect_filled(rect, 0.0, palette::SURFACE_900);
+        }
         let (_, fine) = self.fine_tiles(rect, now);
         for key in fine {
             let Some((Some(tex), stale, a)) = self.loaded_ancestor(key, generation) else {
@@ -731,9 +770,10 @@ impl TiledViewer {
                 Pos2::new(((c[0] - a[0]) / aw) as f32, ((c[1] - a[1]) / ah) as f32),
                 Pos2::new(((c[2] - a[0]) / aw) as f32, ((c[3] - a[1]) / ah) as f32),
             );
-            let tint = if stale { stale_tint() } else { Color32::WHITE };
-            painter.image(tex, screen, uv, tint);
-            if stale {
+            let dim = stale && !self.presentation;
+            let tint = if dim { stale_tint() } else { Color32::WHITE };
+            painter.image(tex, screen, uv, tint.gamma_multiply(self.opacity));
+            if dim {
                 hatch(&painter.with_clip_rect(screen.intersect(rect)), screen);
             }
         }

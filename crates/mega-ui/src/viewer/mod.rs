@@ -2,10 +2,12 @@
 //! selection, and the tiled viewer widget with background loading.
 
 mod cache;
+mod image_source;
 mod source;
 mod view;
 mod widget;
 
+pub use image_source::ImageTileSource;
 pub use source::{Fetched, TileSource};
 pub use view::{
     ANIMATION_TIME, MAX_ZOOM, PyramidGeometry, SPRING_STIFFNESS, Spring, TileKey, View, pick_level,
