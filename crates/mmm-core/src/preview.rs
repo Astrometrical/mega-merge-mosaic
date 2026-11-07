@@ -652,6 +652,115 @@ fn read_preview(file: &Path) -> Result<(Preview, Option<ReferenceFrame>)> {
     ))
 }
 
+/// Every readable `.mmmp` preview under `session_dir`'s [`PREVIEWS_DIR`],
+/// sorted by panel path. Other files there (the frame file) and unreadable
+/// previews are skipped; a missing directory gives an empty list. Blocking.
+pub fn load_cached_previews(session_dir: &Path) -> Vec<Preview> {
+    let Ok(rd) = std::fs::read_dir(session_dir.join(PREVIEWS_DIR)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Preview> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "mmmp"))
+        .filter_map(|p| load_preview(&p).ok())
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// A small planar image of the whole plan, made by [`render_overview`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Overview {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Channel count.
+    pub channels: u32,
+    /// Planar samples, `channels × height × width`; zero is no data.
+    pub data: Vec<f32>,
+}
+
+/// Place `previews` in a picture of `canvas` whose longer side is
+/// `max_side` pixels: each preview is resampled into its `rect` by nearest
+/// neighbour, and where previews overlap each channel is averaged over the
+/// previews with data (non-zero) there. `channels` is the most any preview
+/// has; mono previews fill channel 0 only. Work is bounded by the
+/// overview's size, never the canvas's.
+///
+/// `None` for no previews, an empty canvas or `max_side` 0. A caller gets
+/// the canvas from the previews' frame: load [`preview_frame_path`] with
+/// [`ReferenceFrame::load`] and take [`ReferenceFrame::canvas`].
+pub fn render_overview(
+    previews: &[&Preview],
+    canvas: (u64, u64),
+    max_side: u32,
+) -> Option<Overview> {
+    if previews.is_empty() || canvas.0 == 0 || canvas.1 == 0 || max_side == 0 {
+        return None;
+    }
+    let scale = f64::from(max_side) / canvas.0.max(canvas.1) as f64;
+    let width = ((canvas.0 as f64 * scale).round() as u32).max(1);
+    let height = ((canvas.1 as f64 * scale).round() as u32).max(1);
+    let channels = previews
+        .iter()
+        .map(|p| p.channels)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let plane = width as usize * height as usize;
+    let mut sum = vec![0f64; plane * channels as usize];
+    let mut count = vec![0u32; plane * channels as usize];
+    for p in previews {
+        let [x0, y0, x1, y1] = p.rect;
+        let (rw, rh) = (x1 - x0, y1 - y0);
+        if p.width == 0 || p.height == 0 || rw <= 0.0 || rh <= 0.0 {
+            continue;
+        }
+        let pplane = p.width as usize * p.height as usize;
+        // Output pixel (ox, oy) is sampled at its centre, in canvas pixels.
+        let span = |lo: f64, hi: f64, n: u32| {
+            let a = ((lo * scale - 0.5).ceil().max(0.0)) as u32;
+            let b = ((hi * scale - 0.5).ceil().max(0.0) as u32).min(n);
+            a..b
+        };
+        for oy in span(y0, y1, height) {
+            let cy = (f64::from(oy) + 0.5) / scale;
+            let py = (((cy - y0) / rh * f64::from(p.height)) as usize).min(p.height as usize - 1);
+            for ox in span(x0, x1, width) {
+                let cx = (f64::from(ox) + 0.5) / scale;
+                let px = (((cx - x0) / rw * f64::from(p.width)) as usize).min(p.width as usize - 1);
+                for c in 0..p.channels.min(channels) as usize {
+                    let v = p.data[c * pplane + py * p.width as usize + px];
+                    if v != 0.0 {
+                        let i = c * plane + oy as usize * width as usize + ox as usize;
+                        sum[i] += f64::from(v);
+                        count[i] += 1;
+                    }
+                }
+            }
+        }
+    }
+    let data = sum
+        .iter()
+        .zip(&count)
+        .map(|(&s, &n)| {
+            if n > 0 {
+                (s / f64::from(n)) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    Some(Overview {
+        width,
+        height,
+        channels,
+        data,
+    })
+}
+
 /// Everything [`run_previews`] needs, detached from the [`Mosaic`] (made by
 /// [`plan_previews`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -1217,5 +1326,66 @@ mod tests {
     /// How many times `path`'s preview was built (test counter).
     fn builds(path: &Path) -> usize {
         test_hooks::count(path)
+    }
+
+    fn flat(name: &str, rect: [f64; 4], channels: u32, v: f32) -> Preview {
+        Preview {
+            path: PathBuf::from(name),
+            rect,
+            width: 4,
+            height: 4,
+            channels,
+            data: vec![v; (4 * 4 * channels) as usize],
+        }
+    }
+
+    #[test]
+    fn overview_places_previews_in_their_rects() {
+        let a = flat("a.xisf", [0.0, 0.0, 500.0, 500.0], 1, 1.0);
+        let b = flat("b.xisf", [500.0, 0.0, 1000.0, 500.0], 1, 3.0);
+        let o = render_overview(&[&a, &b], (1000, 500), 200).unwrap();
+        assert_eq!((o.width, o.height, o.channels), (200, 100, 1));
+        assert_eq!(o.data[50 * 200 + 20], 1.0);
+        assert_eq!(o.data[50 * 200 + 180], 3.0);
+    }
+
+    #[test]
+    fn overlap_is_averaged() {
+        let a = flat("a.xisf", [0.0, 0.0, 100.0, 100.0], 1, 1.0);
+        let b = flat("b.xisf", [0.0, 0.0, 100.0, 100.0], 1, 3.0);
+        let o = render_overview(&[&a, &b], (100, 100), 50).unwrap();
+        assert!(o.data.iter().all(|&v| v == 2.0));
+    }
+
+    #[test]
+    fn uncovered_is_no_data() {
+        let a = flat("a.xisf", [0.0, 0.0, 50.0, 100.0], 3, 1.0);
+        let o = render_overview(&[&a], (100, 100), 50).unwrap();
+        assert_eq!(o.channels, 3);
+        for c in 0..3usize {
+            assert_eq!(o.data[c * 2500 + 10 * 50 + 40], 0.0);
+            assert_eq!(o.data[c * 2500 + 10 * 50 + 10], 1.0);
+        }
+    }
+
+    #[test]
+    fn no_previews_no_overview() {
+        assert_eq!(render_overview(&[], (100, 100), 64), None);
+        let a = flat("a.xisf", [0.0, 0.0, 10.0, 10.0], 1, 1.0);
+        assert_eq!(render_overview(&[&a], (0, 100), 64), None);
+    }
+
+    #[test]
+    fn cached_previews_load_back() {
+        let dir = tmp("cached");
+        let pd = dir.join(PREVIEWS_DIR);
+        let b = flat("b.xisf", [0.0, 0.0, 10.0, 10.0], 1, 2.0);
+        let a = flat("a.xisf", [10.0, 0.0, 20.0, 10.0], 1, 1.0);
+        save_preview(&b, &pd.join("b.mmmp")).unwrap();
+        save_preview(&a, &pd.join("a.mmmp")).unwrap();
+        std::fs::write(pd.join("junk.mmmp"), b"nope").unwrap();
+        std::fs::write(pd.join(PREVIEW_FRAME_FILE), b"{}").unwrap();
+        assert_eq!(load_cached_previews(&dir), vec![a, b]);
+        assert!(load_cached_previews(&dir.join("absent")).is_empty());
     }
 }
