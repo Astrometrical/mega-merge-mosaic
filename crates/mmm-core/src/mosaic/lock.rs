@@ -55,6 +55,12 @@ pub fn lock_session(dir: &Path) -> Result<SessionLock> {
 /// Opens [`LOCK_FILE`] without creating it (absent: `false`) and tries a
 /// shared lock, released at once. This microseconds-long probe is the only
 /// time a start screen touches the lock; it never holds it.
+///
+/// A probe error other than contention (permissions, I/O) returns `false`: it
+/// is not evidence of another holder. Live reads go through
+/// [`crate::tiles::FileTileReader`], which is safe against a concurrent
+/// writer, and opening the session still takes the real lock and reports a
+/// real error.
 pub fn session_busy(dir: &Path) -> bool {
     let Ok(file) = File::open(dir.join(LOCK_FILE)) else {
         return false;

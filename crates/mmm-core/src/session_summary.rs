@@ -10,9 +10,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::export::export_check;
 use crate::fsutil::write_atomic;
-use crate::tiles::TileReader;
+use crate::tiles::{FileTileReader, TileRead, TileState};
 
 /// Name of the summary file at the session root.
 pub const SUMMARY_FILE: &str = "summary.json";
@@ -87,27 +86,33 @@ pub fn write_summary(dir: &Path, s: &SessionSummary) -> Result<()> {
     write_atomic(&path, &bytes)
 }
 
-/// Classify the result store at `store` from its tile state table (via
-/// [`export_check`]). A missing or unreadable store is [`ResultState::None`].
-///
-/// Valid tiles are not counted by the report, so "nothing valid" is derived
-/// as every level-0 tile (from the store geometry) being missing.
+/// Classify the result store at `store` from its level-0 tile states, read
+/// with [`FileTileReader`] (never memory-mapped, so a store recreated by
+/// another process is safe to read). A missing or unreadable store is
+/// [`ResultState::None`]; a stale tile makes the result [`ResultState::Stale`]
+/// even if others are missing.
 pub fn result_state(store: &Path) -> ResultState {
-    let Ok(report) = export_check(store) else {
-        return ResultState::None;
-    };
-    if report.is_complete() {
-        return ResultState::Complete;
-    }
-    if report.stale_tiles > 0 {
-        return ResultState::Stale;
-    }
-    let Ok(reader) = TileReader::open(store) else {
+    let Ok(reader) = FileTileReader::open(store) else {
         return ResultState::None;
     };
     let (nx, ny) = reader.geometry().tiles(0);
-    if report.missing_tiles >= nx as usize * ny as usize {
+    let (mut valid, mut stale, mut total) = (0usize, 0usize, 0usize);
+    for ty in 0..ny {
+        for tx in 0..nx {
+            total += 1;
+            match reader.state(0, tx, ty) {
+                TileState::Valid => valid += 1,
+                TileState::Stale => stale += 1,
+                TileState::Missing => {}
+            }
+        }
+    }
+    if stale > 0 {
+        ResultState::Stale
+    } else if valid == 0 {
         ResultState::None
+    } else if valid == total {
+        ResultState::Complete
     } else {
         ResultState::Partial
     }
@@ -207,6 +212,17 @@ mod tests {
             store.invalidate_rect([0, 0, 4, 4]);
         }
         assert_eq!(result_state(&path), ResultState::Stale);
+
+        // Stale wins over missing: a recreated store with one tile written,
+        // then invalidated, leaves stale and missing tiles together.
+        let mixed = dir.join("mixed.tiles");
+        {
+            let mut store = TileStore::create(&mixed, g).unwrap();
+            store.write_tile(0, 0, 0, &tile).unwrap();
+            store.write_tile(0, 1, 0, &tile).unwrap();
+            store.invalidate_rect([0, 0, 4, 4]);
+        }
+        assert_eq!(result_state(&mixed), ResultState::Stale);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
