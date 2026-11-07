@@ -64,6 +64,10 @@
 //!   provenance) or 32-bit float TIFF, whole canvas, linear, read tile row
 //!   by tile row; [`export::export_check`] counts stale and missing tiles
 //!   first so a frontend can warn.
+//! - [`session_summary`] — the small `summary.json` kept in each session folder
+//!   (counts, per-group result state, check counts) so a start screen can show
+//!   a session's facts without opening it; [`session_summary::result_state`]
+//!   classifies a group's result store.
 //! - [`preview`] — cached low-resolution panel previews placed in the
 //!   shared reference frame (a block mean for aligned canvases, a WCS warp
 //!   for solved panels), built on a bounded pool before any analysis
