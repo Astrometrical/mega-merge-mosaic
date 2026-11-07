@@ -1,9 +1,13 @@
-//! Astrometrical dark theme: palette constants and egui `Visuals` setup.
+//! The Mega theme: Astrometrical colour tokens, fonts, the type scale,
+//! layout tokens and the complete egui style.
 
-use egui::{Color32, Stroke};
+use egui::Color32;
 
 pub mod fonts;
 pub mod palette;
+pub mod style;
+pub mod text;
+pub mod tokens;
 
 /// Severity of a check result, independent of any engine's own type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,39 +129,12 @@ pub fn legible_text(tint: Color32, bg: Color32) -> Color32 {
         .unwrap_or(Color32::WHITE)
 }
 
-/// Install the dark Astrometrical visuals on `ctx`.
+/// Install the Mega theme on `ctx`: the embedded fonts, the dark theme
+/// (forced, whatever the OS prefers) and the complete [`style::style`].
 pub fn apply(ctx: &egui::Context) {
-    use palette::*;
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = SURFACE_800;
-    v.window_fill = SURFACE_800;
-    v.extreme_bg_color = SURFACE_900;
-    v.faint_bg_color = SURFACE_700;
-    v.window_stroke = Stroke::new(1.0, BORDER);
-    v.override_text_color = None;
-    v.hyperlink_color = ACCENT_400;
-    v.selection.bg_fill = ACCENT_600;
-    v.selection.stroke = Stroke::new(1.0, ACCENT_400);
-
-    v.widgets.noninteractive.bg_fill = SURFACE_800;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_BODY);
-    v.widgets.inactive.bg_fill = SURFACE_700;
-    v.widgets.inactive.weak_bg_fill = SURFACE_700;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_BODY);
-    v.widgets.hovered.bg_fill = SURFACE_700;
-    v.widgets.hovered.weak_bg_fill = SURFACE_700;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_500);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.5, TEXT_STRONG);
-    v.widgets.active.bg_fill = ACCENT_600;
-    v.widgets.active.weak_bg_fill = ACCENT_600;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_400);
-    v.widgets.active.fg_stroke = Stroke::new(2.0, TEXT_STRONG);
-    v.widgets.open.bg_fill = SURFACE_700;
-    v.widgets.open.weak_bg_fill = SURFACE_700;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, BORDER);
-    ctx.set_visuals(v);
+    ctx.set_fonts(fonts::definitions());
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.set_style_of(egui::Theme::Dark, style::style());
 }
 
 #[cfg(test)]
