@@ -2,6 +2,7 @@
 
 use egui::{Color32, Stroke};
 
+pub mod fonts;
 pub mod palette;
 
 /// Severity of a check result, independent of any engine's own type.
@@ -52,6 +53,19 @@ impl Tone {
             Tone::Warning => palette::SII_400,
             Tone::Problem => palette::HA_500,
             Tone::Neutral => palette::BORDER_STRONG,
+        }
+    }
+
+    /// The Lucide glyph shown with this tone, so meaning never rests on
+    /// colour alone; `None` for [`Tone::Neutral`].
+    pub fn icon(self) -> Option<char> {
+        use crate::icons;
+        match self {
+            Tone::Success => Some(icons::CHECK),
+            Tone::Info => Some(icons::INFO),
+            Tone::Warning => Some(icons::TRIANGLE_ALERT),
+            Tone::Problem => Some(icons::CIRCLE_X),
+            Tone::Neutral => None,
         }
     }
 
@@ -213,5 +227,15 @@ mod tests {
         let tint = Tone::Problem.tint();
         assert_eq!(tint.a(), 20);
         assert_eq!(Tone::from(Severity::Note), Tone::Warning);
+    }
+
+    #[test]
+    fn tones_carry_icons() {
+        use crate::icons;
+        assert_eq!(Tone::Success.icon(), Some(icons::CHECK));
+        assert_eq!(Tone::Info.icon(), Some(icons::INFO));
+        assert_eq!(Tone::Warning.icon(), Some(icons::TRIANGLE_ALERT));
+        assert_eq!(Tone::Problem.icon(), Some(icons::CIRCLE_X));
+        assert_eq!(Tone::Neutral.icon(), None);
     }
 }
