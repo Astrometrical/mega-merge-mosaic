@@ -110,6 +110,7 @@ struct Loading {
 enum Cmd {
     Select(PathBuf),
     Open(PathBuf),
+    Create(PathBuf),
     TogglePin(PathBuf),
     Remove(PathBuf),
     Dialog(DialogPurpose),
@@ -394,6 +395,7 @@ impl StartScreen {
         match cmd {
             Cmd::Select(path) => self.selected = Some(path),
             Cmd::Open(path) => return Some(StartAction::Open(path)),
+            Cmd::Create(path) => return Some(StartAction::Create(with_session_ext(path))),
             Cmd::TogglePin(path) => {
                 let pinned = self
                     .library
@@ -414,6 +416,7 @@ impl StartScreen {
             Cmd::NewMosaic => self.start_dialog(ctx, DialogPurpose::NewSession),
             Cmd::TypePath => {
                 self.typed_open = true;
+                self.no_dialog = false;
                 self.focus_typed = true;
             }
             Cmd::ShowAll(on) => self.all_sessions = on,
@@ -521,11 +524,13 @@ impl StartScreen {
             (DialogPurpose::Open, Ok(Some(path))) => {
                 // Shown in the typed-path field too, for retrying.
                 self.typed_path = path.display().to_string();
+                self.no_dialog = false;
                 self.notice = None;
                 self.pending_open = Some(StartAction::Open(path));
             }
             (DialogPurpose::NewSession, Ok(Some(path))) => {
                 self.notice = None;
+                self.no_dialog = false;
                 self.pending_open = Some(StartAction::Create(with_session_ext(path)));
             }
             (DialogPurpose::Locate(old), Ok(Some(new))) => {

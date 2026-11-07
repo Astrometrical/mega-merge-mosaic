@@ -402,8 +402,19 @@ impl StartScreen {
                 let open = ui
                     .add(MegaButton::new(ButtonKind::Secondary, "Open"))
                     .clicked();
+                let create = ui
+                    .add(MegaButton::new(ButtonKind::Secondary, "Create"))
+                    .clicked();
                 let typed = self.typed_path.trim();
-                if (open || entered) && !typed.is_empty() {
+                if typed.is_empty() {
+                    return;
+                }
+                // Enter does what the dialog that gave no answer was for.
+                let create = create || (entered && self.no_dialog);
+                let open = open || (entered && !self.no_dialog);
+                if create {
+                    out.cmds.push(Cmd::Create(expand_home(typed)));
+                } else if open {
                     out.cmds.push(Cmd::Open(expand_home(typed)));
                 }
             });

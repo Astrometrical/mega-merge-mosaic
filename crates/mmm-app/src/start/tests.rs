@@ -33,8 +33,9 @@ impl SessionDialogs for StubPicker {
 pub(crate) struct RecordingLauncher(pub std::sync::Mutex<Vec<Option<PathBuf>>>);
 
 impl crate::app::Launcher for RecordingLauncher {
-    fn open_window(&self, session: Option<&Path>) {
+    fn open_window(&self, session: Option<&Path>) -> Result<(), String> {
         self.0.lock().unwrap().push(session.map(Path::to_path_buf));
+        Ok(())
     }
 }
 

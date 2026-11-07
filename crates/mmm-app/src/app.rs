@@ -71,18 +71,35 @@ fn default_tab(session: &OpenSession) -> Tab {
 
 /// Opens another application window.
 pub trait Launcher: Send + Sync {
-    /// Open a window on `session`, or on the start screen with `None`.
-    fn open_window(&self, session: Option<&Path>);
+    /// Open a window on `session`, or on the start screen with `None`;
+    /// `Err` says why no window opened.
+    fn open_window(&self, session: Option<&Path>) -> Result<(), String>;
 }
 
 /// Opens windows as new processes of this executable.
 pub struct ProcessLauncher;
 
 impl Launcher for ProcessLauncher {
-    fn open_window(&self, session: Option<&Path>) {
-        match open_in_new_process(session) {
-            Ok(()) => tracing::info!("opened a new window"),
-            Err(e) => tracing::error!("cannot open a new window: {e}"),
+    fn open_window(&self, session: Option<&Path>) -> Result<(), String> {
+        open_in_new_process(session).map_err(|e| format!("Cannot open a new window: {e}"))?;
+        tracing::info!("opened a new window");
+        Ok(())
+    }
+}
+
+/// Open a window through `launcher`; a failure becomes a notice. Whether
+/// a window opened.
+fn launch(launcher: &dyn Launcher, notices: &mut Vec<Notice>, session: Option<&Path>) -> bool {
+    match launcher.open_window(session) {
+        Ok(()) => true,
+        Err(text) => {
+            tracing::warn!("{text}");
+            notices.push(Notice {
+                text,
+                color: palette::HA_400,
+                until: Instant::now() + NOTICE_TIME,
+            });
+            false
         }
     }
 }
@@ -267,8 +284,9 @@ impl Shell {
                     // A created session holds the lock; release it so the
                     // child can take it.
                     drop(opened);
-                    self.launcher.open_window(Some(&dir));
-                    self.start.record_opened(&dir, unix_now());
+                    if launch(&*self.launcher, &mut self.notices, Some(&dir)) {
+                        self.start.record_opened(&dir, unix_now());
+                    }
                 } else {
                     tracing::info!("opened session {}", dir.display());
                     self.start.record_opened(&dir, unix_now());
@@ -386,10 +404,10 @@ impl Shell {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Open another…").clicked() {
-                        self.launcher.open_window(None);
+                        launch(&*self.launcher, &mut self.notices, None);
                     }
                     if ui.button("New mosaic…").clicked() {
-                        self.launcher.open_window(None);
+                        launch(&*self.launcher, &mut self.notices, None);
                     }
                     let mut auto = auto_analyze(&session.mosaic.config);
                     if ui
@@ -1013,6 +1031,86 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(h.state().session().is_none());
+    }
+
+    #[test]
+    fn typed_path_creates_after_a_cancelled_dialog() {
+        for use_enter in [false, true] {
+            let parent = temp_dir(if use_enter {
+                "typed-enter"
+            } else {
+                "typed-button"
+            });
+            let mut h = harness(StubPicker(None));
+            h.run();
+            h.get_by_label("New mosaic").click();
+            let role = egui::accesskit::Role::TextInput;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while h
+                .query_by_role_and_label(role, "No dialog? Type a path")
+                .is_none()
+            {
+                assert!(Instant::now() < deadline, "no typed-path row");
+                h.step();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let typed = parent.join("Typed");
+            type_into(&mut h, "No dialog? Type a path", typed.to_str().unwrap());
+            if use_enter {
+                h.key_press(egui::Key::Enter);
+                h.step();
+            } else {
+                h.get_by_label("Create").click();
+            }
+            step_until(&mut h, |s| s.session().is_some());
+            let dir = parent.join("Typed.mmm-session");
+            assert!(dir.join("mosaic.json").is_file());
+            assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
+            assert_eq!(h.state().tab(), Tab::Panels);
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+    }
+
+    #[test]
+    fn failed_launch_shows_a_notice_and_records_nothing() {
+        struct Failing;
+        impl Launcher for Failing {
+            fn open_window(&self, _: Option<&Path>) -> Result<(), String> {
+                Err("Cannot open a new window: no process".into())
+            }
+        }
+        let root = temp_dir("shell-launch-fail");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let other = root.join("Other.mmm-session");
+        drop(crate::session::create_blocking(&other).unwrap());
+        let shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(StubPicker(None))))
+            .with_launcher(Arc::new(Failing));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 800.0))
+            .with_max_steps(64)
+            .build_ui_state(
+                |ui, s: &mut Shell| {
+                    if crate::testutil::themed(ui) {
+                        s.ui(ui);
+                    }
+                },
+                shell,
+            );
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        let recent = h.state().start.recent().to_vec();
+        h.get_by_label("Open another…").click();
+        h.step();
+        h.get_by_label_contains("Cannot open a new window");
+        // A session opened in a window that cannot launch is not recorded.
+        let ctx = h.ctx.clone();
+        h.state_mut().request(Request::Open(other), &ctx);
+        step_until(&mut h, |s| !s.is_busy());
+        assert_eq!(h.state().start.recent(), recent.as_slice());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
