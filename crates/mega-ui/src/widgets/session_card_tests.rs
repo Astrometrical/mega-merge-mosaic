@@ -106,3 +106,38 @@ fn card_has_fixed_width() {
     h.run();
     assert_eq!(h.state().rect.unwrap().width(), CARD_WIDTH);
 }
+
+/// Click point over the status row, near the card's bottom.
+fn status_point(h: &Harness<'static, State>) -> egui::Pos2 {
+    let r = h.state().rect.unwrap();
+    egui::pos2(r.left() + 40.0, r.bottom() - 16.0)
+}
+
+fn click_at(h: &mut Harness<'static, State>, pos: egui::Pos2) {
+    h.hover_at(pos);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+    h.step();
+}
+
+#[test]
+fn status_row_does_not_swallow_clicks() {
+    let mut h = harness(false);
+    h.run();
+    let pos = status_point(&h);
+    click_at(&mut h, pos);
+    h.run();
+    assert_eq!(h.state().clicked, 1);
+    let mut h = harness(false);
+    h.run();
+    let pos = status_point(&h);
+    click_at(&mut h, pos);
+    click_at(&mut h, pos);
+    assert_eq!(h.state().double, 1);
+}

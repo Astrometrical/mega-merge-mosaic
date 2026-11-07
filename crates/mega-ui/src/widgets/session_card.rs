@@ -7,7 +7,7 @@ use egui::{
     text::{LayoutJob, TextFormat, TextWrapping},
 };
 
-use super::{focus_ring, status};
+use super::focus_ring;
 use crate::icons;
 use crate::theme::Tone;
 use crate::theme::palette::{ACCENT_500, BORDER, SURFACE_800, SURFACE_900, TEXT_STRONG};
@@ -23,6 +23,8 @@ const BODY_HEIGHT: f32 = 58.0;
 const SELECTED_BORDER: f32 = 2.0;
 /// Size of the pin glyph.
 const PIN_SIZE: f32 = 14.0;
+/// Diameter of the status dot (as in `status`).
+const STATUS_DOT: f32 = 7.0;
 
 /// What a [`session_card`] shows.
 pub struct SessionCardData<'a> {
@@ -103,13 +105,32 @@ pub fn session_card(ui: &mut Ui, card: &SessionCardData) -> Response {
     let title_h = galley.size().y;
     p.galley(title_pos, galley, TEXT_STRONG);
     if let Some((tone, label)) = card.status {
-        let status_rect = Rect::from_min_max(
-            egui::pos2(rect.left() + space::M, text_top + title_h + space::XS),
-            rect.right_bottom() - Vec2::splat(space::S),
+        // Painted, not a label: labels sense clicks and would swallow the
+        // card's click and double-click over the status row.
+        let y = text_top + title_h + space::XS;
+        let x = rect.left() + space::M;
+        let mut job = LayoutJob::single_section(
+            label.to_owned(),
+            TextFormat::simple(TextStyle::Small.resolve(ui.style()), tone.color()),
         );
-        ui.scope_builder(UiBuilder::new().max_rect(status_rect), |ui| {
-            status(ui, tone, label);
-        });
+        job.wrap = TextWrapping {
+            max_width: max_text - STATUS_DOT - space::S,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let galley = p.layout_job(job);
+        let mid = y + galley.size().y / 2.0;
+        p.circle_filled(
+            egui::pos2(x + STATUS_DOT / 2.0, mid),
+            STATUS_DOT / 2.0,
+            tone.color(),
+        );
+        p.galley(
+            egui::pos2(x + STATUS_DOT + space::S, y),
+            galley,
+            tone.color(),
+        );
     }
 
     let (width, color) = if card.selected {
