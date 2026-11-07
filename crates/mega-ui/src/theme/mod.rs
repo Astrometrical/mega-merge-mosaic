@@ -146,6 +146,19 @@ pub fn is_applied(ctx: &egui::Context) -> bool {
     ctx.fonts(|f| f.definitions().families.contains_key(&fonts::semibold()))
 }
 
+/// [`apply`] the theme if it isn't in use yet, for hosts (and test
+/// harnesses) that can't apply it before their first frame. Returns
+/// whether it is ready; when not, it asks for another frame, and the
+/// caller should draw no Mega widgets this frame.
+pub fn ensure_applied(ctx: &egui::Context) -> bool {
+    if is_applied(ctx) {
+        return true;
+    }
+    apply(ctx);
+    ctx.request_repaint();
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +240,19 @@ mod tests {
             .textures_delta
             .clear();
         assert!(is_applied(&ctx));
+    }
+
+    #[test]
+    fn ensure_applied_is_ready_one_frame_later() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        assert!(!ensure_applied(&ctx));
+        ctx.run_ui(Default::default(), |_| {})
+            .textures_delta
+            .clear();
+        assert!(ensure_applied(&ctx));
     }
 
     #[test]

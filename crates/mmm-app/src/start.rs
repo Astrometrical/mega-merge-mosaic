@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use egui::RichText;
+use mega_ui::brand::{self, BrandImages, LockupSize};
 use mega_ui::theme::palette;
 use serde::{Deserialize, Serialize};
 
@@ -50,36 +51,6 @@ impl FolderPicker for RfdPicker {
     }
 }
 
-/// The logo (window icon and start screen), 128 px tall.
-pub const LOGO_PNG: &[u8] = include_bytes!("../assets/logo-white.png");
-/// The Astrometrical wordmark, 64 px tall.
-pub const WORDMARK_PNG: &[u8] = include_bytes!("../assets/wordmark-white.png");
-
-/// Brand images as textures.
-struct Brand {
-    logo: egui::TextureHandle,
-    wordmark: egui::TextureHandle,
-}
-
-impl Brand {
-    /// Decode the embedded PNGs (a few KB, once per window; not session
-    /// I/O).
-    fn load(ctx: &egui::Context) -> Self {
-        let tex = |name: &str, png: &[u8]| {
-            let icon = eframe::icon_data::from_png_bytes(png).expect("embedded PNG decodes");
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [icon.width as usize, icon.height as usize],
-                &icon.rgba,
-            );
-            ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
-        };
-        Brand {
-            logo: tex("mmm-logo", LOGO_PNG),
-            wordmark: tex("mmm-wordmark", WORDMARK_PNG),
-        }
-    }
-}
-
 /// What an open file dialog is for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DialogPurpose {
@@ -114,7 +85,7 @@ pub struct StartScreen {
     error: Option<String>,
     notice: Option<String>,
     pending_open: Option<PathBuf>,
-    brand: Option<Brand>,
+    brand: Option<BrandImages>,
 }
 
 impl StartScreen {
@@ -200,7 +171,11 @@ impl StartScreen {
         let ctx = ui.ctx().clone();
         self.poll_background(&ctx);
         if self.brand.is_none() {
-            self.brand = Some(Brand::load(&ctx));
+            self.brand = Some(BrandImages::load(
+                &ctx,
+                brand::MEGA_MERGE_MOSAIC_PNG,
+                "Mega Merge Mosaic",
+            ));
         }
         // A folder picked in the Open… dialog.
         let mut action = self.pending_open.take().map(StartAction::Open);
@@ -315,30 +290,8 @@ impl StartScreen {
     }
 
     fn header(&self, ui: &mut egui::Ui) {
-        let Some(brand) = &self.brand else { return };
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::Image::new((brand.logo.id(), sized(&brand.logo, 72.0)))
-                    .alt_text("Mega Merge Mosaic logo"),
-            );
-            ui.add_space(12.0);
-            ui.vertical(|ui| {
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("Mega Merge Mosaic")
-                        .size(28.0)
-                        .color(palette::TEXT_STRONG),
-                );
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(RichText::new("by").small().color(palette::TEXT_SUBTLE));
-                    ui.add(
-                        egui::Image::new((brand.wordmark.id(), sized(&brand.wordmark, 10.0)))
-                            .alt_text("Astrometrical"),
-                    );
-                });
-            });
-        });
+        let Some(images) = &self.brand else { return };
+        brand::lockup(ui, images, LockupSize::Large);
     }
 
     fn actions(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) -> Option<StartAction> {
@@ -499,12 +452,6 @@ impl StartScreen {
     }
 }
 
-/// `texture` scaled to `height` points tall.
-fn sized(texture: &egui::TextureHandle, height: f32) -> egui::Vec2 {
-    let [w, h] = texture.size();
-    egui::vec2(height * w as f32 / h.max(1) as f32, height)
-}
-
 /// Seconds since the Unix epoch.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -638,7 +585,12 @@ pub(crate) mod tests {
         Harness::builder()
             .with_size(egui::vec2(1000.0, 800.0))
             .build_ui_state(
-                |ui, s: &mut Screen| s.actions.extend(s.screen.ui(ui)),
+                |ui, s: &mut Screen| {
+                    // As the app does before its first frame.
+                    if mega_ui::theme::ensure_applied(ui.ctx()) {
+                        s.actions.extend(s.screen.ui(ui));
+                    }
+                },
                 state,
             )
     }

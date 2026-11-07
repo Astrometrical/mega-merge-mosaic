@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 egui.workspace = true
+png.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -113,7 +113,7 @@ fn main() -> ExitCode {
         .with_app_id("mega-merge-mosaic")
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([720.0, 480.0]);
-    match eframe::icon_data::from_png_bytes(start::LOGO_PNG) {
+    match eframe::icon_data::from_png_bytes(mega_ui::brand::LOGO_PNG) {
         Ok(icon) => viewport = viewport.with_icon(Arc::new(icon)),
         Err(e) => tracing::warn!("window icon: {e}"),
     }

@@ -853,7 +853,15 @@ mod tests {
         let shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(picker)));
         Harness::builder()
             .with_size(egui::vec2(1000.0, 800.0))
-            .build_ui_state(|ui, s: &mut Shell| s.ui(ui), shell)
+            .build_ui_state(
+                |ui, s: &mut Shell| {
+                    // As the app does before its first frame.
+                    if mega_ui::theme::ensure_applied(ui.ctx()) {
+                        s.ui(ui);
+                    }
+                },
+                shell,
+            )
     }
 
     fn type_into(h: &mut Harness<'static, Shell>, field: &str, text: &str) {

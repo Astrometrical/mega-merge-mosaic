@@ -6,6 +6,7 @@
 //! Photometrical. App-specific knowledge lives in the app crates.
 #![warn(missing_docs)]
 
+pub mod brand;
 pub mod checks;
 pub mod groups;
 pub mod icons;
@@ -22,11 +23,6 @@ pub(crate) mod testutil {
     /// Install the theme on `ui`'s context; `false` (draw nothing this
     /// frame) until its fonts are in use, which is one frame later.
     pub fn themed(ui: &mut egui::Ui) -> bool {
-        if crate::theme::is_applied(ui.ctx()) {
-            return true;
-        }
-        crate::theme::apply(ui.ctx());
-        ui.ctx().request_repaint();
-        false
+        crate::theme::ensure_applied(ui.ctx())
     }
 }
