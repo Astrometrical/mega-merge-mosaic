@@ -7,6 +7,8 @@ use egui_kittest::kittest::Queryable;
 use super::*;
 use crate::theme::tokens::KEN_BURNS_ZOOM;
 use crate::viewer::ImageTileSource;
+use crate::viewer::{Fetched, PyramidGeometry, TileKey, TileSource};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const EPS: f64 = 0.01;
 
@@ -193,4 +195,79 @@ fn an_odd_view_starts_on_its_drift_camera() {
     };
     let ratio = zoom_of(1) / zoom_of(0);
     assert!((ratio - KEN_BURNS_ZOOM).abs() < 1e-6, "{ratio}");
+}
+
+/// A source that serves no tiles until `open` is set.
+struct Gated {
+    inner: ImageTileSource,
+    open: Arc<AtomicBool>,
+}
+
+impl TileSource for Gated {
+    fn geometry(&self) -> PyramidGeometry {
+        self.inner.geometry()
+    }
+    fn generation(&self) -> u64 {
+        u64::from(self.open.load(Ordering::SeqCst))
+    }
+    fn fetch(&self, key: TileKey) -> Fetched {
+        if self.open.load(Ordering::SeqCst) {
+            self.inner.fetch(key)
+        } else {
+            Fetched::Missing
+        }
+    }
+}
+
+#[test]
+fn crossfade_keeps_the_outgoing_view_while_the_incoming_has_no_tiles() {
+    let open = Arc::new(AtomicBool::new(false));
+    let slow = HeroView {
+        label: "OIII".into(),
+        source: Arc::new(Gated {
+            inner: ImageTileSource::new(
+                ColorImage::new([640, 480], vec![Color32::BLUE; 640 * 480]),
+                256,
+            ),
+            open: open.clone(),
+        }),
+    };
+    let mut h = harness(vec![view("Ha", Color32::RED), slow], false);
+    frames(&mut h, 0.0);
+    frames(&mut h, 6.5);
+    let outgoing_opacity = |h: &Harness<'_, State>| {
+        let s = &h.state().stage;
+        s.viewers[s.current].as_ref().expect("viewer").opacity()
+    };
+    // Past dwell + crossfade, still no incoming tiles.
+    frames(&mut h, 10.5);
+    assert_eq!(label(&h).as_deref(), Some("Ha"));
+    assert_eq!(outgoing_opacity(&h), 1.0);
+    // Tiles arrive: the swap happens.
+    open.store(true, Ordering::SeqCst);
+    frames(&mut h, 10.6);
+    frames(&mut h, 10.7);
+    assert_eq!(label(&h).as_deref(), Some("OIII"));
+}
+
+#[test]
+fn crossfade_swaps_after_the_hold_when_tiles_never_come() {
+    let open = Arc::new(AtomicBool::new(false));
+    let slow = HeroView {
+        label: "OIII".into(),
+        source: Arc::new(Gated {
+            inner: ImageTileSource::new(
+                ColorImage::new([640, 480], vec![Color32::BLUE; 640 * 480]),
+                256,
+            ),
+            open,
+        }),
+    };
+    let mut h = harness(vec![view("Ha", Color32::RED), slow], false);
+    frames(&mut h, 0.0);
+    frames(&mut h, 6.5);
+    frames(&mut h, 10.5);
+    assert_eq!(label(&h).as_deref(), Some("Ha"));
+    frames(&mut h, 12.5);
+    assert_eq!(label(&h).as_deref(), Some("OIII"));
 }

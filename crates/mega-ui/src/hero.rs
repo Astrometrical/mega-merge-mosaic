@@ -249,7 +249,7 @@ impl HeroStage {
             self.crossfading = true;
         }
         self.label_idx = (n > 0).then(|| {
-            if self.crossfading && fade >= 0.5 {
+            if self.crossfading && fade >= 0.5 && self.drawn(self.next_index()) {
                 self.next_index()
             } else {
                 self.current
@@ -271,7 +271,10 @@ impl HeroStage {
                     *v = None;
                 }
             }
-            let out_opacity = if self.crossfading {
+            // Never fade the outgoing view out before the incoming one has
+            // tiles to show in its place.
+            let incoming_ready = incoming.is_some_and(|i| self.drawn(i));
+            let out_opacity = if self.crossfading && incoming_ready {
                 1.0 - fade as f32
             } else {
                 1.0

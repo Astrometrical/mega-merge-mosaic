@@ -357,6 +357,11 @@ impl TiledViewer {
         self.needs_home = false;
     }
 
+    /// The tile opacity set with [`TiledViewer::set_opacity`].
+    pub fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
     /// True once any tile has been painted.
     pub fn has_drawn_tiles(&self) -> bool {
         self.drawn_any
