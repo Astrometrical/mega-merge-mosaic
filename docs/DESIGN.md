@@ -1271,7 +1271,7 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   from its cached previews (`preview::load_cached_previews`,
   `render_overview`) through the saved Plan stretch. Otherwise, no views
   and a line saying why (a session whose state is unknown: "Nothing to
-  show yet — resume to build the preview"). Every failure degrades to fewer
+  show yet â€” resume to build the preview"). Every failure degrades to fewer
   views, never a panic. The image area's edges feather into the page
   (`HeroStage` paints page-colour ramps on every edge not at the window's
   edge), so no hard line shows.
