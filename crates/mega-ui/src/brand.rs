@@ -7,6 +7,7 @@ use egui::{
     TextureOptions, Ui, Vec2,
 };
 
+use crate::theme::text::Type;
 use crate::theme::tokens::space;
 use crate::widgets::overline;
 
@@ -22,9 +23,10 @@ pub const MEGA_MERGE_MOSAIC_PNG: &[u8] =
 /// Lockup sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockupSize {
-    /// Top left of a screen: 34 pt logo, 12 pt name.
+    /// Top left of a screen: 22 pt logo mark, 12 pt name, 7 pt wordmark.
     Compact,
-    /// First run and empty states: 72 pt logo, 22 pt name.
+    /// First run and empty states: 46 pt logo mark, 22 pt name, 10 pt
+    /// wordmark.
     Large,
 }
 
@@ -48,7 +50,26 @@ fn decode(png_bytes: &[u8]) -> ColorImage {
             .collect(),
         other => panic!("embedded PNG must have alpha, got {other:?}"),
     };
-    ColorImage::from_rgba_unmultiplied(size, &rgba)
+    trim_transparent(size, &rgba)
+}
+
+/// The image cropped to its non-transparent pixels, so a lockup size is
+/// the artwork's own size, not its padding's.
+fn trim_transparent([w, h]: [usize; 2], rgba: &[u8]) -> ColorImage {
+    let opaque = |x: usize, y: usize| rgba[(y * w + x) * 4 + 3] > 0;
+    let rows: Vec<usize> = (0..h).filter(|&y| (0..w).any(|x| opaque(x, y))).collect();
+    let cols: Vec<usize> = (0..w).filter(|&x| (0..h).any(|y| opaque(x, y))).collect();
+    let (Some(&y0), Some(&y1), Some(&x0), Some(&x1)) =
+        (rows.first(), rows.last(), cols.first(), cols.last())
+    else {
+        return ColorImage::from_rgba_unmultiplied([w, h], rgba);
+    };
+    let (tw, th) = (x1 - x0 + 1, y1 - y0 + 1);
+    let mut out = Vec::with_capacity(tw * th * 4);
+    for y in y0..=y1 {
+        out.extend_from_slice(&rgba[(y * w + x0) * 4..(y * w + x1 + 1) * 4]);
+    }
+    ColorImage::from_rgba_unmultiplied([tw, th], &out)
 }
 
 /// The lockup's images as textures, loaded once per window.
@@ -99,12 +120,21 @@ fn at_height(size: Vec2, height: f32) -> Vec2 {
 
 /// The brand lockup at `size`.
 pub fn lockup(ui: &mut Ui, images: &BrandImages, size: LockupSize) -> Response {
-    let (logo_h, name_h, mark_h) = match size {
-        LockupSize::Compact => (34.0, 12.0, 7.0),
-        LockupSize::Large => (72.0, 22.0, 10.0),
+    let (logo_h, name_h, mark_h): (f32, f32, f32) = match size {
+        LockupSize::Compact => (22.0, 12.0, 7.0),
+        LockupSize::Large => (46.0, 22.0, 10.0),
     };
-    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+    // A row as tall as the taller of the logo and the text column, both
+    // centred in it.
+    // (A bare centred layout would centre in all the height a scroll area
+    // offers, and `horizontal` rows are at least a control high.)
+    let by_h = ui
+        .text_style_height(&Type::Overline.text_style())
+        .max(mark_h);
+    let row = Vec2::new(ui.available_width(), logo_h.max(name_h + space::XS + by_h));
+    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = space::M;
+        ui.spacing_mut().interact_size.y = 0.0;
         ui.add(
             Image::new((images.logo.id(), at_height(images.logo_size(), logo_h)))
                 .alt_text("Astrometrical logo"),
@@ -154,6 +184,10 @@ mod tests {
             name.x > 20.0 * name.y,
             "name image is a wide strip: {name:?}"
         );
+        // Transparent borders are trimmed, so sizes are the artwork's own:
+        // the wordmark PNG is 589×64 with its letters in 541×21.
+        assert_eq!(images.wordmark_size(), Vec2::new(541.0, 21.0));
+        assert_eq!(images.logo_size(), Vec2::new(100.0, 80.0));
     }
 
     #[test]
@@ -172,5 +206,41 @@ mod tests {
         h.get_by_label("Astrometrical logo");
         h.get_by_label("Mega Merge Mosaic");
         h.get_by_label("Astrometrical");
+    }
+
+    #[test]
+    fn lockup_lines_up_inside_a_scroll_area() {
+        let mut images = None;
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(600.0, 800.0))
+            .build_ui(move |ui| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                let images = images.get_or_insert_with(|| {
+                    BrandImages::load(ui.ctx(), MEGA_MERGE_MOSAIC_PNG, "Mega Merge Mosaic")
+                });
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    lockup(ui, images, LockupSize::Compact);
+                });
+            });
+        h.run();
+        let logo = h.get_by_label("Astrometrical logo").rect();
+        let name = h.get_by_label("Mega Merge Mosaic").rect();
+        let mark = h.get_by_label("Astrometrical").rect();
+        assert!(logo.min.y < 60.0, "the lockup sits at the top: {logo:?}");
+        let column = name.union(mark);
+        assert!(
+            (logo.center().y - column.center().y).abs() < 2.0,
+            "logo and text column are centred on each other: logo {logo:?}, column {column:?}"
+        );
+        assert!(
+            mark.min.y > name.max.y,
+            "the wordmark row sits under the name"
+        );
+        assert!(
+            mark.height() >= 7.0 - 0.5,
+            "the wordmark is legible: {mark:?}"
+        );
     }
 }

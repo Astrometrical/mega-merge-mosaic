@@ -2,8 +2,8 @@
 //! and bar, passed checks collapsed into one expandable summary row.
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Frame, Label, Layout, Margin, Pos2, Rect,
-    RichText, Sense, TextStyle, Ui, Vec2, collapsing_header::CollapsingState,
+    Align, Align2, Color32, CornerRadius, Frame, Label, Layout, Margin, Pos2, Rect, RichText,
+    Sense, TextStyle, Ui, Vec2, collapsing_header::CollapsingState,
 };
 
 use crate::icons;
@@ -84,13 +84,8 @@ pub fn checks_list(
 
 /// Paint `glyph` with its top-left at `pos`.
 fn paint_icon(ui: &Ui, pos: Pos2, glyph: char, color: Color32) {
-    ui.painter().text(
-        pos,
-        Align2::LEFT_TOP,
-        glyph,
-        FontId::proportional(ICON_SIZE),
-        color,
-    );
+    ui.painter()
+        .text(pos, Align2::LEFT_TOP, glyph, icons::font(ICON_SIZE), color);
 }
 
 /// One problem or note row; `index` is the item's index in the caller's
@@ -234,8 +229,10 @@ mod tests {
             .with_size(egui::Vec2::new(400.0, 600.0))
             .build_ui_state(
                 |ui, s: &mut State| {
-                    let a = checks_list(ui, "Checks", &s.items, Some(&mut s.show_all));
-                    s.actions.extend(a);
+                    if crate::testutil::themed(ui) {
+                        let a = checks_list(ui, "Checks", &s.items, Some(&mut s.show_all));
+                        s.actions.extend(a);
+                    }
                 },
                 State {
                     items,
@@ -284,6 +281,23 @@ mod tests {
         out
     }
 
+    /// Every painted Lucide glyph uses the icon family.
+    fn icon_fonts_ok(h: &Harness<'static, State>) -> bool {
+        let icon = crate::theme::fonts::icon_family();
+        let mut ok = true;
+        for c in &h.output().shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                for section in &t.galley.job.sections {
+                    let r = &section.byte_range;
+                    let s = &t.galley.job.text[r.start.0..r.end.0];
+                    let has_icon = crate::icons::ALL.iter().any(|(_, g)| s.contains(*g));
+                    ok &= !has_icon || section.format.font_id.family == icon;
+                }
+            }
+        }
+        ok
+    }
+
     #[test]
     fn severity_rows_carry_their_icon() {
         let mut h = harness(vec![
@@ -293,6 +307,7 @@ mod tests {
         ]);
         h.run();
         let text = painted_text(&h);
+        assert!(icon_fonts_ok(&h), "icons are drawn in the icon family");
         assert!(text.contains(crate::icons::CIRCLE_X), "problem icon");
         assert!(text.contains(crate::icons::TRIANGLE_ALERT), "note icon");
         assert!(text.contains(crate::icons::CHECK), "passed icon");

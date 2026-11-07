@@ -1196,3 +1196,38 @@ marked before the first blend; the dot clears once a blend (ROI or whole)
 runs with the current settings. Per-group overrides (set with `mmm set
 --group`) are respected but not edited; the panel notes each group that
 has them ("Ha has its own overrides (CLI)").
+
+## Mega UI standard (2026-11)
+
+Spec: `docs/superpowers/specs/2026-11-07-ui-standard-and-start-screen-design.md`
+(it supersedes §4 and §5.1 of the standalone app spec). `mega-ui` is the
+shared UI standard of the Mega apps; it echoes the Astrometrical web app and
+stays free of `mmm-core`.
+
+- **Tokens** (`mega_ui::theme`): `palette` (the web's colours and AA text
+  roles, plus `HA_400` for Hα text and SII gold `SII_300/400/600` for
+  warnings), `tokens` (spacing 4·8·12·16·24·32, radii 4/6/8, 30 px controls,
+  100 ms hover fades), `text::Type` (the type scale), `Tone` (success, info,
+  warning, problem, neutral: colour, accent, tint and icon), and
+  `contrast_ratio`/`legible_text` for checking new colours. UI code takes
+  colours, sizes, radii and durations from these, never literals.
+- **Fonts** (`theme::fonts`): Inter (UI), JetBrains Mono (numbers) and
+  Lucide (icons), embedded; licences in `crates/mega-ui/assets/fonts/` and
+  `NOTICE`. Icons render only in the Lucide family (`icons::font`,
+  `icons::rich`): Inter has its own glyphs in Lucide's private-use range.
+- **`theme::apply`** installs the fonts, forces the dark theme and sets the
+  complete `egui::Style`. Fonts bind on the next frame and egui panics on an
+  unbound family or a missing named text style, so apps call `apply` before
+  their first frame; hosts and test harnesses that can't use
+  `theme::ensure_applied` and skip drawing for one frame.
+- **Components** (`mega_ui::widgets`): `MegaButton` (primary, secondary,
+  quiet, danger, ghost; large; icon buttons), `chip`, `status`, `overline`,
+  `property_grid`, `segmented`, `text_input`, `notes_field`, `progress`,
+  `Toasts` (the only notifications; never modal), plus the restyled
+  `checks::checks_list` and `jobs::job_panel`, `groups` (the group palette,
+  whose order is frozen because sessions store its indices) and `brand`
+  (the lockup; app names are images pre-rendered from Angora by
+  `assets/brand/make-name.sh`).
+- **Gallery**: `cargo run -p mega-ui --example gallery` shows every token and
+  component; `crates/mega-ui/tests/snapshots.rs` keeps image snapshots of it
+  (ignored by default, see CLAUDE.md).

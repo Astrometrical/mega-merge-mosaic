@@ -37,6 +37,12 @@ cargo build --release      # required for real-data runs (2 GB frames)
 target/release/mmm info test_data/orion_mosaic/*PANEL-4_*.xisf --stats
 ```
 
+UI standard: `cargo run -p mega-ui --example gallery` shows every token and
+component. Image snapshots of it are ignored tests (they need a GPU):
+`cargo test -p mega-ui --test snapshots -- --ignored`, with
+`UPDATE_SNAPSHOTS=1` after an intended visual change; if wgpu can't create a
+device (DX12 fails on some Windows machines), set `WGPU_BACKEND=vulkan`.
+
 GUI runs: launch the app only via `--selftest` (it closes itself; never
 kill a GUI on a timer). Selftest session: `cargo run -p mmm-app --example
 make_selftest_session -- DIR`. Under WSL the app sets `GALLIUM_DRIVER=d3d12`
@@ -54,6 +60,9 @@ Rust via rustup (`source ~/.cargo/env` if PATH lacks cargo).
 - Tests must not depend on `test_data/` (synthesize inputs); real-data runs
   are manual smoke tests. `blend.rs`'s unit tests live in the sibling
   `blend_tests.rs` (a `#[path]` child module).
+- UI code takes colours, sizes, radii and durations from `mega_ui::theme`
+  tokens, never literals; reusable components belong in `mega-ui`
+  (docs/DESIGN.md "Mega UI standard").
 - Every public item in `mmm-core` needs a doc comment (`missing_docs` is
   warned); keep `cargo fmt`, `cargo clippy --all-targets`, and `cargo doc`
   warning-free. `lib.rs` documents the intended public API surface.

@@ -118,6 +118,8 @@ is both good UX and brand consistency.
 
 ## 4. Branding and look
 
+> Superseded by `2026-11-07-ui-standard-and-start-screen-design.md`.
+
 - Dark theme and colours from `../astrometrical/apps/web/src/styles/app.css`:
   - Surfaces: `#050505` (astro-900), `#0e0e0e` (800), `#1a1a1a` (700),
     borders `#2a2a2a` (600).
@@ -150,6 +152,8 @@ compact technical readout (memory, CPU) that expands into a panel with
 per-stage timings.
 
 ### 5.1 Start screen
+
+> Superseded by `2026-11-07-ui-standard-and-start-screen-design.md`.
 
 On launch, with no session open: **New mosaic…**, **Open…**, and a list of
 recent sessions (thumbnail from the session's preview pyramid, panel

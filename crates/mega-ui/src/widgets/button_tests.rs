@@ -82,3 +82,27 @@ fn disabled_button_does_not_click() {
     h.run();
     assert!(!h.state().clicked);
 }
+
+#[test]
+fn icon_renders_in_the_icon_font() {
+    let mut h =
+        harness(|ui| ui.add(MegaButton::new(ButtonKind::Primary, "New mosaic").icon(icons::PLUS)));
+    h.run();
+    let mut found = false;
+    for c in &h.output().shapes {
+        if let egui::Shape::Text(t) = &c.shape {
+            for section in &t.galley.job.sections {
+                let r = &section.byte_range;
+                let s = &t.galley.job.text[r.start.0..r.end.0];
+                if s.contains(icons::PLUS) {
+                    found = true;
+                    assert_eq!(
+                        section.format.font_id.family,
+                        crate::theme::fonts::icon_family()
+                    );
+                }
+            }
+        }
+    }
+    assert!(found, "the plus glyph was painted");
+}

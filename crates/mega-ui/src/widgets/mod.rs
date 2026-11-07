@@ -7,6 +7,7 @@ pub mod progress;
 pub mod property;
 pub mod segmented;
 pub mod status_line;
+pub mod text_input;
 pub mod toast;
 
 pub use button::{ButtonKind, MegaButton, icon_button};
@@ -16,6 +17,7 @@ pub use progress::{progress, progress_bar};
 pub use property::{property_grid, property_row, property_row_numeric, property_row_ui};
 pub use segmented::segmented;
 pub use status_line::{overline, status};
+pub use text_input::text_input;
 pub use toast::{MAX_TOASTS, TOAST_LIFETIME_S, Toast, ToastEvent, ToastId, Toasts};
 
 #[cfg(test)]

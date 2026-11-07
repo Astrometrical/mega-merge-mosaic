@@ -13,4 +13,6 @@ png.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-egui_kittest.workspace = true
+eframe.workspace = true
+# Image snapshots (tests/snapshots.rs, ignored by default) render with wgpu.
+egui_kittest = { workspace = true, features = ["snapshot", "wgpu"] }

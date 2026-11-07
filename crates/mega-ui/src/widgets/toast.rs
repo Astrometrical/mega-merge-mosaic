@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use egui::{
-    Align2, Area, Color32, Context, CornerRadius, FontId, Frame, Id, Margin, Order, Pos2, RichText,
-    Sense, Shadow, Stroke, TextStyle, Vec2,
+    Align2, Area, Color32, Context, CornerRadius, Frame, Id, Margin, Order, Pos2, RichText, Sense,
+    Shadow, Stroke, TextStyle, Vec2,
 };
 
 use crate::theme::Tone;
@@ -136,7 +136,7 @@ impl Toasts {
                                         Pos2::new(icon.min.x, icon.min.y),
                                         Align2::LEFT_TOP,
                                         g,
-                                        FontId::proportional(ICON),
+                                        crate::icons::font(ICON),
                                         t.toast.tone.color(),
                                     );
                                 }

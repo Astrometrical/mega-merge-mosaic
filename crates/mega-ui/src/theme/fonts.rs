@@ -25,10 +25,11 @@ pub fn icon_family() -> FontFamily {
     FontFamily::Name("icons".into())
 }
 
-/// egui's default fonts plus ours: Inter first in Proportional,
-/// JetBrains Mono first in Monospace, Lucide as the next fallback in both
-/// (so icon glyphs work in any text), and the defaults (emoji and more)
-/// kept after them.
+/// egui's default fonts plus ours: Inter first in Proportional (and the
+/// semibold family), JetBrains Mono first in Monospace, the defaults
+/// (emoji and more) kept after them, and Lucide alone in
+/// [`icon_family`]. Lucide is in no text chain: Inter has glyphs in the
+/// private-use range Lucide uses, and Lucide has digits.
 pub fn definitions() -> FontDefinitions {
     let mut d = FontDefinitions::default();
     let add = |d: &mut FontDefinitions, name: &str, bytes: &'static [u8]| {
@@ -67,7 +68,7 @@ pub fn definitions() -> FontDefinitions {
         .cloned()
         .unwrap_or_default();
     let chain = |first: &str, rest: &[String]| {
-        let mut v = vec![first.to_owned(), LUCIDE.to_owned()];
+        let mut v = vec![first.to_owned()];
         v.extend(rest.iter().cloned());
         v
     };
@@ -92,7 +93,15 @@ mod tests {
     fn families_put_our_fonts_first_and_keep_fallbacks() {
         let d = definitions();
         let p = &d.families[&FontFamily::Proportional];
-        assert_eq!(&p[..2], &[INTER_REGULAR.to_owned(), LUCIDE.to_owned()]);
+        assert_eq!(p[0], INTER_REGULAR);
+        // Inter has private-use glyphs where Lucide keeps its icons, and
+        // Lucide has digits: icons must never come from a text chain.
+        for family in [FontFamily::Proportional, FontFamily::Monospace, semibold()] {
+            assert!(
+                !d.families[&family].iter().any(|f| f == LUCIDE),
+                "{family:?} must not fall back to Lucide"
+            );
+        }
         assert!(
             p.iter().any(|f| f == "NotoEmoji-Regular"),
             "emoji fallback kept: {p:?}"

@@ -1,10 +1,24 @@
 //! Lucide icon glyphs (lucide-static 1.60.0, ISC licence).
 //!
-//! The Lucide font is a fallback in every text family (see
-//! [`crate::theme::fonts`]), so these characters can sit inside any text,
-//! e.g. `format!("{}  New mosaic", icons::PLUS)`. Codepoints come from the
-//! package's `font/codepoints.json`; they are not stable across Lucide
-//! versions, so bump the font and this table together.
+//! Always draw these in the icon family ([`font`], [`rich`]), never in a
+//! text font: Inter has its own glyphs in the private-use range Lucide
+//! uses, so an icon in ordinary text shows the wrong symbol. Codepoints
+//! come from the package's `font/codepoints.json`; they are not stable
+//! across Lucide versions, so bump the font and this table together.
+
+use egui::{FontId, RichText};
+
+use crate::theme::fonts::icon_family;
+
+/// The icon font at `size` points.
+pub fn font(size: f32) -> FontId {
+    FontId::new(size, icon_family())
+}
+
+/// `glyph` as rich text in the icon font at `size` points.
+pub fn rich(glyph: char, size: f32) -> RichText {
+    RichText::new(glyph).font(font(size))
+}
 
 /// `plus`
 pub const PLUS: char = '\u{e13d}';
@@ -82,3 +96,16 @@ pub const ALL: &[(&str, char)] = &[
     ("house", HOUSE),
     ("maximize-2", MAXIMIZE_2),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::fonts::icon_family;
+
+    #[test]
+    fn icons_use_the_icon_family() {
+        assert_eq!(font(14.0).family, icon_family());
+        assert_eq!(font(14.0).size, 14.0);
+        assert_eq!(rich(PLUS, 14.0).text(), PLUS.to_string());
+    }
+}

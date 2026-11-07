@@ -71,3 +71,25 @@ fn disabled_notes_field_is_read_only() {
     h.run();
     assert_eq!(h.state(), "Shoot row 4");
 }
+
+#[test]
+fn text_input_is_a_control_high_and_edits() {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(500.0, 100.0))
+        .build_ui_state(
+            |ui, s: &mut (String, Option<egui::Rect>)| {
+                if crate::testutil::themed(ui) {
+                    s.1 = Some(super::text_input::text_input(ui, &mut s.0, "Session name").rect);
+                }
+            },
+            (String::new(), None),
+        );
+    h.run();
+    let r = h.state().1.unwrap();
+    assert!((r.height() - 30.0).abs() < 0.5, "{r:?}");
+    h.get_by_role(Role::TextInput).focus();
+    h.step();
+    h.get_by_role(Role::TextInput).type_text("Carina");
+    h.run();
+    assert_eq!(h.state().0, "Carina");
+}

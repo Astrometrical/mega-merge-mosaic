@@ -8,6 +8,7 @@
 
 pub mod brand;
 pub mod checks;
+pub mod gallery;
 pub mod groups;
 pub mod icons;
 pub mod jobs;

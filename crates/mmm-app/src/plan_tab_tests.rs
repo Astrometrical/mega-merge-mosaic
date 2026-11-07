@@ -31,10 +31,14 @@ struct State {
 
 fn harness(session: OpenSession) -> Harness<'static, State> {
     Harness::builder()
-        .with_size(egui::vec2(1200.0, 800.0))
+        .with_size(egui::vec2(1200.0, 1100.0))
         .with_step_dt(0.01)
         .build_ui_state(
             |ui, s: &mut State| {
+                // As the app does before its first frame.
+                if !mega_ui::theme::ensure_applied(ui.ctx()) {
+                    return;
+                }
                 let feed = PlanFeed {
                     previews: &s.previews,
                     generation: s.generation,

@@ -2,14 +2,17 @@
 //! large sizes; icon buttons.
 
 use egui::{
-    Color32, CornerRadius, FontId, Response, RichText, Stroke, Ui, Vec2, Widget, WidgetInfo,
-    WidgetType, style::WidgetVisuals,
+    Color32, CornerRadius, FontId, Response, Stroke, TextStyle, Ui, Vec2, Widget, WidgetInfo,
+    WidgetType,
+    style::WidgetVisuals,
+    text::{LayoutJob, TextFormat},
 };
 
+use crate::icons;
 use crate::theme::Tone;
 use crate::theme::fonts::semibold;
 use crate::theme::palette::*;
-use crate::theme::tokens::{CONTROL_HEIGHT, CONTROL_HEIGHT_LARGE, radius};
+use crate::theme::tokens::{CONTROL_HEIGHT, CONTROL_HEIGHT_LARGE, radius, space};
 
 /// What a button is for; decides its colours.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,14 +147,25 @@ impl Widget for MegaButton {
         } else {
             CONTROL_HEIGHT
         };
-        let label = match (self.icon, self.square) {
-            (Some(g), true) => g.to_string(),
-            (Some(g), false) => format!("{g}  {}", self.text),
-            (None, _) => self.text.clone(),
+        let text_font = if self.large {
+            FontId::new(14.0, semibold())
+        } else {
+            TextStyle::Button.resolve(ui.style())
         };
-        let mut rich = RichText::new(label);
-        if self.large {
-            rich = rich.font(FontId::new(14.0, semibold()));
+        // Placeholder colours take the button's state colour.
+        let mut job = LayoutJob::default();
+        if let Some(g) = self.icon {
+            let format =
+                TextFormat::simple(icons::font(text_font.size + 1.0), Color32::PLACEHOLDER);
+            job.append(&g.to_string(), 0.0, format);
+        }
+        if !self.square {
+            let gap = if self.icon.is_some() { space::S } else { 0.0 };
+            job.append(
+                &self.text,
+                gap,
+                TextFormat::simple(text_font, Color32::PLACEHOLDER),
+            );
         }
         let [idle, hovered, pressed] = looks(self.kind);
         let enabled = ui.is_enabled();
@@ -167,7 +181,7 @@ impl Widget for MegaButton {
                 } else {
                     Vec2::new(0.0, height)
                 };
-                ui.add(egui::Button::new(rich).min_size(min))
+                ui.add(egui::Button::new(job).min_size(min))
             })
             .inner;
         let text = self.text;
