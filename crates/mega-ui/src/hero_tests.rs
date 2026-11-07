@@ -5,6 +5,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use super::*;
+use crate::theme::tokens::KEN_BURNS_ZOOM;
 use crate::viewer::ImageTileSource;
 
 const EPS: f64 = 0.01;
@@ -99,6 +100,10 @@ fn reduced_motion_cuts() {
     let z0 = zoom(&h);
     frames(&mut h, 4.0);
     assert_eq!(zoom(&h), z0);
+    // The next view is already loaded when the cut comes.
+    frames(&mut h, 6.5);
+    let next = h.state().stage.next_index();
+    assert!(h.state().stage.drawn(next));
     frames(&mut h, 8.0 + EPS);
     assert_eq!(label(&h).as_deref(), Some("OIII"));
     assert!(!h.state().stage.is_crossfading());
@@ -147,4 +152,45 @@ fn drift_zooms_in_over_time() {
     let z0 = zoom(&h);
     frames(&mut h, 5.0);
     assert!(zoom(&h) > z0 * 1.01);
+}
+
+#[test]
+fn cut_keeps_the_outgoing_view_until_the_incoming_has_tiles() {
+    let mut h = harness(two_views(), true);
+    frames(&mut h, 0.0);
+    // Jump past the cut with nothing preloaded: the old view holds for the
+    // frame in which the new viewer is built, then the cut happens.
+    h.state_mut().now = 8.0 + EPS;
+    h.step();
+    assert_eq!(label(&h).as_deref(), Some("Ha"));
+    h.run_steps(2);
+    assert_eq!(label(&h).as_deref(), Some("OIII"));
+    assert!(h.state().stage.drawn(1));
+}
+
+#[test]
+fn next_waits_for_tiles_then_swaps() {
+    let mut h = harness(two_views(), false);
+    frames(&mut h, 0.0);
+    h.get_by_label("Next image").click();
+    h.state_mut().now = 1.0;
+    h.step();
+    assert_eq!(label(&h).as_deref(), Some("Ha"));
+    h.run_steps(3);
+    assert_eq!(label(&h).as_deref(), Some("OIII"));
+}
+
+#[test]
+fn an_odd_view_starts_on_its_drift_camera() {
+    let zoom_of = |start: usize| {
+        let mut h = harness(two_views(), false);
+        h.state_mut().stage.set_views(two_views(), start, 0.0);
+        frames(&mut h, 0.0);
+        let s = &h.state().stage;
+        let v = s.viewers[s.current].as_ref().expect("viewer");
+        let (_, t) = v.last_frame().expect("shown");
+        v.view().zoom(t)
+    };
+    let ratio = zoom_of(1) / zoom_of(0);
+    assert!((ratio - KEN_BURNS_ZOOM).abs() < 1e-6, "{ratio}");
 }

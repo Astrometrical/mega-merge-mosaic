@@ -20,6 +20,8 @@ const STARFIELD_SEED: u64 = 42;
 const PAN_FRACTION: f64 = 0.02;
 /// How long before its fade starts the next view begins loading.
 const PRELOAD_S: f64 = 2.0;
+/// The longest a swap waits for the incoming view's first tiles.
+const HOLD_MAX_S: f64 = 2.0;
 
 /// One image the hero can show: a label and the tiles to draw.
 pub struct HeroView {
@@ -58,6 +60,9 @@ pub struct HeroStage {
     synchronous: bool,
     crossfading: bool,
     label_idx: Option<usize>,
+    /// A view the user asked for with Next, shown once it has drawn tiles.
+    swap_to: Option<usize>,
+    swap_at: f64,
 }
 
 impl HeroStage {
@@ -79,6 +84,8 @@ impl HeroStage {
             synchronous: false,
             crossfading: false,
             label_idx: None,
+            swap_to: None,
+            swap_at: 0.0,
         }
     }
 
@@ -99,6 +106,7 @@ impl HeroStage {
         self.since = now;
         self.paused_at = now;
         self.crossfading = false;
+        self.swap_to = None;
         self.label_idx = (!self.views.is_empty()).then_some(self.current);
     }
 
@@ -135,6 +143,14 @@ impl HeroStage {
         self.crossfading
     }
 
+    /// True once view `i` has a viewer that has painted tiles.
+    fn drawn(&self, i: usize) -> bool {
+        self.viewers
+            .get(i)
+            .and_then(Option::as_ref)
+            .is_some_and(TiledViewer::has_drawn_tiles)
+    }
+
     fn next_index(&self) -> usize {
         (self.current + 1) % self.views.len()
     }
@@ -152,7 +168,8 @@ impl HeroStage {
 
     /// Draw viewer `i` in `rect` at `opacity`, `age` seconds into its drift.
     fn draw_view(&mut self, ui: &mut Ui, rect: Rect, i: usize, opacity: f32, age: f64) {
-        if self.viewers[i].is_none() {
+        let fresh = self.viewers[i].is_none();
+        if fresh {
             self.viewers[i] = Some(self.make_viewer(i));
         }
         // The fitted camera the drift starts from.
@@ -177,12 +194,13 @@ impl HeroStage {
             bc.1,
         );
 
-        let reduced = self.reduced_motion;
         let viewer = self.viewers[i].as_mut().expect("viewer just built");
         viewer.set_opacity(opacity);
-        if !reduced {
-            viewer.view_mut().set_view(centre, zoom, 0.0);
+        if fresh {
+            // Start on the drift camera, not the viewer's home fit.
+            viewer.set_camera(rect.size(), centre, zoom);
         }
+        viewer.view_mut().set_view(centre, zoom, 0.0);
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             viewer.show(ui);
         });
@@ -202,9 +220,22 @@ impl HeroStage {
         } else {
             HERO_DWELL_S + HERO_CROSSFADE_S
         };
-        if n > 1 {
+        if let Some(t) = self.swap_to {
+            if t >= n {
+                self.swap_to = None;
+            } else if self.drawn(t) || now - self.swap_at > HOLD_MAX_S {
+                self.current = t;
+                self.since = eff;
+                self.swap_to = None;
+            }
+        }
+        if n > 1 && self.swap_to.is_none() {
             let mut guard = 0;
             while eff - self.since >= total && guard < n * 64 {
+                // Hold the outgoing view until the incoming one has tiles.
+                if eff - self.since - total < HOLD_MAX_S && !self.drawn(self.next_index()) {
+                    break;
+                }
                 self.current = self.next_index();
                 self.since += HERO_DWELL_S;
                 guard += 1;
@@ -227,11 +258,16 @@ impl HeroStage {
 
         if n > 0 && image_rect.width() > 0.0 && image_rect.height() > 0.0 {
             let cur = self.current;
-            let next = (n > 1).then(|| self.next_index());
+            let preload = n > 1 && elapsed >= HERO_DWELL_S - PRELOAD_S;
+            // The incoming view: the one asked for, else the next, loading
+            // (at opacity 0) before it is shown.
+            let incoming = self
+                .swap_to
+                .or_else(|| preload.then(|| self.next_index()))
+                .filter(|&i| i != cur);
             // Drop viewers (and their tiles) that are neither shown nor next.
-            let preload = n > 1 && !self.reduced_motion && elapsed >= HERO_DWELL_S - PRELOAD_S;
             for (i, v) in self.viewers.iter_mut().enumerate() {
-                if i != cur && !(preload && Some(i) == next) {
+                if i != cur && Some(i) != incoming {
                     *v = None;
                 }
             }
@@ -241,9 +277,18 @@ impl HeroStage {
                 1.0
             };
             self.draw_view(ui, image_rect, cur, out_opacity, elapsed);
-            if preload && let Some(nx) = next {
-                let age = elapsed - HERO_DWELL_S;
-                self.draw_view(ui, image_rect, nx, fade as f32, age);
+            if let Some(nx) = incoming {
+                let age = if self.swap_to.is_some() {
+                    0.0
+                } else {
+                    elapsed - HERO_DWELL_S
+                };
+                let opacity = if self.swap_to.is_some() {
+                    0.0
+                } else {
+                    fade as f32
+                };
+                self.draw_view(ui, image_rect, nx, opacity, age);
             }
         }
 
@@ -313,9 +358,8 @@ impl HeroStage {
                 self.paused = !self.paused;
             }
             Some(Action::Next) => {
-                let at = if self.paused { self.paused_at } else { now };
-                self.current = self.next_index();
-                self.since = at;
+                self.swap_to = Some(self.next_index());
+                self.swap_at = now;
             }
             None => {}
         }
@@ -328,9 +372,16 @@ impl HeroStage {
             return;
         }
         let multiple = self.views.len() > 1;
-        if self.reduced_motion {
+        if self.swap_to.is_some() {
+            ui.ctx().request_repaint();
+        } else if self.reduced_motion {
             if multiple {
-                let wait = (HERO_DWELL_S - elapsed).max(0.0);
+                let wake = if elapsed < HERO_DWELL_S - PRELOAD_S {
+                    HERO_DWELL_S - PRELOAD_S
+                } else {
+                    HERO_DWELL_S
+                };
+                let wait = (wake - elapsed).max(0.0);
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs_f64(wait));
             }
