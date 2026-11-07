@@ -152,7 +152,7 @@ fn stuck_harness(recent: Vec<RecentEntry>) -> Harness<'static, Screen> {
 }
 
 /// A recent entry for `path`, opened at `t`.
-fn entry_at(path: &Path, t: u64) -> RecentEntry {
+pub(crate) fn entry_at(path: &Path, t: u64) -> RecentEntry {
     RecentEntry {
         path: path.to_path_buf(),
         last_opened: t,
@@ -165,7 +165,7 @@ fn entry(path: &Path) -> RecentEntry {
 }
 
 /// An empty session `root/{name}.mmm-session` (created, then closed).
-fn session(root: &Path, name: &str) -> PathBuf {
+pub(crate) fn session(root: &Path, name: &str) -> PathBuf {
     let dir = root.join(format!("{name}.mmm-session"));
     drop(crate::session::create_blocking(&dir).unwrap());
     dir

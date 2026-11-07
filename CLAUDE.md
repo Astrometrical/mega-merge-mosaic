@@ -42,6 +42,8 @@ component. Image snapshots of it are ignored tests (they need a GPU):
 `cargo test -p mega-ui --test snapshots -- --ignored`, with
 `UPDATE_SNAPSHOTS=1` after an intended visual change; if wgpu can't create a
 device (DX12 fails on some Windows machines), set `WGPU_BACKEND=vulkan`.
+The start screen has one too (needs the same flags):
+`cargo test -p mmm-app start::snapshot_tests -- --ignored`.
 
 GUI runs: launch the app only via `--selftest` (it closes itself; never
 kill a GUI on a timer). Selftest session: `cargo run -p mmm-app --example

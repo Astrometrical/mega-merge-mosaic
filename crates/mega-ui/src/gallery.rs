@@ -3,23 +3,28 @@
 //! Look here before building anything new. `cargo run -p mega-ui --example
 //! gallery` shows it in a window; the snapshot tests render it too.
 
+use std::sync::Arc;
+
 use egui::{
-    Color32, CornerRadius, FontId, Mesh, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind,
-    TextStyle, Ui, Vec2,
+    Color32, ColorImage, CornerRadius, FontId, Mesh, Rect, RichText, ScrollArea, Sense, Stroke,
+    StrokeKind, TextStyle, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
 };
 
 use crate::brand::{self, BrandImages, LockupSize};
 use crate::checks::{CheckItem, checks_list};
 use crate::groups::GROUP_PALETTE;
+use crate::hero::{HeroStage, HeroView};
 use crate::icons;
+use crate::starfield::Starfield;
 use crate::theme::palette::*;
 use crate::theme::text::{Type, text};
 use crate::theme::tokens::{radius, space};
 use crate::theme::{Severity, Tone};
+use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, MegaButton, Toast, Toasts, chip, icon_button, notes_field, overline, progress,
-    property_grid, property_row, property_row_numeric, property_row_ui, segmented, status,
-    text_input,
+    ButtonKind, MegaButton, SessionCardData, Toast, Toasts, chip, icon_button, notes_field,
+    overline, progress, property_grid, property_row, property_row_numeric, property_row_ui,
+    segmented, session_card, status, text_input,
 };
 
 /// The gallery's interactive state.
@@ -30,6 +35,9 @@ pub struct GalleryState {
     checks: Vec<CheckItem>,
     toasts: Toasts,
     brand: Option<BrandImages>,
+    starfield: Starfield,
+    hero: Option<HeroStage>,
+    card_thumbs: Option<[TextureHandle; 2]>,
 }
 
 impl Default for GalleryState {
@@ -65,6 +73,9 @@ impl Default for GalleryState {
             checks,
             toasts: Toasts::default(),
             brand: None,
+            starfield: Starfield::new(7),
+            hero: None,
+            card_thumbs: None,
         }
     }
 }
@@ -107,6 +118,38 @@ fn imagery(ui: &Ui, rect: Rect) {
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     ui.painter().add(mesh);
+}
+
+/// A diagonal gradient image from `a` to `b`, standing in for a mosaic.
+fn gradient_image(size: [usize; 2], a: Color32, b: Color32) -> ColorImage {
+    let [w, h] = size;
+    let mut pixels = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let t = (x as f32 / w as f32 + y as f32 / h as f32) / 2.0;
+            pixels.push(a.lerp_to_gamma(b, t));
+        }
+    }
+    ColorImage::new(size, pixels)
+}
+
+/// A hero stage over two generated gradients, frozen at time zero so the
+/// gallery (and its snapshots) stay still.
+fn gallery_hero() -> HeroStage {
+    let view = |label: &str, a: Color32, b: Color32| HeroView {
+        label: label.to_string(),
+        source: Arc::new(ImageTileSource::new(gradient_image([640, 480], a, b), 256)),
+    };
+    let mut stage = HeroStage::new_synchronous();
+    stage.set_views(
+        vec![
+            view("Ha", ACCENT_600, HA_500),
+            view("OIII", SURFACE_700, ACCENT_500),
+        ],
+        0,
+        0.0,
+    );
+    stage
 }
 
 /// Draw the gallery.
@@ -315,6 +358,79 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
             brand::lockup(ui, images, LockupSize::Compact);
             ui.add_space(space::L);
             brand::lockup(ui, images, LockupSize::Large);
+        });
+
+        section(ui, "Starfield", |ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(560.0, 160.0), Sense::hover());
+            ui.painter().rect_filled(rect, 0.0, SURFACE_900);
+            state
+                .starfield
+                .paint(&ui.painter().with_clip_rect(rect), rect);
+        });
+
+        section(ui, "Hero stage", |ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(1000.0, 320.0), Sense::hover());
+            let image = Rect::from_min_max(
+                egui::pos2(rect.left() + rect.width() / 3.0, rect.top()),
+                rect.max,
+            );
+            let hero = state.hero.get_or_insert_with(gallery_hero);
+            // Constant time keeps the stage on its first view, mid-drift.
+            ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+                ui.set_clip_rect(rect);
+                hero.show(ui, image, 0.0);
+            });
+        });
+
+        section(ui, "Session cards", |ui| {
+            let ctx = ui.ctx().clone();
+            let thumbs = state.card_thumbs.get_or_insert_with(|| {
+                let tex = |name: &str, a, b| {
+                    ctx.load_texture(
+                        name,
+                        gradient_image([200, 80], a, b),
+                        TextureOptions::LINEAR,
+                    )
+                };
+                [
+                    tex("gallery-card-a", ACCENT_600, HA_500),
+                    tex("gallery-card-b", SURFACE_700, ACCENT_500),
+                ]
+            });
+            ui.horizontal_wrapped(|ui| {
+                let status = Some((Tone::Success, "Merged"));
+                let base = |title, thumb| SessionCardData {
+                    title,
+                    status,
+                    pinned: false,
+                    dimmed: false,
+                    selected: false,
+                    thumbnail: Some(thumb),
+                };
+                let _ = session_card(ui, &base("Normal", &thumbs[0]));
+                let _ = session_card(
+                    ui,
+                    &SessionCardData {
+                        selected: true,
+                        ..base("Selected", &thumbs[1])
+                    },
+                );
+                let _ = session_card(
+                    ui,
+                    &SessionCardData {
+                        pinned: true,
+                        ..base("Pinned", &thumbs[0])
+                    },
+                );
+                let _ = session_card(
+                    ui,
+                    &SessionCardData {
+                        dimmed: true,
+                        status: Some((Tone::Warning, "Missing")),
+                        ..base("Dimmed", &thumbs[1])
+                    },
+                );
+            });
         });
         ui.add_space(space::XXL);
     });

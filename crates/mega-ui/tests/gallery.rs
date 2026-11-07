@@ -35,6 +35,9 @@ fn gallery_renders_every_section() {
         "TOASTS",
         "ICONS",
         "BRAND LOCKUP",
+        "STARFIELD",
+        "HERO STAGE",
+        "SESSION CARDS",
         "41 checks passed",
         "62% · 0:41 left",
     ] {

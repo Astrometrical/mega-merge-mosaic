@@ -706,3 +706,7 @@ fn with_session_ext(path: PathBuf) -> PathBuf {
 /// The tests and the shared start-screen test helpers live in `tests.rs`.
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// An image snapshot of the start screen (ignored: needs a GPU).
+#[cfg(test)]
+mod snapshot_tests;
