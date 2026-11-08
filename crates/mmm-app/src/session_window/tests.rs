@@ -2880,6 +2880,9 @@ fn edit_panels(s: &mut OpenSession, jobs: &mut JobRunner, f: impl FnOnce(&mut Ve
     let deadline = Instant::now() + PATIENCE;
     while edits.has_pending() {
         assert!(Instant::now() < deadline, "the edit never applied");
+        // Reap the jobs the edit cancelled (the pipeline may have one
+        // running): the edit applies only once the runner is idle.
+        jobs.poll(s);
         edits.poll(&ctx, s, jobs);
         std::thread::sleep(Duration::from_millis(2));
     }
