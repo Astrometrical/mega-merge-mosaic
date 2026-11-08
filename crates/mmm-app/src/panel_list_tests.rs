@@ -2387,3 +2387,53 @@ fn dropping_no_panel_files_says_so() {
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_panicking_header_read_shows_an_unreadable_row() {
+    let root = temp_dir("list-panic-read");
+    let session = two_group_session(&root);
+    let bad = session.mosaic.config.panels[0].path.clone();
+    assert_eq!(name_of(&bad), "Ha_0.xisf");
+    read_hooks::panic_reading(&bad);
+    let mut h = harness(session, vec![], runner());
+    wait(&mut h, State::settled);
+    assert_eq!(cells(&h, "Ha_0.xisf"), ["Unreadable", "—", "—", "—"]);
+    h.get_by_label_contains("Unreadable: ");
+    // The rest still group, and nothing is read again.
+    heading(&h, "Ha · 3");
+    heading(&h, "OIII · 4");
+    assert_eq!(
+        warning(&h, "No group · 1").as_deref(),
+        Some("FILTER missing")
+    );
+    steps(&mut h);
+    assert_eq!(read_hooks::resolves(&bad), 1);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_lost_resolution_is_retried_later() {
+    let root = temp_dir("list-panic-resolve");
+    let session = two_group_session(&root);
+    let p = session.mosaic.config.panels[0].path.clone();
+    read_hooks::panic_resolving(&p, true);
+    let mut h = harness(session, vec![], runner());
+    let start = Instant::now();
+    step_until(&mut h, |_| read_hooks::resolves(&p) >= 1);
+    for _ in 0..40 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Not again at once: at most once per RESOLVE_RETRY (more apart each
+    // time).
+    let tries = read_hooks::resolves(&p);
+    let allowed = 1 + (start.elapsed().as_secs_f64() / RESOLVE_RETRY.as_secs_f64()) as usize;
+    assert!(tries <= allowed, "{tries} tries in {:?}", start.elapsed());
+    // Once it works, a later try resolves the panels.
+    read_hooks::panic_resolving(&p, false);
+    wait(&mut h, State::settled);
+    heading(&h, "Ha · 4");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}

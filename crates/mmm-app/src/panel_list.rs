@@ -74,7 +74,10 @@
 //! groups meanwhile. Each panel's header is read once
 //! ([`read_panel_header`]) and cached by path and file fingerprint, so
 //! regrouping after an edit reads nothing new; a header rule on a keyword
-//! other than FILTER reads that keyword once more per panel.
+//! other than FILTER reads that keyword once more per panel. A reader that
+//! panics makes its panel "Unreadable"; a resolution that stops
+//! unexpectedly is tried again for the same inputs after [`RESOLVE_RETRY`]
+//! (doubling each time), never every frame.
 //!
 //! Edits go through [`PanelEdits`] (queued behind running jobs; see
 //! [`crate::panel_edits`]).
@@ -82,6 +85,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Key, Label, Layout, Modifiers, Popup, TextWrapMode};
 use mega_ui::icons;
@@ -121,6 +125,11 @@ const UNKNOWN: &str = "—";
 const READING: &str = "Reading…";
 /// The FILTER cell of a panel that can't be opened.
 const UNREADABLE: &str = "Unreadable";
+/// Wait before resolving the same inputs again after a resolution
+/// stopped unexpectedly (doubling each time, up to [`RESOLVE_RETRY_MAX`]).
+const RESOLVE_RETRY: Duration = Duration::from_secs(2);
+/// Longest wait between two tries of the same inputs.
+const RESOLVE_RETRY_MAX: Duration = Duration::from_secs(60);
 /// The tag of a row whose panel was moved by hand.
 const BY_HAND: &str = "by hand";
 /// Why a batch of files that are not panels added nothing.
@@ -262,11 +271,39 @@ fn rule_key(grouping: &Grouping) -> Option<String> {
     }
 }
 
+/// `path`'s header facts, or why they can't be read: a reader that panics
+/// makes the panel "Unreadable" (the rest still group) rather than end the
+/// resolution. Blocking (one open).
+fn read_header(path: &Path) -> Result<PanelHeader, String> {
+    std::panic::catch_unwind(|| {
+        #[cfg(test)]
+        read_hooks::reading(path);
+        read_panel_header(path).map_err(|e| e.to_string())
+    })
+    .unwrap_or_else(|_| Err("reading the file failed unexpectedly".into()))
+}
+
+/// The value of header keyword `key` in `path` (`None`: absent, or the file
+/// unreadable, a reader that panics included). Blocking (one open).
+fn read_key(path: &Path, key: &str) -> Option<String> {
+    std::panic::catch_unwind(|| {
+        #[cfg(test)]
+        read_hooks::reading(path);
+        InputPanel::open(path)
+            .ok()
+            .and_then(|panel| header_value(&panel, key))
+    })
+    .ok()
+    .flatten()
+}
+
 /// Read what `infos` lacks for `inputs` (the header of each panel new or
 /// changed on disk since read, and the rule's keyword), then resolve the
 /// groups and count the FILTER values. Blocking (header reads): runs on a
 /// worker.
 fn resolve(inputs: PanelsEdit, mut infos: BTreeMap<PathBuf, PanelInfo>) -> Resolved {
+    #[cfg(test)]
+    read_hooks::resolving(&inputs);
     let key = rule_key(&inputs.grouping);
     // FILTER is among the header facts; another keyword is read on its own.
     let extra = key.clone().filter(|k| k != DEFAULT_HEADER_KEY);
@@ -276,7 +313,7 @@ fn resolve(inputs: PanelsEdit, mut infos: BTreeMap<PathBuf, PanelInfo>) -> Resol
             .get(&p.path)
             .is_none_or(|i| i.fingerprint != fingerprint);
         if fresh {
-            let header = read_panel_header(&p.path).map_err(|e| e.to_string());
+            let header = read_header(&p.path);
             let info = PanelInfo {
                 fingerprint,
                 header,
@@ -291,9 +328,7 @@ fn resolve(inputs: PanelsEdit, mut infos: BTreeMap<PathBuf, PanelInfo>) -> Resol
             && !info.keys.contains_key(k)
         {
             let value = match &info.header {
-                Ok(_) => InputPanel::open(&p.path)
-                    .ok()
-                    .and_then(|panel| header_value(&panel, k)),
+                Ok(_) => read_key(&p.path, k),
                 Err(_) => None,
             };
             info.keys.insert(k.clone(), value);
@@ -853,6 +888,10 @@ pub struct PanelList {
     resolving: Option<Task<Resolved>>,
     /// The inputs of the last resolution started.
     attempted: Option<PanelsEdit>,
+    /// When to try `attempted` again (its resolution stopped unexpectedly),
+    /// and the wait before the try after that.
+    retry: Option<Instant>,
+    retry_wait: Duration,
     /// The last resolution's inputs and groups.
     resolved: Option<(PanelsEdit, Groups)>,
     /// How many FILTER values the last resolution found.
@@ -903,6 +942,8 @@ impl PanelList {
             infos: BTreeMap::new(),
             resolving: None,
             attempted: None,
+            retry: None,
+            retry_wait: RESOLVE_RETRY,
             resolved: None,
             filters: 0,
             auto_grouped: false,
@@ -1264,14 +1305,18 @@ impl PanelList {
                         }
                     }
                     self.resolved = Some((r.inputs, r.groups));
+                    self.retry_wait = RESOLVE_RETRY;
                 }
                 Poll::Lost => {
-                    // Try again on the next poll rather than leave rows
-                    // "Reading…" for good.
+                    // Try again later rather than leave rows "Reading…"
+                    // for good, or try again every frame.
                     self.resolving = None;
-                    self.attempted = None;
-                    tracing::warn!("reading the panel headers stopped unexpectedly; retrying");
-                    ctx.request_repaint();
+                    let wait = self.retry_wait;
+                    self.retry = Some(Instant::now() + wait);
+                    self.retry_wait = (wait * 2).min(RESOLVE_RETRY_MAX);
+                    tracing::warn!(
+                        "reading the panel headers stopped unexpectedly; trying again in {wait:?}"
+                    );
                 }
             }
         }
@@ -1281,8 +1326,22 @@ impl PanelList {
         {
             session.groups = Some(groups.clone());
         }
+        if self.resolving.is_some() {
+            return;
+        }
         let shown = self.edits.shown(session);
-        if self.resolving.is_none() && self.attempted.as_ref() != Some(&shown) {
+        // The same inputs again only once their retry is due.
+        let now = Instant::now();
+        let again = match self.retry {
+            Some(at) if at > now => {
+                ctx.request_repaint_after(at - now);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if again || self.attempted.as_ref() != Some(&shown) {
+            self.retry = None;
             let infos: BTreeMap<PathBuf, PanelInfo> = shown
                 .panels
                 .iter()
@@ -1875,6 +1934,66 @@ impl PanelList {
             Type::Title.text_style().resolve(&ctx.global_style()),
             palette::ACCENT_400,
         );
+    }
+}
+
+/// Test-only hooks into the background resolution: readers that panic for
+/// chosen panels, a resolution that panics outside them, and how many
+/// resolutions each panel took part in.
+#[cfg(test)]
+pub(crate) mod read_hooks {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use crate::panel_edits::PanelsEdit;
+
+    static PANIC_READING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    static PANIC_RESOLVING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    static RESOLVES: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+
+    /// Reading `path`'s header panics from now on.
+    pub(crate) fn panic_reading(path: &Path) {
+        PANIC_READING.lock().unwrap().insert(path.to_path_buf());
+    }
+
+    /// A resolution with `path` among its inputs panics (outside any
+    /// reader) from now on, or (`on: false`) no longer.
+    pub(crate) fn panic_resolving(path: &Path, on: bool) {
+        let mut set = PANIC_RESOLVING.lock().unwrap();
+        if on {
+            set.insert(path.to_path_buf());
+        } else {
+            set.remove(path);
+        }
+    }
+
+    /// How many resolutions `path` was among the inputs of.
+    pub(crate) fn resolves(path: &Path) -> usize {
+        RESOLVES.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+
+    /// A reader opens `path`.
+    pub(super) fn reading(path: &Path) {
+        if PANIC_READING.lock().unwrap().contains(path) {
+            panic!("test: reading {} panics", path.display());
+        }
+    }
+
+    /// A resolution of `inputs` starts.
+    pub(super) fn resolving(inputs: &PanelsEdit) {
+        let mut panics = false;
+        {
+            let mut counts = RESOLVES.lock().unwrap();
+            let set = PANIC_RESOLVING.lock().unwrap();
+            for p in &inputs.panels {
+                *counts.entry(p.path.clone()).or_default() += 1;
+                panics |= set.contains(&p.path);
+            }
+        }
+        if panics {
+            panic!("test: resolving panics");
+        }
     }
 }
 
