@@ -175,6 +175,9 @@ pub(crate) struct Found {
     pub empty: Vec<PathBuf>,
     /// Folders that could not be read.
     pub unreadable: Vec<PathBuf>,
+    /// Files that are not panel files (by extension), and paths that do
+    /// not exist.
+    pub skipped: Vec<PathBuf>,
 }
 
 impl Found {
@@ -190,8 +193,8 @@ impl Found {
 /// The panel files `paths` stand for, normalised: a directory contributes
 /// the panel files at its top level (never its subfolders), sorted; a file
 /// with a panel extension is kept; anything else, or a path that does not
-/// exist, is dropped. Folders giving no file are noted. Blocking (file
-/// I/O): call off the UI thread.
+/// exist, is dropped (and noted). Folders giving no file are noted.
+/// Blocking (file I/O): call off the UI thread.
 pub(crate) fn panel_files_in(paths: Vec<PathBuf>) -> Found {
     let mut out = Found::default();
     for path in paths {
@@ -213,6 +216,8 @@ pub(crate) fn panel_files_in(paths: Vec<PathBuf>) -> Found {
             out.files.extend(files);
         } else if is_panel_file(&path) && path.is_file() {
             out.files.push(normalize(&path));
+        } else {
+            out.skipped.push(path);
         }
     }
     out

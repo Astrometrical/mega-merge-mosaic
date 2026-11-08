@@ -121,6 +121,8 @@ const READING: &str = "Reading…";
 const UNREADABLE: &str = "Unreadable";
 /// The tag of a row whose panel was moved by hand.
 const BY_HAND: &str = "by hand";
+/// Why a batch of files that are not panels added nothing.
+const ONLY_PANELS: &str = "Only XISF and FITS panel files can be added";
 
 /// The table's columns.
 const COLUMNS: [Column<'static>; 5] = [
@@ -508,9 +510,9 @@ fn removed_title(n: usize) -> String {
 
 /// The toast saying why adding `found` added nothing, every reason in one
 /// toast, the worst first: folders that couldn't be read, folders with no
-/// panel at their top level, then panels already in the session. None when
-/// there is nothing to say (no folder, no panel file). For a batch that
-/// added nothing.
+/// panel at their top level, panels already in the session, then files
+/// that are not panels (or not there). None for an empty batch. For a
+/// batch that added nothing.
 fn nothing_added(found: &Found) -> Option<WindowToast> {
     let names = |paths: &[PathBuf]| -> String {
         let names: Vec<String> = paths.iter().map(|p| file_name(p)).collect();
@@ -528,6 +530,9 @@ fn nothing_added(found: &Found) -> Option<WindowToast> {
     }
     if !found.files.is_empty() {
         reasons.push("Already in the session".to_string());
+    }
+    if !found.skipped.is_empty() {
+        reasons.push(ONLY_PANELS.to_string());
     }
     let mut reasons = reasons.into_iter();
     let title = reasons.next()?;

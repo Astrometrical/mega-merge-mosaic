@@ -2102,10 +2102,31 @@ fn nothing_added_names_each_reason() {
         files: files.iter().map(PathBuf::from).collect(),
         empty: empty.iter().map(PathBuf::from).collect(),
         unreadable: unreadable.iter().map(PathBuf::from).collect(),
+        skipped: Vec::new(),
     };
     let toast = |f: Found| nothing_added(&f).map(|t| (t.toast.title, t.toast.detail));
-    // Nothing to say: no folder, no panel (a stray file dropped).
+    // Nothing to say: nothing in the batch.
     assert_eq!(toast(found(&[], &[], &[])), None);
+    // Only files that are not panels (or not there).
+    let strays = Found {
+        skipped: vec![PathBuf::from("d/notes.txt"), PathBuf::from("d/gone.xisf")],
+        ..Found::default()
+    };
+    assert_eq!(
+        toast(strays),
+        Some(("Only XISF and FITS panel files can be added".into(), None))
+    );
+    let with_known = Found {
+        skipped: vec![PathBuf::from("d/notes.txt")],
+        ..found(&["d/a.xisf"], &[], &[])
+    };
+    assert_eq!(
+        toast(with_known),
+        Some((
+            "Already in the session".into(),
+            Some("Only XISF and FITS panel files can be added".into())
+        ))
+    );
     assert_eq!(
         toast(found(&["d/a.xisf"], &[], &[])),
         Some(("Already in the session".into(), None))
@@ -2243,6 +2264,29 @@ fn a_stale_undo_keeps_a_later_choice() {
     assert_eq!(s.session.mosaic.config.grouping, manual);
     assert_eq!(on_disk(s).grouping, manual);
     assert_eq!(s.session.mosaic.config.provenance.len(), edits, "no edit");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropping_no_panel_files_says_so() {
+    let root = temp_dir("list-strays");
+    let notes = root.join("notes.txt");
+    std::fs::write(&notes, b"text").unwrap();
+    let session = create_blocking(&root.join("s.mmm-session")).unwrap();
+    let mut h = harness(session, vec![], runner());
+    steps(&mut h);
+    drop_paths(&mut h, vec![notes, root.join("gone.xisf")]);
+    step_until(&mut h, |s| !s.list().adding() && !s.toasts.is_empty());
+    let toast = &h.state().toasts[0];
+    assert_eq!(
+        toast.toast.title,
+        "Only XISF and FITS panel files can be added"
+    );
+    assert!(toast.toast.action.is_none() && toast.undo.is_none());
+    assert!(h.state().session.mosaic.config.panels.is_empty());
+    steps(&mut h);
+    assert_eq!(h.state().toasts.len(), 1, "one toast for the batch");
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
