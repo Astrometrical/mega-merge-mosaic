@@ -22,9 +22,10 @@ use crate::theme::tokens::{radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, MegaButton, NotesMode, SessionCardData, Toast, Toasts, chip, icon_button,
-    notes_view, overline, progress, property_grid, property_row, property_row_numeric,
-    property_row_ui, segmented, session_card, status, text_input,
+    ButtonKind, ChoiceChip, MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast,
+    Toasts, chip, choice_chip, icon_button, notes_view, overline, progress, property_grid,
+    property_row, property_row_numeric, property_row_ui, segmented, session_card, status,
+    step_strip, text_input,
 };
 
 /// The gallery's interactive state.
@@ -318,6 +319,51 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                 chip(ui, "OSC", None);
                 chip(ui, "Ha_3nm_2026-10-12_flat-corrected_master_light", None);
             });
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                for (label, color, selected, dashed) in [
+                    ("Hα", Some(GROUP_PALETTE[0]), true, false),
+                    ("OIII", Some(GROUP_PALETTE[2]), false, false),
+                    ("Composite", None, false, true),
+                    ("Composite", None, true, true),
+                ] {
+                    choice_chip(
+                        ui,
+                        &ChoiceChip {
+                            label,
+                            color,
+                            selected,
+                            dashed,
+                        },
+                    );
+                }
+            });
+        });
+
+        section(ui, "Step strip", |ui| {
+            let step = |label: &str, state| StripStep {
+                label: label.to_owned(),
+                state,
+                cancellable: false,
+            };
+            step_strip(
+                ui,
+                &[
+                    step("Todo", StepState::Todo),
+                    step("Next", StepState::Next),
+                    step("Done", StepState::Done),
+                    step("Warn", StepState::Warn),
+                    StripStep {
+                        cancellable: true,
+                        ..step(
+                            "Merging",
+                            StepState::Working {
+                                fraction: Some(0.43),
+                            },
+                        )
+                    },
+                ],
+            );
         });
 
         section(ui, "Status", |ui| {
