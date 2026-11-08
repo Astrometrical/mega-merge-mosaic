@@ -594,6 +594,18 @@ impl PanelsTab {
         self.pending.is_some()
     }
 
+    /// Apply the waiting edit now, without waiting for its retry (the
+    /// session is being left); call only while no job but an export runs.
+    /// One refused again because a store is held elsewhere stays waiting.
+    pub fn apply_waiting(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if let Some(edit) = self.pending.take() {
+            self.submit(edit, session, jobs);
+            if self.pending.is_some() {
+                tracing::warn!("the panel edit waits: a result is in use elsewhere");
+            }
+        }
+    }
+
     /// The inputs as shown: the waiting edit, else the session's.
     fn shown(&self, session: &OpenSession) -> PanelsEdit {
         self.pending

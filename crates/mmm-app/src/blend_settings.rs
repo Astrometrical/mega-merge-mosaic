@@ -446,6 +446,23 @@ impl SettingsPanel {
         }
     }
 
+    /// Apply the waiting edit now, without waiting for its retry (the
+    /// session is being left); call only while no job but an export runs.
+    /// One refused again because a store is held elsewhere stays waiting.
+    /// The impact when it was applied.
+    pub fn apply_waiting(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) -> Option<ChangeImpact> {
+        let edit = self.pending.take()?;
+        let applied = self.submit(edit, session, jobs);
+        if self.pending.is_some() {
+            tracing::warn!("the settings edit waits: a result is in use elsewhere");
+        }
+        applied
+    }
+
     /// Take a finished tile count, start one when needed, and apply a
     /// waiting edit once the runner is idle. Call every frame after the
     /// runner's poll, whichever tab is shown. The impact when an edit was

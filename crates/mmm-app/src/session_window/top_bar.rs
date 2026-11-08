@@ -1,5 +1,7 @@
-//! The top bar (spec §5, §6): **‹** (back to the start screen), the session
-//! name, the step strip ([`steps`]) and, at the right, the main button:
+//! The top bar (spec §5, §6, §15): **‹** (back to the start screen: the
+//! shell closes the session; disabled while an export runs, its tooltip
+//! says why), the session name, the step strip ([`steps`]) and, at the
+//! right, the main button:
 //! **Add panels…** while the session has no panels (it opens the panel
 //! list and its file dialog), **Merge** while a merge is needed
 //! ([`needs_merge`]) followed by the merge settings' summary ("Pyramid ·
@@ -34,6 +36,8 @@ use crate::session::OpenSession;
 
 /// The ‹ button's tooltip and accessible label.
 const BACK: &str = "Back to the start screen";
+/// Why ‹ cannot be pressed while exporting.
+const EXPORTING: &str = "Exporting: cancel it or wait to go back";
 /// Why **Merge** cannot be pressed while merging.
 const MERGING: &str = "Merging: the Merge step shows how far it is";
 
@@ -50,8 +54,16 @@ enum Main {
 }
 
 impl SessionWindow {
+    /// Why the session cannot be left now, if it cannot: an export is
+    /// running or queued (its Cancel is in the step strip). Anything else
+    /// running is cancelled on leaving.
+    pub fn back_block_reason(jobs: &JobRunner) -> Option<&'static str> {
+        jobs.run_of(JobTarget::Export).map(|_| EXPORTING)
+    }
+
     /// The top bar, one row filling `ui`'s width: the main button at the
-    /// right first, so it always shows; the rest from the left.
+    /// right first, so it always shows; the rest from the left. Whether ‹
+    /// was clicked.
     pub(super) fn top_bar(
         &mut self,
         ui: &mut egui::Ui,
@@ -59,16 +71,21 @@ impl SessionWindow {
         jobs: &mut JobRunner,
         pipeline: &mut Pipeline,
         checks: &ChecksEngine,
-    ) {
+    ) -> bool {
         let strip = steps(session, jobs, pipeline, checks);
         let mut event = None;
         let mut main = None;
+        let mut back = false;
         let row = egui::vec2(ui.available_width(), CONTROL_HEIGHT);
         ui.allocate_ui_with_layout(row, Layout::right_to_left(Align::Center), |ui| {
             main = self.main_button(ui, session, jobs);
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                // Wired to the start screen with the session's close.
-                let _ = ui.add(icon_button_of(ButtonKind::Quiet, icons::ARROW_LEFT, BACK));
+                let blocked = Self::back_block_reason(jobs);
+                let button = icon_button_of(ButtonKind::Quiet, icons::ARROW_LEFT, BACK);
+                back = ui
+                    .add_enabled(blocked.is_none(), button)
+                    .on_disabled_hover_text(blocked.unwrap_or_default())
+                    .clicked();
                 ui.add_space(space::XS);
                 ui.label(text(Type::Heading, session.name()));
                 ui.add_space(space::L);
@@ -90,6 +107,7 @@ impl SessionWindow {
             Some(StripEvent::Cancel(i)) => cancel_step(i, jobs),
             None => {}
         }
+        back
     }
 
     /// The main button (and, with **Merge**, the settings' summary after

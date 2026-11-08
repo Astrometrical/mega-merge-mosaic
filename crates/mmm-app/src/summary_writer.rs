@@ -10,14 +10,17 @@
 //! (classifying each group's result store, writing the file) runs on a
 //! background thread; the UI thread does no file I/O. The classified
 //! result states are handed back ([`SummaryWriter::take_results`]) unless
-//! something changed while they were read.
+//! something changed while they were read. Leaving the session writes the
+//! summary one last time on the UI thread ([`SummaryWriter::finish`]); no
+//! background write lands after that.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use mmm_core::mosaic::MosaicConfig;
 use mmm_core::mosaic::grouping::Groups;
+use mmm_core::mosaic::{Mosaic, MosaicConfig};
 use mmm_core::session_summary::{
     GroupSummary, ResultState, SUMMARY_FORMAT, SessionSummary, result_state, write_summary,
 };
@@ -108,11 +111,82 @@ impl Settings {
     }
 }
 
-/// What a background write found: each group's result, and the summary it
-/// wrote (`None` if unchanged or the write failed).
+impl Inputs {
+    /// What `session` shows now, with its check counts and last view.
+    fn of(session: &OpenSession, checks: Option<CheckCounts>, last_view: Option<String>) -> Self {
+        Inputs {
+            panels: session.mosaic.config.panels.len(),
+            groups: session
+                .groups
+                .as_ref()
+                .map(Groups::processing_groups)
+                .unwrap_or_default(),
+            checks,
+            canvas: session.canvas(),
+            last_view,
+            settings: Settings::of(&session.mosaic.config),
+        }
+    }
+}
+
+/// What a write found: each group's result, and the summary it wrote
+/// (`None` if unchanged, the write failed, or the writer was closed).
 struct Written {
     results: BTreeMap<String, ResultState>,
     summary: Option<SessionSummary>,
+}
+
+/// Classify each processing group's result store, then write the summary of
+/// `inputs` and those results unless `last` already says the same, or
+/// `closed` (held around the write) says the writer is closed. Blocking
+/// file I/O.
+fn classify_and_write(
+    mosaic: &Mosaic,
+    groups: Option<&Groups>,
+    inputs: &Inputs,
+    stamps: &Stamps,
+    last: Option<&SessionSummary>,
+    closed: Option<&Mutex<bool>>,
+) -> Written {
+    let results: BTreeMap<String, ResultState> = groups
+        .iter()
+        .flat_map(|g| g.processing_groups())
+        .map(|(g, _)| {
+            let state = result_state(&mosaic.result_path(&g));
+            (g, state)
+        })
+        .collect();
+    let mut summary = summarize(
+        &mosaic.config,
+        groups,
+        inputs.checks,
+        inputs.canvas,
+        inputs.last_view.clone(),
+        &results,
+        stamps,
+    );
+    if last.is_some_and(|l| same_facts(l, &summary)) {
+        return Written {
+            results,
+            summary: None,
+        };
+    }
+    let closed = closed.map(|c| c.lock().unwrap_or_else(PoisonError::into_inner));
+    if closed.as_deref() == Some(&true) {
+        return Written {
+            results,
+            summary: None,
+        };
+    }
+    summary.written_at = unix_now();
+    let summary = match write_summary(&mosaic.dir, &summary) {
+        Ok(()) => Some(summary),
+        Err(e) => {
+            tracing::warn!("cannot write the session summary: {e}");
+            None
+        }
+    };
+    Written { results, summary }
 }
 
 /// Writes the session's summary in the background when it has changed.
@@ -126,6 +200,9 @@ pub struct SummaryWriter {
     running: Option<Receiver<Written>>,
     /// Result states classified and not taken yet.
     results: Option<BTreeMap<String, ResultState>>,
+    /// Set (under the lock) by [`SummaryWriter::finish`]: background writes
+    /// check it, holding the lock while they write.
+    closed: Arc<Mutex<bool>>,
     /// How many summaries have been written (for tests).
     #[cfg(test)]
     writes: usize,
@@ -158,9 +235,51 @@ impl SummaryWriter {
             inputs: None,
             running: None,
             results: None,
+            closed: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             writes: 0,
         }
+    }
+
+    /// Write the summary of `session` now, on this thread, and nothing
+    /// after: the session is being left. A background write under way
+    /// finishes first; one that has not written yet never does. Like a
+    /// background write, it reads each group's result state and skips the
+    /// file when the facts are unchanged. Blocking file I/O on the UI
+    /// thread, on the user's ‹ only.
+    pub fn finish(
+        &mut self,
+        session: &OpenSession,
+        checks: Option<CheckCounts>,
+        last_view: Option<String>,
+    ) {
+        let closed = Arc::clone(&self.closed);
+        let mut closed = closed.lock().unwrap_or_else(PoisonError::into_inner);
+        *closed = true;
+        if let Some(rx) = self.running.take()
+            && let Ok(Written {
+                summary: Some(s), ..
+            }) = rx.try_recv()
+        {
+            self.last = Some(s);
+        }
+        let inputs = Inputs::of(session, checks, last_view);
+        let written = classify_and_write(
+            &session.mosaic,
+            session.groups.as_ref(),
+            &inputs,
+            &self.stamps,
+            self.last.as_ref(),
+            None,
+        );
+        if written.summary.is_some() {
+            #[cfg(test)]
+            {
+                self.writes += 1;
+            }
+            self.last = written.summary;
+        }
+        self.dirty = false;
     }
 
     /// Note that something the summary shows may have changed (a job ended).
@@ -245,18 +364,7 @@ impl SummaryWriter {
                 Err(TryRecvError::Empty) => return,
             }
         }
-        let inputs = Inputs {
-            panels: session.mosaic.config.panels.len(),
-            groups: session
-                .groups
-                .as_ref()
-                .map(Groups::processing_groups)
-                .unwrap_or_default(),
-            checks,
-            canvas: session.canvas(),
-            last_view,
-            settings: Settings::of(&session.mosaic.config),
-        };
+        let inputs = Inputs::of(session, checks, last_view);
         if self.inputs.as_ref() != Some(&inputs) {
             self.inputs = Some(inputs.clone());
             self.dirty = true;
@@ -276,41 +384,21 @@ impl SummaryWriter {
         let groups = session.groups.clone();
         let stamps = self.stamps.clone();
         let last = self.last.clone();
+        let closed = Arc::clone(&self.closed);
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("mmm-summary".into())
             .spawn(move || {
-                let results: BTreeMap<String, ResultState> = groups
-                    .iter()
-                    .flat_map(Groups::processing_groups)
-                    .map(|(g, _)| {
-                        let state = result_state(&mosaic.result_path(&g));
-                        (g, state)
-                    })
-                    .collect();
-                let mut summary = summarize(
-                    &mosaic.config,
+                let written = classify_and_write(
+                    &mosaic,
                     groups.as_ref(),
-                    inputs.checks,
-                    inputs.canvas,
-                    inputs.last_view,
-                    &results,
+                    &inputs,
                     &stamps,
+                    last.as_ref(),
+                    Some(&closed),
                 );
-                let summary = if last.as_ref().is_some_and(|l| same_facts(l, &summary)) {
-                    None
-                } else {
-                    summary.written_at = unix_now();
-                    match write_summary(&mosaic.dir, &summary) {
-                        Ok(()) => Some(summary),
-                        Err(e) => {
-                            tracing::warn!("cannot write the session summary: {e}");
-                            None
-                        }
-                    }
-                };
-                let _ = tx.send(Written { results, summary });
+                let _ = tx.send(written);
                 ctx.request_repaint();
             });
         match spawned {
@@ -325,7 +413,7 @@ mod tests {
     use super::*;
     use mmm_core::job::JobCtl;
     use mmm_core::mosaic::{analyze_all, blend_group, invalidate_group, set_settings};
-    use mmm_core::session_summary::read_summary;
+    use mmm_core::session_summary::{SUMMARY_FILE, read_summary};
 
     use crate::start::tests::temp_dir;
 
@@ -472,6 +560,29 @@ mod tests {
         settle(&mut w, &ctx, &s);
         assert_eq!(w.writes, 2);
         assert_eq!(read_summary(&dir).unwrap().groups[1].blended_at, Some(333));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finish_writes_at_once_and_nothing_lands_after() {
+        let root = temp_dir("summary-finish");
+        let s = crate::testutil::two_group_session(&root);
+        let dir = s.mosaic.dir.clone();
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        // A background write starts, then the session is left at once.
+        w.poll(&ctx, &s, None, Some("Ha".into()));
+        w.record_blend("Ha", 111);
+        w.finish(&s, None, Some("OIII".into()));
+        let written = read_summary(&dir).unwrap();
+        assert_eq!(written.last_view.as_deref(), Some("OIII"));
+        assert_eq!(written.groups[0].blended_at, Some(111));
+        let bytes = std::fs::read(dir.join(SUMMARY_FILE)).unwrap();
+        // Nothing is written after it, by the write under way or a later one.
+        w.record_blend("OIII", 222);
+        settle(&mut w, &ctx, &s);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(std::fs::read(dir.join(SUMMARY_FILE)).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(&root);
     }
 

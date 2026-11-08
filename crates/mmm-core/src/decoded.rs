@@ -98,6 +98,12 @@ pub fn set_cache_dir(dir: PathBuf) {
     *CACHE_DIR.write().unwrap_or_else(|e| e.into_inner()) = Some(dir);
 }
 
+/// Forget the cache directory set by [`set_cache_dir`] (its session was
+/// closed): until one is set again, panels are decoded into memory.
+pub fn clear_cache_dir() {
+    *CACHE_DIR.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// The cache directory as set by [`set_cache_dir`]; `None` when no session
 /// provides one, in which case panels are decoded into memory and nothing is
 /// left behind on disk.

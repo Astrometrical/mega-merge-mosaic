@@ -493,6 +493,32 @@ impl JobRunner {
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
     }
 
+    /// Cancel every job, exports included, and wait up to `wait` for the
+    /// running one to stop, applying (or discarding) its outcome as
+    /// [`JobRunner::poll`] does (a cancelled analysis keeps the groups it
+    /// finished). The events of the jobs that ended, and whether every job
+    /// stopped in time (one that did not winds down on its own, and nothing
+    /// applies its outcome). Blocks the calling (UI) thread: for leaving the
+    /// session only.
+    pub fn stop_all(&mut self, session: &mut OpenSession, wait: Duration) -> (Vec<JobEvent>, bool) {
+        let deadline = Instant::now() + wait;
+        if let Some(r) = &self.running {
+            r.token.cancel();
+        }
+        let dropped: Vec<u64> = self.queue.drain(..).map(|q| q.id).collect();
+        self.pending
+            .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+        let mut events = self.poll(session);
+        while self.busy() {
+            if Instant::now() >= deadline {
+                return (events, false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(self.poll(session));
+        }
+        (events, true)
+    }
+
     /// Whether a blend is running or queued.
     pub fn blending(&self) -> bool {
         self.running.as_ref().is_some_and(|r| r.blend.is_some())
@@ -1173,6 +1199,34 @@ pub(crate) mod tests {
         let gate = r.hold();
         r.start_blend(&mut s, "Ha", None);
         assert!(!r.analyzing(), "a blend is not an analysis");
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stop_all_cancels_every_job_and_waits_for_it() {
+        let (root, mut s, mut r) = analyzed("job-stop-all");
+        let gate = r.hold();
+        let ha = r.start_blend(&mut s, "Ha", None);
+        let export = r.start_export(&s, "OIII", root.join("o.fits"), ExportFormat::Fits);
+        // The running merge gets going while `stop_all` waits for it.
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            gate.open();
+        });
+        let (events, stopped) = r.stop_all(&mut s, Duration::from_secs(20));
+        opener.join().unwrap();
+        assert!(stopped);
+        assert!(!r.busy());
+        for id in [ha, export] {
+            assert!(events.contains(&JobEvent::Cancelled { id }), "{events:?}");
+        }
+        // A job that ignores the wait is left to wind down.
+        let gate = r.hold();
+        r.start_blend(&mut s, "OIII", None);
+        let (_, stopped) = r.stop_all(&mut s, Duration::from_millis(20));
+        assert!(!stopped);
         gate.open();
         let _ = drain(&mut r, &mut s);
         let _ = std::fs::remove_dir_all(&root);

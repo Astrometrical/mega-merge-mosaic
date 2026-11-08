@@ -293,6 +293,31 @@ fn apply_during_a_blend_cancels_it_and_applies_when_idle() {
 }
 
 #[test]
+fn a_waiting_edit_applies_when_the_session_is_left() {
+    let (root, mut s, mut jobs) = analyzed("settings-apply-waiting");
+    let gate = jobs.hold();
+    jobs.start_blend(&mut s, "Ha", None);
+    let mut panel = SettingsPanel::new();
+    let mut e = SettingsEdit::of(&s.mosaic.config);
+    e.blend.feather_px = 100.0;
+    panel.stage(e, &s.mosaic.config);
+    assert_eq!(panel.apply(&mut s, &mut jobs), None);
+    assert!(panel.has_pending(), "waits for the merge to stop");
+    // Leaving the session: the jobs stop, then the edit applies at once.
+    gate.open();
+    let (_, stopped) = jobs.stop_all(&mut s, std::time::Duration::from_secs(20));
+    assert!(stopped);
+    assert_eq!(
+        panel.apply_waiting(&mut s, &mut jobs),
+        Some(ChangeImpact::Reblend)
+    );
+    assert!(!panel.has_pending());
+    let saved = mmm_core::mosaic::MosaicConfig::load(&s.mosaic.dir).unwrap();
+    assert_eq!(saved.blend.feather_px, 100.0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn blend_local_edit_spares_a_running_analysis() {
     let (root, mut s, mut jobs) = analyzed("settings-spare-analysis");
     let ctx = egui::Context::default();

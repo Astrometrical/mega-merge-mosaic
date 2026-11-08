@@ -1,5 +1,6 @@
 //! The application shell: the start screen until a session is open, then
-//! the session view. [`Shell`] is plain egui (testable without eframe);
+//! the session window, until its ‹ goes back to the start screen
+//! ([`Shell::close_session`]). [`Shell`] is plain egui (testable without eframe);
 //! [`MmmApp`] wraps it for eframe with persistence and the self-test.
 
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ const DECODED_DIR: &str = "decoded";
 const RECENT_KEY: &str = "recent_sessions";
 /// The window title when no session is open.
 const APP_TITLE: &str = "Mega Merge Mosaic";
+/// Longest leaving the session waits for its jobs to stop.
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// The window title for a session named `name`.
 fn session_title(name: &str) -> String {
@@ -157,12 +160,75 @@ impl Shell {
         &self.checks
     }
 
-    /// Save anything held back by a rate limit (the display stretch, ROIs,
-    /// composites, notes), e.g. when the window closes.
+    /// Save anything held back: edits waiting for the jobs to stop (panels,
+    /// merge settings) when none runs, then what a rate limit holds back
+    /// (the display stretch, ROIs, composites, notes). When the window
+    /// closes, and on leaving the session ([`Shell::close_session`]); also
+    /// from eframe's periodic save.
     pub fn flush_pending_saves(&mut self) {
-        if let Some(session) = &self.session {
-            self.window.flush_save(session);
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if let Some(jobs) = &mut self.jobs {
+            self.window.apply_waiting_edits(session, jobs);
         }
+        self.window.flush_save(session);
+    }
+
+    /// Leave the open session for the start screen, in this window (‹,
+    /// spec §15). Refused while an export runs or waits (`Err` says why).
+    /// Otherwise every other job is cancelled (all can be run again) and
+    /// waited for, at most [`STOP_WAIT`] (one that ignores it is left to
+    /// wind down, logged); pending saves are flushed
+    /// ([`Shell::flush_pending_saves`]) and the summary written, both on
+    /// this thread; the session is dropped (its lock released) with its
+    /// window, pipeline, checks and summary writer; the decode cache is
+    /// forgotten; the start screen reads the session's facts again; the
+    /// title names no session. Nothing writes into the session after.
+    /// Without a session open, nothing to do.
+    pub fn close_session(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        if let Some(jobs) = &mut self.jobs {
+            if let Some(why) = SessionWindow::back_block_reason(jobs) {
+                return Err(why.to_string());
+            }
+            let (events, stopped) = jobs.stop_all(session, STOP_WAIT);
+            for event in &events {
+                let target = match event {
+                    JobEvent::Finished { id, .. } => jobs.target(*id),
+                    _ => None,
+                };
+                self.summary.on_job_event(event, target, unix_now());
+            }
+            if !stopped {
+                tracing::warn!(
+                    "a job did not stop within {} s of leaving the session; it winds down on its own",
+                    STOP_WAIT.as_secs()
+                );
+            }
+        }
+        self.flush_pending_saves();
+        let Some(session) = self.session.take() else {
+            return Ok(());
+        };
+        let checks = self.checks.counts(&session.mosaic.config);
+        let last_view = self.window.view_key(&session.mosaic.config.ui);
+        self.summary.finish(&session, checks, last_view);
+        self.jobs = None;
+        let dir = session.mosaic.dir.clone();
+        drop(session);
+        self.window = SessionWindow::new(self.files_picker.clone());
+        self.pipeline = Pipeline::new();
+        self.checks = ChecksEngine::new();
+        self.summary = SummaryWriter::new(None);
+        mmm_core::decoded::clear_cache_dir();
+        tracing::info!("closed session {}", dir.display());
+        self.start.session_closed(&dir);
+        self.update_title(ctx);
+        ctx.request_repaint();
+        Ok(())
     }
 
     /// Open or create a session on a background thread. With a session
@@ -235,28 +301,19 @@ impl Shell {
                         "{} is already open in this window.",
                         dir.display()
                     )));
-                } else if self.session.is_some() {
-                    // One session per window: the other one gets its own.
-                    // A created session holds the lock; release it so the
-                    // child can take it.
+                } else if self.session.is_some() || opened.lock.is_none() {
+                    // One session per window: the other one gets its own
+                    // (also when this window's session was closed since it
+                    // was asked for: it was only checked, without the
+                    // lock). A created session holds the lock; release it
+                    // so the child can take it.
                     drop(opened);
                     let now = ctx.input(|i| i.time);
                     if launch(&*self.launcher, &mut self.toasts, now, Some(&dir)) {
                         self.start.record_opened(&dir, unix_now());
                     }
                 } else {
-                    tracing::info!("opened session {}", dir.display());
-                    self.start.record_opened(&dir, unix_now());
-                    // Compressed panels decode to disk once, shared by
-                    // previews and analysis (one session per process).
-                    mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
-                    self.summary = SummaryWriter::new(opened.summary.clone());
-                    self.session = Some(opened);
-                    self.jobs = Some(JobRunner::new(ctx.clone()));
-                    // A session without panels opens on its panel list.
-                    self.window = SessionWindow::new(self.files_picker.clone());
-                    self.pipeline = Pipeline::new();
-                    self.checks = ChecksEngine::new();
+                    self.open_here(opened, ctx);
                 }
             }
             Err(message) => {
@@ -264,6 +321,25 @@ impl Shell {
                 self.start.set_error(Some(message));
             }
         }
+    }
+
+    /// Show `opened` (its lock taken) in this window: recorded as opened,
+    /// its decode cache set, and a fresh job runner, window, pipeline,
+    /// checks and summary writer made for it.
+    fn open_here(&mut self, opened: OpenSession, ctx: &egui::Context) {
+        let dir = opened.mosaic.dir.clone();
+        tracing::info!("opened session {}", dir.display());
+        self.start.record_opened(&dir, unix_now());
+        // Compressed panels decode to disk once, shared by previews and
+        // analysis (one session per process).
+        mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
+        self.summary = SummaryWriter::new(opened.summary.clone());
+        self.session = Some(opened);
+        self.jobs = Some(JobRunner::new(ctx.clone()));
+        // A session without panels opens on its panel list.
+        self.window = SessionWindow::new(self.files_picker.clone());
+        self.pipeline = Pipeline::new();
+        self.checks = ChecksEngine::new();
     }
 
     /// Apply finished jobs and toast each outcome, let the panel list
@@ -339,6 +415,12 @@ impl Shell {
                 self.toasts
                     .push(toast(Tone::Problem, message), ctx.input(|i| i.time));
             }
+        }
+        if out.back
+            && let Err(why) = self.close_session(&ctx)
+        {
+            self.toasts
+                .push(toast(Tone::Neutral, why), ctx.input(|i| i.time));
         }
     }
 }
@@ -752,7 +834,7 @@ mod tests {
     use std::sync::Arc;
 
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
     use crate::start::tests::{
@@ -1233,6 +1315,168 @@ mod tests {
         shell.flush_pending_saves();
         let back = mmm_core::mosaic::MosaicConfig::load(&dir).unwrap();
         assert_eq!(back.ui["marker"], 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The ‹ button's label.
+    const BACK: &str = "Back to the start screen";
+
+    /// The window titles sent in the last frame.
+    fn titles(h: &Harness<'static, Shell>) -> Vec<String> {
+        h.output().viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::ViewportCommand::Title(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A shell (asking `launcher` for other windows) with the session in
+    /// `dir` open, as the start screen opens one; its job runner holds every
+    /// worker at the gate returned until it opens.
+    fn harness_open(
+        dir: &Path,
+        launcher: Arc<RecordingLauncher>,
+    ) -> (Harness<'static, Shell>, Arc<crate::jobs::tests::Gate>) {
+        let mut h = harness_launching(StubPicker(None), launcher);
+        let opened = crate::session::open_blocking(dir).unwrap();
+        let ctx = h.ctx.clone();
+        let shell = h.state_mut();
+        shell.open_here(opened, &ctx);
+        let gate = shell.jobs.as_mut().unwrap().hold();
+        (h, gate)
+    }
+
+    #[test]
+    fn back_returns_to_the_start_screen() {
+        use crate::session::{notes, set_notes};
+        use mmm_core::mosaic::MosaicConfig;
+        let root = temp_dir("shell-back");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let launcher = Arc::new(RecordingLauncher::default());
+        let (mut h, gate) = harness_open(&dir, launcher.clone());
+        gate.open();
+        h.run_steps(3);
+        assert!(h.query_by_label("Resume session").is_none());
+        // Notes typed in the session window: saved, then a later edit held
+        // back by the rate limit.
+        let type_notes = |h: &mut Harness<'static, Shell>, text: &str| {
+            let shell = h.state_mut();
+            set_notes(&mut shell.session.as_mut().unwrap().mosaic.config.ui, text);
+            shell.window.touch_save();
+        };
+        let on_disk = |dir: &Path| notes(&MosaicConfig::load(dir).unwrap().ui);
+        type_notes(&mut h, "Draft");
+        step_until(&mut h, |_| on_disk(&dir) == "Draft");
+        type_notes(&mut h, "Redo DBE");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, BACK)
+            .click();
+        h.step();
+        assert!(h.state().session().is_none());
+        assert_eq!(on_disk(&dir), "Redo DBE", "flushed on leaving");
+        assert_eq!(titles(&h), ["Mega Merge Mosaic"]);
+        // The start screen, the session's card read again (its notes as
+        // the window saved them).
+        step_until(&mut h, |s| !s.start.checking_recent());
+        h.run();
+        h.get_by_label("Resume session");
+        assert_eq!(h.state().start.notes_text(), "Redo DBE");
+        // It opens again in this window.
+        h.get_by_label("Resume session").click();
+        step_until(&mut h, |s| s.session().is_some());
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
+        assert!(launcher.0.lock().unwrap().is_empty(), "no other window");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_cancels_running_work_and_releases_the_lock() {
+        use mmm_core::mosaic::{CONFIG_FILE, lock_session};
+        use mmm_core::session_summary::SUMMARY_FILE;
+        let root = temp_dir("shell-back-cancel");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, previews) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        // The previews pass; the analysis after them is held before it
+        // starts.
+        step_until(&mut h, |s| s.jobs.as_ref().unwrap().busy());
+        let analysis = h.state_mut().jobs.as_mut().unwrap().hold();
+        previews.open();
+        let running = |s: &Shell| {
+            let views = s.jobs.as_ref().unwrap().views();
+            views.first().is_some_and(|v| v.label == "Analyze")
+        };
+        step_until(&mut h, running);
+        assert!(running(h.state()), "analysing");
+        // It gets going while ‹ waits for it to stop.
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            analysis.open();
+        });
+        h.get_by_role_and_label(egui::accesskit::Role::Button, BACK)
+            .click();
+        h.step();
+        assert!(h.state().session().is_none());
+        assert!(h.state().jobs.is_none(), "no jobs");
+        drop(lock_session(&dir).expect("the session's lock is released"));
+        let config = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
+        let summary = std::fs::read(dir.join(SUMMARY_FILE)).expect("a summary");
+        opener.join().unwrap();
+        // A moment later, nothing has written into the session.
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(dir.join(CONFIG_FILE)).unwrap(), config);
+        assert_eq!(std::fs::read(dir.join(SUMMARY_FILE)).unwrap(), summary);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_is_disabled_while_exporting() {
+        use egui::accesskit::Role;
+        use mmm_core::export::ExportFormat;
+        let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("shell-back-export");
+        jobs.start_blend(&mut s, "Ha", None);
+        let _ = crate::jobs::tests::drain(&mut jobs, &mut s);
+        let dir = s.mosaic.dir.clone();
+        drop((s, jobs));
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        {
+            let shell = h.state_mut();
+            let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
+            jobs.start_export(session, "Ha", root.join("Ha.fits"), ExportFormat::Fits);
+        }
+        h.run_steps(3);
+        let back = |h: &Harness<'static, Shell>| {
+            h.get_by_role_and_label(Role::Button, BACK)
+                .accesskit_node()
+                .is_disabled()
+        };
+        assert!(back(&h), "disabled while exporting");
+        // Its tooltip says why.
+        let why = "Exporting: cancel it or wait to go back";
+        h.get_by_role_and_label(Role::Button, BACK).hover();
+        for _ in 0..200 {
+            if h.query_by_label(why).is_some() {
+                break;
+            }
+            h.step();
+        }
+        h.get_by_label(why);
+        let ctx = h.ctx.clone();
+        assert_eq!(h.state_mut().close_session(&ctx), Err(why.to_string()));
+        assert!(h.state().session().is_some());
+        // Once the export has ended, ‹ goes back.
+        gate.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        assert!(!back(&h));
+        h.get_by_role_and_label(Role::Button, BACK).click();
+        h.step();
+        assert!(h.state().session().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

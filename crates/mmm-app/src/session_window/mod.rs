@@ -3,10 +3,11 @@
 //! ([`MosaicView`]) of the group or composite chosen, with a view bar
 //! across its top, and the inspector at its right.
 //!
-//! - **Top bar** ([`top_bar`]): ‹, the session name, the step strip
-//!   ([`steps`]: Panels · Checks · Merge · Export, with the work in
-//!   progress) and the main button (**Add panels…**, **Merge** with the
-//!   merge settings' summary, or **Export…**).
+//! - **Top bar** ([`top_bar`]): ‹ (back to the start screen,
+//!   [`SessionOutput::back`]; not while an export runs), the session name,
+//!   the step strip ([`steps`]: Panels · Checks · Merge · Export, with the
+//!   work in progress) and the main button (**Add panels…**, **Merge**
+//!   with the merge settings' summary, or **Export…**).
 //! - **Panel list** ([`PanelsTab`]): while open it takes the canvas's
 //!   place (view bar included); the Panels step opens and closes it. A
 //!   session without panels opens on it. Files dropped on the window are
@@ -80,6 +81,9 @@ pub enum CanvasMode {
 pub struct SessionOutput {
     /// Accept these checks ([`ChecksEngine::accept`]).
     pub accept: Vec<Check>,
+    /// ‹ was clicked: back to the start screen
+    /// ([`crate::app::Shell::close_session`]).
+    pub back: bool,
 }
 
 /// The open session's window: canvas, view bar and inspector (see the
@@ -281,6 +285,18 @@ impl SessionWindow {
         self.mosaic.view_key(ui)
     }
 
+    /// Apply the edits waiting for the jobs to stop (panels, merge
+    /// settings) now, if no job but an export runs: the session is being
+    /// left, and nothing would apply them later. One refused because a
+    /// store is held elsewhere stays waiting (logged).
+    pub fn apply_waiting_edits(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if jobs.busy_except_exports() {
+            return;
+        }
+        self.panels.apply_waiting(session, jobs);
+        self.mosaic.apply_waiting_settings(session, jobs);
+    }
+
     /// Save a pending (rate-limited) change now, whatever the rate limit:
     /// the window is closing. A small `mosaic.json` write.
     pub fn flush_save(&mut self, session: &OpenSession) {
@@ -317,7 +333,9 @@ impl SessionWindow {
         egui::Panel::top("session-top-bar")
             .resizable(false)
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
-            .show(ui, |ui| self.top_bar(ui, session, jobs, pipeline, checks));
+            .show(ui, |ui| {
+                out.back = self.top_bar(ui, session, jobs, pipeline, checks);
+            });
         egui::Panel::right("session-inspector")
             .resizable(false)
             .exact_size(inspector_width(&self.inspector))

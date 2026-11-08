@@ -533,6 +533,15 @@ impl MosaicView {
         applied
     }
 
+    /// Apply a merge settings edit waiting for the jobs to stop now
+    /// ([`SettingsPanel::apply_waiting`]); call only while no job but an
+    /// export runs.
+    pub fn apply_waiting_settings(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if let Some(impact) = self.settings.apply_waiting(session, jobs) {
+            self.on_settings_applied(impact);
+        }
+    }
+
     /// The view's every-frame work, whether or not the canvas is drawn:
     /// resolve the view's groups, poll and start the background work
     /// (opening results, stretches, health, ROI sync and freshness), follow
