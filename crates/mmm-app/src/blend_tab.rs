@@ -122,6 +122,11 @@ impl BlendTab {
         self.mosaic.settings_editing(session)
     }
 
+    /// See [`MosaicView::poll`]. Call every frame, whichever tab is shown.
+    pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
+        self.mosaic.poll(ctx, session, jobs);
+    }
+
     /// See [`MosaicView::poll_settings`]. Call every frame, whichever tab
     /// is shown.
     pub fn poll_settings(

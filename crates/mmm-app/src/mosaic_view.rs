@@ -4,8 +4,15 @@
 //! and the look ([`CanvasLook`]), starts merges and exports through its
 //! methods, and shows the ROI list ([`MosaicView::rois_ui`]), the merge
 //! settings ([`MosaicView::settings_ui`]) and the health
-//! ([`MosaicView::health_ui`]) where it likes.
+//! ([`MosaicView::health_ui`]) where it likes, whether or not the canvas
+//! is drawn.
 //!
+//! - **Every frame.** The shell calls [`MosaicView::poll`] (and
+//!   [`MosaicView::poll_settings`]) every frame, shown or not: it resolves
+//!   the view's groups, opens and checks results, follows merges and
+//!   analyses, releases given-up sources and runs the ROI and health work,
+//!   so the merge guard, the ROI list and the health stay current while the
+//!   window shows the plan. [`MosaicView::show`] only draws.
 //! - **Views.** Each group, then each composition (the plan's
 //!   compositions, [`crate::compositions`]). A composition view mixes its
 //!   groups' results in a [`CompositeTileSource`], each through that
@@ -35,13 +42,15 @@
 //!   canvas size: the next viewer's first painted frame is through it,
 //!   never its home fit.
 //! - **Stretch.** Always automatic: [`DisplayStretch::params`] of each
-//!   shown group's coarse pyramid statistics, with the look's Linked and
-//!   Strong ([`CanvasLook::stretch`]). No pumping: while a merge of a shown
-//!   group runs, the stretch in use is held (the previous result's; for a
-//!   group's first result in a group view, the plan's stretch handed to
+//!   shown group's coarse pyramid statistics, with the session's Linked and
+//!   Strong ([`DisplayStretch`] in `MosaicConfig.ui`, what the look's
+//!   [`CanvasLook::stretch`] shows), followed by `poll` whether or not the
+//!   canvas is drawn. No pumping: while a merge of a shown group runs, the
+//!   stretch in use is held (the previous result's; for a group's first
+//!   result in a group view, the plan's stretch last handed to
 //!   [`MosaicView::show`]). It is worked out again when the merges of the
-//!   shown groups have ended, when the view changes and when the look
-//!   changes. The manual stretch earlier versions saved per group
+//!   shown groups have ended, when the view changes and when the toggles
+//!   change. The manual stretch earlier versions saved per group
 //!   (`blend_stretch` in `MosaicConfig.ui`) is ignored.
 //!
 //! Everything slow runs on background threads ([`Task`]): opening each
@@ -269,6 +278,10 @@ pub struct MosaicView {
     look: DisplayStretch,
     /// The view the members' stretches were last worked out for.
     stretch_view: Option<ViewKind>,
+    /// The view the members were last resolved for (by `poll`).
+    resolved: Option<ViewKind>,
+    /// The plan's stretch of the view, as last handed to `show`.
+    plan_stretch: Option<Vec<StretchParams>>,
     health: Option<HealthResult>,
     health_task: Option<Task<(String, HealthResult)>>,
     want_health: bool,
@@ -312,6 +325,8 @@ impl MosaicView {
             camera: None,
             look: DisplayStretch::default(),
             stretch_view: None,
+            resolved: None,
+            plan_stretch: None,
             health: None,
             health_task: None,
             want_health: false,
@@ -518,6 +533,46 @@ impl MosaicView {
             self.on_settings_applied(impact);
         }
         applied
+    }
+
+    /// The view's every-frame work, whether or not the canvas is drawn:
+    /// resolve the view's groups, poll and start the background work
+    /// (opening results, stretches, health, ROI sync and freshness), follow
+    /// merges and analyses, release given-up sources, and save. Call every
+    /// frame after the runner's poll (and [`MosaicView::track_analysis`]),
+    /// before anything is drawn. The stretch toggles followed are the
+    /// session's ([`DisplayStretch`] in `MosaicConfig.ui`).
+    pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
+        self.rois.load_once(&session.mosaic.config.ui);
+        let groups = group_names(session);
+        let compositions = load_compositions(&session.mosaic.config.ui);
+        match self.resolve_view(&groups, &compositions) {
+            Some(view) => {
+                // A composition's mapping may change (in the plan): follow
+                // it.
+                let members = view_members(&view, &compositions);
+                if self.view.as_ref() != Some(&view) || self.members != members {
+                    self.apply_view(view, members);
+                }
+            }
+            None => {
+                self.retire_all();
+                self.results.clear();
+                self.members.clear();
+                self.view = None;
+                self.group = None;
+            }
+        }
+        self.resolved = self.view.clone();
+        let look = DisplayStretch::load(&session.mosaic.config.ui);
+        let plan_stretch = self.plan_stretch.take();
+        self.update(ctx, session, jobs, look, plan_stretch.as_deref());
+        self.plan_stretch = plan_stretch;
+        self.sync_viewer(&compositions);
+        self.readiness = self
+            .group
+            .as_ref()
+            .map_or(Readiness::NotAnalyzed, |g| group_readiness(session, g));
     }
 
     /// Settings were applied: the view's results went stale (their tiles
@@ -766,46 +821,26 @@ impl MosaicView {
         }
     }
 
-    /// Draw the canvas filling `ui`, through `look`, and handle its input
-    /// (a rectangle drawn with the ROI tool becomes an ROI). `plan_stretch`
-    /// is the plan's stretch of the same view, held for a group's first
-    /// merge (see the module docs).
+    /// Draw the canvas filling `ui` and handle its input (a rectangle drawn
+    /// with the ROI tool becomes an ROI). Drawing only: the state it draws
+    /// is brought up to date by [`MosaicView::poll`]. The look's stretch
+    /// toggles are the session's, which `poll` follows (see the module
+    /// docs); `plan_stretch` is the plan's stretch of the same view, kept
+    /// for a group's first merge.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
-        jobs: &mut JobRunner,
-        look: &CanvasLook,
+        _jobs: &mut JobRunner,
+        _look: &CanvasLook,
         plan_stretch: Option<&[StretchParams]>,
     ) {
-        let ctx = ui.ctx().clone();
         self.shown = true;
-        self.rois.load_once(&session.mosaic.config.ui);
-        let groups = group_names(session);
-        let compositions = load_compositions(&session.mosaic.config.ui);
-        match self.resolve_view(&groups, &compositions) {
-            Some(view) => {
-                // A composition's mapping may change (in the plan): follow
-                // it.
-                let members = view_members(&view, &compositions);
-                if self.view.as_ref() != Some(&view) || self.members != members {
-                    self.apply_view(view, members);
-                }
-            }
-            None => {
-                self.retire_all();
-                self.results.clear();
-                self.members.clear();
-                self.view = None;
-                self.group = None;
-            }
+        self.plan_stretch = plan_stretch.map(<[StretchParams]>::to_vec);
+        if self.resolved.as_ref() != self.view.as_ref() {
+            // A view selected since the last poll: drawn from the next frame.
+            ui.ctx().request_repaint();
         }
-        self.update(&ctx, session, jobs, look.stretch, plan_stretch);
-        self.sync_viewer(&compositions);
-        self.readiness = self
-            .group
-            .as_ref()
-            .map_or(Readiness::NotAnalyzed, |g| group_readiness(session, g));
         let canvas = self.view_canvas();
         let overlays = self.rois.overlays();
         let notes = self.member_notes();

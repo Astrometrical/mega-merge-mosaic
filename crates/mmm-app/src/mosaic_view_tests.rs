@@ -22,6 +22,10 @@ struct State {
     look: CanvasLook,
     plan_stretch: Option<Vec<StretchParams>>,
     events: Vec<JobEvent>,
+    /// The canvas is drawn (else only the shell's every-frame work runs).
+    canvas: bool,
+    /// The ROI list and the health are drawn beside the canvas.
+    inspector: bool,
 }
 
 impl State {
@@ -33,13 +37,16 @@ impl State {
             look: CanvasLook::default(),
             plan_stretch: None,
             events: Vec::new(),
+            canvas: true,
+            inspector: false,
         }
     }
 }
 
 /// The view's canvas filling the window, driven as the shell drives it:
-/// the job runner's events and the settings first, then the canvas, then
-/// the export dialog.
+/// the job runner's events, the settings and the view's every-frame work
+/// first, then (when shown) the inspector and the canvas, then the export
+/// dialog.
 fn harness(state: State) -> Harness<'static, State> {
     Harness::builder()
         .with_size(egui::vec2(900.0, 700.0))
@@ -56,15 +63,24 @@ fn harness(state: State) -> Harness<'static, State> {
                 }
                 s.events.extend(events);
                 s.view.poll_settings(&ctx, &mut s.session, &mut s.jobs);
-                egui::CentralPanel::default().show(ui, |ui| {
-                    s.view.show(
-                        ui,
-                        &mut s.session,
-                        &mut s.jobs,
-                        &s.look,
-                        s.plan_stretch.as_deref(),
-                    );
-                });
+                s.view.poll(&ctx, &mut s.session, &mut s.jobs);
+                if s.inspector {
+                    egui::Panel::right("inspector").show(ui, |ui| {
+                        s.view.rois_ui(ui, &mut s.session);
+                        s.view.health_ui(ui);
+                    });
+                }
+                if s.canvas {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        s.view.show(
+                            ui,
+                            &mut s.session,
+                            &mut s.jobs,
+                            &s.look,
+                            s.plan_stretch.as_deref(),
+                        );
+                    });
+                }
                 s.view.export_ui(&ctx, &mut s.session, &mut s.jobs);
             },
             state,
@@ -330,6 +346,60 @@ fn first_merge_uses_the_plan_stretch() {
     assert_ne!(auto, plan);
     assert_eq!(src.stretch(), auto);
     drop(src);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_hidden_view_still_follows_analyses_and_merges() {
+    let (root, state) = merged_ha("mosaic-hidden");
+    let mut h = harness(state);
+    step_until(&mut h, |st| {
+        st.view.source().is_some() && st.view.is_settled()
+    });
+    // The canvas is hidden (the window shows the plan).
+    h.state_mut().canvas = false;
+    h.run_steps(2);
+    // An analysis ends (the automatic pipeline's, tracked by the shell):
+    // the results are checked again without the canvas being drawn, and
+    // merging is allowed again.
+    let id = {
+        let st = h.state_mut();
+        st.jobs.start_analyze(&mut st.session)
+    };
+    h.state_mut().view.track_analysis(id);
+    step_until(&mut h, |st| {
+        !st.jobs.busy() && st.view.merge_block_reason(&st.session, &st.jobs).is_none()
+    });
+    // A merge from the plan: the merged result opens again, still hidden.
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.view.merge_all(&mut st.session, &mut st.jobs);
+    }
+    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    gate.open();
+    step_until(&mut h, |st| {
+        !st.jobs.busy()
+            && st.view.source().is_some()
+            && st.view.merge_block_reason(&st.session, &st.jobs).is_none()
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rois_and_health_show_without_the_canvas() {
+    use egui_kittest::kittest::Queryable;
+
+    let (root, mut state) = merged_ha("mosaic-inspector-only");
+    state.canvas = false;
+    state.inspector = true;
+    let mut h = harness(state);
+    // The session's ROIs are listed and the health computed, though the
+    // canvas has never been drawn.
+    step_until(&mut h, |st| st.view.health().is_some());
+    h.get_by_label("ROI 1");
+    h.get_by_label("Seam step median");
+    assert!(h.query_by_label("None yet.").is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
 

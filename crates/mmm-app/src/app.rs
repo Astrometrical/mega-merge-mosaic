@@ -318,8 +318,9 @@ impl Shell {
     }
 
     /// Apply finished jobs and post a notice for each, let the Panels tab
-    /// take its background work and apply a waiting edit, then run the
-    /// automatic pipeline and the checks.
+    /// take its background work and apply a waiting edit, run the
+    /// automatic pipeline, let the merged mosaic follow (shown or not), and
+    /// run the checks.
     fn poll_jobs(&mut self, ctx: &egui::Context) {
         let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
             return;
@@ -363,6 +364,9 @@ impl Shell {
         if let Some(id) = self.pipeline.take_started_analysis() {
             self.blend.track_analysis(id);
         }
+        // The merged mosaic's state follows jobs and analyses even while
+        // another tab is shown.
+        self.blend.poll(ctx, session, jobs);
         self.checks.poll(ctx, session, jobs, &events);
         self.plan.release_if_hidden(now);
         // The last view: that of the active tab (Blend or Plan), else the other's.

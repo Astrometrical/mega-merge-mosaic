@@ -26,6 +26,7 @@ fn harness(state: State) -> Harness<'static, State> {
                     s.tab.on_event(&e);
                 }
                 s.tab.poll_settings(ui.ctx(), &mut s.session, &mut s.jobs);
+                s.tab.poll(ui.ctx(), &mut s.session, &mut s.jobs);
                 s.tab.ui(ui, &mut s.session, &mut s.jobs, None);
             },
             state,
