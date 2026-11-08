@@ -1112,7 +1112,34 @@ views and export. No algorithm changed. Core additions are bookkeeping
   other (`PlacedItem::highlighted`, `Row::highlighted`), a row click
   selects the panel on the plan (the inspector shows it) and a plan click
   selects and reveals its row (`TableState::reveal`); Esc clears both.
-  **Group by** chooses Don't group, a header keyword or a filename token.
+  Columns hide from the right as the list narrows (the first column elides,
+  the actions stay pinned); unknown cells show "—", "Reading…" or
+  "Unreadable". Row ids are stable (path based), so selection, folds and
+  hover survive a re-sort or regroup. Panels are added by **Add files…**,
+  **Add folder…** (top-level files only), dropped files and folders, or
+  More → Type a path…; an add that adds nothing says why in a toast ("No
+  panels at the top level of {folder}", "Already in the session", "Couldn't
+  read {folder}"). Undo toasts travel from the window to the shell
+  (`SessionOutput.toasts`, the `Undo` enum, `SessionWindow::undo`); an
+  Undo whose state has moved on is a no-op.
+  **Group by** chooses Don't group, FILTER header, Header keyword…, Path
+  keyword… or By hand (`GroupRule::{HeaderKeyword, PathKeyword, Manual}`;
+  the legacy `FilenameToken` is shown as Path keyword… until edited, and
+  re-picking the shown choice changes nothing). **Path keyword** is
+  WBPP-style: the whole path is split on `_ - space . / \`, the keyword
+  matches a whole token case-insensitively and the next token is the value;
+  conflicting values in one path mean no group. **By hand** groups only
+  what the user moves. **Automatic FILTER grouping** happens once: with at
+  least two FILTER values, grouping off and no earlier choice (an accepted
+  FiltersDifferUngrouped note, or a disabled non-default rule, counts as a
+  choice; a session opened with analysis results is skipped until its
+  panels change) it groups by FILTER and toasts "Grouped by FILTER: {k}
+  filters" with Undo, which restores only the grouping.
+  `mmm_core::panel_header::read_panel_header` opens a panel once for the
+  filter, exposure (EXPTIME/EXPOSURE), NCOMBINE and integration (exposure
+  times frames). Until a panel is aligned, `preview::aligned_bbox` gives its
+  outline on the plan early; the footprint worker cancels on a generation
+  or frame change.
   Group colours are stable and persisted in `ui.group_colors`: well-known
   filters get physical colours (Ha red, OIII cyan, SII orange-red `#E0703A`,
   R/G/B, L white), other names take the first unused entry after the six
@@ -1265,14 +1292,12 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
 
 ## Coming in project 3
 
-Plans 2–6 of project 3 change the session window as follows; none of it is
-built yet.
+Plan 2 (the panel list and grouping, above) is built. Plans 3–6 of project
+3 change the session window as follows; none of it is built yet.
 
-- **Plan 2, panel list and grouping.** The panel list sits beside the plan
-  instead of replacing the canvas, with sections, **Group by** and WBPP
-  keywords.
 - **Plan 3, draft merge settings.** Settings become drafts, with per-group
-  staleness (which groups are out of date, not just the mosaic).
+  staleness (which groups are out of date, not just the mosaic), including
+  on adding or removing panels.
 - **Plan 4, ROIs.** An ROI list with transient previews, drawing an ROI on the
   plan, and the Draw ROI shortcut.
 - **Plan 5, composites and export.** A composites popover and the new Export
@@ -1316,6 +1341,13 @@ stays free of `mmm-core`.
   whose order is frozen because sessions store its indices) and `brand`
   (the lockup; app names are images pre-rendered from Angora by
   `assets/brand/make-name.sh`).
+- **Table** (`mega_ui::table::sectioned_table`, `TableState`): sections with
+  a fold and a roll-up row ("… N more"; problem rows always shown), tags,
+  selection and highlight fills, "⋯" row actions (`icons::ELLIPSIS`), rows
+  that drag onto headings, columns that hide from the right and a first
+  column that elides when narrow, actions pinned; `TableState::reveal`
+  scrolls to a row. Layout tokens `PANEL_LIST_MIN_WIDTH` and
+  `CANVAS_MIN_WIDTH`; `PlacedItem.highlighted` lights a tile-viewer item.
 - **Gallery**: `cargo run -p mega-ui --example gallery` shows every token and
   component; `crates/mega-ui/tests/snapshots.rs` keeps image snapshots of it
   (ignored by default, see CLAUDE.md).
