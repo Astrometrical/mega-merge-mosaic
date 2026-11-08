@@ -44,6 +44,10 @@ impl FilesPicker for AskedFiles {
         self.0.store(true, Ordering::SeqCst);
         None
     }
+
+    fn pick_folders(&self) -> Option<Vec<PathBuf>> {
+        None
+    }
 }
 
 /// The window and what the shell hands it each frame.

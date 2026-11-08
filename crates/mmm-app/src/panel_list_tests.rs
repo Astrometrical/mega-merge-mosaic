@@ -37,6 +37,10 @@ impl FilesPicker for StubFiles {
     fn pick_files(&self) -> Option<Vec<PathBuf>> {
         Some(self.0.clone())
     }
+
+    fn pick_folders(&self) -> Option<Vec<PathBuf>> {
+        Some(self.0.clone())
+    }
 }
 
 /// A file dropped on the window (native: just a path).
@@ -618,6 +622,100 @@ fn add_files_dedupes() {
     let list = h.state().w.list_rect.expect("the list was drawn");
     assert!(list.width() >= WINDOW.x / 2.0 - 1.0, "{list:?}");
     assert_eq!(cells(&h, "a.xisf"), ["Unreadable", "—", "—", "—"]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A folder of empty panel files (names `names`), plus noise `panel_files_in`
+/// must skip: a subfolder with two panels and a `.txt`.
+fn folder_with_panels(root: &Path, names: &[&str]) -> PathBuf {
+    let dir = root.join("folder");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    for n in names {
+        std::fs::write(dir.join(n), b"not an image").unwrap();
+    }
+    for n in ["s1.xisf", "s2.xisf"] {
+        std::fs::write(dir.join("sub").join(n), b"not an image").unwrap();
+    }
+    std::fs::write(dir.join("notes.txt"), b"text").unwrap();
+    dir
+}
+
+/// Drop `paths` on the window for one frame.
+fn drop_paths(h: &mut Harness<'static, State>, paths: Vec<PathBuf>) {
+    h.input_mut().dropped_files = paths
+        .into_iter()
+        .map(|path| Arc::new(Dropped(path)) as egui::DroppedFileHandle)
+        .collect();
+    h.step();
+    h.input_mut().dropped_files.clear();
+}
+
+#[test]
+fn folders_add_only_new_top_level_panels() {
+    let root = temp_dir("list-folders");
+    let dir = folder_with_panels(&root, &["a.xisf", "b.fits", "c.XISF"]);
+    let session = create_blocking(&root.join("s.mmm-session")).unwrap();
+    let mut h = harness(session, vec![dir.clone()], runner());
+    steps(&mut h);
+    // One of the folder's panels is in already.
+    drop_paths(&mut h, vec![dir.join("a.xisf")]);
+    step_until(&mut h, |s| s.session.mosaic.config.panels.len() == 1);
+    step_until(&mut h, |s| s.settled() && !s.list().adding());
+    h.get_by_label("Add folder…").click();
+    step_until(&mut h, |s| s.session.mosaic.config.panels.len() == 3);
+    step_until(&mut h, |s| s.settled() && !s.list().adding());
+    assert_eq!(h.state().panel_names(), ["a.xisf", "b.fits", "c.XISF"]);
+    // The same folder dropped again adds nothing.
+    drop_paths(&mut h, vec![dir.clone()]);
+    steps(&mut h);
+    step_until(&mut h, |s| s.settled() && !s.list().adding());
+    assert_eq!(h.state().session.mosaic.config.panels.len(), 3);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropped_files_and_folders_mix() {
+    let root = temp_dir("list-mix");
+    let dir = folder_with_panels(&root, &["a.xisf", "b.xisf"]);
+    let lone = root.join("lone.fits");
+    std::fs::write(&lone, b"not an image").unwrap();
+    let missing = root.join("gone.xisf");
+    let session = create_blocking(&root.join("s.mmm-session")).unwrap();
+    let mut h = harness(session, vec![], runner());
+    steps(&mut h);
+    drop_paths(
+        &mut h,
+        vec![lone, dir.clone(), dir.join("notes.txt"), missing],
+    );
+    step_until(&mut h, |s| s.session.mosaic.config.panels.len() == 3);
+    step_until(&mut h, |s| s.settled() && !s.list().adding());
+    let mut names = h.state().panel_names();
+    names.sort();
+    assert_eq!(names, ["a.xisf", "b.xisf", "lone.fits"]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn typed_path_still_works() {
+    let root = temp_dir("list-typed");
+    let dir = folder_with_panels(&root, &["a.xisf", "b.xisf"]);
+    let session = create_blocking(&root.join("s.mmm-session")).unwrap();
+    let mut h = harness(session, vec![], runner());
+    steps(&mut h);
+    h.get_by_label("More").click();
+    steps(&mut h);
+    h.get_by_label("Type a path…").click();
+    steps(&mut h);
+    h.get_by_role_and_label(Role::TextInput, "Add path")
+        .type_text(dir.join("*.xisf").to_str().unwrap());
+    h.step();
+    h.key_press(egui::Key::Enter);
+    h.step();
+    step_until(&mut h, |s| s.session.mosaic.config.panels.len() == 2);
+    assert_eq!(h.state().panel_names(), ["a.xisf", "b.xisf"]);
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }

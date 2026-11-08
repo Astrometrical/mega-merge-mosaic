@@ -112,6 +112,10 @@ pub trait FilesPicker: Send + Sync {
     /// Show a multi-file dialog for panels; `None` when cancelled or when no
     /// dialog is available.
     fn pick_files(&self) -> Option<Vec<PathBuf>>;
+
+    /// Show a multi-folder dialog; `None` when cancelled or when no dialog
+    /// is available.
+    fn pick_folders(&self) -> Option<Vec<PathBuf>>;
 }
 
 /// The native dialog through `rfd`, filtered to [`PANEL_EXTENSIONS`].
@@ -124,6 +128,38 @@ impl FilesPicker for RfdFilesPicker {
             .add_filter("Panels (XISF, FITS)", &PANEL_EXTENSIONS)
             .pick_files()
     }
+
+    fn pick_folders(&self) -> Option<Vec<PathBuf>> {
+        rfd::FileDialog::new()
+            .set_title("Add folders of panels")
+            .pick_folders()
+    }
+}
+
+/// The panel files `paths` stand for, normalised: a directory contributes
+/// the panel files at its top level (never its subfolders), sorted; a file
+/// with a panel extension is kept; anything else, or a path that does not
+/// exist, is dropped. Blocking (file I/O): call off the UI thread.
+pub(crate) fn panel_files_in(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            let mut files: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| is_panel_file(p) && p.is_file())
+                .map(|p| normalize(&p))
+                .collect();
+            files.sort();
+            out.extend(files);
+        } else if is_panel_file(&path) && path.is_file() {
+            out.push(normalize(&path));
+        }
+    }
+    out
 }
 
 /// Whether `path` has a panel file extension.

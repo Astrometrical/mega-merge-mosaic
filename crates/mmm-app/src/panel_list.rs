@@ -78,7 +78,7 @@ use crate::checks::ChecksReport;
 use crate::jobs::JobRunner;
 use crate::panel_edits::{
     FilesPicker, PanelEdits, PanelsEdit, assign_group_colors, expand_typed, group_colors,
-    is_panel_file, load_group_colors, save_group_colors,
+    load_group_colors, panel_files_in, save_group_colors,
 };
 use crate::session::{OpenSession, normalize};
 use crate::session_window::{Undo, WindowToast};
@@ -899,15 +899,12 @@ impl PanelList {
                 .dropped_files
                 .iter()
                 .map(|f| f.path().to_path_buf())
-                .filter(|p| is_panel_file(p))
                 .collect()
         });
         if !dropped.is_empty() {
-            // Normalised (symlinks resolved) off the UI thread before the
-            // duplicate check, as picked and typed paths are.
-            let task = Task::spawn("mmm-drop-paths", ctx, move || {
-                dropped.iter().map(|p| normalize(p)).collect()
-            });
+            // Folders expanded and paths normalised (symlinks resolved) off
+            // the UI thread before the duplicate check.
+            let task = Task::spawn("mmm-drop-paths", ctx, move || panel_files_in(dropped));
             self.normalizing.extend(task);
         }
         let mut normalized = Vec::new();
@@ -1015,6 +1012,19 @@ impl PanelList {
         self.picking = Task::spawn("mmm-pick-files", ctx, move || {
             let picked = picker.pick_files()?;
             Some(picked.iter().map(|p| normalize(p)).collect())
+        });
+    }
+
+    /// Open the folder dialog (on a worker; [`PanelList::poll`] adds the
+    /// panel files at the top level of what was picked), unless a dialog is
+    /// open already.
+    pub fn pick_folders(&mut self, ctx: &egui::Context) {
+        if self.picking.is_some() {
+            return;
+        }
+        let picker = self.picker.clone();
+        self.picking = Task::spawn("mmm-pick-folders", ctx, move || {
+            Some(panel_files_in(picker.pick_folders()?))
         });
     }
 
@@ -1189,8 +1199,11 @@ impl PanelList {
             if ui.add_enabled(self.picking.is_none(), add).clicked() {
                 self.pick_files(ctx);
             }
-            // Folders come next; the button holds its place meanwhile.
-            ui.add_enabled(false, MegaButton::new(ButtonKind::Secondary, "Add folder…"));
+            let folder = MegaButton::new(ButtonKind::Secondary, "Add folder…")
+                .hover_text("Choose folders of panels (their top level only)");
+            if ui.add_enabled(self.picking.is_none(), folder).clicked() {
+                self.pick_folders(ctx);
+            }
             let more = ui.add(icon_button_of(ButtonKind::Quiet, icons::ELLIPSIS, "More"));
             egui::Popup::menu(&more).show(|ui| {
                 if ui.button("Type a path…").clicked() {
@@ -1543,7 +1556,7 @@ impl PanelList {
         painter.text(
             screen.center(),
             egui::Align2::CENTER_CENTER,
-            "Drop panel files to add them",
+            "Drop panel files or folders to add them",
             Type::Title.text_style().resolve(&ctx.global_style()),
             palette::ACCENT_400,
         );
