@@ -11,6 +11,8 @@ mod blend_settings;
 mod blend_tab;
 mod checks;
 mod compositions;
+#[allow(dead_code)] // used from Task 5 on
+mod display_stretch;
 mod export;
 mod jobs;
 mod panels_tab;

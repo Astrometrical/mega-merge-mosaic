@@ -87,16 +87,16 @@ pub fn mtf(m: f32, x: f32) -> f32 {
     ((m - 1.0) * x) / d
 }
 
-fn params_for(median: f32, mad: f32) -> StretchParams {
+fn params_for(median: f32, mad: f32, clip: f32, target: f32) -> StretchParams {
     let black = if mad == 0.0 {
         0.0
     } else {
-        (median + SHADOWS_CLIP * MAD_TO_SIGMA * mad).clamp(0.0, 1.0)
+        (median + clip * MAD_TO_SIGMA * mad).clamp(0.0, 1.0)
     };
     let white = 1.0;
     let norm = (median - black) / (white - black);
     let midtones = if norm.is_finite() && norm > 0.0 {
-        mtf(TARGET_BACKGROUND, norm.min(1.0))
+        mtf(target, norm.min(1.0))
     } else {
         0.5
     };
@@ -107,20 +107,52 @@ fn params_for(median: f32, mad: f32) -> StretchParams {
     }
 }
 
+/// How hard the automatic stretch pulls the background up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Strength {
+    /// The standard stretch ([`SHADOWS_CLIP`], [`TARGET_BACKGROUND`]).
+    #[default]
+    Normal,
+    /// A stronger stretch that exaggerates faint gradients
+    /// ([`STRONG_SHADOWS_CLIP`], [`STRONG_TARGET_BACKGROUND`]).
+    Strong,
+}
+
+/// Shadows clipping point of the strong stretch, in robust sigmas.
+pub const STRONG_SHADOWS_CLIP: f32 = -1.25;
+/// Output level the median is mapped to by the strong stretch.
+pub const STRONG_TARGET_BACKGROUND: f32 = 0.45;
+
 /// Automatic display stretch, one [`StretchParams`] per channel. When `linked`
 /// every channel gets the same parameters, computed from the mean of the
 /// channels' medians and MADs.
 pub fn auto_stretch(stats: &[ChannelStats], linked: bool) -> Vec<StretchParams> {
+    auto_stretch_with(stats, linked, Strength::Normal)
+}
+
+/// [`auto_stretch`] with a chosen [`Strength`].
+pub fn auto_stretch_with(
+    stats: &[ChannelStats],
+    linked: bool,
+    strength: Strength,
+) -> Vec<StretchParams> {
     if stats.is_empty() {
         return Vec::new();
     }
+    let (clip, target) = match strength {
+        Strength::Normal => (SHADOWS_CLIP, TARGET_BACKGROUND),
+        Strength::Strong => (STRONG_SHADOWS_CLIP, STRONG_TARGET_BACKGROUND),
+    };
     if linked {
         let n = stats.len() as f32;
         let median = stats.iter().map(|s| s.median).sum::<f32>() / n;
         let mad = stats.iter().map(|s| s.mad).sum::<f32>() / n;
-        vec![params_for(median, mad); stats.len()]
+        vec![params_for(median, mad, clip, target); stats.len()]
     } else {
-        stats.iter().map(|s| params_for(s.median, s.mad)).collect()
+        stats
+            .iter()
+            .map(|s| params_for(s.median, s.mad, clip, target))
+            .collect()
     }
 }
 
@@ -139,6 +171,49 @@ pub fn apply(p: &StretchParams, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strong_lifts_the_background() {
+        let s = [ChannelStats {
+            median: 0.1,
+            mad: 0.01,
+        }];
+        let normal = auto_stretch_with(&s, false, Strength::Normal)[0];
+        let strong = auto_stretch_with(&s, false, Strength::Strong)[0];
+        assert!((apply(&normal, 0.1) - 0.25).abs() < 1e-4);
+        assert!((apply(&strong, 0.1) - 0.45).abs() < 1e-4);
+    }
+
+    #[test]
+    fn strong_clips_shadows_nearer_the_median() {
+        let s = [ChannelStats {
+            median: 0.1,
+            mad: 0.01,
+        }];
+        let normal = auto_stretch_with(&s, false, Strength::Normal)[0];
+        let strong = auto_stretch_with(&s, false, Strength::Strong)[0];
+        assert!(strong.black > normal.black);
+    }
+
+    #[test]
+    fn auto_stretch_is_normal() {
+        let s = [
+            ChannelStats {
+                median: 0.1,
+                mad: 0.01,
+            },
+            ChannelStats {
+                median: 0.2,
+                mad: 0.02,
+            },
+        ];
+        for linked in [false, true] {
+            assert_eq!(
+                auto_stretch(&s, linked),
+                auto_stretch_with(&s, linked, Strength::Normal)
+            );
+        }
+    }
 
     #[test]
     fn mtf_fixed_points() {
@@ -193,7 +268,7 @@ mod tests {
         assert_ne!(u[0], u[1]);
         let l = auto_stretch(&s, true);
         assert_eq!(l[0], l[1]);
-        let mean = params_for(0.15, 0.015);
+        let mean = params_for(0.15, 0.015, SHADOWS_CLIP, TARGET_BACKGROUND);
         assert_eq!(l[0], mean);
     }
 
