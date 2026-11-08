@@ -15,6 +15,7 @@ use crate::checks::{CheckItem, checks_list};
 use crate::groups::GROUP_PALETTE;
 use crate::hero::{HeroStage, HeroView};
 use crate::icons;
+use crate::inspector::{Badge, InspectorState, Section, inspector, inspector_width};
 use crate::starfield::Starfield;
 use crate::theme::palette::*;
 use crate::theme::text::{Type, text};
@@ -34,6 +35,7 @@ pub struct GalleryState {
     name: String,
     notes: String,
     notes_mode: NotesMode,
+    inspector: InspectorState,
     checks: Vec<CheckItem>,
     toasts: Toasts,
     brand: Option<BrandImages>,
@@ -76,6 +78,11 @@ impl Default for GalleryState {
 Panel 7: gradient in the lower left, redo DBE."
                 .into(),
             notes_mode: NotesMode::default(),
+            inspector: {
+                let mut s = InspectorState::default();
+                s.toggle("problems");
+                s
+            },
             checks,
             toasts: Toasts::default(),
             brand: None,
@@ -364,6 +371,35 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                     },
                 ],
             );
+        });
+
+        section(ui, "Inspector", |ui| {
+            let sections = [
+                Section {
+                    id: "display",
+                    title: "Display",
+                    badge: None,
+                },
+                Section {
+                    id: "problems",
+                    title: "Problems",
+                    badge: Some(Badge {
+                        text: "2".to_owned(),
+                        tone: Tone::Warning,
+                    }),
+                },
+                Section {
+                    id: "notes",
+                    title: "Notes",
+                    badge: None,
+                },
+            ];
+            let width = inspector_width(&state.inspector);
+            ui.allocate_ui(Vec2::new(width, 240.0), |ui| {
+                inspector(ui, &mut state.inspector, &sections, |ui, id| {
+                    ui.label(format!("{id} body"));
+                });
+            });
         });
 
         section(ui, "Status", |ui| {

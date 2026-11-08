@@ -36,6 +36,8 @@ pub const CHECK: char = '\u{e06c}';
 pub const INFO: char = '\u{e0f9}';
 /// `chevron-right`
 pub const CHEVRON_RIGHT: char = '\u{e06f}';
+/// `chevron-left`
+pub const CHEVRON_LEFT: char = '\u{e06e}';
 /// `chevron-down`
 pub const CHEVRON_DOWN: char = '\u{e06d}';
 /// `chevron-up`
@@ -81,6 +83,7 @@ pub const ALL: &[(&str, char)] = &[
     ("check", CHECK),
     ("info", INFO),
     ("chevron-right", CHEVRON_RIGHT),
+    ("chevron-left", CHEVRON_LEFT),
     ("chevron-down", CHEVRON_DOWN),
     ("arrow-left", ARROW_LEFT),
     ("search", SEARCH),

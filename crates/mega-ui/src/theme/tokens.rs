@@ -27,6 +27,8 @@ pub mod radius {
     pub const CARD: u8 = 8;
 }
 
+/// Width of the unfolded inspector column.
+pub const INSPECTOR_WIDTH: f32 = 320.0;
 /// Height of buttons, inputs and segmented controls.
 pub const CONTROL_HEIGHT: f32 = 30.0;
 /// Height of a large button (at most one per screen).
