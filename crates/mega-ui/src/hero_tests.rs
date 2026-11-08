@@ -5,7 +5,6 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use super::*;
-use crate::theme::palette::SURFACE_900;
 use crate::theme::tokens::KEN_BURNS_ZOOM;
 use crate::viewer::ImageTileSource;
 use crate::viewer::{Fetched, PyramidGeometry, TileKey, TileSource};
@@ -441,13 +440,6 @@ fn darkening_at(h: &Harness<'_, State>, p: egui::Pos2) -> f32 {
     1.0 - clear
 }
 
-/// The colour a white image (the worst case under light text) shows at a
-/// point darkened by `d` toward the page colour.
-fn over_white(d: f32) -> Color32 {
-    let page = f32::from(SURFACE_900.r());
-    Color32::from_gray((255.0 * (1.0 - d) + page * d).round() as u8)
-}
-
 /// Whether the starfield was painted: an untextured mesh with bright
 /// vertices.
 fn starfield_painted(h: &Harness<'_, State>) -> bool {
@@ -484,7 +476,7 @@ fn label_and_controls_sit_in_the_top_right_feather() {
         (next.top() - (full.top() + space::XXL)).abs() < 1.0,
         "{next:?}"
     );
-    // The label stays AA over a white image, corner to corner.
+    // The label lies in the feather's hold, corner to corner.
     let label = h.get_by_label("Ha").rect();
     for p in [
         label.left_top(),
@@ -492,10 +484,17 @@ fn label_and_controls_sit_in_the_top_right_feather() {
         label.left_bottom(),
         label.right_bottom(),
     ] {
-        let bg = over_white(darkening_at(&h, p));
-        let ratio = crate::theme::contrast_ratio(TEXT_EMPHASIS, bg);
-        assert!(ratio >= 4.5, "label at {p:?}: {ratio} on {bg:?}");
+        let d = darkening_at(&h, p);
+        assert!(
+            (d - TOP_FEATHER_OPACITY).abs() < 0.01,
+            "label at {p:?}: {d}"
+        );
     }
+}
+
+/// The first row below the top feather's reach.
+fn below_top_feather(full: Rect) -> f32 {
+    full.top() + space::XXL + CONTROL_HEIGHT + TOP_FEATHER_EASE + 1.0
 }
 
 #[test]
@@ -503,7 +502,7 @@ fn left_feather_holds_over_the_column_then_eases_to_clear() {
     let mut h = harness(two_views(), true);
     frames(&mut h, 0.0);
     let full = h.state().full;
-    let (col, y) = (column(full), full.center().y);
+    let (col, y) = (column(full), below_top_feather(full));
     let at = |x: f32| darkening_at(&h, pos2(x, y));
     let edge = at(full.left() + 1.0);
     // Darkened, but never to black: the image shows through.
@@ -523,7 +522,7 @@ fn nothing_else_darkens_the_image() {
     let x = full.left() + 0.9 * full.width();
     for p in [
         pos2(x, full.bottom() - 2.0),
-        pos2(x, full.center().y),
+        pos2(x, below_top_feather(full)),
         pos2(full.right() - 2.0, full.bottom() - 2.0),
     ] {
         assert_eq!(darkening_at(&h, p), 0.0, "at {p:?}");

@@ -1290,11 +1290,13 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   along the left, `LEFT_FEATHER_OPACITY` (below 1, so the image shows
   through) over the content column (the session block and the shelf's
   heading row, whose right edge the start screen passes to
-  `HeroStage::show`), easing to clear (a smoothstep) over a quarter of the
-  width past it; and along the top, `TOP_FEATHER_OPACITY` down to the
-  bottom of the view's label and the slideshow controls, which sit at the
-  top right, easing to clear below them (the label stays AA over a white
-  image). Text laid over the hero all sits in the left feather's column,
+  `HeroStage::show`), easing to clear (a smoothstep) over
+  `LEFT_FEATHER_EASE` of the width past it; and along the top,
+  `TOP_FEATHER_OPACITY` down to the bottom of the view's label and the
+  slideshow controls, which sit at the top right, easing to clear below
+  them. Both were tuned by eye on real mosaics, which are far from white:
+  over a pure white image the label and the dimmer greys in the column
+  fall below AA (revisit if that bites). Text laid over the hero all sits in the left feather's column,
   so "All sessions" is beside the "Recent sessions" heading, and the grid's
   Back and search are on the left. The cards are opaque; a missing
   session's faded card keeps an opaque backing, so the image never shows

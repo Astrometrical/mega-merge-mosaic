@@ -439,18 +439,19 @@ fn drift_camera(geom: &PyramidGeometry, screen: Vec2, along: f64, dir: f64) -> (
 
 /// The left feather's opacity (of the page colour) from the left edge to
 /// the content column's right edge. Below 1, so the image shows through.
-const LEFT_FEATHER_OPACITY: f32 = 0.8;
+const LEFT_FEATHER_OPACITY: f32 = 0.66;
 /// How far past the column the left feather eases to clear, as a fraction
 /// of the stage's width.
-const LEFT_FEATHER_EASE: f32 = 0.25;
+const LEFT_FEATHER_EASE: f32 = 0.2;
 /// The top feather's opacity from the top edge down to the controls'
-/// bottom: enough for the label to stay AA (4.5:1) over a white image.
-const TOP_FEATHER_OPACITY: f32 = 0.75;
+/// bottom. Like the left one it is tuned by eye on real mosaics, which are
+/// far from white: over a pure white image the label falls below AA.
+const TOP_FEATHER_OPACITY: f32 = 0.33;
 /// How far below the controls the top feather eases to clear, in points.
-const TOP_FEATHER_EASE: f32 = 64.0;
+const TOP_FEATHER_EASE: f32 = 196.0;
 /// Steps in a feather's ease (a smoothstep, so no band shows where the
 /// hold ends).
-const EASE_STEPS: usize = 16;
+const EASE_STEPS: usize = 64;
 
 /// A feather of page colour across `full`, from its left edge (or its top
 /// edge, when `down`): `opacity` for the first `hold` points, then easing
