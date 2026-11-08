@@ -45,13 +45,14 @@
 //! - **Selection.** A click selects a row, Shift-click the rows on screen
 //!   from the last one clicked, Ctrl-click (Cmd-click) adds or takes away
 //!   one. It follows the panels (a regrouped panel stays selected; a
-//!   removed one, or one whose section is folded, leaves it). A plain click also selects the panel on the
-//!   plan, and a panel clicked there selects its row
-//!   ([`PanelList::select_only`]); the window links the rows and the plan
-//!   ([`crate::session_window`]), clears the selection on Esc and removes
-//!   it on Delete ([`PanelList::remove_selection`]). The row the pointer is
-//!   over is reported ([`PanelListOutput::hovered`]), and the row of the
-//!   panel pointed at on the plan is highlighted
+//!   removed one, or one whose section is folded, leaves it). A plain
+//!   click also selects the panel on the plan (showing its group there
+//!   first if the plan shows another view), and a panel clicked there
+//!   selects its row ([`PanelList::select_only`]); the window links the
+//!   rows and the plan ([`crate::session_window`]), clears the selection on
+//!   Esc and removes it on Delete ([`PanelList::remove_selection`]). The
+//!   row the pointer is over is reported ([`PanelListOutput::hovered`]),
+//!   and the row of the panel pointed at on the plan is highlighted
 //!   ([`PanelList::set_highlight`]).
 //! - **Rows** carry an actions menu, acting on the selection when the row
 //!   is selected, else on the row: with grouping on, **Move to** with each

@@ -1661,6 +1661,35 @@ fn a_row_click_selects_the_panel_in_the_plan() {
 }
 
 #[test]
+fn a_row_click_shows_its_group_on_the_plan() {
+    use crate::compositions::ViewKind;
+    let (root, session, jobs) = crate::jobs::tests::analyzed("list-row-group");
+    let oiii_1 = session.mosaic.config.panels[5].path.clone();
+    assert_eq!(name_of(&oiii_1), "OIII_1.xisf");
+    let mut h = harness(session, vec![], jobs);
+    wait(&mut h, |s| s.settled() && !s.w.plan().items().is_empty());
+    let ha = ViewKind::Group("Ha".into());
+    assert_eq!(h.state().w.view(), Some(&ha));
+    // Pointing at a row of another group changes nothing.
+    h.get_by_role_and_label(Role::ListItem, "OIII_1.xisf")
+        .hover();
+    steps(&mut h);
+    assert_eq!(h.state().w.view(), Some(&ha));
+    assert!(h.state().w.plan().items().iter().all(|i| !i.highlighted));
+    // A click shows its group, the panel selected there.
+    click_row(&mut h, "OIII_1.xisf", egui::Modifiers::NONE);
+    let oiii = ViewKind::Group("OIII".into());
+    assert_eq!(h.state().w.view(), Some(&oiii));
+    assert_eq!(h.state().w.plan().selected(), Some(oiii_1.as_path()));
+    wait(&mut h, |s| {
+        s.w.plan().items().iter().any(|i| i.path == oiii_1)
+    });
+    assert_eq!(selection(&h), ["OIII_1.xisf"]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn hover_links_rows_and_outlines() {
     let (root, session, jobs) = crate::jobs::tests::analyzed("list-hover");
     let ha_2 = session.mosaic.config.panels[2].path.clone();

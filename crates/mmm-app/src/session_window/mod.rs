@@ -19,8 +19,9 @@
 //!   §7.4): a row pointed at lights its panel's outline on the plan and a
 //!   panel pointed at on the plan lights its row (the panels the view
 //!   shows); a row clicked selects its panel on the plan (the inspector
-//!   shows it), and a panel clicked on the plan selects its row, brought
-//!   into view. Esc clears the selection in both.
+//!   shows it), showing its group first when the view does not have it,
+//!   and a panel clicked on the plan selects its row, brought into view.
+//!   Esc clears the selection in both.
 //! - **One view, one camera.** The window keeps the view (a group or a
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
@@ -76,7 +77,7 @@ mod steps;
 mod top_bar;
 pub mod view_state;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -99,7 +100,7 @@ use crate::mosaic_view::MosaicView;
 use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
-use crate::plan_view::{CanvasLook, PlanView};
+use crate::plan_view::{CanvasLook, PlanView, group_members};
 use crate::session::OpenSession;
 use crate::util::{Debounce, group_names};
 use view_state::ViewState;
@@ -497,7 +498,7 @@ impl SessionWindow {
             {
                 self.list_rect = Some(list.response.rect);
             }
-            self.follow_list(list.inner);
+            self.follow_list(session, list.inner);
         } else {
             for toast in self.panels.take_toasts() {
                 self.push_toast(toast);
@@ -524,15 +525,21 @@ impl SessionWindow {
     }
 
     /// Act on what the panel list reported this frame: its toasts; the row
-    /// pointed at lights its panel on the plan; a row clicked (plainly)
-    /// selects its panel there, opening the inspector's Panels section for
-    /// a new one; a removed panel is no longer selected.
-    fn follow_list(&mut self, out: PanelListOutput) {
+    /// pointed at lights its panel on the plan (if the view shows it); a
+    /// row clicked (plainly) selects its panel there, showing its group
+    /// first when the view does not show it, and opening the inspector's
+    /// Panels section for a new one; a removed panel is no longer selected.
+    fn follow_list(&mut self, session: &OpenSession, out: PanelListOutput) {
         for toast in out.toasts {
             self.push_toast(toast);
         }
         self.plan.set_highlight(out.hovered);
         if let Some(path) = out.clicked {
+            if !self.view_shows(session, &path)
+                && let Some(group) = group_of(session, &path)
+            {
+                self.select_view(ViewKind::Group(group));
+            }
             if self.selected.as_ref() != Some(&path) {
                 self.inspector.reveal(PANELS);
             }
@@ -540,6 +547,29 @@ impl SessionWindow {
             self.selected = Some(path);
         }
         self.panels_removed(&out.removed);
+    }
+
+    /// Whether the view shown has panel `path` (one of its groups does).
+    fn view_shows(&self, session: &OpenSession, path: &Path) -> bool {
+        let groups: Vec<String> = match &self.view {
+            Some(ViewKind::Group(g)) => vec![g.clone()],
+            Some(ViewKind::Composition(i)) => compositions_of(session)
+                .get(*i)
+                .map(|c| {
+                    c.channels
+                        .iter()
+                        .flatten()
+                        .map(|(g, _)| g.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => return false,
+        };
+        let members = group_members(session, &groups);
+        groups
+            .iter()
+            .filter_map(|g| members.get(g))
+            .any(|ps| ps.iter().any(|p| p == path))
     }
 
     /// `removed` left the inputs: the plan's selection goes with them (now,
@@ -721,6 +751,15 @@ fn compositions_of(session: &OpenSession) -> Vec<Composition> {
     } else {
         Vec::new()
     }
+}
+
+/// The group panel `path` is in (as resolved), if known.
+fn group_of(session: &OpenSession, path: &Path) -> Option<String> {
+    let groups = session.groups.as_ref()?.processing_groups();
+    groups
+        .into_iter()
+        .find(|(_, panels)| panels.iter().any(|p| p == path))
+        .map(|(name, _)| name)
 }
 
 /// The view `key` ([`SessionWindow::view_key`]) names in `session`, if it
