@@ -115,6 +115,7 @@ pub mod linalg;
 pub mod mosaic;
 pub mod output;
 pub mod overlap;
+pub mod panel_header;
 pub mod panel_reader;
 pub mod photometry;
 pub mod preview;
