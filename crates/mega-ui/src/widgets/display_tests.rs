@@ -81,6 +81,7 @@ fn choice_chip_reports_selected_state() {
                     color: Some(palette::HA_500),
                     selected,
                     dashed: false,
+                    mark: None,
                 },
             )
         });
@@ -109,6 +110,7 @@ fn choice_chip_click_is_reported() {
                 color: None,
                 selected: false,
                 dashed: true,
+                mark: None,
             },
         );
         if r.clicked() {
@@ -121,4 +123,48 @@ fn choice_chip_click_is_reported() {
     h.get_by_label("Hα").click();
     h.run();
     assert!(clicked.get());
+}
+
+#[test]
+fn choice_chip_draws_its_mark() {
+    use super::chip::{ChipMark, ChoiceChip, choice_chip};
+    use std::{cell::Cell, rc::Rc};
+    let widths = Rc::new(Cell::new([0.0_f32; 3]));
+    let seen = widths.clone();
+    let mut h = harness(move |ui| {
+        let mut w = [0.0_f32; 3];
+        let mut last = None;
+        for (i, mark) in [None, Some(ChipMark::Attention), Some(ChipMark::Changed)]
+            .into_iter()
+            .enumerate()
+        {
+            let r = choice_chip(
+                ui,
+                &ChoiceChip {
+                    label: ["Plain", "Stale", "Edited"][i],
+                    color: None,
+                    selected: false,
+                    dashed: false,
+                    mark,
+                },
+            );
+            w[i] = r.rect.width();
+            last = Some(r);
+        }
+        seen.set(w);
+        last.unwrap()
+    });
+    h.run();
+    // The dot takes room, and the state is said in words.
+    assert!(widths.get().iter().all(|w| *w > 0.0));
+    assert_eq!(
+        h.get_by_label("Stale").accesskit_node().description(),
+        Some("out of date".to_string())
+    );
+    assert_eq!(
+        h.get_by_label("Edited").accesskit_node().description(),
+        Some("settings changed".to_string())
+    );
+    assert_eq!(h.get_by_label("Plain").accesskit_node().description(), None);
+    assert_ne!(ChipMark::Attention.color(), ChipMark::Changed.color());
 }

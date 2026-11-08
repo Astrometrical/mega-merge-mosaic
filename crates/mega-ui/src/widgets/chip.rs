@@ -6,9 +6,9 @@ use egui::{
     text::{LayoutJob, TextFormat, TextWrapping},
 };
 
-use crate::theme::legible_text;
 use crate::theme::palette::{ACCENT_500, BORDER, SURFACE_700, TEXT_BODY, TEXT_STRONG};
 use crate::theme::tokens::space;
+use crate::theme::{Tone, legible_text};
 
 /// Widest a chip may grow; longer labels are truncated with "…" and shown
 /// in full on hover.
@@ -82,12 +82,44 @@ pub struct ChoiceChip<'a> {
     pub selected: bool,
     /// Draw the outline dashed (composites).
     pub dashed: bool,
+    /// A state dot after the label (see [`ChipMark`]).
+    pub mark: Option<ChipMark>,
+}
+
+/// A chip's state dot: what needs the user's attention, drawn in a tone's
+/// colour and described to assistive technology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipMark {
+    /// Out of date: the warning tone, "out of date".
+    Attention,
+    /// Changed since it was made: the info tone, "settings changed".
+    Changed,
+}
+
+impl ChipMark {
+    /// The dot's colour.
+    pub fn color(self) -> Color32 {
+        match self {
+            ChipMark::Attention => Tone::Warning.accent(),
+            ChipMark::Changed => Tone::Info.accent(),
+        }
+    }
+
+    /// The state in words (the chip's accessible description).
+    pub fn description(self) -> &'static str {
+        match self {
+            ChipMark::Attention => "out of date",
+            ChipMark::Changed => "settings changed",
+        }
+    }
 }
 
 /// Dash and gap lengths of a dashed chip outline, in points.
 const DASH: (f32, f32) = (3.0, 2.5);
 /// Diameter of the colour dot.
 const DOT: f32 = 8.0;
+/// Diameter of the state dot.
+const MARK_DOT: f32 = 6.0;
 
 /// The outline of a rounded rectangle as a closed point path.
 fn outline(rect: egui::Rect, r: f32) -> Vec<egui::Pos2> {
@@ -127,7 +159,12 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
     } else {
         0.0
     };
-    let size = Vec2::new(galley.size().x + 2.0 * PAD + dot, HEIGHT);
+    let mark = if chip.mark.is_some() {
+        MARK_DOT + space::XS
+    } else {
+        0.0
+    };
+    let size = Vec2::new(galley.size().x + 2.0 * PAD + dot + mark, HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if chip.selected { BORDER } else { SURFACE_700 };
@@ -161,10 +198,20 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
             x += dot;
         }
         let pos = egui::pos2(x, rect.center().y - galley.size().y / 2.0);
+        let text_width = galley.size().x;
         p.galley(pos, galley, text_color);
+        if let Some(m) = chip.mark {
+            let c = egui::pos2(x + text_width + space::XS + MARK_DOT / 2.0, rect.center().y);
+            p.circle_filled(c, MARK_DOT / 2.0, m.color());
+        }
     }
     super::button::focus_ring(ui, &response, (HEIGHT / 2.0) as u8);
     let (selected, label) = (chip.selected, chip.label);
     response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, label));
+    if let Some(m) = chip.mark {
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_description(m.description());
+        });
+    }
     response
 }

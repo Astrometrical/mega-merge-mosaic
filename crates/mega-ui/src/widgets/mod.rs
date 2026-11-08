@@ -14,7 +14,7 @@ pub mod text_input;
 pub mod toast;
 
 pub use button::{ButtonKind, MegaButton, focus_ring, icon_button, icon_button_of};
-pub use chip::{CHIP_MAX_WIDTH, ChoiceChip, chip, choice_chip};
+pub use chip::{CHIP_MAX_WIDTH, ChipMark, ChoiceChip, chip, choice_chip};
 pub use menu::submenu;
 pub use notes::{NOTES_LINES, NotesMode, NotesResponse, notes_view};
 pub use progress::{progress, progress_bar};
