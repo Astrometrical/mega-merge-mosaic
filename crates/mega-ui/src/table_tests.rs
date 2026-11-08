@@ -1,7 +1,7 @@
 use egui::accesskit::Role;
 use egui::{Modifiers, Rect, Vec2, pos2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 use super::*;
 
@@ -36,6 +36,7 @@ fn row(id: u64, name: &str, scale: &str, filter: &str) -> Row<'static> {
     Row {
         id,
         cells: vec![name.to_owned(), scale.to_owned(), filter.to_owned()],
+        sort_keys: Vec::new(),
         problem: None,
         tag: None,
         selected: false,
@@ -562,4 +563,213 @@ fn revealing_a_row_opens_its_section_and_scrolls_to_it() {
     assert!(screen.contains_rect(b1), "{b1:?} not on screen");
     // Once: the user scrolls on from there.
     assert_eq!(h.state().table.revealing, None);
+}
+
+/// `row` with these sort keys.
+fn keyed(row: Row<'static>, keys: Vec<SortKey>) -> Row<'static> {
+    Row {
+        sort_keys: keys,
+        ..row
+    }
+}
+
+/// Section "ha" (h1..h3) and section "oiii" (o1, o2), with scales whose
+/// text order is not their numeric order, and an unknown one ("—").
+fn sortable() -> Vec<Section<'static>> {
+    let n = |v: f64| SortKey::Number(v);
+    let t = |s: &str| SortKey::Text(s.to_owned());
+    let r = |id, name: &str, scale: &str, key: SortKey, filter: &str| {
+        keyed(row(id, name, scale, filter), vec![t(name), key, t(filter)])
+    };
+    vec![
+        Section {
+            heading: Some(heading("ha", "Ha · 3")),
+            rows: vec![
+                r(1, "h1", "100.125", n(100.125), "Ha"),
+                r(2, "h2", "—", SortKey::Unknown, "ha"),
+                r(3, "h3", "9.5", n(9.5), "HA"),
+            ],
+        },
+        Section {
+            heading: Some(heading("oiii", "OIII · 2")),
+            rows: vec![
+                r(4, "o1", "10.25", n(10.25), "OIII"),
+                r(5, "o2", "2", n(2.0), "oiii"),
+            ],
+        },
+    ]
+}
+
+/// The rows' first cells, top to bottom, as drawn.
+fn drawn_order(h: &Harness<'_, State>) -> Vec<String> {
+    let mut rows: Vec<(String, f32)> = h
+        .query_all_by_role(Role::ListItem)
+        .map(|n| {
+            (
+                n.accesskit_node().label().unwrap_or_default(),
+                n.rect().top(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.1.total_cmp(&b.1));
+    rows.into_iter().map(|(l, _)| l).collect()
+}
+
+#[test]
+fn a_heading_click_sorts_rows_within_their_sections() {
+    let mut h = harness(sortable());
+    h.run();
+    // The caller's order at first.
+    assert_eq!(drawn_order(&h), ["h1", "h2", "h3", "o1", "o2"]);
+    assert_eq!(h.state().table.sort, None);
+    // Numbers compare as numbers; the unknown one goes last; sections stay
+    // where they are.
+    h.get_by_role_and_label(Role::Button, "Scale").click();
+    h.run();
+    assert_eq!(drawn_order(&h), ["h3", "h1", "h2", "o2", "o1"]);
+    assert_eq!(
+        h.state().table.sort,
+        Some(Sort {
+            column: 1,
+            descending: false
+        })
+    );
+    let ha = h.get_by_label("Ha · 3").rect();
+    let oiii = h.get_by_label("OIII · 2").rect();
+    assert!(ha.top() < oiii.top());
+    // Again: the other way, the unknown one still last.
+    h.get_by_role_and_label(Role::Button, "Scale").click();
+    h.run();
+    assert_eq!(drawn_order(&h), ["h1", "h3", "h2", "o1", "o2"]);
+    // Text compares whatever its case; equal keys keep the caller's order.
+    h.get_by_role_and_label(Role::Button, "Filter").click();
+    h.run();
+    assert_eq!(drawn_order(&h), ["h1", "h2", "h3", "o1", "o2"]);
+    assert_eq!(
+        h.state().table.sort,
+        Some(Sort {
+            column: 2,
+            descending: false
+        })
+    );
+    // Events report the caller's ids, whatever the order.
+    h.get_by_label("h3").click();
+    h.run();
+    assert!(h.state().all.contains(&TableEvent::Click {
+        id: 3,
+        modifiers: Modifiers::NONE
+    }));
+}
+
+#[test]
+fn the_sorted_heading_shows_its_direction() {
+    let mut h = harness(sortable());
+    h.run();
+    let up = icons::CHEVRON_UP.to_string();
+    let down = icons::CHEVRON_DOWN.to_string();
+    let scale = h.get_by_role_and_label(Role::Button, "Scale");
+    assert_eq!(scale.accesskit_node().sort_direction(), None);
+    // The section chevrons point down (open): count only the headings'.
+    let header = text_rect(&h, "SCALE").expect("SCALE heading");
+    let in_header = |h: &Harness<'_, State>, glyph: &str| {
+        painted(h)
+            .into_iter()
+            .filter(|(t, r)| t == glyph && (r.center().y - header.center().y).abs() < 4.0)
+            .count()
+    };
+    assert_eq!(in_header(&h, &up) + in_header(&h, &down), 0, "unsorted");
+    scale.click();
+    h.run();
+    assert_eq!(in_header(&h, &up), 1);
+    assert_eq!(in_header(&h, &down), 0);
+    let node = h.get_by_role_and_label(Role::Button, "Scale");
+    assert_eq!(
+        node.accesskit_node().sort_direction(),
+        Some(egui::accesskit::SortDirection::Ascending)
+    );
+    node.click();
+    h.run();
+    assert_eq!(in_header(&h, &up), 0);
+    assert_eq!(in_header(&h, &down), 1);
+    assert_eq!(
+        h.get_by_role_and_label(Role::Button, "Scale")
+            .accesskit_node()
+            .sort_direction(),
+        Some(egui::accesskit::SortDirection::Descending)
+    );
+    // The arrow sits in the column's heading, which the cells line up with
+    // (numbers on the right).
+    let arrow = painted(&h)
+        .into_iter()
+        .find(|(t, r)| *t == down && (r.center().y - header.center().y).abs() < 4.0)
+        .unwrap()
+        .1;
+    let header = text_rect(&h, "SCALE").unwrap();
+    assert!(arrow.right() <= header.left() + 0.5, "{arrow:?} {header:?}");
+    let cell = text_rect(&h, "10.25").unwrap();
+    assert!((cell.right() - header.right()).abs() < 0.5);
+}
+
+#[test]
+fn a_rolled_up_section_shows_the_first_rows_it_sorts() {
+    // p0..p9 scaled 0..9; p1 has a problem.
+    let mut sections = rolled_up();
+    for r in &mut sections[0].rows {
+        r.problem = (r.id == 1).then_some("No astrometric solution");
+        r.sort_keys = vec![
+            SortKey::Text(r.cells[0].clone()),
+            SortKey::Number(r.id as f64),
+        ];
+    }
+    let mut state = TableState::default();
+    state.sort_by(1);
+    state.sort_by(1);
+    assert_eq!(
+        state.sort,
+        Some(Sort {
+            column: 1,
+            descending: true
+        })
+    );
+    // Largest first: p9, p8 and p7, then p1 (its problem shows it).
+    assert_eq!(shown_ids(&state, &sections), [9, 8, 7, 1]);
+    let mut h = harness(sections);
+    h.state_mut().table = state;
+    h.run();
+    assert_eq!(drawn_order(&h), ["p9", "p8", "p7", "p1"]);
+    h.get_by_role_and_label(Role::Button, "… 6 more");
+    // A row the roll-up hides in this order is revealed: the section opens.
+    h.state_mut().table.reveal(0);
+    h.run();
+    assert_eq!(drawn_order(&h).last().map(String::as_str), Some("p0"));
+}
+
+#[test]
+fn sort_keys_default_to_the_cells() {
+    // No keys: cells compare as text, case aside; empty and "—" are unknown.
+    let rows = vec![
+        row(1, "b", "x", "Ha"),
+        row(2, "—", "x", "Ha"),
+        row(3, "A", "x", "Ha"),
+        row(4, "", "x", "Ha"),
+        row(5, "c", "x", "Ha"),
+    ];
+    let sections = vec![Section {
+        heading: None,
+        rows,
+    }];
+    let mut state = TableState::default();
+    state.sort_by(0);
+    assert_eq!(shown_ids(&state, &sections), [3, 1, 5, 2, 4]);
+    state.sort_by(0);
+    assert_eq!(shown_ids(&state, &sections), [5, 1, 3, 2, 4]);
+    // Another column sorts ascending first.
+    state.sort_by(2);
+    assert_eq!(
+        state.sort,
+        Some(Sort {
+            column: 2,
+            descending: false
+        })
+    );
 }

@@ -958,6 +958,100 @@ fn integration_reads_hours_and_minutes() {
     assert_eq!(scale_text(1.2149), "1.21″");
 }
 
+/// The panels' rows, top to bottom, as drawn.
+fn row_order(h: &Harness<'_, State>) -> Vec<String> {
+    let mut rows: Vec<(String, f32)> = h
+        .query_all_by_role(Role::ListItem)
+        .map(|n| {
+            (
+                n.accesskit_node().label().unwrap_or_default(),
+                n.rect().top(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.1.total_cmp(&b.1));
+    rows.into_iter().map(|(l, _)| l).collect()
+}
+
+#[test]
+fn integration_sorts_within_sections() {
+    let root = temp_dir("list-sort");
+    let dir = root.join("panels");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name, filter: &str, cards: &[(&'static str, &'static str)]| {
+        let filter = format!("'{filter}'");
+        let mut all = vec![("FILTER", filter.as_str())];
+        all.extend_from_slice(cards);
+        panel(&dir, name, &all)
+    };
+    let paths = vec![
+        p("Ha_a.xisf", "Ha", &[("EXPTIME", "300"), ("NCOMBINE", "24")]),
+        p("Ha_b.xisf", "Ha", &[("EXPTIME", "45"), ("NCOMBINE", "1")]),
+        p("Ha_c.xisf", "Ha", &[("EXPTIME", "300")]),
+        p(
+            "OIII_x.xisf",
+            "OIII",
+            &[("EXPTIME", "300"), ("NCOMBINE", "37")],
+        ),
+        p(
+            "OIII_y.xisf",
+            "OIII",
+            &[("EXPTIME", "300"), ("NCOMBINE", "12")],
+        ),
+    ];
+    let mut h = harness(session_of(&root, paths), vec![], runner());
+    wait(&mut h, State::settled);
+    let caller = [
+        "Ha_a.xisf",
+        "Ha_b.xisf",
+        "Ha_c.xisf",
+        "OIII_x.xisf",
+        "OIII_y.xisf",
+    ];
+    assert_eq!(row_order(&h), caller);
+    // Shortest first, as numbers ("45s" before "2h 00m"), the unknown last;
+    // each group keeps its own rows.
+    h.get_by_role_and_label(Role::Button, "INTEGRATION").click();
+    steps(&mut h);
+    assert_eq!(
+        row_order(&h),
+        [
+            "Ha_b.xisf",
+            "Ha_a.xisf",
+            "Ha_c.xisf",
+            "OIII_y.xisf",
+            "OIII_x.xisf"
+        ]
+    );
+    let ha = heading(&h, "Ha · 3").rect();
+    let oiii = heading(&h, "OIII · 2 · 4h 05m").rect();
+    assert!(ha.top() < oiii.top());
+    // Longest first, the unknown still last.
+    h.get_by_role_and_label(Role::Button, "INTEGRATION").click();
+    steps(&mut h);
+    assert_eq!(
+        row_order(&h),
+        [
+            "Ha_a.xisf",
+            "Ha_b.xisf",
+            "Ha_c.xisf",
+            "OIII_x.xisf",
+            "OIII_y.xisf"
+        ]
+    );
+    // The sort stays as the panels change: a panel removed.
+    remove_row(&mut h, "Ha_a.xisf");
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 4
+    });
+    assert_eq!(
+        row_order(&h),
+        ["Ha_b.xisf", "Ha_c.xisf", "OIII_x.xisf", "OIII_y.xisf"]
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The texts painted on the row of panel `name` (its name included, icons
 /// left out) and where, left to right.
 fn cell_rects(h: &Harness<'_, State>, name: &str) -> Vec<(String, Rect)> {

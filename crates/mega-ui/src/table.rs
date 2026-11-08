@@ -8,6 +8,15 @@
 //! ranges) and drag onto headings that take drops. [`TableState::reveal`]
 //! brings a row into view (an item selected elsewhere).
 //!
+//! Column headings are buttons: a click sorts the rows within each section
+//! by that column ([`TableState::sort`]; sections keep their order), a
+//! second click the other way, and the sorted heading shows an arrow (up:
+//! smallest first). Numbers compare as numbers ([`Row::sort_keys`]), text
+//! case-insensitively, and unknown cells ("—", empty) go last either way;
+//! rows that compare equal keep the caller's order, which is the order
+//! until a heading is clicked. A rolled-up section shows the first rows of
+//! the sorted order (and its rows with a problem).
+//!
 //! The caller places the table in a `ScrollArea` and persists
 //! [`TableState`]. Rows outside the visible area are laid out but not
 //! painted; a rolled-up section bounds the rows it lays out. The table
@@ -19,7 +28,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use egui::accesskit::Role;
+use egui::accesskit::{Role, SortDirection};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
     Align, Color32, CornerRadius, DragAndDrop, FontId, FontSelection, Galley, Id, LayerId, Layout,
@@ -68,6 +77,46 @@ pub struct Row<'a> {
     pub selected: bool,
     /// Whether the row is highlighted (e.g. its item is hovered elsewhere).
     pub highlighted: bool,
+    /// One key per column for sorting by it ([`TableState::sort`]); a
+    /// column without one sorts by its cell's text ([`SortKey::of_cell`]).
+    /// Give numbers here (e.g. seconds for "3h 05m").
+    pub sort_keys: Vec<SortKey>,
+}
+
+/// How a cell compares when the rows are sorted by its column.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SortKey {
+    /// A number; numbers come before text in one column.
+    Number(f64),
+    /// Text, compared case-insensitively.
+    Text(String),
+    /// Not known: sorts last, whichever the direction.
+    Unknown,
+}
+
+impl SortKey {
+    /// The key of a cell showing `text`: [`SortKey::Unknown`] when it is
+    /// empty or [`UNKNOWN_CELL`], else the text.
+    pub fn of_cell(text: &str) -> Self {
+        let t = text.trim();
+        if t.is_empty() || t == UNKNOWN_CELL {
+            SortKey::Unknown
+        } else {
+            SortKey::Text(t.to_owned())
+        }
+    }
+}
+
+/// What a cell whose fact is unknown shows.
+pub const UNKNOWN_CELL: &str = "—";
+
+/// The column the rows are sorted by, within each section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sort {
+    /// The column's index.
+    pub column: usize,
+    /// Largest (or last) first.
+    pub descending: bool,
 }
 
 /// The heading row of a section.
@@ -99,13 +148,17 @@ pub struct Section<'a> {
     pub rows: Vec<Row<'a>>,
 }
 
-/// Fold and roll-up state of a table, keyed by [`Heading::id`].
+/// Fold, roll-up and sort state of a table, sections keyed by
+/// [`Heading::id`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableState {
     /// Sections whose rows are folded away.
     pub folded: BTreeSet<String>,
     /// Rolling-up sections the user opened in full ("… N more").
     pub expanded: BTreeSet<String>,
+    /// The column the rows are sorted by within each section (a click on
+    /// its heading); `None`: the caller's order.
+    pub sort: Option<Sort>,
     /// The row to bring into view the next time the table is drawn
     /// ([`TableState::reveal`]).
     revealing: Option<u64>,
@@ -132,6 +185,21 @@ impl TableState {
     /// Show all rows of rolling-up section `id`.
     pub fn expand(&mut self, id: &str) {
         self.expanded.insert(id.to_owned());
+    }
+
+    /// Sort by column `column` (a click on its heading): smallest first,
+    /// or the other way round if sorted by it already.
+    pub fn sort_by(&mut self, column: usize) {
+        self.sort = Some(match self.sort {
+            Some(s) if s.column == column => Sort {
+                column,
+                descending: !s.descending,
+            },
+            _ => Sort {
+                column,
+                descending: false,
+            },
+        });
     }
 
     /// Bring row `id` into view the next time the table is drawn (e.g. its
@@ -166,7 +234,8 @@ impl TableState {
             return;
         };
         self.folded.remove(heading.id);
-        let (shown, _) = shown_rows(&section.rows, self.rolled(section));
+        let order = display_order(&section.rows, self.sort);
+        let (shown, _) = shown_rows(&section.rows, &order, self.rolled(section));
         if !shown.contains(&at) {
             self.expand(heading.id);
         }
@@ -174,9 +243,10 @@ impl TableState {
 }
 
 /// Ids of the rows [`sectioned_table`] shows for `sections` with `state`, in
-/// display order: none of a folded section, and of a rolled-up one only
-/// its first [`ROLL_UP_ROWS`] and the rows with a problem. A Shift-click
-/// range runs over these, so it never takes in rows the user cannot see.
+/// display order (sorted within each section as `state` says): none of a
+/// folded section, and of a rolled-up one only its first [`ROLL_UP_ROWS`]
+/// and the rows with a problem. A Shift-click range runs over these, so it
+/// never takes in rows the user cannot see.
 pub fn shown_ids(state: &TableState, sections: &[Section<'_>]) -> Vec<u64> {
     let mut out = Vec::new();
     for section in sections {
@@ -187,10 +257,59 @@ pub fn shown_ids(state: &TableState, sections: &[Section<'_>]) -> Vec<u64> {
         {
             continue;
         }
-        let (shown, _) = shown_rows(&section.rows, state.rolled(section));
+        let order = display_order(&section.rows, state.sort);
+        let (shown, _) = shown_rows(&section.rows, &order, state.rolled(section));
         out.extend(shown.into_iter().map(|i| section.rows[i].id));
     }
     out
+}
+
+/// A row's key for column `column` as compared: its [`Row::sort_keys`]
+/// entry, else its cell's ([`SortKey::of_cell`]); text lower-cased, a
+/// number that is not finite unknown.
+fn compared_key(row: &Row<'_>, column: usize) -> SortKey {
+    let key = row
+        .sort_keys
+        .get(column)
+        .cloned()
+        .unwrap_or_else(|| SortKey::of_cell(row.cells.get(column).map_or("", String::as_str)));
+    match key {
+        SortKey::Number(n) if !n.is_finite() => SortKey::Unknown,
+        SortKey::Text(t) => SortKey::Text(t.to_lowercase()),
+        k => k,
+    }
+}
+
+/// How two compared keys order, smallest first ([`SortKey::Unknown`]
+/// last, whatever `descending`).
+fn compare_keys(a: &SortKey, b: &SortKey, descending: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let known = match (a, b) {
+        (SortKey::Unknown, SortKey::Unknown) => return Ordering::Equal,
+        (SortKey::Unknown, _) => return Ordering::Greater,
+        (_, SortKey::Unknown) => return Ordering::Less,
+        (SortKey::Number(x), SortKey::Number(y)) => x.total_cmp(y),
+        (SortKey::Text(x), SortKey::Text(y)) => x.cmp(y),
+        (SortKey::Number(_), SortKey::Text(_)) => Ordering::Less,
+        (SortKey::Text(_), SortKey::Number(_)) => Ordering::Greater,
+    };
+    if descending { known.reverse() } else { known }
+}
+
+/// The indices of `rows` in the order they are shown: the caller's, or
+/// sorted by `sort` (stable: rows that compare equal keep the caller's
+/// order).
+fn display_order(rows: &[Row<'_>], sort: Option<Sort>) -> Vec<usize> {
+    let Some(sort) = sort else {
+        return (0..rows.len()).collect();
+    };
+    let mut keyed: Vec<(usize, SortKey)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (i, compared_key(r, sort.column)))
+        .collect();
+    keyed.sort_by(|(_, a), (_, b)| compare_keys(a, b, sort.descending));
+    keyed.into_iter().map(|(i, _)| i).collect()
 }
 
 /// What the user did in the table this frame.
@@ -242,6 +361,9 @@ const MIN_FIRST_WIDTH: f32 = 120.0;
 const TAG_HEIGHT: f32 = 18.0;
 /// Horizontal padding inside a tag pill.
 const TAG_PAD: f32 = space::S;
+/// Gap between a column heading and its sort arrow.
+const SORT_GAP: f32 = space::XS;
+
 /// Opacity of a highlighted row's fill, the selection fill
 /// ([`ACCENT_800`]) at part strength.
 const HIGHLIGHT_STRENGTH: f32 = 0.5;
@@ -272,6 +394,8 @@ struct Table<'t> {
     g: Geometry,
     columns: &'t [Column<'t>],
     sections: &'t [Section<'t>],
+    /// The sort the frame is drawn with.
+    sort: Option<Sort>,
 }
 
 /// Draw `sections` of rows under a row of `columns` headings, and report
@@ -302,8 +426,9 @@ pub fn sectioned_table(
             g: geometry(ui, width, columns, sections),
             columns,
             sections,
+            sort: state.sort,
         };
-        table.column_headings(ui);
+        table.column_headings(ui, state);
         let mut hovered = false;
         for (i, section) in sections.iter().enumerate() {
             let mut rolled = false;
@@ -317,7 +442,10 @@ pub fn sectioned_table(
                 }
                 rolled = state.rolled(section);
             }
-            let (shown, hidden) = shown_rows(&section.rows, rolled);
+            // The order the frame began with (a heading clicked sorts
+            // from the next frame).
+            let order = display_order(&section.rows, table.sort);
+            let (shown, hidden) = shown_rows(&section.rows, &order, rolled);
             for &r in &shown {
                 let row = &section.rows[r];
                 let rect = table.row_line(ui, row, &mut row_menu, &mut hovered, &mut events);
@@ -336,33 +464,38 @@ pub fn sectioned_table(
     events
 }
 
-/// Indices of `rows` a section shows and how many it hides behind its
-/// "… N more" row: all of them, or when `rolled` the first
-/// [`ROLL_UP_ROWS`] and every row with a problem.
-fn shown_rows(rows: &[Row<'_>], rolled: bool) -> (Vec<usize>, usize) {
+/// Indices of `rows` a section shows, in display order (`order`, from
+/// [`display_order`]), and how many it hides behind its "… N more" row:
+/// all of them, or when `rolled` the first [`ROLL_UP_ROWS`] in that order
+/// and every row with a problem.
+fn shown_rows(rows: &[Row<'_>], order: &[usize], rolled: bool) -> (Vec<usize>, usize) {
     if !rolled {
-        return ((0..rows.len()).collect(), 0);
+        return (order.to_vec(), 0);
     }
-    let shown: Vec<usize> = rows
+    let shown: Vec<usize> = order
         .iter()
         .enumerate()
-        .filter(|(i, r)| *i < ROLL_UP_ROWS || r.problem.is_some())
-        .map(|(i, _)| i)
+        .filter(|&(at, &i)| at < ROLL_UP_ROWS || rows[i].problem.is_some())
+        .map(|(_, &i)| i)
         .collect();
     let hidden = rows.len() - shown.len();
     (shown, hidden)
 }
 
 /// The rows a drag of row `dragged` carries: every selected row (in
-/// display order, folded or rolled-up ones too) if it is selected, else
-/// just it.
-fn drag_ids(sections: &[Section<'_>], dragged: u64) -> Vec<u64> {
+/// display order under `sort`, folded or rolled-up ones too) if it is
+/// selected, else just it.
+fn drag_ids(sections: &[Section<'_>], sort: Option<Sort>, dragged: u64) -> Vec<u64> {
     let rows = || sections.iter().flat_map(|s| &s.rows);
-    if rows().any(|r| r.id == dragged && r.selected) {
-        rows().filter(|r| r.selected).map(|r| r.id).collect()
-    } else {
-        vec![dragged]
+    if !rows().any(|r| r.id == dragged && r.selected) {
+        return vec![dragged];
     }
+    sections
+        .iter()
+        .flat_map(|s| display_order(&s.rows, sort).into_iter().map(|i| &s.rows[i]))
+        .filter(|r| r.selected)
+        .map(|r| r.id)
+        .collect()
 }
 
 /// The body font.
@@ -397,14 +530,19 @@ fn elided(ui: &Ui, s: &str, font: FontId, color: Color32, max: f32) -> Arc<Galle
     ui.painter().layout_job(job)
 }
 
-/// A column heading laid out as an overline.
-fn overline_galley(ui: &Ui, title: &str) -> Arc<Galley> {
-    WidgetText::from(text(Type::Overline, title)).into_galley(
+/// A column heading laid out as an overline in `color`.
+fn overline_galley(ui: &Ui, title: &str, color: Color32) -> Arc<Galley> {
+    WidgetText::from(text(Type::Overline, title).color(color)).into_galley(
         ui,
         Some(TextWrapMode::Extend),
         f32::INFINITY,
         FontSelection::Default,
     )
+}
+
+/// The room a column heading keeps for its sort arrow.
+fn sort_room(ui: &Ui) -> f32 {
+    SORT_GAP + icon(ui, icons::CHEVRON_UP, TEXT_BODY).size().x
 }
 
 /// Whether column `i` holds numbers.
@@ -430,10 +568,12 @@ fn cell_font(ui: &Ui, columns: &[Column<'_>], i: usize) -> FontId {
 /// actions button always sits at the right end. Rows under headings are
 /// indented past the chevron.
 fn geometry(ui: &Ui, width: f32, columns: &[Column<'_>], sections: &[Section<'_>]) -> Geometry {
+    // Headings keep room for the sort arrow, so sorting moves nothing.
+    let arrow = sort_room(ui);
     let mut widths: Vec<f32> = columns
         .iter()
         .skip(1)
-        .map(|c| overline_galley(ui, c.title).size().x)
+        .map(|c| overline_galley(ui, c.title, TEXT_BODY).size().x + arrow)
         .collect();
     for (k, w) in widths.iter_mut().enumerate() {
         let i = k + 1;
@@ -493,15 +633,17 @@ fn allocate_line(ui: &mut Ui, width: f32, height: f32) -> Rect {
 }
 
 impl Table<'_> {
-    /// The row of overline column headings.
-    fn column_headings(&self, ui: &mut Ui) {
+    /// The row of overline column headings, each a button sorting the rows
+    /// by its column ([`TableState::sort_by`]); the sorted one is brighter
+    /// and shows its direction with an arrow (up: smallest first), before
+    /// the title of a numeric column (its cells end under the title) and
+    /// after another's.
+    fn column_headings(&self, ui: &mut Ui, state: &mut TableState) {
         if self.columns.is_empty() {
             return;
         }
         let rect = allocate_line(ui, self.width, HEADER_HEIGHT);
-        if !ui.is_rect_visible(rect) {
-            return;
-        }
+        let visible = ui.is_rect_visible(rect);
         for (i, column) in self.columns.iter().enumerate() {
             let (x, w) = if i == 0 {
                 (self.g.first_x, self.g.first_w)
@@ -511,8 +653,53 @@ impl Table<'_> {
                 // Left out for want of room, with its cells.
                 break;
             };
-            let galley = overline_galley(ui, column.title);
-            paint_in_cell(ui, rect, x, w, galley, column.numeric);
+            let cell = Rect::from_min_size(
+                pos2(rect.left() + x, rect.top()),
+                Vec2::new(w, rect.height()),
+            );
+            let id = self.id.with(("column", i));
+            let response = ui.interact(cell, id, Sense::click());
+            let sorted = self.sort.filter(|s| s.column == i);
+            if visible {
+                let color = if response.hovered() {
+                    TEXT_STRONG
+                } else if sorted.is_some() {
+                    TEXT_BODY
+                } else {
+                    Type::Overline.color()
+                };
+                let galley = overline_galley(ui, column.title, color);
+                let title = paint_in_cell(ui, rect, x, w, galley, column.numeric);
+                if let Some(s) = sorted {
+                    let glyph = if s.descending {
+                        icons::CHEVRON_DOWN
+                    } else {
+                        icons::CHEVRON_UP
+                    };
+                    let arrow = icon(ui, glyph, color);
+                    let at = if column.numeric {
+                        title.left() - rect.left() - SORT_GAP - arrow.size().x
+                    } else {
+                        title.right() - rect.left() + SORT_GAP
+                    };
+                    paint_in_cell(ui, rect, at, 0.0, arrow, false);
+                }
+            }
+            focus_ring(ui, &response, radius::CONTROL);
+            let title = column.title;
+            response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, title));
+            if let Some(s) = sorted {
+                let direction = if s.descending {
+                    SortDirection::Descending
+                } else {
+                    SortDirection::Ascending
+                };
+                ui.ctx()
+                    .accesskit_node_builder(id, |node| node.set_sort_direction(direction));
+            }
+            if response.clicked() {
+                state.sort_by(i);
+            }
         }
     }
 
@@ -683,7 +870,8 @@ impl Table<'_> {
             });
         }
         if response.drag_started() {
-            DragAndDrop::set_payload(ui.ctx(), RowDrag(drag_ids(self.sections, row.id)));
+            let ids = drag_ids(self.sections, self.sort, row.id);
+            DragAndDrop::set_payload(ui.ctx(), RowDrag(ids));
         }
         if response.dragged() {
             drag_ghost(ui, id, first);

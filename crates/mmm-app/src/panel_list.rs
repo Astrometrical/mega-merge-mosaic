@@ -31,7 +31,10 @@
 //!   **INTEGRATION**, **SCALE** and **SIZE** from the panel headers ("—"
 //!   when unknown; a file that can't be opened reads "Unreadable" with the
 //!   error as its problem). A panel with an unaccepted problem in the checks
-//!   report carries a ⚠ with the problem's text.
+//!   report carries a ⚠ with the problem's text. A click on a column
+//!   heading sorts the rows within each section by it (integration, scale
+//!   and size as numbers; "—", "Reading…" and "Unreadable" last), again
+//!   the other way; the sort stays while the session is open.
 //! - **Sections.** With grouping on: "No group" first (never rolled up; its
 //!   heading says why the rule placed nothing), then each group in name
 //!   order, headed "{group} · {n}" (" · {total integration}" when every
@@ -81,7 +84,7 @@ use std::sync::Arc;
 use egui::{Align, Color32, Key, Label, Layout, Modifiers, Popup, TextWrapMode};
 use mega_ui::icons;
 use mega_ui::table::{
-    Column, Heading, Row, Section, TableEvent, TableState, sectioned_table, shown_ids,
+    Column, Heading, Row, Section, SortKey, TableEvent, TableState, sectioned_table, shown_ids,
 };
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{CONTROL_HEIGHT, KEYWORD_INPUT_WIDTH, space};
@@ -669,6 +672,8 @@ struct RowData {
     tag: Option<&'static str>,
     selected: bool,
     highlighted: bool,
+    /// How each cell sorts (numbers for the numeric columns).
+    sort_keys: Vec<SortKey>,
 }
 
 /// One section heading, owned.
@@ -709,6 +714,7 @@ impl SectionData {
                     tag: r.tag,
                     selected: r.selected,
                     highlighted: r.highlighted,
+                    sort_keys: r.sort_keys.clone(),
                 })
                 .collect(),
         }
@@ -1739,24 +1745,39 @@ impl PanelList {
     }
 
     /// `path`'s row: its cells from its header ("—" for what is not known,
-    /// yet or at all), and its problems (the read error, then `problems`).
+    /// yet or at all), how they sort (integration in seconds, scale in
+    /// arcseconds, size in pixels; "Reading…" and "Unreadable" last), and
+    /// its problems (the read error, then `problems`).
     fn row(&self, path: &Path, problems: Option<&Vec<String>>) -> RowData {
-        let mut cells = vec![file_name(path)];
+        let name = file_name(path);
+        let mut sort_keys = vec![SortKey::Text(name.clone())];
+        let mut cells = vec![name];
         let mut texts = Vec::new();
+        let number = |n: Option<f64>| n.map_or(SortKey::Unknown, SortKey::Number);
         match self.infos.get(path).map(|i| &i.header) {
             None => cells.extend([READING, UNKNOWN, UNKNOWN, UNKNOWN].map(String::from)),
-            Some(Ok(h)) => cells.extend([
-                h.filter.clone().unwrap_or_else(|| UNKNOWN.into()),
-                h.integration_s()
-                    .map_or_else(|| UNKNOWN.into(), integration_text),
-                h.scale_arcsec.map_or_else(|| UNKNOWN.into(), scale_text),
-                format!("{} × {}", h.width, h.height),
-            ]),
+            Some(Ok(h)) => {
+                cells.extend([
+                    h.filter.clone().unwrap_or_else(|| UNKNOWN.into()),
+                    h.integration_s()
+                        .map_or_else(|| UNKNOWN.into(), integration_text),
+                    h.scale_arcsec.map_or_else(|| UNKNOWN.into(), scale_text),
+                    format!("{} × {}", h.width, h.height),
+                ]);
+                sort_keys.extend([
+                    h.filter.clone().map_or(SortKey::Unknown, SortKey::Text),
+                    number(h.integration_s()),
+                    number(h.scale_arcsec),
+                    SortKey::Number(h.width as f64 * h.height as f64),
+                ]);
+            }
             Some(Err(e)) => {
                 cells.extend([UNREADABLE, UNKNOWN, UNKNOWN, UNKNOWN].map(String::from));
                 texts.push(format!("{UNREADABLE}: {e}"));
             }
         }
+        // Not read (yet, or at all): unknown in every column but the name.
+        sort_keys.resize(cells.len(), SortKey::Unknown);
         texts.extend(problems.into_iter().flatten().cloned());
         RowData {
             id: row_id(path),
@@ -1765,6 +1786,7 @@ impl PanelList {
             tag: None,
             selected: false,
             highlighted: false,
+            sort_keys,
         }
     }
 

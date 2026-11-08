@@ -87,7 +87,12 @@ Panel 7: gradient in the lower left, redo DBE."
                 s.toggle("problems");
                 s
             },
-            table: TableState::default(),
+            table: {
+                // Sorted by integration.
+                let mut t = TableState::default();
+                t.sort_by(2);
+                t
+            },
             table_selection: BTreeSet::from([8]),
             checks,
             toasts: Toasts::default(),
@@ -205,9 +210,9 @@ fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
     });
 }
 
-/// The table section: a rolled-up group with a problem row, and a group
-/// with a warning, a highlighted row and a row moved by hand. Clicks
-/// select (Shift or Ctrl add).
+/// The table section, sorted by integration at first: a rolled-up group
+/// with a problem row, and a group with a warning, a highlighted row and
+/// a row moved by hand. Clicks select (Shift or Ctrl add); headings sort.
 fn table_section(ui: &mut Ui, state: &mut TableState, selection: &mut BTreeSet<u64>) {
     let column = |title, numeric| table::Column { title, numeric };
     let columns = [
@@ -216,23 +221,34 @@ fn table_section(ui: &mut Ui, state: &mut TableState, selection: &mut BTreeSet<u
         column("Integration", true),
         column("Scale", true),
     ];
-    let row = |id: u64, filter: &str, time: &str| table::Row {
+    // Integration in minutes, shown as "3h 05m".
+    let row = |id: u64, filter: &str, minutes: u32| table::Row {
         id,
         cells: vec![
             format!("Carina_P{id}.xisf"),
             filter.to_owned(),
-            time.to_owned(),
+            format!("{}h {:02}m", minutes / 60, minutes % 60),
             "1.21″".to_owned(),
         ],
         problem: None,
         tag: None,
         selected: selection.contains(&id),
         highlighted: false,
+        sort_keys: vec![
+            table::SortKey::Text(format!("Carina_P{id}.xisf")),
+            table::SortKey::Text(filter.to_owned()),
+            table::SortKey::Number(f64::from(minutes)),
+            table::SortKey::Number(1.21),
+        ],
     };
-    let mut ha: Vec<_> = (1..=6).map(|i| row(i, "Ha", "3h 05m")).collect();
+    let minutes = [185, 170, 200, 185, 0, 155];
+    let mut ha: Vec<_> = (1..=6)
+        .map(|i| row(i, "Ha", minutes[i as usize - 1]))
+        .collect();
     ha[4].problem = Some("No astrometric solution: plate-solve it, then add it again");
     ha[4].cells[2] = "—".to_owned();
-    let mut oiii: Vec<_> = (7..=9).map(|i| row(i, "OIII", "3h 20m")).collect();
+    ha[4].sort_keys[2] = table::SortKey::Unknown;
+    let mut oiii: Vec<_> = (7..=9).map(|i| row(i, "OIII", 200)).collect();
     oiii[0].highlighted = true;
     oiii[2].tag = Some("by hand");
     oiii[2].cells[1] = "Ha".to_owned();
