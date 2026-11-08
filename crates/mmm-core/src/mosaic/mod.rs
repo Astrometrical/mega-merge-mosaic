@@ -40,10 +40,15 @@
 pub mod grouping;
 pub use grouping::affected_groups;
 mod lock;
+mod preview;
 mod run;
 
 pub use lock::{
     LOCK_CONTENTION_WAIT, LOCK_FILE, SessionLock, busy_message, lock_session, session_busy,
+};
+
+pub use preview::{
+    PREVIEW_MAX_PIXELS, PreviewPatch, PreviewPlan, plan_preview, preview_downsample, run_preview,
 };
 
 pub use run::{

@@ -11,12 +11,13 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::{Groups, affected_groups};
 use mmm_core::mosaic::{
-    AnalyzeScope, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE,
-    SINGLE_GROUP, analyze_all, blend_group, commit_blend_settings, invalidate_group,
-    last_analyze_settings, last_merge_settings, mark_needs_analyze, plan_analyze,
-    plan_analyze_scoped, plan_analyze_with, plan_blend, plan_blend_with, run_analyze, run_blend,
-    set_analyze_settings, set_blend_settings, set_group_override, set_inputs, set_inputs_affecting,
-    set_settings, settings_changed,
+    AnalyzeScope, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig,
+    PREVIEW_MAX_PIXELS, RESULT_FILE, SINGLE_GROUP, analyze_all, blend_group, commit_blend_settings,
+    invalidate_group, last_analyze_settings, last_merge_settings, mark_needs_analyze, plan_analyze,
+    plan_analyze_scoped, plan_analyze_with, plan_blend, plan_blend_with, plan_preview,
+    preview_downsample, run_analyze, run_blend, run_preview, set_analyze_settings,
+    set_blend_settings, set_group_override, set_inputs, set_inputs_affecting, set_settings,
+    settings_changed,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -1590,4 +1591,131 @@ fn out_of_date_reason_follows_the_trail() {
     assert_eq!(out_of_date_reason(&c4, "Ha"), R::RegionDiffers);
     c4.needs_analyze.insert("Ha".into());
     assert_eq!(out_of_date_reason(&c4, "Ha"), R::Panels);
+}
+
+// ---- transient previews -------------------------------------------------
+
+/// Every file under `dir` with its length and mtime.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let md = e.metadata().unwrap();
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                out.push((e.path(), md.len(), md.modified().unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn a_preview_matches_the_whole_merge_there() {
+    let tmp = TempDir::new("preview-match");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    let plan = plan_preview(&m, "Ha", [100, 50, 400, 300], BlendSettings::default()).unwrap();
+    assert_eq!(plan.rect, [0, 0, 512, 420]);
+    assert_eq!(plan.downsample, 1);
+    let patch = run_preview(&plan, &JobCtl::none()).unwrap();
+    assert_eq!(patch.rect, plan.rect);
+    assert_eq!((patch.width, patch.height), (512, 420));
+    assert_eq!(patch.channels as u64, CH);
+    assert_eq!(patch.data.len(), 512 * 420 * CH as usize);
+
+    let store = TileStore::open(&m.result_path("Ha")).unwrap();
+    let g = store.geometry();
+    let t = g.tile as usize;
+    let (nx, ny) = g.tiles(0);
+    let mut buf = vec![0.0f32; CH as usize * t * t];
+    for ty in 0..ny {
+        for tx in 0..nx {
+            assert!(store.read_tile(0, tx, ty, &mut buf));
+            for c in 0..CH as usize {
+                for y in 0..t {
+                    for x in 0..t {
+                        let (cx, cy) = (tx as usize * t + x, ty as usize * t + y);
+                        if cx >= 512 || cy >= 420 {
+                            continue;
+                        }
+                        let a = buf[(c * t + y) * t + x];
+                        let b = patch.data[(c * 420 + cy) * 512 + cx];
+                        assert_eq!(a, b, "({cx},{cy}) ch {c}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_preview_writes_nothing() {
+    let tmp = TempDir::new("preview-nowrite");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let before = snapshot(&m.dir);
+    let plan = plan_preview(&m, "Ha", [0, 0, 300, 300], BlendSettings::default()).unwrap();
+    run_preview(&plan, &JobCtl::none()).unwrap();
+    assert_eq!(snapshot(&m.dir), before);
+    assert!(!m.result_path("Ha").exists());
+}
+
+#[test]
+fn a_large_roi_is_downsampled_under_the_cap() {
+    assert_eq!(preview_downsample(2048, 2048), Some(1));
+    assert_eq!(preview_downsample(2304, 2304), Some(8));
+    let d = preview_downsample(9255, 18310).unwrap();
+    assert!(d > 1);
+    assert!(9255u64.div_ceil(d as u64) * 18310u64.div_ceil(d as u64) <= PREVIEW_MAX_PIXELS);
+    // Beyond what the L8 blend can reach under the cap: refused.
+    assert_eq!(preview_downsample(40_000, 40_000), None);
+
+    // A downsampled run delivers the 1/8 grid of the rect.
+    let tmp = TempDir::new("preview-ds");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let mut plan = plan_preview(
+        &m,
+        "Ha",
+        [0, 0, CANVAS.0, CANVAS.1],
+        BlendSettings::default(),
+    )
+    .unwrap();
+    plan.downsample = 8;
+    let patch = run_preview(&plan, &JobCtl::none()).unwrap();
+    assert_eq!(patch.downsample, 8);
+    assert_eq!((patch.width, patch.height), (75, 53));
+    assert!(patch.width as u64 * patch.height as u64 <= PREVIEW_MAX_PIXELS);
+    assert_eq!(patch.data.len(), 75 * 53 * CH as usize);
+    assert!(patch.data.iter().any(|v| *v > 0.0));
+}
+
+#[test]
+fn preview_refuses_unanalysed_groups() {
+    let tmp = TempDir::new("preview-refuse");
+    let mut m = two_group_mosaic(&tmp.0);
+    let err = plan_preview(&m, "Ha", [0, 0, 100, 100], BlendSettings::default()).unwrap_err();
+    assert!(err.to_string().contains("analy"), "{err}");
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    plan_preview(&m, "Ha", [0, 0, 100, 100], BlendSettings::default()).unwrap();
+    m.config.needs_analyze.insert("Ha".into());
+    assert!(plan_preview(&m, "Ha", [0, 0, 100, 100], BlendSettings::default()).is_err());
+}
+
+#[test]
+fn a_cancelled_preview_errs_cancelled() {
+    let tmp = TempDir::new("preview-cancel");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let plan = plan_preview(&m, "Ha", [0, 0, 300, 300], BlendSettings::default()).unwrap();
+    let token = CancelToken::new();
+    token.cancel();
+    let err = run_preview(&plan, &JobCtl::new(token, None)).unwrap_err();
+    assert!(err.is_cancelled(), "{err}");
 }
