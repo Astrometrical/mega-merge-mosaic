@@ -1055,7 +1055,7 @@ impl PanelsTab {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(
-                                "These panels use different filters. Group them to blend each \
+                                "These panels use different filters. Group them to merge each \
                                  filter separately.",
                             )
                             .color(palette::TEXT_STRONG),

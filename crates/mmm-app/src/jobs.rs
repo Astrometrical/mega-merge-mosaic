@@ -384,7 +384,7 @@ impl JobRunner {
         group: &str,
         rect: Option<[u64; 4]>,
     ) -> u64 {
-        let id = self.new_id(format!("Blend {group}"));
+        let id = self.new_id(format!("Merge {group}"));
         self.begin(JobTarget::Blend, id, group);
         if rect.is_none() {
             self.whole.insert(id);
@@ -1245,13 +1245,13 @@ pub(crate) mod tests {
         let id = r.start_blend(&mut s, "Ha", None);
         assert!(r.busy());
         assert_eq!(r.views().len(), 1);
-        assert_eq!(r.views()[0].label, "Blend Ha");
+        assert_eq!(r.views()[0].label, "Merge Ha");
         let events = drain(&mut r, &mut s);
         assert_eq!(
             events,
             vec![JobEvent::Finished {
                 id,
-                label: "Blend Ha".into()
+                label: "Merge Ha".into()
             }]
         );
         assert!(!r.busy());
@@ -1273,7 +1273,7 @@ pub(crate) mod tests {
         assert!(!r.views()[0].cancellable);
         gate.open();
         assert_eq!(drain(&mut r, &mut s), vec![JobEvent::Cancelled { id }]);
-        assert_eq!(r.label(id), Some("Blend Ha"));
+        assert_eq!(r.label(id), Some("Merge Ha"));
         assert_eq!(actions(&s), ["analyze"]);
         assert_eq!(MosaicConfig::load(&s.mosaic.dir).unwrap(), s.mosaic.config);
 
@@ -1320,7 +1320,7 @@ pub(crate) mod tests {
             drain(&mut r, &mut s),
             vec![JobEvent::Finished {
                 id,
-                label: "Blend Ha".into()
+                label: "Merge Ha".into()
             }]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1350,11 +1350,11 @@ pub(crate) mod tests {
                 JobEvent::Cancelled { id: old },
                 JobEvent::Finished {
                     id: other,
-                    label: "Blend OIII".into()
+                    label: "Merge OIII".into()
                 },
                 JobEvent::Finished {
                     id: new,
-                    label: "Blend Ha".into()
+                    label: "Merge Ha".into()
                 },
             ]
         );
@@ -1376,11 +1376,11 @@ pub(crate) mod tests {
             vec![
                 JobEvent::Finished {
                     id: ha,
-                    label: "Blend Ha".into()
+                    label: "Merge Ha".into()
                 },
                 JobEvent::Finished {
                     id: oiii,
-                    label: "Blend OIII".into()
+                    label: "Merge OIII".into()
                 },
             ]
         );
@@ -1402,7 +1402,7 @@ pub(crate) mod tests {
                 JobEvent::Cancelled { id: first },
                 JobEvent::Finished {
                     id: second,
-                    label: "Blend Ha".into()
+                    label: "Merge Ha".into()
                 },
             ]
         );
@@ -1480,7 +1480,7 @@ pub(crate) mod tests {
                 },
                 JobEvent::Finished {
                     id: blend,
-                    label: "Blend OIII".into()
+                    label: "Merge OIII".into()
                 },
             ]
         );
@@ -1560,7 +1560,7 @@ pub(crate) mod tests {
         assert_eq!(names, ["OIII", "Red"]);
         let cached = s.groups.as_ref().unwrap();
         assert_eq!(cached.groups.keys().collect::<Vec<_>>(), ["OIII", "Red"]);
-        assert_eq!(s.group_count(), 2);
+        assert_eq!(cached.processing_groups().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

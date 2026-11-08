@@ -491,7 +491,7 @@ pub fn open_result(
     stretch: DisplayStretch,
 ) -> Opened {
     if !result_path.exists() {
-        return Opened::Absent("Not blended yet.".into());
+        return Opened::Absent("Not merged yet.".into());
     }
     let expected = match Session::open(session_dir) {
         Ok(s) => s.canvas,
@@ -499,12 +499,12 @@ pub fn open_result(
     };
     let source = match MosaicTileSource::open(result_path, None) {
         Ok(s) => s,
-        Err(e) => return Opened::Absent(format!("Cannot open the result ({e}); blend again.")),
+        Err(e) => return Opened::Absent(format!("Cannot open the result ({e}); merge again.")),
     };
     let g = source.tile_geometry();
     if (g.width, g.height, u64::from(g.channels)) != expected {
         return Opened::Absent(
-            "The result predates the latest analysis; blend to refresh it.".into(),
+            "The result predates the latest analysis; merge to refresh it.".into(),
         );
     }
     let given = given.filter(|s| s.len() == g.channels as usize);
@@ -823,7 +823,7 @@ mod tests {
         else {
             panic!("no result yet");
         };
-        assert_eq!(why, "Not blended yet.");
+        assert_eq!(why, "Not merged yet.");
         blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
 
         // Matching geometry: open, with an automatic stretch with the

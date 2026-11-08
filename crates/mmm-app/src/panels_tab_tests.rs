@@ -586,7 +586,7 @@ fn panels_edit_spares_exports() {
         panic!("the edit should wait for the blend");
     };
     let labels: Vec<String> = jobs.views().into_iter().map(|v| v.label).collect();
-    assert_eq!(labels, ["Blend OIII", "Export Ha"], "export kept");
+    assert_eq!(labels, ["Merge OIII", "Export Ha"], "export kept");
     let second = jobs.hold();
     first.open();
     let mut events = Vec::new();

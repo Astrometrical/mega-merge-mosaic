@@ -998,7 +998,7 @@ impl MosaicView {
     }
 
     /// In a composition view, a note for each group without an open
-    /// result ("OIII: Not blended yet.").
+    /// result ("OIII: Not merged yet.").
     fn member_notes(&self) -> Vec<String> {
         if self.members.len() < 2 {
             return Vec::new();

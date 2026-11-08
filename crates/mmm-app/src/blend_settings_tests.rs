@@ -89,7 +89,7 @@ fn panel_shows_current_values_and_override_note() {
         set_group_override(m, "Ha", o).unwrap();
     }
     h.run_steps(2);
-    h.get_by_label("Blend settings");
+    h.get_by_label("Merge settings");
     assert_eq!(value(&h, Role::ComboBox, "Mode"), "TwoBand");
     assert_eq!(value(&h, Role::TextInput, "Feather (px)"), "100");
     assert_eq!(value(&h, Role::ComboBox, "Flatten"), "1 (plane)");
@@ -102,7 +102,7 @@ fn panel_shows_current_values_and_override_note() {
             .is_none()
     );
     // Both kinds are captioned.
-    h.get_by_label("BLEND · reblend only");
+    h.get_by_label("MERGE · re-merge only");
     h.get_by_label("ANALYSIS · reruns analysis, every tile goes stale");
     // Nothing staged: no Apply.
     assert!(h.query_by_label("Apply").is_none());
@@ -131,7 +131,9 @@ fn staging_shows_cost_and_revert_discards() {
     h.run_steps(1);
     // Only Ha has a result store (OIII was never blended).
     assert_eq!(h.state().panel.counts(), Some((6, 6)));
-    h.get_by_label_contains("Existing results go stale; reblend to see the change (6 of 6 tiles)");
+    h.get_by_label_contains(
+        "Existing results go stale; merge again to see the change (6 of 6 tiles)",
+    );
     h.get_by_label("Revert").click();
     h.run_steps(2);
     assert!(h.state().panel.draft().is_none());
@@ -397,7 +399,7 @@ fn last_blend_reads_provenance() {
 fn cost_text_says_what_goes_stale() {
     assert_eq!(
         cost_text(ChangeImpact::Reblend, Some((3, 12))),
-        "Existing results go stale; reblend to see the change (3 of 12 tiles)."
+        "Existing results go stale; merge again to see the change (3 of 12 tiles)."
     );
     assert_eq!(
         cost_text(ChangeImpact::Reanalyze, Some((0, 0))),

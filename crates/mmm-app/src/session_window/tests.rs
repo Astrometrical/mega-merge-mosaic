@@ -333,7 +333,7 @@ fn mosaic_shows_by_default_once_merged() {
     // A group not merged yet says so in the canvas.
     h.get_by_label("OIII · 4").click();
     step_until(&mut h, |st| st.w.mosaic().absent().is_some());
-    h.get_by_label("Not blended yet.");
+    h.get_by_label("Not merged yet.");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -357,7 +357,7 @@ fn merge_switches_to_the_mosaic() {
         st.w.merge(&mut st.session, &mut st.jobs);
     }
     assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
-    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
     gate.open();
     // Merged once the merges finish: Mosaic can be chosen from then on.
     step_until(&mut h, |st| !st.jobs.busy() && st.session.merged);
@@ -1214,7 +1214,7 @@ fn main_button_follows_the_work() {
         .unwrap()
         .click();
     h.run_steps(2);
-    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
     assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
@@ -1285,7 +1285,7 @@ fn cancelling_a_working_step_cancels_its_job() {
     h.get_by_label(&cancel).click();
     h.run_steps(2);
     // The queued merge is dropped at once; the running one winds down.
-    assert_eq!(labels(&h.state().jobs), ["Blend Ha"]);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
     h.run_steps(2);
@@ -1523,9 +1523,77 @@ fn the_merged_step_shows_the_mosaic() {
         .unwrap()
         .click();
     h.run_steps(2);
-    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
     assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every text the last frame painted and every accessibility label and
+/// value on it.
+fn all_text(h: &Harness<'_, State>) -> Vec<String> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for cs in &h.output().shapes {
+        walk(&cs.shape, &mut out);
+    }
+    for n in h.root().children_recursive() {
+        let node = n.accesskit_node();
+        out.extend(node.label());
+        out.extend(node.value());
+    }
+    out
+}
+
+fn assert_no_blend(h: &Harness<'_, State>, what: &str) {
+    let bad: Vec<_> = all_text(h)
+        .into_iter()
+        .filter(|t| t.to_lowercase().contains("blend"))
+        .collect();
+    assert!(bad.is_empty(), "{what}: {bad:?}");
+}
+
+#[test]
+fn no_user_visible_blend_wording() {
+    let (root, mut s, jobs) = merged("window-wording");
+    add_roi(&mut s);
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    for id in [PROBLEMS, PANELS, ROIS, MERGE_SETTINGS, COMPOSITES, NOTES] {
+        h.state_mut().w.inspector_mut().open.insert(id.to_string());
+    }
+    step_until(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    step_until(&mut h, |st| st.w.mosaic().health().is_some());
+    h.run_steps(3);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    assert_no_blend(&h, "mosaic");
+    // The settings caption is among what was checked.
+    assert!(
+        all_text(&h)
+            .iter()
+            .any(|t| t.contains("MERGE · re-merge only"))
+    );
+
+    // The export dialog.
+    let State { w, session, .. } = h.state_mut();
+    w.mosaic.open_export(session);
+    h.run_steps(4);
+    assert!(
+        !h.state().w.mosaic().can_open_export(),
+        "the dialog is open"
+    );
+    assert_no_blend(&h, "export dialog");
+
+    // The plan.
+    h.state_mut().w.set_mode(CanvasMode::Plan);
+    h.run_steps(4);
+    assert_no_blend(&h, "plan");
     let _ = std::fs::remove_dir_all(&root);
 }

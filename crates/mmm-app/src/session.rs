@@ -62,15 +62,6 @@ impl OpenSession {
     pub fn canvas(&self) -> Option<(u64, u64)> {
         self.frame.as_ref().map(ReferenceFrame::canvas)
     }
-
-    /// The number of processing groups: from the resolved groups, else the
-    /// groups known from analysis.
-    pub fn group_count(&self) -> usize {
-        match &self.groups {
-            Some(g) => g.processing_groups().len(),
-            None => self.mosaic.config.group_dirs.len(),
-        }
-    }
 }
 
 /// The extension of a session folder (`<name>.mmm-session`).

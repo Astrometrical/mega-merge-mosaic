@@ -466,11 +466,11 @@ impl RoiPanel {
 }
 
 /// How fresh an ROI is for the view's groups: "fresh", "stale (NN%
-/// fresh)", "not blended" or "no tiles"; with several groups, each
+/// fresh)", "not merged" or "no tiles"; with several groups, each
 /// prefixed by its name.
 pub fn fresh_text(counts: &MemberCounts) -> String {
     let one = |c: &Option<(usize, usize)>| match c.map(fresh_fraction) {
-        None => "not blended".to_string(),
+        None => "not merged".to_string(),
         Some(None) => "no tiles".to_string(),
         Some(Some(f)) if f >= 1.0 => "fresh".to_string(),
         Some(Some(f)) => format!("stale ({:.0}% fresh)", (f * 100.0).floor()),
@@ -613,8 +613,8 @@ mod tests {
         assert_eq!(fresh_text(&one(Some((2, 2)))), "fresh");
         assert_eq!(fresh_text(&one(Some((1, 3)))), "stale (33% fresh)");
         assert_eq!(fresh_text(&one(Some((0, 0)))), "no tiles");
-        assert_eq!(fresh_text(&one(None)), "not blended");
+        assert_eq!(fresh_text(&one(None)), "not merged");
         let two = vec![("Ha".to_string(), Some((4, 4))), ("OIII".to_string(), None)];
-        assert_eq!(fresh_text(&two), "Ha fresh, OIII not blended");
+        assert_eq!(fresh_text(&two), "Ha fresh, OIII not merged");
     }
 }

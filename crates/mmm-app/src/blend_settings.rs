@@ -197,7 +197,7 @@ pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>) -> String
     match impact {
         ChangeImpact::None => String::new(),
         ChangeImpact::Reblend => {
-            format!("Existing results go stale; reblend to see the change{tiles}.")
+            format!("Existing results go stale; merge again to see the change{tiles}.")
         }
         ChangeImpact::Reanalyze => {
             format!("Analysis reruns and every result goes stale{tiles}.")
@@ -512,7 +512,7 @@ impl SettingsPanel {
         jobs: &mut JobRunner,
     ) -> Option<ChangeImpact> {
         let mut applied = None;
-        egui::CollapsingHeader::new(RichText::new("Blend settings").color(palette::TEXT_STRONG))
+        egui::CollapsingHeader::new(RichText::new("Merge settings").color(palette::TEXT_STRONG))
             .id_salt("blend-settings")
             .default_open(true)
             .show(ui, |ui| {
@@ -536,7 +536,7 @@ impl SettingsPanel {
             ui.label(RichText::new(t).small().color(palette::TEXT_SUBTLE));
         };
 
-        caption(ui, "BLEND · reblend only");
+        caption(ui, "MERGE · re-merge only");
         ui.add_enabled_ui(editable, |ui| {
             egui::Grid::new("blend-settings-blend")
                 .num_columns(3)
@@ -677,8 +677,8 @@ impl SettingsPanel {
             }
         } else if let Some(impact) = self.applied {
             let note = match impact {
-                ChangeImpact::Reblend => "Applied. Blend again to see the change.",
-                ChangeImpact::Reanalyze => "Applied. Analysis reruns, then blend again.",
+                ChangeImpact::Reblend => "Applied. Merge again to see the change.",
+                ChangeImpact::Reanalyze => "Applied. Analysis reruns, then merge again.",
                 ChangeImpact::None => "",
             };
             if !note.is_empty() {
@@ -751,7 +751,7 @@ fn mark(ui: &mut egui::Ui, changed: bool) {
                 .small()
                 .color(palette::ACCENT_400),
         )
-        .on_hover_text("Changed since the last blend");
+        .on_hover_text("Changed since the last merge");
     } else {
         ui.label("");
     }

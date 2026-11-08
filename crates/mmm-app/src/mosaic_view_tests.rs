@@ -185,7 +185,7 @@ fn merge_all_starts_one_merge_per_group() {
         let st = h.state_mut();
         st.view.merge_all(&mut st.session, &mut st.jobs);
     }
-    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
     let finished = h
@@ -371,7 +371,7 @@ fn a_hidden_view_still_follows_analyses_and_merges() {
         let st = h.state_mut();
         st.view.merge_all(&mut st.session, &mut st.jobs);
     }
-    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
     gate.open();
     step_until(&mut h, |st| {
         !st.jobs.busy()
@@ -603,7 +603,7 @@ fn merge_blocked_until_result_checked_and_reader_released() {
     view.merge_jobs.insert(9, "Ha".into());
     view.on_event(&JobEvent::Finished {
         id: 9,
-        label: "Blend Ha".into(),
+        label: "Merge Ha".into(),
     });
     assert!(view.merge_jobs.is_empty() && member(&mut view, "Ha").reopen && view.want_health);
     let _ = std::fs::remove_dir_all(&root);
@@ -770,7 +770,7 @@ fn merge_roi_starts_one_merge_per_view_group() {
     assert_eq!(view.merge_roi_block_reason(&s, &jobs), None);
     let gate = jobs.hold();
     view.merge_roi(&mut s, &mut jobs);
-    assert_eq!(labels(&jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(labels(&jobs), ["Merge Ha", "Merge OIII"]);
     let mut groups: Vec<&String> = view.merge_jobs.values().collect();
     groups.sort();
     assert_eq!(groups, ["Ha", "OIII"]);
@@ -803,13 +803,13 @@ fn merge_roi_starts_one_merge_per_view_group() {
     member(&mut view, "OIII").reopen = false;
     let gate = jobs.hold();
     view.merge_roi(&mut s, &mut jobs);
-    assert_eq!(labels(&jobs), ["Blend OIII"]);
+    assert_eq!(labels(&jobs), ["Merge OIII"]);
     gate.open();
     drain(&mut jobs, &mut s);
     // ...but merging the whole mosaic merges every group (spec §5.4).
     let gate = jobs.hold();
     view.merge_all(&mut s, &mut jobs);
-    assert_eq!(labels(&jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(labels(&jobs), ["Merge Ha", "Merge OIII"]);
     gate.open();
     drain(&mut jobs, &mut s);
     // No selected ROI: nothing to merge, and the reason says so.
@@ -848,7 +848,7 @@ fn composition_shows_merged_members() {
     assert!(view.results["Ha"].source.is_some());
     assert!(view.results["OIII"].source.is_none());
     assert!(view.viewer.is_some(), "the merged member is shown");
-    assert_eq!(view.member_notes(), ["OIII: Not blended yet."]);
+    assert_eq!(view.member_notes(), ["OIII: Not merged yet."]);
     assert_eq!(view.shown_text(), None);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -937,10 +937,10 @@ fn export_dialog_warns_then_runs() {
     assert!(!picked.exists());
 
     // Merging first merges the chosen groups; no export.
-    h.get_by_label("Blend whole mosaic first").click();
+    h.get_by_label("Merge whole mosaic first").click();
     h.run_steps(1);
     assert!(!h.state().view.export.is_open());
-    assert_eq!(labels(&h.state().jobs), ["Blend Ha"]);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
     step_until(&mut h, |st| {
         !st.jobs.busy() && can_merge(&st.view, &st.session, &st.jobs)
     });
@@ -948,7 +948,7 @@ fn export_dialog_warns_then_runs() {
         h.state()
             .events
             .iter()
-            .any(|e| matches!(e, JobEvent::Finished { label, .. } if label == "Blend Ha"))
+            .any(|e| matches!(e, JobEvent::Finished { label, .. } if label == "Merge Ha"))
     );
 
     // Stale it all, then "Export anyway" runs the export as a job.
@@ -1049,7 +1049,7 @@ fn export_refused_for_a_pending_merge_after_switching_view() {
             .accesskit_node()
             .is_disabled()
     );
-    h.get_by_label_contains("Waiting for the blend of Ha");
+    h.get_by_label_contains("Waiting for the merge of Ha");
     gate.open();
     let _ = std::fs::remove_dir_all(&root);
 }
