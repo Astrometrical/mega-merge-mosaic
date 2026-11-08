@@ -21,8 +21,8 @@ use super::*;
 use crate::checks::{ChecksEngine, ChecksReport};
 use crate::jobs::JobRunner;
 use crate::panel_edits::{
-    Applied, FilesPicker, GROUP_PALETTE, PHYSICAL_SLOTS, PanelsEdit, assign_group_colors,
-    group_colors, load_group_colors, save_group_colors,
+    Applied, FilesPicker, Found, GROUP_PALETTE, PHYSICAL_SLOTS, PanelsEdit, assign_group_colors,
+    group_colors, grouping_chosen, load_group_colors, save_group_colors,
 };
 use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, create_blocking};
@@ -406,6 +406,7 @@ fn no_group_comes_first_with_its_reason() {
     assert!(none.top() < stray.top() && stray.top() < ha.top());
     assert_eq!(cells(&h, "stray.xisf"), ["—", "—", "—", "64 × 48"]);
     // A header rule on another keyword: only the stray one has OBJECT.
+    choose(&mut h, "Header keyword…");
     let field = h.get_by_role_and_label(Role::TextInput, "Header key");
     assert_eq!(field.value().as_deref(), Some("FILTER"));
     field.focus();
@@ -462,7 +463,7 @@ fn groups_roll_up() {
     );
     // Grouping off: one flat list, nothing rolled up.
     let group_by = h.get_by_role_and_label(Role::ComboBox, "Group by");
-    assert_eq!(group_by.value().as_deref(), Some("Header keyword…"));
+    assert_eq!(group_by.value().as_deref(), Some("FILTER header"));
     group_by.click();
     steps(&mut h);
     h.get_by_label("Don't group").click();
@@ -476,14 +477,19 @@ fn groups_roll_up() {
         h.query_by_role_and_label(Role::TextInput, "Header key")
             .is_none()
     );
-    // The FILTER headers differ: the list suggests grouping again.
-    h.get_by_label("Turn grouping on").click();
+    // The user chose: the differing FILTER headers don't group the panels
+    // again by themselves.
+    assert!(grouping_chosen(&on_disk(h.state()).ui));
+    steps(&mut h);
+    assert!(!h.state().session.mosaic.config.grouping.enabled);
+    assert!(h.state().toasts.is_empty(), "no automatic grouping");
+    // FILTER header groups them again.
+    choose(&mut h, "FILTER header");
     wait(&mut h, |s| {
         s.settled() && s.session.mosaic.config.grouping.enabled
     });
     assert!(on_disk(h.state()).grouping.enabled);
     heading(&h, "Ha · 4");
-    assert!(h.query_by_label("Turn grouping on").is_none());
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -977,7 +983,8 @@ fn the_list_fits_its_narrowest_width() {
         (list.width() - PANEL_LIST_MIN_WIDTH).abs() < 1.0,
         "{list:?}"
     );
-    // The toolbar fits.
+    // The toolbar fits, with a keyword field.
+    choose(&mut h, "Header keyword…");
     for (role, label) in [
         (Role::Button, "Add files…"),
         (Role::Button, "More"),
@@ -1466,6 +1473,7 @@ fn delete_removes_the_selection() {
     click_row(&mut h, "Ha_0.xisf", Modifiers::NONE);
     click_row(&mut h, "Ha_2.xisf", Modifiers::COMMAND);
     // Not while a text field has the keyboard.
+    choose(&mut h, "Header keyword…");
     h.get_by_role_and_label(Role::TextInput, "Header key")
         .focus();
     steps(&mut h);
@@ -1613,4 +1621,357 @@ fn removing_the_selected_panel_clears_the_selection() {
     assert_eq!(h.state().session.mosaic.config.panels, before);
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Pick `choice` in the **Group by** dropdown.
+fn choose(h: &mut Harness<'static, State>, choice: &str) {
+    h.get_by_role_and_label(Role::ComboBox, "Group by").click();
+    steps(h);
+    h.get_by_role_and_label(Role::Button, choice).click();
+    steps(h);
+}
+
+/// The **Group by** dropdown's choice as shown.
+fn group_by_shows(h: &Harness<'static, State>) -> String {
+    let combo = h.get_by_role_and_label(Role::ComboBox, "Group by");
+    combo.value().unwrap_or_default()
+}
+
+/// Wait until the session's grouping is `want`, applied and resolved, and
+/// check it was saved, with the user's choice noted.
+fn wait_grouping(h: &mut Harness<'static, State>, want: Grouping) {
+    wait(h, |s| {
+        s.settled() && s.session.mosaic.config.grouping == want
+    });
+    let saved = on_disk(h.state());
+    assert_eq!(saved.grouping, want);
+    assert!(grouping_chosen(&saved.ui), "the choice is noted");
+}
+
+/// Replace the text of the toolbar's keyword field `label` with `typed`
+/// and press Enter.
+fn type_keyword(h: &mut Harness<'static, State>, label: &str, typed: &str) {
+    h.get_by_role_and_label(Role::TextInput, label).focus();
+    h.step();
+    h.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
+    h.step();
+    h.get_by_role_and_label(Role::TextInput, label)
+        .type_text(typed);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    steps(h);
+}
+
+fn header(key: &str) -> Grouping {
+    Grouping {
+        enabled: true,
+        rule: GroupRule::Header { key: key.into() },
+    }
+}
+
+#[test]
+fn group_by_switches_rules() {
+    let root = temp_dir("list-rules");
+    let data = root.join("data");
+    let mut paths = Vec::new();
+    // The folders name the filters one way, the headers another.
+    for (folder, filter, names) in [
+        ("FILTER_Ha", "'Halpha'", ["p1.xisf", "p2.xisf"]),
+        ("FILTER_OIII", "'O3'", ["p3.xisf", "p4.xisf"]),
+    ] {
+        let dir = data.join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            paths.push(panel(&dir, n, &[("FILTER", filter), ("OBJECT", "'M42'")]));
+        }
+    }
+    let mut h = harness(session_of(&root, paths), vec![], runner());
+    wait(&mut h, State::settled);
+    assert_eq!(group_by_shows(&h), "FILTER header");
+    heading(&h, "Halpha · 2");
+    heading(&h, "O3 · 2");
+    assert_eq!(h.query_all_by_role(Role::TextInput).count(), 0, "no field");
+    // Path keyword: the token after FILTER in the path.
+    choose(&mut h, "Path keyword…");
+    wait_grouping(
+        &mut h,
+        Grouping {
+            enabled: true,
+            rule: GroupRule::PathKeyword {
+                keyword: "FILTER".into(),
+            },
+        },
+    );
+    assert_eq!(group_by_shows(&h), "Path keyword…");
+    let field = h.get_by_role_and_label(Role::TextInput, "Path keyword");
+    assert_eq!(field.value().as_deref(), Some("FILTER"));
+    heading(&h, "Ha · 2");
+    heading(&h, "OIII · 2");
+    // Header keyword…: a header key to type, FILTER at first.
+    choose(&mut h, "Header keyword…");
+    wait_grouping(&mut h, header("FILTER"));
+    assert_eq!(group_by_shows(&h), "Header keyword…");
+    let field = h.get_by_role_and_label(Role::TextInput, "Header key");
+    assert_eq!(field.value().as_deref(), Some("FILTER"));
+    type_keyword(&mut h, "Header key", "OBJECT");
+    wait_grouping(&mut h, header("OBJECT"));
+    heading(&h, "M42 · 4");
+    // By hand: nothing placed until panels are moved.
+    choose(&mut h, "By hand");
+    wait_grouping(
+        &mut h,
+        Grouping {
+            enabled: true,
+            rule: GroupRule::Manual,
+        },
+    );
+    assert_eq!(
+        warning(&h, "No group · 4").as_deref(),
+        Some("not placed by hand")
+    );
+    assert_eq!(h.query_all_by_role(Role::TextInput).count(), 0, "no field");
+    // Don't group: one flat list.
+    choose(&mut h, "Don't group");
+    wait(&mut h, |s| {
+        s.settled() && !s.session.mosaic.config.grouping.enabled
+    });
+    assert!(!on_disk(h.state()).grouping.enabled);
+    assert_eq!(group_by_shows(&h), "Don't group");
+    assert_eq!(rows(&h), 4);
+    assert!(!has_heading(&h, "No group · 4"));
+    // FILTER header again.
+    choose(&mut h, "FILTER header");
+    wait_grouping(&mut h, header("FILTER"));
+    heading(&h, "Halpha · 2");
+    heading(&h, "O3 · 2");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_legacy_filename_token_session_keeps_its_groups() {
+    let root = temp_dir("list-legacy");
+    let dir = root.join("panels");
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = [
+        "M42_filter_Ha-300s_1.xisf",
+        "M42_filter_Ha-300s_2.xisf",
+        "M42_filter_OIII-300s_1.xisf",
+    ]
+    .map(|n| panel(&dir, n, &[("FILTER", "'L'")]))
+    .to_vec();
+    let mut cfg = MosaicConfig::new(paths);
+    let legacy = Grouping {
+        enabled: true,
+        rule: GroupRule::FilenameToken {
+            keyword: "filter".into(),
+        },
+    };
+    cfg.grouping = legacy.clone();
+    let session = open(Mosaic::create(&root.join("p.mmm-session"), cfg).unwrap());
+    let mut h = harness(session, vec![], runner());
+    wait(&mut h, State::settled);
+    // Grouped as before: the file name's `_` token (not the path keyword's
+    // "Ha").
+    heading(&h, "Ha-300s · 2");
+    heading(&h, "OIII-300s · 1");
+    // Shown as a path keyword, its keyword kept; nothing rewritten.
+    assert_eq!(group_by_shows(&h), "Path keyword…");
+    let field = h.get_by_role_and_label(Role::TextInput, "Path keyword");
+    assert_eq!(field.value().as_deref(), Some("filter"));
+    let saved = on_disk(h.state());
+    assert_eq!(saved.grouping, legacy);
+    assert!(saved.provenance.is_empty(), "no edit");
+    // Editing the keyword stores a path keyword rule.
+    type_keyword(&mut h, "Path keyword", "FILTER");
+    wait_grouping(
+        &mut h,
+        Grouping {
+            enabled: true,
+            rule: GroupRule::PathKeyword {
+                keyword: "FILTER".into(),
+            },
+        },
+    );
+    heading(&h, "Ha · 2");
+    heading(&h, "OIII · 1");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn filters_group_themselves_once() {
+    let root = temp_dir("list-auto");
+    let mut session = two_group_session(&root);
+    session.mosaic.config.grouping.enabled = false;
+    session.mosaic.save().unwrap();
+    session.groups = session.mosaic.groups().ok();
+    let mut h = harness(session, vec![], runner());
+    // Two FILTER values, grouping off: grouped by FILTER, in one edit.
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.grouping.enabled
+    });
+    let s = h.state();
+    assert_eq!(s.session.mosaic.config.grouping, header("FILTER"));
+    let saved = on_disk(s);
+    assert_eq!(saved.grouping, header("FILTER"));
+    assert_eq!(saved.provenance.len(), 1, "one edit");
+    assert!(!grouping_chosen(&saved.ui), "not the user's choice");
+    assert_eq!(s.toasts.len(), 1);
+    let toast = &s.toasts[0];
+    assert_eq!(toast.toast.title, "Grouped by FILTER: 2 filters");
+    assert_eq!(toast.toast.action.as_deref(), Some("Undo"));
+    assert!(matches!(&toast.undo, Some(Undo::Grouping(g)) if !g.enabled));
+    assert_eq!(group_by_shows(&h), "FILTER header");
+    heading(&h, "Ha · 4");
+    heading(&h, "OIII · 4");
+    // A later edit of the panels...
+    remove_row(&mut h, "OIII_0.xisf");
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 7
+    });
+    // ...survives the Undo, which restores only the grouping, and notes the
+    // choice.
+    undo_toast(&mut h, 0);
+    wait(&mut h, |s| {
+        s.settled() && !s.session.mosaic.config.grouping.enabled
+    });
+    let saved = on_disk(h.state());
+    assert!(!saved.grouping.enabled);
+    assert_eq!(saved.panels.len(), 7);
+    assert!(grouping_chosen(&saved.ui));
+    assert_eq!(group_by_shows(&h), "Don't group");
+    // The next resolution (another panel removed) doesn't group again.
+    remove_row(&mut h, "OIII_1.xisf");
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 6
+    });
+    steps(&mut h);
+    assert!(!h.state().session.mosaic.config.grouping.enabled);
+    let titles: Vec<&str> = h
+        .state()
+        .toasts
+        .iter()
+        .map(|t| t.toast.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "Grouped by FILTER: 2 filters",
+            "Removed 1 panel",
+            "Removed 1 panel"
+        ]
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_rule_that_places_nothing_explains_why() {
+    let root = temp_dir("list-nothing");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    // No FILTER in these paths: every panel in No group, saying why.
+    choose(&mut h, "Path keyword…");
+    wait_grouping(
+        &mut h,
+        Grouping {
+            enabled: true,
+            rule: GroupRule::PathKeyword {
+                keyword: "FILTER".into(),
+            },
+        },
+    );
+    assert_eq!(
+        warning(&h, "No group · 8").as_deref(),
+        Some("no FILTER in the path")
+    );
+    assert!(!has_heading(&h, "Ha · 4"));
+    // FILTER header puts them back in their groups.
+    choose(&mut h, "FILTER header");
+    wait_grouping(&mut h, header("FILTER"));
+    heading(&h, "Ha · 4");
+    heading(&h, "OIII · 4");
+    assert!(!has_heading(&h, "No group · 8"));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_folder_without_panels_says_so() {
+    let root = temp_dir("list-folder-says");
+    // Per-filter subfolders, nothing at the top level.
+    let parent = root.join("Orion");
+    for f in ["FILTER_Ha", "FILTER_OIII"] {
+        std::fs::create_dir_all(parent.join(f)).unwrap();
+        std::fs::write(parent.join(f).join("p.xisf"), b"not an image").unwrap();
+    }
+    std::fs::write(parent.join("notes.txt"), b"text").unwrap();
+    let session = create_blocking(&root.join("s.mmm-session")).unwrap();
+    let mut h = harness(session, vec![parent.clone()], runner());
+    steps(&mut h);
+    let last = |s: &State| s.toasts.last().map(|t| t.toast.title.clone());
+    drop_paths(&mut h, vec![parent.clone()]);
+    step_until(&mut h, |s| !s.list().adding() && !s.toasts.is_empty());
+    let toast = &h.state().toasts[0];
+    assert_eq!(toast.toast.title, "No panels at the top level of Orion");
+    assert!(toast.toast.action.is_none() && toast.undo.is_none());
+    assert!(h.state().session.mosaic.config.panels.is_empty());
+    // The subfolders dropped together add their panels, saying nothing.
+    drop_paths(
+        &mut h,
+        vec![parent.join("FILTER_Ha"), parent.join("FILTER_OIII")],
+    );
+    step_until(&mut h, |s| s.session.mosaic.config.panels.len() == 2);
+    step_until(&mut h, |s| s.settled() && !s.list().adding());
+    assert_eq!(h.state().toasts.len(), 1);
+    // Add folder… picks the parent: the same toast.
+    h.get_by_label("Add folder…").click();
+    step_until(&mut h, |s| !s.list().adding() && s.toasts.len() == 2);
+    assert_eq!(
+        last(h.state()).as_deref(),
+        Some("No panels at the top level of Orion")
+    );
+    // Every panel found already in: one toast for the batch.
+    drop_paths(
+        &mut h,
+        vec![parent.join("FILTER_Ha"), parent.join("FILTER_OIII")],
+    );
+    step_until(&mut h, |s| !s.list().adding() && s.toasts.len() == 3);
+    assert_eq!(last(h.state()).as_deref(), Some("Already in the session"));
+    steps(&mut h);
+    assert_eq!(h.state().toasts.len(), 3);
+    assert_eq!(h.state().session.mosaic.config.panels.len(), 2);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn nothing_added_names_each_reason() {
+    let found = |files: &[&str], empty: &[&str], unreadable: &[&str]| Found {
+        files: files.iter().map(PathBuf::from).collect(),
+        empty: empty.iter().map(PathBuf::from).collect(),
+        unreadable: unreadable.iter().map(PathBuf::from).collect(),
+    };
+    let toast = |f: Found| nothing_added(&f).map(|t| (t.toast.title, t.toast.detail));
+    // Nothing to say: no folder, no panel (a stray file dropped).
+    assert_eq!(toast(found(&[], &[], &[])), None);
+    assert_eq!(
+        toast(found(&["d/a.xisf"], &[], &[])),
+        Some(("Already in the session".into(), None))
+    );
+    assert_eq!(
+        toast(found(&[], &["d/Orion"], &[])),
+        Some(("No panels at the top level of Orion".into(), None))
+    );
+    // Every reason, in one toast: the worst first.
+    let all = nothing_added(&found(&["d/a.xisf"], &["d/Orion", "d/M31"], &["d/Locked"]))
+        .expect("a toast");
+    assert_eq!(all.toast.title, "Couldn't read Locked");
+    assert_eq!(
+        all.toast.detail.as_deref(),
+        Some("No panels at the top level of Orion, M31\nAlready in the session")
+    );
+    assert_eq!(all.toast.tone, Tone::Problem);
+    assert!(all.toast.action.is_none() && all.undo.is_none());
 }

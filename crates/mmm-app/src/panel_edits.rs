@@ -17,7 +17,8 @@
 //!
 //! Group colours ([`group_colors`]) are assigned when groups resolve and
 //! kept in `MosaicConfig.ui` ([`GROUP_COLORS_KEY`]); they are saved with the
-//! next `mosaic.json` save.
+//! next `mosaic.json` save. So is whether the user has chosen how to group
+//! ([`GROUPING_CHOSEN_KEY`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -41,6 +42,33 @@ const BUSY_RETRY: Duration = Duration::from_millis(500);
 /// Key in `MosaicConfig.ui` of the group colours: group name to an index
 /// in [`GROUP_PALETTE`], assigned once (first seen) and then kept.
 pub const GROUP_COLORS_KEY: &str = "group_colors";
+
+/// Key in `MosaicConfig.ui` of whether the user has chosen how to group
+/// (`true` once they pick in **Group by** or undo the automatic grouping):
+/// the panels are then never grouped by FILTER by themselves.
+pub const GROUPING_CHOSEN_KEY: &str = "grouping_chosen";
+
+/// Whether `ui` (`MosaicConfig.ui`) records that the user has chosen how to
+/// group ([`GROUPING_CHOSEN_KEY`]).
+pub fn grouping_chosen(ui: &Value) -> bool {
+    ui.get(GROUPING_CHOSEN_KEY).and_then(Value::as_bool) == Some(true)
+}
+
+/// Record in `ui` that the user has chosen how to group, keeping everything
+/// else there (a `ui` that is not a JSON object becomes one). Whether that
+/// changed `ui`.
+pub fn set_grouping_chosen(ui: &mut Value) -> bool {
+    if grouping_chosen(ui) {
+        return false;
+    }
+    if !ui.is_object() {
+        *ui = Value::Object(Default::default());
+    }
+    if let Some(obj) = ui.as_object_mut() {
+        obj.insert(GROUPING_CHOSEN_KEY.to_string(), Value::Bool(true));
+    }
+    true
+}
 
 /// The persisted group colours in `ui` (`MosaicConfig.ui`); empty when
 /// absent or unreadable.
@@ -136,15 +164,40 @@ impl FilesPicker for RfdFilesPicker {
     }
 }
 
+/// What a batch of paths to add stands for ([`panel_files_in`]): the panel
+/// files, and the folders that gave none, so that a batch adding nothing
+/// can say why.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Found {
+    /// The panel files, normalised, in batch order.
+    pub files: Vec<PathBuf>,
+    /// Folders with no panel file at their top level.
+    pub empty: Vec<PathBuf>,
+    /// Folders that could not be read.
+    pub unreadable: Vec<PathBuf>,
+}
+
+impl Found {
+    /// Panel files alone (picked, or a typed path's).
+    pub fn of_files(files: Vec<PathBuf>) -> Self {
+        Found {
+            files,
+            ..Found::default()
+        }
+    }
+}
+
 /// The panel files `paths` stand for, normalised: a directory contributes
 /// the panel files at its top level (never its subfolders), sorted; a file
 /// with a panel extension is kept; anything else, or a path that does not
-/// exist, is dropped. Blocking (file I/O): call off the UI thread.
-pub(crate) fn panel_files_in(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// exist, is dropped. Folders giving no file are noted. Blocking (file
+/// I/O): call off the UI thread.
+pub(crate) fn panel_files_in(paths: Vec<PathBuf>) -> Found {
+    let mut out = Found::default();
     for path in paths {
         if path.is_dir() {
             let Ok(entries) = std::fs::read_dir(&path) else {
+                out.unreadable.push(path);
                 continue;
             };
             let mut files: Vec<PathBuf> = entries
@@ -153,10 +206,13 @@ pub(crate) fn panel_files_in(paths: Vec<PathBuf>) -> Vec<PathBuf> {
                 .filter(|p| is_panel_file(p) && p.is_file())
                 .map(|p| normalize(&p))
                 .collect();
+            if files.is_empty() {
+                out.empty.push(path);
+            }
             files.sort();
-            out.extend(files);
+            out.files.extend(files);
         } else if is_panel_file(&path) && path.is_file() {
-            out.push(normalize(&path));
+            out.files.push(normalize(&path));
         }
     }
     out
@@ -329,13 +385,14 @@ impl PanelEdits {
     }
 
     /// Add `paths` not already in the shown inputs (duplicates, also within
-    /// `paths`, ignored), after the others; nothing when none is new.
+    /// `paths`, ignored), after the others; nothing when none is new. How
+    /// many were new.
     pub fn add_paths(
         &mut self,
         paths: Vec<PathBuf>,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
-    ) {
+    ) -> usize {
         let mut edit = self.shown(session);
         let mut known: BTreeSet<PathBuf> = edit.panels.iter().map(|p| p.path.clone()).collect();
         let before = edit.panels.len();
@@ -348,9 +405,11 @@ impl PanelEdits {
                 });
             }
         }
-        if edit.panels.len() > before {
+        let added = edit.panels.len() - before;
+        if added > 0 {
             self.submit(edit, session, jobs);
         }
+        added
     }
 
     /// Cancel jobs started after the waiting edit was queued (newer work

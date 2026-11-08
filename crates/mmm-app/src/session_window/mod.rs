@@ -56,8 +56,10 @@
 //!   (removes the panels selected in the open list) and `Esc` (clears the
 //!   selection); none while a text field has the keyboard or the Export
 //!   dialog is open.
-//! - **Saves.** The view state, the display stretch toggles, the composites
-//!   and the notes live in the session's `MosaicConfig.ui`, changed at once
+//! - **Saves.** The view state, the display stretch toggles, the composites,
+//!   the notes and the user's grouping choice (noted by the panel list,
+//!   [`PanelList::take_ui_changed`]) live in the session's
+//!   `MosaicConfig.ui`, changed at once
 //!   in memory and written to `mosaic.json` on the UI thread at most once
 //!   per [`SAVE_INTERVAL`](crate::util::SAVE_INTERVAL) ([`Debounce`]; the
 //!   documented exception), and at once by
@@ -83,7 +85,7 @@ use mega_ui::theme::palette;
 use mega_ui::theme::tokens::{CANVAS_MIN_WIDTH, PANEL_LIST_MIN_WIDTH, space};
 use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
-use mmm_core::mosaic::PanelEntry;
+use mmm_core::mosaic::{Grouping, PanelEntry};
 use mmm_core::session_summary::ResultState;
 use mmm_core::settings::ChangeImpact;
 use serde::{Deserialize, Serialize};
@@ -133,6 +135,10 @@ pub enum Undo {
     /// its index in the inputs before the removal (or the end, if fewer
     /// panels are left); one already back is left alone.
     Readd(Vec<(usize, PanelEntry)>),
+    /// Put back the grouping from before the automatic grouping by FILTER
+    /// (the panels as they are now), noting that the user has chosen how to
+    /// group.
+    Grouping(Grouping),
 }
 
 /// A toast the window asks the shell to show.
@@ -328,6 +334,15 @@ impl SessionWindow {
         jobs: &mut JobRunner,
     ) {
         self.panels.poll(ctx, session, jobs);
+        self.save_panel_choices();
+    }
+
+    /// Save (rate-limited) what the panel list noted in the session's `ui`
+    /// without an edit to carry it (the user's grouping choice).
+    fn save_panel_choices(&mut self) {
+        if self.panels.take_ui_changed() {
+            self.save.touch();
+        }
     }
 
     /// An edit of the panels waits for the jobs to stop (or a busy store):
@@ -407,7 +422,9 @@ impl SessionWindow {
     pub fn undo(&mut self, undo: Undo, session: &mut OpenSession, jobs: &mut JobRunner) {
         match undo {
             Undo::Readd(removed) => self.panels.readd(removed, session, jobs),
+            Undo::Grouping(grouping) => self.panels.regroup(grouping, session, jobs),
         }
+        self.save_panel_choices();
     }
 
     /// Save a pending (rate-limited) change now, whatever the rate limit,
@@ -415,6 +432,7 @@ impl SessionWindow {
     /// being left. A small `mosaic.json` write.
     pub fn flush_save(&mut self, session: &mut OpenSession) {
         self.keep_view_state(session);
+        self.save_panel_choices();
         if self.save.pending() {
             self.save.saved(Instant::now());
             if let Err(e) = session.mosaic.save() {
@@ -494,6 +512,7 @@ impl SessionWindow {
             });
         self.mosaic.export_ui(&ctx, session, jobs);
         out.toasts.append(&mut self.toasts);
+        self.save_panel_choices();
         // Files dropped anywhere are added, whatever shows.
         self.panels.drop_overlay(&ctx);
         // What this frame changed is saved from the next one.

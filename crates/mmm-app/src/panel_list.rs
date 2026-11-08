@@ -4,8 +4,23 @@
 //!
 //! - **Toolbar.** **Add files…** (the file dialog), **Add folder…**, a
 //!   More menu (**Type a path…**: a file, or `folder/*.xisf`) and **Group
-//!   by** with the rule's keyword. Files dropped anywhere on the window are
-//!   added whatever shows ([`PanelList::poll`]).
+//!   by**. Files dropped anywhere on the window are added whatever shows
+//!   ([`PanelList::poll`]). Adding that adds nothing says why in a toast: a
+//!   folder with no panel at its top level (per-filter subfolders are
+//!   dropped together instead), one that can't be read, or panels already
+//!   in the session.
+//! - **Group by** (spec §10.3) chooses the rule: **Don't group**, **FILTER
+//!   header**, **Header keyword…** and **Path keyword…** (each with its
+//!   keyword's field, FILTER at first, committed on Enter or clicking
+//!   away, Esc reverting), or **By hand**. A legacy file-name token rule
+//!   shows as **Path keyword…** with its keyword and keeps resolving as it
+//!   did until the user edits the keyword or picks a choice. Any choice
+//!   notes in the session that the user has chosen
+//!   ([`GROUPING_CHOSEN_KEY`](crate::panel_edits::GROUPING_CHOSEN_KEY)).
+//! - **Automatic grouping.** Until the user has chosen, panels whose headers
+//!   carry two or more FILTER values while grouping is off are grouped by
+//!   **FILTER header** by themselves, once, in one edit, with a toast whose
+//!   Undo puts back only the grouping (and counts as a choice).
 //! - **Table** ([`sectioned_table`]): columns **PANEL**, **FILTER**,
 //!   **INTEGRATION**, **SCALE** and **SIZE** from the panel headers ("—"
 //!   when unknown; a file that can't be opened reads "Unreadable" with the
@@ -57,16 +72,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use egui::{Align, Color32, Key, Label, Layout, Modifiers, Popup, RichText, Stroke, TextWrapMode};
+use egui::{Align, Color32, Key, Label, Layout, Modifiers, Popup, TextWrapMode};
 use mega_ui::icons;
 use mega_ui::table::{
     Column, Heading, Row, Section, TableEvent, TableState, sectioned_table, shown_ids,
 };
 use mega_ui::theme::text::{Type, text};
-use mega_ui::theme::tokens::{CONTROL_HEIGHT, KEYWORD_INPUT_WIDTH, radius, space};
+use mega_ui::theme::tokens::{CONTROL_HEIGHT, KEYWORD_INPUT_WIDTH, space};
 use mega_ui::theme::{Tone, palette};
 use mega_ui::widgets::{ButtonKind, MegaButton, Toast, icon_button_of, submenu, text_input};
-use mmm_core::checks::{CheckCode, PanelFacts, Severity, input_checks, is_accepted};
+use mmm_core::checks::{Severity, is_accepted};
 use mmm_core::formats::InputPanel;
 use mmm_core::mosaic::grouping::{Groups, header_value, resolve_groups};
 use mmm_core::mosaic::{
@@ -77,17 +92,18 @@ use mmm_core::panel_header::{PanelHeader, read_panel_header};
 use crate::checks::ChecksReport;
 use crate::jobs::JobRunner;
 use crate::panel_edits::{
-    FilesPicker, PanelEdits, PanelsEdit, assign_group_colors, expand_typed, group_colors,
-    load_group_colors, panel_files_in, save_group_colors,
+    FilesPicker, Found, PanelEdits, PanelsEdit, assign_group_colors, expand_typed, group_colors,
+    grouping_chosen, load_group_colors, panel_files_in, save_group_colors, set_grouping_chosen,
 };
 use crate::session::{OpenSession, normalize};
 use crate::session_window::{Undo, WindowToast};
 use crate::util::{Poll, Task};
 
-/// Header keyword of a new header rule.
+/// Header keyword of **FILTER header**, and the first of **Header
+/// keyword…**.
 const DEFAULT_HEADER_KEY: &str = "FILTER";
-/// Keyword of a new filename-token rule (`xxx_filter_Ha_yyy` → `Ha`).
-const DEFAULT_TOKEN_KEYWORD: &str = "filter";
+/// The first keyword of **Path keyword…** (`…/FILTER_Ha/…` → `Ha`).
+const DEFAULT_PATH_KEYWORD: &str = "FILTER";
 /// A cell whose fact is unknown.
 const UNKNOWN: &str = "—";
 /// The FILTER cell of a panel whose header is not read yet.
@@ -174,8 +190,15 @@ struct Resolved {
     /// What is known about their panels.
     infos: BTreeMap<PathBuf, PanelInfo>,
     groups: Groups,
-    /// The "filters differ but grouping is off" check fired.
-    filters_differ: bool,
+    /// How many FILTER values the panels' headers carry (panels without
+    /// one not counted).
+    filters: usize,
+}
+
+/// Whether header keyword `key` is FILTER (keywords match whatever their
+/// case).
+fn is_filter(key: &str) -> bool {
+    key.trim().eq_ignore_ascii_case(DEFAULT_HEADER_KEY)
 }
 
 /// The upper-case header keyword `grouping` groups by, if it is an enabled
@@ -191,7 +214,8 @@ fn rule_key(grouping: &Grouping) -> Option<String> {
 
 /// Read what `infos` lacks for `inputs` (the header of each panel new or
 /// changed on disk since read, and the rule's keyword), then resolve the
-/// groups and the input checks. Blocking (header reads): runs on a worker.
+/// groups and count the FILTER values. Blocking (header reads): runs on a
+/// worker.
 fn resolve(inputs: PanelsEdit, mut infos: BTreeMap<PathBuf, PanelInfo>) -> Resolved {
     let key = rule_key(&inputs.grouping);
     // FILTER is among the header facts; another keyword is read on its own.
@@ -237,28 +261,18 @@ fn resolve(inputs: PanelsEdit, mut infos: BTreeMap<PathBuf, PanelInfo>) -> Resol
             info.keys.get(k).cloned().flatten()
         }
     });
-    let facts: Vec<PanelFacts> = inputs
+    // Counted as FILTER header would group them.
+    let filters = inputs
         .panels
         .iter()
-        .filter_map(|p| {
-            let h = infos.get(&p.path)?.header.as_ref().ok()?;
-            Some(PanelFacts {
-                path: p.path.clone(),
-                channels: h.channels,
-                filter: h.filter.clone(),
-                solution: h.solution,
-                scale_arcsec: h.scale_arcsec,
-            })
-        })
-        .collect();
-    let filters_differ = input_checks(&cfg, &facts, &groups)
-        .iter()
-        .any(|c| c.code == CheckCode::FiltersDifferUngrouped);
+        .filter_map(|p| infos.get(&p.path)?.header.as_ref().ok()?.filter.as_deref())
+        .collect::<BTreeSet<&str>>()
+        .len();
     Resolved {
         inputs,
         infos,
         groups,
-        filters_differ,
+        filters,
     }
 }
 
@@ -443,6 +457,48 @@ fn removed_title(n: usize) -> String {
     } else {
         format!("Removed {n} panels")
     }
+}
+
+/// The toast saying why adding `found` added nothing, every reason in one
+/// toast, the worst first: folders that couldn't be read, folders with no
+/// panel at their top level, then panels already in the session. None when
+/// there is nothing to say (no folder, no panel file). For a batch that
+/// added nothing.
+fn nothing_added(found: &Found) -> Option<WindowToast> {
+    let names = |paths: &[PathBuf]| -> String {
+        let names: Vec<String> = paths.iter().map(|p| file_name(p)).collect();
+        names.join(", ")
+    };
+    let mut reasons = Vec::new();
+    if !found.unreadable.is_empty() {
+        reasons.push(format!("Couldn't read {}", names(&found.unreadable)));
+    }
+    if !found.empty.is_empty() {
+        reasons.push(format!(
+            "No panels at the top level of {}",
+            names(&found.empty)
+        ));
+    }
+    if !found.files.is_empty() {
+        reasons.push("Already in the session".to_string());
+    }
+    let mut reasons = reasons.into_iter();
+    let title = reasons.next()?;
+    let rest: Vec<String> = reasons.collect();
+    let tone = if found.unreadable.is_empty() {
+        Tone::Info
+    } else {
+        Tone::Problem
+    };
+    Some(WindowToast {
+        toast: Toast {
+            tone,
+            title,
+            detail: (!rest.is_empty()).then(|| rest.join("\n")),
+            action: None,
+        },
+        undo: None,
+    })
 }
 
 /// A message for the user that something went wrong.
@@ -633,23 +689,38 @@ impl SectionData {
 /// The **Group by** choices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GroupBy {
+    /// One mosaic.
     Off,
+    /// The FILTER header.
+    Filter,
+    /// Another header keyword.
     Header,
-    Token,
+    /// A keyword in the file path (or, shown so, a legacy file-name token).
     Path,
+    /// Groups made by hand.
     Manual,
 }
 
 impl GroupBy {
-    /// The choice `grouping` is.
-    fn of(grouping: &Grouping) -> Self {
+    /// The choices, in the dropdown's order.
+    const ALL: [GroupBy; 5] = [
+        GroupBy::Off,
+        GroupBy::Filter,
+        GroupBy::Header,
+        GroupBy::Path,
+        GroupBy::Manual,
+    ];
+
+    /// The choice `grouping` is; a FILTER header rule shows as **Header
+    /// keyword…** while the user has it open (`custom_header`).
+    fn of(grouping: &Grouping, custom_header: bool) -> Self {
         if !grouping.enabled {
             return GroupBy::Off;
         }
-        match grouping.rule {
+        match &grouping.rule {
+            GroupRule::Header { key } if is_filter(key) && !custom_header => GroupBy::Filter,
             GroupRule::Header { .. } => GroupBy::Header,
-            GroupRule::FilenameToken { .. } => GroupBy::Token,
-            GroupRule::PathKeyword { .. } => GroupBy::Path,
+            GroupRule::PathKeyword { .. } | GroupRule::FilenameToken { .. } => GroupBy::Path,
             GroupRule::Manual => GroupBy::Manual,
         }
     }
@@ -657,10 +728,24 @@ impl GroupBy {
     fn label(self) -> &'static str {
         match self {
             GroupBy::Off => "Don't group",
+            GroupBy::Filter => "FILTER header",
             GroupBy::Header => "Header keyword…",
-            GroupBy::Token => "Filename token…",
             GroupBy::Path => "Path keyword…",
             GroupBy::Manual => "By hand",
+        }
+    }
+
+    /// The choice's tooltip.
+    fn hint(self) -> &'static str {
+        match self {
+            GroupBy::Off => "Merge every panel into one mosaic",
+            GroupBy::Filter => "A group for each filter the panel headers name",
+            GroupBy::Header => "A group for each value of a header keyword you type",
+            GroupBy::Path => {
+                "A group for each value after a keyword in the file path, like Ha \
+                 in FILTER_Ha (as WBPP groups)"
+            }
+            GroupBy::Manual => "Groups you make with Move to",
         }
     }
 }
@@ -668,10 +753,11 @@ impl GroupBy {
 /// The panel list's state for the open session.
 pub struct PanelList {
     picker: Arc<dyn FilesPicker>,
-    /// The file dialog, while open (its paths come back normalised).
-    picking: Option<Task<Option<Vec<PathBuf>>>>,
+    /// The file or folder dialog, while open (its paths come back
+    /// normalised).
+    picking: Option<Task<Option<Found>>>,
     /// Dropped files being normalised.
-    normalizing: Vec<Task<Vec<PathBuf>>>,
+    normalizing: Vec<Task<Found>>,
     /// The typed-path row shows (opened from More → Type a path…).
     typing: bool,
     /// Focus the typed-path field on the next frame.
@@ -682,9 +768,12 @@ pub struct PanelList {
     expanding: Option<Task<Result<Vec<PathBuf>, String>>>,
     /// The rule keyword being typed (committed on Enter or focus lost).
     rule_text: Option<String>,
-    /// The last header key and token keyword used, for switching rules.
+    /// The last header key and path keyword used, for switching rules.
     header_key: String,
-    token_keyword: String,
+    path_keyword: String,
+    /// **Header keyword…** was picked: a FILTER header rule shows as it
+    /// (with its field) rather than as **FILTER header**.
+    custom_header: bool,
     /// Edits on their way into the session.
     edits: PanelEdits,
     /// Header facts by panel path.
@@ -695,8 +784,14 @@ pub struct PanelList {
     attempted: Option<PanelsEdit>,
     /// The last resolution's inputs and groups.
     resolved: Option<(PanelsEdit, Groups)>,
-    /// The last resolution found different filters with grouping off.
-    filters_differ: bool,
+    /// How many FILTER values the last resolution found.
+    filters: usize,
+    /// The panels were grouped by FILTER by themselves (or tried to be):
+    /// never again for this session.
+    auto_grouped: bool,
+    /// The session's `ui` changed with no edit to save it (the user's
+    /// grouping choice); see [`PanelList::take_ui_changed`].
+    ui_changed: bool,
     /// The table's folded and opened sections.
     table: TableState,
     /// The selected panels.
@@ -725,13 +820,16 @@ impl PanelList {
             expanding: None,
             rule_text: None,
             header_key: DEFAULT_HEADER_KEY.into(),
-            token_keyword: DEFAULT_TOKEN_KEYWORD.into(),
+            path_keyword: DEFAULT_PATH_KEYWORD.into(),
+            custom_header: false,
             edits: PanelEdits::default(),
             infos: BTreeMap::new(),
             resolving: None,
             attempted: None,
             resolved: None,
-            filters_differ: false,
+            filters: 0,
+            auto_grouped: false,
+            ui_changed: false,
             table: TableState::default(),
             selection: BTreeSet::new(),
             anchor: None,
@@ -806,6 +904,101 @@ impl PanelList {
         if edit.panels.len() > before {
             self.edits.submit(edit, session, jobs);
             self.collect_errors();
+        }
+    }
+
+    /// Put back `grouping` (an Undo of the automatic grouping) into the
+    /// inputs as they are now (the panels untouched), noting that the user
+    /// has chosen how to group. Applied as any edit (queued behind running
+    /// jobs).
+    pub(crate) fn regroup(
+        &mut self,
+        grouping: Grouping,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        self.note_choice(session);
+        self.custom_header = false;
+        self.rule_text = None;
+        let mut edit = self.edits.shown(session);
+        if edit.grouping != grouping {
+            edit.grouping = grouping;
+            self.edits.submit(edit, session, jobs);
+            self.collect_errors();
+        }
+    }
+
+    /// Whether the session's `ui` changed since last asked with no edit to
+    /// save it (the user's grouping choice): the window saves it with its
+    /// own small, rate-limited saves.
+    pub fn take_ui_changed(&mut self) -> bool {
+        std::mem::take(&mut self.ui_changed)
+    }
+
+    /// Note in the session that the user has chosen how to group (saved
+    /// with the edit that follows, else by the window).
+    fn note_choice(&mut self, session: &mut OpenSession) {
+        if set_grouping_chosen(&mut session.mosaic.config.ui) {
+            self.ui_changed = true;
+        }
+    }
+
+    /// Group by FILTER by themselves (once) panels whose headers carry two
+    /// or more FILTER values while grouping is off, until the user has
+    /// chosen how to group: one edit of the inputs as shown, once their
+    /// resolution is in, with a toast whose Undo puts back the grouping
+    /// from before.
+    fn auto_group(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if self.auto_grouped || self.filters < 2 || grouping_chosen(&session.mosaic.config.ui) {
+            return;
+        }
+        // The filters were counted for the resolved inputs: only for those.
+        let Some((resolved, _)) = &self.resolved else {
+            return;
+        };
+        if resolved.grouping.enabled {
+            return;
+        }
+        let shown = self.edits.shown(session);
+        if *resolved != shown {
+            return;
+        }
+        self.auto_grouped = true;
+        self.custom_header = false;
+        self.rule_text = None;
+        let previous = shown.grouping.clone();
+        let edit = PanelsEdit {
+            panels: shown.panels,
+            grouping: Grouping {
+                enabled: true,
+                rule: GroupRule::Header {
+                    key: DEFAULT_HEADER_KEY.into(),
+                },
+            },
+        };
+        self.edits.submit(edit, session, jobs);
+        self.collect_errors();
+        if !self.edits.shown(session).grouping.enabled {
+            // Refused: its error toast says why.
+            return;
+        }
+        self.toasts.push(WindowToast {
+            toast: Toast {
+                tone: Tone::Info,
+                title: format!("Grouped by FILTER: {} filters", self.filters),
+                detail: None,
+                action: Some("Undo".into()),
+            },
+            undo: Some(Undo::Grouping(previous)),
+        });
+    }
+
+    /// Add `found`'s panel files not in yet; a batch adding none says why
+    /// in a toast.
+    fn add_found(&mut self, found: Found, session: &mut OpenSession, jobs: &mut JobRunner) {
+        let why = nothing_added(&found);
+        if self.edits.add_paths(found.files, session, jobs) == 0 {
+            self.toasts.extend(why);
         }
     }
 
@@ -889,8 +1082,9 @@ impl PanelList {
     }
 
     /// Take finished background work (dialog, typed path, dropped files,
-    /// header reads), apply a waiting edit once the runner is idle, and
-    /// start resolving the shown inputs if they changed. Call every frame,
+    /// header reads), apply a waiting edit once the runner is idle, start
+    /// resolving the shown inputs if they changed, and group the panels by
+    /// FILTER by themselves when due. Call every frame,
     /// after the runner's poll, whether or not the list is shown (files
     /// dropped on the window are added whatever shows).
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
@@ -910,22 +1104,22 @@ impl PanelList {
         let mut normalized = Vec::new();
         self.normalizing.retain(|task| match task.poll() {
             Poll::Pending => true,
-            Poll::Done(paths) => {
-                normalized.push(paths);
+            Poll::Done(found) => {
+                normalized.push(found);
                 false
             }
             Poll::Lost => false,
         });
-        for paths in normalized {
-            self.edits.add_paths(paths, session, jobs);
+        for found in normalized {
+            self.add_found(found, session, jobs);
         }
         if let Some(task) = &self.picking {
             match task.poll() {
                 Poll::Pending => {}
                 Poll::Done(picked) => {
                     self.picking = None;
-                    if let Some(paths) = picked {
-                        self.edits.add_paths(paths, session, jobs);
+                    if let Some(found) = picked {
+                        self.add_found(found, session, jobs);
                     }
                 }
                 Poll::Lost => self.picking = None,
@@ -939,7 +1133,7 @@ impl PanelList {
                     match expanded {
                         Ok(paths) => {
                             self.path_text.clear();
-                            self.edits.add_paths(paths, session, jobs);
+                            self.add_found(Found::of_files(paths), session, jobs);
                         }
                         Err(message) => self.toasts.push(problem_toast(message)),
                     }
@@ -950,6 +1144,7 @@ impl PanelList {
         self.edits.poll(ctx, session, jobs);
         self.collect_errors();
         self.poll_resolution(ctx, session);
+        self.auto_group(session, jobs);
     }
 
     /// Take a finished resolution (refreshing the session's cached groups
@@ -962,7 +1157,7 @@ impl PanelList {
                 Poll::Done(r) => {
                     self.resolving = None;
                     self.infos.extend(r.infos);
-                    self.filters_differ = r.filters_differ;
+                    self.filters = r.filters;
                     if r.inputs.grouping.enabled {
                         // Saved with the next edit or small save (the
                         // UI-thread exception); kept in memory until then.
@@ -1011,7 +1206,9 @@ impl PanelList {
         let picker = self.picker.clone();
         self.picking = Task::spawn("mmm-pick-files", ctx, move || {
             let picked = picker.pick_files()?;
-            Some(picked.iter().map(|p| normalize(p)).collect())
+            Some(Found::of_files(
+                picked.iter().map(|p| normalize(p)).collect(),
+            ))
         });
     }
 
@@ -1049,10 +1246,17 @@ impl PanelList {
         self.keep_selection(&shown);
         let mut out = PanelListOutput::default();
         let mut edit: Option<PanelsEdit> = None;
-        self.toolbar(ui, &ctx, &shown, &mut edit);
-        if let Some(e) = self.notices(ui, &shown) {
-            edit = Some(e);
+        if let Some(grouping) = self.toolbar(ui, &ctx, &shown) {
+            // Noted first, so the edit's save carries it.
+            self.note_choice(session);
+            if grouping != shown.grouping {
+                edit = Some(PanelsEdit {
+                    panels: shown.panels.clone(),
+                    grouping,
+                });
+            }
         }
+        self.notices(ui);
         self.typed_row(ui, &ctx);
         ui.add_space(space::S);
         if shown.panels.is_empty() {
@@ -1183,14 +1387,13 @@ impl PanelList {
     }
 
     /// Add files, Add folder, More (Type a path…), and Group by with the
-    /// rule's keyword.
+    /// rule's keyword; the grouping the user chose in Group by, if they did.
     fn toolbar(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         shown: &PanelsEdit,
-        edit: &mut Option<PanelsEdit>,
-    ) {
+    ) -> Option<Grouping> {
         // Two rows, each fitting the narrowest list: adding, then grouping.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = space::S;
@@ -1218,59 +1421,64 @@ impl PanelList {
         ui.add_space(space::XS);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = space::S;
-            if let Some(grouping) = self.group_by(ui, shown) {
-                *edit = Some(PanelsEdit {
-                    panels: shown.panels.clone(),
-                    grouping,
-                });
-            }
-        });
+            self.group_by(ui, shown)
+        })
+        .inner
     }
 
     /// The **Group by** dropdown and, for a rule with one, its keyword
-    /// field; the new grouping once the user commits one.
+    /// field; the grouping the user chose (picked, perhaps the one in use,
+    /// or with a new keyword committed).
     fn group_by(&mut self, ui: &mut egui::Ui, shown: &PanelsEdit) -> Option<Grouping> {
-        let current = GroupBy::of(&shown.grouping);
-        let mut chosen = current;
+        let rule = &shown.grouping.rule;
+        // The session's keywords, for switching back to their rules.
+        match rule {
+            GroupRule::Header { key } if !is_filter(key) => self.header_key = key.clone(),
+            GroupRule::PathKeyword { keyword } | GroupRule::FilenameToken { keyword } => {
+                self.path_keyword = keyword.clone();
+            }
+            _ => {}
+        }
+        let current = GroupBy::of(&shown.grouping, self.custom_header);
+        let mut chosen = None;
         let label =
             ui.add(Label::new(text(Type::Small, "Group by")).wrap_mode(TextWrapMode::Extend));
         let combo = egui::ComboBox::from_id_salt("panel-list-group-by")
             .selected_text(current.label())
             .show_ui(ui, |ui| {
-                for c in [GroupBy::Off, GroupBy::Header, GroupBy::Token] {
-                    ui.selectable_value(&mut chosen, c, c.label());
-                }
-                // Path keywords and by hand are shown, not offered yet.
-                if matches!(current, GroupBy::Path | GroupBy::Manual) {
-                    ui.selectable_value(&mut chosen, current, current.label());
+                for c in GroupBy::ALL {
+                    let item = ui
+                        .selectable_label(c == current, c.label())
+                        .on_hover_text(c.hint());
+                    if item.clicked() {
+                        chosen = Some(c);
+                    }
                 }
             });
         let _ = combo.response.labelled_by(label.id);
-        let rule = &shown.grouping.rule;
-        if chosen != current {
+        if let Some(c) = chosen {
             self.rule_text = None;
-            let rule = match chosen {
+            self.custom_header = c == GroupBy::Header;
+            let rule = match c {
                 GroupBy::Off => rule.clone(),
-                GroupBy::Header => match rule {
-                    GroupRule::Header { .. } => rule.clone(),
-                    _ => GroupRule::Header {
-                        key: self.header_key.clone(),
-                    },
+                GroupBy::Filter => GroupRule::Header {
+                    key: DEFAULT_HEADER_KEY.into(),
                 },
-                GroupBy::Token => match rule {
-                    GroupRule::FilenameToken { .. } => rule.clone(),
-                    _ => GroupRule::FilenameToken {
-                        keyword: self.token_keyword.clone(),
-                    },
+                GroupBy::Header => GroupRule::Header {
+                    key: self.header_key.clone(),
                 },
-                GroupBy::Path | GroupBy::Manual => return None,
+                // A legacy file-name token rule becomes a path keyword one.
+                GroupBy::Path => GroupRule::PathKeyword {
+                    keyword: self.path_keyword.clone(),
+                },
+                GroupBy::Manual => GroupRule::Manual,
             };
             return Some(Grouping {
-                enabled: chosen != GroupBy::Off,
+                enabled: c != GroupBy::Off,
                 rule,
             });
         }
-        if !shown.grouping.enabled {
+        if !matches!(current, GroupBy::Header | GroupBy::Path) {
             return None;
         }
         self.rule_field(ui, rule).map(|rule| Grouping {
@@ -1280,14 +1488,15 @@ impl PanelList {
     }
 
     /// The rule's keyword field; the new rule once the user commits a new
-    /// keyword (Enter or clicking away; Esc abandons the typing).
+    /// keyword (Enter or clicking away; Esc, or an empty field, abandons
+    /// the typing). A new keyword for a legacy file-name token rule makes
+    /// it a path keyword rule.
     fn rule_field(&mut self, ui: &mut egui::Ui, rule: &GroupRule) -> Option<GroupRule> {
         let (current, field_label, hint) = match rule {
             GroupRule::Header { key } => (key, "Header key", DEFAULT_HEADER_KEY),
-            GroupRule::FilenameToken { keyword } => {
-                (keyword, "Token keyword", DEFAULT_TOKEN_KEYWORD)
+            GroupRule::PathKeyword { keyword } | GroupRule::FilenameToken { keyword } => {
+                (keyword, "Path keyword", DEFAULT_PATH_KEYWORD)
             }
-            GroupRule::PathKeyword { keyword } => (keyword, "Path keyword", DEFAULT_HEADER_KEY),
             GroupRule::Manual => return None,
         };
         let label =
@@ -1309,7 +1518,7 @@ impl PanelList {
                 return None;
             }
             let typed = typed.trim().to_string();
-            if typed == *current {
+            if typed.is_empty() || typed == *current {
                 return None;
             }
             return Some(match rule {
@@ -1317,12 +1526,10 @@ impl PanelList {
                     self.header_key = typed.clone();
                     GroupRule::Header { key: typed }
                 }
-                GroupRule::FilenameToken { .. } => {
-                    self.token_keyword = typed.clone();
-                    GroupRule::FilenameToken { keyword: typed }
+                _ => {
+                    self.path_keyword = typed.clone();
+                    GroupRule::PathKeyword { keyword: typed }
                 }
-                GroupRule::PathKeyword { .. } => GroupRule::PathKeyword { keyword: typed },
-                GroupRule::Manual => return None,
             });
         }
         if field.has_focus() {
@@ -1331,10 +1538,8 @@ impl PanelList {
         None
     }
 
-    /// The waiting edit, and the grouping suggestion (grouping turned on
-    /// when taken).
-    fn notices(&mut self, ui: &mut egui::Ui, shown: &PanelsEdit) -> Option<PanelsEdit> {
-        let mut edit = None;
+    /// The waiting edit, if any.
+    fn notices(&mut self, ui: &mut egui::Ui) {
         if self.edits.has_pending() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -1346,41 +1551,6 @@ impl PanelList {
                 ui.label(text(Type::Body, waiting));
             });
         }
-        let suggest = !shown.grouping.enabled
-            && self.filters_differ
-            && self.resolved.as_ref().is_some_and(|(i, _)| i == shown);
-        if suggest {
-            ui.add_space(space::XS);
-            egui::Frame::new()
-                .fill(palette::SURFACE_700)
-                .stroke(Stroke::new(1.0, palette::ACCENT_600))
-                .corner_radius(radius::CONTROL)
-                .inner_margin(space::S)
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(
-                                "These panels use different filters. Group them to merge each \
-                                 filter separately.",
-                            )
-                            .color(palette::TEXT_STRONG),
-                        );
-                        if ui
-                            .add(MegaButton::new(ButtonKind::Secondary, "Turn grouping on"))
-                            .clicked()
-                        {
-                            edit = Some(PanelsEdit {
-                                panels: shown.panels.clone(),
-                                grouping: Grouping {
-                                    enabled: true,
-                                    rule: shown.grouping.rule.clone(),
-                                },
-                            });
-                        }
-                    });
-                });
-        }
-        edit
     }
 
     /// The typed-path row, once opened from More → Type a path….

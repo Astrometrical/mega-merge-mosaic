@@ -613,6 +613,8 @@ fn no_chips_for_a_single_group() {
     let root = temp_dir("window-single-group");
     let mut s = two_group_session(&root);
     s.mosaic.config.grouping.enabled = false;
+    // Chosen so: the two filters don't group the panels by themselves.
+    crate::panel_edits::set_grouping_chosen(&mut s.mosaic.config.ui);
     s.groups = s.mosaic.groups().ok();
     let mut h = harness(State::new(s, runner()));
     step_until(&mut h, |st| st.w.view().is_some());
