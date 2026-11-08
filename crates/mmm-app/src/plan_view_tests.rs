@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui_kittest::Harness;
@@ -649,12 +649,15 @@ fn plan_places_solved_panels_before_previews() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[test]
-fn aligned_panels_get_outlines_before_previews() {
+/// The aligned canvas of [`aligned_session`].
+const ALIGNED_CANVAS: (u64, u64) = (400, 300);
+
+/// A session in `root` of aligned full-canvas panels, one covering each of
+/// `rects` (`[x0, y0, x1, y1]`), its previews' frame saved (nothing
+/// analysed): the session, the panels and the frame.
+fn aligned_session(root: &Path, rects: &[[u64; 4]]) -> (OpenSession, Vec<PathBuf>, ReferenceFrame) {
     use mmm_core::synth::write_xisf;
-    let root = temp_dir("plan-aligned");
-    let (w, h) = (400u64, 300u64);
-    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260]];
+    let (w, h) = ALIGNED_CANVAS;
     let paths: Vec<PathBuf> = rects
         .iter()
         .enumerate()
@@ -678,16 +681,23 @@ fn aligned_panels_get_outlines_before_previews() {
     frame
         .save(&mmm_core::preview::preview_frame_path(&mosaic.dir))
         .unwrap();
-    let groups = mosaic.groups().ok();
-    let s = OpenSession {
-        mosaic,
-        frame: None,
-        groups,
-        lock: None,
-        summary: None,
-        merged: false,
-        results: Default::default(),
-    };
+    (crate::testutil::open(mosaic), paths, frame)
+}
+
+/// The rect of `path`'s item, as last drawn.
+fn item_rect(s: &State, path: &Path) -> Option<[f64; 4]> {
+    s.view
+        .items()
+        .iter()
+        .find(|i| i.path == path)
+        .map(|i| i.rect)
+}
+
+#[test]
+fn aligned_panels_get_outlines_before_previews() {
+    let root = temp_dir("plan-aligned");
+    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260]];
+    let (s, paths, _) = aligned_session(&root, &rects);
     let mut h = harness(s);
     step_until(&mut h, |s| s.view.items().len() == 2);
     assert_eq!(h.state().view.unplaced(), 0);
@@ -699,6 +709,109 @@ fn aligned_panels_get_outlines_before_previews() {
         }
     }
     assert!(dashes(&h) > 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// No outline search runs, and the last one was started for the feed's
+/// previews generation.
+fn outlines_settled(s: &State) -> bool {
+    s.view.footprint_task.is_none() && s.view.outlines_checked == Some(s.generation)
+}
+
+/// How many times each of `paths` has had its outline read.
+fn scan_counts(paths: &[PathBuf]) -> Vec<usize> {
+    paths
+        .iter()
+        .map(|p| super::outline_hooks::scans(p))
+        .collect()
+}
+
+#[test]
+fn aligned_outlines_are_scanned_once() {
+    use super::outline_hooks::scans;
+    let root = temp_dir("plan-aligned-once");
+    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260], [0, 0, 90, 90]];
+    let (s, paths, frame) = aligned_session(&root, &rects);
+    // The third panel's preview is in already: no scan for it.
+    let mut state = State::new(s);
+    state.previews = previews_in(&frame, &paths[2..]);
+    let mut h = harness_of(state);
+    step_until(&mut h, |s| s.view.items().len() == 3 && outlines_settled(s));
+    assert_eq!(scan_counts(&paths), [1, 1, 0]);
+    // Edits of the inputs (a regroup, a move): the previews generation
+    // goes up and the previews are dropped; the outlines stay, nothing is
+    // read again, and the third panel keeps its preview's outline.
+    for _ in 0..3 {
+        let s = h.state_mut();
+        s.generation += 1;
+        s.previews.clear();
+        step_until(&mut h, outlines_settled);
+        assert_eq!(h.state().view.unplaced(), 0);
+        assert_eq!(h.state().view.items().len(), 3);
+    }
+    assert_eq!(scan_counts(&paths), [1, 1, 0]);
+    let third = item_rect(h.state(), &paths[2]).unwrap();
+    assert!((third[2] - 90.0).abs() <= 1.0, "{third:?}");
+    // A panel added: only it is read.
+    let extra = root.join("al_extra.xisf");
+    std::fs::copy(&paths[0], &extra).unwrap();
+    {
+        let s = h.state_mut();
+        let entry = mmm_core::mosaic::PanelEntry {
+            path: extra.clone(),
+            fingerprint: None,
+            manual_group: None,
+        };
+        s.session.mosaic.config.panels.push(entry);
+        s.session.groups = s.session.mosaic.groups().ok();
+        s.generation += 1;
+    }
+    step_until(&mut h, |s| s.view.items().len() == 4 && outlines_settled(s));
+    assert_eq!(scans(&extra), 1);
+    assert_eq!(scan_counts(&paths), [1, 1, 0]);
+    // The frame moves: every outline not placed otherwise is found again
+    // in it.
+    let (w, ht) = ALIGNED_CANVAS;
+    let moved = ReferenceFrame::Aligned {
+        width: w,
+        height: ht + 10,
+        wcs: None,
+    };
+    {
+        let s = h.state_mut();
+        let file = mmm_core::preview::preview_frame_path(&s.session.mosaic.dir);
+        moved.save(&file).unwrap();
+        s.generation += 1;
+    }
+    step_until(&mut h, |s| {
+        s.view.frame_canvas() == Some((w, ht + 10)) && outlines_settled(s) && scans(&extra) == 2
+    });
+    assert_eq!(scan_counts(&paths), [2, 2, 1]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropping_the_plan_cancels_its_outline_search() {
+    use super::outline_hooks::{cancelled, hold, scans};
+    let root = temp_dir("plan-aligned-drop");
+    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260]];
+    let (s, paths, _) = aligned_session(&root, &rects);
+    // Its scan waits for a cancel once started.
+    hold(&paths[0]);
+    let mut h = harness(s);
+    step_until(&mut h, |_| scans(&paths[0]) == 1);
+    assert!(!cancelled(&paths[0]));
+    // Leaving the session drops the plan: its search stops.
+    drop(h);
+    let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
+    while !cancelled(&paths[0]) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the outline search outlived its plan"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
