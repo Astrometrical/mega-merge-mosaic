@@ -316,7 +316,7 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
                     "Panels use different filters ({}) but grouping is off.",
                     filters.into_iter().collect::<Vec<_>>().join(", ")
                 ),
-                remedy: Some("Turn grouping on to merge each filter separately.".into()),
+                remedy: Some("Group by FILTER header to merge each filter separately.".into()),
             });
         }
     }
@@ -613,7 +613,10 @@ mod tests {
         let f = of(&checks, CheckCode::FiltersDifferUngrouped);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Note);
-        assert!(f[0].remedy.as_deref().unwrap().contains("grouping on"));
+        assert_eq!(
+            f[0].remedy.as_deref(),
+            Some("Group by FILTER header to merge each filter separately.")
+        );
     }
 
     #[test]

@@ -1782,6 +1782,15 @@ fn a_legacy_filename_token_session_keeps_its_groups() {
     let saved = on_disk(h.state());
     assert_eq!(saved.grouping, legacy);
     assert!(saved.provenance.is_empty(), "no edit");
+    // Picking the choice shown changes nothing, but notes the choice.
+    choose(&mut h, "Path keyword…");
+    wait(&mut h, |s| s.settled() && grouping_chosen(&on_disk(s).ui));
+    let s = h.state();
+    assert_eq!(s.session.mosaic.config.grouping, legacy);
+    let saved = on_disk(s);
+    assert_eq!(saved.grouping, legacy);
+    assert!(saved.provenance.is_empty(), "no edit");
+    heading(&h, "Ha-300s · 2");
     // Editing the keyword stores a path keyword rule.
     type_keyword(&mut h, "Path keyword", "FILTER");
     wait_grouping(
@@ -1974,4 +1983,125 @@ fn nothing_added_names_each_reason() {
     );
     assert_eq!(all.toast.tone, Tone::Problem);
     assert!(all.toast.action.is_none() && all.undo.is_none());
+}
+
+/// [`two_group_session`] with grouping off (the rule left as it is).
+fn ungrouped_session(root: &Path) -> OpenSession {
+    let mut session = two_group_session(root);
+    session.mosaic.config.grouping.enabled = false;
+    session.mosaic.save().unwrap();
+    session.groups = session.mosaic.groups().ok();
+    session
+}
+
+#[test]
+fn an_analysed_session_keeps_its_results() {
+    let root = temp_dir("list-analysed");
+    let mut session = ungrouped_session(&root);
+    let mut jobs = runner();
+    jobs.start_analyze(&mut session);
+    crate::jobs::tests::drain(&mut jobs, &mut session);
+    let before = session.mosaic.config.clone();
+    assert!(!before.group_dirs.is_empty(), "analysed");
+    assert!(before.needs_analyze.is_empty());
+    let extra = panel(&root.join("panels"), "Ha_extra.xisf", &[("FILTER", "'Ha'")]);
+    // Reopened with its two filters ungrouped: left as it is, results and
+    // all.
+    let mut h = harness(session, vec![extra], jobs);
+    wait(&mut h, State::settled);
+    steps(&mut h);
+    let s = h.state();
+    assert!(!s.session.mosaic.config.grouping.enabled);
+    assert!(s.toasts.is_empty(), "no automatic grouping");
+    let saved = on_disk(s);
+    assert!(saved.needs_analyze.is_empty(), "results kept");
+    assert_eq!(saved.provenance, before.provenance, "no edit");
+    assert_eq!(saved.group_dirs, before.group_dirs);
+    // A panel added (its edit invalidates the results anyway): grouped by
+    // FILTER then.
+    h.get_by_label("Add files…").click();
+    wait(&mut h, |s| {
+        s.settled()
+            && s.session.mosaic.config.panels.len() == 9
+            && s.session.mosaic.config.grouping.enabled
+    });
+    assert_eq!(h.state().session.mosaic.config.grouping, header("FILTER"));
+    let titles: Vec<&str> = h
+        .state()
+        .toasts
+        .iter()
+        .map(|t| t.toast.title.as_str())
+        .collect();
+    assert_eq!(titles, ["Grouped by FILTER: 2 filters"]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An ungrouped two-filter session changed by `setup` stays ungrouped when
+/// opened.
+fn stays_ungrouped(tag: &str, setup: fn(&mut OpenSession)) {
+    let root = temp_dir(tag);
+    let mut session = ungrouped_session(&root);
+    setup(&mut session);
+    session.mosaic.save().unwrap();
+    let before = session.mosaic.config.clone();
+    let mut h = harness(session, vec![], runner());
+    wait(&mut h, State::settled);
+    steps(&mut h);
+    let s = h.state();
+    assert!(!s.session.mosaic.config.grouping.enabled, "{tag}");
+    assert!(s.toasts.is_empty(), "{tag}: no automatic grouping");
+    assert_eq!(on_disk(s).grouping, before.grouping, "{tag}");
+    assert_eq!(rows(&h), 8, "{tag}: one flat list");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_prior_choice_keeps_grouping_off() {
+    use mmm_core::checks::{CheckCode, CheckKey};
+    // The "filters differ" note accepted.
+    stays_ungrouped("list-prior-accepted", |s| {
+        s.mosaic.config.accepted_checks.push(CheckKey {
+            code: CheckCode::FiltersDifferUngrouped,
+            panel: None,
+        });
+    });
+    // A rule other than FILTER header chosen before grouping was turned off.
+    stays_ungrouped("list-prior-token", |s| {
+        s.mosaic.config.grouping.rule = GroupRule::FilenameToken {
+            keyword: "filter".into(),
+        };
+    });
+}
+
+#[test]
+fn a_stale_undo_keeps_a_later_choice() {
+    let root = temp_dir("list-stale-undo");
+    let mut h = harness(ungrouped_session(&root), vec![], runner());
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.grouping.enabled
+    });
+    assert_eq!(
+        h.state().toasts[0].toast.title,
+        "Grouped by FILTER: 2 filters"
+    );
+    // The user picks another rule while the toast still shows...
+    choose(&mut h, "By hand");
+    let manual = Grouping {
+        enabled: true,
+        rule: GroupRule::Manual,
+    };
+    wait_grouping(&mut h, manual.clone());
+    let edits = h.state().session.mosaic.config.provenance.len();
+    // ...then clicks its Undo: their choice stays.
+    undo_toast(&mut h, 0);
+    steps(&mut h);
+    wait(&mut h, State::settled);
+    let s = h.state();
+    assert_eq!(s.session.mosaic.config.grouping, manual);
+    assert_eq!(on_disk(s).grouping, manual);
+    assert_eq!(s.session.mosaic.config.provenance.len(), edits, "no edit");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
 }

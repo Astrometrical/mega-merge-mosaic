@@ -20,7 +20,13 @@
 //! - **Automatic grouping.** Until the user has chosen, panels whose headers
 //!   carry two or more FILTER values while grouping is off are grouped by
 //!   **FILTER header** by themselves, once, in one edit, with a toast whose
-//!   Undo puts back only the grouping (and counts as a choice).
+//!   Undo puts back only the grouping (and counts as a choice; after
+//!   another choice it changes nothing). Picking the choice already shown
+//!   changes nothing. A session that kept its filters together before
+//!   (the "filters differ" note accepted, or grouping off with another
+//!   rule than FILTER header) is not grouped, nor is one opened with
+//!   analysis results until panels are added or removed: the edit would
+//!   throw the results away.
 //! - **Table** ([`sectioned_table`]): columns **PANEL**, **FILTER**,
 //!   **INTEGRATION**, **SCALE** and **SIZE** from the panel headers ("—"
 //!   when unknown; a file that can't be opened reads "Unreadable" with the
@@ -81,7 +87,7 @@ use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{CONTROL_HEIGHT, KEYWORD_INPUT_WIDTH, space};
 use mega_ui::theme::{Tone, palette};
 use mega_ui::widgets::{ButtonKind, MegaButton, Toast, icon_button_of, submenu, text_input};
-use mmm_core::checks::{Severity, is_accepted};
+use mmm_core::checks::{CheckCode, CheckKey, Severity, is_accepted};
 use mmm_core::formats::InputPanel;
 use mmm_core::mosaic::grouping::{Groups, header_value, resolve_groups};
 use mmm_core::mosaic::{
@@ -193,6 +199,29 @@ struct Resolved {
     /// How many FILTER values the panels' headers carry (panels without
     /// one not counted).
     filters: usize,
+}
+
+/// The grouping the panels get by themselves: by the FILTER header.
+fn by_filter() -> Grouping {
+    Grouping {
+        enabled: true,
+        rule: GroupRule::Header {
+            key: DEFAULT_HEADER_KEY.into(),
+        },
+    }
+}
+
+/// Whether `config` shows the user chose to keep different filters
+/// together before they could say so in **Group by**: the "filters differ"
+/// note accepted, or grouping turned off with a rule other than FILTER
+/// header.
+fn kept_ungrouped(config: &MosaicConfig) -> bool {
+    let note = CheckKey {
+        code: CheckCode::FiltersDifferUngrouped,
+        panel: None,
+    };
+    config.accepted_checks.contains(&note)
+        || (!config.grouping.enabled && config.grouping.rule != GroupRule::default())
 }
 
 /// Whether header keyword `key` is FILTER (keywords match whatever their
@@ -789,6 +818,12 @@ pub struct PanelList {
     /// The panels were grouped by FILTER by themselves (or tried to be):
     /// never again for this session.
     auto_grouped: bool,
+    /// The session has been polled once ([`PanelList::poll`]).
+    opened: bool,
+    /// The panels of a session opened with analysis results, as opened:
+    /// no automatic grouping (which would throw the results away) while
+    /// they are the panels shown.
+    analysed_panels: Option<BTreeSet<PathBuf>>,
     /// The session's `ui` changed with no edit to save it (the user's
     /// grouping choice); see [`PanelList::take_ui_changed`].
     ui_changed: bool,
@@ -829,6 +864,8 @@ impl PanelList {
             resolved: None,
             filters: 0,
             auto_grouped: false,
+            opened: false,
+            analysed_panels: None,
             ui_changed: false,
             table: TableState::default(),
             selection: BTreeSet::new(),
@@ -909,8 +946,9 @@ impl PanelList {
 
     /// Put back `grouping` (an Undo of the automatic grouping) into the
     /// inputs as they are now (the panels untouched), noting that the user
-    /// has chosen how to group. Applied as any edit (queued behind running
-    /// jobs).
+    /// has chosen how to group; nothing more once the user has chosen
+    /// another way to group than **FILTER header** (their choice stays).
+    /// Applied as any edit (queued behind running jobs).
     pub(crate) fn regroup(
         &mut self,
         grouping: Grouping,
@@ -918,14 +956,14 @@ impl PanelList {
         jobs: &mut JobRunner,
     ) {
         self.note_choice(session);
-        self.custom_header = false;
-        self.rule_text = None;
         let mut edit = self.edits.shown(session);
-        if edit.grouping != grouping {
-            edit.grouping = grouping;
-            self.edits.submit(edit, session, jobs);
-            self.collect_errors();
+        if edit.grouping != by_filter() || self.custom_header || edit.grouping == grouping {
+            return;
         }
+        self.rule_text = None;
+        edit.grouping = grouping;
+        self.edits.submit(edit, session, jobs);
+        self.collect_errors();
     }
 
     /// Whether the session's `ui` changed since last asked with no edit to
@@ -947,9 +985,17 @@ impl PanelList {
     /// or more FILTER values while grouping is off, until the user has
     /// chosen how to group: one edit of the inputs as shown, once their
     /// resolution is in, with a toast whose Undo puts back the grouping
-    /// from before.
+    /// from before. Not for a session that shows the user kept its filters
+    /// together ([`kept_ungrouped`]), nor for one opened with analysis
+    /// results while it has the panels it was opened with: the edit would
+    /// throw the results away (adding or removing panels does anyway).
     fn auto_group(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
-        if self.auto_grouped || self.filters < 2 || grouping_chosen(&session.mosaic.config.ui) {
+        let config = &session.mosaic.config;
+        if self.auto_grouped
+            || self.filters < 2
+            || grouping_chosen(&config.ui)
+            || kept_ungrouped(config)
+        {
             return;
         }
         // The filters were counted for the resolved inputs: only for those.
@@ -963,18 +1009,19 @@ impl PanelList {
         if *resolved != shown {
             return;
         }
+        if let Some(opened) = &self.analysed_panels
+            && shown.panels.len() == opened.len()
+            && shown.panels.iter().all(|p| opened.contains(&p.path))
+        {
+            return;
+        }
         self.auto_grouped = true;
         self.custom_header = false;
         self.rule_text = None;
         let previous = shown.grouping.clone();
         let edit = PanelsEdit {
             panels: shown.panels,
-            grouping: Grouping {
-                enabled: true,
-                rule: GroupRule::Header {
-                    key: DEFAULT_HEADER_KEY.into(),
-                },
-            },
+            grouping: by_filter(),
         };
         self.edits.submit(edit, session, jobs);
         self.collect_errors();
@@ -1088,6 +1135,13 @@ impl PanelList {
     /// after the runner's poll, whether or not the list is shown (files
     /// dropped on the window are added whatever shows).
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if !std::mem::replace(&mut self.opened, true) {
+            let config = &session.mosaic.config;
+            if !config.group_dirs.is_empty() {
+                let panels = config.panels.iter().map(|p| p.path.clone());
+                self.analysed_panels = Some(panels.collect());
+            }
+        }
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1458,6 +1512,10 @@ impl PanelList {
         let _ = combo.response.labelled_by(label.id);
         if let Some(c) = chosen {
             self.rule_text = None;
+            if c == current {
+                // Nothing changes (a legacy file-name token rule stays one).
+                return Some(shown.grouping.clone());
+            }
             self.custom_header = c == GroupBy::Header;
             let rule = match c {
                 GroupBy::Off => rule.clone(),

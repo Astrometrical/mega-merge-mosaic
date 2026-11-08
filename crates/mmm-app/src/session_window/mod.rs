@@ -137,7 +137,7 @@ pub enum Undo {
     Readd(Vec<(usize, PanelEntry)>),
     /// Put back the grouping from before the automatic grouping by FILTER
     /// (the panels as they are now), noting that the user has chosen how to
-    /// group.
+    /// group; nothing more if they have chosen another way since.
     Grouping(Grouping),
 }
 
