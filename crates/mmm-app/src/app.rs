@@ -196,11 +196,21 @@ impl Shell {
     /// notes). When the window closes, and on leaving the session
     /// ([`Shell::close_session`]); also from eframe's periodic save.
     pub fn flush_pending_saves(&mut self) {
+        self.flush_saves(true);
+    }
+
+    /// [`Shell::flush_pending_saves`] from eframe's periodic save: edits still
+    /// working out their scope are left to apply themselves.
+    fn flush_periodic_saves(&mut self) {
+        self.flush_saves(false);
+    }
+
+    fn flush_saves(&mut self, leaving: bool) {
         let Some(session) = &mut self.session else {
             return;
         };
         if let Some(jobs) = &mut self.jobs {
-            self.window.apply_waiting_edits(session, jobs);
+            self.window.apply_waiting_edits(session, jobs, leaving);
         }
         self.window.flush_save(session);
     }
@@ -943,7 +953,7 @@ impl eframe::App for MmmApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.shell.flush_pending_saves();
+        self.shell.flush_periodic_saves();
         if self.selftest.is_none() {
             eframe::set_value(storage, RECENT_KEY, &self.shell.start.recent());
         }

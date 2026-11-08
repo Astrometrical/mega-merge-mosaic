@@ -840,7 +840,7 @@ fn a_waiting_edit_applies_when_the_session_is_left() {
     gate.open();
     let (_, stopped) = jobs.stop_all(&mut session, crate::testutil::PATIENCE);
     assert!(stopped);
-    list.apply_waiting(&mut session, &mut jobs);
+    list.apply_waiting(&mut session, &mut jobs, true);
     assert!(!list.has_pending());
     assert_eq!(
         MosaicConfig::load(&session.mosaic.dir)

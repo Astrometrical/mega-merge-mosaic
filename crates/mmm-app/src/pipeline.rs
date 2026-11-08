@@ -1096,4 +1096,72 @@ mod tests {
         assert_ne!(stamp(&oiii), oiii_before);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn removing_a_panel_from_one_group_keeps_the_others_merged() {
+        use mmm_core::session_summary::{ResultState, result_state};
+        let root = temp_dir("pipe-scoped-remove");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let mut seen = Seen::default();
+        run_until(
+            &mut p,
+            &mut s,
+            &mut r,
+            Instant::now(),
+            false,
+            &mut seen,
+            idle,
+        );
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        let (ha, oiii) = (
+            s.mosaic.group_session_dir("Ha"),
+            s.mosaic.group_session_dir("OIII"),
+        );
+        let (ha_before, oiii_before) = (stamp(&ha), stamp(&oiii));
+
+        let mut edit = PanelsEdit::of(&s);
+        let last_ha = edit
+            .panels
+            .iter()
+            .rposition(|e| {
+                e.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("Ha")
+            })
+            .unwrap();
+        edit.panels.remove(last_ha);
+        apply_edit(edit, &mut s, &mut r);
+        let marked: Vec<&str> = s
+            .mosaic
+            .config
+            .needs_analyze
+            .iter()
+            .map(|g| g.as_str())
+            .collect();
+        assert_eq!(marked, ["Ha"]);
+        assert_eq!(
+            result_state(&s.mosaic.result_path("OIII")),
+            ResultState::Complete
+        );
+
+        let seen = run_after_edit(&mut p, &mut s, &mut r);
+        assert!(
+            seen.events
+                .iter()
+                .all(|e| matches!(e, JobEvent::Finished { .. }))
+        );
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_eq!(stamp(&oiii), oiii_before, "OIII untouched");
+        assert_eq!(
+            result_state(&s.mosaic.result_path("OIII")),
+            ResultState::Complete
+        );
+        assert_ne!(stamp(&ha), ha_before, "Ha was re-analysed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

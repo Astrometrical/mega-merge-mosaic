@@ -1039,12 +1039,7 @@ impl JobRunner {
                         Err(e) => Some(failed(format!("{name}: {}", describe(&e)))),
                     };
                 }
-                match (result, applied) {
-                    (_, Err(e)) => failed(format!("{name}: {}", describe(&e))),
-                    (Ok(()), Ok(())) => JobEvent::Finished { id, label: name },
-                    (Err(e), Ok(())) if e.is_cancelled() => JobEvent::Cancelled { id },
-                    (Err(e), Ok(())) => failed(format!("{name}: {}", describe(&e))),
-                }
+                analysis_event(id, name, result, applied, r.token.is_cancelled())
             }
             (Done::Blend(Ok(rect)), Some(plan)) => match session.mosaic.apply_blend(plan, rect) {
                 Ok(()) => JobEvent::Finished { id, label: name },
@@ -1105,6 +1100,31 @@ fn job_label(verb: &str, group: &str, session: &OpenSession) -> String {
 }
 
 /// A core error as a message for the user.
+/// The event for a finished analysis (not restarted): its outcome as
+/// applied, or the failure. A cancelled job reports `Cancelled` even when
+/// the error it ended with is a moved frame (found before the stop was
+/// noticed), never a failure.
+fn analysis_event(
+    id: u64,
+    name: String,
+    result: mmm_core::Result<()>,
+    applied: mmm_core::Result<()>,
+    cancelled: bool,
+) -> JobEvent {
+    let failed = |e: mmm_core::Error| JobEvent::Failed {
+        id,
+        message: format!("{name}: {}", describe(&e)),
+    };
+    match (result, applied) {
+        (_, Err(e)) => failed(e),
+        (Ok(()), Ok(())) => JobEvent::Finished { id, label: name },
+        (Err(e), Ok(())) if e.is_cancelled() || (e.is_frame_moved() && cancelled) => {
+            JobEvent::Cancelled { id }
+        }
+        (Err(e), Ok(())) => failed(e),
+    }
+}
+
 fn describe(e: &mmm_core::Error) -> String {
     if e.is_busy() {
         format!("{e} — the result is in use by another job or program; try again when it ends")
@@ -1883,5 +1903,18 @@ pub(crate) mod tests {
         assert_ne!(s.frame.as_ref(), Some(&frame), "the new canvas");
         assert_ne!(result_state(&oiii), ResultState::Complete, "re-analysed");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cancelled_analysis_that_found_the_frame_moved_reports_cancelled() {
+        let moved = || Err(mmm_core::Error::FrameMoved);
+        assert_eq!(
+            analysis_event(4, "Analyse".into(), moved(), Ok(()), true),
+            JobEvent::Cancelled { id: 4 }
+        );
+        assert!(matches!(
+            analysis_event(4, "Analyse".into(), moved(), Ok(()), false),
+            JobEvent::Failed { id: 4, .. }
+        ));
     }
 }

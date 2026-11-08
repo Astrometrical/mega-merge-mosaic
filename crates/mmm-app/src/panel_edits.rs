@@ -7,13 +7,13 @@
 //! Every edit (add, remove, move, rule) builds a new panel list and
 //! grouping, a [`PanelsEdit`], and [`PanelsEdit::apply_scoped`]s it with
 //! [`set_inputs_affecting`], limited to the groups it touches (worked out on
-//! a worker, [`PanelEdits::submit`]). While a job runs (it may hold a result store) the edit
-//! cancels every job and waits ([`PanelEdits`]); [`PanelEdits::poll`]
-//! cancels any job started meanwhile too and applies the edit once the
-//! runner is idle, and a newer edit replaces a waiting one (newer work
-//! wins). The list shows the waiting edit as if applied
-//! ([`PanelEdits::shown`]). `set_inputs` saves `mosaic.json` and
-//! invalidates the stores' state tables on the UI thread: the documented
+//! a worker, [`PanelEdits::submit`]). While a job runs (it may hold a result
+//! store) the edit cancels every job and waits ([`PanelEdits`]);
+//! [`PanelEdits::poll`] cancels any job started meanwhile too and applies the
+//! edit once the groups it touches are known and the runner is idle; a newer
+//! edit replaces a waiting one (newer work wins). The list shows the waiting
+//! edit as if applied ([`PanelEdits::shown`]). `set_inputs_affecting` saves
+//! `mosaic.json` and invalidates the touched groups' state tables on
 //! exception to "no file I/O on the UI thread".
 //!
 //! Group colours ([`group_colors`]) are assigned when groups resolve and
@@ -394,6 +394,8 @@ pub struct PanelEdits {
     /// For starting scope workers (set by [`PanelEdits::poll`]); without
     /// one an edit touches every group.
     ctx: Option<egui::Context>,
+    /// The pending edit waits for jobs to stop (as of the last step).
+    blocked: bool,
     /// When to retry a pending edit refused as busy.
     retry_at: Option<Instant>,
     /// Refused edits' messages, for the user.
@@ -411,6 +413,12 @@ impl PanelEdits {
     #[cfg(test)]
     pub fn pending(&self) -> Option<&PanelsEdit> {
         self.pending.as_ref()
+    }
+
+    /// The waiting edit waits for jobs to stop (rather than only for its
+    /// scope, or a held store); the list says so.
+    pub fn waits_for_jobs(&self) -> bool {
+        self.pending.is_some() && self.blocked
     }
 
     /// The waiting edit was refused because a result store is held by
@@ -456,6 +464,7 @@ impl PanelEdits {
     /// Move the waiting edit along: take a finished scope, and apply it once
     /// the runner is idle and any busy retry is due.
     fn step(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        self.blocked = false;
         if self.pending.is_none() {
             return;
         }
@@ -463,6 +472,7 @@ impl PanelEdits {
             match task.poll() {
                 Poll::Pending => {
                     if jobs.busy_except_exports() {
+                        self.blocked = true;
                         jobs.cancel_all_but_exports();
                     }
                     return;
@@ -473,6 +483,7 @@ impl PanelEdits {
         }
         if jobs.busy_except_exports() {
             // Cancelling again is harmless.
+            self.blocked = true;
             jobs.cancel_all_but_exports();
             return;
         }
@@ -488,6 +499,7 @@ impl PanelEdits {
         match edit.apply_scoped(session, jobs, scope.as_ref()) {
             Applied::Done => {}
             Applied::Queued(edit) => {
+                self.blocked = true;
                 self.pending = Some(edit);
                 self.scope = Some(Scope::Known(scope));
             }
@@ -550,19 +562,38 @@ impl PanelEdits {
         }
     }
 
-    /// Apply the waiting edit now, without waiting for its retry or its
-    /// scope (every group is then assumed touched; the session is being
-    /// left); call only while no job but an export runs. One refused again
-    /// because a store is held elsewhere stays waiting.
-    pub fn apply_waiting(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
-        if let Some(edit) = self.pending.take() {
-            self.retry_at = None;
-            self.pending = Some(edit);
-            self.scope = Some(Scope::Known(None));
+    /// Flush the waiting edit; call only while no job but an export runs.
+    ///
+    /// With `leaving` (the session is being left or the app exits, and
+    /// nothing would apply the edit later) it applies now, without waiting
+    /// for its retry, and an edit whose scope is still being worked out
+    /// touches every group. Otherwise (a periodic save) the edit is left to
+    /// apply itself as soon as its scope is known; a known scope is kept
+    /// either way. One refused again because a store is held elsewhere
+    /// stays waiting.
+    pub fn apply_waiting(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        leaving: bool,
+    ) {
+        if self.pending.is_none() {
+            return;
+        }
+        if !leaving {
             self.step(session, jobs);
-            if self.pending.is_some() {
-                tracing::warn!("the panel edit waits: a result is in use elsewhere");
-            }
+            return;
+        }
+        self.retry_at = None;
+        if let Some(Scope::Scoping(task)) = &self.scope {
+            self.scope = Some(Scope::Known(match task.poll() {
+                Poll::Done(scope) => scope,
+                Poll::Pending | Poll::Lost => None,
+            }));
+        }
+        self.step(session, jobs);
+        if self.pending.is_some() {
+            tracing::warn!("the panel edit waits: a result is in use elsewhere");
         }
     }
 
@@ -685,6 +716,98 @@ mod scope_tests {
             "the first edit was replaced"
         );
         assert_eq!(marked(&s), ["OIII"], "scoped by the newer edit only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_periodic_save_keeps_the_edit_scope() {
+        let (root, mut s, mut r) = analyzed("edit-periodic");
+        let to_oiii = copy_of(&s, "OIII", "OIII_extra.xisf");
+        let ctx = egui::Context::default();
+        let mut edits = PanelEdits::default();
+        edits.poll(&ctx, &mut s, &mut r);
+
+        // A job keeps the edit waiting until its scope is known.
+        let gate = r.hold();
+        r.start_analyze(&mut s);
+        let mut edit = PanelsEdit::of(&s);
+        edit.panels.push(to_oiii);
+        edits.submit(edit, &mut s, &mut r);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        while !matches!(edits.scope, Some(Scope::Known(Some(_)))) {
+            assert!(Instant::now() < deadline, "scope never known");
+            edits.poll(&ctx, &mut s, &mut r);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        gate.open();
+        drain(&mut r, &mut s);
+        // The periodic save flushes: the known scope is kept.
+        edits.apply_waiting(&mut s, &mut r, false);
+        assert!(!edits.has_pending());
+        assert_eq!(marked(&s), ["OIII"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scope_in_flight_waits_for_a_periodic_save_but_not_for_leaving() {
+        let (root, mut s, mut r) = analyzed("edit-in-flight");
+        let to_oiii = copy_of(&s, "OIII", "OIII_extra.xisf");
+        let mut edit = PanelsEdit::of(&s);
+        edit.panels.push(to_oiii);
+        let ctx = egui::Context::default();
+        let mut edits = PanelEdits::default();
+        edits.poll(&ctx, &mut s, &mut r);
+        // A scope that has not finished (its worker waits for `release`).
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let task = Task::spawn("test-scope", &ctx, move || {
+            let _ = held.recv();
+            Some(BTreeSet::from(["OIII".to_string()]))
+        })
+        .unwrap();
+        edits.pending = Some(edit);
+        edits.scope = Some(Scope::Scoping(task));
+
+        edits.apply_waiting(&mut s, &mut r, false);
+        assert!(edits.has_pending(), "left to apply itself once scoped");
+        assert_eq!(s.mosaic.config.panels.len(), 8, "nothing applied yet");
+
+        edits.apply_waiting(&mut s, &mut r, true);
+        assert!(!edits.has_pending());
+        assert_eq!(s.mosaic.config.panels.len(), 9);
+        assert_eq!(marked(&s), ["Ha", "OIII"], "unscoped: every group");
+        drop(release);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scoping_alone_waits_for_no_job() {
+        let (root, mut s, mut r) = analyzed("edit-scoping-only");
+        let mut edit = PanelsEdit::of(&s);
+        edit.panels.pop();
+        let ctx = egui::Context::default();
+        let mut edits = PanelEdits::default();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let task = Task::spawn("test-scope", &ctx, move || {
+            let _ = held.recv();
+            None
+        })
+        .unwrap();
+        edits.pending = Some(edit);
+        edits.scope = Some(Scope::Scoping(task));
+        edits.poll(&ctx, &mut s, &mut r);
+        assert!(edits.has_pending());
+        assert!(!edits.waits_for_jobs(), "only its scope is awaited");
+        assert!(!edits.waits_for_store());
+
+        // With a job running, it waits for the job.
+        let gate = r.hold();
+        r.start_analyze(&mut s);
+        edits.poll(&ctx, &mut s, &mut r);
+        assert!(edits.waits_for_jobs());
+        drop(release);
+        gate.open();
+        drain(&mut r, &mut s);
+        poll_until_applied(&mut edits, &mut s, &mut r, &ctx);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -401,14 +401,20 @@ impl SessionWindow {
     }
 
     /// Apply the edits waiting for the jobs to stop (panels, merge
-    /// settings) now, if no job but an export runs: the session is being
-    /// left, and nothing would apply them later. One refused because a
+    /// settings) now, if no job but an export runs. With `leaving` (the
+    /// session or app is being left) nothing would apply a panel edit later,
+    /// so it applies now unscoped if need be. One refused because a
     /// store is held elsewhere stays waiting (logged).
-    pub fn apply_waiting_edits(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+    pub fn apply_waiting_edits(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        leaving: bool,
+    ) {
         if jobs.busy_except_exports() {
             return;
         }
-        self.panels.apply_waiting(session, jobs);
+        self.panels.apply_waiting(session, jobs, leaving);
         self.mosaic.apply_waiting_settings(session, jobs);
     }
 

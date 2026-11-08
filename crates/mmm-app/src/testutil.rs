@@ -63,8 +63,8 @@ pub(crate) fn themed(ui: &mut egui::Ui) -> bool {
 
 /// A solved (plate-solved, header-only WCS) two-group mosaic session in
 /// `root/s.mmm-session`: groups `Ha` and `OIII` of two overlapping 200x150
-/// panels each (manual groups), analysed from the solutions
-/// (`InputSelect::Solved`), not yet analysed. Also a third `Ha` panel,
+/// panels each (manual groups), to be analysed from the solutions
+/// (`InputSelect::Solved`); nothing is analysed yet. Also a third `Ha` panel,
 /// not in the session, overlapping the others and extending the canvas to
 /// the left: adding it moves the reference frame.
 pub(crate) fn solved_two_group_session(root: &Path) -> (OpenSession, std::path::PathBuf) {

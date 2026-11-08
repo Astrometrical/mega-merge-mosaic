@@ -1205,10 +1205,15 @@ impl PanelList {
         self.edits.has_pending()
     }
 
-    /// Apply the waiting edit now (the session is being left); see
+    /// Flush the waiting edit (`leaving`: the session or app is being left); see
     /// [`PanelEdits::apply_waiting`].
-    pub fn apply_waiting(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
-        self.edits.apply_waiting(session, jobs);
+    pub fn apply_waiting(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        leaving: bool,
+    ) {
+        self.edits.apply_waiting(session, jobs, leaving);
     }
 
     /// The toasts raised since last asked (an edit refused while the list
@@ -1740,9 +1745,15 @@ impl PanelList {
         None
     }
 
-    /// The waiting edit, if any.
+    /// An edit waits for a running job or a held store (not merely for its
+    /// scope to be worked out, which shows nothing).
+    fn shows_waiting_notice(&self) -> bool {
+        self.edits.waits_for_jobs() || self.edits.waits_for_store()
+    }
+
+    /// The notice of an edit waiting for a job or a held store.
     fn notices(&mut self, ui: &mut egui::Ui) {
-        if self.edits.has_pending() {
+        if self.shows_waiting_notice() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 let waiting = if self.edits.waits_for_store() {
