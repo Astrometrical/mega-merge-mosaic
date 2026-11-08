@@ -72,6 +72,8 @@ pub const ZOOM_OUT: char = '\u{e1b7}';
 pub const HOUSE: char = '\u{e0f5}';
 /// `maximize-2`
 pub const MAXIMIZE_2: char = '\u{e113}';
+/// `ellipsis`: more actions (a table row's actions menu).
+pub const ELLIPSIS: char = '\u{e0b6}';
 
 /// Every glyph above with its Lucide name, for tests and the gallery.
 pub const ALL: &[(&str, char)] = &[
@@ -100,6 +102,7 @@ pub const ALL: &[(&str, char)] = &[
     ("zoom-out", ZOOM_OUT),
     ("house", HOUSE),
     ("maximize-2", MAXIMIZE_2),
+    ("ellipsis", ELLIPSIS),
 ];
 
 #[cfg(test)]

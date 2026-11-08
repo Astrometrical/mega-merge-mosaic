@@ -18,6 +18,7 @@ pub mod motion;
 pub mod plan;
 pub mod starfield;
 pub mod status;
+pub mod table;
 pub mod theme;
 pub mod viewer;
 pub mod widgets;

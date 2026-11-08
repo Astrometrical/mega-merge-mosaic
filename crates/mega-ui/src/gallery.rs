@@ -3,6 +3,7 @@
 //! Look here before building anything new. `cargo run -p mega-ui --example
 //! gallery` shows it in a window; the snapshot tests render it too.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use egui::{
@@ -17,6 +18,7 @@ use crate::hero::{HeroStage, HeroView};
 use crate::icons;
 use crate::inspector::{Badge, InspectorState, Section, inspector, inspector_width};
 use crate::starfield::Starfield;
+use crate::table::{self, TableEvent, TableState, sectioned_table};
 use crate::theme::palette::*;
 use crate::theme::text::{Type, text};
 use crate::theme::tokens::{radius, space};
@@ -36,6 +38,8 @@ pub struct GalleryState {
     notes: String,
     notes_mode: NotesMode,
     inspector: InspectorState,
+    table: TableState,
+    table_selection: BTreeSet<u64>,
     checks: Vec<CheckItem>,
     toasts: Toasts,
     brand: Option<BrandImages>,
@@ -83,6 +87,8 @@ Panel 7: gradient in the lower left, redo DBE."
                 s.toggle("problems");
                 s
             },
+            table: TableState::default(),
+            table_selection: BTreeSet::from([8]),
             checks,
             toasts: Toasts::default(),
             brand: None,
@@ -197,6 +203,78 @@ fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
         ui.set_clip_rect(rect);
         hero.show(ui, rect.left() + rect.width() / 3.0, 0.0);
     });
+}
+
+/// The table section: a rolled-up group with a problem row, and a group
+/// with a warning, a highlighted row and a row moved by hand. Clicks
+/// select (Shift or Ctrl add).
+fn table_section(ui: &mut Ui, state: &mut TableState, selection: &mut BTreeSet<u64>) {
+    let column = |title, numeric| table::Column { title, numeric };
+    let columns = [
+        column("Panel", false),
+        column("Filter", false),
+        column("Integration", true),
+        column("Scale", true),
+    ];
+    let row = |id: u64, filter: &str, time: &str| table::Row {
+        id,
+        cells: vec![
+            format!("Carina_P{id}.xisf"),
+            filter.to_owned(),
+            time.to_owned(),
+            "1.21″".to_owned(),
+        ],
+        problem: None,
+        tag: None,
+        selected: selection.contains(&id),
+        highlighted: false,
+    };
+    let mut ha: Vec<_> = (1..=6).map(|i| row(i, "Ha", "3h 05m")).collect();
+    ha[4].problem = Some("No astrometric solution: plate-solve it, then add it again");
+    ha[4].cells[2] = "—".to_owned();
+    let mut oiii: Vec<_> = (7..=9).map(|i| row(i, "OIII", "3h 20m")).collect();
+    oiii[0].highlighted = true;
+    oiii[2].tag = Some("by hand");
+    oiii[2].cells[1] = "Ha".to_owned();
+    let heading = |id, title: &str, color| table::Heading {
+        id,
+        title: title.to_owned(),
+        color: Some(color),
+        warning: None,
+        rolls_up: true,
+        drop_target: true,
+    };
+    let sections = [
+        table::Section {
+            heading: Some(heading("ha", "Ha · 6 · 15h 25m", GROUP_PALETTE[0])),
+            rows: ha,
+        },
+        table::Section {
+            heading: Some(table::Heading {
+                warning: Some("3 fewer than Ha".to_owned()),
+                ..heading("oiii", "OIII · 3 · 10h 00m", GROUP_PALETTE[2])
+            }),
+            rows: oiii,
+        },
+    ];
+    let events = sectioned_table(ui, state, &columns, &sections, |ui, _id| {
+        ui.menu_button("Move to", |ui| {
+            let _ = ui.button("Ha");
+            let _ = ui.button("OIII");
+        });
+        let _ = ui.button("Remove");
+    });
+    for event in events {
+        if let TableEvent::Click { id, modifiers } = event {
+            if modifiers.shift || modifiers.command || modifiers.ctrl {
+                if !selection.remove(&id) {
+                    selection.insert(id);
+                }
+            } else {
+                *selection = BTreeSet::from([id]);
+            }
+        }
+    }
 }
 
 /// Draw the gallery.
@@ -400,6 +478,13 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                 inspector(ui, &mut state.inspector, &sections, |ui, id| {
                     ui.label(format!("{id} body"));
                 });
+            });
+        });
+
+        section(ui, "Table", |ui| {
+            ui.scope(|ui| {
+                ui.set_max_width(640.0);
+                table_section(ui, &mut state.table, &mut state.table_selection);
             });
         });
 
