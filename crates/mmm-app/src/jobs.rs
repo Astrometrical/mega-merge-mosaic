@@ -1100,7 +1100,7 @@ pub(crate) mod tests {
             let open = self.open.lock().unwrap();
             let (open, timeout) = self
                 .cv
-                .wait_timeout_while(open, Duration::from_secs(30), |o| !*o)
+                .wait_timeout_while(open, crate::testutil::PATIENCE, |o| !*o)
                 .unwrap();
             assert!(*open && !timeout.timed_out(), "gate never opened");
         }
@@ -1132,7 +1132,7 @@ pub(crate) mod tests {
             let state = self.state.lock().unwrap();
             let (mut state, timeout) = self
                 .cv
-                .wait_timeout_while(state, Duration::from_secs(30), |(steps, open)| {
+                .wait_timeout_while(state, crate::testutil::PATIENCE, |(steps, open)| {
                     *steps == 0 && !*open
                 })
                 .unwrap();
@@ -1174,7 +1174,7 @@ pub(crate) mod tests {
 
     /// Poll until no job is running or queued (bounded); every event.
     pub(crate) fn drain(runner: &mut JobRunner, s: &mut OpenSession) -> Vec<JobEvent> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         let mut events = runner.poll(s);
         while runner.busy() {
             assert!(Instant::now() < deadline, "timed out waiting for jobs");
@@ -1256,7 +1256,7 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(100));
             gate.open();
         });
-        let (events, stopped) = r.stop_all(&mut s, Duration::from_secs(20));
+        let (events, stopped) = r.stop_all(&mut s, crate::testutil::PATIENCE);
         opener.join().unwrap();
         assert!(stopped);
         assert!(!r.busy());
@@ -1309,7 +1309,7 @@ pub(crate) mod tests {
         assert_eq!(r.run_of(JobTarget::Export), None);
         gate.open();
         // Ha ended: OIII, the second of two, runs.
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while r.run_of(JobTarget::Blend).is_some_and(|x| x.id == ha) {
             assert!(Instant::now() < deadline, "Ha never ended");
             std::thread::sleep(Duration::from_millis(5));
@@ -1327,7 +1327,7 @@ pub(crate) mod tests {
         let again = r.start_blend(&mut s, "OIII", None);
         assert_eq!(r.run_of(JobTarget::Blend), Some(run(again, "OIII", 1, 1)));
         gate.open();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while r.views().first().is_some_and(|v| v.id == roi) {
             assert!(Instant::now() < deadline, "the ROI's merge never ended");
             std::thread::sleep(Duration::from_millis(5));
@@ -1392,7 +1392,7 @@ pub(crate) mod tests {
         let id = r.start_analyze(&mut s);
         let analyze = r.hold();
         resolve.open();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while r.views()[0].stage == "Resolving groups…" {
             assert!(Instant::now() < deadline, "resolution never finished");
             std::thread::sleep(Duration::from_millis(5));
@@ -1522,7 +1522,7 @@ pub(crate) mod tests {
         assert!(r.blend_unstarted("OIII"));
         assert!(!r.blend_unstarted("SII"));
         gate.open();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while r
             .blend_progress()
             .is_none_or(|(_, g, n)| g != "Ha" || n == 0)

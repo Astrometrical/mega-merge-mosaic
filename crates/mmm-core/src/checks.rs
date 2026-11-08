@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::formats::InputPanel;
 use crate::mosaic::grouping::Groups;
 use crate::mosaic::{MosaicConfig, fingerprint};
 use crate::overlap::OverlapGraph;
@@ -136,24 +135,13 @@ pub struct PanelFacts {
 
 /// Read a panel's facts from its header only (no pixel data).
 pub fn panel_facts(path: &Path) -> Result<PanelFacts> {
-    let panel = InputPanel::open(path)?;
-    let (solution, scale_arcsec) = match panel.wcs_model() {
-        Ok(m) => {
-            let kind = if m.has_distortion() {
-                SolutionKind::Distorted
-            } else {
-                SolutionKind::Linear
-            };
-            (kind, m.pixel_scale_arcsec())
-        }
-        Err(_) => (SolutionKind::None, None),
-    };
+    let h = crate::panel_header::read_panel_header(path)?;
     Ok(PanelFacts {
         path: path.to_path_buf(),
-        channels: panel.channels(),
-        filter: panel.filter_name(),
-        solution,
-        scale_arcsec,
+        channels: h.channels,
+        filter: h.filter,
+        solution: h.solution,
+        scale_arcsec: h.scale_arcsec,
     })
 }
 
@@ -328,7 +316,7 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
                     "Panels use different filters ({}) but grouping is off.",
                     filters.into_iter().collect::<Vec<_>>().join(", ")
                 ),
-                remedy: Some("Turn grouping on to merge each filter separately.".into()),
+                remedy: Some("Group by FILTER header to merge each filter separately.".into()),
             });
         }
     }
@@ -438,6 +426,7 @@ pub fn analysis_checks(group: &str, session: &Session, graph: &OverlapGraph) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::InputPanel;
     use crate::mosaic::grouping::resolve_groups;
     use crate::overlap::OverlapEdge;
     use crate::session::PanelMeta;
@@ -446,8 +435,12 @@ mod tests {
         write_xisf_with_header_xml,
     };
 
+    /// A fresh directory per call (tests run in parallel, several calling
+    /// with the same tag).
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mmm-checks-{tag}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mmm-checks-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -624,7 +617,10 @@ mod tests {
         let f = of(&checks, CheckCode::FiltersDifferUngrouped);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Note);
-        assert!(f[0].remedy.as_deref().unwrap().contains("grouping on"));
+        assert_eq!(
+            f[0].remedy.as_deref(),
+            Some("Group by FILTER header to merge each filter separately.")
+        );
     }
 
     #[test]

@@ -29,6 +29,12 @@ pub mod radius {
 
 /// Width of the unfolded inspector column.
 pub const INSPECTOR_WIDTH: f32 = 320.0;
+/// Narrowest a list column beside the canvas (e.g. a panel list) gets.
+pub const PANEL_LIST_MIN_WIDTH: f32 = 420.0;
+/// Narrowest the canvas gets beside such a list (the list stops growing).
+pub const CANVAS_MIN_WIDTH: f32 = 360.0;
+/// Width of a short single-line input (a keyword, a header key).
+pub const KEYWORD_INPUT_WIDTH: f32 = 120.0;
 /// Height of buttons, inputs and segmented controls.
 pub const CONTROL_HEIGHT: f32 = 30.0;
 /// Height of a large button (at most one per screen).

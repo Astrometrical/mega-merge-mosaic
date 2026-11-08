@@ -22,7 +22,7 @@ use crate::compositions::{Composition, ViewKind, load_compositions, save_composi
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::tests::{analyzed, drain};
 use crate::jobs::{JobRunner, JobTarget};
-use crate::panels_tab::FilesPicker;
+use crate::panel_edits::FilesPicker;
 use crate::pipeline::{Pipeline, Step};
 use crate::rois::{Roi, save_rois};
 use crate::session::{OpenSession, any_merged, classify_results, create_blocking, notes};
@@ -42,6 +42,10 @@ impl AskedFiles {
 impl FilesPicker for AskedFiles {
     fn pick_files(&self) -> Option<Vec<PathBuf>> {
         self.0.store(true, Ordering::SeqCst);
+        None
+    }
+
+    fn pick_folders(&self) -> Option<Vec<PathBuf>> {
         None
     }
 }
@@ -609,6 +613,8 @@ fn no_chips_for_a_single_group() {
     let root = temp_dir("window-single-group");
     let mut s = two_group_session(&root);
     s.mosaic.config.grouping.enabled = false;
+    // Chosen so: the two filters don't group the panels by themselves.
+    crate::panel_edits::set_grouping_chosen(&mut s.mosaic.config.ui);
     s.groups = s.mosaic.groups().ok();
     let mut h = harness(State::new(s, runner()));
     step_until(&mut h, |st| st.w.view().is_some());
@@ -987,7 +993,7 @@ fn pump(
     done: impl Fn(&JobRunner, &Pipeline) -> bool,
 ) {
     let ctx = egui::Context::default();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !done(jobs, pipeline) {
         assert!(Instant::now() < deadline, "timed out waiting for the jobs");
         std::thread::sleep(Duration::from_millis(2));
@@ -1316,10 +1322,9 @@ fn empty_session_opens_on_the_panel_list() {
     for l in ["Add panels", "Checks", "Merge", "Export", "Add panels…"] {
         h.get_by_label(l);
     }
-    assert!(
-        h.query_by_label("Plan").is_none(),
-        "the list over the canvas"
-    );
+    h.get_by_label("Plan");
+    let list = h.state().w.list_rect.expect("the list beside the canvas");
+    assert!(list.left() < h.get_by_label("Plan").rect().left());
     // Closed: the empty canvas, where nothing can be merged yet.
     h.get_by_label("Add panels").click();
     h.run_steps(3);
@@ -1358,10 +1363,11 @@ fn panels_step_toggles_the_panel_list() {
     h.run_steps(2);
     assert!(h.state().w.panel_list_open);
     h.get_by_label("Add files…");
-    assert!(
-        h.query_by_label("Plan").is_none(),
-        "the list over the canvas"
-    );
+    h.get_by_label("Plan");
+    // Plan / Mosaic leaves the list beside the canvas.
+    h.state_mut().w.set_mode(CanvasMode::Plan);
+    h.run_steps(2);
+    assert!(h.state().w.panel_list_open);
     h.get_by_label("8 panels").click();
     h.run_steps(2);
     assert!(!h.state().w.panel_list_open);

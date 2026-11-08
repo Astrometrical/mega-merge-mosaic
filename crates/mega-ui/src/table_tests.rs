@@ -1,0 +1,775 @@
+use egui::accesskit::Role;
+use egui::{Modifiers, Rect, Vec2, pos2};
+use egui_kittest::Harness;
+use egui_kittest::kittest::{NodeT, Queryable};
+
+use super::*;
+
+struct State {
+    table: TableState,
+    columns: Vec<Column<'static>>,
+    sections: Vec<Section<'static>>,
+    /// Every event so far.
+    all: Vec<TableEvent>,
+    /// The events of the last frame.
+    last: Vec<TableEvent>,
+}
+
+fn columns() -> Vec<Column<'static>> {
+    vec![
+        Column {
+            title: "Panel",
+            numeric: false,
+        },
+        Column {
+            title: "Scale",
+            numeric: true,
+        },
+        Column {
+            title: "Filter",
+            numeric: false,
+        },
+    ]
+}
+
+fn row(id: u64, name: &str, scale: &str, filter: &str) -> Row<'static> {
+    Row {
+        id,
+        cells: vec![name.to_owned(), scale.to_owned(), filter.to_owned()],
+        sort_keys: Vec::new(),
+        problem: None,
+        tag: None,
+        selected: false,
+        highlighted: false,
+    }
+}
+
+fn heading(id: &'static str, title: &str) -> Heading<'static> {
+    Heading {
+        id,
+        title: title.to_owned(),
+        color: None,
+        warning: None,
+        rolls_up: false,
+        drop_target: false,
+    }
+}
+
+/// Section "ha" ("Ha · 2": a1, a2) and section "oiii" ("OIII · 1": b1).
+fn two_sections() -> Vec<Section<'static>> {
+    vec![
+        Section {
+            heading: Some(heading("ha", "Ha · 2")),
+            rows: vec![row(1, "a1", "1.5", "Ha"), row(2, "a2", "12.25", "Ha")],
+        },
+        Section {
+            heading: Some(heading("oiii", "OIII · 1")),
+            rows: vec![row(3, "b1", "123.125", "OIII")],
+        },
+    ]
+}
+
+/// One rolled-up section "ha" of ten rows p0..p9; p7 has a problem.
+fn rolled_up() -> Vec<Section<'static>> {
+    let rows = (0..10)
+        .map(|i| Row {
+            problem: (i == 7).then_some("No astrometric solution"),
+            ..row(i, &format!("p{i}"), "1.21", "Ha")
+        })
+        .collect();
+    vec![Section {
+        heading: Some(Heading {
+            rolls_up: true,
+            ..heading("ha", "Ha · 10")
+        }),
+        rows,
+    }]
+}
+
+fn harness(sections: Vec<Section<'static>>) -> Harness<'static, State> {
+    harness_sized(sections, Vec2::new(600.0, 600.0))
+}
+
+/// [`harness`] in a window of `size`.
+fn harness_sized(sections: Vec<Section<'static>>, size: Vec2) -> Harness<'static, State> {
+    Harness::builder().with_size(size).build_ui_state(
+        |ui, s: &mut State| {
+            if !crate::testutil::themed(ui) {
+                return;
+            }
+            let events = sectioned_table(ui, &mut s.table, &s.columns, &s.sections, |ui, id| {
+                ui.label(format!("menu for {id}"));
+            });
+            s.all.extend(events.iter().cloned());
+            s.last = events;
+        },
+        State {
+            table: TableState::default(),
+            columns: columns(),
+            sections,
+            all: Vec::new(),
+            last: Vec::new(),
+        },
+    )
+}
+
+/// The rect of the painted text `s`, if any is painted this frame.
+fn text_rect(h: &Harness<'_, State>, s: &str) -> Option<Rect> {
+    h.output().shapes.iter().find_map(|c| match &c.shape {
+        egui::Shape::Text(t) if t.galley.text() == s => {
+            Some(Rect::from_min_size(t.pos, t.galley.size()))
+        }
+        _ => None,
+    })
+}
+
+/// The font the painted text `s` uses.
+fn text_font(h: &Harness<'_, State>, s: &str) -> egui::FontId {
+    h.output()
+        .shapes
+        .iter()
+        .find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text() == s => {
+                Some(t.galley.job.sections[0].format.font_id.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no text {s:?} painted"))
+}
+
+#[test]
+fn headings_and_rows_draw_in_order() {
+    let mut h = harness(two_sections());
+    h.run();
+    let header = text_rect(&h, "PANEL").expect("column heading PANEL");
+    let mut last = header.min.y;
+    for l in ["Ha · 2", "a1", "a2", "OIII · 1", "b1"] {
+        let y = h.get_by_label(l).rect().min.y;
+        assert!(y > last, "{l} at {y} after {last}");
+        last = y;
+    }
+    // Headings are buttons; rows are selectable list items.
+    h.get_by_role_and_label(Role::Button, "Ha · 2");
+    h.get_by_role_and_label(Role::ListItem, "a1");
+}
+
+#[test]
+fn numeric_columns_align_right() {
+    let mut h = harness(two_sections());
+    h.run();
+    let header = text_rect(&h, "SCALE").expect("column heading SCALE");
+    for n in ["1.5", "12.25", "123.125"] {
+        let r = text_rect(&h, n).unwrap_or_else(|| panic!("no cell {n}"));
+        assert!(
+            (r.right() - header.right()).abs() < 0.5,
+            "{n} ends at {}, the heading at {}",
+            r.right(),
+            header.right()
+        );
+    }
+    let numeric = Type::Numeric.text_style().resolve(&h.ctx.global_style());
+    assert_eq!(text_font(&h, "12.25"), numeric, "numbers in the mono face");
+    // Text columns align left.
+    let filter = text_rect(&h, "FILTER").expect("column heading FILTER");
+    for t in ["Ha", "OIII"] {
+        let r = text_rect(&h, t).unwrap_or_else(|| panic!("no cell {t}"));
+        assert!((r.left() - filter.left()).abs() < 0.5, "{t} at {r:?}");
+    }
+}
+
+#[test]
+fn rolled_up_sections_show_their_first_rows_and_problems() {
+    let mut h = harness(rolled_up());
+    h.run();
+    for i in [0, 1, 2, 7] {
+        h.get_by_label(&format!("p{i}"));
+    }
+    for i in [3, 4, 5, 6, 8, 9] {
+        assert!(h.query_by_label(&format!("p{i}")).is_none(), "p{i} shown");
+    }
+    h.get_by_role_and_label(Role::Button, "… 6 more");
+    // The problem row carries the warning icon.
+    let p7 = h.get_by_label("p7").rect();
+    let icon = text_rect(&h, &icons::TRIANGLE_ALERT.to_string()).expect("problem icon");
+    assert!(p7.contains_rect(icon), "{icon:?} not in {p7:?}");
+}
+
+#[test]
+fn the_more_row_expands_the_section() {
+    let mut h = harness(rolled_up());
+    h.run();
+    h.get_by_label("… 6 more").click();
+    h.run();
+    for i in 0..10 {
+        h.get_by_label(&format!("p{i}"));
+    }
+    assert!(h.query_by_label("… 6 more").is_none());
+    assert!(h.state().table.is_expanded("ha"));
+}
+
+#[test]
+fn a_heading_folds_its_rows() {
+    let mut h = harness(two_sections());
+    h.run();
+    h.get_by_label("Ha · 2").click();
+    h.run();
+    assert!(h.query_by_label("a1").is_none());
+    assert!(h.query_by_label("a2").is_none());
+    h.get_by_label("b1");
+    assert!(h.state().table.is_folded("ha"));
+    h.get_by_label("Ha · 2").click();
+    h.run();
+    h.get_by_label("a1");
+    assert!(!h.state().table.is_folded("ha"));
+}
+
+#[test]
+fn clicks_report_their_modifiers() {
+    let mut h = harness(two_sections());
+    h.run();
+    h.get_by_label("a1").click();
+    h.run();
+    h.get_by_label("a2").click_modifiers(Modifiers::SHIFT);
+    h.run();
+    h.get_by_label("b1").click_modifiers(Modifiers::CTRL);
+    h.run();
+    let clicks: Vec<_> = h
+        .state()
+        .all
+        .iter()
+        .filter(|e| matches!(e, TableEvent::Click { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        clicks,
+        vec![
+            TableEvent::Click {
+                id: 1,
+                modifiers: Modifiers::NONE
+            },
+            TableEvent::Click {
+                id: 2,
+                modifiers: Modifiers::SHIFT
+            },
+            TableEvent::Click {
+                id: 3,
+                modifiers: Modifiers::CTRL
+            },
+        ]
+    );
+}
+
+#[test]
+fn hovering_a_row_reports_it() {
+    let mut h = harness(two_sections());
+    h.run();
+    let a2 = h.get_by_label("a2").rect();
+    h.hover_at(a2.center());
+    h.run();
+    let hovers: Vec<_> = h
+        .state()
+        .last
+        .iter()
+        .filter(|e| matches!(e, TableEvent::Hover(_)))
+        .collect();
+    assert_eq!(hovers, vec![&TableEvent::Hover(2)]);
+    // A heading is not a row.
+    let heading = h.get_by_label("OIII · 1").rect();
+    h.hover_at(heading.center());
+    h.run();
+    assert!(
+        !h.state()
+            .last
+            .iter()
+            .any(|e| matches!(e, TableEvent::Hover(_)))
+    );
+}
+
+#[test]
+fn the_row_menu_opens_from_its_button() {
+    let mut h = harness(two_sections());
+    h.run();
+    assert!(
+        h.query_by_label("Panel actions").is_none(),
+        "hidden at rest"
+    );
+    let a1 = h.get_by_label("a1").rect();
+    h.hover_at(a1.center());
+    h.run();
+    let button = h.get_by_label("Panel actions");
+    assert!(
+        a1.contains_rect(button.rect()),
+        "the button sits in its row"
+    );
+    button.click();
+    h.run();
+    h.get_by_label("menu for 1");
+    assert!(
+        !h.state()
+            .all
+            .iter()
+            .any(|e| matches!(e, TableEvent::Click { .. })),
+        "the button is not a row click"
+    );
+}
+
+#[test]
+fn the_row_menu_shows_while_its_row_has_focus() {
+    let mut h = harness(two_sections());
+    h.run();
+    h.get_by_label("b1").focus();
+    h.run();
+    let b1 = h.get_by_label("b1").rect();
+    let button = h.get_by_label("Panel actions");
+    assert!(b1.contains_rect(button.rect()));
+}
+
+#[test]
+fn dragging_rows_onto_a_heading_drops_them() {
+    let mut sections = two_sections();
+    for s in &mut sections {
+        if let Some(hd) = &mut s.heading {
+            hd.drop_target = true;
+        }
+    }
+    sections[0].rows[0].selected = true;
+    sections[0].rows[1].selected = true;
+    let mut h = harness(sections);
+    h.run();
+
+    let drag = |h: &mut Harness<'_, State>, from: Rect, to: Rect| {
+        h.drag_at(from.center());
+        h.run();
+        h.hover_at(from.center() + Vec2::new(0.0, space::L));
+        h.run();
+        h.hover_at(to.center());
+        h.run();
+        h.drop_at(to.center());
+        h.run();
+    };
+
+    // A selected row carries the whole selection.
+    let a1 = h.get_by_label("a1").rect();
+    let oiii = h.get_by_label("OIII · 1").rect();
+    drag(&mut h, a1, oiii);
+    // An unselected row carries itself.
+    let b1 = h.get_by_label("b1").rect();
+    let ha = h.get_by_label("Ha · 2").rect();
+    drag(&mut h, b1, ha);
+
+    let drops: Vec<_> = h
+        .state()
+        .all
+        .iter()
+        .filter(|e| matches!(e, TableEvent::Drop { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        drops,
+        vec![
+            TableEvent::Drop {
+                ids: vec![1, 2],
+                section: "oiii".to_owned()
+            },
+            TableEvent::Drop {
+                ids: vec![3],
+                section: "ha".to_owned()
+            },
+        ]
+    );
+    assert!(
+        !h.state()
+            .all
+            .iter()
+            .any(|e| matches!(e, TableEvent::Click { .. })),
+        "a drag is not a click"
+    );
+}
+
+#[test]
+fn headings_without_drop_target_take_no_drops() {
+    let mut h = harness(two_sections());
+    h.run();
+    let a1 = h.get_by_label("a1").rect();
+    let oiii = h.get_by_label("OIII · 1").rect();
+    h.drag_at(a1.center());
+    h.run();
+    h.hover_at(pos2(a1.center().x, oiii.center().y));
+    h.run();
+    h.drop_at(oiii.center());
+    h.run();
+    assert!(
+        !h.state()
+            .all
+            .iter()
+            .any(|e| matches!(e, TableEvent::Drop { .. }))
+    );
+}
+
+/// Every text painted last frame and its rect.
+fn painted(h: &Harness<'_, State>) -> Vec<(String, Rect)> {
+    h.output()
+        .shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some((
+                t.galley.text().to_owned(),
+                Rect::from_min_size(t.pos, t.galley.size()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_narrow_table_hides_columns_from_the_right() {
+    let mut sections = two_sections();
+    sections[0].rows[0].cells[0] = "Orion_Mosaic_Panel_With_A_Long_Name_01.xisf".to_owned();
+    let mut h = harness_sized(sections, Vec2::new(300.0, 600.0));
+    h.run();
+    // The row (and the table) is as wide as the window lets it be.
+    let row = h.get_by_label("a2").rect();
+    // Nothing is painted past the table's right edge: the long name is cut
+    // short, and columns that don't fit are left out, never cut.
+    for (t, r) in painted(&h) {
+        assert!(
+            r.right() <= row.right() + 0.5,
+            "{t:?} at {r:?} past {row:?}"
+        );
+    }
+    let shows = |s: &str| text_rect(&h, s).is_some();
+    // FILTER, the last column, has no room: its heading and cells go.
+    assert!(!shows("FILTER") && !shows("OIII"), "FILTER hidden");
+    // A column shows whole or not at all.
+    let scale = ["SCALE", "1.5", "12.25", "123.125"];
+    let shown = scale.iter().filter(|s| shows(s)).count();
+    assert!(shown == 0 || shown == scale.len(), "SCALE partly shown");
+    // The first column still shows, cut short.
+    h.get_by_label("a2");
+    // The actions button sits inside the row, at its right end.
+    h.hover_at(row.center());
+    h.run();
+    let button = h.get_by_label("Panel actions").rect();
+    assert!(row.contains_rect(button), "{button:?} not in {row:?}");
+    assert!(
+        row.right() - button.right() < space::S,
+        "{button:?} {row:?}"
+    );
+}
+
+#[test]
+fn a_table_too_narrow_for_any_column_keeps_its_first() {
+    let mut h = harness_sized(two_sections(), Vec2::new(200.0, 600.0));
+    h.run();
+    let row = h.get_by_label("a1").rect();
+    for (t, r) in painted(&h) {
+        assert!(
+            r.right() <= row.right() + 0.5,
+            "{t:?} at {r:?} past {row:?}"
+        );
+    }
+    for s in ["SCALE", "FILTER", "1.5", "Ha", "OIII"] {
+        assert!(text_rect(&h, s).is_none(), "{s} shown");
+    }
+    assert!(text_rect(&h, "PANEL").is_some());
+    h.hover_at(row.center());
+    h.run();
+    let button = h.get_by_label("Panel actions").rect();
+    assert!(row.contains_rect(button), "{button:?} not in {row:?}");
+}
+
+#[test]
+fn shown_ids_are_the_rows_on_screen() {
+    let sections = rolled_up();
+    let mut state = TableState::default();
+    // Rolled up: the first rows and the problem row.
+    assert_eq!(shown_ids(&state, &sections), [0, 1, 2, 7]);
+    state.expand("ha");
+    assert_eq!(shown_ids(&state, &sections), (0..10).collect::<Vec<_>>());
+    state.toggle_fold("ha");
+    assert!(shown_ids(&state, &sections).is_empty(), "folded");
+    // Sections in order; a flat list shows every row.
+    assert_eq!(
+        shown_ids(&TableState::default(), &two_sections()),
+        [1, 2, 3]
+    );
+    let flat = vec![Section {
+        heading: None,
+        rows: (0..5).map(|i| row(i, "p", "1", "Ha")).collect(),
+    }];
+    assert_eq!(shown_ids(&TableState::default(), &flat), [0, 1, 2, 3, 4]);
+}
+
+/// A rolled-up section "ha" of 40 rows p0..p39 and a section "oiii" with
+/// b1 (id 100), in a scroll area in a short window.
+fn scrolled() -> Harness<'static, State> {
+    let ha = (0..40)
+        .map(|i| row(i, &format!("p{i}"), "1.21", "Ha"))
+        .collect();
+    let sections = vec![
+        Section {
+            heading: Some(Heading {
+                rolls_up: true,
+                ..heading("ha", "Ha · 40")
+            }),
+            rows: ha,
+        },
+        Section {
+            heading: Some(heading("oiii", "OIII · 1")),
+            rows: vec![row(100, "b1", "1.21", "OIII")],
+        },
+    ];
+    Harness::builder()
+        .with_size(Vec2::new(600.0, 300.0))
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    sectioned_table(ui, &mut s.table, &s.columns, &s.sections, |_, _| {});
+                });
+            },
+            State {
+                table: TableState::default(),
+                columns: columns(),
+                sections,
+                all: Vec::new(),
+                last: Vec::new(),
+            },
+        )
+}
+
+#[test]
+fn revealing_a_row_opens_its_section_and_scrolls_to_it() {
+    let mut h = scrolled();
+    h.run();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
+    assert!(h.query_by_label("p30").is_none(), "rolled up");
+    // A row a rolled-up section hides: the section opens, the row shows.
+    h.state_mut().table.reveal(30);
+    h.run();
+    assert!(h.state().table.is_expanded("ha"));
+    let p30 = h.get_by_label("p30").rect();
+    assert!(screen.contains_rect(p30), "{p30:?} not on screen");
+    // A row in a folded section: the section unfolds, the row shows.
+    h.state_mut().table.toggle_fold("oiii");
+    h.run();
+    assert!(h.query_by_label("b1").is_none(), "folded");
+    h.state_mut().table.reveal(100);
+    h.run();
+    assert!(!h.state().table.is_folded("oiii"));
+    let b1 = h.get_by_label("b1").rect();
+    assert!(screen.contains_rect(b1), "{b1:?} not on screen");
+    // Once: the user scrolls on from there.
+    assert_eq!(h.state().table.revealing, None);
+}
+
+/// `row` with these sort keys.
+fn keyed(row: Row<'static>, keys: Vec<SortKey>) -> Row<'static> {
+    Row {
+        sort_keys: keys,
+        ..row
+    }
+}
+
+/// Section "ha" (h1..h3) and section "oiii" (o1, o2), with scales whose
+/// text order is not their numeric order, and an unknown one ("—").
+fn sortable() -> Vec<Section<'static>> {
+    let n = |v: f64| SortKey::Number(v);
+    let t = |s: &str| SortKey::Text(s.to_owned());
+    let r = |id, name: &str, scale: &str, key: SortKey, filter: &str| {
+        keyed(row(id, name, scale, filter), vec![t(name), key, t(filter)])
+    };
+    vec![
+        Section {
+            heading: Some(heading("ha", "Ha · 3")),
+            rows: vec![
+                r(1, "h1", "100.125", n(100.125), "Ha"),
+                r(2, "h2", "—", SortKey::Unknown, "ha"),
+                r(3, "h3", "9.5", n(9.5), "HA"),
+            ],
+        },
+        Section {
+            heading: Some(heading("oiii", "OIII · 2")),
+            rows: vec![
+                r(4, "o1", "10.25", n(10.25), "OIII"),
+                r(5, "o2", "2", n(2.0), "oiii"),
+            ],
+        },
+    ]
+}
+
+/// The rows' first cells, top to bottom, as drawn.
+fn drawn_order(h: &Harness<'_, State>) -> Vec<String> {
+    let mut rows: Vec<(String, f32)> = h
+        .query_all_by_role(Role::ListItem)
+        .map(|n| {
+            (
+                n.accesskit_node().label().unwrap_or_default(),
+                n.rect().top(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.1.total_cmp(&b.1));
+    rows.into_iter().map(|(l, _)| l).collect()
+}
+
+#[test]
+fn a_heading_click_sorts_rows_within_their_sections() {
+    let mut h = harness(sortable());
+    h.run();
+    // The caller's order at first.
+    assert_eq!(drawn_order(&h), ["h1", "h2", "h3", "o1", "o2"]);
+    assert_eq!(h.state().table.sort, None);
+    // Numbers compare as numbers; the unknown one goes last; sections stay
+    // where they are.
+    h.get_by_role_and_label(Role::Button, "Scale").click();
+    h.run();
+    assert_eq!(drawn_order(&h), ["h3", "h1", "h2", "o2", "o1"]);
+    assert_eq!(
+        h.state().table.sort,
+        Some(Sort {
+            column: 1,
+            descending: false
+        })
+    );
+    let ha = h.get_by_label("Ha · 3").rect();
+    let oiii = h.get_by_label("OIII · 2").rect();
+    assert!(ha.top() < oiii.top());
+    // Again: the other way, the unknown one still last.
+    h.get_by_role_and_label(Role::Button, "Scale").click();
+    h.run();
+    assert_eq!(drawn_order(&h), ["h1", "h3", "h2", "o1", "o2"]);
+    // Text compares whatever its case; equal keys keep the caller's order.
+    h.get_by_role_and_label(Role::Button, "Filter").click();
+    h.run();
+    assert_eq!(drawn_order(&h), ["h1", "h2", "h3", "o1", "o2"]);
+    assert_eq!(
+        h.state().table.sort,
+        Some(Sort {
+            column: 2,
+            descending: false
+        })
+    );
+    // Events report the caller's ids, whatever the order.
+    h.get_by_label("h3").click();
+    h.run();
+    assert!(h.state().all.contains(&TableEvent::Click {
+        id: 3,
+        modifiers: Modifiers::NONE
+    }));
+}
+
+#[test]
+fn the_sorted_heading_shows_its_direction() {
+    let mut h = harness(sortable());
+    h.run();
+    let up = icons::CHEVRON_UP.to_string();
+    let down = icons::CHEVRON_DOWN.to_string();
+    let scale = h.get_by_role_and_label(Role::Button, "Scale");
+    assert_eq!(scale.accesskit_node().sort_direction(), None);
+    // The section chevrons point down (open): count only the headings'.
+    let header = text_rect(&h, "SCALE").expect("SCALE heading");
+    let in_header = |h: &Harness<'_, State>, glyph: &str| {
+        painted(h)
+            .into_iter()
+            .filter(|(t, r)| t == glyph && (r.center().y - header.center().y).abs() < 4.0)
+            .count()
+    };
+    assert_eq!(in_header(&h, &up) + in_header(&h, &down), 0, "unsorted");
+    scale.click();
+    h.run();
+    assert_eq!(in_header(&h, &up), 1);
+    assert_eq!(in_header(&h, &down), 0);
+    let node = h.get_by_role_and_label(Role::Button, "Scale");
+    assert_eq!(
+        node.accesskit_node().sort_direction(),
+        Some(egui::accesskit::SortDirection::Ascending)
+    );
+    node.click();
+    h.run();
+    assert_eq!(in_header(&h, &up), 0);
+    assert_eq!(in_header(&h, &down), 1);
+    assert_eq!(
+        h.get_by_role_and_label(Role::Button, "Scale")
+            .accesskit_node()
+            .sort_direction(),
+        Some(egui::accesskit::SortDirection::Descending)
+    );
+    // The arrow sits in the column's heading, which the cells line up with
+    // (numbers on the right).
+    let arrow = painted(&h)
+        .into_iter()
+        .find(|(t, r)| *t == down && (r.center().y - header.center().y).abs() < 4.0)
+        .unwrap()
+        .1;
+    let header = text_rect(&h, "SCALE").unwrap();
+    assert!(arrow.right() <= header.left() + 0.5, "{arrow:?} {header:?}");
+    let cell = text_rect(&h, "10.25").unwrap();
+    assert!((cell.right() - header.right()).abs() < 0.5);
+}
+
+#[test]
+fn a_rolled_up_section_shows_the_first_rows_it_sorts() {
+    // p0..p9 scaled 0..9; p1 has a problem.
+    let mut sections = rolled_up();
+    for r in &mut sections[0].rows {
+        r.problem = (r.id == 1).then_some("No astrometric solution");
+        r.sort_keys = vec![
+            SortKey::Text(r.cells[0].clone()),
+            SortKey::Number(r.id as f64),
+        ];
+    }
+    let mut state = TableState::default();
+    state.sort_by(1);
+    state.sort_by(1);
+    assert_eq!(
+        state.sort,
+        Some(Sort {
+            column: 1,
+            descending: true
+        })
+    );
+    // Largest first: p9, p8 and p7, then p1 (its problem shows it).
+    assert_eq!(shown_ids(&state, &sections), [9, 8, 7, 1]);
+    let mut h = harness(sections);
+    h.state_mut().table = state;
+    h.run();
+    assert_eq!(drawn_order(&h), ["p9", "p8", "p7", "p1"]);
+    h.get_by_role_and_label(Role::Button, "… 6 more");
+    // A row the roll-up hides in this order is revealed: the section opens.
+    h.state_mut().table.reveal(0);
+    h.run();
+    assert_eq!(drawn_order(&h).last().map(String::as_str), Some("p0"));
+}
+
+#[test]
+fn sort_keys_default_to_the_cells() {
+    // No keys: cells compare as text, case aside; empty and "—" are unknown.
+    let rows = vec![
+        row(1, "b", "x", "Ha"),
+        row(2, "—", "x", "Ha"),
+        row(3, "A", "x", "Ha"),
+        row(4, "", "x", "Ha"),
+        row(5, "c", "x", "Ha"),
+    ];
+    let sections = vec![Section {
+        heading: None,
+        rows,
+    }];
+    let mut state = TableState::default();
+    state.sort_by(0);
+    assert_eq!(shown_ids(&state, &sections), [3, 1, 5, 2, 4]);
+    state.sort_by(0);
+    assert_eq!(shown_ids(&state, &sections), [5, 1, 3, 2, 4]);
+    // Another column sorts ascending first.
+    state.sort_by(2);
+    assert_eq!(
+        state.sort,
+        Some(Sort {
+            column: 2,
+            descending: false
+        })
+    );
+}

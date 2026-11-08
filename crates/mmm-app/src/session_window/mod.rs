@@ -8,10 +8,20 @@
 //!   the step strip ([`steps`]: Panels · Checks · Merge · Export, with the
 //!   work in progress) and the main button (**Add panels…**, **Merge**
 //!   with the merge settings' summary, or **Export…**).
-//! - **Panel list** ([`PanelsTab`]): while open it takes the canvas's
-//!   place (view bar included); the Panels step opens and closes it. A
-//!   session without panels opens on it. Files dropped on the window are
-//!   added whatever shows ([`SessionWindow::poll_panels`]).
+//! - **Panel list** ([`PanelList`]): while open it is a resizable column
+//!   at the left of the canvas (about half the window wide at first, never
+//!   narrower than [`PANEL_LIST_MIN_WIDTH`], never so wide that the canvas
+//!   gets narrower than [`CANVAS_MIN_WIDTH`]), so the view bar and the plan
+//!   stay beside it; the Panels step opens and closes it, and switching
+//!   between plan and mosaic leaves it as it is. A session without panels
+//!   opens on it. Files dropped on the window are added whatever shows
+//!   ([`SessionWindow::poll_panels`]). Rows and the plan are linked (spec
+//!   §7.4): a row pointed at lights its panel's outline on the plan and a
+//!   panel pointed at on the plan lights its row (the panels the view
+//!   shows); a row clicked selects its panel on the plan (the inspector
+//!   shows it), showing its group first when the view does not have it,
+//!   and a panel clicked on the plan selects its row, brought into view.
+//!   Esc clears the selection in both.
 //! - **One view, one camera.** The window keeps the view (a group or a
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
@@ -43,10 +53,14 @@
 //!   once something is merged, the first group, Problems open, Outlines and
 //!   ROIs on.
 //! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `L`, `S`
-//!   and `Ctrl+Enter`, each named in its control's tooltip; none while a
-//!   text field has the keyboard or the Export dialog is open.
-//! - **Saves.** The view state, the display stretch toggles, the composites
-//!   and the notes live in the session's `MosaicConfig.ui`, changed at once
+//!   and `Ctrl+Enter`, each named in its control's tooltip, `Delete`
+//!   (removes the panels selected in the open list) and `Esc` (clears the
+//!   selection); none while a text field has the keyboard or the Export
+//!   dialog is open.
+//! - **Saves.** The view state, the display stretch toggles, the composites,
+//!   the notes and the user's grouping choice (noted by the panel list,
+//!   [`PanelList::take_ui_changed`]) live in the session's
+//!   `MosaicConfig.ui`, changed at once
 //!   in memory and written to `mosaic.json` on the UI thread at most once
 //!   per [`SAVE_INTERVAL`](crate::util::SAVE_INTERVAL) ([`Debounce`]; the
 //!   documented exception), and at once by
@@ -63,15 +77,16 @@ mod steps;
 mod top_bar;
 pub mod view_state;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use mega_ui::inspector::{InspectorState, inspector_width};
 use mega_ui::theme::palette;
-use mega_ui::theme::tokens::space;
+use mega_ui::theme::tokens::{CANVAS_MIN_WIDTH, PANEL_LIST_MIN_WIDTH, space};
 use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
+use mmm_core::mosaic::{Grouping, PanelEntry};
 use mmm_core::session_summary::ResultState;
 use mmm_core::settings::ChangeImpact;
 use serde::{Deserialize, Serialize};
@@ -82,9 +97,10 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
-use crate::panels_tab::{FilesPicker, PanelsTab};
+use crate::panel_edits::FilesPicker;
+use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
-use crate::plan_view::{CanvasLook, PlanView};
+use crate::plan_view::{CanvasLook, PlanView, group_members};
 use crate::session::OpenSession;
 use crate::util::{Debounce, group_names};
 use view_state::ViewState;
@@ -107,6 +123,32 @@ pub struct SessionOutput {
     /// ‹ was clicked: back to the start screen
     /// ([`crate::app::Shell::close_session`]).
     pub back: bool,
+    /// Toasts to show, each with the undo its action button runs.
+    pub toasts: Vec<WindowToast>,
+}
+
+/// What an Undo toast's action restores ([`SessionWindow::undo`]): only
+/// what its action changed, into the inputs as they are by then (later,
+/// unrelated edits stay).
+#[derive(Clone, Debug)]
+pub enum Undo {
+    /// Put back removed panels, each as it was (its manual group too) at
+    /// its index in the inputs before the removal (or the end, if fewer
+    /// panels are left); one already back is left alone.
+    Readd(Vec<(usize, PanelEntry)>),
+    /// Put back the grouping from before the automatic grouping by FILTER
+    /// (the panels as they are now), noting that the user has chosen how to
+    /// group; nothing more if they have chosen another way since.
+    Grouping(Grouping),
+}
+
+/// A toast the window asks the shell to show.
+#[derive(Debug)]
+pub struct WindowToast {
+    /// What to show; its action (if any) runs `undo`.
+    pub toast: mega_ui::widgets::Toast,
+    /// What the toast's action restores.
+    pub undo: Option<Undo>,
 }
 
 /// The open session's window: canvas, view bar and inspector (see the
@@ -124,7 +166,8 @@ pub struct SessionWindow {
     /// Problems lists every check, notes and passed ones too.
     show_all_checks: bool,
     notes_mode: NotesMode,
-    /// The panel selected on the plan last frame (a new one opens Panels).
+    /// The plan's selected panel as last seen: a new one opens Panels, and
+    /// one picked on the plan selects its row in the panel list.
     selected: Option<PathBuf>,
     /// The view bar's choices' and toggles' one-row widths, as last drawn.
     bar_widths: Option<(f32, f32)>,
@@ -132,12 +175,20 @@ pub struct SessionWindow {
     /// The view as last written into the session's `ui` (or found there).
     saved_view: Option<ViewState>,
     /// The panel list: the files and their grouping.
-    panels: PanelsTab,
-    /// The panel list shows in the canvas's place.
+    panels: PanelList,
+    /// Toasts raised since the last frame, handed to the shell by `ui`.
+    toasts: Vec<WindowToast>,
+    /// The panel list shows at the left of the canvas.
     pub(crate) panel_list_open: bool,
+    /// A text field had the keyboard when the last frame ended: an Esc now
+    /// left it (egui lets go of the field before the shortcuts see the key).
+    was_typing: bool,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
+    /// The panel list's rect, as last drawn (tests).
+    #[cfg(test)]
+    pub(crate) list_rect: Option<egui::Rect>,
 }
 
 /// Inspector section ids, in their fixed order.
@@ -167,10 +218,14 @@ impl SessionWindow {
             bar_widths: None,
             save: Debounce::default(),
             saved_view: None,
-            panels: PanelsTab::new(picker),
+            panels: PanelList::new(picker),
+            toasts: Vec::new(),
             panel_list_open: false,
+            was_typing: false,
             #[cfg(test)]
             top_bar_rect: None,
+            #[cfg(test)]
+            list_rect: None,
         }
     }
 
@@ -180,10 +235,9 @@ impl SessionWindow {
         self.mode.unwrap_or(CanvasMode::Plan)
     }
 
-    /// Show the plan or the mosaic, where the shown canvas looks; the panel
-    /// list closes, so the canvas shows.
+    /// Show the plan or the mosaic, where the shown canvas looks (the
+    /// panel list beside it stays as it is).
     pub fn set_mode(&mut self, mode: CanvasMode) {
-        self.panel_list_open = false;
         if self.mode == Some(mode) {
             return;
         }
@@ -264,7 +318,13 @@ impl SessionWindow {
         self.mosaic.track_analysis(id);
     }
 
-    /// The panel list's background work, shown or not ([`PanelsTab::poll`]):
+    /// The panel list (tests).
+    #[cfg(test)]
+    pub(crate) fn panel_list(&self) -> &PanelList {
+        &self.panels
+    }
+
+    /// The panel list's background work, shown or not ([`PanelList::poll`]):
     /// files picked, typed or dropped anywhere on the window are added, and
     /// a waiting edit applies. Call every frame after the runner's poll,
     /// before the pipeline's.
@@ -275,6 +335,15 @@ impl SessionWindow {
         jobs: &mut JobRunner,
     ) {
         self.panels.poll(ctx, session, jobs);
+        self.save_panel_choices();
+    }
+
+    /// Save (rate-limited) what the panel list noted in the session's `ui`
+    /// without an edit to carry it (the user's grouping choice).
+    fn save_panel_choices(&mut self) {
+        if self.panels.take_ui_changed() {
+            self.save.touch();
+        }
     }
 
     /// An edit of the panels waits for the jobs to stop (or a busy store):
@@ -343,11 +412,28 @@ impl SessionWindow {
         self.mosaic.apply_waiting_settings(session, jobs);
     }
 
+    /// Raise a toast: the shell shows it with this frame's output (the
+    /// next one's, raised after drawing).
+    pub(crate) fn push_toast(&mut self, toast: WindowToast) {
+        self.toasts.push(toast);
+    }
+
+    /// Run an Undo toast's action: an edit of the inputs as they are now,
+    /// applied like any other (queued behind running jobs).
+    pub fn undo(&mut self, undo: Undo, session: &mut OpenSession, jobs: &mut JobRunner) {
+        match undo {
+            Undo::Readd(removed) => self.panels.readd(removed, session, jobs),
+            Undo::Grouping(grouping) => self.panels.regroup(grouping, session, jobs),
+        }
+        self.save_panel_choices();
+    }
+
     /// Save a pending (rate-limited) change now, whatever the rate limit,
     /// the view as it is included: the window is closing, or the session is
     /// being left. A small `mosaic.json` write.
     pub fn flush_save(&mut self, session: &mut OpenSession) {
         self.keep_view_state(session);
+        self.save_panel_choices();
         if self.save.pending() {
             self.save.saved(Instant::now());
             if let Err(e) = session.mosaic.save() {
@@ -364,8 +450,8 @@ impl SessionWindow {
     }
 
     /// Draw the window filling `ui`: the top bar across it, the inspector
-    /// at the right, the view bar and the canvas (or the panel list) in the
-    /// rest, and the export dialog when open.
+    /// at the right, the panel list (when open) at the left, the view bar
+    /// and the canvas in the rest, and the export dialog when open.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -395,26 +481,115 @@ impl SessionWindow {
             .show(ui, |ui| {
                 self.inspector_ui(ui, session, jobs, pipeline, checks, &mut out);
             });
+        if self.panel_list_open {
+            // About half the window at first; the user resizes it, never
+            // squeezing the canvas below its minimum (unless the window is
+            // too small for both, when the list keeps its own).
+            let widest = (ui.available_width() - CANVAS_MIN_WIDTH).max(PANEL_LIST_MIN_WIDTH);
+            let width = (ctx.content_rect().width() / 2.0).clamp(PANEL_LIST_MIN_WIDTH, widest);
+            let list = egui::Panel::left("panel-list")
+                .resizable(true)
+                .default_size(width)
+                .min_size(PANEL_LIST_MIN_WIDTH)
+                .max_size(widest)
+                .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
+                .show(ui, |ui| self.panels.ui(ui, session, jobs, checks.report()));
+            #[cfg(test)]
+            {
+                self.list_rect = Some(list.response.rect);
+            }
+            self.follow_list(session, list.inner);
+        } else {
+            for toast in self.panels.take_toasts() {
+                self.push_toast(toast);
+            }
+            self.plan.set_highlight(None);
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| {
-                if self.panel_list_open {
-                    self.panels.ui(ui, session, jobs);
-                } else {
-                    self.view_bar(ui, session, jobs, pipeline);
-                    self.canvas_ui(ui, session, pipeline, checks);
-                }
+                self.view_bar(ui, session, jobs, pipeline);
+                self.canvas_ui(ui, session, pipeline, checks);
             });
         self.mosaic.export_ui(&ctx, session, jobs);
-        if !self.panel_list_open {
-            // Files dropped anywhere are added (the list draws its own).
-            self.panels.drop_overlay(&ctx);
-        }
+        out.toasts.append(&mut self.toasts);
+        self.save_panel_choices();
+        // Files dropped anywhere are added, whatever shows.
+        self.panels.drop_overlay(&ctx);
         // What this frame changed is saved from the next one.
         if self.keep_view_state(session) {
             ctx.request_repaint();
         }
+        self.was_typing = ctx.text_edit_focused();
         out
+    }
+
+    /// Act on what the panel list reported this frame: its toasts; the row
+    /// pointed at lights its panel on the plan (if the view shows it); a
+    /// row clicked (plainly) selects its panel there, showing its group
+    /// first when the view does not show it, and opening the inspector's
+    /// Panels section for a new one; a removed panel is no longer selected.
+    fn follow_list(&mut self, session: &OpenSession, out: PanelListOutput) {
+        for toast in out.toasts {
+            self.push_toast(toast);
+        }
+        self.plan.set_highlight(out.hovered);
+        if let Some(path) = out.clicked {
+            if !self.view_shows(session, &path)
+                && let Some(group) = group_of(session, &path)
+            {
+                self.select_view(ViewKind::Group(group));
+            }
+            if self.selected.as_ref() != Some(&path) {
+                self.inspector.reveal(PANELS);
+            }
+            self.plan.select(Some(path.clone()));
+            self.selected = Some(path);
+        }
+        self.panels_removed(&out.removed);
+    }
+
+    /// Whether the view shown has panel `path` (one of its groups does).
+    fn view_shows(&self, session: &OpenSession, path: &Path) -> bool {
+        let groups: Vec<String> = match &self.view {
+            Some(ViewKind::Group(g)) => vec![g.clone()],
+            Some(ViewKind::Composition(i)) => compositions_of(session)
+                .get(*i)
+                .map(|c| {
+                    c.channels
+                        .iter()
+                        .flatten()
+                        .map(|(g, _)| g.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => return false,
+        };
+        let members = group_members(session, &groups);
+        groups
+            .iter()
+            .filter_map(|g| members.get(g))
+            .any(|ps| ps.iter().any(|p| p == path))
+    }
+
+    /// `removed` left the inputs: the plan's selection goes with them (now,
+    /// not once a queued edit applies).
+    fn panels_removed(&mut self, removed: &[PathBuf]) {
+        if self
+            .plan
+            .selected()
+            .is_some_and(|p| removed.iter().any(|r| r == p))
+        {
+            self.plan.select(None);
+            self.selected = None;
+        }
+    }
+
+    /// Clear the selection, in the list and on the plan (Esc).
+    fn clear_selection(&mut self) {
+        self.panels.clear_selection();
+        self.plan.select(None);
+        self.selected = None;
     }
 
     /// On the first call, restore the view the session saved
@@ -576,6 +751,15 @@ fn compositions_of(session: &OpenSession) -> Vec<Composition> {
     } else {
         Vec::new()
     }
+}
+
+/// The group panel `path` is in (as resolved), if known.
+fn group_of(session: &OpenSession, path: &Path) -> Option<String> {
+    let groups = session.groups.as_ref()?.processing_groups();
+    groups
+        .into_iter()
+        .find(|(_, panels)| panels.iter().any(|p| p == path))
+        .map(|(name, _)| name)
 }
 
 /// The view `key` ([`SessionWindow::view_key`]) names in `session`, if it

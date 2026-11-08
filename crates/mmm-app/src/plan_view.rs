@@ -1,9 +1,12 @@
 //! The plan canvas (spec §5.3): every panel in place in the shared frame,
 //! drawn from its low-resolution preview as each one arrives, with outlines,
 //! numbers and selection. Only the canvas: the window around it picks the
-//! view ([`PlanView::select_view`]) and the look ([`CanvasLook`]), and shows
+//! view ([`PlanView::select_view`]) and the look ([`CanvasLook`]), shows
 //! the selected panel's details where it likes
-//! ([`PlanView::selection_ui`]).
+//! ([`PlanView::selection_ui`]), and links it to the panel list: it selects
+//! ([`PlanView::select`]) and highlights ([`PlanView::set_highlight`]) the
+//! panel of a row, and reads the panel under the pointer
+//! ([`PlanView::hovered`]).
 //!
 //! - **Views.** Each group, then each composition (a colour mix of groups,
 //!   [`crate::compositions`]). With grouping off there is one view.
@@ -15,10 +18,17 @@
 //!   header ([`read_info`]) are each read on a worker too.
 //! - **Placement.** A panel is drawn at its preview's rect. Until its
 //!   preview arrives it is drawn as a dashed outline where the last
-//!   analysis placed it or, failing that, at its header-only WCS footprint
-//!   in a solved frame ([`load_footprints`], once per previews generation
-//!   and frame). The canvas extent is the shared frame's canvas, which does
-//!   not move as previews arrive (so the user's zoom is kept).
+//!   analysis placed it or, failing that, at its [`Outline`]: an earlier
+//!   preview's rect (kept while an edit drops the previews and they are
+//!   read again), or read from the file on a worker ([`find_outlines`]:
+//!   the header-only WCS footprint in a solved frame, a strided scan of the
+//!   covered area in an aligned one). Outlines are kept per frame, across
+//!   edits: only a panel with no place yet is read, and a file changed on
+//!   disk (checked once per previews generation, by its fingerprint) is
+//!   read again; a new frame drops them all. The search passes over panels
+//!   placed meanwhile and stops when the plan is dropped (the session
+//!   left). The canvas extent is the shared frame's canvas, which does not
+//!   move as previews arrive (so the user's zoom is kept).
 //! - **Camera.** [`PlanView::set_camera`] moves the canvas without
 //!   animation, from the next frame drawn. The canvas fits its extent on its
 //!   first frame and whenever the extent changes; the camera is shown in
@@ -53,9 +63,10 @@ use mega_ui::theme::palette;
 use mega_ui::theme::tokens::space;
 use mmm_core::checks::{Severity, SolutionKind, is_accepted, panel_facts};
 use mmm_core::formats::InputPanel;
-use mmm_core::mosaic::FRAME_FILE;
+use mmm_core::job::{CancelToken, JobCtl};
+use mmm_core::mosaic::{FRAME_FILE, Fingerprint, fingerprint};
 use mmm_core::overlap::OverlapGraph;
-use mmm_core::preview::{Preview, footprint, preview_frame_path};
+use mmm_core::preview::{Preview, aligned_bbox, footprint, preview_frame_path};
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 use mmm_core::stretch::{ChannelStats, StretchParams, apply, channel_stats};
@@ -64,7 +75,7 @@ use crate::camera::Camera;
 use crate::checks::ChecksReport;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
-use crate::panels_tab::{group_colors, load_group_colors};
+use crate::panel_edits::{group_colors, load_group_colors};
 use crate::session::OpenSession;
 use crate::status::format_canvas;
 use crate::util::{Poll, Task, group_names};
@@ -399,21 +410,79 @@ pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
     out
 }
 
-/// Each of `panels`' header-only footprint in `frame` (solved frames only;
-/// see [`footprint`]). Blocking (worker thread): reads headers; a panel
-/// whose footprint cannot be found is left out.
-pub fn load_footprints(frame: &ReferenceFrame, panels: &[PathBuf]) -> BTreeMap<PathBuf, [f64; 4]> {
-    panels
-        .iter()
-        .filter_map(|p| match footprint(p, frame) {
-            Ok(Some(r)) => Some((p.clone(), r)),
-            Ok(None) => None,
+/// A panel's outline in the shared frame, and where it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outline {
+    /// Its preview's rect (the previews run checks the file itself).
+    Preview([f64; 4]),
+    /// Read from the file (see [`find_outlines`]).
+    Read {
+        /// The file's fingerprint when read (`None`: it could not be read).
+        fingerprint: Option<Fingerprint>,
+        /// The outline, if one was found.
+        rect: Option<[f64; 4]>,
+    },
+}
+
+impl Outline {
+    /// Where the panel is, if known.
+    pub fn rect(&self) -> Option<&[f64; 4]> {
+        match self {
+            Outline::Preview(r) => Some(r),
+            Outline::Read { rect, .. } => rect.as_ref(),
+        }
+    }
+}
+
+/// Read the outline in `frame` of each of `panels` that is new or changed
+/// on disk since its outline was read (each comes with the fingerprint it
+/// was read at, if it was): the header-only footprint in a solved frame
+/// (see [`footprint`]), the strided covered-area scan in an aligned one
+/// (see [`aligned_bbox`]). A panel no longer in `wanted` when its turn
+/// comes (its preview arrived meanwhile, or it left the inputs) is passed
+/// over; one whose outline cannot be found is recorded without one, so it
+/// is not read again until its file changes. Blocking (worker thread); a
+/// cancelled `ctl` ends the search early with what has been found.
+pub fn find_outlines(
+    frame: &ReferenceFrame,
+    panels: Vec<(PathBuf, Option<Option<Fingerprint>>)>,
+    wanted: &Mutex<BTreeSet<PathBuf>>,
+    ctl: &JobCtl,
+) -> BTreeMap<PathBuf, Outline> {
+    let mut out = BTreeMap::new();
+    for (path, read_at) in panels {
+        if ctl.check().is_err() {
+            break;
+        }
+        let still_wanted = wanted.lock().map_or(true, |w| w.contains(&path));
+        if !still_wanted {
+            continue;
+        }
+        let fingerprint = fingerprint(&path).ok();
+        if fingerprint.is_some() && read_at.as_ref() == Some(&fingerprint) {
+            // Unchanged since read.
+            continue;
+        }
+        #[cfg(test)]
+        outline_hooks::scanning(&path, ctl);
+        // A reader that panics costs that panel its outline, not the
+        // search.
+        let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match frame {
+            ReferenceFrame::Aligned { .. } => aligned_bbox(&path, ctl),
+            ReferenceFrame::Solved { .. } => footprint(&path, frame),
+        }))
+        .unwrap_or_else(|_| Err(mmm_core::error::Error::format(&path, "reading it panicked")));
+        let rect = match found {
+            Ok(r) => r,
+            Err(mmm_core::error::Error::Cancelled) => break,
             Err(e) => {
-                tracing::debug!("Plan: no footprint for {}: {e}", p.display());
+                tracing::debug!("Plan: no outline for {}: {e}", path.display());
                 None
             }
-        })
-        .collect()
+        };
+        out.insert(path, Outline::Read { fingerprint, rect });
+    }
+    out
 }
 
 /// Header facts of a panel for its details.
@@ -500,6 +569,8 @@ pub struct ItemSnapshot {
     pub outline: Color32,
     /// The panel number shown.
     pub label: String,
+    /// Highlighted ([`PlanView::set_highlight`]: its row is pointed at).
+    pub highlighted: bool,
 }
 
 /// What the automatic stretch was last computed for.
@@ -585,6 +656,10 @@ pub struct PlanView {
     view: Option<ViewKind>,
     canvas: PlanCanvas,
     selected: Option<PathBuf>,
+    /// The panel under the pointer in the last frame drawn.
+    hovered: Option<PathBuf>,
+    /// The panel to highlight (pointed at elsewhere).
+    highlight: Option<PathBuf>,
     held_camera: Option<HeldCamera>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
@@ -606,11 +681,20 @@ pub struct PlanView {
     layout: Layout,
     layout_task: Option<Task<Layout>>,
     layout_for: Option<LayoutKey>,
-    /// Header-only footprints of the panels in the frame (solved frames).
-    footprints: BTreeMap<PathBuf, [f64; 4]>,
-    footprint_task: Option<Task<BTreeMap<PathBuf, [f64; 4]>>>,
-    /// The previews generation and frame the footprints were found for.
-    footprints_for: Option<(u64, ReferenceFrame)>,
+    /// The panels' outlines in `outlines_frame`, kept across previews
+    /// generations (see the module docs).
+    footprints: BTreeMap<PathBuf, Outline>,
+    /// The frame the outlines are in.
+    outlines_frame: Option<ReferenceFrame>,
+    /// The outline search ([`find_outlines`]), while it runs.
+    footprint_task: Option<Task<BTreeMap<PathBuf, Outline>>>,
+    /// Cancels the running outline search (its frame went, or the plan).
+    footprint_cancel: CancelToken,
+    /// The panels the running search still needs, shared with it.
+    outlines_wanted: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// The previews generation the outlines read were last checked for
+    /// (their files may have changed since).
+    outlines_checked: Option<u64>,
     /// The previews generation the header facts belong to.
     info_generation: u64,
     /// When the view was last drawn (textures are dropped once hidden).
@@ -631,6 +715,16 @@ impl Default for PlanView {
     }
 }
 
+impl Drop for PlanView {
+    /// Stop the outline search: nothing reads its outlines once the plan
+    /// is gone (the session was left, or another opened), and it must not
+    /// keep reading panel files (or hold the decode lock) for the next
+    /// session.
+    fn drop(&mut self) {
+        self.footprint_cancel.cancel();
+    }
+}
+
 impl PlanView {
     /// A view showing the first group once drawn.
     pub fn new() -> Self {
@@ -638,6 +732,8 @@ impl PlanView {
             view: None,
             canvas: PlanCanvas::new(),
             selected: None,
+            hovered: None,
+            highlight: None,
             held_camera: None,
             textures_for: None,
             textures: HashMap::new(),
@@ -655,8 +751,11 @@ impl PlanView {
             layout_task: None,
             layout_for: None,
             footprints: BTreeMap::new(),
+            outlines_frame: None,
             footprint_task: None,
-            footprints_for: None,
+            footprint_cancel: CancelToken::new(),
+            outlines_wanted: Arc::default(),
+            outlines_checked: None,
             info_generation: 0,
             last_shown: None,
             info: BTreeMap::new(),
@@ -707,10 +806,22 @@ impl PlanView {
         self.selected.as_deref()
     }
 
-    /// Select the panel `path` (or none); the canvas selects by click.
-    #[cfg(test)]
+    /// Select the panel `path` (or none), as a click on it does (e.g. its
+    /// row was clicked in the panel list).
     pub fn select(&mut self, path: Option<PathBuf>) {
         self.selected = path;
+    }
+
+    /// The panel under the pointer in the last frame drawn (one of the
+    /// view's), if any.
+    pub fn hovered(&self) -> Option<&Path> {
+        self.hovered.as_deref()
+    }
+
+    /// Highlight panel `path`'s outline (or none) from the next frame drawn,
+    /// if the view shows it (e.g. its row is pointed at in the panel list).
+    pub fn set_highlight(&mut self, path: Option<PathBuf>) {
+        self.highlight = path;
     }
 
     /// The automatic display stretch in use, once known.
@@ -724,7 +835,7 @@ impl PlanView {
     }
 
     /// Panels of the view with no place to draw them yet (no preview, no
-    /// analysis and no footprint), last frame.
+    /// analysis and no outline), last frame.
     pub fn unplaced(&self) -> usize {
         self.unplaced
     }
@@ -768,7 +879,9 @@ impl PlanView {
     }
 
     /// Draw the canvas filling `ui`, and handle its input: a click selects
-    /// a panel, a click on no panel or Esc clears the selection.
+    /// a panel, a click on no panel clears the selection (Esc is the
+    /// window's: [`PlanView::select`]), and the panel under the pointer is
+    /// noted ([`PlanView::hovered`]).
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -778,6 +891,8 @@ impl PlanView {
     ) {
         let ctx = ui.ctx().clone();
         self.last_shown = Some(Instant::now());
+        // Set again if the canvas is drawn and the pointer is on a panel.
+        self.hovered = None;
         if self.info_generation != feed.generation {
             // The panel files may have changed: read their headers again.
             self.info_generation = feed.generation;
@@ -828,9 +943,6 @@ impl PlanView {
                     ui.label(RichText::new(text).color(palette::TEXT_MUTED));
                 });
             }
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.egui_wants_keyboard_input() {
-            self.selected = None;
         }
         self.settled = feed.complete
             && self.layout_task.is_none()
@@ -887,6 +999,7 @@ impl PlanView {
         } else if r.clicked_empty {
             self.selected = None;
         }
+        self.hovered = r.hovered.and_then(path_of);
     }
 
     /// The view to draw this frame, if any.
@@ -964,7 +1077,7 @@ impl PlanView {
     ) {
         self.poll_tasks();
         self.start_layout(ctx, session, feed);
-        self.start_footprints(ctx, session, feed);
+        self.follow_outlines(ctx, session, feed);
         let Some(spec) = spec else {
             self.view_key = None;
             return;
@@ -1001,16 +1114,6 @@ impl PlanView {
                     self.layout_task = None;
                     tracing::warn!("Plan: reading the layout failed (see the log)");
                 }
-            }
-        }
-        if let Some(task) = &self.footprint_task {
-            match task.poll() {
-                Poll::Pending => {}
-                Poll::Done(f) => {
-                    self.footprint_task = None;
-                    self.footprints = f;
-                }
-                Poll::Lost => self.footprint_task = None,
             }
         }
         if let Some(task) = &self.info_task {
@@ -1070,37 +1173,111 @@ impl PlanView {
         });
     }
 
-    /// Find the panels' header-only footprints once per previews generation
-    /// and frame (solved frames; an aligned frame has none to find).
-    fn start_footprints(
-        &mut self,
-        ctx: &egui::Context,
-        session: &OpenSession,
-        feed: &PlanFeed<'_>,
-    ) {
-        let Some(frame) = self.layout.frame.clone() else {
+    /// Keep the panels' outlines (see the module docs): take a finished
+    /// search; on a new frame drop them all (and stop the search); keep
+    /// each arrived preview's rect; and search (on a worker) for the
+    /// panels with no place, no preview and no outline yet, and once per
+    /// previews generation for those whose outline was read (only a file
+    /// changed since is read again). The running search passes over panels
+    /// placed meanwhile.
+    fn follow_outlines(&mut self, ctx: &egui::Context, session: &OpenSession, feed: &PlanFeed<'_>) {
+        if let Some(task) = &self.footprint_task {
+            match task.poll() {
+                Poll::Pending => {}
+                Poll::Done(found) => {
+                    self.footprint_task = None;
+                    self.footprints.extend(found);
+                }
+                Poll::Lost => {
+                    self.footprint_task = None;
+                    tracing::warn!("Plan: the outline search stopped unexpectedly");
+                    // Not tried again before the next generation: no
+                    // outline for those still without one.
+                    for p in self.wanted_outlines(session) {
+                        let none = Outline::Read {
+                            fingerprint: None,
+                            rect: None,
+                        };
+                        self.footprints.entry(p).or_insert(none);
+                    }
+                }
+            }
+        }
+        let Some(frame) = self.layout.frame.as_ref() else {
             return;
         };
-        let key = (feed.generation, frame);
-        if self.footprint_task.is_some() || self.footprints_for.as_ref() == Some(&key) {
-            return;
-        }
-        let frame = key.1.clone();
-        self.footprints_for = Some(key);
-        if !matches!(frame, ReferenceFrame::Solved { .. }) {
+        if self.outlines_frame.as_ref() != Some(frame) {
+            // Outlines belong to one frame.
+            self.footprint_cancel.cancel();
+            self.footprint_task = None;
             self.footprints.clear();
+            self.outlines_frame = Some(frame.clone());
+            self.outlines_checked = None;
+        }
+        // A preview's rect outlines its panel while the previews are
+        // dropped and read again (after an edit).
+        for (path, p) in feed.previews {
+            let outline = Outline::Preview(p.rect);
+            if self.footprints.get(path) != Some(&outline) {
+                self.footprints.insert(path.clone(), outline);
+            }
+        }
+        if self.footprint_task.is_some() {
+            let wanted = self.wanted_outlines(session);
+            if let Ok(mut shared) = self.outlines_wanted.lock()
+                && *shared != wanted
+            {
+                *shared = wanted;
+            }
             return;
         }
-        let panels: Vec<PathBuf> = session
+        // A panel with no place at all yet (new, or the analysis that
+        // placed it is out of date).
+        let fresh = session.mosaic.config.panels.iter().any(|p| {
+            !self.layout.rects.contains_key(&p.path) && !self.footprints.contains_key(&p.path)
+        });
+        if !fresh && self.outlines_checked == Some(feed.generation) {
+            return;
+        }
+        self.outlines_checked = Some(feed.generation);
+        let wanted = self.wanted_outlines(session);
+        if wanted.is_empty() {
+            return;
+        }
+        let panels: Vec<(PathBuf, Option<Option<Fingerprint>>)> = wanted
+            .iter()
+            .map(|p| {
+                let read_at = match self.footprints.get(p) {
+                    Some(Outline::Read { fingerprint, .. }) => Some(fingerprint.clone()),
+                    _ => None,
+                };
+                (p.clone(), read_at)
+            })
+            .collect();
+        self.footprint_cancel = CancelToken::new();
+        self.outlines_wanted = Arc::new(Mutex::new(wanted));
+        let (frame, cancel) = (frame.clone(), self.footprint_cancel.clone());
+        let shared = Arc::clone(&self.outlines_wanted);
+        self.footprint_task = Task::spawn("mmm-plan-outlines", ctx, move || {
+            find_outlines(&frame, panels, &shared, &JobCtl::new(cancel, None))
+        });
+    }
+
+    /// The panels whose outline must be read from their file: those the
+    /// last analysis did not place, with no preview's outline.
+    fn wanted_outlines(&self, session: &OpenSession) -> BTreeSet<PathBuf> {
+        session
             .mosaic
             .config
             .panels
             .iter()
-            .map(|p| p.path.clone())
-            .collect();
-        self.footprint_task = Task::spawn("mmm-plan-footprints", ctx, move || {
-            load_footprints(&frame, &panels)
-        });
+            .map(|p| &p.path)
+            .filter(|p| {
+                !self.layout.rects.contains_key(*p)
+                    && !matches!(self.footprints.get(*p), Some(Outline::Preview(_)))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Compute the automatic stretch when the view's previews have changed
@@ -1276,13 +1453,14 @@ impl PlanView {
                 let path = path.clone();
                 number += 1;
                 let preview = feed.previews.get(&path);
-                // Preview, else where analysis put it, else the header
-                // footprint (solved frames); dashed until the preview.
+                // Preview, else where analysis put it, else its outline
+                // (an earlier preview's, or read from the file); dashed
+                // until the preview.
                 let known = self
                     .layout
                     .rects
                     .get(&path)
-                    .or_else(|| self.footprints.get(&path));
+                    .or_else(|| self.footprints.get(&path).and_then(Outline::rect));
                 let rect = match (preview, known) {
                     (Some(p), _) => p.rect,
                     (None, Some(r)) => *r,
@@ -1317,12 +1495,14 @@ impl PlanView {
                 } else {
                     palette::ACCENT_500
                 };
+                let highlighted = self.highlight.as_ref() == Some(&path);
                 snaps.push(ItemSnapshot {
                     path: path.clone(),
                     rect,
                     layers: drawn.iter().map(|l| (l.tint, l.additive)).collect(),
                     outline,
                     label: number.to_string(),
+                    highlighted,
                 });
                 items.push(PlacedItem {
                     id: id as u64,
@@ -1332,6 +1512,7 @@ impl PlanView {
                     label: number.to_string(),
                     marker: flag.then_some(palette::HA_500),
                     selected: self.selected.as_ref() == Some(&path),
+                    highlighted,
                 });
             }
         }
@@ -1474,6 +1655,55 @@ fn solution_text(k: SolutionKind) -> &'static str {
         SolutionKind::None => "None (registered)",
         SolutionKind::Linear => "Linear (TAN)",
         SolutionKind::Distorted => "With distortion",
+    }
+}
+
+/// Test-only record of the outline searches: how many times each panel's
+/// outline was read, and panels whose read waits for a cancel ([`hold`]).
+#[cfg(test)]
+pub(crate) mod outline_hooks {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use mmm_core::job::JobCtl;
+
+    static SCANS: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+    static HELD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    static CANCELLED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+    /// The outline of `path` is about to be read under `ctl`: counted, and
+    /// for a held panel, wait (at most [`PATIENCE`](crate::testutil::PATIENCE))
+    /// until `ctl` is cancelled, noting that it was.
+    pub(crate) fn scanning(path: &Path, ctl: &JobCtl) {
+        *SCANS.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+        if !HELD.lock().unwrap().contains(path) {
+            return;
+        }
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        while Instant::now() < deadline {
+            if ctl.check().is_err() {
+                CANCELLED.lock().unwrap().insert(path.to_path_buf());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// How many times `path`'s outline has been read.
+    pub(crate) fn scans(path: &Path) -> usize {
+        SCANS.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+
+    /// Make `path`'s outline reads wait for their search to be cancelled.
+    pub(crate) fn hold(path: &Path) {
+        HELD.lock().unwrap().insert(path.to_path_buf());
+    }
+
+    /// Whether a held read of `path` saw its search cancelled.
+    pub(crate) fn cancelled(path: &Path) -> bool {
+        CANCELLED.lock().unwrap().contains(path)
     }
 }
 

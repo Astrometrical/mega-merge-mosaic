@@ -19,7 +19,7 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, add_composition};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
-use crate::panels_tab::{group_colors, load_group_colors};
+use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{PlanFeed, group_members};
 use crate::session::OpenSession;
@@ -271,15 +271,32 @@ impl SessionWindow {
                     checks: checks.report(),
                 };
                 self.plan.show(ui, session, &feed, &self.look);
-                // A panel just selected: its details open in the inspector.
+                // The plan's selection changed (a click, Esc): a panel just
+                // selected opens its details in the inspector; the list
+                // follows (drawn already: from the next frame).
                 let selected = self.plan.selected().map(Path::to_path_buf);
-                if selected.is_some() && selected != self.selected {
-                    self.inspector.reveal(super::PANELS);
+                if selected != self.selected {
+                    match &selected {
+                        Some(p) => {
+                            self.inspector.reveal(super::PANELS);
+                            self.panels.select_only(p, self.panel_list_open);
+                        }
+                        None => self.panels.clear_selection(),
+                    }
                     ui.ctx().request_repaint();
                 }
                 self.selected = selected;
+                // The panel pointed at lights its row, from the next frame.
+                let hovered = self.plan.hovered().map(Path::to_path_buf);
+                if self.panels.set_highlight(hovered) {
+                    ui.ctx().request_repaint();
+                }
             }
             CanvasMode::Mosaic => {
+                // No plan to point at.
+                if self.panels.set_highlight(None) {
+                    ui.ctx().request_repaint();
+                }
                 // The plan's stretch holds a first merge of the view it was
                 // worked out for.
                 let same_view = self.plan.view_key().map(str::to_string)

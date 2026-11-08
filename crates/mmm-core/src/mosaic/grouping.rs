@@ -15,6 +15,70 @@ pub fn token_after(file_name: &str, keyword: &str) -> Option<String> {
     tokens.find(|t| t.eq_ignore_ascii_case(keyword))?;
     tokens.find(|t| !t.is_empty()).map(str::to_string)
 }
+/// The value after `keyword` in `path` (PixInsight WBPP's path-keyword rule,
+/// hardened). Every folder and the file stem (no extension) are split into
+/// tokens on `_`, `-`, space, `.`, `/` and `\`, dropping empty tokens. The
+/// keyword matches a whole token, case-insensitively; the value is the next
+/// token in its original case. No match, or the keyword as the last token,
+/// gives `None`. The keyword found more than once with values that differ
+/// (case-insensitively) gives `None`; the same value repeated gives the
+/// first occurrence's. [`path_keyword`] says why there is none.
+pub fn path_keyword_value(path: &Path, keyword: &str) -> Option<String> {
+    match path_keyword(path, keyword) {
+        PathKeyword::Value(v) => Some(v),
+        PathKeyword::Missing | PathKeyword::Conflicting => None,
+    }
+}
+
+/// What a path says about a keyword ([`path_keyword`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathKeyword {
+    /// The keyword's value (as [`path_keyword_value`] gives it).
+    Value(String),
+    /// The keyword is not in the path, or has no value after it.
+    Missing,
+    /// The keyword is found with values that differ.
+    Conflicting,
+}
+
+/// The value after `keyword` in `path` as [`path_keyword_value`] reads it,
+/// or why there is none: values that differ ([`PathKeyword::Conflicting`])
+/// before a keyword with no value after it ([`PathKeyword::Missing`]).
+pub fn path_keyword(path: &Path, keyword: &str) -> PathKeyword {
+    let mut text = String::new();
+    if let Some(parent) = path.parent() {
+        text.push_str(&parent.to_string_lossy());
+        text.push('/');
+    }
+    let Some(stem) = path.file_stem() else {
+        return PathKeyword::Missing;
+    };
+    text.push_str(&stem.to_string_lossy());
+    let tokens: Vec<&str> = text
+        .split(['_', '-', ' ', '.', '/', '\\'])
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut found: Option<&str> = None;
+    let mut without_value = false;
+    for (i, t) in tokens.iter().enumerate() {
+        if !t.eq_ignore_ascii_case(keyword) {
+            continue;
+        }
+        let Some(&value) = tokens.get(i + 1) else {
+            without_value = true;
+            continue;
+        };
+        match found {
+            Some(f) if !f.eq_ignore_ascii_case(value) => return PathKeyword::Conflicting,
+            Some(_) => {}
+            None => found = Some(value),
+        }
+    }
+    match found {
+        Some(v) if !without_value => PathKeyword::Value(v.to_string()),
+        _ => PathKeyword::Missing,
+    }
+}
 
 /// The value of header keyword `key` in `panel`. `FILTER` goes through
 /// [`InputPanel::filter_name`]; other keys come from the FITS keywords with
@@ -81,6 +145,8 @@ pub fn resolve_groups(cfg: &MosaicConfig, header: &dyn Fn(&Path) -> Option<Strin
                 .file_name()
                 .and_then(|f| f.to_str())
                 .and_then(|f| token_after(f, keyword)),
+            GroupRule::PathKeyword { keyword } => path_keyword_value(&p.path, keyword),
+            GroupRule::Manual => None,
         });
         match name {
             Some(n) => out.groups.entry(n).or_default().push(p.path.clone()),
@@ -197,6 +263,115 @@ mod tests {
         );
         assert_eq!(token_after("P11_filter_Ha_int.xisf", "nope"), None);
         assert_eq!(token_after("x_filter_.xisf", "filter"), None);
+    }
+
+    fn pk(p: &str, k: &str) -> Option<String> {
+        path_keyword_value(Path::new(p), k)
+    }
+
+    #[test]
+    fn path_keyword_reads_folders_and_names() {
+        assert_eq!(
+            pk("C:/data/Orion/FILTER_Ha/master.xisf", "FILTER").as_deref(),
+            Some("Ha")
+        );
+        assert_eq!(
+            pk("/d/Orion_FILTER-OIII_300s.fits", "FILTER").as_deref(),
+            Some("OIII")
+        );
+        assert_eq!(pk("/d/FILTER Ha/x.xisf", "FILTER").as_deref(), Some("Ha"));
+        assert_eq!(pk("/d/FILTER_Ha/x.xisf", "filter").as_deref(), Some("Ha"));
+        assert_eq!(
+            pk(r"C:\d\FILTER_Ha\x.xisf", "FILTER").as_deref(),
+            Some("Ha")
+        );
+    }
+
+    #[test]
+    fn path_keyword_needs_a_whole_token() {
+        assert_eq!(pk("/d/filtered_Ha.xisf", "filter"), None);
+    }
+
+    #[test]
+    fn path_keyword_refuses_conflicts() {
+        assert_eq!(pk("/d/FILTER_Ha/FILTER_OIII.xisf", "FILTER"), None);
+        assert_eq!(
+            pk("/d/FILTER_Ha/m_FILTER_ha.xisf", "FILTER").as_deref(),
+            Some("Ha")
+        );
+    }
+
+    #[test]
+    fn path_keyword_without_a_value() {
+        assert_eq!(pk("/d/Orion_FILTER.xisf", "FILTER"), None);
+    }
+
+    #[test]
+    fn path_keyword_says_why_it_has_no_value() {
+        let why = |p: &str| path_keyword(Path::new(p), "FILTER");
+        assert_eq!(why("/d/FILTER_Ha/x.xisf"), PathKeyword::Value("Ha".into()));
+        assert_eq!(why("/d/Orion/x.xisf"), PathKeyword::Missing);
+        assert_eq!(why("/d/Orion_FILTER.xisf"), PathKeyword::Missing);
+        assert_eq!(
+            why("/d/FILTER_Ha/FILTER_OIII.xisf"),
+            PathKeyword::Conflicting
+        );
+        // A conflict is a conflict even with a keyword missing its value.
+        assert_eq!(
+            why("/d/FILTER_Ha/FILTER_OIII_FILTER.xisf"),
+            PathKeyword::Conflicting
+        );
+        assert_eq!(why("/d/FILTER_Ha/x_FILTER.xisf"), PathKeyword::Missing);
+        // The value is the one path_keyword_value gives.
+        for p in [
+            "/d/FILTER_Ha/m_FILTER_ha.xisf",
+            "/d/x.xisf",
+            "/d/FILTER_Ha/FILTER_OIII.xisf",
+        ] {
+            let value = match why(p) {
+                PathKeyword::Value(v) => Some(v),
+                _ => None,
+            };
+            assert_eq!(value, pk(p, "FILTER"), "{p}");
+        }
+    }
+
+    #[test]
+    fn manual_rule_places_only_manual_groups() {
+        let mut c = cfg(&["a.xisf", "b.xisf"]);
+        c.grouping = Grouping {
+            enabled: true,
+            rule: GroupRule::Manual,
+        };
+        c.panels[0].manual_group = Some("X".into());
+        let g = resolve_groups(&c, &|_| Some("Ha".into()));
+        assert_eq!(g.groups["X"], vec![PathBuf::from("a.xisf")]);
+        assert_eq!(g.groups.len(), 1);
+        assert_eq!(g.ungrouped, vec![PathBuf::from("b.xisf")]);
+    }
+
+    #[test]
+    fn rules_round_trip_through_json() {
+        let pk = GroupRule::PathKeyword {
+            keyword: "FILTER".into(),
+        };
+        let j = serde_json::to_string(&pk).unwrap();
+        assert_eq!(j, r#"{"kind":"path_keyword","keyword":"FILTER"}"#);
+        assert_eq!(serde_json::from_str::<GroupRule>(&j).unwrap(), pk);
+        let j = serde_json::to_string(&GroupRule::Manual).unwrap();
+        assert_eq!(j, r#"{"kind":"manual"}"#);
+        assert_eq!(
+            serde_json::from_str::<GroupRule>(&j).unwrap(),
+            GroupRule::Manual
+        );
+        let old: GroupRule =
+            serde_json::from_str(r#"{"kind":"filename_token","keyword":"filter"}"#).unwrap();
+        assert_eq!(
+            old,
+            GroupRule::FilenameToken {
+                keyword: "filter".into()
+            }
+        );
     }
 
     #[test]

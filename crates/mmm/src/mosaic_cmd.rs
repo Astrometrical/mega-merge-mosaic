@@ -244,6 +244,10 @@ fn describe_grouping(g: &Grouping) -> String {
         (true, GroupRule::FilenameToken { keyword }) => {
             format!("grouped by file-name token after {keyword}")
         }
+        (true, GroupRule::PathKeyword { keyword }) => {
+            format!("grouped by path keyword {keyword}")
+        }
+        (true, GroupRule::Manual) => "grouped by hand".to_string(),
     }
 }
 

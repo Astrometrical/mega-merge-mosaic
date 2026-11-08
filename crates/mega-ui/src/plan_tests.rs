@@ -11,6 +11,8 @@ struct State {
     extent: [f64; 4],
     items: Vec<PlacedItem>,
     log: Vec<PlanResponse>,
+    /// Outlines and labels shown.
+    outlines: bool,
 }
 
 fn harness(extent: [f64; 4], items: Vec<PlacedItem>) -> Harness<'static, State> {
@@ -21,7 +23,9 @@ fn harness(extent: [f64; 4], items: Vec<PlacedItem>) -> Harness<'static, State> 
         .with_max_steps(400)
         .build_ui_state(
             |ui, s: &mut State| {
-                let r = s.canvas.show(ui, s.extent, &s.items, true, true);
+                let r = s
+                    .canvas
+                    .show(ui, s.extent, &s.items, s.outlines, s.outlines);
                 s.log.push(r);
             },
             State {
@@ -29,6 +33,7 @@ fn harness(extent: [f64; 4], items: Vec<PlacedItem>) -> Harness<'static, State> 
                 extent,
                 items,
                 log: Vec::new(),
+                outlines: true,
             },
         )
 }
@@ -42,6 +47,7 @@ fn item(id: u64, rect: [f64; 4]) -> PlacedItem {
         label: format!("{id}"),
         marker: None,
         selected: false,
+        highlighted: false,
     }
 }
 
@@ -320,4 +326,67 @@ fn set_view_for_replaces_the_fit() {
         (c.0 - 500.0).abs() < 1e-9 && (c.1 - 500.0).abs() < 1e-9,
         "{c:?}"
     );
+}
+
+/// The outline strokes painted last frame exactly on `rect` (screen), in
+/// paint order.
+fn strokes_on(h: &Harness<'_, State>, rect: Rect) -> Vec<Stroke> {
+    let near = |a: Rect| (a.min - rect.min).length() < 0.5 && (a.max - rect.max).length() < 0.5;
+    h.output()
+        .shapes
+        .iter()
+        .filter_map(|cs| match &cs.shape {
+            Shape::Rect(r) if r.stroke.width > 0.0 && near(r.rect) => Some(r.stroke),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_highlighted_item_is_outlined_under_the_selection() {
+    let (a, b, c) = (
+        [0.0, 0.0, 300.0, 300.0],
+        [350.0, 350.0, 650.0, 650.0],
+        [700.0, 700.0, 1000.0, 1000.0],
+    );
+    let mut items = vec![item(1, a), item(2, b), item(3, c)];
+    items[0].highlighted = true;
+    items[1].highlighted = true;
+    items[1].selected = true;
+    let mut h = harness([0.0, 0.0, 1000.0, 1000.0], items);
+    // Drawn whether or not outlines are shown, as the selection is.
+    h.state_mut().outlines = false;
+    h.run();
+    let screen = |h: &Harness<'_, State>, r: [f64; 4]| {
+        Rect::from_min_max(to_screen(h, (r[0], r[1])), to_screen(h, (r[2], r[3])))
+    };
+    let highlight = Stroke::new(
+        SELECTED_STROKE,
+        palette::ACCENT_400.gamma_multiply(HIGHLIGHT_STRENGTH),
+    );
+    let selection = Stroke::new(SELECTED_STROKE, palette::ACCENT_400);
+    assert_eq!(strokes_on(&h, screen(&h, a)), [highlight]);
+    // Under the selection: painted first, the selection over it.
+    assert_eq!(strokes_on(&h, screen(&h, b)), [highlight, selection]);
+    assert!(strokes_on(&h, screen(&h, c)).is_empty(), "outlines hidden");
+    // With outlines shown, the highlight stands in for the item's own.
+    let mut it = item(4, a);
+    it.layers = vec![Layer {
+        texture: h.ctx.load_texture(
+            "img",
+            ColorImage::new([2, 2], vec![Color32::WHITE; 4]),
+            egui::TextureOptions::LINEAR,
+        ),
+        tint: Color32::WHITE,
+        additive: false,
+    }];
+    it.highlighted = true;
+    h.state_mut().items = vec![it];
+    h.state_mut().outlines = true;
+    h.run();
+    assert_eq!(strokes_on(&h, screen(&h, a)), [highlight]);
+    h.state_mut().items[0].highlighted = false;
+    h.run();
+    let plain = Stroke::new(OUTLINE_STROKE, palette::ACCENT_500);
+    assert_eq!(strokes_on(&h, screen(&h, a)), [plain]);
 }

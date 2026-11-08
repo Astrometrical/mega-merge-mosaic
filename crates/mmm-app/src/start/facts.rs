@@ -12,7 +12,7 @@ use mmm_core::preview::PREVIEWS_DIR;
 use mmm_core::session_summary::{ResultState, SessionSummary, read_summary};
 
 use super::RecentEntry;
-use crate::panels_tab::load_group_colors;
+use crate::panel_edits::load_group_colors;
 use crate::session::{notes, session_name};
 
 /// Whether a recent session can be used right now.
@@ -397,10 +397,11 @@ mod tests {
         load_facts(entry)
     }
 
-    /// Poll `loader` until `n` results came, or `secs` passed.
-    fn collect(loader: &mut FactsLoader, n: usize, secs: u64) -> Vec<CardFacts> {
+    /// Poll `loader` until `n` results came (bounded by
+    /// [`PATIENCE`](crate::testutil::PATIENCE)).
+    fn collect(loader: &mut FactsLoader, n: usize) -> Vec<CardFacts> {
         let mut got = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
         while got.len() < n && std::time::Instant::now() < deadline {
             got.extend(loader.poll());
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -431,7 +432,7 @@ mod tests {
         let hero = entries[3].path.clone();
         let ctx = egui::Context::default();
         let mut loader = FactsLoader::spawn_with(entries, Some(hero.clone()), &ctx, stalling);
-        let got = collect(&mut loader, 5, 10);
+        let got = collect(&mut loader, 5);
         assert_eq!(got.len(), 5, "timed out");
         assert_eq!(got[0].path, hero);
     }
@@ -446,7 +447,7 @@ mod tests {
         let stuck = entries[0].path.clone();
         let ctx = egui::Context::default();
         let mut loader = FactsLoader::spawn_with(entries, Some(stuck.clone()), &ctx, stalling);
-        let got = collect(&mut loader, 4, 5);
+        let got = collect(&mut loader, 4);
         assert_eq!(got.len(), 4, "the others' facts arrive while one is stuck");
         assert!(got.iter().all(|f| f.path != stuck));
     }

@@ -3,6 +3,7 @@
 //! ([`Shell::close_session`]). [`Shell`] is plain egui (testable without eframe);
 //! [`MmmApp`] wraps it for eframe with persistence and the self-test.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -11,17 +12,17 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mega_ui::theme::{Tone, palette};
-use mega_ui::widgets::{Toast, Toasts};
+use mega_ui::widgets::{Toast, ToastEvent, ToastId, Toasts};
 use mmm_core::mosaic::SessionLock;
 
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::mosaic_view::MosaicView;
-use crate::panels_tab::{FilesPicker, RfdFilesPicker};
+use crate::panel_edits::{FilesPicker, RfdFilesPicker};
 use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
-use crate::session_window::{CanvasMode, SessionWindow};
+use crate::session_window::{CanvasMode, SessionWindow, Undo, WindowToast};
 use crate::start::{RecentEntry, RfdDialogs, StartAction, StartScreen, unix_now};
 use crate::summary_writer::{FinalWrite, SummaryWriter};
 use crate::util::group_names;
@@ -93,6 +94,9 @@ pub struct Shell {
     jobs: Option<JobRunner>,
     /// Job outcomes and failures to open windows.
     toasts: Toasts,
+    /// What each toast with an action undoes (dropped with the toast; the
+    /// toasts go with the session, [`Shell::drop_undos`]).
+    undos: BTreeMap<ToastId, Undo>,
     /// Every toast's title pushed, in order (tests: a toast expires).
     #[cfg(test)]
     toasted: Vec<String>,
@@ -128,6 +132,7 @@ impl Shell {
             launcher: Arc::new(ProcessLauncher),
             jobs: None,
             toasts: Toasts::default(),
+            undos: BTreeMap::new(),
             #[cfg(test)]
             toasted: Vec::new(),
             title: APP_TITLE.to_string(),
@@ -205,7 +210,8 @@ impl Shell {
     /// Otherwise every other job is cancelled (all can be run again) and
     /// waited for, at most [`STOP_WAIT`]; pending saves are flushed
     /// ([`Shell::flush_pending_saves`]); the session is dropped with its
-    /// window, pipeline, checks and summary writer; the decode cache is
+    /// window, pipeline, checks and summary writer, and its Undo toasts
+    /// are taken down; the decode cache is
     /// forgotten; the start screen reads the session's facts again; the
     /// title names no session.
     ///
@@ -269,6 +275,7 @@ impl Shell {
             reap(leftover, summary, session.lock.take(), &dir, reaped, ctx);
         }
         self.jobs = None;
+        self.drop_undos();
         drop(session);
         self.window = SessionWindow::new(self.files_picker.clone());
         self.pipeline = Pipeline::new();
@@ -280,6 +287,14 @@ impl Shell {
         self.update_title(ctx);
         ctx.request_repaint();
         Ok(())
+    }
+
+    /// Take down the toasts whose Undo would change the session being left
+    /// (or one no longer open), and forget what they undo.
+    fn drop_undos(&mut self) {
+        for id in std::mem::take(&mut self.undos).into_keys() {
+            self.toasts.dismiss(id);
+        }
     }
 
     /// Open or create a session on a background thread. With a session
@@ -316,7 +331,20 @@ impl Shell {
         }
         // Toasts float above either screen.
         let now = ctx.input(|i| i.time);
-        let _ = self.toasts.show(&ctx, now);
+        for event in self.toasts.show(&ctx, now) {
+            match event {
+                ToastEvent::Action(id) => {
+                    if let Some(undo) = self.undos.remove(&id)
+                        && let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut())
+                    {
+                        self.window.undo(undo, session, jobs);
+                    }
+                }
+                ToastEvent::Dismissed(id) => {
+                    self.undos.remove(&id);
+                }
+            }
+        }
     }
 
     /// Name the session in the window title (sent when it changes).
@@ -391,6 +419,7 @@ impl Shell {
         self.summary = SummaryWriter::new(opened.summary.clone());
         self.session = Some(opened);
         self.jobs = Some(JobRunner::new(ctx.clone()));
+        self.drop_undos();
         // A session without panels opens on its panel list.
         self.window = SessionWindow::new(self.files_picker.clone());
         self.pipeline = Pipeline::new();
@@ -473,6 +502,16 @@ impl Shell {
                 self.toasted.push(message.clone());
                 self.toasts
                     .push(toast(Tone::Problem, message), ctx.input(|i| i.time));
+            }
+        }
+        let now = ctx.input(|i| i.time);
+        for WindowToast { toast, undo } in out.toasts {
+            let has_action = toast.action.is_some();
+            #[cfg(test)]
+            self.toasted.push(toast.title.clone());
+            let id = self.toasts.push(toast, now);
+            if let (true, Some(undo)) = (has_action, undo) {
+                self.undos.insert(id, undo);
             }
         }
         if out.back
@@ -1318,10 +1357,12 @@ mod tests {
         assert!(h.state().window().panel_list_open);
         h.get_by_label("Ha_0.xisf");
         let deadline = Instant::now() + crate::testutil::PATIENCE;
-        while h.query_by_label("OIII").is_none() {
-            assert!(Instant::now() < deadline, "no OIII column");
+        // The OIII section's heading reads like its chip in the view bar.
+        while h.query_all_by_label("OIII · 4").count() < 2 {
+            assert!(Instant::now() < deadline, "no OIII section");
             h.step();
         }
+        h.get_by_label("OIII_0.xisf");
         let actions: Vec<_> = h
             .state()
             .session()
@@ -1511,6 +1552,88 @@ mod tests {
     }
 
     #[test]
+    fn an_undo_toast_restores_the_edit() {
+        use crate::panel_edits::{Applied, PanelsEdit};
+        use mmm_core::mosaic::MosaicConfig;
+        let root = temp_dir("shell-undo");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| {
+            s.session().unwrap().mosaic.config.group_dirs.len() == 2
+                && !s.jobs.as_ref().unwrap().busy()
+        });
+        h.run_steps(2);
+        let on_disk = |dir: &Path| MosaicConfig::load(dir).unwrap().panels.len();
+        let previous = PanelsEdit::of(h.state().session().unwrap());
+        assert_eq!(previous.panels.len(), 8);
+        // Remove two panels, and offer to put them back.
+        let mut fewer = previous.clone();
+        let removed: Vec<_> = fewer
+            .panels
+            .drain(6..)
+            .enumerate()
+            .map(|(i, p)| (6 + i, p))
+            .collect();
+        {
+            let shell = h.state_mut();
+            let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
+            assert!(matches!(fewer.apply(session, jobs), Applied::Done));
+            shell.window.push_toast(WindowToast {
+                toast: Toast {
+                    tone: Tone::Neutral,
+                    title: "Removed 2 panels".into(),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::Readd(removed)),
+            });
+        }
+        assert_eq!(on_disk(&dir), 6);
+        h.run_steps(2);
+        h.get_by_label("Removed 2 panels");
+        assert_eq!(h.state().undos.len(), 1);
+        h.get_by_label("Undo").click();
+        step_until(&mut h, |_| on_disk(&dir) == 8);
+        assert_eq!(MosaicConfig::load(&dir).unwrap().panels, previous.panels);
+        assert!(h.state().undos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn leaving_takes_down_the_undo_toasts() {
+        let root = temp_dir("shell-undo-leave");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        let panel = h.state().session().unwrap().mosaic.config.panels[7].clone();
+        let removed = vec![(7, panel)];
+        h.state_mut().window.push_toast(WindowToast {
+            toast: Toast {
+                tone: Tone::Neutral,
+                title: "Removed 1 panel".into(),
+                detail: None,
+                action: Some("Undo".into()),
+            },
+            undo: Some(Undo::Readd(removed)),
+        });
+        h.run_steps(2);
+        h.get_by_label("Removed 1 panel");
+        // Its Undo would change a session no longer open: it goes too.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, BACK)
+            .click();
+        h.step();
+        assert!(h.state().session().is_none());
+        h.run_steps(2);
+        assert!(h.query_by_label("Removed 1 panel").is_none());
+        assert!(h.query_by_label("Undo").is_none());
+        assert!(h.state().undos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn back_cancels_running_work_and_releases_the_lock() {
         use mmm_core::mosaic::{CONFIG_FILE, MosaicConfig, lock_session};
         use mmm_core::session_summary::SUMMARY_FILE;
@@ -1661,7 +1784,7 @@ mod tests {
     fn watchdog_fires_after_deadline() {
         let ctx = egui::Context::default();
         let fired = selftest_watchdog(&ctx, std::time::Duration::from_millis(10), None);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
         while !fired.load(std::sync::atomic::Ordering::SeqCst) {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));

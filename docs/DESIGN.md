@@ -1003,8 +1003,12 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   converter pool; the UI thread uploads at most 32 textures a frame. The
   canvas extent is the frame canvas (read on a worker), so arriving previews
   never reset the zoom; a panel without a preview yet is a dashed outline at
-  its analysed bbox or, in a solved frame, at its header-only WCS footprint
-  (`preview::footprint`, found on a worker once per previews generation).
+  its analysed bbox or, failing that, at its outline (`plan_view::Outline`):
+  an earlier preview's rect, or read from the file on a worker — the
+  header-only WCS footprint in a solved frame (`preview::footprint`), a
+  strided covered-area scan in an aligned one (`preview::aligned_bbox`).
+  Outlines are kept per frame across input edits (keyed by path and file
+  fingerprint; see "Plan (additions)" below).
   Textures are dropped after the plan has been hidden 5 s and rebuilt on
   return. Composites draw each channel's group as additive layers tinted pure
   R, G or B × weight; overlaps within one group add up (a known limitation).
@@ -1051,9 +1055,12 @@ views and export. No algorithm changed. Core additions are bookkeeping
   WCS warp. The reference frame is always re-derived header-only on a preview
   run (cheap) and saved atomically, only when it changed and the full panel
   set was used, to **`previews/frame.mmm-frame.json`** (each cached preview's
-  header also records its frame), so previews never see a stale frame. `preview::footprint` gives
-  a solved panel's outline from its header alone (aligned gives `None`), so
-  Plan shows dashed outlines of 100+ panels before any preview exists.
+  header also records its frame), so previews never see a stale frame.
+  `preview::footprint` gives a solved panel's outline from its header alone
+  (aligned gives `None`) and `preview::aligned_bbox` an aligned panel's from
+  a strided scan of channel 0 (every 18th row of a 9255 × 18310 panel, about
+  37 MB), so Plan shows dashed outlines of 100+ panels before any preview
+  exists.
   Compressed XISF and FITS panels are decoded once into `<session>/decoded`
   (the app points the decode cache there), which analysis reuses. Per-panel
   failures are logged; the run still finishes.
@@ -1092,11 +1099,97 @@ views and export. No algorithm changed. Core additions are bookkeeping
   when groups or panels change and after any pipeline job ends; the Checks step and the
   inspector's Problems section show problems, notes and passed. Accepting a check adds its keys to
   `accepted_checks` in `mosaic.json`; accepted problems stop counting.
-- **Panel list** (`panels_tab.rs`, opened from the Panels step). Add files (picker, drag and drop, or a typed path with one
-  `*` in the file name; duplicates ignored), per-panel cards, Remove, and
-  grouping. Grouping is **off by default** (plain grid); turning it on shows
-  the header-key rule and one column per group, with **No group** first and an
-  "N to sort" header; Move to places a panel manually or lets the rule decide.
+- **Panel list** (`panel_list.rs`, edits in `panel_edits.rs`; opened from
+  the Panels step, a resizable column left of the canvas). A sectioned
+  table (`mega_ui::table`): PANEL, FILTER, INTEGRATION, SCALE, SIZE from
+  one header read per panel (`read_panel_header`, cached by path and
+  fingerprint on a worker; a reader that panics makes its row "Unreadable"
+  and the rest still group, and a resolution that stops unexpectedly is
+  tried again for the same inputs after 2 s, doubling up to a minute, never
+  every frame); with grouping on, **No group** first (its heading says why:
+  "FILTER missing", "no FILTER in the path", "no single FILTER value in the
+  path") then a rolled-up section per group ("Ha · 12 · 38h 20m", "1 fewer
+  than Ha"). While a new rule resolves, rows stay where the last rule put
+  them (the flat list when grouping was just turned on) instead of all
+  dropping into No group.
+  **Sorting** (spec §10.2): column headings are buttons; a click sorts the
+  rows within each section by that column (`TableState::sort`, kept while
+  the session is open; sections keep their order), a second click the other
+  way, and the sorted heading shows a chevron (up: smallest first) and its
+  accessible sort direction. Numbers compare as numbers (`Row::sort_keys`:
+  integration in seconds, scale in arcseconds, size in pixels), text
+  case-insensitively, unknown cells ("—", "Reading…", "Unreadable") last
+  either way; ties keep the configuration order, which is the order until a
+  heading is clicked. A rolled-up section shows the first rows of the
+  sorted order (plus its problem rows); Shift ranges, reveal and drags
+  follow the sorted order. Headings keep room for the arrow, so sorting
+  moves no column.
+  Rows select with click, Shift-click (the rows on screen) and
+  Ctrl/Cmd-click; folding a section deselects its rows (Delete and Move to
+  act only on what shows). The actions menu (on the selection when the row
+  is selected) has **Move to** (each group, **New group…** named in the
+  menu and made of the panels moved, **No group**, **Let the rule decide**)
+  and **Remove**; rows also drag onto a section heading. A panel moved by
+  hand (`manual_group`) is tagged "by hand" and keeps its FILTER cell.
+  Remove and Delete (Backspace on macOS) on the selection offer Undo in a
+  toast. Rows and the plan are linked (spec §7.4): hovering either lights
+  the other (`PlacedItem::highlighted`, `Row::highlighted`; only panels the
+  plan's view shows), a row click selects the panel on the plan (the
+  inspector shows it), first switching the plan to the panel's group when
+  its view does not have it, and a plan click selects and reveals its row
+  (`TableState::reveal`); Esc clears both. Columns hide from the right as
+  the list narrows (the first column elides, the actions stay pinned);
+  unknown cells show "—", "Reading…" or "Unreadable". Row ids are stable
+  (path based), so selection, folds and hover survive a re-sort or
+  regroup. Panels are added by **Add files…**, **Add folder…** (top-level
+  files only), dropped files and folders, or More → Type a path… (one `*`
+  in the file name); duplicates are ignored, and an add that adds nothing
+  says why in one toast ("Couldn't read {folder}", "No panels at the top
+  level of {folder}", "Already in the session", "Only XISF and FITS panel
+  files can be added"). The empty list reads "No panels yet: add files or
+  folders, or drop them anywhere on the window."
+  **Undo toasts** travel from the window to the shell
+  (`SessionOutput.toasts`, the `Undo` enum, `SessionWindow::undo`) and are
+  taken down (`Toasts::dismiss`) when the session closes or another opens.
+  The removal Undo (`Undo::Readd`) puts the removed panels back at their
+  old indices into the inputs as they are now (keeping later edits; one
+  already back is left alone); the grouping Undo (`Undo::Grouping`)
+  restores only the grouping, and is a no-op once the user has chosen
+  another rule.
+  **Group by** chooses Don't group, FILTER header, Header keyword…, Path
+  keyword… or By hand (`GroupRule::{Header, PathKeyword, Manual}`; the
+  legacy `FilenameToken` is shown as Path keyword… until edited).
+  Re-picking the shown choice changes nothing, nor does a header key or
+  path keyword that differs only in case (e.g. a legacy
+  `Header { key: "filter" }` picked as Header keyword… or typed "FILTER"):
+  it groups alike and the edit would only throw the analysis away. **Path
+  keyword** is WBPP-style: the whole path is split on `_ - space . / \`,
+  the keyword matches a whole token case-insensitively and the next token
+  is the value; conflicting values in one path mean no group
+  (`grouping::path_keyword` says why: `Missing` or `Conflicting`;
+  `path_keyword_value` is its value). **By hand** groups only what the user
+  moves. **Automatic FILTER grouping** happens once: with at least two
+  FILTER values, grouping off and no earlier choice (an accepted
+  FiltersDifferUngrouped note, or a disabled non-default rule, counts as a
+  choice; a session opened with analysis results is skipped until its
+  panels change) it groups by FILTER and toasts "Grouped by FILTER: {k}
+  filters" with Undo.
+  `mmm_core::panel_header::read_panel_header` opens a panel once for the
+  filter, exposure (EXPTIME/EXPOSURE), NCOMBINE and integration (exposure
+  times frames).
+  **Early outlines.** An aligned panel, until its preview arrives, gets its
+  outline on the plan from `preview::aligned_bbox` (a solved one from
+  `preview::footprint`). The plan keeps outlines per frame across input
+  edits (`plan_view::Outline`, keyed by path and file fingerprint): an
+  arrived preview's rect is kept as its panel's outline while an edit drops
+  and reloads the previews; only a panel with no analysed rect, no preview
+  and no outline is read, and those read before are checked again by
+  fingerprint once per previews generation (a changed file is read again),
+  so a regroup or move reads nothing. The running search passes over panels
+  placed meanwhile (`plan_view::find_outlines`); a new frame drops every
+  outline; and dropping the `PlanView` (leaving the session) cancels the
+  search, so it never reads panels (or holds the decode lock) for the next
+  session.
   Group colours are stable and persisted in `ui.group_colors`: well-known
   filters get physical colours (Ha red, OIII cyan, SII orange-red `#E0703A`,
   R/G/B, L white), other names take the first unused entry after the six
@@ -1197,10 +1290,10 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   window opens on the mosaic once something is merged, else on the plan;
   Mosaic cannot be chosen before something is merged or a merge has
   started. `MosaicView::poll` runs
-  every frame whether or not the mosaic is drawn. The panel list (still the
-  old `PanelsTab` UI) replaces the canvas, view bar included, while open; a
-  session without panels opens on it, and files dropped on the window are
-  added whatever shows.
+  every frame whether or not the mosaic is drawn. The panel list sits in a
+  resizable column left of the canvas while open (view bar and canvas stay
+  beside it; switching plan/mosaic leaves it open); a session without panels
+  opens on it, and files dropped on the window are added whatever shows.
 - **View bar.** Plan / Mosaic, a chip per group and per composite and **+**
   (with two or more groups), and the Outlines, ROIs, Linked and Strong
   toggles. It wraps when the window is narrow.
@@ -1229,7 +1322,11 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   back to the start screen).
 - **Shortcuts.** `I` inspector, `M` plan/mosaic, `[` and `]` previous and next
   view, `O` outlines, `R` ROIs, `L` Linked, `S` Strong, `Ctrl/Cmd+Enter` the
-  main button; each is named in its tooltip, and none acts while a text field
+  main button; each is named in its tooltip. `Delete` (also `Backspace` on
+  macOS) removes the panels selected in the open panel list, and `Esc`
+  clears the selection (unless it closes a menu or leaves a text field: egui
+  lets go of the field before the shortcuts run, so the window remembers
+  whether one had the keyboard last frame). None acts while a text field
   has the keyboard (`Context::text_edit_focused`; a button or chip focused
   by keyboard navigation does not stop them) or the Export dialog is open.
 - **Back to start** (`Shell::close_session`). Cancels the running jobs and
@@ -1241,18 +1338,18 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   session lock until the abandoned workers have ended, so another window or
   the CLI never opens a session that is still being written.
 - **Toasts** (`mega_ui::widgets::Toasts`) replace the notices: a merge or an
-  export that ended, a failure. Never modal.
+  export that ended, a failure. Never modal. A toast whose Undo would
+  change the session is taken down when the session closes or another
+  opens (`Toasts::dismiss`).
 
 ## Coming in project 3
 
-Plans 2–6 of project 3 change the session window as follows; none of it is
-built yet.
+Plan 2 (the panel list and grouping, above) is built. Plans 3–6 of project
+3 change the session window as follows; none of it is built yet.
 
-- **Plan 2, panel list and grouping.** The panel list sits beside the plan
-  instead of replacing the canvas, with sections, **Group by** and WBPP
-  keywords.
 - **Plan 3, draft merge settings.** Settings become drafts, with per-group
-  staleness (which groups are out of date, not just the mosaic).
+  staleness (which groups are out of date, not just the mosaic), including
+  on adding or removing panels.
 - **Plan 4, ROIs.** An ROI list with transient previews, drawing an ROI on the
   plan, and the Draw ROI shortcut.
 - **Plan 5, composites and export.** A composites popover and the new Export
@@ -1289,11 +1386,27 @@ stays free of `mmm-core`.
   measures one row, and the strip wraps when it does not fit), `chip`,
   `status`, `overline`,
   `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
-  `Toasts` (the only notifications; never modal), plus the restyled
+  `submenu` (a menu entry with an icon-font chevron, staying open for a
+  text field inside),
+  `Toasts` (the only notifications; never modal; `Toasts::dismiss` takes
+  one down whose action no longer means anything), plus the restyled
   `checks::checks_list` and `jobs::job_panel`, `groups` (the group palette,
   whose order is frozen because sessions store its indices) and `brand`
   (the lockup; app names are images pre-rendered from Angora by
   `assets/brand/make-name.sh`).
+- **Table** (`mega_ui::table::sectioned_table`, `TableState`): sections with
+  a fold and a roll-up row ("… N more"; problem rows always shown), tags,
+  selection and highlight fills, "⋯" row actions (`icons::ELLIPSIS`), rows
+  that drag onto headings, columns that hide from the right and a first
+  column that elides when narrow, actions pinned; `TableState::reveal`
+  scrolls to a row. Column headings are buttons that sort the rows within
+  each section (`TableState::sort`, `Sort`; `Row::sort_keys` with
+  `SortKey::{Number, Text, Unknown}`, a cell's text by default, "—" and
+  empty cells unknown and last), a second click reversing, the sorted one
+  marked with a chevron (`icons::CHEVRON_UP` / `CHEVRON_DOWN`) and its
+  accessible sort direction; roll-up shows the first rows of the sorted
+  order. The gallery shows its table sorted by integration. Layout tokens `PANEL_LIST_MIN_WIDTH` and
+  `CANVAS_MIN_WIDTH`; `PlacedItem.highlighted` lights a tile-viewer item.
 - **Gallery**: `cargo run -p mega-ui --example gallery` shows every token and
   component; `crates/mega-ui/tests/snapshots.rs` keeps image snapshots of it
   (ignored by default, see CLAUDE.md).

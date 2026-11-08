@@ -182,6 +182,29 @@ impl BlockRow {
     }
 }
 
+/// Row stride of the covered-area scan: about half the block size a
+/// full-canvas bbox would need at `max_side`.
+fn bbox_stride(w: u64, h: u64, max_side: u64) -> u64 {
+    (w.max(h).div_ceil(max_side) / 2).max(1)
+}
+
+/// The area `[x0, y0, x1, y1]` (canvas pixels, exclusive end) an aligned
+/// full-canvas panel covers, from a cheap strided scan of channel 0 (the
+/// scan [`build_preview`] does first, at [`PREVIEW_MAX_SIDE`]); `None` when
+/// the panel has no covered pixels. Blocking: reads about every
+/// stride-th row. Cancellable through `ctl`.
+pub fn aligned_bbox(path: &Path, ctl: &JobCtl) -> Result<Option<[f64; 4]>> {
+    let reader = PanelReader::open_file(path)?;
+    let (w, h, _) = reader.canvas();
+    reader.advise_sequential();
+    let stride = bbox_stride(w, h, u64::from(PREVIEW_MAX_SIDE));
+    let bb = covered_bbox(&reader, path, stride, ctl)?;
+    if let Some(e) = reader.backing_error() {
+        return Err(e);
+    }
+    Ok(bb.map(|[x0, y0, x1, y1]| [x0 as f64, y0 as f64, x1 as f64, y1 as f64]))
+}
+
 /// Aligned full-canvas panel: covered bbox (channel 0, streamed), then a
 /// block mean of the covered pixels inside it.
 fn aligned_preview(
@@ -206,7 +229,7 @@ fn aligned_preview(
     // Pass 1: the bbox of covered channel-0 samples (a superset of the
     // covered pixels), sampling rows at about half the block size a
     // full-canvas bbox would need.
-    let stride = (w.max(h).div_ceil(max_side) / 2).max(1);
+    let stride = bbox_stride(w, h, max_side);
     let Some([x0, y0, x1, y1]) = covered_bbox(&reader, path, stride, ctl)? else {
         return Err(Error::format(path, "panel has no covered pixels"));
     };
@@ -1320,6 +1343,28 @@ mod tests {
                 );
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn aligned_bbox_finds_the_covered_area() {
+        let dir = tmp("aligned-bbox");
+        let (w, h) = (400u64, 300u64);
+        let mut p = vec![0f32; (w * h) as usize];
+        for y in 60..210u64 {
+            for x in 33..251u64 {
+                p[(y * w + x) as usize] = 0.4;
+            }
+        }
+        let path = dir.join("a.xisf");
+        write_xisf(&path, w, h, 1, &p).unwrap();
+        let b = aligned_bbox(&path, &JobCtl::none()).unwrap().unwrap();
+        for (got, want) in b.iter().zip([33.0, 60.0, 251.0, 210.0]) {
+            assert!((got - want).abs() <= 1.0, "{b:?}");
+        }
+        let empty = dir.join("e.xisf");
+        write_xisf(&empty, w, h, 1, &vec![0f32; (w * h) as usize]).unwrap();
+        assert_eq!(aligned_bbox(&empty, &JobCtl::none()).unwrap(), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

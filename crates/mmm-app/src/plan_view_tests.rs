@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui_kittest::Harness;
@@ -169,7 +169,7 @@ fn assert_painted_with(h: &Harness<'_, State>, cam: Camera) {
 
 /// Step until `done` holds, stopping at the frame that made it so.
 fn step_to(h: &mut Harness<'_, State>, done: impl Fn(&State) -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
     while !done(h.state()) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -397,6 +397,51 @@ fn plan_draws_partial_previews() {
 }
 
 #[test]
+fn a_highlight_lights_its_panel_and_the_pointer_names_one() {
+    let (root, s, _r) = analyzed("plan-highlight");
+    let ha = panels(&s, "Ha");
+    let oiii = panels(&s, "OIII");
+    let mut h = harness(s);
+    step_until(&mut h, |s| s.view.items().len() == 4);
+    let lit = |h: &Harness<'_, State>| -> Vec<PathBuf> {
+        let items = h.state().view.items();
+        items
+            .iter()
+            .filter(|i| i.highlighted)
+            .map(|i| i.path.clone())
+            .collect()
+    };
+    assert!(lit(&h).is_empty());
+    h.state_mut().view.set_highlight(Some(ha[1].clone()));
+    h.step();
+    assert_eq!(lit(&h), [ha[1].clone()]);
+    // A panel the view does not show lights nothing.
+    h.state_mut().view.set_highlight(Some(oiii[0].clone()));
+    h.step();
+    assert!(lit(&h).is_empty());
+    h.state_mut().view.set_highlight(None);
+    // The panel under the pointer.
+    let it = h
+        .state()
+        .view
+        .items()
+        .iter()
+        .find(|i| i.path == ha[2])
+        .unwrap()
+        .rect;
+    let centre = ((it[0] + it[2]) / 2.0, (it[1] + it[3]) / 2.0);
+    let p = h.state().view.to_screen(centre).unwrap();
+    h.hover_at(p);
+    h.step();
+    assert_eq!(h.state().view.hovered(), Some(ha[2].as_path()));
+    // Off the canvas (over the details): none.
+    h.hover_at(egui::pos2(1190.0, 790.0));
+    h.step();
+    assert_eq!(h.state().view.hovered(), None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn composition_view_uses_additive_layers() {
     let (root, mut s, _r) = analyzed("plan-composition");
     let mut hoo = Composition::new("HOO");
@@ -604,6 +649,172 @@ fn plan_places_solved_panels_before_previews() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The aligned canvas of [`aligned_session`].
+const ALIGNED_CANVAS: (u64, u64) = (400, 300);
+
+/// A session in `root` of aligned full-canvas panels, one covering each of
+/// `rects` (`[x0, y0, x1, y1]`), its previews' frame saved (nothing
+/// analysed): the session, the panels and the frame.
+fn aligned_session(root: &Path, rects: &[[u64; 4]]) -> (OpenSession, Vec<PathBuf>, ReferenceFrame) {
+    use mmm_core::synth::write_xisf;
+    let (w, h) = ALIGNED_CANVAS;
+    let paths: Vec<PathBuf> = rects
+        .iter()
+        .enumerate()
+        .map(|(k, r)| {
+            let path = root.join(format!("al_{k}.xisf"));
+            let mut p = vec![0f32; (w * h) as usize];
+            for y in r[1]..r[3] {
+                for x in r[0]..r[2] {
+                    p[(y * w + x) as usize] = 0.3;
+                }
+            }
+            write_xisf(&path, w, h, 1, &p).unwrap();
+            path
+        })
+        .collect();
+    let cfg = mmm_core::mosaic::MosaicConfig::new(paths.clone());
+    let input = cfg.analyze.input;
+    let mosaic = mmm_core::mosaic::Mosaic::create(&root.join("s.mmm-session"), cfg).unwrap();
+    let frame = mmm_core::reference::derive(&paths, input).unwrap();
+    assert!(matches!(frame, ReferenceFrame::Aligned { .. }));
+    frame
+        .save(&mmm_core::preview::preview_frame_path(&mosaic.dir))
+        .unwrap();
+    (crate::testutil::open(mosaic), paths, frame)
+}
+
+/// The rect of `path`'s item, as last drawn.
+fn item_rect(s: &State, path: &Path) -> Option<[f64; 4]> {
+    s.view
+        .items()
+        .iter()
+        .find(|i| i.path == path)
+        .map(|i| i.rect)
+}
+
+#[test]
+fn aligned_panels_get_outlines_before_previews() {
+    let root = temp_dir("plan-aligned");
+    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260]];
+    let (s, paths, _) = aligned_session(&root, &rects);
+    let mut h = harness(s);
+    step_until(&mut h, |s| s.view.items().len() == 2);
+    assert_eq!(h.state().view.unplaced(), 0);
+    for it in h.state().view.items() {
+        assert!(it.layers.is_empty());
+        let k = paths.iter().position(|p| *p == it.path).unwrap();
+        for (g, want) in it.rect.iter().zip(rects[k]) {
+            assert!((g - want as f64).abs() <= 1.0, "{:?}", it.rect);
+        }
+    }
+    assert!(dashes(&h) > 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// No outline search runs, and the last one was started for the feed's
+/// previews generation.
+fn outlines_settled(s: &State) -> bool {
+    s.view.footprint_task.is_none() && s.view.outlines_checked == Some(s.generation)
+}
+
+/// How many times each of `paths` has had its outline read.
+fn scan_counts(paths: &[PathBuf]) -> Vec<usize> {
+    paths
+        .iter()
+        .map(|p| super::outline_hooks::scans(p))
+        .collect()
+}
+
+#[test]
+fn aligned_outlines_are_scanned_once() {
+    use super::outline_hooks::scans;
+    let root = temp_dir("plan-aligned-once");
+    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260], [0, 0, 90, 90]];
+    let (s, paths, frame) = aligned_session(&root, &rects);
+    // The third panel's preview is in already: no scan for it.
+    let mut state = State::new(s);
+    state.previews = previews_in(&frame, &paths[2..]);
+    let mut h = harness_of(state);
+    step_until(&mut h, |s| s.view.items().len() == 3 && outlines_settled(s));
+    assert_eq!(scan_counts(&paths), [1, 1, 0]);
+    // Edits of the inputs (a regroup, a move): the previews generation
+    // goes up and the previews are dropped; the outlines stay, nothing is
+    // read again, and the third panel keeps its preview's outline.
+    for _ in 0..3 {
+        let s = h.state_mut();
+        s.generation += 1;
+        s.previews.clear();
+        step_until(&mut h, outlines_settled);
+        assert_eq!(h.state().view.unplaced(), 0);
+        assert_eq!(h.state().view.items().len(), 3);
+    }
+    assert_eq!(scan_counts(&paths), [1, 1, 0]);
+    let third = item_rect(h.state(), &paths[2]).unwrap();
+    assert!((third[2] - 90.0).abs() <= 1.0, "{third:?}");
+    // A panel added: only it is read.
+    let extra = root.join("al_extra.xisf");
+    std::fs::copy(&paths[0], &extra).unwrap();
+    {
+        let s = h.state_mut();
+        let entry = mmm_core::mosaic::PanelEntry {
+            path: extra.clone(),
+            fingerprint: None,
+            manual_group: None,
+        };
+        s.session.mosaic.config.panels.push(entry);
+        s.session.groups = s.session.mosaic.groups().ok();
+        s.generation += 1;
+    }
+    step_until(&mut h, |s| s.view.items().len() == 4 && outlines_settled(s));
+    assert_eq!(scans(&extra), 1);
+    assert_eq!(scan_counts(&paths), [1, 1, 0]);
+    // The frame moves: every outline not placed otherwise is found again
+    // in it.
+    let (w, ht) = ALIGNED_CANVAS;
+    let moved = ReferenceFrame::Aligned {
+        width: w,
+        height: ht + 10,
+        wcs: None,
+    };
+    {
+        let s = h.state_mut();
+        let file = mmm_core::preview::preview_frame_path(&s.session.mosaic.dir);
+        moved.save(&file).unwrap();
+        s.generation += 1;
+    }
+    step_until(&mut h, |s| {
+        s.view.frame_canvas() == Some((w, ht + 10)) && outlines_settled(s) && scans(&extra) == 2
+    });
+    assert_eq!(scan_counts(&paths), [2, 2, 1]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropping_the_plan_cancels_its_outline_search() {
+    use super::outline_hooks::{cancelled, hold, scans};
+    let root = temp_dir("plan-aligned-drop");
+    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260]];
+    let (s, paths, _) = aligned_session(&root, &rects);
+    // Its scan waits for a cancel once started.
+    hold(&paths[0]);
+    let mut h = harness(s);
+    step_until(&mut h, |_| scans(&paths[0]) == 1);
+    assert!(!cancelled(&paths[0]));
+    // Leaving the session drops the plan: its search stops.
+    drop(h);
+    let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
+    while !cancelled(&paths[0]) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the outline search outlived its plan"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn linked_auto_stretch_ignores_empty_channels() {
     let p = Arc::new(Preview {
@@ -675,7 +886,7 @@ fn converter_drops_superseded_epochs() {
     while done.len() < jobs {
         let (e, _, _) = conv
             .rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(crate::testutil::PATIENCE)
             .expect("conversions finish");
         done.push(e);
     }

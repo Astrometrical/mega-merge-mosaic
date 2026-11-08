@@ -2,6 +2,7 @@
 
 pub mod button;
 pub mod chip;
+pub mod menu;
 pub mod notes;
 pub mod progress;
 pub mod property;
@@ -14,6 +15,7 @@ pub mod toast;
 
 pub use button::{ButtonKind, MegaButton, focus_ring, icon_button, icon_button_of};
 pub use chip::{CHIP_MAX_WIDTH, ChoiceChip, chip, choice_chip};
+pub use menu::submenu;
 pub use notes::{NOTES_LINES, NotesMode, NotesResponse, notes_view};
 pub use progress::{progress, progress_bar};
 pub use property::{property_grid, property_row, property_row_numeric, property_row_ui};

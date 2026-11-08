@@ -1,6 +1,7 @@
 //! Toasts: the only way the apps notify. Non-modal, bottom-right, at most
 //! [`MAX_TOASTS`] at once, each gone after [`TOAST_LIFETIME_S`] (paused
-//! while hovered) or when its action is clicked.
+//! while hovered), when its action is clicked, or when the app takes it
+//! down ([`Toasts::dismiss`]).
 
 use std::time::Duration;
 
@@ -45,7 +46,8 @@ pub struct Toast {
 pub enum ToastEvent {
     /// Its action was clicked (it is also dismissed).
     Action(ToastId),
-    /// It expired or was pushed out by newer toasts.
+    /// It expired, was pushed out by newer toasts, or was taken down
+    /// ([`Toasts::dismiss`]).
     Dismissed(ToastId),
 }
 
@@ -86,6 +88,19 @@ impl Toasts {
             self.pending.push(ToastEvent::Dismissed(gone.id));
         }
         id
+    }
+
+    /// Take toast `id` down now (its action no longer means anything, e.g.
+    /// what it would undo is gone), reported as [`ToastEvent::Dismissed`]
+    /// by the next [`Toasts::show`]. Whether it was up.
+    pub fn dismiss(&mut self, id: ToastId) -> bool {
+        let before = self.live.len();
+        self.live.retain(|t| t.id != id);
+        let up = self.live.len() < before;
+        if up {
+            self.pending.push(ToastEvent::Dismissed(id));
+        }
+        up
     }
 
     /// Draw the toasts at time `now` and return what happened since the

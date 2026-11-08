@@ -85,7 +85,9 @@ impl Mosaic {
             GroupRule::Header { key } => InputPanel::open(p)
                 .ok()
                 .and_then(|panel| header_value(&panel, key)),
-            GroupRule::FilenameToken { .. } => None,
+            GroupRule::FilenameToken { .. } | GroupRule::PathKeyword { .. } | GroupRule::Manual => {
+                None
+            }
         };
         Ok(resolve_groups(&self.config, &header))
     }

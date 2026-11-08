@@ -10,13 +10,17 @@
 //! | `L` | **Linked** (not for a mono view) | the toggle |
 //! | `S` | **Strong** | the toggle |
 //! | `Ctrl+Enter` (`Cmd+Enter` on macOS) | **Merge**, while the main button offers it | the main button |
+//! | `Delete` (and `Backspace` on macOS) | remove the selected panels (a toast offers Undo), while the panel list is open | the row menu's **Remove** |
+//! | `Esc` | clear the selection, in the panel list and on the plan | |
 //!
-//! The letters and brackets count with no modifier held. None acts while a
-//! text field has the keyboard (notes, names, a path) or the Export dialog
-//! is open; a focused button or chip (keyboard navigation) does not stop
-//! them. The canvas's own (`M`, the brackets and the
-//! toggles) act only while the canvas shows, not the panel list. A key that
-//! is a shortcut is consumed, so no widget sees it too.
+//! The letters, brackets and Delete count with no modifier held. None acts
+//! while a text field has the keyboard (notes, names, a path) or the Export
+//! dialog is open; a focused button or chip (keyboard navigation) does not
+//! stop them. The canvas always shows (the panel list sits beside it), so
+//! the canvas's own (`M`, the brackets and the toggles) act with the list
+//! open too. A key that is a shortcut is consumed, so no widget sees it
+//! too, except Esc: an Esc that closes a menu or leaves a text field does
+//! only that, keeping the selection.
 
 use egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -46,6 +50,12 @@ pub(super) const LINKED: Key = Key::L;
 pub(super) const STRONG: Key = Key::S;
 /// Merges, as the main button does.
 pub(super) const MERGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
+/// Removes the panels selected in the panel list.
+pub(super) const REMOVE: Key = Key::Delete;
+/// Removes them too on macOS, whose keyboards label Backspace "delete".
+pub(super) const REMOVE_MAC: Key = Key::Backspace;
+/// Clears the selection.
+pub(super) const CLEAR: Key = Key::Escape;
 
 /// `text` naming its shortcut `key`: "Outlines (O)".
 pub(super) fn keyed(text: &str, key: Key) -> String {
@@ -77,14 +87,27 @@ impl SessionWindow {
         let pressed = |key: Key| {
             ctx.input_mut(|i| i.modifiers.is_none() && i.consume_key(Modifiers::NONE, key))
         };
+        if self.panel_list_open {
+            // Both keys are checked (and consumed) whatever the other did.
+            let delete = pressed(REMOVE);
+            let backspace = cfg!(target_os = "macos") && pressed(REMOVE_MAC);
+            if delete || backspace {
+                let removed = self.panels.remove_selection(session, jobs);
+                self.panels_removed(&removed);
+            }
+        }
+        // Not consumed: an open menu closes on it (and the selection
+        // stays), as does a text field it leaves (egui has let go of the
+        // field already: hence what the last frame ended with).
+        let escape = ctx.input(|i| i.key_pressed(CLEAR));
+        if escape && !self.was_typing && !egui::Popup::is_any_open(ctx) {
+            self.clear_selection();
+        }
         if pressed(FOLD) {
             self.inspector.folded = !self.inspector.folded;
         }
         if ctx.input_mut(|i| i.consume_shortcut(&MERGE)) && self.can_merge(session, jobs) {
             self.merge(session, jobs);
-        }
-        if self.panel_list_open {
-            return;
         }
         // As the segment: the plan always, the mosaic once it can show.
         if pressed(PLAN_MOSAIC) {

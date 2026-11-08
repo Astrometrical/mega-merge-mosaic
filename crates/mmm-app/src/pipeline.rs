@@ -383,7 +383,7 @@ mod tests {
 
     use super::*;
     use crate::jobs::tests::drain;
-    use crate::panels_tab::{Applied, PanelsEdit};
+    use crate::panel_edits::{Applied, PanelsEdit};
     use crate::start::tests::temp_dir;
     use crate::testutil::two_group_session;
 
@@ -424,7 +424,7 @@ mod tests {
         done: impl Fn(&Pipeline, &JobRunner) -> bool,
     ) {
         let ctx = egui::Context::default();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         loop {
             let events = r.poll(s);
             p.poll(&ctx, at, s, r, &events, editing);
@@ -842,7 +842,7 @@ mod tests {
 
         // The shell's order: runner, then `editing`, then the panel, then
         // the pipeline.
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         let mut ended = Vec::new();
         let mut again = None;
         let mut t = t0;

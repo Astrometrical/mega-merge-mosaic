@@ -162,3 +162,29 @@ fn long_toast_stays_compact() {
     }
     assert_eq!(h.query_all_by_label(title).count(), 3);
 }
+
+#[test]
+fn a_toast_can_be_dismissed() {
+    let mut h = harness();
+    h.run();
+    let undo = h
+        .state_mut()
+        .toasts
+        .push(toast("Removed 2 panels", Some("Undo")), 0.0);
+    h.state_mut()
+        .toasts
+        .push(toast("Export finished", None), 0.0);
+    h.run();
+    h.get_by_label("Removed 2 panels");
+    // Its action no longer means anything (e.g. its session was left).
+    assert!(h.state_mut().toasts.dismiss(undo));
+    h.run();
+    assert!(h.query_by_label("Removed 2 panels").is_none());
+    assert!(h.query_by_label("Undo").is_none());
+    h.get_by_label("Export finished");
+    assert_eq!(h.state().events, vec![ToastEvent::Dismissed(undo)]);
+    // Gone already: nothing to dismiss.
+    assert!(!h.state_mut().toasts.dismiss(undo));
+    h.run();
+    assert_eq!(h.state().events, vec![ToastEvent::Dismissed(undo)]);
+}
