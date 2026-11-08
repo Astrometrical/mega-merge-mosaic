@@ -4,7 +4,6 @@ use egui_kittest::kittest::Queryable;
 
 use super::*;
 use crate::icons;
-use crate::theme::Tone;
 
 struct State {
     steps: Vec<StripStep>,
@@ -76,7 +75,8 @@ fn working_step_fills_to_its_fraction() {
     let mut h = harness(steps);
     h.run();
     let pill = h.get_by_label("Merge").rect();
-    let fill = Tone::Info.tint();
+    let fill = WORKING_FILL;
+    assert_eq!(fill.a(), 255);
     let found = h.output().shapes.iter().any(|c| match &c.shape {
         egui::Shape::Rect(r) => {
             r.fill == fill
@@ -127,4 +127,13 @@ fn done_and_warn_carry_icons() {
     };
     assert!(painted(icons::CHECK));
     assert!(painted(icons::TRIANGLE_ALERT));
+}
+
+#[test]
+fn working_label_is_legible_on_fill_and_pill() {
+    use crate::theme::palette::{SURFACE_800, TEXT_STRONG};
+    for bg in [WORKING_FILL, SURFACE_800] {
+        let c = crate::theme::contrast_ratio(TEXT_STRONG, bg);
+        assert!(c >= 4.5, "{c:.2}:1 on {bg:?}");
+    }
 }

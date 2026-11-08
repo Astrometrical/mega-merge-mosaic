@@ -94,3 +94,31 @@ fn choice_chip_reports_selected_state() {
         assert_eq!(node.accesskit_node().toggled(), Some(want));
     }
 }
+
+#[test]
+fn choice_chip_click_is_reported() {
+    use super::chip::{ChoiceChip, choice_chip};
+    use std::{cell::Cell, rc::Rc};
+    let clicked = Rc::new(Cell::new(false));
+    let seen = clicked.clone();
+    let mut h = harness(move |ui| {
+        let r = choice_chip(
+            ui,
+            &ChoiceChip {
+                label: "Hα",
+                color: None,
+                selected: false,
+                dashed: true,
+            },
+        );
+        if r.clicked() {
+            seen.set(true);
+        }
+        r
+    });
+    h.run();
+    assert!(!clicked.get());
+    h.get_by_label("Hα").click();
+    h.run();
+    assert!(clicked.get());
+}

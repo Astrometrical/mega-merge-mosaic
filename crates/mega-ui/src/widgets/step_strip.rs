@@ -8,7 +8,7 @@ use egui::{
 
 use crate::icons;
 use crate::theme::Tone;
-use crate::theme::palette::{ACCENT_500, BORDER, TEXT_MUTED, TEXT_STRONG};
+use crate::theme::palette::{ACCENT_500, ACCENT_700, BORDER, TEXT_MUTED, TEXT_STRONG};
 use crate::theme::tokens::{CONTROL_HEIGHT, space};
 
 use super::button::focus_ring;
@@ -57,6 +57,8 @@ pub enum StripEvent {
 const HEIGHT: f32 = CONTROL_HEIGHT - 4.0;
 /// Horizontal padding inside a pill.
 const PAD: f32 = space::M;
+/// Fill of a working pill's progress part (opaque; text stays AA on it).
+pub(crate) const WORKING_FILL: Color32 = ACCENT_700;
 /// Size of the cancel icon button.
 const CANCEL: f32 = HEIGHT - 6.0;
 
@@ -114,8 +116,8 @@ fn pill(ui: &mut Ui, index: usize, step: &StripStep) -> Option<StripEvent> {
         let p = ui.painter();
         if let StepState::Working { fraction } = step.state {
             let (w, fill) = match fraction {
-                Some(f) => (rect.width() * f.clamp(0.0, 1.0), Tone::Info.tint()),
-                None => (rect.width(), Tone::Info.tint().gamma_multiply(0.5)),
+                Some(f) => (rect.width() * f.clamp(0.0, 1.0), WORKING_FILL),
+                None => (rect.width(), WORKING_FILL.gamma_multiply(0.5)),
             };
             if w > 0.0 {
                 let fill_rect = Rect::from_min_size(rect.min, Vec2::new(w, HEIGHT));
