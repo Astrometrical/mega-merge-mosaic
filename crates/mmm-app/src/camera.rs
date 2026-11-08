@@ -23,11 +23,4 @@ impl Camera {
             zoom: view.zoom(now),
         }
     }
-
-    /// Jump `view` to this camera, with no animation (the zoom is clamped
-    /// to the view's limits).
-    #[allow(dead_code)] // used by the mosaic view from Task 6 on
-    pub fn apply(self, view: &mut View, now: f64) {
-        view.set_view(self.centre, self.zoom, now);
-    }
 }
