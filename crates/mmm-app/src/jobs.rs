@@ -495,26 +495,6 @@ impl JobRunner {
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
     }
 
-    /// Cancel every blend: the running one winds down (reported by
-    /// [`JobRunner::poll`] when it has), queued ones are dropped at once.
-    /// For blend-local settings edits, which only need the stores' writer
-    /// locks.
-    pub fn cancel_blends(&mut self) {
-        if let Some(r) = self.running.as_ref().filter(|r| r.blend.is_some()) {
-            r.token.cancel();
-        }
-        let mut dropped = Vec::new();
-        self.queue.retain(|q| {
-            let keep = !matches!(q.kind, Kind::Blend { .. });
-            if !keep {
-                dropped.push(q.id);
-            }
-            keep
-        });
-        self.pending
-            .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
-    }
-
     /// Cancel every job, exports included, and wait up to `wait` for the
     /// running one to stop, applying (or discarding) its outcome as
     /// [`JobRunner::poll`] does (a cancelled analysis keeps the groups it

@@ -88,7 +88,7 @@ use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
 use mmm_core::mosaic::{Grouping, PanelEntry};
 use mmm_core::session_summary::ResultState;
-use mmm_core::settings::ChangeImpact;
+use mmm_core::settings::{AnalyzeSettings, ChangeImpact};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -140,6 +140,9 @@ pub enum Undo {
     /// (the panels as they are now), noting that the user has chosen how to
     /// group; nothing more if they have chosen another way since.
     Grouping(Grouping),
+    /// Put back the analysis settings from before the change, as an
+    /// ordinary analysis edit (queued behind running jobs like any).
+    Analyze(AnalyzeSettings),
 }
 
 /// A toast the window asks the shell to show.
@@ -365,7 +368,29 @@ impl SessionWindow {
         session: &mut OpenSession,
         jobs: &mut JobRunner,
     ) -> Option<ChangeImpact> {
-        self.mosaic.poll_settings(ctx, session, jobs)
+        let applied = self.mosaic.poll_settings(ctx, session, jobs);
+        self.follow_settings();
+        applied
+    }
+
+    /// Follow the merge settings panel: its draft changed (save it, rate
+    /// limited), or an analysis change was applied (raise the Undo toast;
+    /// the shell takes down the previous analysis toast).
+    fn follow_settings(&mut self) {
+        if self.mosaic.take_draft_changed() {
+            self.save.touch();
+        }
+        if let Some(previous) = self.mosaic.take_analysis_undo() {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Neutral,
+                    title: "Analysis settings changed".into(),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::Analyze(previous)),
+            });
+        }
     }
 
     /// The window's every-frame work, drawn or not: pick the mode and the
@@ -430,6 +455,9 @@ impl SessionWindow {
         match undo {
             Undo::Readd(removed) => self.panels.readd(removed, session, jobs),
             Undo::Grouping(grouping) => self.panels.regroup(grouping, session, jobs),
+            Undo::Analyze(previous) => {
+                self.mosaic.edit_analysis(previous, session, jobs);
+            }
         }
         self.save_panel_choices();
     }
@@ -518,6 +546,7 @@ impl SessionWindow {
                 self.canvas_ui(ui, session, pipeline, checks);
             });
         self.mosaic.export_ui(&ctx, session, jobs);
+        self.follow_settings();
         out.toasts.append(&mut self.toasts);
         self.save_panel_choices();
         // Files dropped anywhere are added, whatever shows.

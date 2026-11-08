@@ -32,9 +32,10 @@
 //!   group), once the ROIs follow the current frame;
 //!   [`MosaicView::merge_all`] merges every group over the whole canvas.
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
-//!   analysis and merge settings, staged and applied with their cost shown
-//!   first. While its tile count runs or an edit waits to apply, merging is
-//!   blocked; an applied edit reloads the view's (now stale) tiles.
+//!   merge settings (a draft kept in `ui`, edited at once) and analysis
+//!   settings (applied at once, with an Undo toast). While an analysis edit
+//!   waits to apply or the feather text is invalid, merging is blocked; an
+//!   applied analysis edit reloads the view's (now stale) tiles.
 //! - **Export** ([`crate::export`]) writes the view's groups' results to
 //!   FITS or TIFF as jobs, after warning about stale or missing tiles.
 //! - **Camera.** [`MosaicView::set_camera`] moves the canvas without
@@ -107,7 +108,7 @@ use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
-use mmm_core::settings::ChangeImpact;
+use mmm_core::settings::{AnalyzeSettings, ChangeImpact};
 use mmm_core::stretch::StretchParams;
 use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
@@ -437,7 +438,6 @@ impl MosaicView {
             && self.health_task.is_none()
             && self.rois.idle()
             && self.export.idle()
-            && self.settings.idle()
             && !self.settings.has_pending()
             && self
                 .viewer
@@ -480,7 +480,6 @@ impl MosaicView {
 
     /// React to a job that ended (from [`JobRunner::poll`]).
     pub fn on_event(&mut self, event: &JobEvent) {
-        self.settings.on_event(event);
         let id = match event {
             JobEvent::Finished { id, .. }
             | JobEvent::Cancelled { id }
@@ -675,7 +674,10 @@ impl MosaicView {
         if !self.export.idle() {
             return Some("Waiting for the export check.".into());
         }
-        if !self.settings.idle() || self.settings.has_pending() {
+        if let Some(why) = self.settings.input_error() {
+            return Some(why.into());
+        }
+        if self.settings.has_pending() {
             return Some("Waiting for the merge settings change.".into());
         }
         if self
@@ -724,10 +726,9 @@ impl MosaicView {
         groups: Vec<String>,
         rect: Option<[u64; 4]>,
     ) {
-        // The export check and the settings tile count map result stores
-        // a merge may recreate; a settings edit waiting to apply would
-        // cancel the merge anyway.
-        if !self.export.idle() || !self.settings.idle() || self.settings.has_pending() {
+        // The export check maps result stores a merge may recreate; an
+        // analysis edit waiting to apply would cancel the merge anyway.
+        if !self.export.idle() || self.settings.has_pending() {
             return;
         }
         for g in groups {
@@ -819,16 +820,46 @@ impl MosaicView {
         out.go_to
     }
 
-    /// The merge settings, staged and applied with their cost shown first.
+    /// The merge settings (a draft, edited at once) and the analysis
+    /// settings (applied at once), marked against the view's groups.
     pub fn settings_ui(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
     ) {
-        if let Some(impact) = self.settings.ui(ui, session, jobs) {
+        let groups = self.members.clone();
+        if let Some(impact) = self.settings.ui(ui, session, jobs, &groups) {
             self.on_settings_applied(impact);
         }
+    }
+
+    /// Apply the analysis settings `new` ([`SettingsPanel::edit_analysis`]),
+    /// queued behind the jobs in the way like any edit; the impact when it
+    /// was applied now.
+    pub fn edit_analysis(
+        &mut self,
+        new: AnalyzeSettings,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) -> Option<ChangeImpact> {
+        let applied = self.settings.edit_analysis(new, session, jobs);
+        if let Some(impact) = applied {
+            self.on_settings_applied(impact);
+        }
+        applied
+    }
+
+    /// The analysis settings from before the last applied change, once
+    /// ([`SettingsPanel::take_analysis_undo`]).
+    pub fn take_analysis_undo(&mut self) -> Option<AnalyzeSettings> {
+        self.settings.take_analysis_undo()
+    }
+
+    /// Whether the merge settings draft changed since the last call
+    /// ([`SettingsPanel::take_draft_changed`]).
+    pub fn take_draft_changed(&mut self) -> bool {
+        self.settings.take_draft_changed()
     }
 
     /// The health of the view's group (in a composition view, of the group

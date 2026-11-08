@@ -97,6 +97,8 @@ pub struct Shell {
     /// What each toast with an action undoes (dropped with the toast; the
     /// toasts go with the session, [`Shell::drop_undos`]).
     undos: BTreeMap<ToastId, Undo>,
+    /// The analysis settings toast shown, which the next one replaces.
+    analysis_toast: Option<ToastId>,
     /// Every toast's title pushed, in order (tests: a toast expires).
     #[cfg(test)]
     toasted: Vec<String>,
@@ -133,6 +135,7 @@ impl Shell {
             jobs: None,
             toasts: Toasts::default(),
             undos: BTreeMap::new(),
+            analysis_toast: None,
             #[cfg(test)]
             toasted: Vec::new(),
             title: APP_TITLE.to_string(),
@@ -302,6 +305,7 @@ impl Shell {
     /// Take down the toasts whose Undo would change the session being left
     /// (or one no longer open), and forget what they undo.
     fn drop_undos(&mut self) {
+        self.analysis_toast = None;
         for id in std::mem::take(&mut self.undos).into_keys() {
             self.toasts.dismiss(id);
         }
@@ -521,6 +525,13 @@ impl Shell {
             self.toasted.push(toast.title.clone());
             let id = self.toasts.push(toast, now);
             if let (true, Some(undo)) = (has_action, undo) {
+                // A new analysis toast replaces the previous one.
+                if matches!(undo, Undo::Analyze(_))
+                    && let Some(old) = self.analysis_toast.replace(id)
+                {
+                    self.undos.remove(&old);
+                    self.toasts.dismiss(old);
+                }
                 self.undos.insert(id, undo);
             }
         }
@@ -1607,6 +1618,32 @@ mod tests {
         step_until(&mut h, |_| on_disk(&dir) == 8);
         assert_eq!(MosaicConfig::load(&dir).unwrap().panels, previous.panels);
         assert!(h.state().undos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_analysis_toast_replaces_the_previous_one() {
+        let root = temp_dir("shell-undo-analysis");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        let analysis = h.state().session().unwrap().mosaic.config.analyze.clone();
+        for _ in 0..2 {
+            h.state_mut().window.push_toast(WindowToast {
+                toast: Toast {
+                    tone: Tone::Neutral,
+                    title: "Analysis settings changed".into(),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::Analyze(analysis.clone())),
+            });
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().undos.len(), 1, "the first one was taken down");
+        assert_eq!(h.query_all_by_label("Analysis settings changed").count(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

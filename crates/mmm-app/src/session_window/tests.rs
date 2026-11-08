@@ -63,6 +63,8 @@ struct State {
     accepted: Vec<Check>,
     /// The panel list's file dialog.
     files: Arc<AskedFiles>,
+    /// The toasts the window raised, in order.
+    toasts: Vec<WindowToast>,
 }
 
 impl State {
@@ -77,6 +79,7 @@ impl State {
             run_pipeline: false,
             accepted: Vec::new(),
             files,
+            toasts: Vec::new(),
         }
     }
 }
@@ -121,6 +124,7 @@ fn harness_sized(state: State, size: egui::Vec2) -> Harness<'static, State> {
                 let out =
                     s.w.ui(ui, &mut s.session, &mut s.jobs, &mut s.pipeline, &s.checks);
                 s.accepted.extend(out.accept);
+                s.toasts.extend(out.toasts);
             },
             state,
         )
@@ -2401,5 +2405,79 @@ fn the_strip_never_wraps_beside_the_name() {
     }
     assert!(one_row_at.is_some(), "never one row");
     drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_analysis_change_raises_an_undo_toast() {
+    use mmm_core::photometry::GainMode;
+
+    let (root, s, jobs) = analyzed("window-analysis-toast");
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    let edit = |h: &mut Harness<'static, State>, gain| {
+        let st = h.state_mut();
+        let mut a = st.session.mosaic.config.analyze.clone();
+        a.gain = gain;
+        st.w.mosaic.edit_analysis(a, &mut st.session, &mut st.jobs)
+    };
+    assert!(edit(&mut h, GainMode::Unity).is_some());
+    h.run_steps(3);
+    let toasts = std::mem::take(&mut h.state_mut().toasts);
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert_eq!(toasts[0].toast.title, "Analysis settings changed");
+    assert_eq!(toasts[0].toast.action.as_deref(), Some("Undo"));
+    let Some(Undo::Analyze(prev)) = toasts.into_iter().next().and_then(|t| t.undo) else {
+        panic!("an analysis undo");
+    };
+    assert_eq!(prev.gain, GainMode::Fit);
+    // Undo restores the values.
+    {
+        let st = h.state_mut();
+        st.w.undo(Undo::Analyze(prev), &mut st.session, &mut st.jobs);
+        assert_eq!(st.session.mosaic.config.analyze.gain, GainMode::Fit);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_draft_edit_is_saved_with_the_window() {
+    let (root, s, jobs) = analyzed("window-draft-save");
+    let dir = s.mosaic.dir.clone();
+    let mut state = State::new(s, jobs);
+    state.w.inspector_mut().reveal(MERGE_SETTINGS);
+    let mut h = harness(state);
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Defect veto")
+        .click();
+    h.run_steps(2);
+    h.get_by_label("Off").click();
+    h.run_steps(2);
+    assert!(h.state().w.save.pending(), "the draft awaits its save");
+    {
+        let st = h.state_mut();
+        st.w.flush_save(&mut st.session);
+    }
+    let saved = MosaicConfig::load(&dir).unwrap();
+    assert!(!crate::blend_settings::load_draft(&saved).defect_veto);
+    assert!(saved.blend.defect_veto, "the config's settings are kept");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_old_session_shows_merged() {
+    // A merged session saved before drafts: no `merge_draft` key.
+    let (root, s, jobs) = merged("window-old-merged");
+    assert!(s.mosaic.config.ui.get("merge_draft").is_none());
+    let mut state = State::new(s, jobs);
+    state.w.inspector_mut().reveal(MERGE_SETTINGS);
+    let mut h = harness(state);
+    h.run_steps(3);
+    assert_eq!(shown_steps(h.state())[2], strip("Merged", StepState::Done));
+    assert_eq!(
+        h.query_all_by_label(crate::blend_settings::CHANGED_MARK)
+            .count(),
+        0
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

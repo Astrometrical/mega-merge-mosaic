@@ -1302,9 +1302,11 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   fold (Merge settings has no fold of its own inside). The merge settings
   are the
   mosaic-wide `AnalyzeSettings` / `BlendSettings` with the CLI's value
-  domains, edited and applied as before (staged edits, applied once the
-  cancelled jobs have stopped; a global change marks every analysed group
-  `needs_analyze`).
+  domains. Merge fields edit a draft kept in `ui.merge_draft` (saved with
+  the window's debounced save; nothing is invalidated or cancelled; a merge
+  commits it). Analysis fields apply at once (applied once the cancelled
+  jobs have stopped; a change marks every analysed group `needs_analyze`)
+  and raise an "Analysis settings changed" toast with Undo.
 - **Display stretch** (`display_stretch.rs`). Always automatic, never set by
   hand, one rule for the plan and the mosaic: an automatic stretch per
   channel, with **Linked** (one stretch for all channels) and **Strong** (a

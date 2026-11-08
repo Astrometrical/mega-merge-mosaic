@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn settings_changes_reanalyse_only_when_global() {
-        use crate::blend_settings::{SettingsEdit, SettingsPanel};
+        use crate::blend_settings::SettingsPanel;
         use mmm_core::photometry::GainMode;
         use mmm_core::settings::ChangeImpact;
 
@@ -803,21 +803,22 @@ mod tests {
         assert_eq!(seen.started, ["Previews", "Analyse"]);
         let mut panel = SettingsPanel::new();
 
-        // Blend-local: nothing reruns.
-        let mut e = SettingsEdit::of(&s.mosaic.config);
-        e.blend.feather_px = 100.0;
-        panel.stage(e, &s.mosaic.config);
-        assert_eq!(panel.apply(&mut s, &mut r), Some(ChangeImpact::Reblend));
+        // A merge setting is a draft: nothing is applied, nothing reruns.
+        let mut draft = s.mosaic.config.blend.clone();
+        draft.feather_px = 100.0;
+        panel.edit_draft(&mut s.mosaic.config, draft);
         for _ in 0..20 {
             run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         }
         assert_eq!(seen.started, ["Previews", "Analyse"]);
 
         // Global: the pipeline analyses again by itself.
-        let mut e = SettingsEdit::of(&s.mosaic.config);
-        e.analyze.gain = GainMode::Unity;
-        panel.stage(e, &s.mosaic.config);
-        assert_eq!(panel.apply(&mut s, &mut r), Some(ChangeImpact::Reanalyze));
+        let mut a = s.mosaic.config.analyze.clone();
+        a.gain = GainMode::Unity;
+        assert_eq!(
+            panel.edit_analysis(a, &mut s, &mut r),
+            Some(ChangeImpact::Reanalyze)
+        );
         assert_eq!(s.mosaic.config.needs_analyze.len(), 2);
         p.poll(&egui::Context::default(), t0, &mut s, &mut r, &[], false);
         assert_eq!(p.step(), Some(Step::Analyze));
@@ -828,7 +829,7 @@ mod tests {
 
     #[test]
     fn reverted_settings_edit_restarts_the_cancelled_analysis() {
-        use crate::blend_settings::{SettingsEdit, SettingsPanel};
+        use crate::blend_settings::SettingsPanel;
         use mmm_core::photometry::GainMode;
 
         let root = temp_dir("pipe-settings-revert");
@@ -850,12 +851,13 @@ mod tests {
         // A global edit cancels the automatic analysis, then is reverted
         // before the cancel has been reported.
         let mut panel = SettingsPanel::new();
-        let mut e = SettingsEdit::of(&s.mosaic.config);
-        e.analyze.gain = GainMode::Unity;
-        panel.stage(e, &s.mosaic.config);
-        assert_eq!(panel.apply(&mut s, &mut r), None);
+        let original = s.mosaic.config.analyze.clone();
+        let mut a = original.clone();
+        a.gain = GainMode::Unity;
+        assert_eq!(panel.edit_analysis(a, &mut s, &mut r), None);
         assert!(panel.editing(&s.mosaic.config));
-        panel.revert();
+        // The user puts the old value back (nothing differs: no edit).
+        assert_eq!(panel.edit_analysis(original, &mut s, &mut r), None);
         assert!(panel.editing(&s.mosaic.config), "until the cancel lands");
         gate.open();
 

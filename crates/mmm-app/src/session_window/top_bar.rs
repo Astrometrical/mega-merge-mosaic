@@ -39,7 +39,7 @@ use super::steps::{
     needs_merge, offers_analysis, steps,
 };
 use super::{CanvasMode, MERGE_SETTINGS, PROBLEMS, SessionWindow, shortcuts};
-use crate::blend_settings::{feather_text, mode_name};
+use crate::blend_settings::{feather_text, load_draft, mode_name};
 use crate::checks::ChecksEngine;
 use crate::jobs::{JobRunner, JobTarget};
 use crate::pipeline::Pipeline;
@@ -207,7 +207,7 @@ impl SessionWindow {
                 asked = Some(Main::AddPanels);
             }
         } else if needs_merge(session) {
-            let b = &session.mosaic.config.blend;
+            let b = &load_draft(&session.mosaic.config);
             let summary = format!(
                 "{} · feather {} px",
                 mode_name(b.mode),

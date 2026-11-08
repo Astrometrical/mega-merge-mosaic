@@ -1,85 +1,79 @@
 //! The merge settings panel (spec §5.4; the session window's Merge
 //! settings section, through [`crate::mosaic_view::MosaicView`]): the
-//! mosaic-wide analyze and blend settings, exactly the `mmm analyze` /
-//! `mmm blend` options the session keeps ([`AnalyzeSettings`],
-//! [`BlendSettings`]), with the CLI's value domains.
+//! mosaic-wide merge and analysis settings, with the CLI's value domains.
 //!
-//! - **Two kinds.** Mode, feather, defect veto and flatten are
-//!   *blend-local*: analysis is kept, existing results go stale and a
-//!   reblend (ROI or whole) shows the change. Input, surface and gain are
-//!   *global*: analysis reruns (the automatic pipeline starts it) and every
-//!   result goes stale. The panel captions each kind.
-//! - **Staged edits.** Changes are a draft until **Apply**; **Revert**
-//!   discards them. While a draft differs, the panel says what applying
-//!   costs ("… (N of M tiles)"): N valid level-0 tiles of the group results
-//!   that would go stale, of M. The counts are read on a worker
-//!   ([`count_tiles`]), only while no job but an export runs; while a count
-//!   runs no blend may start ([`SettingsPanel::idle`]), so the count's
-//!   [`TileReader`] never maps a store a blend recreates.
-//! - **Applying** uses [`set_settings`] with the pending-edit pattern of
-//!   the Panels tab: the jobs in the way are cancelled and the edit waits
-//!   until they have stopped — blends only for a blend-local change
-//!   ([`set_settings`] needs just the stores' writer locks), every job but
-//!   exports for a global one; a store held elsewhere
-//!   ([`mmm_core::Error::Busy`]) retries after [`BUSY_RETRY`]. Jobs
-//!   cancelled for a global edit count as cancelled *for an edit*
-//!   ([`SettingsPanel::editing`]) until every one has been reported, even
-//!   if the edit is reverted meanwhile, so the automatic pipeline restarts
-//!   its work instead of taking them for the user's cancels.
-//! - **Changed since the last blend.** A field whose shown value differs
-//!   from the settings the last blend used (from provenance; see
-//!   [`last_blend`]) is marked with a dot in the accent colour.
+//! - **Merge fields** (mode, feather, defect veto, flatten) edit a *draft*
+//!   kept in `mosaic.json`'s `ui` ([`MERGE_DRAFT_KEY`], [`load_draft`]):
+//!   at once, with no Apply or Revert. Nothing is invalidated and no job
+//!   is cancelled; the session window saves the draft with its debounced
+//!   save ([`SettingsPanel::take_draft_changed`]) and a merge takes it up
+//!   (`mmm_core::mosaic::commit_blend_settings`). Typed feather text that
+//!   is not a valid width keeps the last valid draft and shows its error;
+//!   merging is blocked meanwhile ([`SettingsPanel::input_error`]).
+//! - **Analysis fields** (input, surface, gain) apply at once
+//!   ([`SettingsPanel::edit_analysis`]) with the pending-edit pattern of
+//!   the Panels tab: the jobs in the way (all but exports) are cancelled
+//!   and the edit waits until they have stopped; a store held elsewhere
+//!   ([`mmm_core::Error::Busy`]) retries after [`BUSY_RETRY`]. The merge
+//!   settings of the config are untouched. Each applied change leaves the
+//!   previous values for the window's Undo toast
+//!   ([`SettingsPanel::take_analysis_undo`]). Jobs cancelled for an edit
+//!   count as cancelled *for an edit* ([`SettingsPanel::editing`]) until
+//!   every one has been reported, so the automatic pipeline restarts its
+//!   work instead of taking them for the user's cancels.
+//! - **Changed since the last merge.** A merge field whose draft value
+//!   (with a group's override) differs from that group's newest
+//!   whole-canvas merge, or an analysis field differing from the group's
+//!   last analysis, is marked with a dot in the accent colour; for a
+//!   composite, any member group counts ([`changed_fields`]).
 //! - **Per-group overrides** (set with the CLI) are respected but not
 //!   edited here; the panel names the groups that have them.
 //!
-//! [`set_settings`] saves `mosaic.json` and flushes store state tables on
-//! the UI thread: the documented exception to "no file I/O on the UI
-//! thread" (see [`crate::jobs`]).
+//! [`SettingsPanel::edit_analysis`] saves `mosaic.json` and flushes store
+//! state tables on the UI thread: the documented exception to "no file I/O
+//! on the UI thread" (see [`crate::jobs`]).
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui::RichText;
 use mega_ui::theme::palette;
 use mmm_core::analyze::InputSelect;
 use mmm_core::blend::BlendMode;
-use mmm_core::mosaic::{MosaicConfig, result_store_paths, set_settings};
-use mmm_core::photometry::GainMode;
-use mmm_core::settings::{
-    AnalyzeSettings, BlendSettings, ChangeImpact, analyze_change, blend_change,
+use mmm_core::mosaic::{
+    MosaicConfig, last_analyze_settings, last_merge_settings, set_analyze_settings,
 };
-use mmm_core::tiles::TileReader;
+use mmm_core::photometry::GainMode;
+use mmm_core::settings::{AnalyzeSettings, BlendSettings, ChangeImpact, analyze_change};
+use serde_json::Value;
 
-use crate::jobs::{JobEvent, JobRunner};
+use crate::jobs::JobRunner;
 use crate::session::OpenSession;
-use crate::util::{Poll, Task};
 
 /// Wait before retrying an edit refused because a store was busy.
 pub const BUSY_RETRY: Duration = Duration::from_millis(500);
-/// Marker of a field changed since the last blend.
+/// Marker of a field changed since the last merge.
 pub const CHANGED_MARK: &str = "●";
+/// Key in `MosaicConfig.ui` of the merge settings draft.
+pub const MERGE_DRAFT_KEY: &str = "merge_draft";
 
-/// A mosaic-wide settings edit: both kinds together, applied at once.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SettingsEdit {
-    /// Global (analysis) settings.
-    pub analyze: AnalyzeSettings,
-    /// Blend-local settings.
-    pub blend: BlendSettings,
+/// The merge settings draft: `ui.merge_draft` if it parses and is valid,
+/// else the config's own merge settings.
+pub fn load_draft(cfg: &MosaicConfig) -> BlendSettings {
+    cfg.ui
+        .get(MERGE_DRAFT_KEY)
+        .and_then(|v| serde_json::from_value::<BlendSettings>(v.clone()).ok())
+        .filter(|b| b.validate().is_ok())
+        .unwrap_or_else(|| cfg.blend.clone())
 }
 
-impl SettingsEdit {
-    /// The mosaic-wide settings of `cfg`.
-    pub fn of(cfg: &MosaicConfig) -> Self {
-        SettingsEdit {
-            analyze: cfg.analyze.clone(),
-            blend: cfg.blend.clone(),
-        }
+/// Store `draft` in `ui` (`MosaicConfig.ui`), keeping everything else
+/// there (a `ui` that is not a JSON object becomes one).
+pub fn save_draft(ui: &mut Value, draft: &BlendSettings) {
+    if !ui.is_object() {
+        *ui = Value::Object(Default::default());
     }
-
-    /// What applying this edit to `cfg` invalidates.
-    pub fn impact(&self, cfg: &MosaicConfig) -> ChangeImpact {
-        analyze_change(&cfg.analyze, &self.analyze).max(blend_change(&cfg.blend, &self.blend))
+    if let (Some(obj), Ok(v)) = (ui.as_object_mut(), serde_json::to_value(draft)) {
+        obj.insert(MERGE_DRAFT_KEY.to_string(), v);
     }
 }
 
@@ -102,107 +96,48 @@ pub enum Field {
     Gain,
 }
 
-/// The settings the last blend used, from provenance: the blend settings
-/// it recorded, and the analyze settings of the last analysis before it
-/// (`None` if that is not recorded). Only blends of groups without
-/// overrides count (theirs are the mosaic-wide settings); `None` when there
-/// is no such blend.
-pub fn last_blend(cfg: &MosaicConfig) -> Option<(Option<AnalyzeSettings>, BlendSettings)> {
-    let prov = &cfg.provenance;
-    let (at, group, blend) = prov.iter().enumerate().rev().find_map(|(i, p)| {
-        if p.action != "blend" {
-            return None;
-        }
-        let group = p.group.clone()?;
-        if cfg
-            .group_overrides
-            .get(&group)
-            .is_some_and(|o| !o.is_empty())
-        {
-            return None;
-        }
-        let blend: BlendSettings = serde_json::from_value(p.detail["settings"].clone()).ok()?;
-        Some((i, group, blend))
-    })?;
-    let analyze = prov[..at]
-        .iter()
-        .rev()
-        .find(|p| p.action == "analyze")
-        .and_then(|p| serde_json::from_value(p.detail["groups"][&group].clone()).ok());
-    Some((analyze, blend))
-}
-
-/// The fields of `shown` that differ from the last blend's settings
-/// (nothing when nothing was blended).
-pub fn changed_fields(cfg: &MosaicConfig, shown: &SettingsEdit) -> Vec<Field> {
-    let Some((analyze, blend)) = last_blend(cfg) else {
-        return Vec::new();
-    };
+/// The fields that differ from what `groups` were last merged and analysed
+/// with: the draft (through each group's override) against the group's
+/// newest whole-canvas merge, the shown analysis settings against its last
+/// analysis. A group never merged (or analysed) marks nothing.
+pub fn changed_fields(
+    cfg: &MosaicConfig,
+    draft: &BlendSettings,
+    analyze: &AnalyzeSettings,
+    groups: &[String],
+) -> Vec<Field> {
     let mut out = Vec::new();
-    let b = &shown.blend;
-    for (f, differs) in [
-        (Field::Mode, b.mode != blend.mode),
-        (Field::Feather, b.feather_px != blend.feather_px),
-        (Field::DefectVeto, b.defect_veto != blend.defect_veto),
-        (Field::Flatten, b.flatten != blend.flatten),
-    ] {
-        if differs {
-            out.push(f);
-        }
-    }
-    if let Some(a) = analyze {
-        let s = &shown.analyze;
-        for (f, differs) in [
-            (Field::Input, s.input != a.input),
-            (Field::Surface, s.surface != a.surface),
-            (Field::Gain, s.gain != a.gain),
-        ] {
-            if differs {
-                out.push(f);
+    for g in groups {
+        let over = cfg.group_overrides.get(g).cloned().unwrap_or_default();
+        if let Some(last) = last_merge_settings(cfg, g) {
+            let b = draft.with(&over.blend);
+            for (f, differs) in [
+                (Field::Mode, b.mode != last.mode),
+                (Field::Feather, b.feather_px != last.feather_px),
+                (Field::DefectVeto, b.defect_veto != last.defect_veto),
+                (Field::Flatten, b.flatten != last.flatten),
+            ] {
+                if differs {
+                    out.push(f);
+                }
             }
         }
-    }
-    out
-}
-
-/// Valid and total level-0 tiles over the stores at `paths` (blocking:
-/// maps each store; run on a worker). Missing or unreadable stores count
-/// as nothing.
-pub fn count_tiles(paths: &[PathBuf]) -> (usize, usize) {
-    let mut valid = 0;
-    let mut total = 0;
-    for p in paths {
-        let Ok(r) = TileReader::open(p) else { continue };
-        let (nx, ny) = r.geometry().tiles(0);
-        for ty in 0..ny {
-            for tx in 0..nx {
-                total += 1;
-                if r.state(0, tx, ty) == mmm_core::tiles::TileState::Valid {
-                    valid += 1;
+        if let Some(last) = last_analyze_settings(cfg, g) {
+            let a = analyze.with(&over.analyze);
+            for (f, differs) in [
+                (Field::Input, a.input != last.input),
+                (Field::Surface, a.surface != last.surface),
+                (Field::Gain, a.gain != last.gain),
+            ] {
+                if differs {
+                    out.push(f);
                 }
             }
         }
     }
-    (valid, total)
-}
-
-/// What applying an edit costs, for the user (a global change reruns the
-/// analysis by itself).
-pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>) -> String {
-    let tiles = match counts {
-        None => " (counting tiles…)".to_string(),
-        Some((_, 0)) => String::new(),
-        Some((n, m)) => format!(" ({n} of {m} tiles)"),
-    };
-    match impact {
-        ChangeImpact::None => String::new(),
-        ChangeImpact::Reblend => {
-            format!("Existing results go stale; merge again to see the change{tiles}.")
-        }
-        ChangeImpact::Reanalyze => {
-            format!("Analysis reruns and every result goes stale{tiles}.")
-        }
-    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The merge mode's name, as the settings show it.
@@ -257,51 +192,45 @@ pub(crate) fn feather_text(v: f32) -> String {
     format!("{v}")
 }
 
-/// The panel's state (owned by the merged mosaic view).
+/// The panel's state (owned by the merged mosaic view). The merge draft
+/// lives in the config's `ui`, not here.
 #[derive(Default)]
 pub struct SettingsPanel {
-    /// Staged edits (`None`: the session's settings are shown).
-    draft: Option<SettingsEdit>,
     /// The feather field's text while it differs from the draft's value
     /// (being typed, or invalid).
     feather_text: Option<String>,
     /// Why the typed feather is refused.
     feather_error: Option<String>,
-    /// An applied edit waiting for the jobs to stop (or a busy store).
-    pending: Option<SettingsEdit>,
+    /// An analysis edit waiting for the jobs to stop (or a busy store).
+    pending: Option<AnalyzeSettings>,
     /// When to retry a pending edit refused as busy.
     retry_at: Option<Instant>,
     /// The last error, for the user.
     error: Option<String>,
-    /// The last applied change, until the next edit (for a short note).
-    applied: Option<ChangeImpact>,
-    /// Valid and total level-0 tiles of the results, when counted.
-    counts: Option<(usize, usize)>,
-    count_task: Option<Task<(usize, usize)>>,
-    /// The counts are out of date.
-    stale_counts: bool,
-    /// Jobs were cancelled for a global edit and have not all been
-    /// reported yet (kept across a Revert; see the module docs).
+    /// Jobs were cancelled for an analysis edit and have not all been
+    /// reported yet (see the module docs).
     cancelled_for_edit: bool,
+    /// The analysis settings before the last applied change, until the
+    /// window takes them for its Undo toast.
+    analysis_undo: Option<AnalyzeSettings>,
+    /// The draft changed since the window last asked.
+    draft_changed: bool,
 }
 
 impl SettingsPanel {
     /// A panel showing the session's settings.
     pub fn new() -> Self {
-        SettingsPanel {
-            stale_counts: true,
-            ..Default::default()
-        }
+        Self::default()
     }
 
-    /// An applied edit waits for the jobs to stop (or a busy store); no
-    /// blend may start meanwhile.
+    /// An analysis edit waits for the jobs to stop (or a busy store); no
+    /// merge may start meanwhile.
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
 
-    /// For the automatic pipeline: a global edit waits to apply, or jobs
-    /// cancelled for one (even one reverted since) have not all been
+    /// For the automatic pipeline: an analysis edit waits to apply, or jobs
+    /// cancelled for one (even one put back since) have not all been
     /// reported. The pipeline starts nothing meanwhile and restarts what
     /// the edit cancelled rather than taking it for a user's cancel.
     pub fn editing(&self, cfg: &MosaicConfig) -> bool {
@@ -309,55 +238,7 @@ impl SettingsPanel {
             || self
                 .pending
                 .as_ref()
-                .is_some_and(|e| e.impact(cfg) == ChangeImpact::Reanalyze)
-    }
-
-    /// Cancel the jobs in the way of `edit`: every blend for a blend-local
-    /// edit, every job but exports for a global one. True if any had to be
-    /// (the edit then waits for them to stop).
-    fn cancel_for(
-        &mut self,
-        edit: &SettingsEdit,
-        cfg: &MosaicConfig,
-        jobs: &mut JobRunner,
-    ) -> bool {
-        if edit.impact(cfg) == ChangeImpact::Reanalyze {
-            if jobs.busy_except_exports() {
-                jobs.cancel_all_but_exports();
-                self.cancelled_for_edit = true;
-                return true;
-            }
-        } else if jobs.blending() {
-            jobs.cancel_blends();
-            return true;
-        }
-        false
-    }
-
-    /// No tile count is running (a blend may start: see the module docs).
-    pub fn idle(&self) -> bool {
-        self.count_task.is_none()
-    }
-
-    /// The settings shown: the pending edit, else the draft, else the
-    /// session's.
-    pub fn shown(&self, cfg: &MosaicConfig) -> SettingsEdit {
-        self.pending
-            .clone()
-            .or_else(|| self.draft.clone())
-            .unwrap_or_else(|| SettingsEdit::of(cfg))
-    }
-
-    /// The staged edits, if any.
-    #[cfg(test)]
-    pub fn draft(&self) -> Option<&SettingsEdit> {
-        self.draft.as_ref()
-    }
-
-    /// The tile counts, once counted.
-    #[cfg(test)]
-    pub fn counts(&self) -> Option<(usize, usize)> {
-        self.counts
+                .is_some_and(|a| analyze_change(&cfg.analyze, a) == ChangeImpact::Reanalyze)
     }
 
     /// Why the typed feather is refused, if it is.
@@ -366,80 +247,93 @@ impl SettingsPanel {
         self.feather_error.as_deref()
     }
 
-    /// Stage `edit` (a draft equal to the session's settings is dropped).
-    pub fn stage(&mut self, edit: SettingsEdit, cfg: &MosaicConfig) {
-        self.applied = None;
-        self.error = None;
-        self.draft = (edit != SettingsEdit::of(cfg)).then_some(edit);
+    /// Pretend the feather text is invalid (tests of the merge guard).
+    #[cfg(test)]
+    pub fn force_feather_error(&mut self) {
+        self.feather_error = Some("Feather must be a number of pixels greater than 0.".into());
     }
 
-    /// Discard the staged edits and any edit waiting to apply.
-    pub fn revert(&mut self) {
-        self.draft = None;
-        self.pending = None;
-        self.retry_at = None;
-        self.feather_text = None;
-        self.feather_error = None;
-        self.error = None;
+    /// Why merging is blocked by what is typed, if it is (an invalid
+    /// feather width).
+    pub fn input_error(&self) -> Option<&'static str> {
+        self.feather_error
+            .is_some()
+            .then_some("Feather width must be a number above 0")
     }
 
-    /// A job ended: the results (and so the counts) may have changed.
-    pub fn on_event(&mut self, event: &JobEvent) {
-        if !matches!(event, JobEvent::Preview(_)) {
-            self.stale_counts = true;
+    /// The analysis settings from before the last applied change, once
+    /// (for the window's Undo toast).
+    pub fn take_analysis_undo(&mut self) -> Option<AnalyzeSettings> {
+        self.analysis_undo.take()
+    }
+
+    /// Whether the draft changed since the last call (the window then
+    /// saves `mosaic.json`, rate-limited).
+    pub fn take_draft_changed(&mut self) -> bool {
+        std::mem::take(&mut self.draft_changed)
+    }
+
+    /// Make `draft` the merge settings draft in `cfg.ui` (nothing is
+    /// invalidated, nothing is cancelled); the window saves it later.
+    pub fn edit_draft(&mut self, cfg: &mut MosaicConfig, draft: BlendSettings) {
+        if draft == load_draft(cfg) {
+            return;
         }
+        save_draft(&mut cfg.ui, &draft);
+        self.draft_changed = true;
     }
 
-    /// Apply the draft (see [`SettingsPanel::submit`]).
-    pub fn apply(
+    /// Cancel the jobs in the way of `new`: every job but exports when it
+    /// reruns the analysis. True if any had to be (the edit then waits for
+    /// them to stop).
+    fn cancel_for(
         &mut self,
+        new: &AnalyzeSettings,
+        cfg: &MosaicConfig,
+        jobs: &mut JobRunner,
+    ) -> bool {
+        if analyze_change(&cfg.analyze, new) == ChangeImpact::Reanalyze
+            && jobs.busy_except_exports()
+        {
+            jobs.cancel_all_but_exports();
+            self.cancelled_for_edit = true;
+            return true;
+        }
+        false
+    }
+
+    /// Apply the analysis settings `new` now with [`set_analyze_settings`],
+    /// or, while jobs in its way run, cancel them and keep it waiting
+    /// (newer work wins; see [`SettingsPanel::cancel_for`]). The impact
+    /// when a change was applied now.
+    pub fn edit_analysis(
+        &mut self,
+        new: AnalyzeSettings,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
     ) -> Option<ChangeImpact> {
-        if self.feather_error.is_some() {
-            return None;
-        }
-        let edit = self.draft.take()?;
-        self.submit(edit, session, jobs)
-    }
-
-    /// Apply `edit` with [`set_settings`], or, while jobs in its way run,
-    /// cancel them and keep it waiting (newer work wins; see
-    /// [`SettingsPanel::cancel_for`]). The impact when it was applied now.
-    fn submit(
-        &mut self,
-        edit: SettingsEdit,
-        session: &mut OpenSession,
-        jobs: &mut JobRunner,
-    ) -> Option<ChangeImpact> {
         self.pending = None;
         self.retry_at = None;
         self.error = None;
-        if self.cancel_for(&edit, &session.mosaic.config, jobs) {
-            self.pending = Some(edit);
+        if self.cancel_for(&new, &session.mosaic.config, jobs) {
+            self.pending = Some(new);
             return None;
         }
-        match set_settings(
-            &mut session.mosaic,
-            edit.analyze.clone(),
-            edit.blend.clone(),
-        ) {
+        let previous = session.mosaic.config.analyze.clone();
+        match set_analyze_settings(&mut session.mosaic, new.clone()) {
+            Ok(ChangeImpact::None) => None,
             Ok(impact) => {
-                self.draft = None;
-                self.feather_text = None;
-                self.applied = Some(impact);
-                self.stale_counts = true;
+                self.analysis_undo = Some(previous);
                 Some(impact)
             }
             Err(e) if e.is_busy() => {
-                self.pending = Some(edit);
+                self.pending = Some(new);
                 self.retry_at = Some(Instant::now() + BUSY_RETRY);
                 None
             }
             Err(e) => {
                 let message = format!("Could not change the settings: {e}");
                 tracing::warn!("{message}");
-                self.draft = Some(edit);
                 self.error = Some(message);
                 None
             }
@@ -456,170 +350,150 @@ impl SettingsPanel {
         jobs: &mut JobRunner,
     ) -> Option<ChangeImpact> {
         let edit = self.pending.take()?;
-        let applied = self.submit(edit, session, jobs);
+        let applied = self.edit_analysis(edit, session, jobs);
         if self.pending.is_some() {
             tracing::warn!("the settings edit waits: a result is in use elsewhere");
         }
         applied
     }
 
-    /// Take a finished tile count, start one when needed, and apply a
-    /// waiting edit once the runner is idle. Call every frame after the
-    /// runner's poll, whichever tab is shown. The impact when an edit was
-    /// applied.
+    /// Apply a waiting edit once the runner is idle. Call every frame after
+    /// the runner's poll, whichever tab is shown. The impact when an edit
+    /// was applied.
     pub fn poll(
         &mut self,
         ctx: &egui::Context,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
     ) -> Option<ChangeImpact> {
-        if let Some(task) = &self.count_task {
-            match task.poll() {
-                Poll::Pending => {}
-                Poll::Done(c) => {
-                    self.count_task = None;
-                    self.counts = Some(c);
-                }
-                Poll::Lost => self.count_task = None,
-            }
-        }
         // Every job cancelled for an edit has been reported (by the
         // runner's poll this frame, before the shell read `editing`).
         if self.cancelled_for_edit && !jobs.busy_except_exports() && !jobs.has_undelivered() {
             self.cancelled_for_edit = false;
         }
-        let mut applied = None;
-        if let Some(edit) = self.pending.clone() {
-            // Newer work wins, also over jobs started after the edit was
-            // queued; exports are spared.
-            if !self.cancel_for(&edit, &session.mosaic.config, jobs) {
-                let now = Instant::now();
-                match self.retry_at {
-                    Some(at) if at > now => ctx.request_repaint_after(at - now),
-                    _ => {
-                        self.pending = None;
-                        applied = self.submit(edit, session, jobs);
-                    }
-                }
+        let edit = self.pending.clone()?;
+        // Newer work wins, also over jobs started after the edit was
+        // queued; exports are spared.
+        if self.cancel_for(&edit, &session.mosaic.config, jobs) {
+            return None;
+        }
+        let now = Instant::now();
+        match self.retry_at {
+            Some(at) if at > now => {
+                ctx.request_repaint_after(at - now);
+                None
             }
+            _ => self.edit_analysis(edit, session, jobs),
         }
-        // Counted only while nothing but exports runs (no blend can
-        // recreate a store under the count's mapping) and only when a
-        // draft needs the cost. The stores are listed on the worker: the
-        // ones `set_settings` invalidates.
-        if self.stale_counts
-            && self.draft.is_some()
-            && self.count_task.is_none()
-            && !jobs.busy_except_exports()
-        {
-            self.stale_counts = false;
-            let dir = session.mosaic.dir.clone();
-            self.count_task = Task::spawn("mmm-settings-count", ctx, move || {
-                count_tiles(&result_store_paths(&dir).unwrap_or_default())
-            });
-        }
-        applied
     }
 
     /// Draw the panel (no heading or fold of its own: the inspector's
-    /// Merge settings section holds it); the impact when an edit was
-    /// applied now.
+    /// Merge settings section holds it) for the view showing `groups`; the
+    /// impact when an analysis edit was applied now.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
+        groups: &[String],
     ) -> Option<ChangeImpact> {
         let cfg = &session.mosaic.config;
-        let shown = self.shown(cfg);
-        let changed = changed_fields(cfg, &shown);
-        let mut edit = shown.clone();
+        let draft = load_draft(cfg);
+        let shown = self.pending.clone().unwrap_or_else(|| cfg.analyze.clone());
+        let changed = changed_fields(cfg, &draft, &shown, groups);
+        let cost = session
+            .merged
+            .then_some("Reruns the analysis; merged results go stale");
+        let mut edit = draft.clone();
+        let mut edit_analyze = shown.clone();
         let editable = self.pending.is_none();
         let caption = |ui: &mut egui::Ui, t: &str| {
             ui.label(RichText::new(t).small().color(palette::TEXT_SUBTLE));
         };
 
         caption(ui, "MERGE · re-merge only");
-        ui.add_enabled_ui(editable, |ui| {
-            egui::Grid::new("blend-settings-blend")
-                .num_columns(3)
-                .spacing([6.0, 4.0])
-                .show(ui, |ui| {
-                    let modes = [BlendMode::Pyramid, BlendMode::TwoBand, BlendMode::Feather];
-                    combo_row(
-                        ui,
-                        "Mode",
-                        changed.contains(&Field::Mode),
-                        &mut edit.blend.mode,
-                        &modes,
-                        mode_name,
-                        "Pyramid: multiband base + star-safe seams. TwoBand: feathered base \
-                         + star-safe seams. Feather: plain weighted average.",
-                    );
-                    self.feather_row(ui, changed.contains(&Field::Feather), &mut edit.blend);
-                    combo_row(
-                        ui,
-                        "Defect veto",
-                        changed.contains(&Field::DefectVeto),
-                        &mut edit.blend.defect_veto,
-                        &[true, false],
-                        on_off,
-                        "Suppress cosmic-ray residue and satellite trails that survive in \
-                         one panel of an overlap (TwoBand and Pyramid)",
-                    );
-                    combo_row(
-                        ui,
-                        "Flatten",
-                        changed.contains(&Field::Flatten),
-                        &mut edit.blend.flatten,
-                        &[None, Some(1), Some(2)],
-                        flatten_name,
-                        "Global background flatten of the merged mosaic (refused on \
-                         nebula-heavy mosaics)",
-                    );
-                });
-        });
+        egui::Grid::new("blend-settings-blend")
+            .num_columns(3)
+            .spacing([6.0, 4.0])
+            .show(ui, |ui| {
+                let modes = [BlendMode::Pyramid, BlendMode::TwoBand, BlendMode::Feather];
+                combo_row(
+                    ui,
+                    "Mode",
+                    changed.contains(&Field::Mode),
+                    &mut edit.mode,
+                    &modes,
+                    mode_name,
+                    "Pyramid: multiband base + star-safe seams. TwoBand: feathered base \
+                     + star-safe seams. Feather: plain weighted average.",
+                    None,
+                );
+                self.feather_row(ui, changed.contains(&Field::Feather), &mut edit);
+                combo_row(
+                    ui,
+                    "Defect veto",
+                    changed.contains(&Field::DefectVeto),
+                    &mut edit.defect_veto,
+                    &[true, false],
+                    on_off,
+                    "Suppress cosmic-ray residue and satellite trails that survive in \
+                     one panel of an overlap (TwoBand and Pyramid)",
+                    None,
+                );
+                combo_row(
+                    ui,
+                    "Flatten",
+                    changed.contains(&Field::Flatten),
+                    &mut edit.flatten,
+                    &[None, Some(1), Some(2)],
+                    flatten_name,
+                    "Global background flatten of the merged mosaic (refused on \
+                     nebula-heavy mosaics)",
+                    None,
+                );
+            });
         ui.add_space(6.0);
         caption(ui, "ANALYSIS · reruns analysis, every tile goes stale");
         ui.add_enabled_ui(editable, |ui| {
             egui::Grid::new("blend-settings-analyze")
-                .num_columns(3)
+                .num_columns(if cost.is_some() { 4 } else { 3 })
                 .spacing([6.0, 4.0])
                 .show(ui, |ui| {
                     combo_row(
                         ui,
                         "Input",
                         changed.contains(&Field::Input),
-                        &mut edit.analyze.input,
+                        &mut edit_analyze.input,
                         &[InputSelect::Auto, InputSelect::Aligned, InputSelect::Solved],
                         input_name,
                         "How the panels are read: detected, registered full-canvas frames, \
                          or unaligned panels with astrometric solutions",
+                        cost,
                     );
                     combo_row(
                         ui,
                         "Surface",
                         changed.contains(&Field::Surface),
-                        &mut edit.analyze.surface,
+                        &mut edit_analyze.surface,
                         &[None, Some(0), Some(1), Some(2)],
                         surface_name,
                         "Residual surface correction order",
+                        cost,
                     );
                     combo_row(
                         ui,
                         "Gain",
                         changed.contains(&Field::Gain),
-                        &mut edit.analyze.gain,
+                        &mut edit_analyze.gain,
                         &[GainMode::Fit, GainMode::Unity],
                         gain_name,
                         "Fit per-panel gains from the overlaps, or pin every gain at 1 \
                          (same rig and exposure)",
+                        cost,
                     );
                 });
         });
-        if editable && edit != shown {
-            self.stage(edit, &session.mosaic.config);
-        }
+        self.edit_draft(&mut session.mosaic.config, edit);
 
         for (group, o) in &session.mosaic.config.group_overrides {
             if !o.is_empty() {
@@ -635,6 +509,9 @@ impl SettingsPanel {
         }
 
         let mut applied = None;
+        if editable && edit_analyze != shown {
+            applied = self.edit_analysis(edit_analyze, session, jobs);
+        }
         if self.pending.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -645,48 +522,6 @@ impl SettingsPanel {
                 };
                 ui.label(RichText::new(text).small().color(palette::TEXT_BODY));
             });
-            if ui.small_button("Revert").clicked() {
-                self.revert();
-            }
-        } else if let Some(draft) = &self.draft {
-            let impact = draft.impact(&session.mosaic.config);
-            let counts = if self.stale_counts || self.count_task.is_some() {
-                None
-            } else {
-                self.counts
-            };
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(cost_text(impact, counts))
-                    .small()
-                    .color(palette::TEXT_BODY),
-            );
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(self.feather_error.is_none(), egui::Button::new("Apply"))
-                    .on_hover_text("Apply the changed settings")
-                    .on_disabled_hover_text("Fix the feather first")
-                    .clicked()
-                {
-                    applied = self.apply(session, jobs);
-                }
-                if ui.button("Revert").clicked() {
-                    self.revert();
-                }
-            });
-        } else if self.feather_error.is_some() {
-            if ui.small_button("Revert").clicked() {
-                self.revert();
-            }
-        } else if let Some(impact) = self.applied {
-            let note = match impact {
-                ChangeImpact::Reblend => "Applied. Merge again to see the change.",
-                ChangeImpact::Reanalyze => "Applied. Analysis reruns, then merge again.",
-                ChangeImpact::None => "",
-            };
-            if !note.is_empty() {
-                ui.label(RichText::new(note).small().color(palette::TEXT_MUTED));
-            }
         }
         if let Some(e) = self.error.clone() {
             ui.horizontal(|ui| {
@@ -700,7 +535,7 @@ impl SettingsPanel {
     }
 
     /// The feather row: a text field, validated as typed (a refused value
-    /// keeps the text and an error, and Apply is disabled).
+    /// keeps the text and an error, and the draft its last valid width).
     fn feather_row(&mut self, ui: &mut egui::Ui, changed: bool, blend: &mut BlendSettings) {
         mark(ui, changed);
         let label = ui.label(RichText::new("Feather (px)").color(palette::TEXT_BODY));
@@ -730,7 +565,7 @@ impl SettingsPanel {
             }
             self.feather_text = Some(text);
         } else if !r.has_focus() && self.feather_error.is_none() {
-            // Not being typed: follow the value (e.g. after Revert).
+            // Not being typed: follow the value.
             self.feather_text = None;
         }
         ui.end_row();
@@ -746,7 +581,7 @@ fn capitalise(s: &str) -> String {
     }
 }
 
-/// The changed-since-last-blend dot (or the room it takes).
+/// The changed-since-last-merge dot (or the room it takes).
 fn mark(ui: &mut egui::Ui, changed: bool) {
     if changed {
         ui.label(
@@ -770,6 +605,7 @@ fn combo_row<T: Copy + PartialEq>(
     options: &[T],
     show: fn(T) -> &'static str,
     hover: &str,
+    note: Option<&str>,
 ) {
     mark(ui, changed);
     let label = ui.label(RichText::new(name).color(palette::TEXT_BODY));
@@ -782,6 +618,9 @@ fn combo_row<T: Copy + PartialEq>(
             }
         });
     r.response.labelled_by(label.id).on_hover_text(hover);
+    if let Some(note) = note {
+        ui.label(RichText::new(note).small().color(palette::TEXT_MUTED));
+    }
     ui.end_row();
 }
 

@@ -1315,40 +1315,40 @@ fn previews_do_not_move_persisted_rois() {
 }
 
 #[test]
-fn no_merge_while_the_settings_tile_count_runs() {
-    use crate::blend_settings::SettingsEdit;
-
-    let (root, mut s, mut jobs) = analyzed("mosaic-settings-count");
-    jobs.start_blend(&mut s, "Ha", None);
-    drain(&mut jobs, &mut s);
-    let ctx = egui::Context::default();
+fn a_draft_edit_does_not_block_merging() {
+    let (root, mut s, mut jobs) = analyzed("mosaic-draft-edit");
     let mut view = MosaicView::new();
     view.select("Ha".into());
     member(&mut view, "Ha").reopen = false;
-    let mut e = SettingsEdit::of(&s.mosaic.config);
-    e.blend.feather_px = 128.0;
-    view.settings.stage(e, &s.mosaic.config);
-    // The draft needs its cost: the count starts (its TileReader maps the
-    // stores a merge may recreate).
-    view.poll_settings(&ctx, &mut s, &mut jobs);
-    assert!(!view.settings.idle());
-    let why = view.merge_block_reason(&s, &jobs).expect("blocked");
-    assert!(why.contains("settings"), "{why}");
-    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
-    assert!(!jobs.busy(), "no merge started during the count");
-    let deadline = Instant::now() + crate::testutil::PATIENCE;
-    while !view.settings.idle() {
-        assert!(Instant::now() < deadline, "the count never ended");
-        std::thread::sleep(Duration::from_millis(2));
-        view.poll_settings(&ctx, &mut s, &mut jobs);
-    }
+    let mut d = s.mosaic.config.blend.clone();
+    d.feather_px = 128.0;
+    view.settings.edit_draft(&mut s.mosaic.config, d);
     assert_eq!(view.merge_block_reason(&s, &jobs), None);
+    assert!(view.is_settled() || !view.settings.has_pending());
+    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
+    assert!(jobs.busy(), "the merge started");
+    drain(&mut jobs, &mut s);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn settings_edit_waits_for_merges_and_blocks_merging() {
-    use crate::blend_settings::SettingsEdit;
+fn an_invalid_feather_blocks_merge() {
+    let (root, s, jobs) = analyzed("mosaic-bad-feather");
+    let mut view = MosaicView::new();
+    view.select("Ha".into());
+    member(&mut view, "Ha").reopen = false;
+    assert_eq!(view.merge_block_reason(&s, &jobs), None);
+    view.settings.force_feather_error();
+    assert_eq!(
+        view.merge_block_reason(&s, &jobs).as_deref(),
+        Some("Feather width must be a number above 0")
+    );
+    assert!(view.merge_roi_block_reason(&s, &jobs).is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn analysis_edit_waits_for_merges_and_blocks_merging() {
     use mmm_core::settings::ChangeImpact;
 
     let (root, mut s, mut jobs) = analyzed("mosaic-settings-wait");
@@ -1359,10 +1359,9 @@ fn settings_edit_waits_for_merges_and_blocks_merging() {
     assert_eq!(view.merge_block_reason(&s, &jobs), None);
     let gate = jobs.hold();
     view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
-    let mut e = SettingsEdit::of(&s.mosaic.config);
-    e.blend.feather_px = 128.0;
-    view.settings.stage(e, &s.mosaic.config);
-    assert_eq!(view.settings.apply(&mut s, &mut jobs), None);
+    let mut a = s.mosaic.config.analyze.clone();
+    a.gain = mmm_core::photometry::GainMode::Unity;
+    assert_eq!(view.edit_analysis(a, &mut s, &mut jobs), None);
     // Waiting for the merge to stop: no merge may start meanwhile, and the
     // shell keeps the pipeline from starting anything.
     assert!(view.settings.has_pending());
@@ -1378,8 +1377,11 @@ fn settings_edit_waits_for_merges_and_blocks_merging() {
         applied = view.poll_settings(&ctx, &mut s, &mut jobs);
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(applied, Some(ChangeImpact::Reblend));
-    assert_eq!(s.mosaic.config.blend.feather_px, 128.0);
+    assert_eq!(applied, Some(ChangeImpact::Reanalyze));
+    assert_eq!(
+        s.mosaic.config.analyze.gain,
+        mmm_core::photometry::GainMode::Unity
+    );
     assert!(!view.settings.has_pending());
     // The view's results, ROI freshness and health are looked at again.
     assert!(view.rois.want_fresh && view.want_health);
