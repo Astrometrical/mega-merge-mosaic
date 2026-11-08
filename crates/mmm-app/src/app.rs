@@ -470,6 +470,8 @@ impl Shell {
                 JobEvent::Preview(_) => continue,
                 JobEvent::Finished { label, .. } if label == PREVIEWS_LABEL => continue,
                 JobEvent::Cancelled { id } if name(id) == PREVIEWS_LABEL => continue,
+                // A panel edit's one toast says why (below).
+                JobEvent::Cancelled { id } if jobs.stopped_by_edit(*id) => continue,
                 JobEvent::Finished { label, .. } => (Tone::Success, format!("{label} finished")),
                 JobEvent::Cancelled { id } => (Tone::Neutral, format!("{} cancelled", name(id))),
                 JobEvent::Failed { message, .. } => (Tone::Problem, message.clone()),
@@ -477,6 +479,12 @@ impl Shell {
             #[cfg(test)]
             self.toasted.push(text.clone());
             self.toasts.push(toast(tone, text), clock);
+        }
+        if jobs.take_merge_stopped() {
+            let text = "Merge stopped: panels changed".to_string();
+            #[cfg(test)]
+            self.toasted.push(text.clone());
+            self.toasts.push(toast(Tone::Neutral, text), clock);
         }
         self.window.poll_panels(ctx, session, jobs);
         self.window.poll_settings(ctx, session, jobs);
@@ -1618,6 +1626,39 @@ mod tests {
         step_until(&mut h, |_| on_disk(&dir) == 8);
         assert_eq!(MosaicConfig::load(&dir).unwrap().panels, previous.panels);
         assert!(h.state().undos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_panel_edit_stops_the_merge_with_one_toast() {
+        use crate::panel_edits::{Applied, PanelsEdit};
+        let root = temp_dir("shell-edit-stops-merge");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| {
+            s.session().unwrap().mosaic.config.group_dirs.len() == 2
+                && !s.jobs.as_ref().unwrap().busy()
+        });
+        h.run_steps(2);
+        let before = h.state().toasted().len();
+        // Two merges, one running (held) and one queued; a panel is removed.
+        let held = {
+            let shell = h.state_mut();
+            let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
+            let held = jobs.hold();
+            jobs.start_blend(session, "Ha", None);
+            jobs.start_blend(session, "OIII", None);
+            let mut edit = PanelsEdit::of(session);
+            edit.panels.pop();
+            assert!(matches!(edit.apply(session, jobs), Applied::Queued(_)));
+            held
+        };
+        held.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        let toasted = &h.state().toasted()[before..];
+        assert_eq!(toasted, ["Merge stopped: panels changed"], "{toasted:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

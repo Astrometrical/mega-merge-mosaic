@@ -278,6 +278,12 @@ pub struct JobRunner {
     exports_ended: usize,
     /// Events raised outside `poll` (queued jobs cancelled), delivered by it.
     pending: Vec<JobEvent>,
+    /// Whole-canvas merges a panel edit stopped, by id
+    /// ([`JobRunner::cancel_for_panel_edit`]).
+    edit_stopped: BTreeSet<u64>,
+    /// Set when an edit stopped a merge not yet reported
+    /// ([`JobRunner::take_merge_stopped`]).
+    merge_stopped: bool,
     /// The frame of the last previews run that finished with every panel,
     /// until taken ([`JobRunner::take_previews_frame`]).
     previews_frame: Option<ReferenceFrame>,
@@ -305,6 +311,8 @@ impl JobRunner {
             blends_ended: 0,
             exports_ended: 0,
             pending: Vec::new(),
+            edit_stopped: BTreeSet::new(),
+            merge_stopped: false,
             previews_frame: None,
             #[cfg(test)]
             gate: None,
@@ -493,6 +501,52 @@ impl JobRunner {
         });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+    }
+
+    /// [`JobRunner::cancel_all_but_exports`] for a panel edit, remembering
+    /// the whole-canvas merges it stops (running or queued, not yet being
+    /// cancelled): they are [`JobRunner::stopped_by_edit`], and
+    /// [`JobRunner::take_merge_stopped`] says once that the edit stopped
+    /// some. Cancelling again later stops nothing new.
+    pub fn cancel_for_panel_edit(&mut self) {
+        let running = self
+            .running
+            .iter()
+            .filter(|r| !r.export && !r.token.is_cancelled())
+            .map(|r| r.id);
+        let queued = self
+            .queue
+            .iter()
+            .filter(|q| matches!(q.kind, Kind::Blend { .. }))
+            .map(|q| q.id);
+        let stopped: Vec<u64> = running
+            .chain(queued)
+            .filter(|id| self.whole_canvas(*id) && self.in_run(*id) == Some(JobTarget::Blend))
+            .collect();
+        self.merge_stopped |= !stopped.is_empty();
+        self.edit_stopped.extend(stopped);
+        self.cancel_all_but_exports();
+    }
+
+    /// Whether a panel edit stopped merge `id`
+    /// ([`JobRunner::cancel_for_panel_edit`]).
+    pub fn stopped_by_edit(&self, id: u64) -> bool {
+        self.edit_stopped.contains(&id)
+    }
+
+    /// Whether a panel edit has stopped whole-canvas merges since the last
+    /// call (once per edit, however many merges it stopped).
+    pub fn take_merge_stopped(&mut self) -> bool {
+        std::mem::take(&mut self.merge_stopped)
+    }
+
+    /// Whether a whole-canvas merge is queued while an export runs.
+    pub fn merge_waits_for_export(&self) -> bool {
+        self.running.as_ref().is_some_and(|r| r.export)
+            && self
+                .queue
+                .iter()
+                .any(|q| matches!(q.kind, Kind::Blend { .. }) && self.whole_canvas(q.id))
     }
 
     /// Cancel every job, exports included, and wait up to `wait` for the

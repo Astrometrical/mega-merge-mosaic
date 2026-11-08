@@ -2271,6 +2271,44 @@ fn a_one_group_merge_names_no_group() {
 }
 
 #[test]
+fn a_merge_waits_behind_an_export() {
+    use crate::jobs::JobEvent;
+    let (root, mut s, mut jobs) = analyzed("steps-merge-after-export");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    // An export runs (held); a merge is pressed meanwhile.
+    let gate = jobs.hold();
+    let out = root.join("ha.fits");
+    let export = jobs.start_export(&s, "Ha", out, crate::export::ExportFormat::Fits);
+    let merge = jobs.start_blend(&mut s, "OIII", None);
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    let want = StripStep {
+        label: "Merge queued after export".into(),
+        state: StepState::Working { fraction: None },
+        cancellable: true,
+        tooltip: None,
+    };
+    assert_eq!(got[MERGE_STEP], want);
+    // Cancel from the step drops the queued merge and spares the export.
+    super::top_bar::cancel_step(MERGE_STEP, &mut jobs);
+    let events = jobs.poll(&mut s);
+    assert!(events.contains(&JobEvent::Cancelled { id: merge }));
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    assert_ne!(got[MERGE_STEP].label, "Merge queued after export");
+    // Queued again, it runs once the export has ended.
+    let merge = jobs.start_blend(&mut s, "OIII", None);
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    let finished = |id: u64| {
+        events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id))
+    };
+    assert!(finished(export) && finished(merge), "{events:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn shortcuts_work_with_a_button_focused() {
     use egui::Key;
     let (root, s, jobs) = merged("window-shortcut-focus");

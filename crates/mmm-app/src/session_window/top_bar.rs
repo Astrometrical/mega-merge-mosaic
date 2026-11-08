@@ -288,7 +288,7 @@ impl SessionWindow {
 
 /// Step `i`'s Cancel was clicked: cancel its jobs (running and queued). An
 /// ROI's merge is not the Merge step's: it runs on.
-fn cancel_step(i: usize, jobs: &mut JobRunner) {
+pub(super) fn cancel_step(i: usize, jobs: &mut JobRunner) {
     let views = jobs.views();
     let of = |target: JobTarget| {
         jobs_where(&views, |v| match jobs.target(v.id) {

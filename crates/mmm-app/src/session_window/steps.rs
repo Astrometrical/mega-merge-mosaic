@@ -6,7 +6,7 @@
 //! |---|---|
 //! | Panels | none: "Add panels"; previews running: "Reading previews {done} / {n}" (cancellable); previews stopped short: "Read previews" (next); else "{n} panels" (done) |
 //! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
-//! | Merge | whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, or it needs analysis): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
+//! | Merge | a whole-canvas merge queued while an export runs: "Merge queued after export" (cancellable, no fraction); whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, or it needs analysis): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
 //! | Export | exports running or queued: "Exporting {i} of {n}" ("Exporting" for one) (cancellable); else "Export" |
 //!
 //! One step at most is next (highlighted): the first that waits for the
@@ -190,6 +190,9 @@ fn checks_step(
 }
 
 fn merge_step(session: &OpenSession, jobs: &JobRunner, views: &[JobView]) -> StripStep {
+    if jobs.merge_waits_for_export() {
+        return working("Merge queued after export".into(), None);
+    }
     if let Some(run) = jobs.run_of(JobTarget::Blend) {
         let f = fraction(views, run.id).unwrap_or(0.0);
         let pct = (f * 100.0).floor() as u32;

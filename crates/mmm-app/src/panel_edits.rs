@@ -336,7 +336,7 @@ impl PanelsEdit {
         scope: Option<&BTreeSet<String>>,
     ) -> Applied {
         if jobs.busy_except_exports() {
-            jobs.cancel_all_but_exports();
+            jobs.cancel_for_panel_edit();
             return Applied::Queued(self);
         }
         match set_inputs_affecting(
@@ -442,7 +442,7 @@ impl PanelEdits {
     pub fn submit(&mut self, edit: PanelsEdit, session: &mut OpenSession, jobs: &mut JobRunner) {
         self.retry_at = None;
         if jobs.busy_except_exports() {
-            jobs.cancel_all_but_exports();
+            jobs.cancel_for_panel_edit();
         }
         let task = self.ctx.as_ref().and_then(|ctx| {
             let (old, frame) = (session.groups.clone()?, session.frame.clone()?);
@@ -473,7 +473,7 @@ impl PanelEdits {
                 Poll::Pending => {
                     if jobs.busy_except_exports() {
                         self.blocked = true;
-                        jobs.cancel_all_but_exports();
+                        jobs.cancel_for_panel_edit();
                     }
                     return;
                 }
@@ -484,7 +484,7 @@ impl PanelEdits {
         if jobs.busy_except_exports() {
             // Cancelling again is harmless.
             self.blocked = true;
-            jobs.cancel_all_but_exports();
+            jobs.cancel_for_panel_edit();
             return;
         }
         if self.retry_at.is_some_and(|at| at > Instant::now()) {
