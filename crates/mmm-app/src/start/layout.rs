@@ -34,9 +34,6 @@ use crate::session::SESSION_EXT;
 const BLOCK_MAX_WIDTH: f32 = 480.0;
 /// Where the session block starts, as a fraction of the window's height.
 const BLOCK_TOP: f32 = 0.25;
-/// How far above the window the hero image starts, as a fraction of its
-/// height.
-const IMAGE_OVERHANG: f32 = 0.02;
 /// Width of the first-run column.
 const FIRST_RUN_WIDTH: f32 = 480.0;
 /// How far above the window's centre the first-run column starts.
@@ -57,12 +54,12 @@ impl StartScreen {
         let full = ui.max_rect();
         let first_run = self.library.entries().is_empty();
         let bottom = self.bottom_area(full);
-        let (image, floor) = self.hero_area(full);
+        let column = self.hero_column(full);
         // The night sky the starfield and the image sit on, whatever the
         // screen is drawn in.
         ui.painter().rect_filled(full, 0.0, SURFACE_900);
         ui.scope_builder(UiBuilder::new().max_rect(full), |ui| {
-            self.stage.show(ui, image, floor, now);
+            self.stage.show(ui, column, now);
         });
         if first_run {
             self.first_run(ui, full, out);
@@ -79,7 +76,6 @@ impl StartScreen {
         }
         if let Some(target) = target {
             let left = full.left() + space::XXL;
-            let width = BLOCK_MAX_WIDTH.min(full.width() - 2.0 * space::XXL);
             // A quarter down, or higher when the window is too short for
             // the block, but under the lockup; it scrolls if still short.
             let end = bottom.top() - space::L;
@@ -87,7 +83,7 @@ impl StartScreen {
                 .min(end - self.block_height)
                 .max(full.top() + space::XXL + LARGE_LOGO_H + space::L);
             let end = end.max(top + CONTROL_HEIGHT_LARGE);
-            let rect = Rect::from_min_max(pos2(left, top), pos2(left + width, end));
+            let rect = Rect::from_min_max(pos2(left, top), pos2(column, end));
             self.block(ui, rect, target, now, out);
         }
         if self.all_sessions {
@@ -97,16 +93,11 @@ impl StartScreen {
         }
     }
 
-    /// The hero's image area, full bleed to the window's right and bottom
-    /// edges, and its floor: the top of the shelf (or the grid) laid over
-    /// the image's foot, or the window's bottom on the first-run screen.
-    pub(super) fn hero_area(&self, full: Rect) -> (Rect, f32) {
-        let floor = if self.library.entries().is_empty() {
-            full.bottom()
-        } else {
-            self.bottom_area(full).top()
-        };
-        (image_rect(full), floor)
+    /// The right edge of the content column along the left (the session
+    /// block, and the shelf's or grid's heading row), over which the
+    /// hero's left feather holds so the text there stays readable.
+    pub(super) fn hero_column(&self, full: Rect) -> f32 {
+        full.left() + space::XXL + BLOCK_MAX_WIDTH.min(full.width() - 2.0 * space::XXL)
     }
 
     /// The shelf's (or the grid's) area along the bottom: a header row and
@@ -246,15 +237,15 @@ impl StartScreen {
                 .layout(Layout::top_down(Align::Min)),
         );
         ui.spacing_mut().item_spacing.y = space::S;
+        // "All sessions" beside the heading, inside the hero's left
+        // feather: the image is not darkened further right.
         ui.horizontal(|ui| {
             overline(ui, "Recent sessions");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let all = MegaButton::new(ButtonKind::Quiet, "All sessions")
-                    .trailing_icon(icons::CHEVRON_RIGHT);
-                if ui.add(all).clicked() {
-                    out.cmds.push(Cmd::ShowAll(true));
-                }
-            });
+            let all = MegaButton::new(ButtonKind::Quiet, "All sessions")
+                .trailing_icon(icons::CHEVRON_RIGHT);
+            if ui.add(all).clicked() {
+                out.cmds.push(Cmd::ShowAll(true));
+            }
         });
         let fit = ((rect.width() + space::M) / (CARD_WIDTH + space::M))
             .floor()
@@ -590,18 +581,6 @@ fn status_rows(ui: &mut Ui, f: &CardFacts) {
             ui.label(text(Type::Small, label).color(tone.color()));
         }
     });
-}
-
-/// The hero image's area: the right two thirds of `full`, from a little
-/// above it down to its bottom edge (under the shelf).
-fn image_rect(full: Rect) -> Rect {
-    Rect::from_min_max(
-        pos2(
-            full.left() + full.width() / 3.0,
-            full.top() - IMAGE_OVERHANG * full.height(),
-        ),
-        full.max,
-    )
 }
 
 /// Run `add` in a child ui with the explicit id `id`, so the text field it

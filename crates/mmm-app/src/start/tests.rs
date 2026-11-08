@@ -92,6 +92,8 @@ struct Screen {
     actions: Vec<StartAction>,
     /// Frames the start screen has drawn.
     frames: usize,
+    /// The area it last drew in.
+    full: Option<egui::Rect>,
     /// After the screen's first pass: the facts it knew, and the session
     /// it showed.
     first_pass: Option<(usize, Option<PathBuf>)>,
@@ -103,6 +105,7 @@ impl Screen {
             screen: StartScreen::new(recent, Arc::new(picker)),
             actions: Vec::new(),
             frames: 0,
+            full: None,
             first_pass: None,
         }
     }
@@ -125,6 +128,7 @@ fn harness_with(state: Screen) -> Harness<'static, Screen> {
             |ui, s: &mut Screen| {
                 if crate::testutil::themed(ui) {
                     s.frames += 1;
+                    s.full = Some(ui.max_rect());
                     s.actions.extend(s.screen.ui(ui));
                     if s.first_pass.is_none() {
                         s.first_pass = Some((s.screen.facts_known(), s.screen.hero()));
@@ -706,28 +710,37 @@ fn all_sessions_searches_names_and_notes() {
 }
 
 #[test]
-fn hero_runs_under_the_shelf() {
-    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
-    let root = temp_dir("hero-under-shelf");
-    let recent = vec![entry(&root.join("Gone.mmm-session"))];
-    let mut s = StartScreen::new(recent, Arc::new(StubPicker(None)));
-    let (image, floor) = s.hero_area(full);
-    // The image fills the window's right two thirds down to its bottom
-    // edge, under the shelf...
-    assert_eq!(image.right(), full.right());
-    assert_eq!(image.bottom(), full.bottom());
-    assert!((image.left() - full.width() / 3.0).abs() < 0.5, "{image:?}");
-    // ...whose top (a header row and a row of cards up) is the floor.
-    let shelf = mega_ui::theme::tokens::CONTROL_HEIGHT + mega_ui::widgets::CARD_HEIGHT;
-    assert!(floor <= full.bottom() - shelf, "{floor}");
-    assert!(floor > full.center().y, "{floor}");
-    // The All sessions grid reaches higher, and so does the floor.
-    s.all_sessions = true;
-    let (_, grid_floor) = s.hero_area(full);
-    assert!(grid_floor < floor, "{grid_floor} vs {floor}");
-    // No shelf on the first-run screen: the floor is the window's bottom.
-    let first = StartScreen::new(Vec::new(), Arc::new(StubPicker(None)));
-    assert_eq!(first.hero_area(full).1, full.bottom());
+fn overlaid_text_lies_over_the_left_feather() {
+    // The hero fills the window; only its left feather keeps the text laid
+    // over it readable, so all of that text sits in the feather's column.
+    let root = temp_dir("start-left-feather");
+    let dir = session(&root, "Veil Nebula");
+    let mut h = harness(vec![entry(&dir)]);
+    settle(&mut h);
+    let column = h.state().screen.hero_column(h.state().full.expect("drawn"));
+    let right = |h: &Harness<'static, Screen>, role: Role, label: &str| {
+        h.get_by_role_and_label(role, label).rect().right()
+    };
+    for (role, label) in [
+        (Role::Label, "Veil Nebula"),
+        (Role::Label, "RECENT SESSIONS"),
+        (Role::Button, "All sessions"),
+        (Role::Button, "Resume session"),
+        (Role::Button, "Open…"),
+    ] {
+        let r = right(&h, role, label);
+        assert!(
+            r <= column + 0.5,
+            "{label} ends at {r}, past the column {column}"
+        );
+    }
+    h.get_by_label("All sessions").click();
+    h.run();
+    let r = right(&h, Role::Button, "Back");
+    assert!(
+        r <= column + 0.5,
+        "Back ends at {r}, past the column {column}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

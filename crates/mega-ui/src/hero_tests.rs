@@ -6,7 +6,6 @@ use egui_kittest::kittest::Queryable;
 
 use super::*;
 use crate::theme::palette::SURFACE_900;
-use crate::theme::palette::TEXT_SUBTLE;
 use crate::theme::tokens::KEN_BURNS_ZOOM;
 use crate::viewer::ImageTileSource;
 use crate::viewer::{Fetched, PyramidGeometry, TileKey, TileSource};
@@ -17,9 +16,6 @@ const EPS: f64 = 0.01;
 struct State {
     stage: HeroStage,
     now: f64,
-    /// How far above the bottom of the drawing area [`harness`] puts the
-    /// floor.
-    floor_inset: f32,
     /// The drawing area, as of the last frame.
     full: Rect,
 }
@@ -28,7 +24,6 @@ fn state(stage: HeroStage) -> State {
     State {
         stage,
         now: 0.0,
-        floor_inset: 0.0,
         full: Rect::NOTHING,
     }
 }
@@ -63,11 +58,15 @@ fn harness(views: Vec<HeroView>, reduced: bool) -> Harness<'static, State> {
                 }
                 let r = ui.max_rect();
                 s.full = r;
-                let image = Rect::from_min_max(pos2(r.left() + r.width() / 3.0, r.top()), r.max);
-                s.stage.show(ui, image, r.bottom() - s.floor_inset, s.now);
+                s.stage.show(ui, column(r), s.now);
             },
             state(stage),
         )
+}
+
+/// The right edge of [`harness`]'s content column: a third of the way in.
+fn column(full: Rect) -> f32 {
+    full.left() + full.width() / 3.0
 }
 
 fn frames(h: &mut Harness<'_, State>, now: f64) {
@@ -225,8 +224,8 @@ fn sized(label: &str, size: [usize; 2]) -> HeroView {
     }
 }
 
-/// A 900 × 500 harness drawing `views` (from `start`) into the fixed image
-/// area `image`.
+/// A 900 × 500 harness drawing `views` (from `start`) into the fixed area
+/// `image` (the stage fills its ui's max rect).
 fn harness_in(
     views: Vec<HeroView>,
     start: usize,
@@ -241,7 +240,9 @@ fn harness_in(
         .build_ui_state(
             move |ui, s: &mut State| {
                 if crate::testutil::themed(ui) {
-                    s.stage.show(ui, image, image.bottom(), s.now);
+                    ui.scope_builder(UiBuilder::new().max_rect(image), |ui| {
+                        s.stage.show(ui, image.left(), s.now);
+                    });
                 }
             },
             state(stage),
@@ -406,153 +407,125 @@ fn meshes(h: &Harness<'_, State>) -> Vec<egui::Mesh> {
     out
 }
 
-/// Whether a feather ramp lies on `edge`: a mesh whose vertices there are
-/// opaque page colour and whose others are transparent.
-fn has_ramp(meshes: &[egui::Mesh], edge: impl Fn(egui::Pos2) -> bool) -> bool {
-    meshes.iter().any(|m| {
-        let on: Vec<_> = m.vertices.iter().filter(|v| edge(v.pos)).collect();
-        let off = m.vertices.len() - on.len();
-        m.vertices.len() == 4
-            && on.len() == 2
-            && off == 2
-            && on.iter().all(|v| v.color == SURFACE_900)
-            && m.vertices
-                .iter()
-                .filter(|v| !edge(v.pos))
-                .all(|v| v.color == Color32::TRANSPARENT)
+/// How much the stage's page-colour meshes (untextured, near-black
+/// vertices) darken the image at `p`: 0 not at all, 1 to the page colour.
+fn darkening_at(h: &Harness<'_, State>, p: egui::Pos2) -> f32 {
+    let mut clear = 1.0;
+    for m in meshes(h) {
+        let dark = m
+            .vertices
+            .iter()
+            .all(|v| v.color.r() <= 8 && v.color.g() <= 8 && v.color.b() <= 8);
+        if m.texture_id != egui::TextureId::default() || !dark {
+            continue;
+        }
+        for t in m.indices.chunks(3) {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| m.vertices[i as usize]);
+            let d = (b.pos.y - c.pos.y) * (a.pos.x - c.pos.x)
+                + (c.pos.x - b.pos.x) * (a.pos.y - c.pos.y);
+            if d.abs() < 1e-6 {
+                continue;
+            }
+            let wa =
+                ((b.pos.y - c.pos.y) * (p.x - c.pos.x) + (c.pos.x - b.pos.x) * (p.y - c.pos.y)) / d;
+            let wb =
+                ((c.pos.y - a.pos.y) * (p.x - c.pos.x) + (a.pos.x - c.pos.x) * (p.y - c.pos.y)) / d;
+            let wc = 1.0 - wa - wb;
+            if [wa, wb, wc].iter().all(|&w| w >= -1e-4) {
+                let alpha = |v: egui::epaint::Vertex| f32::from(v.color.a()) / 255.0;
+                clear *= 1.0 - (wa * alpha(a) + wb * alpha(b) + wc * alpha(c));
+                break;
+            }
+        }
+    }
+    1.0 - clear
+}
+
+/// The colour a white image (the worst case under light text) shows at a
+/// point darkened by `d` toward the page colour.
+fn over_white(d: f32) -> Color32 {
+    let page = f32::from(SURFACE_900.r());
+    Color32::from_gray((255.0 * (1.0 - d) + page * d).round() as u8)
+}
+
+/// Whether the starfield was painted: an untextured mesh with bright
+/// vertices.
+fn starfield_painted(h: &Harness<'_, State>) -> bool {
+    meshes(h).iter().any(|m| {
+        m.texture_id == egui::TextureId::default() && m.vertices.iter().any(|v| v.color.r() > 64)
     })
 }
 
 #[test]
-fn image_edges_off_the_window_edge_are_feathered() {
-    // The harness image runs from a third of the width to the right and
-    // bottom edges of the window: only its left edge is feathered.
+fn starfield_stands_in_until_the_image_is_on_screen() {
+    let mut h = harness(Vec::new(), true);
+    frames(&mut h, 0.0);
+    assert!(starfield_painted(&h), "no views: the starfield shows");
     let mut h = harness(two_views(), true);
     frames(&mut h, 0.0);
-    let m = meshes(&h);
-    let ramps = |m: &[egui::Mesh]| -> Vec<(egui::Pos2, egui::Pos2)> {
-        m.iter()
-            .filter(|m| m.vertices.len() == 4)
-            .filter(|m| m.vertices.iter().filter(|v| v.color == SURFACE_900).count() == 2)
-            .filter(|m| {
-                m.vertices
-                    .iter()
-                    .filter(|v| v.color == Color32::TRANSPARENT)
-                    .count()
-                    == 2
-            })
-            .map(|m| (m.vertices[0].pos, m.vertices[2].pos))
-            .collect()
-    };
-    let r = ramps(&m);
-    assert_eq!(r.len(), 1, "{r:?}");
-    // Opaque at the image's left edge, clear to its right.
-    assert!(r[0].1.x > r[0].0.x);
-
-    // An image inset from the bottom and right is feathered there too.
-    let mut stage = HeroStage::new_synchronous();
-    stage.set_reduced_motion(true);
-    stage.set_views(two_views(), 0, 0.0);
-    let mut h = Harness::builder()
-        .with_size(Vec2::new(900.0, 500.0))
-        .build_ui_state(
-            |ui, s: &mut State| {
-                if !crate::testutil::themed(ui) {
-                    return;
-                }
-                let image = Rect::from_min_max(pos2(300.0, -10.0), pos2(850.0, 400.0));
-                s.stage.show(ui, image, image.bottom(), 0.0);
-            },
-            state(stage),
-        );
-    h.run_steps(3);
-    let m = meshes(&h);
-    assert!(has_ramp(&m, |p| (p.y - 400.0).abs() < 0.5));
-    assert!(has_ramp(&m, |p| (p.x - 850.0).abs() < 0.5));
-    // The top overhangs the window: no ramp there.
-    assert!(!has_ramp(&m, |p| (p.y + 10.0).abs() < 0.5));
-}
-
-/// A [`harness`] whose floor (the top of a shelf laid over the image's
-/// foot) is `inset` points above the bottom.
-fn harness_over(views: Vec<HeroView>, inset: f32) -> Harness<'static, State> {
-    let mut h = harness(views, true);
-    h.state_mut().floor_inset = inset;
-    h
+    assert!(h.state().stage.first_image_drawn());
+    assert!(
+        !starfield_painted(&h),
+        "the image is on screen: no starfield"
+    );
 }
 
 #[test]
-fn label_and_controls_sit_just_above_the_floor() {
-    let mut h = harness_over(two_views(), 150.0);
+fn label_and_controls_sit_in_the_top_right_feather() {
+    let mut h = harness(two_views(), true);
     frames(&mut h, 0.0);
     let full = h.state().full;
-    let floor = full.bottom() - 150.0;
     let next = h.get_by_label("Next image").rect();
-    let label = h.get_by_label("Ha").rect();
-    for (what, r) in [("Next", next), ("label", label)] {
-        assert!(
-            r.bottom() <= floor - space::S,
-            "{what} {r:?} reaches the floor {floor}"
-        );
-        assert!(
-            r.top() >= floor - 2.0 * CONTROL_HEIGHT,
-            "{what} {r:?} is far above the floor {floor}"
-        );
-    }
-    // Their right edge keeps the page margin, like the content below.
     assert!(
         (next.right() - (full.right() - space::XXL)).abs() < 1.0,
         "{next:?}"
     );
-}
-
-/// The painted bottom scrim: the six-vertex mesh, rows at the bottom, the
-/// floor and the top of its rise, opaque [`FLOOR_SCRIM`] at the bottom.
-fn scrim(h: &Harness<'_, State>) -> egui::Mesh {
-    let dark = SURFACE_900.gamma_multiply(FLOOR_SCRIM);
-    meshes(h)
-        .into_iter()
-        .find(|m| m.vertices.len() == 6 && m.vertices[0].color == dark)
-        .expect("a bottom scrim")
-}
-
-/// The colour `scrim` leaves at height `y` over a white image (the worst
-/// case for light text): premultiplied blending, as egui's renderers do.
-fn over_white(scrim: &egui::Mesh, y: f32) -> Color32 {
-    let rows: Vec<_> = scrim.vertices.iter().step_by(2).collect();
-    let src = rows
-        .windows(2)
-        .find_map(|w| {
-            let (a, b) = (w[0], w[1]);
-            let (lo, hi) = (a.pos.y.min(b.pos.y), a.pos.y.max(b.pos.y));
-            (lo <= y && y <= hi && hi > lo).then(|| {
-                let t = (y - a.pos.y) / (b.pos.y - a.pos.y);
-                a.color.lerp_to_gamma(b.color, t)
-            })
-        })
-        .unwrap_or(Color32::TRANSPARENT);
-    let v = |c: u8| (f32::from(c) + 255.0 * (1.0 - f32::from(src.a()) / 255.0)).round() as u8;
-    Color32::from_rgb(v(src.r()), v(src.g()), v(src.b()))
+    assert!(
+        (next.top() - (full.top() + space::XXL)).abs() < 1.0,
+        "{next:?}"
+    );
+    // The label stays AA over a white image, corner to corner.
+    let label = h.get_by_label("Ha").rect();
+    for p in [
+        label.left_top(),
+        label.right_top(),
+        label.left_bottom(),
+        label.right_bottom(),
+    ] {
+        let bg = over_white(darkening_at(&h, p));
+        let ratio = crate::theme::contrast_ratio(TEXT_EMPHASIS, bg);
+        assert!(ratio >= 4.5, "label at {p:?}: {ratio} on {bg:?}");
+    }
 }
 
 #[test]
-fn text_on_and_above_the_floor_stays_legible_over_any_image() {
-    let mut h = harness_over(two_views(), 150.0);
+fn left_feather_holds_over_the_column_then_eases_to_clear() {
+    let mut h = harness(two_views(), true);
     frames(&mut h, 0.0);
     let full = h.state().full;
-    let floor = full.bottom() - 150.0;
-    let s = scrim(&h);
-    // The shelf's faintest text (overlines) anywhere from the floor down.
-    for y in [floor, floor + 20.0, full.bottom() - 1.0] {
-        let bg = over_white(&s, y);
-        let ratio = crate::theme::contrast_ratio(TEXT_SUBTLE, bg);
-        assert!(ratio >= 4.5, "at {y}: {ratio} on {bg:?}");
+    let (col, y) = (column(full), full.center().y);
+    let at = |x: f32| darkening_at(&h, pos2(x, y));
+    let edge = at(full.left() + 1.0);
+    // Darkened, but never to black: the image shows through.
+    assert!(edge > 0.0 && edge < 1.0, "{edge}");
+    assert!((at(col - 1.0) - edge).abs() < 0.01, "holds over the column");
+    let ease = LEFT_FEATHER_EASE * full.width();
+    let eased: Vec<f32> = (0..=10).map(|i| at(col + ease * i as f32 / 10.0)).collect();
+    assert!(eased.windows(2).all(|w| w[1] <= w[0] + 1e-4), "{eased:?}");
+    assert_eq!(at(col + ease + 1.0), 0.0);
+}
+
+#[test]
+fn nothing_else_darkens_the_image() {
+    let mut h = harness(two_views(), true);
+    frames(&mut h, 0.0);
+    let full = h.state().full;
+    let x = full.left() + 0.9 * full.width();
+    for p in [
+        pos2(x, full.bottom() - 2.0),
+        pos2(x, full.center().y),
+        pos2(full.right() - 2.0, full.bottom() - 2.0),
+    ] {
+        assert_eq!(darkening_at(&h, p), 0.0, "at {p:?}");
     }
-    // The hero's label, just above the floor, at its top edge.
-    let top = h.get_by_label("Ha").rect().top();
-    let bg = over_white(&s, top);
-    let ratio = crate::theme::contrast_ratio(TEXT_EMPHASIS, bg);
-    assert!(ratio >= 4.5, "label top {top}: {ratio} on {bg:?}");
-    // High up the image, nothing is darkened.
-    assert_eq!(over_white(&s, full.top() + 1.0), Color32::WHITE);
 }

@@ -176,18 +176,14 @@ fn gallery_hero(size: [usize; 2], grid: [usize; 2]) -> HeroStage {
     stage
 }
 
-/// Draw `hero` as the start screen does, in a 1000 × 320 strip whose right
-/// two thirds are the image area.
+/// Draw `hero` as the start screen does, full bleed in a 1000 × 320 strip
+/// whose left third is the content column.
 fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(1000.0, 320.0), Sense::hover());
-    let image = Rect::from_min_max(
-        egui::pos2(rect.left() + rect.width() / 3.0, rect.top()),
-        rect.max,
-    );
     // Constant time keeps the stage on its first view, mid-drift.
     ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(rect);
-        hero.show(ui, image, rect.bottom(), 0.0);
+        hero.show(ui, rect.left() + rect.width() / 3.0, 0.0);
     });
 }
 

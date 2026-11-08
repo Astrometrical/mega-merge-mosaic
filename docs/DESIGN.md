@@ -1236,8 +1236,9 @@ stays free of `mmm-core`.
 
 Spec: `docs/superpowers/specs/2026-11-07-ui-standard-and-start-screen-design.md`
 (§5). The start screen is the first thing the app shows: the most recently
-opened available session as a full-window hero (a drifting, crossfading
-view of its mosaic over a starfield), its details and **Resume session** on
+opened available session as a full-bleed hero (a drifting, crossfading
+view of its mosaic; a starfield stands in until its first image is on
+screen, and when there is none), its details and **Resume session** on
 the left, a shelf of recent sessions along the bottom and an "All sessions"
 grid with a search. It lives in `crates/mmm-app/src/start/`; the generic
 parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
@@ -1276,23 +1277,28 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   `render_overview`) through the saved Plan stretch. Otherwise, no views
   and a line saying why (a session whose state is unknown: "Nothing to
   show yet — resume to build the preview"). Every failure degrades to fewer
-  views, never a panic. Each view fills its image area (a cover fit, as
+  views, never a panic. Each view fills the whole window (a cover fit, as
   the web's `DziHeroLayer` does), whatever the mosaic's aspect: a portrait
-  mosaic in the landscape area is cropped top and bottom, never shown as a
+  mosaic in a landscape window is cropped top and bottom, never shown as a
   narrow strip. The drift (zoom from the cover fit to `KEN_BURNS_ZOOM`
   times it, alternating in and out per view, with a pan of up to 2 % of
   the view that grows with the zoom and takes at most half the margin the
   zoom opens) stays inside the image, so the image's own edges never show
   (only a zoom past the viewer's `MAX_ZOOM`, an image far smaller than its
-  area, could). The image area's edges feather into the page (`HeroStage`
-  paints page-colour ramps on every edge not at the window's edge), so no
-  hard line shows. The image runs full bleed to the window's right and
-  bottom edges, under the shelf: the shelf's top is the stage's *floor*,
-  from which down a scrim darkens the image by 0.9 (the faintest text,
-  `TEXT_SUBTLE`, stays AA over a white image), easing to clear over the
-  quarter of the height above it; the hero's label and controls sit just
-  above the floor. A missing session's faded card keeps an opaque backing,
-  so the image never shows through it.
+  area, could). Only two feathers of page colour darken the image (no
+  other gradient or vignette; this supersedes the spec's §5.2 gradients):
+  along the left, `LEFT_FEATHER_OPACITY` (below 1, so the image shows
+  through) over the content column (the session block and the shelf's
+  heading row, whose right edge the start screen passes to
+  `HeroStage::show`), easing to clear (a smoothstep) over a quarter of the
+  width past it; and along the top, `TOP_FEATHER_OPACITY` down to the
+  bottom of the view's label and the slideshow controls, which sit at the
+  top right, easing to clear below them (the label stays AA over a white
+  image). Text laid over the hero all sits in the left feather's column,
+  so "All sessions" is beside the "Recent sessions" heading, and the grid's
+  Back and search are on the left. The cards are opaque; a missing
+  session's faded card keeps an opaque backing, so the image never shows
+  through it.
 - **Load order.** The first frame draws at once with no facts. The default
   hero candidate's facts load first, then its hero views (so the first
   image is on screen in under a second with a warm disk), then the other

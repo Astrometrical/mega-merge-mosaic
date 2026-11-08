@@ -1,20 +1,23 @@
-//! The start screen's hero: a starfield with the selected session's mosaic
-//! drifting slowly behind it, crossfading between views, under gradients
-//! that keep the text on the left readable. The page's content can also lie
-//! over the image's foot (the start screen's shelf): a scrim from that
-//! content's top, the floor, down keeps it readable over any image, and
-//! the label and controls sit just above it.
+//! The start screen's hero: the selected session's mosaic as a full-bleed
+//! backdrop, drifting slowly and crossfading between views. A starfield
+//! stands in for it until its first image is on screen (and when there is
+//! none to show).
 //!
-//! Each view fills its image area (a cover fit, as the web's hero does),
-//! whatever the mosaic's aspect: a portrait mosaic in a landscape area is
+//! Two feathers of page colour keep what is laid over the image readable:
+//! one along the left, holding over the page's content column then easing
+//! to clear (never to black: the image shows through it), and a small one
+//! along the top, where the view's label and the slideshow controls sit at
+//! the right. Nothing else darkens the image.
+//!
+//! Each view fills the stage (a cover fit, as the web's hero does),
+//! whatever the mosaic's aspect: a portrait mosaic in a landscape window is
 //! cropped top and bottom rather than shown as a narrow strip with hard
 //! edges. The drift (zoom from the cover fit by [`KEN_BURNS_ZOOM`], pan by
-//! 2 % of the view) stays inside the image, so no image edge ever shows;
-//! the image area's own edges feather into the page.
+//! 2 % of the view) stays inside the image, so no image edge ever shows.
 
 use std::sync::Arc;
 
-use egui::{Align, Color32, Layout, Mesh, Rect, Shape, Ui, UiBuilder, Vec2, pos2, vec2};
+use egui::{Align, Layout, Mesh, Rect, Shape, Ui, UiBuilder, Vec2, pos2, vec2};
 
 use crate::icons;
 use crate::starfield::Starfield;
@@ -40,8 +43,7 @@ const HOLD_MAX_S: f64 = 2.0;
 
 /// One image the hero can show: a label and the tiles to draw.
 pub struct HeroView {
-    /// Short name shown at the right, just above the floor (e.g. a group
-    /// name).
+    /// Short name shown at the top right (e.g. a group name).
     pub label: String,
     /// The mosaic's tiles.
     pub source: Arc<dyn TileSource>,
@@ -216,18 +218,16 @@ impl HeroStage {
         });
     }
 
-    /// Draw the hero: the starfield over all of `ui.max_rect()`, the views
-    /// in `image_rect`, the gradients, the label and the controls. `now` is
-    /// in seconds.
-    ///
-    /// `floor` is the top of the page content laid over the image's foot
-    /// (e.g. a shelf of cards), or the image's bottom when there is none.
-    /// From it down the image is darkened by 90 %, enough for
-    /// the faintest text to stay AA over a white image, easing to clear
-    /// above it; the label and controls sit just above it.
-    pub fn show(&mut self, ui: &mut Ui, image_rect: Rect, floor: f32, now: f64) {
+    /// Draw the hero over all of `ui.max_rect()`: the views (or, until one
+    /// is on screen, the starfield), the feathers, the label and the
+    /// controls. `column_right` is the right edge of the page's content
+    /// column along the left (the start screen's session block and shelf
+    /// heading), over which the left feather holds. `now` is in seconds.
+    pub fn show(&mut self, ui: &mut Ui, column_right: f32, now: f64) {
         let full = ui.max_rect();
-        self.starfield.paint(ui.painter(), full);
+        if self.views.is_empty() || !self.first_image_drawn() {
+            self.starfield.paint(ui.painter(), full);
+        }
 
         let n = self.views.len();
         let eff = if self.paused { self.paused_at } else { now };
@@ -272,7 +272,7 @@ impl HeroStage {
             }
         });
 
-        if n > 0 && image_rect.width() > 0.0 && image_rect.height() > 0.0 {
+        if n > 0 && full.width() > 0.0 && full.height() > 0.0 {
             let cur = self.current;
             let preload = n > 1 && elapsed >= HERO_DWELL_S - PRELOAD_S;
             // The incoming view: the one asked for, else the next, loading
@@ -295,7 +295,7 @@ impl HeroStage {
             } else {
                 1.0
             };
-            self.draw_view(ui, image_rect, cur, out_opacity, elapsed);
+            self.draw_view(ui, full, cur, out_opacity, elapsed);
             if let Some(nx) = incoming {
                 let age = if self.swap_to.is_some() {
                     0.0
@@ -307,35 +307,35 @@ impl HeroStage {
                 } else {
                     fade as f32
                 };
-                self.draw_view(ui, image_rect, nx, opacity, age);
+                self.draw_view(ui, full, nx, opacity, age);
             }
         }
 
-        paint_feather(ui, full, image_rect);
-        paint_gradients(ui, full, floor);
-
         if n == 0 {
             if let Some(msg) = &self.message {
-                // Centred in the image above the floor.
-                let bottom = floor.clamp(image_rect.top(), image_rect.bottom());
-                let centre = pos2(image_rect.center().x, (image_rect.top() + bottom) / 2.0);
+                // Centred in the stage to the right of the content column.
+                let left = column_right.clamp(full.left(), full.right());
+                let centre = pos2((left + full.right()) / 2.0, full.center().y);
                 let rect = Rect::from_center_size(centre, vec2(480.0, 24.0));
                 ui.put(rect, egui::Label::new(text(Type::Body, msg.clone())));
             }
         } else {
-            self.controls(ui, image_rect, floor, now);
+            let painter = ui.painter();
+            painter.add(Shape::mesh(left_feather(full, column_right)));
+            painter.add(Shape::mesh(top_feather(full)));
+            self.controls(ui, full, now);
         }
 
         self.request_repaints(ui, eff, elapsed);
     }
 
-    /// The label and controls, right-aligned a page margin in from the
-    /// image's right edge, just above the floor.
-    fn controls(&mut self, ui: &mut Ui, image_rect: Rect, floor: f32, now: f64) {
-        let bottom = floor - space::L;
+    /// The label and controls at the top right, a page margin in, inside
+    /// the top feather.
+    fn controls(&mut self, ui: &mut Ui, full: Rect, now: f64) {
+        let top = full.top() + space::XXL;
         let strip = Rect::from_min_max(
-            pos2(image_rect.left(), bottom - CONTROL_HEIGHT),
-            pos2(image_rect.right() - space::XXL, bottom),
+            pos2(full.left(), top),
+            pos2(full.right() - space::XXL, top + CONTROL_HEIGHT),
         );
         let mut action = None;
         let multiple = self.views.len() > 1;
@@ -437,149 +437,75 @@ fn drift_camera(geom: &PyramidGeometry, screen: Vec2, along: f64, dir: f64) -> (
     (zoom, (w / 2.0 + pan, h / 2.0))
 }
 
-/// Darkening of the image at and below the floor: over a white image it
-/// leaves the faintest text colour (`TEXT_SUBTLE`) AA, 4.5:1.
-const FLOOR_SCRIM: f32 = 0.9;
-/// Height of the scrim's rise above the floor, from [`FLOOR_SCRIM`] to
-/// clear, as a fraction of the drawing area's height...
-const SCRIM_RISE: f32 = 0.25;
-/// ...and never less than this, in points, so the label just above the
-/// floor stays AA in a short window.
-const SCRIM_RISE_MIN: f32 = 160.0;
+/// The left feather's opacity (of the page colour) from the left edge to
+/// the content column's right edge. Below 1, so the image shows through.
+const LEFT_FEATHER_OPACITY: f32 = 0.8;
+/// How far past the column the left feather eases to clear, as a fraction
+/// of the stage's width.
+const LEFT_FEATHER_EASE: f32 = 0.25;
+/// The top feather's opacity from the top edge down to the controls'
+/// bottom: enough for the label to stay AA (4.5:1) over a white image.
+const TOP_FEATHER_OPACITY: f32 = 0.75;
+/// How far below the controls the top feather eases to clear, in points.
+const TOP_FEATHER_EASE: f32 = 64.0;
+/// Steps in a feather's ease (a smoothstep, so no band shows where the
+/// hold ends).
+const EASE_STEPS: usize = 16;
 
-/// Fraction of the image's width feathered on its left and right edges.
-const FEATHER_SIDE: f32 = 0.15;
-/// Fraction of the image's height feathered on its bottom edge.
-const FEATHER_BOTTOM: f32 = 0.20;
-/// Fraction of the image's height feathered on its top edge.
-const FEATHER_TOP: f32 = 0.08;
-
-/// Fade the image area's edges into the page: a ramp of the page colour,
-/// opaque at the edge and clear inward, on every edge of `image` that is
-/// not at the edge of `full` (the window), so no hard line shows wherever
-/// the image is placed.
-fn paint_feather(ui: &Ui, full: Rect, image: Rect) {
-    if image.width() <= 0.0 || image.height() <= 0.0 {
-        return;
-    }
-    let opaque = SURFACE_900;
-    let clear = Color32::TRANSPARENT;
-    let painter = ui.painter();
-    let ramp = |outer: [egui::Pos2; 2], inner: [egui::Pos2; 2]| {
-        let mut m = Mesh::default();
-        m.colored_vertex(outer[0], opaque);
-        m.colored_vertex(outer[1], opaque);
-        m.colored_vertex(inner[0], clear);
-        m.colored_vertex(inner[1], clear);
-        m.add_triangle(0, 1, 2);
-        m.add_triangle(1, 2, 3);
-        painter.add(Shape::mesh(m));
-    };
-    let eps = 0.5;
-    if image.left() > full.left() + eps {
-        let d = image.width() * FEATHER_SIDE;
-        ramp(
-            [image.left_top(), image.left_bottom()],
-            [
-                pos2(image.left() + d, image.top()),
-                pos2(image.left() + d, image.bottom()),
-            ],
-        );
-    }
-    if image.right() < full.right() - eps {
-        let d = image.width() * FEATHER_SIDE;
-        ramp(
-            [image.right_top(), image.right_bottom()],
-            [
-                pos2(image.right() - d, image.top()),
-                pos2(image.right() - d, image.bottom()),
-            ],
-        );
-    }
-    if image.bottom() < full.bottom() - eps {
-        let d = image.height() * FEATHER_BOTTOM;
-        ramp(
-            [image.left_bottom(), image.right_bottom()],
-            [
-                pos2(image.left(), image.bottom() - d),
-                pos2(image.right(), image.bottom() - d),
-            ],
-        );
-    }
-    if image.top() > full.top() + eps {
-        let d = image.height() * FEATHER_TOP;
-        ramp(
-            [image.left_top(), image.right_top()],
-            [
-                pos2(image.left(), image.top() + d),
-                pos2(image.right(), image.top() + d),
-            ],
-        );
-    }
-}
-
-/// The bottom scrim over `full`: [`FLOOR_SCRIM`] from the bottom up to
-/// `floor`, then easing linearly to clear over the rise above it.
-fn bottom_scrim(full: Rect, floor: f32) -> Mesh {
-    let floor = floor.clamp(full.top(), full.bottom());
-    let rise = (SCRIM_RISE * full.height()).max(SCRIM_RISE_MIN);
-    let dark = SURFACE_900.gamma_multiply(FLOOR_SCRIM);
+/// A feather of page colour across `full`, from its left edge (or its top
+/// edge, when `down`): `opacity` for the first `hold` points, then easing
+/// to clear over the next `ease`.
+fn feather(full: Rect, down: bool, hold: f32, ease: f32, opacity: f32) -> Mesh {
+    let hold = hold.max(0.0);
+    let colour = |o: f32| SURFACE_900.gamma_multiply(o);
+    let eased = (0..=EASE_STEPS).map(|i| {
+        let t = i as f32 / EASE_STEPS as f32;
+        let smooth = t * t * (3.0 - 2.0 * t);
+        (hold + t * ease, colour(opacity * (1.0 - smooth)))
+    });
     let mut m = Mesh::default();
-    for (y, c) in [
-        (full.bottom(), dark),
-        (floor, dark),
-        (floor - rise, Color32::TRANSPARENT),
-    ] {
-        m.colored_vertex(pos2(full.left(), y), c);
-        m.colored_vertex(pos2(full.right(), y), c);
+    for (d, c) in std::iter::once((0.0, colour(opacity))).chain(eased) {
+        let (a, b) = if down {
+            let y = full.top() + d;
+            (pos2(full.left(), y), pos2(full.right(), y))
+        } else {
+            let x = full.left() + d;
+            (pos2(x, full.top()), pos2(x, full.bottom()))
+        };
+        m.colored_vertex(a, c);
+        m.colored_vertex(b, c);
     }
-    for row in [0, 2] {
-        m.add_triangle(row, row + 1, row + 2);
-        m.add_triangle(row + 1, row + 2, row + 3);
+    let rows = m.vertices.len() as u32 / 2;
+    for r in 0..rows - 1 {
+        let i = 2 * r;
+        m.add_triangle(i, i + 1, i + 2);
+        m.add_triangle(i + 1, i + 2, i + 3);
     }
     m
 }
 
-/// The darkening gradients, as vertex-coloured meshes over `rect`, with
-/// the bottom scrim from `floor` down.
-fn paint_gradients(ui: &Ui, rect: Rect, floor: f32) {
-    let dark = |alpha: f32| SURFACE_900.gamma_multiply(alpha);
-    let clear = Color32::TRANSPARENT;
-    let painter = ui.painter();
+/// The left feather: [`LEFT_FEATHER_OPACITY`] over the content column
+/// (up to `column_right`), easing to clear past it.
+fn left_feather(full: Rect, column_right: f32) -> Mesh {
+    feather(
+        full,
+        false,
+        column_right - full.left(),
+        LEFT_FEATHER_EASE * full.width(),
+        LEFT_FEATHER_OPACITY,
+    )
+}
 
-    // Left to right: 0.92 falling to 0 at 60 % of the width.
-    let x60 = rect.left() + rect.width() * 0.6;
-    let mut m = Mesh::default();
-    for (x, c) in [(rect.left(), dark(0.92)), (x60, clear)] {
-        m.colored_vertex(pos2(x, rect.top()), c);
-        m.colored_vertex(pos2(x, rect.bottom()), c);
-    }
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(1, 2, 3);
-    painter.add(Shape::mesh(m));
-
-    painter.add(Shape::mesh(bottom_scrim(rect, floor)));
-
-    // Vignette: clear in the middle, 0.6 around the edges.
-    let mut m = Mesh::default();
-    m.colored_vertex(rect.center(), clear);
-    let ring = [
-        rect.left_top(),
-        rect.center_top(),
-        rect.right_top(),
-        rect.right_center(),
-        rect.right_bottom(),
-        rect.center_bottom(),
-        rect.left_bottom(),
-        rect.left_center(),
-    ];
-    for p in ring {
-        m.colored_vertex(p, dark(0.6));
-    }
-    for i in 0..ring.len() as u32 {
-        m.add_triangle(0, 1 + i, 1 + (i + 1) % ring.len() as u32);
-    }
-    painter.add(Shape::mesh(m));
+/// The top feather: [`TOP_FEATHER_OPACITY`] down to the controls' bottom,
+/// easing to clear below them.
+fn top_feather(full: Rect) -> Mesh {
+    feather(
+        full,
+        true,
+        space::XXL + CONTROL_HEIGHT,
+        TOP_FEATHER_EASE,
+        TOP_FEATHER_OPACITY,
+    )
 }
 
 #[cfg(test)]
