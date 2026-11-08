@@ -5,8 +5,9 @@
 //! # Edits
 //!
 //! Every edit (add, remove, move, rule) builds a new panel list and
-//! grouping, a [`PanelsEdit`], and [`PanelsEdit::apply`]s it with
-//! [`set_inputs`]. While a job runs (it may hold a result store) the edit
+//! grouping, a [`PanelsEdit`], and [`PanelsEdit::apply_scoped`]s it with
+//! [`set_inputs_affecting`], limited to the groups it touches (worked out on
+//! a worker, [`PanelEdits::submit`]). While a job runs (it may hold a result store) the edit
 //! cancels every job and waits ([`PanelEdits`]); [`PanelEdits::poll`]
 //! cancels any job started meanwhile too and applies the edit once the
 //! runner is idle, and a newer edit replaces a waiting one (newer work
@@ -27,11 +28,16 @@ use std::time::{Duration, Instant};
 use egui::Color32;
 use mega_ui::groups::physical_color;
 pub use mega_ui::groups::{GROUP_PALETTE, PHYSICAL_SLOTS};
-use mmm_core::mosaic::{Grouping, MosaicConfig, PanelEntry, UNGROUPED, set_inputs};
+use mmm_core::mosaic::grouping::Groups;
+use mmm_core::mosaic::{
+    Grouping, Mosaic, MosaicConfig, PanelEntry, UNGROUPED, affected_groups, set_inputs_affecting,
+};
+use mmm_core::reference::{self, ReferenceFrame};
 use serde_json::Value;
 
 use crate::jobs::JobRunner;
 use crate::session::{OpenSession, normalize};
+use crate::util::{Poll, Task};
 
 /// File extensions accepted as panels (the dialog filter, drops and
 /// patterns), compared case-insensitively.
@@ -281,7 +287,7 @@ pub struct PanelsEdit {
     pub grouping: Grouping,
 }
 
-/// What became of [`PanelsEdit::apply`].
+/// What became of [`PanelsEdit::apply_scoped`].
 #[derive(Debug)]
 pub enum Applied {
     /// Applied and saved.
@@ -310,20 +316,34 @@ impl PanelsEdit {
         self.panels == config.panels && self.grouping == config.grouping
     }
 
-    /// Apply with [`set_inputs`], or, while any job runs, cancel every job
-    /// and hand the edit back to wait for the runner to be idle (newer work
-    /// wins). Exports are spared and not waited for: they read the result
-    /// without a writer lock and write stale tiles as they are. Owner (UI)
-    /// thread.
+    /// [`PanelsEdit::apply_scoped`] over every group (nothing known of
+    /// which the edit touches).
+    #[cfg(test)]
     pub fn apply(self, session: &mut OpenSession, jobs: &mut JobRunner) -> Applied {
+        self.apply_scoped(session, jobs, None)
+    }
+
+    /// Apply with [`set_inputs_affecting`] (`scope`: the groups the edit
+    /// touches, `None` for every group), or, while any job runs, cancel
+    /// every job and hand the edit back to wait for the runner to be idle
+    /// (newer work wins). Exports are spared and not waited for: they read
+    /// the result without a writer lock and write stale tiles as they are.
+    /// Owner (UI) thread.
+    pub fn apply_scoped(
+        self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        scope: Option<&BTreeSet<String>>,
+    ) -> Applied {
         if jobs.busy_except_exports() {
             jobs.cancel_all_but_exports();
             return Applied::Queued(self);
         }
-        match set_inputs(
+        match set_inputs_affecting(
             &mut session.mosaic,
             self.panels.clone(),
             self.grouping.clone(),
+            scope,
         ) {
             Ok(()) => Applied::Done,
             Err(e) if e.is_busy() => Applied::Busy(self),
@@ -332,13 +352,48 @@ impl PanelsEdit {
     }
 }
 
-/// Edits on their way into the session: at most one waiting (for the jobs
-/// to stop, or for a store held elsewhere), and the messages of edits
-/// refused since last asked.
+/// The groups an edit touches, decided on a worker (it reads panel
+/// headers): `None` (every group) when the groups as last resolved or the
+/// analysed frame are unknown, when the new panels do not resolve or derive
+/// a frame, or when the frame moves (the unaffected groups were analysed on
+/// the old canvas); else the groups whose panels differ.
+///
+/// `m` is the session's mosaic with the edit's panels and grouping.
+fn edit_scope(
+    m: Mosaic,
+    old: Option<Groups>,
+    frame: Option<ReferenceFrame>,
+) -> Option<BTreeSet<String>> {
+    let (old, frame) = (old?, frame?);
+    let paths: Vec<PathBuf> = m.config.panels.iter().map(|p| p.path.clone()).collect();
+    let derived = reference::derive(&paths, m.config.analyze.input).ok()?;
+    if derived != frame {
+        return None;
+    }
+    Some(affected_groups(&old, &m.groups().ok()?))
+}
+
+/// Where an edit stands in finding out which groups it touches.
+#[derive(Debug)]
+enum Scope {
+    /// Being worked out on a worker.
+    Scoping(Task<Option<BTreeSet<String>>>),
+    /// Known (`None`: every group).
+    Known(Option<BTreeSet<String>>),
+}
+
+/// Edits on their way into the session: at most one waiting (for the groups
+/// it touches to be worked out, for the jobs to stop, or for a store held
+/// elsewhere), and the messages of edits refused since last asked.
 #[derive(Debug, Default)]
 pub struct PanelEdits {
-    /// An edit waiting for the jobs to stop (or a busy store).
+    /// An edit waiting to be scoped, for the jobs to stop (or a busy store).
     pending: Option<PanelsEdit>,
+    /// Which groups `pending` touches; `None` with no edit pending.
+    scope: Option<Scope>,
+    /// For starting scope workers (set by [`PanelEdits::poll`]); without
+    /// one an edit touches every group.
+    ctx: Option<egui::Context>,
     /// When to retry a pending edit refused as busy.
     retry_at: Option<Instant>,
     /// Refused edits' messages, for the user.
@@ -346,8 +401,8 @@ pub struct PanelEdits {
 }
 
 impl PanelEdits {
-    /// An edit is waiting for the jobs to stop (or a busy store); the
-    /// automatic pipeline starts nothing meanwhile.
+    /// An edit is waiting (to be scoped, for the jobs to stop, or a busy
+    /// store); the automatic pipeline starts nothing meanwhile.
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -371,15 +426,74 @@ impl PanelEdits {
             .unwrap_or_else(|| PanelsEdit::of(session))
     }
 
-    /// Apply `edit`, or keep it waiting (replacing any waiting one).
+    /// Take `edit` (replacing any waiting one, scoped or not): cancel the
+    /// jobs, work out on a worker which groups it touches, and apply it once
+    /// that is known and the runner is idle (see [`PanelEdits::poll`]).
+    /// Applied at once when nothing needs working out (no analysed frame or
+    /// resolved groups, or no repaint context yet) and the runner is idle.
     pub fn submit(&mut self, edit: PanelsEdit, session: &mut OpenSession, jobs: &mut JobRunner) {
-        self.pending = None;
         self.retry_at = None;
-        match edit.apply(session, jobs) {
+        if jobs.busy_except_exports() {
+            jobs.cancel_all_but_exports();
+        }
+        let task = self.ctx.as_ref().and_then(|ctx| {
+            let (old, frame) = (session.groups.clone()?, session.frame.clone()?);
+            let mut m = session.mosaic.clone();
+            m.config.panels = edit.panels.clone();
+            m.config.grouping = edit.grouping.clone();
+            Task::spawn("mmm-edit-scope", ctx, move || {
+                edit_scope(m, Some(old), Some(frame))
+            })
+        });
+        self.scope = Some(match task {
+            Some(t) => Scope::Scoping(t),
+            None => Scope::Known(None),
+        });
+        self.pending = Some(edit);
+        self.step(session, jobs);
+    }
+
+    /// Move the waiting edit along: take a finished scope, and apply it once
+    /// the runner is idle and any busy retry is due.
+    fn step(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if self.pending.is_none() {
+            return;
+        }
+        if let Some(Scope::Scoping(task)) = &self.scope {
+            match task.poll() {
+                Poll::Pending => {
+                    if jobs.busy_except_exports() {
+                        jobs.cancel_all_but_exports();
+                    }
+                    return;
+                }
+                Poll::Done(scope) => self.scope = Some(Scope::Known(scope)),
+                Poll::Lost => self.scope = Some(Scope::Known(None)),
+            }
+        }
+        if jobs.busy_except_exports() {
+            // Cancelling again is harmless.
+            jobs.cancel_all_but_exports();
+            return;
+        }
+        if self.retry_at.is_some_and(|at| at > Instant::now()) {
+            return;
+        }
+        self.retry_at = None;
+        let edit = self.pending.take().expect("pending edit");
+        let scope = match self.scope.take() {
+            Some(Scope::Known(s)) => s,
+            _ => None,
+        };
+        match edit.apply_scoped(session, jobs, scope.as_ref()) {
             Applied::Done => {}
-            Applied::Queued(edit) => self.pending = Some(edit),
+            Applied::Queued(edit) => {
+                self.pending = Some(edit);
+                self.scope = Some(Scope::Known(scope));
+            }
             Applied::Busy(edit) => {
                 self.pending = Some(edit);
+                self.scope = Some(Scope::Known(scope));
                 self.retry_at = Some(Instant::now() + BUSY_RETRY);
             }
             Applied::Failed(message) => {
@@ -418,33 +532,34 @@ impl PanelEdits {
     }
 
     /// Cancel jobs started after the waiting edit was queued (newer work
-    /// wins; exports are spared), or apply it once the runner is idle and
-    /// any busy retry is due. Call every frame, after the runner's poll.
+    /// wins; exports are spared), or apply it once its groups are known, the
+    /// runner is idle and any busy retry is due. Call every frame, after the
+    /// runner's poll.
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if self.ctx.is_none() {
+            self.ctx = Some(ctx.clone());
+        }
         if self.pending.is_none() {
             return;
         }
-        if jobs.busy_except_exports() {
-            // Cancelling again is harmless.
-            jobs.cancel_all_but_exports();
-            return;
-        }
-        let now = Instant::now();
-        match self.retry_at {
-            Some(at) if at > now => ctx.request_repaint_after(at - now),
-            _ => {
-                let edit = self.pending.take().expect("pending edit");
-                self.submit(edit, session, jobs);
-            }
+        self.step(session, jobs);
+        if let Some(at) = self.retry_at
+            && self.pending.is_some()
+        {
+            ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
         }
     }
 
-    /// Apply the waiting edit now, without waiting for its retry (the
-    /// session is being left); call only while no job but an export runs.
-    /// One refused again because a store is held elsewhere stays waiting.
+    /// Apply the waiting edit now, without waiting for its retry or its
+    /// scope (every group is then assumed touched; the session is being
+    /// left); call only while no job but an export runs. One refused again
+    /// because a store is held elsewhere stays waiting.
     pub fn apply_waiting(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
         if let Some(edit) = self.pending.take() {
-            self.submit(edit, session, jobs);
+            self.retry_at = None;
+            self.pending = Some(edit);
+            self.scope = Some(Scope::Known(None));
+            self.step(session, jobs);
             if self.pending.is_some() {
                 tracing::warn!("the panel edit waits: a result is in use elsewhere");
             }
@@ -454,5 +569,122 @@ impl PanelEdits {
     /// The messages of edits refused since last asked.
     pub fn take_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.errors)
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::jobs::tests::{analyzed, drain};
+
+    /// `session`'s first panel of group `group` (by file-name prefix),
+    /// copied to a new panel entry.
+    fn copy_of(session: &OpenSession, group: &str, name: &str) -> PanelEntry {
+        let first = session
+            .mosaic
+            .config
+            .panels
+            .iter()
+            .find(|p| {
+                p.path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(group))
+            })
+            .unwrap()
+            .path
+            .clone();
+        let path = first.with_file_name(name);
+        std::fs::copy(&first, &path).unwrap();
+        PanelEntry {
+            path,
+            fingerprint: None,
+            manual_group: None,
+        }
+    }
+
+    fn poll_until_applied(
+        edits: &mut PanelEdits,
+        s: &mut OpenSession,
+        r: &mut JobRunner,
+        ctx: &egui::Context,
+    ) {
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        while edits.has_pending() {
+            assert!(Instant::now() < deadline, "the edit never applied");
+            r.poll(s);
+            edits.poll(ctx, s, r);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn marked(s: &OpenSession) -> Vec<String> {
+        s.mosaic.config.needs_analyze.iter().cloned().collect()
+    }
+
+    #[test]
+    fn an_unresolvable_edit_falls_back_to_every_group() {
+        let (root, mut s, mut r) = analyzed("edit-unresolvable");
+        let mut edit = PanelsEdit::of(&s);
+        edit.panels.push(PanelEntry {
+            path: root.join("missing.xisf"),
+            fingerprint: None,
+            manual_group: None,
+        });
+        // The new panels derive no frame: nothing is known of what the
+        // edit touches.
+        let mut m = s.mosaic.clone();
+        m.config.panels = edit.panels.clone();
+        assert_eq!(edit_scope(m, s.groups.clone(), s.frame.clone()), None);
+
+        let ctx = egui::Context::default();
+        let mut edits = PanelEdits::default();
+        edits.poll(&ctx, &mut s, &mut r);
+        edits.submit(edit, &mut s, &mut r);
+        poll_until_applied(&mut edits, &mut s, &mut r, &ctx);
+        assert!(edits.take_errors().is_empty());
+        assert_eq!(marked(&s), ["Ha", "OIII"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_newer_edit_replaces_one_being_scoped() {
+        let (root, mut s, mut r) = analyzed("edit-replaced");
+        let to_ha = copy_of(&s, "Ha", "Ha_extra.xisf");
+        let to_oiii = copy_of(&s, "OIII", "OIII_extra.xisf");
+        let ctx = egui::Context::default();
+        let mut edits = PanelEdits::default();
+        edits.poll(&ctx, &mut s, &mut r);
+
+        // A running job keeps the edits waiting while they are scoped.
+        let gate = r.hold();
+        r.start_analyze(&mut s);
+        let mut first = PanelsEdit::of(&s);
+        first.panels.push(to_ha.clone());
+        edits.submit(first, &mut s, &mut r);
+        assert!(edits.has_pending(), "being scoped");
+        let mut second = PanelsEdit::of(&s);
+        second.panels.push(to_oiii.clone());
+        edits.submit(second.clone(), &mut s, &mut r);
+        assert_eq!(edits.pending(), Some(&second));
+        gate.open();
+        poll_until_applied(&mut edits, &mut s, &mut r, &ctx);
+        drain(&mut r, &mut s);
+
+        let paths: Vec<&Path> = s
+            .mosaic
+            .config
+            .panels
+            .iter()
+            .map(|p| p.path.as_path())
+            .collect();
+        assert!(paths.contains(&to_oiii.path.as_path()));
+        assert!(
+            !paths.contains(&to_ha.path.as_path()),
+            "the first edit was replaced"
+        );
+        assert_eq!(marked(&s), ["OIII"], "scoped by the newer edit only");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

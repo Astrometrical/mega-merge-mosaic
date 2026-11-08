@@ -6,7 +6,7 @@
 //! *run* on its own `std::thread` with a [`JobCtl`], and its outcome is
 //! *applied* on the UI thread by [`JobRunner::poll`]. An analysis first
 //! resolves the groups (panel header reads) on a worker over a copy of the
-//! mosaic, then plans with [`plan_analyze_with`], so the UI thread never
+//! mosaic, then plans with [`plan_analyze_scoped`], so the UI thread never
 //! reads panels.
 //!
 //! The UI thread does write a little: planning, applying and discarding
@@ -50,8 +50,9 @@ use mmm_core::export::{ExportFormat, ExportReport, export_group};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
-    AnalyzeOutcome, AnalyzePlan, BlendPlan, Grouping, Mosaic, PanelEntry, invalidate_group,
-    plan_analyze_with, plan_blend_with, run_analyze, run_blend,
+    AnalyzeOutcome, AnalyzePlan, AnalyzeScope, BlendPlan, Grouping, Mosaic, PanelEntry,
+    invalidate_group, mark_needs_analyze, plan_analyze_scoped, plan_blend_with, run_analyze,
+    run_blend,
 };
 use mmm_core::preview::{Preview, PreviewPlan, PreviewRun, plan_previews, run_previews};
 use mmm_core::reference::ReferenceFrame;
@@ -128,7 +129,9 @@ pub struct Run {
 /// What a queued job will do.
 #[derive(Clone, Debug)]
 enum Kind {
-    Analyze,
+    Analyze {
+        scope: AnalyzeScope,
+    },
     Previews,
     Blend {
         group: String,
@@ -158,7 +161,7 @@ struct Queued {
 enum Planned {
     /// An analysis's first phase: resolve the groups of a copy of the
     /// mosaic (reads panel headers).
-    Resolve(Box<Mosaic>),
+    Resolve(Box<Mosaic>, AnalyzeScope),
     Analyze(AnalyzePlan),
     Blend(BlendPlan),
     Previews(PreviewPlan),
@@ -216,8 +219,9 @@ struct Running {
     handle: JoinHandle<()>,
     /// The plan of a blend, kept to apply or discard its outcome.
     blend: Option<BlendPlan>,
-    /// While resolving groups: the inputs the resolution is based on.
-    resolving: Option<GroupInputs>,
+    /// While resolving groups: the inputs the resolution is based on, and
+    /// which groups the analysis then covers.
+    resolving: Option<(GroupInputs, AnalyzeScope)>,
     /// A previews job (analysis queues behind it rather than cancel it).
     previews: bool,
     /// An export job (input edits spare it).
@@ -322,6 +326,14 @@ impl JobRunner {
     /// kilobytes, not processing: no panel or pixel data is read there, and
     /// the analysis itself runs on the worker.
     pub fn start_analyze(&mut self, session: &mut OpenSession) -> u64 {
+        self.start_analyze_scoped(session, AnalyzeScope::All)
+    }
+
+    /// [`JobRunner::start_analyze`] limited to `scope`: with
+    /// [`AnalyzeScope::Needed`] only the groups marked as needing analysis
+    /// (and new ones). If the frame then moves, it restarts with every group
+    /// (see [`JobRunner::poll`]), reporting no failure.
+    pub fn start_analyze_scoped(&mut self, session: &mut OpenSession, scope: AnalyzeScope) -> u64 {
         let id = self.new_id(ANALYZE_LABEL.into());
         if let Some(r) = self.running.as_ref().filter(|r| !r.previews) {
             r.token.cancel();
@@ -338,7 +350,7 @@ impl JobRunner {
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
         self.queue.push_back(Queued {
             id,
-            kind: Kind::Analyze,
+            kind: Kind::Analyze { scope },
         });
         self.start_next(session);
         id
@@ -409,7 +421,7 @@ impl JobRunner {
                 dropped.push(q.id);
                 false
             }
-            Kind::Blend { .. } | Kind::Analyze | Kind::Previews | Kind::Export(_) => true,
+            Kind::Blend { .. } | Kind::Analyze { .. } | Kind::Previews | Kind::Export(_) => true,
         });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
@@ -563,7 +575,10 @@ impl JobRunner {
         self.running
             .as_ref()
             .is_some_and(|r| r.blend.is_none() && !r.previews && !r.export)
-            || self.queue.iter().any(|q| matches!(q.kind, Kind::Analyze))
+            || self
+                .queue
+                .iter()
+                .any(|q| matches!(q.kind, Kind::Analyze { .. }))
     }
 
     /// Whether events raised outside [`JobRunner::poll`] (queued jobs
@@ -797,7 +812,9 @@ impl JobRunner {
                 return;
             };
             let planned = match &q.kind {
-                Kind::Analyze => Ok(Planned::Resolve(Box::new(session.mosaic.clone()))),
+                Kind::Analyze { scope } => {
+                    Ok(Planned::Resolve(Box::new(session.mosaic.clone()), *scope))
+                }
                 Kind::Blend {
                     group,
                     rect,
@@ -827,12 +844,12 @@ impl JobRunner {
         let blend = match &planned {
             Planned::Blend(plan) => Some(plan.clone()),
             Planned::Analyze(_)
-            | Planned::Resolve(_)
+            | Planned::Resolve(..)
             | Planned::Previews(_)
             | Planned::Export { .. } => None,
         };
         let resolving = match &planned {
-            Planned::Resolve(m) => Some(GroupInputs::of(m)),
+            Planned::Resolve(m, scope) => Some((GroupInputs::of(m), *scope)),
             Planned::Analyze(_)
             | Planned::Blend(_)
             | Planned::Previews(_)
@@ -882,7 +899,7 @@ impl JobRunner {
                     };
                     let ctl = JobCtl::new(worker_token, Some(&observer));
                     match &planned {
-                        Planned::Resolve(m) => Done::Resolved(m.groups()),
+                        Planned::Resolve(m, _) => Done::Resolved(m.groups()),
                         Planned::Analyze(plan) => {
                             let (outcome, result) = run_analyze(plan, &ctl);
                             let frame = ReferenceFrame::load(&plan.frame_path).ok();
@@ -949,7 +966,10 @@ impl JobRunner {
                 Err(e) => return Some(failed(format!("{name}: {}", describe(&e)))),
             };
             let current = GroupInputs::of(&session.mosaic);
-            let fresh = r.resolving.as_ref() == Some(&current);
+            let (fresh, scope) = match &r.resolving {
+                Some((inputs, scope)) => (*inputs == current, *scope),
+                None => (false, AnalyzeScope::All),
+            };
             if fresh {
                 session.groups = Some(groups.clone());
             }
@@ -958,12 +978,12 @@ impl JobRunner {
             }
             // Panels or grouping changed meanwhile: resolve again.
             let planned = if fresh {
-                match plan_analyze_with(&mut session.mosaic, groups) {
+                match plan_analyze_scoped(&mut session.mosaic, groups, scope) {
                     Ok(plan) => Planned::Analyze(plan),
                     Err(e) => return Some(failed(format!("{name}: {}", describe(&e)))),
                 }
             } else {
-                Planned::Resolve(Box::new(session.mosaic.clone()))
+                Planned::Resolve(Box::new(session.mosaic.clone()), scope)
             };
             self.spawn(id, planned);
             return None;
@@ -1001,6 +1021,24 @@ impl JobRunner {
                 }
                 // Applied even when cancelled: the finished groups stay.
                 let applied = session.mosaic.apply_analyze(&outcome);
+                if let (Err(e), Ok(())) = (&result, &applied)
+                    && e.is_frame_moved()
+                    && !r.token.is_cancelled()
+                {
+                    // The groups left out were analysed on another canvas:
+                    // mark them all and analyse everything, with no failure
+                    // to report.
+                    let analysed: Vec<String> =
+                        session.mosaic.config.group_dirs.keys().cloned().collect();
+                    return match mark_needs_analyze(&mut session.mosaic, &analysed) {
+                        Ok(()) => {
+                            let m = Box::new(session.mosaic.clone());
+                            self.spawn(id, Planned::Resolve(m, AnalyzeScope::All));
+                            None
+                        }
+                        Err(e) => Some(failed(format!("{name}: {}", describe(&e)))),
+                    };
+                }
                 match (result, applied) {
                     (_, Err(e)) => failed(format!("{name}: {}", describe(&e))),
                     (Ok(()), Ok(())) => JobEvent::Finished { id, label: name },
@@ -1802,5 +1840,48 @@ pub(crate) mod tests {
         assert!((1..=4).contains(&sent), "{sent}");
         assert!(t.ready(t0 + Duration::from_millis(100), true));
         assert!(t.ready(t0 + Duration::from_millis(140), false));
+    }
+
+    #[test]
+    fn a_moved_frame_restarts_the_analysis_for_every_group() {
+        use mmm_core::session_summary::{ResultState, result_state};
+        let root = temp_dir("job-frame-moved");
+        let (mut s, extra) = crate::testutil::solved_two_group_session(&root);
+        let mut r = runner();
+        r.start_analyze(&mut s);
+        drain(&mut r, &mut s);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        let frame = s.frame.clone().expect("analysed frame");
+        let oiii = s.mosaic.result_path("OIII");
+        assert_eq!(result_state(&oiii), ResultState::Complete);
+
+        // An edit that claims to touch only Ha, though its panel grows the
+        // canvas: the targeted analysis finds the frame moved.
+        let mut panels = s.mosaic.config.panels.clone();
+        panels.push(PanelEntry {
+            path: extra,
+            fingerprint: None,
+            manual_group: Some("Ha".into()),
+        });
+        let touched = std::collections::BTreeSet::from(["Ha".to_string()]);
+        let grouping = s.mosaic.config.grouping.clone();
+        mmm_core::mosaic::set_inputs_affecting(&mut s.mosaic, panels, grouping, Some(&touched))
+            .unwrap();
+        assert_eq!(result_state(&oiii), ResultState::Complete, "left alone");
+        let id = r.start_analyze_scoped(&mut s, AnalyzeScope::Needed);
+        let events = drain(&mut r, &mut s);
+        assert_eq!(
+            events,
+            vec![JobEvent::Finished {
+                id,
+                label: ANALYZE_LABEL.into()
+            }],
+            "restarted, no failure"
+        );
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_ne!(s.frame.as_ref(), Some(&frame), "the new canvas");
+        assert_ne!(result_state(&oiii), ResultState::Complete, "re-analysed");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
