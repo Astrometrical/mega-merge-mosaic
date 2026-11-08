@@ -144,6 +144,13 @@ impl PlanCanvas {
         &self.view
     }
 
+    /// The view, to move it from outside (e.g. a camera shared with another
+    /// canvas). The canvas still fits the extent on its first frame and when
+    /// the extent changes, so set it after those frames to keep it.
+    pub fn view_mut(&mut self) -> &mut View {
+        &mut self.view
+    }
+
     /// Viewport rect and `ui.input().time` of the last frame shown, for
     /// mapping between screen and canvas with [`PlanCanvas::view`].
     pub fn last_frame(&self) -> Option<(Rect, f64)> {

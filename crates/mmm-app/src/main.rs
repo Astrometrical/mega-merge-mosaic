@@ -9,15 +9,16 @@
 mod app;
 mod blend_settings;
 mod blend_tab;
+mod camera;
 mod checks;
 mod compositions;
-#[allow(dead_code)] // used from Task 5 on
 mod display_stretch;
 mod export;
 mod jobs;
 mod panels_tab;
 mod pipeline;
 mod plan_tab;
+mod plan_view;
 mod rois;
 mod session;
 mod start;
