@@ -45,7 +45,7 @@
 //! - **Selection.** A click selects a row, Shift-click the rows on screen
 //!   from the last one clicked, Ctrl-click (Cmd-click) adds or takes away
 //!   one. It follows the panels (a regrouped panel stays selected; a
-//!   removed one leaves it). A plain click also selects the panel on the
+//!   removed one, or one whose section is folded, leaves it). A plain click also selects the panel on the
 //!   plan, and a panel clicked there selects its row
 //!   ([`PanelList::select_only`]); the window links the rows and the plan
 //!   ([`crate::session_window`]), clears the selection on Esc and removes
@@ -1380,6 +1380,7 @@ impl PanelList {
         let groups: Option<Vec<String>> =
             placed.as_ref().map(|p| p.groups.keys().cloned().collect());
         let mut action: Option<(u64, RowAction)> = None;
+        let folded_before = self.table.folded.clone();
         let (table, naming) = (&mut self.table, &mut self.naming);
         let events = egui::ScrollArea::vertical()
             .id_salt("panel-list-rows")
@@ -1393,6 +1394,18 @@ impl PanelList {
             })
             .inner;
         let path = |id: u64| panel_of(shown, id).map(Path::to_path_buf);
+        // Rows folded away leave the selection (Delete and Move to act on
+        // what shows).
+        let folded_now = sections.iter().filter(|s| {
+            s.heading
+                .as_ref()
+                .is_some_and(|h| self.table.is_folded(h.id) && !folded_before.contains(h.id))
+        });
+        for row in folded_now.flat_map(|s| &s.rows) {
+            if let Some(p) = path(row.id) {
+                self.selection.remove(&p);
+            }
+        }
         let mut edit = None;
         for event in events {
             match event {

@@ -1559,6 +1559,35 @@ fn remove_offers_undo() {
 }
 
 #[test]
+fn folding_a_section_deselects_its_rows() {
+    use egui::Modifiers;
+    let root = temp_dir("list-fold-select");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    click_row(&mut h, "Ha_0.xisf", Modifiers::NONE);
+    click_row(&mut h, "Ha_1.xisf", Modifiers::COMMAND);
+    click_row(&mut h, "OIII_1.xisf", Modifiers::COMMAND);
+    assert_eq!(selection(&h), ["Ha_0.xisf", "Ha_1.xisf", "OIII_1.xisf"]);
+    // Rows folded away are no longer selected: Delete acts on what shows.
+    heading(&h, "Ha · 4").click();
+    steps(&mut h);
+    assert_eq!(selection(&h), ["OIII_1.xisf"]);
+    h.key_press(egui::Key::Delete);
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 7
+    });
+    let names = h.state().panel_names();
+    assert!(names.iter().any(|n| n == "Ha_0.xisf"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "OIII_1.xisf"), "{names:?}");
+    // Unfolding leaves the selection as it is.
+    heading(&h, "Ha · 4").click();
+    steps(&mut h);
+    assert!(selection(&h).is_empty());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn delete_removes_the_selection() {
     use egui::Modifiers;
     let root = temp_dir("list-delete");
