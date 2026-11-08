@@ -43,8 +43,9 @@ pub enum CheckAction {
 /// a severity icon and bar (an "Accept" button on acceptable, unaccepted
 /// problems), then the passed checks as one collapsed summary row that
 /// expands to list them. With `show_all`, a "Show all" checkbox sits beside
-/// the heading; the caller does the filtering it stands for. Returns the
-/// actions taken this frame.
+/// the heading; the caller does the filtering it stands for. An empty
+/// `heading` without `show_all` draws no heading row (the list sits under a
+/// heading of the caller's). Returns the actions taken this frame.
 pub fn checks_list(
     ui: &mut Ui,
     heading: &str,
@@ -52,14 +53,16 @@ pub fn checks_list(
     show_all: Option<&mut bool>,
 ) -> Vec<CheckAction> {
     let mut actions = Vec::new();
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(heading).strong().color(palette::TEXT_STRONG));
-        if let Some(all) = show_all {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.checkbox(all, "Show all");
-            });
-        }
-    });
+    if !heading.is_empty() || show_all.is_some() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(heading).strong().color(palette::TEXT_STRONG));
+            if let Some(all) = show_all {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.checkbox(all, "Show all");
+                });
+            }
+        });
+    }
     if items.is_empty() {
         ui.label(RichText::new("No checks yet").color(palette::TEXT_MUTED));
         return actions;
@@ -352,6 +355,32 @@ mod tests {
             (tick.center().y - button.center().y).abs() < 3.0,
             "tick {tick:?} beside summary {button:?}"
         );
+    }
+
+    #[test]
+    fn an_empty_heading_draws_no_heading_row() {
+        let mut h = Harness::builder()
+            .with_size(egui::Vec2::new(400.0, 300.0))
+            .build_ui_state(
+                |ui, s: &mut State| {
+                    if crate::testutil::themed(ui) {
+                        let a = checks_list(ui, "", &s.items, None);
+                        s.actions.extend(a);
+                    }
+                },
+                State {
+                    items: vec![check(Severity::Problem, "Broken", true, false)],
+                    show_all: false,
+                    actions: Vec::new(),
+                },
+            );
+        h.run();
+        h.get_by_label("Broken");
+        let labels: Vec<String> = h
+            .query_all_by_role(egui::accesskit::Role::Label)
+            .filter_map(|n| n.value())
+            .collect();
+        assert!(!labels.iter().any(String::is_empty), "{labels:?}");
     }
 
     #[test]

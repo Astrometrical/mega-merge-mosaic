@@ -17,7 +17,7 @@ pub use chip::{CHIP_MAX_WIDTH, ChoiceChip, chip, choice_chip};
 pub use notes::{NOTES_LINES, NotesMode, NotesResponse, notes_view};
 pub use progress::{progress, progress_bar};
 pub use property::{property_grid, property_row, property_row_numeric, property_row_ui};
-pub use segmented::segmented;
+pub use segmented::{Segment, segmented, segmented_with};
 pub use session_card::{CARD_HEIGHT, CARD_THUMB_HEIGHT, CARD_WIDTH, SessionCardData, session_card};
 pub use status_line::{overline, status};
 pub use step_strip::{StepState, StripEvent, StripStep, step_strip};

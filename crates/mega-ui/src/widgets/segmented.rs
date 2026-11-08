@@ -5,12 +5,42 @@ use egui::{CornerRadius, Frame, Response, Stroke, Ui, Vec2};
 use crate::theme::palette::{BORDER, SURFACE_700, TEXT_MUTED, TEXT_STRONG};
 use crate::theme::tokens::{CONTROL_HEIGHT, radius};
 
+/// One option of [`segmented_with`].
+#[derive(Clone, Copy, Debug)]
+pub struct Segment<'a, T> {
+    /// The value the option stands for.
+    pub value: T,
+    /// The option's text (also its accessible label).
+    pub label: &'a str,
+    /// Why the option cannot be chosen now, shown on hover; `None` when it
+    /// can.
+    pub disabled: Option<&'a str>,
+}
+
 /// Choose one of `options` into `value`. Returns the control's response,
 /// marked changed when `value` changes.
 pub fn segmented<T: PartialEq + Clone>(
     ui: &mut Ui,
     value: &mut T,
     options: &[(T, &str)],
+) -> Response {
+    let options: Vec<Segment<'_, T>> = options
+        .iter()
+        .map(|(value, label)| Segment {
+            value: value.clone(),
+            label,
+            disabled: None,
+        })
+        .collect();
+    segmented_with(ui, value, &options)
+}
+
+/// [`segmented`] with options that may be disabled: a disabled option
+/// cannot be chosen and says why on hover.
+pub fn segmented_with<T: PartialEq + Clone>(
+    ui: &mut Ui,
+    value: &mut T,
+    options: &[Segment<'_, T>],
 ) -> Response {
     let mut changed = false;
     let mut inner = Frame::new()
@@ -34,12 +64,16 @@ pub fn segmented<T: PartialEq + Clone>(
             v.widgets.hovered.weak_bg_fill = SURFACE_700;
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.horizontal(|ui| {
-                for (option, label) in options {
-                    let selected = value == option;
-                    let b = egui::Button::selectable(selected, *label)
+                for option in options {
+                    let selected = *value == option.value;
+                    let b = egui::Button::selectable(selected, option.label)
                         .min_size(Vec2::new(0.0, CONTROL_HEIGHT - 2.0));
-                    if ui.add(b).clicked() && !selected {
-                        *value = option.clone();
+                    let mut r = ui.add_enabled(option.disabled.is_none(), b);
+                    if let Some(why) = option.disabled {
+                        r = r.on_disabled_hover_text(why);
+                    }
+                    if r.clicked() && !selected {
+                        *value = option.value.clone();
                         changed = true;
                     }
                 }
