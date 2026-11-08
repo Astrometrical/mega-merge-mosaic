@@ -26,11 +26,11 @@
 //!   its store). [`Mosaic::apply_analyze`] keeps a group marked
 //!   `needs_analyze` if its analyze settings changed since the plan;
 //!   [`Mosaic::apply_blend`] invalidates the group's store and returns an
-//!   error if its blend settings changed or it was marked `needs_analyze`.
-//!   So tiles blended with superseded settings never stay valid once the
-//!   job is applied — an unapplied job's tiles carry no such guarantee:
-//!   the app invalidates them with [`invalidate_group`] when it discards a
-//!   blend whose settings changed since its plan.
+//!   error if it was marked `needs_analyze`. Blend settings are not
+//!   guarded: a merge keeps the settings it was planned with and its
+//!   provenance entry records them. An unapplied job's tiles carry no
+//!   guarantee: the app invalidates them with [`invalidate_group`] when it
+//!   discards a blend whose analysis was superseded.
 //! - **The app cancels and joins before applying settings.** That is the
 //!   app's workflow; busy refusal and the apply guards are the core's
 //!   backstop.
