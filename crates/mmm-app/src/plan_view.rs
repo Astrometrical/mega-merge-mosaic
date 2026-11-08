@@ -53,9 +53,10 @@ use mega_ui::theme::palette;
 use mega_ui::theme::tokens::space;
 use mmm_core::checks::{Severity, SolutionKind, is_accepted, panel_facts};
 use mmm_core::formats::InputPanel;
+use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
-use mmm_core::preview::{Preview, footprint, preview_frame_path};
+use mmm_core::preview::{Preview, aligned_bbox, footprint, preview_frame_path};
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 use mmm_core::stretch::{ChannelStats, StretchParams, apply, channel_stats};
@@ -399,21 +400,32 @@ pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
     out
 }
 
-/// Each of `panels`' header-only footprint in `frame` (solved frames only;
-/// see [`footprint`]). Blocking (worker thread): reads headers; a panel
-/// whose footprint cannot be found is left out.
-pub fn load_footprints(frame: &ReferenceFrame, panels: &[PathBuf]) -> BTreeMap<PathBuf, [f64; 4]> {
-    panels
-        .iter()
-        .filter_map(|p| match footprint(p, frame) {
-            Ok(Some(r)) => Some((p.clone(), r)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::debug!("Plan: no footprint for {}: {e}", p.display());
-                None
+/// Each of `panels`' outline in `frame`: the header-only footprint in a
+/// solved frame (see [`footprint`]), the strided covered-area scan in an
+/// aligned one (see [`aligned_bbox`]). Blocking (worker thread); a panel
+/// whose outline cannot be found is left out, and a cancelled `ctl` ends the
+/// search early with what has been found.
+pub fn load_footprints(
+    frame: &ReferenceFrame,
+    panels: &[PathBuf],
+    ctl: &JobCtl,
+) -> BTreeMap<PathBuf, [f64; 4]> {
+    let mut out = BTreeMap::new();
+    for p in panels {
+        let found = match frame {
+            ReferenceFrame::Aligned { .. } => aligned_bbox(p, ctl),
+            ReferenceFrame::Solved { .. } => footprint(p, frame),
+        };
+        match found {
+            Ok(Some(r)) => {
+                out.insert(p.clone(), r);
             }
-        })
-        .collect()
+            Ok(None) => {}
+            Err(mmm_core::error::Error::Cancelled) => break,
+            Err(e) => tracing::debug!("Plan: no outline for {}: {e}", p.display()),
+        }
+    }
+    out
 }
 
 /// Header facts of a panel for its details.
@@ -609,6 +621,8 @@ pub struct PlanView {
     /// Header-only footprints of the panels in the frame (solved frames).
     footprints: BTreeMap<PathBuf, [f64; 4]>,
     footprint_task: Option<Task<BTreeMap<PathBuf, [f64; 4]>>>,
+    /// Cancels the running footprint search (its generation or frame went).
+    footprint_cancel: CancelToken,
     /// The previews generation and frame the footprints were found for.
     footprints_for: Option<(u64, ReferenceFrame)>,
     /// The previews generation the header facts belong to.
@@ -656,6 +670,7 @@ impl PlanView {
             layout_for: None,
             footprints: BTreeMap::new(),
             footprint_task: None,
+            footprint_cancel: CancelToken::new(),
             footprints_for: None,
             info_generation: 0,
             last_shown: None,
@@ -1070,8 +1085,10 @@ impl PlanView {
         });
     }
 
-    /// Find the panels' header-only footprints once per previews generation
-    /// and frame (solved frames; an aligned frame has none to find).
+    /// Find the panels' outlines once per previews generation and frame:
+    /// header-only for solved frames, a strided pixel scan for aligned ones
+    /// (both on a worker). A search for a superseded generation or frame is
+    /// cancelled and its result dropped.
     fn start_footprints(
         &mut self,
         ctx: &egui::Context,
@@ -1082,15 +1099,15 @@ impl PlanView {
             return;
         };
         let key = (feed.generation, frame);
-        if self.footprint_task.is_some() || self.footprints_for.as_ref() == Some(&key) {
+        if self.footprints_for.as_ref() == Some(&key) {
             return;
         }
+        // Whatever is running is for another generation or frame.
+        self.footprint_cancel.cancel();
+        self.footprint_task = None;
+        self.footprint_cancel = CancelToken::new();
         let frame = key.1.clone();
         self.footprints_for = Some(key);
-        if !matches!(frame, ReferenceFrame::Solved { .. }) {
-            self.footprints.clear();
-            return;
-        }
         let panels: Vec<PathBuf> = session
             .mosaic
             .config
@@ -1098,8 +1115,9 @@ impl PlanView {
             .iter()
             .map(|p| p.path.clone())
             .collect();
+        let cancel = self.footprint_cancel.clone();
         self.footprint_task = Task::spawn("mmm-plan-footprints", ctx, move || {
-            load_footprints(&frame, &panels)
+            load_footprints(&frame, &panels, &JobCtl::new(cancel, None))
         });
     }
 

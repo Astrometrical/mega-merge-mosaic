@@ -605,6 +605,59 @@ fn plan_places_solved_panels_before_previews() {
 }
 
 #[test]
+fn aligned_panels_get_outlines_before_previews() {
+    use mmm_core::synth::write_xisf;
+    let root = temp_dir("plan-aligned");
+    let (w, h) = (400u64, 300u64);
+    let rects = [[20u64, 30, 180, 140], [150, 120, 330, 260]];
+    let paths: Vec<PathBuf> = rects
+        .iter()
+        .enumerate()
+        .map(|(k, r)| {
+            let path = root.join(format!("al_{k}.xisf"));
+            let mut p = vec![0f32; (w * h) as usize];
+            for y in r[1]..r[3] {
+                for x in r[0]..r[2] {
+                    p[(y * w + x) as usize] = 0.3;
+                }
+            }
+            write_xisf(&path, w, h, 1, &p).unwrap();
+            path
+        })
+        .collect();
+    let cfg = mmm_core::mosaic::MosaicConfig::new(paths.clone());
+    let input = cfg.analyze.input;
+    let mosaic = mmm_core::mosaic::Mosaic::create(&root.join("s.mmm-session"), cfg).unwrap();
+    let frame = mmm_core::reference::derive(&paths, input).unwrap();
+    assert!(matches!(frame, ReferenceFrame::Aligned { .. }));
+    frame
+        .save(&mmm_core::preview::preview_frame_path(&mosaic.dir))
+        .unwrap();
+    let groups = mosaic.groups().ok();
+    let s = OpenSession {
+        mosaic,
+        frame: None,
+        groups,
+        lock: None,
+        summary: None,
+        merged: false,
+        results: Default::default(),
+    };
+    let mut h = harness(s);
+    step_until(&mut h, |s| s.view.items().len() == 2);
+    assert_eq!(h.state().view.unplaced(), 0);
+    for it in h.state().view.items() {
+        assert!(it.layers.is_empty());
+        let k = paths.iter().position(|p| *p == it.path).unwrap();
+        for (g, want) in it.rect.iter().zip(rects[k]) {
+            assert!((g - want as f64).abs() <= 1.0, "{:?}", it.rect);
+        }
+    }
+    assert!(dashes(&h) > 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn linked_auto_stretch_ignores_empty_channels() {
     let p = Arc::new(Preview {
         path: PathBuf::from("x"),
