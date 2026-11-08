@@ -282,10 +282,11 @@ impl SessionWindow {
             self.set_mode(CanvasMode::Mosaic);
         }
     }
+
     /// **Merge this group**: commit the draft and merge `group` alone over
     /// the whole canvas, showing the mosaic (only if a merge was queued).
-    /// Other merges, running or
-    /// queued, keep the settings they were queued with.
+    /// Other merges, running or queued, keep the settings they were queued
+    /// with.
     pub fn merge_group(&mut self, session: &mut OpenSession, jobs: &mut JobRunner, group: &str) {
         if self
             .mosaic

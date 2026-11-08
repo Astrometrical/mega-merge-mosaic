@@ -799,6 +799,7 @@ impl MosaicView {
         }
         any
     }
+
     /// Whether the export dialog may open now: the view has groups, no
     /// tracked analysis runs and the dialog is not open already
     /// ([`MosaicView::export_block_reason`] gives none).
