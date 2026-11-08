@@ -383,7 +383,7 @@ mod tests {
 
     use super::*;
     use crate::jobs::tests::drain;
-    use crate::panels_tab::{Applied, PanelsEdit};
+    use crate::panel_edits::{Applied, PanelsEdit};
     use crate::start::tests::temp_dir;
     use crate::testutil::two_group_session;
 

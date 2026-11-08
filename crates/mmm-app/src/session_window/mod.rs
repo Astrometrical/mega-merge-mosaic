@@ -8,10 +8,13 @@
 //!   the step strip ([`steps`]: Panels · Checks · Merge · Export, with the
 //!   work in progress) and the main button (**Add panels…**, **Merge**
 //!   with the merge settings' summary, or **Export…**).
-//! - **Panel list** ([`PanelsTab`]): while open it takes the canvas's
-//!   place (view bar included); the Panels step opens and closes it. A
-//!   session without panels opens on it. Files dropped on the window are
-//!   added whatever shows ([`SessionWindow::poll_panels`]).
+//! - **Panel list** ([`PanelList`]): while open it is a resizable column
+//!   at the left of the canvas (about half the window wide at first, never
+//!   narrower than [`PANEL_LIST_MIN_WIDTH`]), so the view bar and the plan
+//!   stay beside it; the Panels step opens and closes it, and switching
+//!   between plan and mosaic leaves it as it is. A session without panels
+//!   opens on it. Files dropped on the window are added whatever shows
+//!   ([`SessionWindow::poll_panels`]).
 //! - **One view, one camera.** The window keeps the view (a group or a
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
@@ -69,7 +72,7 @@ use std::time::Instant;
 
 use mega_ui::inspector::{InspectorState, inspector_width};
 use mega_ui::theme::palette;
-use mega_ui::theme::tokens::space;
+use mega_ui::theme::tokens::{PANEL_LIST_MIN_WIDTH, space};
 use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
 use mmm_core::session_summary::ResultState;
@@ -82,7 +85,8 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
-use crate::panels_tab::{FilesPicker, PanelsEdit, PanelsTab};
+use crate::panel_edits::{FilesPicker, PanelsEdit};
+use crate::panel_list::PanelList;
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView};
 use crate::session::OpenSession;
@@ -113,8 +117,6 @@ pub struct SessionOutput {
 
 /// What an Undo toast's action restores ([`SessionWindow::undo`]).
 #[derive(Clone, Debug)]
-// Nothing raises one yet: the panel list's Remove does (Task 7).
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum Undo {
     /// Restore the panels and grouping as they were.
     Panels(PanelsEdit),
@@ -152,14 +154,17 @@ pub struct SessionWindow {
     /// The view as last written into the session's `ui` (or found there).
     saved_view: Option<ViewState>,
     /// The panel list: the files and their grouping.
-    panels: PanelsTab,
+    panels: PanelList,
     /// Toasts raised since the last frame, handed to the shell by `ui`.
     toasts: Vec<WindowToast>,
-    /// The panel list shows in the canvas's place.
+    /// The panel list shows at the left of the canvas.
     pub(crate) panel_list_open: bool,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
+    /// The panel list's rect, as last drawn (tests).
+    #[cfg(test)]
+    pub(crate) list_rect: Option<egui::Rect>,
 }
 
 /// Inspector section ids, in their fixed order.
@@ -189,11 +194,13 @@ impl SessionWindow {
             bar_widths: None,
             save: Debounce::default(),
             saved_view: None,
-            panels: PanelsTab::new(picker),
+            panels: PanelList::new(picker),
             toasts: Vec::new(),
             panel_list_open: false,
             #[cfg(test)]
             top_bar_rect: None,
+            #[cfg(test)]
+            list_rect: None,
         }
     }
 
@@ -203,10 +210,9 @@ impl SessionWindow {
         self.mode.unwrap_or(CanvasMode::Plan)
     }
 
-    /// Show the plan or the mosaic, where the shown canvas looks; the panel
-    /// list closes, so the canvas shows.
+    /// Show the plan or the mosaic, where the shown canvas looks (the
+    /// panel list beside it stays as it is).
     pub fn set_mode(&mut self, mode: CanvasMode) {
-        self.panel_list_open = false;
         if self.mode == Some(mode) {
             return;
         }
@@ -287,7 +293,13 @@ impl SessionWindow {
         self.mosaic.track_analysis(id);
     }
 
-    /// The panel list's background work, shown or not ([`PanelsTab::poll`]):
+    /// The panel list (tests).
+    #[cfg(test)]
+    pub(crate) fn panel_list(&self) -> &PanelList {
+        &self.panels
+    }
+
+    /// The panel list's background work, shown or not ([`PanelList::poll`]):
     /// files picked, typed or dropped anywhere on the window are added, and
     /// a waiting edit applies. Call every frame after the runner's poll,
     /// before the pipeline's.
@@ -401,8 +413,8 @@ impl SessionWindow {
     }
 
     /// Draw the window filling `ui`: the top bar across it, the inspector
-    /// at the right, the view bar and the canvas (or the panel list) in the
-    /// rest, and the export dialog when open.
+    /// at the right, the panel list (when open) at the left, the view bar
+    /// and the canvas in the rest, and the export dialog when open.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -432,22 +444,34 @@ impl SessionWindow {
             .show(ui, |ui| {
                 self.inspector_ui(ui, session, jobs, pipeline, checks, &mut out);
             });
+        if self.panel_list_open {
+            // About half the window at first; the user resizes it.
+            let width = (ctx.content_rect().width() / 2.0).max(PANEL_LIST_MIN_WIDTH);
+            let list = egui::Panel::left("panel-list")
+                .resizable(true)
+                .default_size(width)
+                .min_size(PANEL_LIST_MIN_WIDTH)
+                .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
+                .show(ui, |ui| self.panels.ui(ui, session, jobs, checks.report()));
+            #[cfg(test)]
+            {
+                self.list_rect = Some(list.response.rect);
+            }
+            // Rows and the plan are linked in the list's next step.
+            out.toasts.extend(list.inner.toasts);
+        } else {
+            out.toasts.extend(self.panels.take_toasts());
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| {
-                if self.panel_list_open {
-                    self.panels.ui(ui, session, jobs);
-                } else {
-                    self.view_bar(ui, session, jobs, pipeline);
-                    self.canvas_ui(ui, session, pipeline, checks);
-                }
+                self.view_bar(ui, session, jobs, pipeline);
+                self.canvas_ui(ui, session, pipeline, checks);
             });
         self.mosaic.export_ui(&ctx, session, jobs);
         out.toasts.append(&mut self.toasts);
-        if !self.panel_list_open {
-            // Files dropped anywhere are added (the list draws its own).
-            self.panels.drop_overlay(&ctx);
-        }
+        // Files dropped anywhere are added, whatever shows.
+        self.panels.drop_overlay(&ctx);
         // What this frame changed is saved from the next one.
         if self.keep_view_state(session) {
             ctx.request_repaint();

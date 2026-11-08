@@ -14,9 +14,9 @@
 //! The letters and brackets count with no modifier held. None acts while a
 //! text field has the keyboard (notes, names, a path) or the Export dialog
 //! is open; a focused button or chip (keyboard navigation) does not stop
-//! them. The canvas's own (`M`, the brackets and the
-//! toggles) act only while the canvas shows, not the panel list. A key that
-//! is a shortcut is consumed, so no widget sees it too.
+//! them. The canvas always shows (the panel list sits beside it), so the
+//! canvas's own (`M`, the brackets and the toggles) act with the list open
+//! too. A key that is a shortcut is consumed, so no widget sees it too.
 
 use egui::{Key, KeyboardShortcut, Modifiers};
 
@@ -82,9 +82,6 @@ impl SessionWindow {
         }
         if ctx.input_mut(|i| i.consume_shortcut(&MERGE)) && self.can_merge(session, jobs) {
             self.merge(session, jobs);
-        }
-        if self.panel_list_open {
-            return;
         }
         // As the segment: the plan always, the mosaic once it can show.
         if pressed(PLAN_MOSAIC) {

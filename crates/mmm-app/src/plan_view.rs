@@ -65,7 +65,7 @@ use crate::camera::Camera;
 use crate::checks::ChecksReport;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
-use crate::panels_tab::{group_colors, load_group_colors};
+use crate::panel_edits::{group_colors, load_group_colors};
 use crate::session::OpenSession;
 use crate::status::format_canvas;
 use crate::util::{Poll, Task, group_names};

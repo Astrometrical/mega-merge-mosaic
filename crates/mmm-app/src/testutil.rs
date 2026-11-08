@@ -32,7 +32,7 @@ pub(crate) fn two_group_mono_session(root: &Path) -> OpenSession {
 }
 
 /// `mosaic` as opened, its groups resolved, without a lock.
-fn open(mosaic: mmm_core::mosaic::Mosaic) -> OpenSession {
+pub(crate) fn open(mosaic: mmm_core::mosaic::Mosaic) -> OpenSession {
     let groups = mosaic.groups().ok();
     OpenSession {
         mosaic,

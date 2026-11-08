@@ -12,7 +12,7 @@ use mmm_core::preview::PREVIEWS_DIR;
 use mmm_core::session_summary::{ResultState, SessionSummary, read_summary};
 
 use super::RecentEntry;
-use crate::panels_tab::load_group_colors;
+use crate::panel_edits::load_group_colors;
 use crate::session::{notes, session_name};
 
 /// Whether a recent session can be used right now.

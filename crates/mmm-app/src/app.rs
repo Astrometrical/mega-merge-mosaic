@@ -19,7 +19,7 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::mosaic_view::MosaicView;
-use crate::panels_tab::{FilesPicker, RfdFilesPicker};
+use crate::panel_edits::{FilesPicker, RfdFilesPicker};
 use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::session_window::{CanvasMode, SessionWindow, Undo, WindowToast};
@@ -1348,10 +1348,12 @@ mod tests {
         assert!(h.state().window().panel_list_open);
         h.get_by_label("Ha_0.xisf");
         let deadline = Instant::now() + crate::testutil::PATIENCE;
-        while h.query_by_label("OIII").is_none() {
-            assert!(Instant::now() < deadline, "no OIII column");
+        // The OIII section's heading reads like its chip in the view bar.
+        while h.query_all_by_label("OIII · 4").count() < 2 {
+            assert!(Instant::now() < deadline, "no OIII section");
             h.step();
         }
+        h.get_by_label("OIII_0.xisf");
         let actions: Vec<_> = h
             .state()
             .session()
@@ -1542,7 +1544,7 @@ mod tests {
 
     #[test]
     fn an_undo_toast_restores_the_edit() {
-        use crate::panels_tab::{Applied, PanelsEdit};
+        use crate::panel_edits::{Applied, PanelsEdit};
         use mmm_core::mosaic::MosaicConfig;
         let root = temp_dir("shell-undo");
         let dir = crate::testutil::two_group_session(&root).mosaic.dir;

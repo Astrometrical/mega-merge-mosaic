@@ -1092,11 +1092,16 @@ views and export. No algorithm changed. Core additions are bookkeeping
   when groups or panels change and after any pipeline job ends; the Checks step and the
   inspector's Problems section show problems, notes and passed. Accepting a check adds its keys to
   `accepted_checks` in `mosaic.json`; accepted problems stop counting.
-- **Panel list** (`panels_tab.rs`, opened from the Panels step). Add files (picker, drag and drop, or a typed path with one
-  `*` in the file name; duplicates ignored), per-panel cards, Remove, and
-  grouping. Grouping is **off by default** (plain grid); turning it on shows
-  the header-key rule and one column per group, with **No group** first and an
-  "N to sort" header; Move to places a panel manually or lets the rule decide.
+- **Panel list** (`panel_list.rs`, edits in `panel_edits.rs`; opened from
+  the Panels step, a resizable column left of the canvas). Add files (picker,
+  drag and drop, or More → Type a path… with one `*` in the file name;
+  duplicates ignored) and a sectioned table (`mega_ui::table`): PANEL, FILTER,
+  INTEGRATION, SCALE, SIZE from one header read per panel
+  (`read_panel_header`, cached by path and fingerprint on a worker); with
+  grouping on, **No group** first (its heading says why) then a rolled-up
+  section per group ("Ha · 12 · 38h 20m", "1 fewer than Ha"). Rows have an
+  actions menu (Remove, with Undo in a toast). **Group by** chooses Don't
+  group, a header keyword or a filename token.
   Group colours are stable and persisted in `ui.group_colors`: well-known
   filters get physical colours (Ha red, OIII cyan, SII orange-red `#E0703A`,
   R/G/B, L white), other names take the first unused entry after the six
@@ -1197,10 +1202,10 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   window opens on the mosaic once something is merged, else on the plan;
   Mosaic cannot be chosen before something is merged or a merge has
   started. `MosaicView::poll` runs
-  every frame whether or not the mosaic is drawn. The panel list (still the
-  old `PanelsTab` UI) replaces the canvas, view bar included, while open; a
-  session without panels opens on it, and files dropped on the window are
-  added whatever shows.
+  every frame whether or not the mosaic is drawn. The panel list sits in a
+  resizable column left of the canvas while open (view bar and canvas stay
+  beside it; switching plan/mosaic leaves it open); a session without panels
+  opens on it, and files dropped on the window are added whatever shows.
 - **View bar.** Plan / Mosaic, a chip per group and per composite and **+**
   (with two or more groups), and the Outlines, ROIs, Linked and Strong
   toggles. It wraps when the window is narrow.

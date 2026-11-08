@@ -22,7 +22,7 @@ use crate::compositions::{Composition, ViewKind, load_compositions, save_composi
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::tests::{analyzed, drain};
 use crate::jobs::{JobRunner, JobTarget};
-use crate::panels_tab::FilesPicker;
+use crate::panel_edits::FilesPicker;
 use crate::pipeline::{Pipeline, Step};
 use crate::rois::{Roi, save_rois};
 use crate::session::{OpenSession, any_merged, classify_results, create_blocking, notes};
@@ -1316,10 +1316,9 @@ fn empty_session_opens_on_the_panel_list() {
     for l in ["Add panels", "Checks", "Merge", "Export", "Add panels…"] {
         h.get_by_label(l);
     }
-    assert!(
-        h.query_by_label("Plan").is_none(),
-        "the list over the canvas"
-    );
+    h.get_by_label("Plan");
+    let list = h.state().w.list_rect.expect("the list beside the canvas");
+    assert!(list.left() < h.get_by_label("Plan").rect().left());
     // Closed: the empty canvas, where nothing can be merged yet.
     h.get_by_label("Add panels").click();
     h.run_steps(3);
@@ -1358,10 +1357,11 @@ fn panels_step_toggles_the_panel_list() {
     h.run_steps(2);
     assert!(h.state().w.panel_list_open);
     h.get_by_label("Add files…");
-    assert!(
-        h.query_by_label("Plan").is_none(),
-        "the list over the canvas"
-    );
+    h.get_by_label("Plan");
+    // Plan / Mosaic leaves the list beside the canvas.
+    h.state_mut().w.set_mode(CanvasMode::Plan);
+    h.run_steps(2);
+    assert!(h.state().w.panel_list_open);
     h.get_by_label("8 panels").click();
     h.run_steps(2);
     assert!(!h.state().w.panel_list_open);

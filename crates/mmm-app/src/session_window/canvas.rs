@@ -19,7 +19,7 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, add_composition};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
-use crate::panels_tab::{group_colors, load_group_colors};
+use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{PlanFeed, group_members};
 use crate::session::OpenSession;
