@@ -125,6 +125,24 @@ impl Groups {
     }
 }
 
+/// Processing groups whose member set differs between `old` and `new`,
+/// including groups that were added or vanished. Panel order within a group
+/// and a rule switch that leaves membership alone do not count.
+pub fn affected_groups(old: &Groups, new: &Groups) -> BTreeSet<String> {
+    let sets = |g: &Groups| -> BTreeMap<String, BTreeSet<PathBuf>> {
+        g.processing_groups()
+            .into_iter()
+            .map(|(n, p)| (n, p.into_iter().collect()))
+            .collect()
+    };
+    let (o, n) = (sets(old), sets(new));
+    o.keys()
+        .chain(n.keys())
+        .filter(|k| o.get(*k) != n.get(*k))
+        .cloned()
+        .collect()
+}
+
 /// Split the configuration's panels into groups. `header` looks up a
 /// panel's header value (for [`GroupRule::Header`]). With grouping off every
 /// panel is in [`SINGLE_GROUP`]; with it on, a manual group beats the rule.

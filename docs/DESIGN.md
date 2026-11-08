@@ -911,11 +911,13 @@ below is UI-agnostic and the CLI is its first consumer.
   store before loading anything. A `set_*` landing while no store is locked
   is caught at apply time: `apply_analyze` keeps a group marked
   `needs_analyze` if its analyze settings changed since the plan, and
-  `apply_blend` invalidates the store and returns an error if the group's
-  blend settings changed or it was marked `needs_analyze`. A blend that is
-  never applied (cancelled or failed) carries no such guarantee, so the app
-  invalidates the group's store (`invalidate_group`, busy-aware) when it
-  discards one whose settings were superseded. Invalidation flushes only
+  `apply_blend` invalidates the store and returns an error if the group was
+  marked `needs_analyze` meanwhile (it no longer refuses changed blend
+  settings: a merge keeps the settings it started with, and the `"blend"`
+  provenance entry records them, see "Draft merge settings" below). A blend
+  that is never applied (cancelled or failed) carries no such guarantee, so
+  the app invalidates the group's store (`invalidate_group`, busy-aware)
+  when it discards one whose analysis was superseded. Invalidation flushes only
   the store's state table (`TileStore::flush_state`); `run_blend` flushes
   the whole store on its worker on success, so the owner thread never
   waits on tile write-back, and only the state table on an error or
@@ -1208,7 +1210,9 @@ views and export. No algorithm changed. Core additions are bookkeeping
   the frame when the analysis of changed panels moves it (a rotated
   re-derive grows the box slightly; without a WCS the canvas rect is used as
   stored). Merging an ROI merges it once per group of the current view
-  (ROI merges stay out of the step strip); **Merge** merges every group.
+  with the merge settings draft, uncommitted (ROI merges stay out of the
+  step strip; see "Merge jobs carry their settings" below); **Merge** merges
+  every group.
 - **Export.** `mmm_core::export` writes a group's result for the whole canvas
   as linear 32-bit float, **unclamped**: FITS (WCS cards plus `HISTORY`
   provenance: mmm version and the group's latest blend settings) or TIFF
@@ -1272,12 +1276,31 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   cannot act now says why in its tooltip (Merge: the merge guard's reason;
   Export: `MosaicView::export_block_reason`). ROI merges are not shown in
   the strip.
+- **Merge states and predicates** (`steps.rs`). One set of predicates
+  derives every place's Merge state. `out_of_date(session, group)`: the
+  group's result is not Complete, it needs analysis, or a region of it was
+  merged with other settings than its last whole merge
+  (`mmm_core::mosaic::region_differs`: the store is complete but not of one
+  merge). `draft_changed`:
+  not out of date, but its last whole-canvas merge used different effective
+  merge settings from the draft (`mmm_core::mosaic::settings_changed`, the
+  draft with the group's override applied). The Merge step reads, in order:
+  "Merge queued after export" (a whole-canvas merge waiting behind a running
+  export; cancellable, no fraction), "Merging …" (above), "Merge" (no
+  groups, analysis needed or running; or nothing ever merged, as the next
+  step), "Out of date" (some group `out_of_date`; next), "Settings changed"
+  (some group `draft_changed`; next) or "Merged" (done). The step strip, the
+  main button, the chips, the canvas tag and the start screen's card all
+  agree because they call these predicates (the start screen through
+  `GroupSummary.settings_changed` and `GroupSummary.region_differs`,
+  below).
 - **Main button.** **Add panels…** with no panels, **Merge** (with a summary
-  of the merge settings, which opens Merge settings) while any group lacks a
-  complete result (`needs_merge`: none yet, partly merged or out of date),
-  **Export…** once every group's result is complete (disabled, with its
-  reason as a tooltip, while the Export dialog cannot open).
-  `Ctrl/Cmd+Enter` presses **Merge**.
+  of the merge settings, which opens Merge settings) while any group is out
+  of date or its settings changed (`steps::merge_needed`: the groups
+  `groups_to_merge` returns), **Export…** once every group's result is
+  complete (disabled, with its reason as a tooltip, while the Export dialog
+  cannot open). A group whose settings changed is still complete, so it
+  never blocks export. `Ctrl/Cmd+Enter` presses **Merge**.
 - **Canvas.** The plan (`plan_view.rs`) or the merged mosaic
   (`mosaic_view.rs`) of the chosen group or composite, with one shared
   camera: switching between them, or to another view, hands the shown
@@ -1296,15 +1319,107 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   opens on it, and files dropped on the window are added whatever shows.
 - **View bar.** Plan / Mosaic, a chip per group and per composite and **+**
   (with two or more groups), and the Outlines, ROIs, Linked and Strong
-  toggles. It wraps when the window is narrow.
+  toggles. It wraps when the window is narrow. A group chip carries a
+  `mega_ui::widgets::ChipMark`: `Attention` (the warning tone's icon,
+  "Out of date") when the group is out of date, `Changed` (the info tone's
+  icon, "Settings changed") when only its settings changed; a composite's
+  chip takes its members' worst. The mark is the tone's glyph after the
+  label in the tone's colour, never a bare colour dot (the info tone is the
+  accent, as is a selected or hovered chip's border); the chip's hover text
+  says the state above the caller's own (the view bar's shortcut hint), and
+  its accessible description says it too. The chip's context
+  menu has **Merge this group**, which commits the draft and merges that
+  group only (disabled, "Merging {group}…", while that group's whole merge
+  runs or is queued, and when merging is blocked). In Mosaic mode a tag over
+  the image's top-left says why the shown group is out of date, in the order
+  of `mmm_core::mosaic::out_of_date_reason`: analysis settings changed
+  (`needs_analyze` with analysis settings that differ from the group's
+  last analysis), panels changed (`needs_analyze` otherwise), region merged
+  with other settings (`region_differs`: "Out of date — region merged with
+  other settings"), Not merged yet (no whole merge recorded), panels changed
+  (an `"inputs"` provenance entry newer than the group's last whole merge
+  that touches it), analysis settings changed (an `"analyze"` entry newer
+  than the last merge with different settings), else merge didn't finish.
+  A group whose settings merely changed gets the quieter "Settings changed
+  since this merge": muted text on a translucent panel
+  (`mega_ui::theme::scrim`: `SURFACE_800` at the lowest opacity that keeps
+  the text AA over a white image), where the out-of-date tags sit on an
+  opaque panel in body text. Clicking the tag reveals Merge settings.
 - **Inspector.** Foldable, at the right: Problems, Panels, ROIs, Merge
   settings, Composites and Notes, in that order; only the sections' contents
   fold (Merge settings has no fold of its own inside). The merge settings
   are the
   mosaic-wide `AnalyzeSettings` / `BlendSettings` with the CLI's value
-  domains, edited and applied as before (staged edits, applied once the
-  cancelled jobs have stopped; a global change marks every analysed group
-  `needs_analyze`).
+  domains. Merge fields edit a draft kept in `ui.merge_draft`
+  (`blend_settings::MERGE_DRAFT_KEY`; saved with the window's debounced save;
+  nothing is invalidated or cancelled; a merge commits it). Analysis fields
+  apply at once (applied once the cancelled jobs have stopped; a change
+  marks every analysed group `needs_analyze`), show one muted cost line
+  under the analysis fields once a mosaic exists ("Re-runs the analysis;
+  the mosaic goes out of date"), and raise an "Analysis settings changed"
+  toast with Undo (`Undo::Analyze`; undoing queues like any edit and raises
+  its own toast whose Undo redoes the change). A field whose draft value
+  differs from the group's last merge (or last analysis) is marked with an
+  accent dot (`changed_fields`).
+- **Draft merge settings and commit-at-merge** (project 3, plan 3). The
+  draft is `load_draft(cfg)`: `ui.merge_draft` if it parses and validates,
+  else the committed `config.blend` (an old session has no draft and
+  behaves as before). Pressing Merge (or **Merge this group**) first calls
+  `mmm_core::mosaic::commit_blend_settings`, which validates the base and
+  every group's effective settings, stores them as `config.blend` and
+  saves once, with no store lock, no invalidation and `needs_analyze`
+  untouched (the app does this save on the UI thread, the accepted
+  exception). A commit therefore never invalidates a finished mosaic; the
+  groups merged with other settings read "Settings changed" until
+  re-merged. `mmm set` still goes through `set_settings` and invalidates.
+- **Merge jobs carry their settings.** A merge job captures its
+  settings when it is queued and plans with `plan_blend_with`; a running
+  merge keeps the settings it started with across later commits and its
+  group then shows "Settings changed". The `"blend"` provenance entry
+  records the plan's settings and `whole` (false for an ROI merge; an
+  entry without the key counts as whole), and
+  `mmm_core::mosaic::last_merge_settings` reads the newest whole entry's
+  settings (`None` if never merged or unparseable). A whole-canvas merge
+  whose settings differ from that is `BlendPlan.fresh`: `run_blend`
+  invalidates the whole store before writing, so a merge stopped part-way
+  never leaves old- and new-settings tiles both valid (the group reads Out
+  of date). `TileSink::new` also invalidates the whole aligned rect of any
+  whole-canvas merge, fresh or not, so a finished whole merge rewrites every
+  tile; `fresh` is kept for durability (it flushes the invalidation before
+  the possibly long blend reads the panels, while the sink's sits unflushed
+  in the mapping until the run ends, and `blend_tiles` can fail before the
+  sink exists), so neither replaces the other.
+- **ROI merges use the draft.** An ROI merge (`MosaicView::merge_roi`)
+  queues each group with `JobRunner::start_blend_with` and the draft through
+  the group's override (`blend_settings::draft_for`), without committing it,
+  so "change a merge setting, merge an ROI, look" (spec §11) shows the
+  draft; an invalid feather blocks it like any merge. ROI plans are never
+  `fresh`. ROI merges still write into the real stores until plan 4 makes
+  them transient previews, so a region merged with other settings than the
+  group's last whole merge mixes settings inside a complete store:
+  `mmm_core::mosaic::region_differs` (a `whole: false` entry newer than the
+  newest whole entry records other settings; no whole entry: false; only a
+  later whole merge clears it) makes the group out of date, never "Settings
+  changed", so Merge re-merges it over the whole canvas (the sink rewrites
+  the patch even when that merge is not `fresh`).
+- **Per-group panel edits.** An add, remove, move or rule change works out
+  on a worker which groups it touches (`affected_groups(old, new)`) and
+  applies with `set_inputs_affecting`: only those groups' stores are
+  invalidated and marked `needs_analyze`, and the `"inputs"` entry lists
+  them (`affected`; absent = all, as `set_inputs`). The analysis that follows
+  is `plan_analyze_scoped` with `AnalyzeScope::Needed` (marked groups plus
+  groups never analysed); its plan records the saved frame
+  (`expected_frame`) and `run_analyze` fails with `Error::FrameMoved` if the
+  frame derived from the panels differs (a solved panel growing the
+  canvas). The app treats that as a fallback: it marks every analysed group
+  and re-runs a whole analysis, reporting no failure. A panel edit
+  cancels every non-export job (`JobRunner::cancel_for_panel_edit`,
+  unaffected groups' merges included); a whole merge it stopped raises
+  "Merge stopped: panels changed" once per edit.
+- **Merges behind exports.** The runner has a single slot, so every merge
+  waits behind a running export (not only a merge of the group being
+  exported); the strip says "Merge queued after export"
+  (`JobRunner::merge_waits_for_export`).
 - **Display stretch** (`display_stretch.rs`). Always automatic, never set by
   hand, one rule for the plan and the mosaic: an automatic stretch per
   channel, with **Linked** (one stretch for all channels) and **Strong** (a
@@ -1344,12 +1459,10 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
 
 ## Coming in project 3
 
-Plan 2 (the panel list and grouping, above) is built. Plans 3–6 of project
-3 change the session window as follows; none of it is built yet.
+Plans 2 (the panel list and grouping) and 3 (draft merge settings and
+per-group staleness, in the session window above) are built. Plans 4-6 of
+project 3 change the session window as follows; none of it is built yet.
 
-- **Plan 3, draft merge settings.** Settings become drafts, with per-group
-  staleness (which groups are out of date, not just the mosaic), including
-  on adding or removing panels.
 - **Plan 4, ROIs.** An ROI list with transient previews, drawing an ROI on the
   plan, and the Draw ROI shortcut.
 - **Plan 5, composites and export.** A composites popover and the new Export
@@ -1369,7 +1482,9 @@ stays free of `mmm-core`.
   warnings), `tokens` (spacing 4·8·12·16·24·32, radii 4/6/8, 30 px controls,
   100 ms hover fades), `text::Type` (the type scale), `Tone` (success, info,
   warning, problem, neutral: colour, accent, tint and icon), and
-  `contrast_ratio`/`legible_text` for checking new colours. UI code takes
+  `contrast_ratio`/`legible_text` for checking new colours, plus `scrim`
+  (a surface colour at the lowest opacity that keeps given text AA over
+  any image) for translucent overlays. UI code takes
   colours, sizes, radii and durations from these, never literals.
 - **Fonts** (`theme::fonts`): Inter (UI), JetBrains Mono (numbers) and
   Lucide (icons), embedded; licences in `crates/mega-ui/assets/fonts/` and
@@ -1384,7 +1499,8 @@ stays free of `mmm-core`.
   quiet, danger, ghost; large; icon buttons), `step_strip` (pills with
   state, progress, Cancel and an optional tooltip; `step_strip_width`
   measures one row, and the strip wraps when it does not fit), `chip`,
-  `status`, `overline`,
+  `choice_chip` (a toggle; a `ChipMark` adds its tone's icon, its state as
+  hover text and its accessible description), `status`, `overline`,
   `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
   `submenu` (a menu entry with an icon-font chevron, staying open for a
   text field inside),
@@ -1432,8 +1548,12 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   state and blend/export stamps, check counts, canvas size and the view last
   shown. The app keeps it current (`summary_writer::SummaryWriter`, written
   atomically in the background whenever a fact changes: what it shows, the
-  settings the results depend on (a settings edit marks results stale with
-  no job running), or a job ending, cancelled ones included) so the start
+  settings the results depend on (an analysis or panel edit marks results
+  stale with no job running; a merge-settings commit makes
+  `GroupSummary.settings_changed` true for the groups merged with other
+  settings, with no invalidation; a region merged with other settings makes
+  `GroupSummary.region_differs` true, and such a group is never also
+  settings changed), or a job ending, cancelled ones included) so the start
   screen can show a session without opening it. It is advisory: `read_summary`
   returns `None` for a file that is absent, corrupt or from a newer mmm
   (`SUMMARY_FORMAT`), and the card then falls back to what `mosaic.json`
@@ -1443,8 +1563,12 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   drive, `Busy`, `Unreadable` for a corrupt or newer `mosaic.json`, else
   `Available`), the state, group colours and notes. The states are no
   panels, plan ready, partly merged (some groups merged, the rest without a
-  result), merged, merged and exported, and re-merge needed (any stale or
-  partial group, whatever the others). Facts load on a pool of 4 workers (`FACTS_WORKERS`), so a session on a dead network path stalls
+  result), merged, merged and exported, settings changed (every group
+  complete but one's last whole merge used other settings from the draft;
+  it ranks ahead of merged and exported, since an export of the old
+  settings does not settle the session; `CardState::SettingsChanged`,
+  "Settings changed") and re-merge needed (any stale or partial group, or
+  any with `region_differs`, whatever the others). Facts load on a pool of 4 workers (`FACTS_WORKERS`), so a session on a dead network path stalls
   one worker, never the screen or the other cards.
 - **The hero loader** (`start::hero_views`): a session with any group
   result (merged, partly merged or needing a re-merge) gives one view per

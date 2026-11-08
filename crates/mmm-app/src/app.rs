@@ -97,6 +97,8 @@ pub struct Shell {
     /// What each toast with an action undoes (dropped with the toast; the
     /// toasts go with the session, [`Shell::drop_undos`]).
     undos: BTreeMap<ToastId, Undo>,
+    /// The analysis settings toast shown, which the next one replaces.
+    analysis_toast: Option<ToastId>,
     /// Every toast's title pushed, in order (tests: a toast expires).
     #[cfg(test)]
     toasted: Vec<String>,
@@ -133,6 +135,7 @@ impl Shell {
             jobs: None,
             toasts: Toasts::default(),
             undos: BTreeMap::new(),
+            analysis_toast: None,
             #[cfg(test)]
             toasted: Vec::new(),
             title: APP_TITLE.to_string(),
@@ -196,11 +199,21 @@ impl Shell {
     /// notes). When the window closes, and on leaving the session
     /// ([`Shell::close_session`]); also from eframe's periodic save.
     pub fn flush_pending_saves(&mut self) {
+        self.flush_saves(true);
+    }
+
+    /// [`Shell::flush_pending_saves`] from eframe's periodic save: edits still
+    /// working out their scope are left to apply themselves.
+    fn flush_periodic_saves(&mut self) {
+        self.flush_saves(false);
+    }
+
+    fn flush_saves(&mut self, leaving: bool) {
         let Some(session) = &mut self.session else {
             return;
         };
         if let Some(jobs) = &mut self.jobs {
-            self.window.apply_waiting_edits(session, jobs);
+            self.window.apply_waiting_edits(session, jobs, leaving);
         }
         self.window.flush_save(session);
     }
@@ -292,6 +305,7 @@ impl Shell {
     /// Take down the toasts whose Undo would change the session being left
     /// (or one no longer open), and forget what they undo.
     fn drop_undos(&mut self) {
+        self.analysis_toast = None;
         for id in std::mem::take(&mut self.undos).into_keys() {
             self.toasts.dismiss(id);
         }
@@ -456,6 +470,8 @@ impl Shell {
                 JobEvent::Preview(_) => continue,
                 JobEvent::Finished { label, .. } if label == PREVIEWS_LABEL => continue,
                 JobEvent::Cancelled { id } if name(id) == PREVIEWS_LABEL => continue,
+                // A panel edit's one toast says why (below).
+                JobEvent::Cancelled { id } if jobs.stopped_by_edit(*id) => continue,
                 JobEvent::Finished { label, .. } => (Tone::Success, format!("{label} finished")),
                 JobEvent::Cancelled { id } => (Tone::Neutral, format!("{} cancelled", name(id))),
                 JobEvent::Failed { message, .. } => (Tone::Problem, message.clone()),
@@ -463,6 +479,12 @@ impl Shell {
             #[cfg(test)]
             self.toasted.push(text.clone());
             self.toasts.push(toast(tone, text), clock);
+        }
+        if jobs.take_merge_stopped() {
+            let text = "Merge stopped: panels changed".to_string();
+            #[cfg(test)]
+            self.toasted.push(text.clone());
+            self.toasts.push(toast(Tone::Neutral, text), clock);
         }
         self.window.poll_panels(ctx, session, jobs);
         self.window.poll_settings(ctx, session, jobs);
@@ -511,6 +533,13 @@ impl Shell {
             self.toasted.push(toast.title.clone());
             let id = self.toasts.push(toast, now);
             if let (true, Some(undo)) = (has_action, undo) {
+                // A new analysis toast replaces the previous one.
+                if matches!(undo, Undo::Analyze(_))
+                    && let Some(old) = self.analysis_toast.replace(id)
+                {
+                    self.undos.remove(&old);
+                    self.toasts.dismiss(old);
+                }
                 self.undos.insert(id, undo);
             }
         }
@@ -943,7 +972,7 @@ impl eframe::App for MmmApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.shell.flush_pending_saves();
+        self.shell.flush_periodic_saves();
         if self.selftest.is_none() {
             eframe::set_value(storage, RECENT_KEY, &self.shell.start.recent());
         }
@@ -1597,6 +1626,65 @@ mod tests {
         step_until(&mut h, |_| on_disk(&dir) == 8);
         assert_eq!(MosaicConfig::load(&dir).unwrap().panels, previous.panels);
         assert!(h.state().undos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_panel_edit_stops_the_merge_with_one_toast() {
+        use crate::panel_edits::{Applied, PanelsEdit};
+        let root = temp_dir("shell-edit-stops-merge");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| {
+            s.session().unwrap().mosaic.config.group_dirs.len() == 2
+                && !s.jobs.as_ref().unwrap().busy()
+        });
+        h.run_steps(2);
+        let before = h.state().toasted().len();
+        // Two merges, one running (held) and one queued; a panel is removed.
+        let held = {
+            let shell = h.state_mut();
+            let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
+            let held = jobs.hold();
+            jobs.start_blend(session, "Ha", None);
+            jobs.start_blend(session, "OIII", None);
+            let mut edit = PanelsEdit::of(session);
+            edit.panels.pop();
+            assert!(matches!(edit.apply(session, jobs), Applied::Queued(_)));
+            held
+        };
+        held.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        let toasted = &h.state().toasted()[before..];
+        assert_eq!(toasted, ["Merge stopped: panels changed"], "{toasted:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_analysis_toast_replaces_the_previous_one() {
+        let root = temp_dir("shell-undo-analysis");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        let analysis = h.state().session().unwrap().mosaic.config.analyze.clone();
+        for _ in 0..2 {
+            h.state_mut().window.push_toast(WindowToast {
+                toast: Toast {
+                    tone: Tone::Neutral,
+                    title: "Analysis settings changed".into(),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::Analyze(analysis.clone())),
+            });
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().undos.len(), 1, "the first one was taken down");
+        assert_eq!(h.query_all_by_label("Analysis settings changed").count(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

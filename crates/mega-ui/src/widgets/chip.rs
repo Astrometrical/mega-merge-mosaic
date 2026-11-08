@@ -6,9 +6,10 @@ use egui::{
     text::{LayoutJob, TextFormat, TextWrapping},
 };
 
-use crate::theme::legible_text;
+use crate::icons;
 use crate::theme::palette::{ACCENT_500, BORDER, SURFACE_700, TEXT_BODY, TEXT_STRONG};
 use crate::theme::tokens::space;
+use crate::theme::{Tone, legible_text};
 
 /// Widest a chip may grow; longer labels are truncated with "…" and shown
 /// in full on hover.
@@ -82,6 +83,55 @@ pub struct ChoiceChip<'a> {
     pub selected: bool,
     /// Draw the outline dashed (composites).
     pub dashed: bool,
+    /// A state glyph after the label (see [`ChipMark`]).
+    pub mark: Option<ChipMark>,
+}
+
+/// A chip's state: what needs the user's attention. Drawn as its tone's
+/// icon in the tone's colour (never colour alone), said in words in the
+/// chip's hover text and described to assistive technology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipMark {
+    /// Out of date: the warning tone, "Out of date".
+    Attention,
+    /// Changed since it was made: the info tone, "Settings changed".
+    Changed,
+}
+
+impl ChipMark {
+    /// The mark's tone.
+    pub fn tone(self) -> Tone {
+        match self {
+            ChipMark::Attention => Tone::Warning,
+            ChipMark::Changed => Tone::Info,
+        }
+    }
+
+    /// The glyph's colour (its tone's icon colour).
+    pub fn color(self) -> Color32 {
+        self.tone().color()
+    }
+
+    /// The glyph drawn: its tone's icon.
+    pub fn icon(self) -> char {
+        self.tone().icon().unwrap_or(icons::INFO)
+    }
+
+    /// The state in words, as the chip's hover text shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ChipMark::Attention => "Out of date",
+            ChipMark::Changed => "Settings changed",
+        }
+    }
+
+    /// The state in words (the chip's accessible description).
+    pub fn description(self) -> &'static str {
+        match self {
+            ChipMark::Attention => "out of date",
+            ChipMark::Changed => "settings changed",
+        }
+    }
 }
 
 /// Dash and gap lengths of a dashed chip outline, in points.
@@ -111,7 +161,9 @@ fn outline(rect: egui::Rect, r: f32) -> Vec<egui::Pos2> {
 /// A chip that toggles: selected shows a raised surface and strong text,
 /// unselected looks like [`chip`]. Returns the click response; the caller
 /// flips its own state. Accessible as a toggle button with its selected
-/// state.
+/// state. A [`ChipMark`] adds its glyph after the label, its state as the
+/// accessible description, and its state in words as hover text (hover
+/// text the caller adds to the response shows below it).
 pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
     let font = TextStyle::Small.resolve(ui.style());
     let text_color = if chip.selected {
@@ -119,6 +171,11 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
     } else {
         TEXT_BODY
     };
+    // The state glyph: the mark's tone icon at the label's size.
+    let glyph = chip.mark.map(|m| {
+        ui.painter()
+            .layout_no_wrap(m.icon().to_string(), icons::font(font.size), m.color())
+    });
     let galley = ui
         .painter()
         .layout_no_wrap(chip.label.to_owned(), font, text_color);
@@ -127,7 +184,8 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
     } else {
         0.0
     };
-    let size = Vec2::new(galley.size().x + 2.0 * PAD + dot, HEIGHT);
+    let mark = glyph.as_ref().map_or(0.0, |g| space::XS + g.size().x);
+    let size = Vec2::new(galley.size().x + 2.0 * PAD + dot + mark, HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if chip.selected { BORDER } else { SURFACE_700 };
@@ -161,10 +219,27 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
             x += dot;
         }
         let pos = egui::pos2(x, rect.center().y - galley.size().y / 2.0);
+        let text_width = galley.size().x;
         p.galley(pos, galley, text_color);
+        if let (Some(m), Some(g)) = (chip.mark, glyph) {
+            let pos = egui::pos2(
+                x + text_width + space::XS,
+                rect.center().y - g.size().y / 2.0,
+            );
+            p.galley(pos, g, m.color());
+        }
     }
     super::button::focus_ring(ui, &response, (HEIGHT / 2.0) as u8);
     let (selected, label) = (chip.selected, chip.label);
     response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, label));
-    response
+    match chip.mark {
+        Some(m) => {
+            ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_description(m.description());
+            });
+            // The state in words; hover text the caller adds stacks below.
+            response.on_hover_text(m.label())
+        }
+        None => response,
+    }
 }

@@ -26,11 +26,11 @@
 //!   its store). [`Mosaic::apply_analyze`] keeps a group marked
 //!   `needs_analyze` if its analyze settings changed since the plan;
 //!   [`Mosaic::apply_blend`] invalidates the group's store and returns an
-//!   error if its blend settings changed or it was marked `needs_analyze`.
-//!   So tiles blended with superseded settings never stay valid once the
-//!   job is applied — an unapplied job's tiles carry no such guarantee:
-//!   the app invalidates them with [`invalidate_group`] when it discards a
-//!   blend whose settings changed since its plan.
+//!   error if it was marked `needs_analyze`. Blend settings are not
+//!   guarded: a merge keeps the settings it was planned with and its
+//!   provenance entry records them. An unapplied job's tiles carry no
+//!   guarantee: the app invalidates them with [`invalidate_group`] when it
+//!   discards a blend whose analysis was superseded.
 //! - **The app cancels and joins before applying settings.** That is the
 //!   app's workflow; busy refusal and the apply guards are the core's
 //!   backstop.
@@ -38,6 +38,7 @@
 //!   [`crate::tiles`]).
 
 pub mod grouping;
+pub use grouping::affected_groups;
 mod lock;
 mod run;
 
@@ -46,10 +47,12 @@ pub use lock::{
 };
 
 pub use run::{
-    AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, BlendPlan, Mosaic, analyze_all, blend_group,
-    invalidate_group, mark_needs_analyze, plan_analyze, plan_analyze_with, plan_blend,
-    result_store_paths, run_analyze, run_blend, set_analyze_settings, set_blend_settings,
-    set_group_override, set_inputs, set_settings,
+    AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, AnalyzeScope, BlendPlan, Mosaic, OutOfDateReason,
+    analyze_all, blend_group, commit_blend_settings, invalidate_group, last_analyze_settings,
+    last_merge_settings, mark_needs_analyze, out_of_date_reason, plan_analyze, plan_analyze_scoped,
+    plan_analyze_with, plan_blend, plan_blend_with, region_differs, result_store_paths,
+    run_analyze, run_blend, set_analyze_settings, set_blend_settings, set_group_override,
+    set_inputs, set_inputs_affecting, set_settings, settings_changed,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

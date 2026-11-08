@@ -49,6 +49,7 @@ impl Debounce {
 }
 
 /// A computation on its own thread; the UI is repainted when it ends.
+#[derive(Debug)]
 pub(crate) struct Task<T> {
     rx: Receiver<T>,
 }

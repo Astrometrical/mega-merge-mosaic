@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mmm_core::mosaic::{Grouping, MosaicConfig, mark_needs_analyze};
+use mmm_core::mosaic::{AnalyzeScope, Grouping, MosaicConfig, mark_needs_analyze};
 use mmm_core::preview::Preview;
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::settings::{AnalyzeSettings, GroupOverride};
@@ -59,6 +59,25 @@ pub fn wants_analysis(session: &OpenSession) -> bool {
                 .iter()
                 .any(|(name, _)| !cfg.group_dirs.contains_key(name))
         })
+}
+
+/// The groups the automatic analysis covers: only those needing it
+/// ([`AnalyzeScope::Needed`]) when a frame was analysed and some resolved
+/// group is analysed and still valid (so analysing everything would redo
+/// it), else every group. A moved frame turns the former into the latter
+/// ([`crate::jobs::JobRunner`]).
+fn analysis_scope(session: &OpenSession) -> AnalyzeScope {
+    let cfg = &session.mosaic.config;
+    let some_valid = session.groups.as_ref().is_some_and(|g| {
+        g.processing_groups()
+            .iter()
+            .any(|(n, _)| cfg.group_dirs.contains_key(n) && !cfg.needs_analyze.contains(n))
+    });
+    if session.frame.is_some() && some_valid {
+        AnalyzeScope::Needed
+    } else {
+        AnalyzeScope::All
+    }
 }
 
 /// A pipeline stage.
@@ -268,7 +287,7 @@ impl Pipeline {
             return;
         }
         if !jobs.busy() && wants_analysis(session) && !self.analysis_stalled(session) {
-            let id = jobs.start_analyze(session);
+            let id = jobs.start_analyze_scoped(session, analysis_scope(session));
             self.job = Some(Job {
                 id,
                 step: Step::Analyze,
@@ -771,7 +790,7 @@ mod tests {
 
     #[test]
     fn settings_changes_reanalyse_only_when_global() {
-        use crate::blend_settings::{SettingsEdit, SettingsPanel};
+        use crate::blend_settings::SettingsPanel;
         use mmm_core::photometry::GainMode;
         use mmm_core::settings::ChangeImpact;
 
@@ -784,21 +803,22 @@ mod tests {
         assert_eq!(seen.started, ["Previews", "Analyse"]);
         let mut panel = SettingsPanel::new();
 
-        // Blend-local: nothing reruns.
-        let mut e = SettingsEdit::of(&s.mosaic.config);
-        e.blend.feather_px = 100.0;
-        panel.stage(e, &s.mosaic.config);
-        assert_eq!(panel.apply(&mut s, &mut r), Some(ChangeImpact::Reblend));
+        // A merge setting is a draft: nothing is applied, nothing reruns.
+        let mut draft = s.mosaic.config.blend.clone();
+        draft.feather_px = 100.0;
+        panel.edit_draft(&mut s.mosaic.config, draft);
         for _ in 0..20 {
             run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         }
         assert_eq!(seen.started, ["Previews", "Analyse"]);
 
         // Global: the pipeline analyses again by itself.
-        let mut e = SettingsEdit::of(&s.mosaic.config);
-        e.analyze.gain = GainMode::Unity;
-        panel.stage(e, &s.mosaic.config);
-        assert_eq!(panel.apply(&mut s, &mut r), Some(ChangeImpact::Reanalyze));
+        let mut a = s.mosaic.config.analyze.clone();
+        a.gain = GainMode::Unity;
+        assert_eq!(
+            panel.edit_analysis(a, &mut s, &mut r),
+            Some(ChangeImpact::Reanalyze)
+        );
         assert_eq!(s.mosaic.config.needs_analyze.len(), 2);
         p.poll(&egui::Context::default(), t0, &mut s, &mut r, &[], false);
         assert_eq!(p.step(), Some(Step::Analyze));
@@ -809,7 +829,7 @@ mod tests {
 
     #[test]
     fn reverted_settings_edit_restarts_the_cancelled_analysis() {
-        use crate::blend_settings::{SettingsEdit, SettingsPanel};
+        use crate::blend_settings::SettingsPanel;
         use mmm_core::photometry::GainMode;
 
         let root = temp_dir("pipe-settings-revert");
@@ -831,12 +851,13 @@ mod tests {
         // A global edit cancels the automatic analysis, then is reverted
         // before the cancel has been reported.
         let mut panel = SettingsPanel::new();
-        let mut e = SettingsEdit::of(&s.mosaic.config);
-        e.analyze.gain = GainMode::Unity;
-        panel.stage(e, &s.mosaic.config);
-        assert_eq!(panel.apply(&mut s, &mut r), None);
+        let original = s.mosaic.config.analyze.clone();
+        let mut a = original.clone();
+        a.gain = GainMode::Unity;
+        assert_eq!(panel.edit_analysis(a, &mut s, &mut r), None);
         assert!(panel.editing(&s.mosaic.config));
-        panel.revert();
+        // The user puts the old value back (nothing differs: no edit).
+        assert_eq!(panel.edit_analysis(original, &mut s, &mut r), None);
         assert!(panel.editing(&s.mosaic.config), "until the cancel lands");
         gate.open();
 
@@ -875,6 +896,274 @@ mod tests {
         assert!(s.mosaic.config.needs_analyze.is_empty());
         assert_eq!(s.mosaic.config.group_dirs.len(), 2);
         assert_eq!(s.mosaic.config.analyze.gain, GainMode::Fit, "reverted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file under `dir` with its modification time (a group's
+    /// analysis and result files): equal before and after means untouched.
+    fn stamp(dir: &std::path::Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let meta = e.metadata().unwrap();
+                if meta.is_dir() {
+                    todo.push(e.path());
+                } else {
+                    out.push((e.path(), meta.modified().unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Submit `edit` as the Panels tab does and poll until it has applied.
+    fn apply_edit(edit: PanelsEdit, s: &mut OpenSession, r: &mut JobRunner) {
+        let ctx = egui::Context::default();
+        let mut edits = crate::panel_edits::PanelEdits::default();
+        edits.poll(&ctx, s, r);
+        edits.submit(edit, s, r);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        while edits.has_pending() {
+            assert!(Instant::now() < deadline, "the edit never applied");
+            edits.poll(&ctx, s, r);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(edits.take_errors().is_empty());
+    }
+
+    /// Run the pipeline after an edit (debounce included) until idle.
+    fn run_after_edit(p: &mut Pipeline, s: &mut OpenSession, r: &mut JobRunner) -> Seen {
+        let t = Instant::now();
+        let ctx = egui::Context::default();
+        p.poll(&ctx, t, s, r, &[], false);
+        let mut seen = Seen::default();
+        run_until(
+            p,
+            s,
+            r,
+            t + DEBOUNCE + Duration::from_millis(100),
+            false,
+            &mut seen,
+            idle,
+        );
+        seen
+    }
+
+    #[test]
+    fn adding_a_panel_to_one_group_keeps_the_others_merged() {
+        use mmm_core::session_summary::{ResultState, result_state};
+        let root = temp_dir("pipe-scoped-add");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let mut seen = Seen::default();
+        run_until(
+            &mut p,
+            &mut s,
+            &mut r,
+            Instant::now(),
+            false,
+            &mut seen,
+            idle,
+        );
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        let (ha, oiii) = (
+            s.mosaic.group_session_dir("Ha"),
+            s.mosaic.group_session_dir("OIII"),
+        );
+        let (ha_before, oiii_before) = (stamp(&ha), stamp(&oiii));
+        assert_eq!(
+            result_state(&s.mosaic.result_path("OIII")),
+            ResultState::Complete
+        );
+
+        // One more Ha panel (a copy of the first: same canvas).
+        let first = s.mosaic.config.panels[0].path.clone();
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("Ha")
+        );
+        let extra = first.with_file_name("Ha_extra.xisf");
+        std::fs::copy(&first, &extra).unwrap();
+        let mut edit = PanelsEdit::of(&s);
+        edit.panels.push(mmm_core::mosaic::PanelEntry {
+            path: extra,
+            fingerprint: None,
+            manual_group: None,
+        });
+        apply_edit(edit, &mut s, &mut r);
+        let marked: Vec<&str> = s
+            .mosaic
+            .config
+            .needs_analyze
+            .iter()
+            .map(|g| g.as_str())
+            .collect();
+        assert_eq!(marked, ["Ha"]);
+        assert_eq!(
+            result_state(&s.mosaic.result_path("OIII")),
+            ResultState::Complete
+        );
+        assert_ne!(
+            result_state(&s.mosaic.result_path("Ha")),
+            ResultState::Complete
+        );
+
+        let seen = run_after_edit(&mut p, &mut s, &mut r);
+        assert!(
+            seen.events
+                .iter()
+                .all(|e| matches!(e, JobEvent::Finished { .. }))
+        );
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_eq!(
+            stamp(&oiii),
+            oiii_before,
+            "OIII was neither re-analysed nor re-merged"
+        );
+        assert_eq!(
+            result_state(&s.mosaic.result_path("OIII")),
+            ResultState::Complete
+        );
+        assert_ne!(stamp(&ha), ha_before, "Ha was re-analysed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_frame_moving_add_reanalyses_everything() {
+        let root = temp_dir("pipe-frame-moves");
+        let (mut s, extra) = crate::testutil::solved_two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let mut seen = Seen::default();
+        run_until(
+            &mut p,
+            &mut s,
+            &mut r,
+            Instant::now(),
+            false,
+            &mut seen,
+            idle,
+        );
+        assert!(
+            seen.events
+                .iter()
+                .all(|e| matches!(e, JobEvent::Finished { .. })),
+            "{:?}",
+            seen.events
+        );
+        let frame = s.frame.clone().expect("analysed frame");
+        let (ha, oiii) = (
+            s.mosaic.group_session_dir("Ha"),
+            s.mosaic.group_session_dir("OIII"),
+        );
+        let (ha_before, oiii_before) = (stamp(&ha), stamp(&oiii));
+
+        let mut edit = PanelsEdit::of(&s);
+        edit.panels.push(mmm_core::mosaic::PanelEntry {
+            path: extra,
+            fingerprint: None,
+            manual_group: Some("Ha".into()),
+        });
+        apply_edit(edit, &mut s, &mut r);
+        let marked: Vec<&str> = s
+            .mosaic
+            .config
+            .needs_analyze
+            .iter()
+            .map(|g| g.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            ["Ha", "OIII"],
+            "the moved frame touches every group"
+        );
+
+        let seen = run_after_edit(&mut p, &mut s, &mut r);
+        assert!(
+            seen.events
+                .iter()
+                .all(|e| matches!(e, JobEvent::Finished { .. })),
+            "{:?}",
+            seen.events
+        );
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_ne!(s.frame.as_ref(), Some(&frame), "the canvas grew");
+        assert_ne!(stamp(&ha), ha_before);
+        assert_ne!(stamp(&oiii), oiii_before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_panel_from_one_group_keeps_the_others_merged() {
+        use mmm_core::session_summary::{ResultState, result_state};
+        let root = temp_dir("pipe-scoped-remove");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let mut seen = Seen::default();
+        run_until(
+            &mut p,
+            &mut s,
+            &mut r,
+            Instant::now(),
+            false,
+            &mut seen,
+            idle,
+        );
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        let (ha, oiii) = (
+            s.mosaic.group_session_dir("Ha"),
+            s.mosaic.group_session_dir("OIII"),
+        );
+        let (ha_before, oiii_before) = (stamp(&ha), stamp(&oiii));
+
+        let mut edit = PanelsEdit::of(&s);
+        let last_ha = edit
+            .panels
+            .iter()
+            .rposition(|e| {
+                e.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("Ha")
+            })
+            .unwrap();
+        edit.panels.remove(last_ha);
+        apply_edit(edit, &mut s, &mut r);
+        let marked: Vec<&str> = s
+            .mosaic
+            .config
+            .needs_analyze
+            .iter()
+            .map(|g| g.as_str())
+            .collect();
+        assert_eq!(marked, ["Ha"]);
+        assert_eq!(
+            result_state(&s.mosaic.result_path("OIII")),
+            ResultState::Complete
+        );
+
+        let seen = run_after_edit(&mut p, &mut s, &mut r);
+        assert!(
+            seen.events
+                .iter()
+                .all(|e| matches!(e, JobEvent::Finished { .. }))
+        );
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_eq!(stamp(&oiii), oiii_before, "OIII untouched");
+        assert_eq!(
+            result_state(&s.mosaic.result_path("OIII")),
+            ResultState::Complete
+        );
+        assert_ne!(stamp(&ha), ha_before, "Ha was re-analysed");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

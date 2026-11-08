@@ -88,14 +88,14 @@ use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
 use mmm_core::mosaic::{Grouping, PanelEntry};
 use mmm_core::session_summary::ResultState;
-use mmm_core::settings::ChangeImpact;
+use mmm_core::settings::{AnalyzeSettings, ChangeImpact};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::camera::Camera;
 use crate::checks::ChecksEngine;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
-use crate::jobs::{JobEvent, JobRunner, JobTarget};
+use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
 use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
@@ -140,6 +140,9 @@ pub enum Undo {
     /// (the panels as they are now), noting that the user has chosen how to
     /// group; nothing more if they have chosen another way since.
     Grouping(Grouping),
+    /// Put back the analysis settings from before the change, as an
+    /// ordinary analysis edit (queued behind running jobs like any).
+    Analyze(AnalyzeSettings),
 }
 
 /// A toast the window asks the shell to show.
@@ -183,6 +186,8 @@ pub struct SessionWindow {
     /// A text field had the keyboard when the last frame ended: an Esc now
     /// left it (egui lets go of the field before the shortcuts see the key).
     was_typing: bool,
+    /// Merge settings was opened by itself after the first analysis.
+    settings_revealed: bool,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -222,6 +227,7 @@ impl SessionWindow {
             toasts: Vec::new(),
             panel_list_open: false,
             was_typing: false,
+            settings_revealed: false,
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -262,15 +268,39 @@ impl SessionWindow {
         self.view = Some(view);
     }
 
-    /// Merge every group over the whole canvas and show the mosaic, where
-    /// the merge goes; nothing while
-    /// [`MosaicView::merge_block_reason`] gives a reason.
+    /// **Merge**: commit the merge settings draft, merge every group that
+    /// needs it ([`steps::groups_to_merge`]: out of date, or its settings
+    /// changed) over the whole canvas and show the mosaic, where the merge
+    /// goes; nothing, and no switch, while [`MosaicView::merge_block_reason`]
+    /// gives a reason, the draft cannot be committed or nothing needs it.
     pub fn merge(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
         if self.mosaic.merge_block_reason(session, jobs).is_some() {
             return;
         }
-        self.mosaic.merge_all(session, jobs);
-        self.set_mode(CanvasMode::Mosaic);
+        let groups = steps::groups_to_merge(session);
+        if self.mosaic.merge_these(session, jobs, groups) {
+            self.set_mode(CanvasMode::Mosaic);
+        }
+    }
+
+    /// **Merge this group**: commit the draft and merge `group` alone over
+    /// the whole canvas, showing the mosaic (only if a merge was queued).
+    /// Other merges, running or queued, keep the settings they were queued
+    /// with.
+    pub fn merge_group(&mut self, session: &mut OpenSession, jobs: &mut JobRunner, group: &str) {
+        if self
+            .mosaic
+            .merge_group_block_reason(session, jobs, group)
+            .is_some()
+        {
+            return;
+        }
+        if self
+            .mosaic
+            .merge_these(session, jobs, vec![group.to_string()])
+        {
+            self.set_mode(CanvasMode::Mosaic);
+        }
     }
 
     /// The inspector's fold and open sections (tests; nothing outside the
@@ -301,6 +331,16 @@ impl SessionWindow {
     /// classifies the results again, [`OpenSession::results`]).
     pub fn on_event(&mut self, session: &mut OpenSession, jobs: &JobRunner, event: &JobEvent) {
         self.mosaic.on_event(event);
+        // Findability (spec §11): Merge settings opens by itself when the
+        // first analysis of a session never merged finishes, once.
+        if let JobEvent::Finished { label, .. } = event
+            && label == ANALYZE_LABEL
+            && !session.merged
+            && !self.settings_revealed
+        {
+            self.settings_revealed = true;
+            self.inspector.reveal(MERGE_SETTINGS);
+        }
         if let JobEvent::Finished { id, .. } = event
             && let Some((JobTarget::Blend, group)) = jobs.target(*id)
         {
@@ -322,6 +362,12 @@ impl SessionWindow {
     #[cfg(test)]
     pub(crate) fn panel_list(&self) -> &PanelList {
         &self.panels
+    }
+
+    /// The panel list, to submit edits as the list does (tests).
+    #[cfg(test)]
+    pub(crate) fn panel_list_mut(&mut self) -> &mut PanelList {
+        &mut self.panels
     }
 
     /// The panel list's background work, shown or not ([`PanelList::poll`]):
@@ -365,7 +411,40 @@ impl SessionWindow {
         session: &mut OpenSession,
         jobs: &mut JobRunner,
     ) -> Option<ChangeImpact> {
-        self.mosaic.poll_settings(ctx, session, jobs)
+        let applied = self.mosaic.poll_settings(ctx, session, jobs);
+        self.follow_settings();
+        applied
+    }
+
+    /// Follow the merge settings panel: its draft changed (save it, rate
+    /// limited), or an analysis change was applied (raise the Undo toast;
+    /// the shell takes down the previous analysis toast).
+    fn follow_settings(&mut self) {
+        if self.mosaic.take_draft_changed() {
+            self.save.touch();
+        }
+        if let Some(why) = self.mosaic.take_problem() {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Problem,
+                    title: why,
+                    detail: None,
+                    action: None,
+                },
+                undo: None,
+            });
+        }
+        if let Some(previous) = self.mosaic.take_analysis_undo() {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Neutral,
+                    title: "Analysis settings changed".into(),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::Analyze(previous)),
+            });
+        }
     }
 
     /// The window's every-frame work, drawn or not: pick the mode and the
@@ -401,14 +480,20 @@ impl SessionWindow {
     }
 
     /// Apply the edits waiting for the jobs to stop (panels, merge
-    /// settings) now, if no job but an export runs: the session is being
-    /// left, and nothing would apply them later. One refused because a
+    /// settings) now, if no job but an export runs. With `leaving` (the
+    /// session or app is being left) nothing would apply a panel edit later,
+    /// so it applies now unscoped if need be. One refused because a
     /// store is held elsewhere stays waiting (logged).
-    pub fn apply_waiting_edits(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+    pub fn apply_waiting_edits(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        leaving: bool,
+    ) {
         if jobs.busy_except_exports() {
             return;
         }
-        self.panels.apply_waiting(session, jobs);
+        self.panels.apply_waiting(session, jobs, leaving);
         self.mosaic.apply_waiting_settings(session, jobs);
     }
 
@@ -424,6 +509,9 @@ impl SessionWindow {
         match undo {
             Undo::Readd(removed) => self.panels.readd(removed, session, jobs),
             Undo::Grouping(grouping) => self.panels.regroup(grouping, session, jobs),
+            Undo::Analyze(previous) => {
+                self.mosaic.edit_analysis(previous, session, jobs);
+            }
         }
         self.save_panel_choices();
     }
@@ -509,9 +597,10 @@ impl SessionWindow {
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| {
                 self.view_bar(ui, session, jobs, pipeline);
-                self.canvas_ui(ui, session, pipeline, checks);
+                self.canvas_ui(ui, session, jobs, pipeline, checks);
             });
         self.mosaic.export_ui(&ctx, session, jobs);
+        self.follow_settings();
         out.toasts.append(&mut self.toasts);
         self.save_panel_choices();
         // Files dropped anywhere are added, whatever shows.

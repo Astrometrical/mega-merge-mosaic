@@ -53,6 +53,18 @@ pub struct GroupSummary {
     pub blended_at: Option<u64>,
     /// When the group was last exported, in unix seconds.
     pub exported_at: Option<u64>,
+    /// The group's result is complete, but its last whole-canvas merge used
+    /// different merge settings from the draft (so a re-merge would differ).
+    /// Absent in summaries written before this existed.
+    #[serde(default)]
+    pub settings_changed: bool,
+    /// A region of the group was merged, since its last whole-canvas
+    /// merge, with other settings ([`crate::mosaic::region_differs`]): the
+    /// result is complete but not of one merge, so the group is out of
+    /// date (never [`GroupSummary::settings_changed`] as well). Absent in
+    /// summaries written before this existed.
+    #[serde(default)]
+    pub region_differs: bool,
 }
 
 /// How much of a group's result store is current.
@@ -141,6 +153,8 @@ mod tests {
                 result: ResultState::Stale,
                 blended_at: Some(1_699_999_000),
                 exported_at: None,
+                settings_changed: false,
+                region_differs: false,
             }],
             problems: Some(1),
             notes: None,
@@ -155,6 +169,20 @@ mod tests {
         let s = sample();
         write_summary(&dir, &s).unwrap();
         assert_eq!(read_summary(&dir), Some(s));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_summaries_still_load() {
+        // Written before `settings_changed` existed.
+        let dir = tmp("old");
+        let old = r#"{"format":1,"written_at":5,"panels":2,
+            "groups":[{"name":"L","panels":["a.xisf"],"result":"complete",
+            "blended_at":1,"exported_at":null}],
+            "problems":null,"notes":null,"canvas":null,"last_view":null}"#;
+        std::fs::write(dir.join(SUMMARY_FILE), old).unwrap();
+        let s = read_summary(&dir).expect("an old summary loads");
+        assert!(!s.groups[0].settings_changed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

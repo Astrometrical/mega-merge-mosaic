@@ -58,7 +58,10 @@
 //!   into plan / run / apply for background jobs ([`mosaic::plan_analyze`],
 //!   [`mosaic::run_blend`], ...), plus busy-aware settings edits
 //!   ([`mosaic::set_settings`]) and input edits ([`mosaic::set_inputs`]) that
-//!   stale exactly the affected result stores, and a cross-process session
+//!   stale exactly the affected result stores, non-invalidating draft commits
+//!   ([`mosaic::commit_blend_settings`]) with per-group provenance lookups
+//!   ([`mosaic::settings_changed`], [`mosaic::region_differs`]), and a
+//!   cross-process session
 //!   lock ([`mosaic::lock_session`]).
 //!   One writer per store is enforced (`Error::Busy`); the plan / run / apply
 //!   concurrency contract is in the [`mosaic`] module docs.

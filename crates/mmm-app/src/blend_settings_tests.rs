@@ -1,19 +1,24 @@
+use std::path::PathBuf;
+
 use egui::accesskit::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
+use mmm_core::mosaic::{MosaicConfig, commit_blend_settings, last_analyze_settings};
 use mmm_core::mosaic::{set_group_override, set_settings};
 use mmm_core::settings::{BlendOverride, GroupOverride};
 use mmm_core::tiles::TileStore;
 
 use super::*;
+use crate::jobs::JobEvent;
 use crate::jobs::tests::{analyzed, drain};
-use crate::start::tests::step_until;
 
 struct State {
     panel: SettingsPanel,
     session: OpenSession,
     jobs: JobRunner,
     applied: Vec<ChangeImpact>,
+    /// The groups the panel is showing (a view's members).
+    groups: Vec<String>,
 }
 
 /// The panel over an analysed two-group session, polled and drawn each
@@ -30,7 +35,8 @@ fn harness(tag: &str) -> (PathBuf, Harness<'static, State>) {
                 if let Some(i) = st.panel.poll(&ctx, &mut st.session, &mut st.jobs) {
                     st.applied.push(i);
                 }
-                if let Some(i) = st.panel.ui(ui, &mut st.session, &mut st.jobs) {
+                let groups = st.groups.clone();
+                if let Some(i) = st.panel.ui(ui, &mut st.session, &mut st.jobs, &groups) {
                     st.applied.push(i);
                 }
             },
@@ -39,6 +45,7 @@ fn harness(tag: &str) -> (PathBuf, Harness<'static, State>) {
                 session,
                 jobs,
                 applied: Vec::new(),
+                groups: vec!["Ha".into()],
             },
         );
     (root, h)
@@ -105,41 +112,103 @@ fn panel_shows_current_values_and_override_note() {
     // Both kinds are captioned.
     h.get_by_label("MERGE · re-merge only");
     h.get_by_label("ANALYSIS · reruns analysis, every tile goes stale");
-    // Nothing staged: no Apply.
+    // Merge fields edit at once, analysis fields apply at once: no buttons.
     assert!(h.query_by_label("Apply").is_none());
+    assert!(h.query_by_label("Revert").is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn analysis(gain: GainMode, cfg: &MosaicConfig) -> AnalyzeSettings {
+    AnalyzeSettings {
+        gain,
+        ..cfg.analyze.clone()
+    }
+}
+
+#[test]
+fn merge_fields_edit_the_draft() {
+    let (root, mut h) = harness("settings-draft");
+    let ha = {
+        let st = h.state_mut();
+        st.jobs.start_blend(&mut st.session, "Ha", None);
+        drain(&mut st.jobs, &mut st.session);
+        st.session.mosaic.result_path("Ha")
+    };
+    h.run_steps(2);
+    // A merge is running: the edit must not cancel it.
+    let gate = h.state_mut().jobs.hold();
+    let oiii = {
+        let st = h.state_mut();
+        st.jobs.start_blend(&mut st.session, "OIII", None)
+    };
+    type_feather(&mut h, "0"); // 256 -> 2560
+    let st = h.state();
+    assert_eq!(
+        load_draft(&st.session.mosaic.config).feather_px,
+        2560.0,
+        "the draft"
+    );
+    assert_eq!(
+        st.session.mosaic.config.ui[MERGE_DRAFT_KEY]["feather_px"],
+        2560.0
+    );
+    assert_eq!(st.session.mosaic.config.blend.feather_px, 256.0);
+    assert!(st.session.mosaic.config.needs_analyze.is_empty());
+    assert_eq!(valid0(&ha), 6, "nothing went stale");
+    assert!(st.jobs.blending(), "no job was cancelled");
+    assert!(!st.panel.has_pending());
+    assert!(st.applied.is_empty());
+    // The window is told to save.
+    assert!(h.state_mut().panel.take_draft_changed());
+    assert!(!h.state_mut().panel.take_draft_changed());
+    // A combo too.
+    h.get_by_role_and_label(Role::ComboBox, "Defect veto")
+        .click();
+    h.run_steps(2);
+    h.get_by_label("Off").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert!(!load_draft(&st.session.mosaic.config).defect_veto);
+    assert!(st.session.mosaic.config.blend.defect_veto);
+    assert!(h.query_by_label("Apply").is_none());
+    // The running merge was not cancelled: it finishes.
+    gate.open();
+    let st = h.state_mut();
+    let events = drain(&mut st.jobs, &mut st.session);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { id, .. } if *id == oiii)),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Cancelled { .. }))
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn staging_shows_cost_and_revert_discards() {
-    let (root, mut h) = harness("settings-stage");
-    // Something blended, so there are tiles to count.
-    {
-        let st = h.state_mut();
-        st.jobs.start_blend(&mut st.session, "Ha", None);
-        drain(&mut st.jobs, &mut st.session);
-    }
-    h.run_steps(2);
-    type_feather(&mut h, "0"); // 256 → 2560
-    assert_eq!(
-        h.state().panel.draft().map(|d| d.blend.feather_px),
-        Some(2560.0)
-    );
-    // Not applied: the session keeps its settings.
-    assert_eq!(h.state().session.mosaic.config.blend.feather_px, 256.0);
-    // The cost, counted on a worker: Ha's 6 level-0 tiles are valid.
-    step_until(&mut h, |st| st.panel.counts().is_some() && st.panel.idle());
-    h.run_steps(1);
-    // Only Ha has a result store (OIII was never blended).
-    assert_eq!(h.state().panel.counts(), Some((6, 6)));
-    h.get_by_label_contains(
-        "Existing results go stale; merge again to see the change (6 of 6 tiles)",
-    );
-    h.get_by_label("Revert").click();
-    h.run_steps(2);
-    assert!(h.state().panel.draft().is_none());
-    assert_eq!(value(&h, Role::TextInput, "Feather (px)"), "256");
-    assert!(h.query_by_label("Apply").is_none());
+fn the_draft_survives_reopening() {
+    let (root, mut s, _jobs) = analyzed("settings-draft-reopen");
+    let mut draft = s.mosaic.config.blend.clone();
+    draft.mode = BlendMode::Feather;
+    draft.feather_px = 99.0;
+    // Without a draft key the config's own settings show.
+    assert_eq!(load_draft(&s.mosaic.config), s.mosaic.config.blend);
+    save_draft(&mut s.mosaic.config.ui, &draft);
+    s.mosaic.save().unwrap();
+    let loaded = MosaicConfig::load(&s.mosaic.dir).unwrap();
+    assert_eq!(load_draft(&loaded), draft);
+    assert_eq!(loaded.blend, s.mosaic.config.blend);
+    // Other `ui` keys are kept; an unreadable draft falls back.
+    let mut ui = serde_json::json!({"other": 1});
+    save_draft(&mut ui, &draft);
+    assert_eq!(ui["other"], 1);
+    let mut broken = s.mosaic.config.clone();
+    broken.ui[MERGE_DRAFT_KEY] = serde_json::json!("nonsense");
+    assert_eq!(load_draft(&broken), broken.blend);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -147,27 +216,29 @@ fn staging_shows_cost_and_revert_discards() {
 fn invalid_feather_is_rejected() {
     let (root, mut h) = harness("settings-bad-feather");
     h.run_steps(2);
+    assert_eq!(h.state().panel.input_error(), None);
     type_feather(&mut h, "x");
     h.get_by_label("Feather must be a number of pixels greater than 0.");
-    assert!(h.state().panel.feather_error().is_some());
-    assert!(h.state().panel.draft().is_none(), "nothing staged");
-    // Zero (and NaN) parse but the core refuses them.
-    {
-        let st = h.state_mut();
-        st.panel.revert();
-    }
-    h.run_steps(2);
+    assert_eq!(
+        h.state().panel.input_error(),
+        Some("Feather width must be a number above 0")
+    );
+    // The last valid draft is kept.
+    assert_eq!(
+        load_draft(&h.state().session.mosaic.config).feather_px,
+        256.0
+    );
+    // Zero parses but the core refuses it; the draft keeps the last value.
     h.get_by_role_and_label(Role::TextInput, "Feather (px)")
         .focus();
     h.step();
-    for _ in 0..3 {
+    for _ in 0..4 {
         h.key_press(egui::Key::Backspace);
         h.step();
     }
     h.get_by_role_and_label(Role::TextInput, "Feather (px)")
         .type_text("0");
-    h.step();
-    h.run_steps(1);
+    h.run_steps(2);
     let err = h
         .state()
         .panel
@@ -175,13 +246,12 @@ fn invalid_feather_is_rejected() {
         .unwrap_or_default()
         .to_string();
     assert!(err.starts_with("Feather must be"), "{err}");
-    // NaN parses as a float too; the core refuses it.
+    assert!(h.state().panel.input_error().is_some());
     h.key_press(egui::Key::Backspace);
     h.step();
     h.get_by_role_and_label(Role::TextInput, "Feather (px)")
         .type_text("NaN");
     h.run_steps(2);
-    assert_eq!(value(&h, Role::TextInput, "Feather (px)"), "NaN");
     let err = h
         .state()
         .panel
@@ -189,177 +259,125 @@ fn invalid_feather_is_rejected() {
         .unwrap_or_default()
         .to_string();
     assert!(err.contains("finite"), "{err}");
-    // The refused value is never staged (the draft keeps the last valid one).
-    let draft = h.state().panel.draft().map(|d| d.blend.feather_px);
-    assert!(draft.is_none_or(f32::is_finite), "{draft:?}");
-    // Another change is staged, but Apply stays disabled.
-    {
-        let st = h.state_mut();
-        let mut e = SettingsEdit::of(&st.session.mosaic.config);
-        e.blend.defect_veto = false;
-        st.panel.stage(e, &st.session.mosaic.config);
-    }
-    h.run_steps(2);
-    assert!(h.get_by_label("Apply").accesskit_node().is_disabled());
-    {
-        let st = h.state_mut();
-        assert_eq!(st.panel.apply(&mut st.session, &mut st.jobs), None);
-    }
-    assert_eq!(h.state().session.mosaic.config.blend.feather_px, 256.0);
+    assert!(
+        load_draft(&h.state().session.mosaic.config)
+            .feather_px
+            .is_finite()
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn blend_local_apply_stales_tiles_without_reanalysis() {
-    let (root, mut h) = harness("settings-reblend");
-    let ha = {
-        let st = h.state_mut();
-        st.jobs.start_blend(&mut st.session, "Ha", None);
-        drain(&mut st.jobs, &mut st.session);
-        st.session.mosaic.result_path("Ha")
-    };
-    assert_eq!(valid0(&ha), 6);
-    h.run_steps(2);
-    h.get_by_role_and_label(Role::ComboBox, "Defect veto")
-        .click();
-    h.run_steps(2);
-    h.get_by_label("Off").click();
-    h.run_steps(2);
-    h.get_by_label("Apply").click();
-    h.run_steps(2);
-    let st = h.state();
-    assert_eq!(st.applied, [ChangeImpact::Reblend]);
-    assert!(!st.session.mosaic.config.blend.defect_veto);
-    assert!(st.session.mosaic.config.needs_analyze.is_empty());
-    assert_eq!(valid0(&ha), 0, "every tile stale");
-    assert!(st.panel.draft().is_none());
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn global_apply_marks_needs_analyze() {
-    let (root, mut h) = harness("settings-reanalyze");
+fn analysis_fields_apply_at_once_with_undo() {
+    let (root, mut h) = harness("settings-analysis-now");
     h.run_steps(2);
     h.get_by_role_and_label(Role::ComboBox, "Gain").click();
     h.run_steps(2);
     h.get_by_label("Unity").click();
     h.run_steps(2);
-    h.get_by_label_contains("Analysis reruns and every result goes stale");
-    h.get_by_label("Apply").click();
-    h.run_steps(2);
-    let cfg = &h.state().session.mosaic.config;
-    assert_eq!(h.state().applied, [ChangeImpact::Reanalyze]);
+    let st = h.state();
+    let cfg = &st.session.mosaic.config;
+    assert_eq!(st.applied, [ChangeImpact::Reanalyze]);
     assert_eq!(cfg.analyze.gain, GainMode::Unity);
     assert_eq!(
         cfg.needs_analyze.iter().cloned().collect::<Vec<_>>(),
         ["Ha", "OIII"]
     );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn apply_during_a_blend_cancels_it_and_applies_when_idle() {
-    let (root, mut h) = harness("settings-pending");
-    h.run_steps(2);
-    let gate = {
-        let st = h.state_mut();
-        let gate = st.jobs.hold();
-        st.jobs.start_blend(&mut st.session, "Ha", None);
-        st.jobs.start_blend(&mut st.session, "OIII", None);
-        gate
-    };
-    type_feather(&mut h, "0");
-    h.get_by_label("Apply").click();
-    h.run_steps(2);
-    assert!(h.state().panel.has_pending());
-    assert!(h.state().applied.is_empty(), "not while the blend runs");
-    assert_eq!(h.state().session.mosaic.config.blend.feather_px, 256.0);
-    h.get_by_label_contains("Waiting for the running job to stop");
-    gate.open();
-    step_until(&mut h, |st| !st.panel.has_pending());
-    let st = h.state();
-    assert_eq!(st.applied, [ChangeImpact::Reblend]);
-    assert_eq!(st.session.mosaic.config.blend.feather_px, 2560.0);
-    assert!(!st.jobs.busy());
-    // The blends were cancelled: none recorded.
-    assert!(
-        !st.session
-            .mosaic
-            .config
-            .provenance
-            .iter()
-            .any(|p| p.action == "blend")
+    assert!(h.query_by_label("Apply").is_none());
+    // The previous values, once.
+    let prev = h.state_mut().panel.take_analysis_undo().unwrap();
+    assert_eq!(prev.gain, GainMode::Fit);
+    assert_eq!(h.state_mut().panel.take_analysis_undo(), None);
+    // Undo is an ordinary analysis edit.
+    let st = h.state_mut();
+    assert_eq!(
+        st.panel.edit_analysis(prev, &mut st.session, &mut st.jobs),
+        Some(ChangeImpact::Reanalyze)
     );
+    assert_eq!(st.session.mosaic.config.analyze.gain, GainMode::Fit);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn a_waiting_edit_applies_when_the_session_is_left() {
+fn undo_of_an_analysis_change_waits_for_the_running_analysis() {
+    let (root, mut s, mut jobs) = analyzed("settings-undo-waits");
+    let ctx = egui::Context::default();
+    let mut panel = SettingsPanel::new();
+    let fit = s.mosaic.config.analyze.clone();
+    let unity = analysis(GainMode::Unity, &s.mosaic.config);
+    assert_eq!(
+        panel.edit_analysis(unity, &mut s, &mut jobs),
+        Some(ChangeImpact::Reanalyze)
+    );
+    let prev = panel.take_analysis_undo().unwrap();
+    assert_eq!(prev, fit);
+    // The analysis it caused is running when Undo is pressed.
+    let gate = jobs.hold();
+    let id = jobs.start_analyze(&mut s);
+    assert_eq!(panel.edit_analysis(prev, &mut s, &mut jobs), None);
+    assert!(panel.has_pending());
+    assert!(panel.editing(&s.mosaic.config));
+    assert_eq!(s.mosaic.config.analyze.gain, GainMode::Unity, "not yet");
+    gate.open();
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
+    let mut events = Vec::new();
+    let mut applied = None;
+    while applied.is_none() {
+        assert!(Instant::now() < deadline, "never applied");
+        events.extend(jobs.poll(&mut s));
+        applied = panel.poll(&ctx, &mut s, &mut jobs);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(applied, Some(ChangeImpact::Reanalyze));
+    assert!(events.contains(&JobEvent::Cancelled { id }));
+    assert_eq!(s.mosaic.config.analyze.gain, GainMode::Fit);
+    assert!(!panel.has_pending());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_waiting_analysis_edit_applies_when_the_session_is_left() {
     let (root, mut s, mut jobs) = analyzed("settings-apply-waiting");
     let gate = jobs.hold();
-    jobs.start_blend(&mut s, "Ha", None);
+    jobs.start_analyze(&mut s);
     let mut panel = SettingsPanel::new();
-    let mut e = SettingsEdit::of(&s.mosaic.config);
-    e.blend.feather_px = 100.0;
-    panel.stage(e, &s.mosaic.config);
-    assert_eq!(panel.apply(&mut s, &mut jobs), None);
-    assert!(panel.has_pending(), "waits for the merge to stop");
-    // Leaving the session: the jobs stop, then the edit applies at once.
+    let unity = analysis(GainMode::Unity, &s.mosaic.config);
+    assert_eq!(panel.edit_analysis(unity, &mut s, &mut jobs), None);
+    assert!(panel.has_pending(), "waits for the analysis to stop");
     gate.open();
     let (_, stopped) = jobs.stop_all(&mut s, crate::testutil::PATIENCE);
     assert!(stopped);
     assert_eq!(
         panel.apply_waiting(&mut s, &mut jobs),
-        Some(ChangeImpact::Reblend)
+        Some(ChangeImpact::Reanalyze)
     );
     assert!(!panel.has_pending());
-    let saved = mmm_core::mosaic::MosaicConfig::load(&s.mosaic.dir).unwrap();
-    assert_eq!(saved.blend.feather_px, 100.0);
+    let saved = MosaicConfig::load(&s.mosaic.dir).unwrap();
+    assert_eq!(saved.analyze.gain, GainMode::Unity);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn blend_local_edit_spares_a_running_analysis() {
-    let (root, mut s, mut jobs) = analyzed("settings-spare-analysis");
-    let ctx = egui::Context::default();
-    let gate = jobs.hold();
-    let analysis = jobs.start_analyze(&mut s);
+fn analysis_edit_leaves_the_merge_settings_alone() {
+    let (root, mut s, mut jobs) = analyzed("settings-analysis-keeps-blend");
+    let mut draft = s.mosaic.config.blend.clone();
+    draft.feather_px = 77.0;
+    save_draft(&mut s.mosaic.config.ui, &draft);
+    let unity = analysis(GainMode::Unity, &s.mosaic.config);
     let mut panel = SettingsPanel::new();
-    let mut e = SettingsEdit::of(&s.mosaic.config);
-    e.blend.feather_px = 100.0;
-    panel.stage(e, &s.mosaic.config);
-    // Blend-local: only blends are in the way, and none runs.
-    assert_eq!(panel.apply(&mut s, &mut jobs), Some(ChangeImpact::Reblend));
-    assert!(!panel.editing(&s.mosaic.config));
-    // A blend queued behind the analysis is cancelled by the next one...
-    jobs.start_blend(&mut s, "Ha", None);
-    let mut e = SettingsEdit::of(&s.mosaic.config);
-    e.blend.feather_px = 50.0;
-    panel.stage(e, &s.mosaic.config);
-    assert_eq!(panel.apply(&mut s, &mut jobs), None);
-    assert!(panel.has_pending() && !panel.editing(&s.mosaic.config));
-    let mut events = jobs.poll(&mut s);
-    assert_eq!(
-        panel.poll(&ctx, &mut s, &mut jobs),
-        Some(ChangeImpact::Reblend)
-    );
-    assert_eq!(s.mosaic.config.blend.feather_px, 50.0);
-    // ...but the analysis runs on.
-    gate.open();
-    events.extend(drain(&mut jobs, &mut s));
-    assert!(events.contains(&JobEvent::Finished {
-        id: analysis,
-        label: crate::jobs::ANALYZE_LABEL.into()
-    }));
+    let before = s.mosaic.config.blend.clone();
+    panel.edit_analysis(unity, &mut s, &mut jobs);
+    assert_eq!(s.mosaic.config.blend, before);
+    assert_eq!(load_draft(&s.mosaic.config), draft);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn changed_marker_follows_the_last_blend() {
+fn the_dot_follows_the_last_merge() {
     let (root, mut h) = harness("settings-marker");
     let marks = |h: &Harness<'static, State>| h.query_all_by_label(CHANGED_MARK).count();
     h.run_steps(2);
-    // Never blended: nothing to compare with.
+    // Never merged: nothing to compare with.
     assert_eq!(marks(&h), 0);
     {
         let st = h.state_mut();
@@ -368,76 +386,170 @@ fn changed_marker_follows_the_last_blend() {
     }
     h.run_steps(2);
     assert_eq!(marks(&h), 0);
-    // A staged change is marked, and stays marked once applied...
+    // A draft change is marked for a group that was merged...
     {
         let st = h.state_mut();
-        let mut e = SettingsEdit::of(&st.session.mosaic.config);
-        e.blend.mode = BlendMode::Feather;
-        st.panel.stage(e, &st.session.mosaic.config);
+        let mut d = load_draft(&st.session.mosaic.config);
+        d.mode = BlendMode::Feather;
+        st.panel.edit_draft(&mut st.session.mosaic.config, d);
     }
     h.run_steps(2);
     assert_eq!(marks(&h), 1);
-    assert_eq!(
-        changed_fields(
-            &h.state().session.mosaic.config,
-            &h.state().panel.shown(&h.state().session.mosaic.config)
-        ),
-        [Field::Mode]
-    );
-    h.get_by_label("Apply").click();
+    // ...not for one that never was, and a composite counts any member.
+    h.state_mut().groups = vec!["OIII".into()];
+    h.run_steps(2);
+    assert_eq!(marks(&h), 0);
+    h.state_mut().groups = vec!["OIII".into(), "Ha".into()];
     h.run_steps(2);
     assert_eq!(marks(&h), 1);
-    // ...until a reblend uses it.
+    h.state_mut().groups = vec!["Ha".into()];
+    // A merge that used the draft clears the merge dot.
     {
         let st = h.state_mut();
-        st.jobs
-            .start_blend(&mut st.session, "Ha", Some([0, 0, 256, 256]));
+        let d = load_draft(&st.session.mosaic.config);
+        commit_blend_settings(&mut st.session.mosaic, d).unwrap();
+        st.jobs.start_blend(&mut st.session, "Ha", None);
         drain(&mut st.jobs, &mut st.session);
     }
     h.run_steps(2);
-    assert_eq!(marks(&h), 0);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn last_blend_reads_provenance() {
-    let (root, mut s, mut jobs) = analyzed("settings-last-blend");
-    assert_eq!(last_blend(&s.mosaic.config), None);
-    jobs.start_blend(&mut s, "OIII", Some([0, 0, 256, 256]));
-    drain(&mut jobs, &mut s);
-    let (a, b) = last_blend(&s.mosaic.config).unwrap();
-    assert_eq!(a, Some(s.mosaic.config.analyze.clone()));
-    assert_eq!(b, s.mosaic.config.blend);
-    // A group with overrides does not stand for the mosaic-wide settings.
-    let o = GroupOverride {
+    assert_eq!(marks(&h), 0, "the merge used the draft");
+    // A group's override decides what the draft means for it. The last
+    // merge used the draft (Feather).
+    let over = |mode| GroupOverride {
         blend: BlendOverride {
-            mode: Some(BlendMode::Feather),
+            mode: Some(mode),
             ..Default::default()
         },
         ..Default::default()
     };
-    set_group_override(&mut s.mosaic, "OIII", o).unwrap();
-    assert_eq!(last_blend(&s.mosaic.config), None);
+    assert_eq!(
+        mmm_core::mosaic::last_merge_settings(&h.state().session.mosaic.config, "Ha")
+            .unwrap()
+            .mode,
+        BlendMode::Feather
+    );
+    // An override that differs from the last merge shows the dot...
+    set_group_override(
+        &mut h.state_mut().session.mosaic,
+        "Ha",
+        over(BlendMode::Pyramid),
+    )
+    .unwrap();
+    h.run_steps(2);
+    assert_eq!(marks(&h), 1);
+    // ...one that equals it shows none.
+    set_group_override(
+        &mut h.state_mut().session.mosaic,
+        "Ha",
+        over(BlendMode::Feather),
+    )
+    .unwrap();
+    h.run_steps(2);
+    assert_eq!(marks(&h), 0);
+    set_group_override(
+        &mut h.state_mut().session.mosaic,
+        "Ha",
+        GroupOverride::default(),
+    )
+    .unwrap();
+    h.run_steps(2);
+    // An analysis change is marked against the last analysis.
+    {
+        let st = h.state_mut();
+        let a = analysis(GainMode::Unity, &st.session.mosaic.config);
+        assert_eq!(
+            last_analyze_settings(&st.session.mosaic.config, "Ha")
+                .unwrap()
+                .gain,
+            GainMode::Fit
+        );
+        st.panel.edit_analysis(a, &mut st.session, &mut st.jobs);
+    }
+    h.run_steps(2);
+    assert_eq!(marks(&h), 1);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn cost_text_says_what_goes_stale() {
+fn an_old_session_shows_no_dot() {
+    // No draft key, a merged session: the draft is the config's settings.
+    let (root, mut s, mut jobs) = analyzed("settings-old-session");
+    jobs.start_blend(&mut s, "Ha", None);
+    drain(&mut jobs, &mut s);
+    assert!(s.mosaic.config.ui.get(MERGE_DRAFT_KEY).is_none());
+    let cfg = &s.mosaic.config;
+    let groups = ["Ha".to_string()];
     assert_eq!(
-        cost_text(ChangeImpact::Reblend, Some((3, 12))),
-        "Existing results go stale; merge again to see the change (3 of 12 tiles)."
+        changed_fields(cfg, &load_draft(cfg), &cfg.analyze, &groups),
+        Vec::<Field>::new()
     );
-    assert_eq!(
-        cost_text(ChangeImpact::Reanalyze, Some((0, 0))),
-        "Analysis reruns and every result goes stale."
-    );
-    assert_eq!(
-        cost_text(ChangeImpact::Reanalyze, Some((2, 6))),
-        "Analysis reruns and every result goes stale (2 of 6 tiles)."
-    );
-    assert!(cost_text(ChangeImpact::Reblend, None).contains("counting"));
-    assert_eq!(
-        count_tiles(&[PathBuf::from("/nonexistent/result.mmmt")]),
-        (0, 0)
-    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_invalid_draft_is_never_written() {
+    let (root, mut s, _jobs) = analyzed("settings-invalid-draft");
+    let mut panel = SettingsPanel::new();
+    let mut bad = s.mosaic.config.blend.clone();
+    bad.feather_px = 0.0;
+    panel.edit_draft(&mut s.mosaic.config, bad);
+    assert!(s.mosaic.config.ui.get(MERGE_DRAFT_KEY).is_none());
+    assert!(!panel.take_draft_changed());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_cost_note_shows_once_after_a_merge() {
+    let (root, mut h) = harness("settings-cost-note");
+    let note = "Re-runs the analysis; the mosaic goes out of date";
+    h.run_steps(2);
+    assert!(h.query_by_label(note).is_none(), "nothing merged yet");
+    h.state_mut().session.merged = true;
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label(note).count(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_pending_analysis_edit_stays_editable() {
+    let (root, mut h) = harness("settings-pending-editable");
+    h.run_steps(2);
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.jobs.start_analyze(&mut st.session);
+    }
+    h.get_by_role_and_label(Role::ComboBox, "Gain").click();
+    h.run_steps(2);
+    h.get_by_label("Unity").click();
+    h.run_steps(2);
+    assert!(h.state().panel.has_pending());
+    // Setting the old value back clears it; nothing was applied.
+    h.get_by_role_and_label(Role::ComboBox, "Gain").click();
+    h.run_steps(2);
+    h.get_by_label("Fit").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert!(!st.panel.has_pending());
+    assert!(st.applied.is_empty());
+    assert_eq!(st.session.mosaic.config.analyze.gain, GainMode::Fit);
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_failed_edit_is_reported_for_a_toast() {
+    let (root, mut s, mut jobs) = analyzed("settings-failed-edit");
+    let mut panel = SettingsPanel::new();
+    assert_eq!(panel.take_problem(), None);
+    // A directory where mosaic.json goes: the save fails.
+    let file = s.mosaic.dir.join(mmm_core::mosaic::CONFIG_FILE);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let unity = analysis(GainMode::Unity, &s.mosaic.config);
+    assert_eq!(panel.edit_analysis(unity, &mut s, &mut jobs), None);
+    let why = panel.take_problem().expect("a problem");
+    assert!(why.starts_with("Could not change the settings"), "{why}");
+    assert_eq!(panel.take_problem(), None, "once");
+    let _ = std::fs::remove_dir_all(&root);
 }

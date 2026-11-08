@@ -129,6 +129,32 @@ pub fn legible_text(tint: Color32, bg: Color32) -> Color32 {
         .unwrap_or(Color32::WHITE)
 }
 
+/// `fill` (an opaque surface colour) as a translucent panel for text in
+/// `ink` drawn over an image: at the lowest opacity, in steps of 5 %, at
+/// which `ink` keeps AA contrast (at least 4.5:1) whatever the image is
+/// under it, from black to white (blending as egui does, in gamma space);
+/// opaque `fill` when no opacity does. Lets an overlay be quieter than an
+/// opaque panel without failing over a bright region.
+pub fn scrim(fill: Color32, ink: Color32) -> Color32 {
+    let over = |a: f32, bg: u8| {
+        let ch = |f: u8| (f as f32 * a + bg as f32 * (1.0 - a)).round() as u8;
+        Color32::from_rgb(ch(fill.r()), ch(fill.g()), ch(fill.b()))
+    };
+    let li = luminance(ink);
+    (0..=20)
+        .map(|step| step as f32 / 20.0)
+        .find(|&a| {
+            let (light, dark) = (over(a, 255), over(a, 0));
+            // Every image puts the panel between these two: the ink must
+            // be on one side of both, far enough from the nearer.
+            let same_side = (luminance(light) < li) == (luminance(dark) < li);
+            same_side && contrast_ratio(ink, light).min(contrast_ratio(ink, dark)) >= 4.5
+        })
+        .map_or(fill, |a| {
+            Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), (a * 255.0).round() as u8)
+        })
+}
+
 /// Install the Mega theme on `ctx`: the embedded fonts, the dark theme
 /// (forced, whatever the OS prefers) and the complete [`style::style`].
 pub fn apply(ctx: &egui::Context) {
@@ -253,6 +279,37 @@ mod tests {
             .textures_delta
             .clear();
         assert!(ensure_applied(&ctx));
+    }
+
+    #[test]
+    fn a_scrim_keeps_its_ink_legible_over_any_image() {
+        use palette::*;
+        // Premultiplied `c` drawn over opaque `bg` (egui blends in gamma
+        // space).
+        let over = |c: Color32, bg: Color32| {
+            let k = 1.0 - c.a() as f32 / 255.0;
+            let ch = |f: u8, b: u8| (f as f32 + b as f32 * k).round() as u8;
+            Color32::from_rgb(ch(c.r(), bg.r()), ch(c.g(), bg.g()), ch(c.b(), bg.b()))
+        };
+        for (fill, ink) in [(SURFACE_800, TEXT_MUTED), (SURFACE_900, TEXT_BODY)] {
+            let s = scrim(fill, ink);
+            assert!(s.a() > 0 && s.a() < 255, "translucent: {s:?}");
+            for bg in [Color32::WHITE, Color32::BLACK, FILL_MUTED, SII_300] {
+                let c = contrast_ratio(ink, over(s, bg));
+                assert!(c >= 4.5, "{ink:?} on {s:?} over {bg:?}: {c}");
+            }
+            // As translucent as that allows: a step clearer fails over white.
+            let a = s.a() as f32 / 255.0 - 0.05;
+            let clearer = Color32::from_rgba_unmultiplied(
+                fill.r(),
+                fill.g(),
+                fill.b(),
+                (a * 255.0).round() as u8,
+            );
+            assert!(contrast_ratio(ink, over(clearer, Color32::WHITE)) < 4.5);
+        }
+        // Ink that never reads over white gets an opaque fill.
+        assert_eq!(scrim(SURFACE_800, FILL_MUTED).a(), 255);
     }
 
     #[test]

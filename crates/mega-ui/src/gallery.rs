@@ -25,8 +25,8 @@ use crate::theme::tokens::{radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, ChoiceChip, MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast,
-    Toasts, chip, choice_chip, icon_button, notes_view, overline, progress, property_grid,
+    ButtonKind, ChipMark, ChoiceChip, MegaButton, NotesMode, SessionCardData, StepState, StripStep,
+    Toast, Toasts, chip, choice_chip, icon_button, notes_view, overline, progress, property_grid,
     property_row, property_row_numeric, property_row_ui, segmented, session_card, status,
     step_strip, submenu, text_input,
 };
@@ -425,11 +425,25 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
             });
             ui.add_space(space::S);
             ui.horizontal(|ui| {
-                for (label, color, selected, dashed) in [
-                    ("Hα", Some(GROUP_PALETTE[0]), true, false),
-                    ("OIII", Some(GROUP_PALETTE[2]), false, false),
-                    ("Composite", None, false, true),
-                    ("Composite", None, true, true),
+                for (label, color, selected, dashed, mark) in [
+                    ("Hα", Some(GROUP_PALETTE[0]), true, false, None),
+                    ("OIII", Some(GROUP_PALETTE[2]), false, false, None),
+                    ("Composite", None, false, true, None),
+                    ("Composite", None, true, true, None),
+                    (
+                        "SII",
+                        Some(GROUP_PALETTE[1]),
+                        false,
+                        false,
+                        Some(ChipMark::Attention),
+                    ),
+                    (
+                        "Hα",
+                        Some(GROUP_PALETTE[0]),
+                        false,
+                        false,
+                        Some(ChipMark::Changed),
+                    ),
                 ] {
                     choice_chip(
                         ui,
@@ -438,6 +452,7 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                             color,
                             selected,
                             dashed,
+                            mark,
                         },
                     );
                 }

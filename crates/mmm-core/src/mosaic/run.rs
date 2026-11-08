@@ -18,7 +18,7 @@
 //! <dir>/groups/<group dir>/result.mmmt   the group's tiled result
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -34,7 +34,7 @@ use crate::formats::InputPanel;
 use crate::job::JobCtl;
 use crate::overlap::OverlapGraph;
 use crate::photometry::Photometry;
-use crate::reference;
+use crate::reference::{self, ReferenceFrame};
 use crate::session::Session;
 use crate::settings::{
     AnalyzeSettings, BlendSettings, ChangeImpact, GroupOverride, analyze_change, blend_change,
@@ -153,30 +153,34 @@ impl Mosaic {
     /// aligned rect it returned): append a `"blend"` provenance entry
     /// (group, rect, settings) and save.
     ///
-    /// If the group's effective blend settings no longer equal the plan's,
-    /// or the group was marked [`MosaicConfig::needs_analyze`] since (a
+    /// The provenance records `plan.settings` (the settings the run used),
+    /// whatever the committed settings are now: a later edit leaves the
+    /// result out of date ([`settings_changed`]) but not wrong.
+    ///
+    /// If the group was marked [`MosaicConfig::needs_analyze`] since (a
     /// `set_*` landed between [`plan_blend`] and the run taking the store's
     /// writer lock), the tiles just written are stale: the group's store is
-    /// invalidated, nothing is recorded, and an [`Error::Compute`] saying
-    /// the settings changed during the blend is returned ([`Error::Busy`]
-    /// if another writer holds the store).
+    /// invalidated, nothing is recorded, and an [`Error::Compute`] is
+    /// returned ([`Error::Busy`] if another writer holds the store).
     pub fn apply_blend(&mut self, plan: &BlendPlan, rect: [u64; 4]) -> Result<()> {
         let group = &plan.group;
-        if self.config.settings_for(group).1 != plan.settings
-            || self.config.needs_analyze.contains(group)
-        {
+        if self.config.needs_analyze.contains(group) {
             let mut stores = lock_stores(std::slice::from_ref(&plan.result_path))?;
             invalidate(&mut stores)?;
             return Err(Error::compute(format!(
-                "settings for group '{group}' changed during the merge — its tiles were \
-                 invalidated; merge again"
+                "analyze settings for group '{group}' changed during the merge — its tiles were invalidated; analyze, then merge again"
             )));
         }
         let mut next = self.config.clone();
         next.push_provenance(
             "blend",
             Some(&plan.group),
-            json!({ "group": plan.group, "rect": rect, "settings": plan.settings }),
+            json!({
+                "group": plan.group,
+                "rect": rect,
+                "settings": plan.settings,
+                "whole": plan.rect.is_none(),
+            }),
         );
         next.save(&self.dir)?;
         self.config = next;
@@ -215,8 +219,25 @@ pub struct AnalyzePlan {
     pub input: InputSelect,
     /// The groups as resolved when planning.
     pub resolved: Groups,
-    /// The processing groups to analyze, in order.
+    /// The processing groups to analyze, in order. Empty for a
+    /// [`AnalyzeScope::Needed`] plan when nothing needs analysing; running
+    /// such a plan does nothing (no frame is derived, no provenance added).
     pub groups: Vec<AnalyzeGroup>,
+    /// The saved analysed reference frame, set by a [`AnalyzeScope::Needed`]
+    /// plan when a frame file exists: [`run_analyze`] refuses with
+    /// [`Error::FrameMoved`] if the frame derived from the panels now
+    /// differs, because the groups left out were analysed on the old one.
+    pub expected_frame: Option<ReferenceFrame>,
+}
+
+/// Which groups a [`plan_analyze_scoped`] plan analyses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalyzeScope {
+    /// Every processing group.
+    All,
+    /// Only groups in [`MosaicConfig::needs_analyze`], plus resolved groups
+    /// never analysed (no recorded directory).
+    Needed,
 }
 
 /// What a [`run_analyze`] achieved, for [`Mosaic::apply_analyze`].
@@ -257,11 +278,35 @@ pub fn plan_analyze(m: &mut Mosaic) -> Result<AnalyzePlan> {
 /// owner thread that must not do file reads proportional to the panel
 /// count. `resolved` must come from the current panels and grouping.
 pub fn plan_analyze_with(m: &mut Mosaic, resolved: Groups) -> Result<AnalyzePlan> {
+    plan_analyze_scoped(m, resolved, AnalyzeScope::All)
+}
+
+/// [`plan_analyze_with`] limited by `scope`. A [`AnalyzeScope::Needed`] plan
+/// builds, locks, invalidates and marks only its groups (marks of vanished
+/// groups are still dropped), and records the saved analysed frame in
+/// [`AnalyzePlan::expected_frame`] (a missing or unreadable frame file gives
+/// `None`). A plan with no groups is valid and does nothing when run.
+pub fn plan_analyze_scoped(
+    m: &mut Mosaic,
+    resolved: Groups,
+    scope: AnalyzeScope,
+) -> Result<AnalyzePlan> {
     let mut next = m.clone();
+    let never_analyzed: BTreeSet<String> = resolved
+        .processing_groups()
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| !m.config.group_dirs.contains_key(n))
+        .collect();
     next.assign_group_dirs(&resolved);
     let groups: Vec<AnalyzeGroup> = resolved
         .processing_groups()
         .into_iter()
+        .filter(|(name, _)| {
+            scope == AnalyzeScope::All
+                || next.config.needs_analyze.contains(name)
+                || never_analyzed.contains(name)
+        })
         .map(|(name, paths)| AnalyzeGroup {
             session_dir: next.group_session_dir(&name),
             result_path: next.result_path(&name),
@@ -275,22 +320,33 @@ pub fn plan_analyze_with(m: &mut Mosaic, resolved: Groups) -> Result<AnalyzePlan
     // Groups that no longer resolve (a rule or manual-group change) can
     // never be analysed: drop their marks. Their directories stay in
     // `group_dirs`, so caches stay stable if the name comes back.
+    let resolved_names: BTreeSet<String> = resolved
+        .processing_groups()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     next.config
         .needs_analyze
-        .retain(|name| groups.iter().any(|g| &g.name == name));
+        .retain(|name| resolved_names.contains(name));
     next.config
         .needs_analyze
         .extend(groups.iter().map(|g| g.name.clone()));
     invalidate(&mut stores)?;
     next.save()?;
     *m = next;
+    let frame_path = m.dir.join(FRAME_FILE);
+    let expected_frame = match scope {
+        AnalyzeScope::All => None,
+        AnalyzeScope::Needed => ReferenceFrame::load(&frame_path).ok(),
+    };
     Ok(AnalyzePlan {
         dir: m.dir.clone(),
-        frame_path: m.dir.join(FRAME_FILE),
+        frame_path,
         panels: m.config.panels.iter().map(|p| p.path.clone()).collect(),
         input: m.config.analyze.input,
         resolved,
         groups,
+        expected_frame,
     })
 }
 
@@ -311,7 +367,13 @@ pub fn run_analyze(plan: &AnalyzePlan, ctl: &JobCtl) -> (AnalyzeOutcome, Result<
 
 fn run_analyze_into(plan: &AnalyzePlan, ctl: &JobCtl, out: &mut AnalyzeOutcome) -> Result<()> {
     ctl.check()?;
+    if plan.groups.is_empty() {
+        return Ok(());
+    }
     let frame = reference::derive(&plan.panels, plan.input)?;
+    if plan.expected_frame.as_ref().is_some_and(|e| *e != frame) {
+        return Err(Error::FrameMoved);
+    }
     frame.save(&plan.frame_path)?;
     let mut detail = serde_json::Map::new();
     for g in &plan.groups {
@@ -373,10 +435,28 @@ pub struct BlendPlan {
     pub session_dir: PathBuf,
     /// The group's tiled result store.
     pub result_path: PathBuf,
-    /// The group's effective blend settings.
+    /// The blend settings the run uses (recorded in the provenance).
     pub settings: BlendSettings,
     /// Level-0 canvas rect to blend; `None` = the whole canvas.
     pub rect: Option<[u64; 4]>,
+    /// A whole-canvas merge whose settings differ from the group's last
+    /// whole-canvas merge: [`run_blend`] invalidates the whole store before
+    /// writing, so a stopped run leaves nothing that looks current. A
+    /// region merge is never fresh (the sink invalidates just its rect;
+    /// one with other settings makes the group out of date instead, see
+    /// [`region_differs`]).
+    ///
+    /// The tile sink ([`crate::tiles::TileSink::new`]) also invalidates
+    /// the whole aligned rect of any whole-canvas merge, fresh or not, so
+    /// a finished whole merge always rewrites every tile. `fresh` is kept
+    /// for durability: it invalidates and flushes the state table before
+    /// [`crate::tiles::blend_tiles`] starts, whereas the sink's
+    /// invalidation sits only in the mapping until the run ends, through
+    /// the (possibly long) blend that reads every panel. A crash or cancel
+    /// before the sink exists (or before its invalidation reaches the disk)
+    /// still leaves the group out of date. Neither covers the other: keep
+    /// both.
+    pub fresh: bool,
 }
 
 /// Plan a blend of `rect` (level-0 canvas coordinates; `None` = the whole
@@ -386,6 +466,19 @@ pub struct BlendPlan {
 /// (no recorded directory) or whose analysis is out of date
 /// ([`MosaicConfig::needs_analyze`]): run [`analyze_all`] first.
 pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<BlendPlan> {
+    plan_blend_with(m, group, rect, m.config.settings_for(group).1)
+}
+
+/// [`plan_blend`] with explicit `settings` (those a queued merge was
+/// queued with) instead of the group's committed ones. The plan is
+/// [`BlendPlan::fresh`] when it is a whole-canvas merge and `settings`
+/// differ from [`last_merge_settings`].
+pub fn plan_blend_with(
+    m: &Mosaic,
+    group: &str,
+    rect: Option<[u64; 4]>,
+    settings: BlendSettings,
+) -> Result<BlendPlan> {
     if !m.config.group_dirs.contains_key(group) {
         return Err(Error::compute(format!(
             "group '{group}' has not been analyzed yet — analyze first"
@@ -400,7 +493,8 @@ pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<Ble
         group: group.to_string(),
         session_dir: m.group_session_dir(group),
         result_path: m.result_path(group),
-        settings: m.config.settings_for(group).1,
+        fresh: rect.is_none() && last_merge_settings(&m.config, group).as_ref() != Some(&settings),
+        settings,
         rect,
     })
 }
@@ -449,6 +543,17 @@ pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
         Some(s) => s,
         None => TileStore::create(path, geometry)?,
     };
+    // Durability, not redundancy: `TileSink::new` (inside `blend_tiles`)
+    // also invalidates the whole aligned rect of any whole-canvas merge,
+    // but only in the mapping, unflushed until the run ends, and
+    // `blend_tiles` can fail before the sink exists. Invalidating and
+    // flushing here, before the (possibly long) blend reads the panels,
+    // means a crash or cancel at any point still leaves the group out of
+    // date rather than its old-settings tiles looking current. Keep both.
+    if plan.fresh {
+        store.invalidate_all();
+        store.flush_state()?;
+    }
     let blended = blend_tiles(
         &session,
         &phot,
@@ -651,6 +756,174 @@ pub fn set_settings(
     Ok(impact)
 }
 
+/// Commit new global blend settings without invalidating anything: the
+/// settings are validated like [`set_settings`] (the base and every group's
+/// effective settings), stored and saved once. No store lock is taken, no
+/// tiles are invalidated and [`MosaicConfig::needs_analyze`] is untouched;
+/// the next merge uses the new settings, and [`settings_changed`] tells a
+/// frontend which groups' merged tiles no longer match.
+///
+/// Refused with nothing changed (in memory or on disk) when any resolved
+/// settings fail [`BlendSettings::validate`].
+pub fn commit_blend_settings(m: &mut Mosaic, blend: BlendSettings) -> Result<()> {
+    validate_blend(&m.config, &blend)?;
+    let mut next = m.config.clone();
+    next.blend = blend;
+    next.save(&m.dir)?;
+    m.config = next;
+    Ok(())
+}
+
+/// Whether `e` is a `"blend"` entry of `group`.
+fn is_merge_of(e: &ProvenanceEntry, group: &str) -> bool {
+    e.action == "blend" && e.group.as_deref() == Some(group)
+}
+
+/// Whether a `"blend"` entry was a whole-canvas merge: `whole` is not
+/// false (entries without the key predate it and count as whole).
+fn is_whole(e: &ProvenanceEntry) -> bool {
+    e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false)
+}
+
+/// The settings a `"blend"` entry records (`None` if they do not parse).
+fn merge_settings(e: &ProvenanceEntry) -> Option<BlendSettings> {
+    serde_json::from_value(e.detail.get("settings")?.clone()).ok()
+}
+
+/// Where `group`'s newest whole-canvas merge is in the provenance trail.
+fn last_whole_merge(cfg: &MosaicConfig, group: &str) -> Option<usize> {
+    cfg.provenance
+        .iter()
+        .rposition(|e| is_merge_of(e, group) && is_whole(e))
+}
+
+/// The blend settings of `group`'s newest whole-canvas merge, from the
+/// provenance trail (`None` if never merged, or if that entry's settings do
+/// not parse: an older entry never answers for it). Region merges (`whole` false)
+/// are skipped; entries without a `whole` key predate it and count as whole.
+pub fn last_merge_settings(cfg: &MosaicConfig, group: &str) -> Option<BlendSettings> {
+    last_whole_merge(cfg, group).and_then(|i| merge_settings(&cfg.provenance[i]))
+}
+
+/// Whether a region of `group` was merged, since its newest whole-canvas
+/// merge, with settings different from that merge's
+/// ([`last_merge_settings`]): some `"blend"` entry of the group with
+/// `whole` false, later in the provenance trail than the newest whole
+/// entry, records other settings. Its tiles then sit in the group's store
+/// beside the whole merge's, so the store is complete but not of one
+/// merge: a frontend treats the group as out of date (a whole merge
+/// rewrites it) rather than as merely having changed settings. A later
+/// region merge with the whole merge's settings does not clear it (the
+/// other tiles may remain outside it); only a whole merge does. `false`
+/// when no whole merge is recorded (the group is not merged at all).
+pub fn region_differs(cfg: &MosaicConfig, group: &str) -> bool {
+    let Some(whole) = last_whole_merge(cfg, group) else {
+        return false;
+    };
+    let merged = merge_settings(&cfg.provenance[whole]);
+    cfg.provenance[whole + 1..]
+        .iter()
+        .filter(|e| is_merge_of(e, group))
+        .any(|e| merge_settings(e) != merged)
+}
+
+/// The analyze settings `group` was last analyzed with, from the newest
+/// `"analyze"` provenance entry that includes it (`None` if never analyzed).
+pub fn last_analyze_settings(cfg: &MosaicConfig, group: &str) -> Option<AnalyzeSettings> {
+    cfg.provenance
+        .iter()
+        .rev()
+        .filter(|e| e.action == "analyze")
+        .find_map(|e| serde_json::from_value(e.detail.get("groups")?.get(group)?.clone()).ok())
+}
+
+/// Why a group's mosaic is out of date, as far as the provenance trail
+/// can tell (see [`out_of_date_reason`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutOfDateReason {
+    /// The group's analysis settings differ from those it was analysed with.
+    AnalysisSettings,
+    /// The panels changed.
+    Panels,
+    /// No whole-canvas merge is recorded.
+    NotMerged,
+    /// Nothing explains it: a merge that did not finish.
+    MergeUnfinished,
+    /// A region was merged with other settings since the whole-canvas
+    /// merge ([`region_differs`]).
+    RegionDiffers,
+}
+
+/// Why `group`'s mosaic is out of date, first match of: it needs analysis
+/// and its effective analysis settings differ from [`last_analyze_settings`]
+/// ([`OutOfDateReason::AnalysisSettings`]); it needs analysis
+/// ([`OutOfDateReason::Panels`]); a region was merged with other settings
+/// since the whole merge ([`region_differs`]:
+/// [`OutOfDateReason::RegionDiffers`]); no whole merge is recorded
+/// ([`OutOfDateReason::NotMerged`]); an `"inputs"` entry newer than the
+/// group's last whole merge touches it (no `affected` key, or it lists the
+/// group: `Panels`); an `"analyze"` entry listing the group, newer than
+/// that merge, has different settings for it from the newest one before
+/// the merge (`AnalysisSettings`: the pipeline already re-analysed, so
+/// `needs_analyze` is clear); else [`OutOfDateReason::MergeUnfinished`].
+/// Reads only the config, so it says nothing of whether the group *is* out
+/// of date.
+pub fn out_of_date_reason(cfg: &MosaicConfig, group: &str) -> OutOfDateReason {
+    if cfg.needs_analyze.contains(group) {
+        let changed =
+            last_analyze_settings(cfg, group).is_some_and(|last| last != cfg.settings_for(group).0);
+        return if changed {
+            OutOfDateReason::AnalysisSettings
+        } else {
+            OutOfDateReason::Panels
+        };
+    }
+    if region_differs(cfg, group) {
+        return OutOfDateReason::RegionDiffers;
+    }
+    let Some(merge) = last_whole_merge(cfg, group) else {
+        return OutOfDateReason::NotMerged;
+    };
+    let after = &cfg.provenance[merge + 1..];
+    let touches = |e: &ProvenanceEntry| match e.detail.get("affected").and_then(|a| a.as_array()) {
+        None => true,
+        Some(list) => list.iter().any(|g| g.as_str() == Some(group)),
+    };
+    if after.iter().any(|e| e.action == "inputs" && touches(e)) {
+        return OutOfDateReason::Panels;
+    }
+    let of = |e: &ProvenanceEntry| -> Option<AnalyzeSettings> {
+        serde_json::from_value(e.detail.get("groups")?.get(group)?.clone()).ok()
+    };
+    let before = cfg.provenance[..merge]
+        .iter()
+        .rev()
+        .filter(|e| e.action == "analyze")
+        .find_map(of);
+    let changed = after
+        .iter()
+        .filter(|e| e.action == "analyze")
+        .filter_map(of)
+        .any(|s| before.as_ref().is_some_and(|b| *b != s));
+    if changed {
+        OutOfDateReason::AnalysisSettings
+    } else {
+        OutOfDateReason::MergeUnfinished
+    }
+}
+
+/// Whether `draft` global blend settings, resolved through `group`'s
+/// override, differ from those of the group's last whole-canvas merge.
+/// `false` when the group was never merged.
+pub fn settings_changed(cfg: &MosaicConfig, group: &str, draft: &BlendSettings) -> bool {
+    let over = cfg
+        .group_overrides
+        .get(group)
+        .map(|o| o.blend.clone())
+        .unwrap_or_default();
+    last_merge_settings(cfg, group).is_some_and(|s| s != draft.with(&over))
+}
+
 /// Replace the input panel list and grouping rule. Unchanged inputs are a
 /// no-op. Otherwise every existing group result store is invalidated, every
 /// group with a recorded directory is marked in
@@ -662,17 +935,48 @@ pub fn set_settings(
 /// Refused with nothing changed (in memory or on disk) with [`Error::Busy`]
 /// when any store is held by a writer.
 pub fn set_inputs(m: &mut Mosaic, panels: Vec<PanelEntry>, grouping: Grouping) -> Result<()> {
+    set_inputs_affecting(m, panels, grouping, None)
+}
+
+/// [`set_inputs`] limited to `affected` groups (see [`super::grouping::affected_groups`]):
+/// only their stores are locked and invalidated and only they (those with a
+/// recorded directory) are marked in [`MosaicConfig::needs_analyze`]; other
+/// groups stay valid and unmarked. `None` means every group, exactly
+/// [`set_inputs`]. The `"inputs"` provenance entry gains an `"affected"`
+/// list of names when `affected` is `Some` (absent = all).
+pub fn set_inputs_affecting(
+    m: &mut Mosaic,
+    panels: Vec<PanelEntry>,
+    grouping: Grouping,
+    affected: Option<&BTreeSet<String>>,
+) -> Result<()> {
     if panels == m.config.panels && grouping == m.config.grouping {
         return Ok(());
     }
-    let mut stores = lock_stores(&all_result_stores(m)?)?;
+    let mut stores = match affected {
+        None => lock_stores(&all_result_stores(m)?)?,
+        Some(a) => {
+            let paths: Vec<PathBuf> = a.iter().map(|g| m.result_path(g)).collect();
+            lock_stores(&paths)?
+        }
+    };
     let mut next = m.config.clone();
-    next.needs_analyze.extend(next.group_dirs.keys().cloned());
-    next.push_provenance(
-        "inputs",
-        None,
-        json!({ "panels": panels.len(), "groups": next.group_dirs.len() }),
-    );
+    match affected {
+        None => next.needs_analyze.extend(next.group_dirs.keys().cloned()),
+        Some(a) => {
+            let marked: Vec<String> = a
+                .iter()
+                .filter(|g| next.group_dirs.contains_key(*g))
+                .cloned()
+                .collect();
+            next.needs_analyze.extend(marked);
+        }
+    }
+    let mut detail = json!({ "panels": panels.len(), "groups": next.group_dirs.len() });
+    if let Some(a) = affected {
+        detail["affected"] = json!(a);
+    }
+    next.push_provenance("inputs", None, detail);
     next.panels = panels;
     next.grouping = grouping;
     invalidate(&mut stores)?;

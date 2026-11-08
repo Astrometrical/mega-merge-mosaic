@@ -6,7 +6,7 @@
 //! *run* on its own `std::thread` with a [`JobCtl`], and its outcome is
 //! *applied* on the UI thread by [`JobRunner::poll`]. An analysis first
 //! resolves the groups (panel header reads) on a worker over a copy of the
-//! mosaic, then plans with [`plan_analyze_with`], so the UI thread never
+//! mosaic, then plans with [`plan_analyze_scoped`], so the UI thread never
 //! reads panels.
 //!
 //! The UI thread does write a little: planning, applying and discarding
@@ -50,11 +50,13 @@ use mmm_core::export::{ExportFormat, ExportReport, export_group};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
-    AnalyzeOutcome, AnalyzePlan, BlendPlan, Grouping, Mosaic, PanelEntry, invalidate_group,
-    plan_analyze_with, plan_blend, run_analyze, run_blend,
+    AnalyzeOutcome, AnalyzePlan, AnalyzeScope, BlendPlan, Grouping, Mosaic, PanelEntry,
+    invalidate_group, mark_needs_analyze, plan_analyze_scoped, plan_blend_with, run_analyze,
+    run_blend,
 };
 use mmm_core::preview::{Preview, PreviewPlan, PreviewRun, plan_previews, run_previews};
 use mmm_core::reference::ReferenceFrame;
+use mmm_core::settings::BlendSettings;
 
 use crate::session::OpenSession;
 
@@ -127,11 +129,18 @@ pub struct Run {
 /// What a queued job will do.
 #[derive(Clone, Debug)]
 enum Kind {
-    Analyze,
+    Analyze {
+        scope: AnalyzeScope,
+    },
     Previews,
     Blend {
         group: String,
         rect: Option<[u64; 4]>,
+        /// The settings it was queued with (the committed ones, or the
+        /// draft for an ROI merge: [`JobRunner::start_blend_with`]): the
+        /// merge runs with these, whatever is committed by the time it
+        /// starts.
+        settings: BlendSettings,
     },
     Export(ExportJob),
 }
@@ -154,7 +163,7 @@ struct Queued {
 enum Planned {
     /// An analysis's first phase: resolve the groups of a copy of the
     /// mosaic (reads panel headers).
-    Resolve(Box<Mosaic>),
+    Resolve(Box<Mosaic>, AnalyzeScope),
     Analyze(AnalyzePlan),
     Blend(BlendPlan),
     Previews(PreviewPlan),
@@ -212,8 +221,9 @@ struct Running {
     handle: JoinHandle<()>,
     /// The plan of a blend, kept to apply or discard its outcome.
     blend: Option<BlendPlan>,
-    /// While resolving groups: the inputs the resolution is based on.
-    resolving: Option<GroupInputs>,
+    /// While resolving groups: the inputs the resolution is based on, and
+    /// which groups the analysis then covers.
+    resolving: Option<(GroupInputs, AnalyzeScope)>,
     /// A previews job (analysis queues behind it rather than cancel it).
     previews: bool,
     /// An export job (input edits spare it).
@@ -270,6 +280,12 @@ pub struct JobRunner {
     exports_ended: usize,
     /// Events raised outside `poll` (queued jobs cancelled), delivered by it.
     pending: Vec<JobEvent>,
+    /// Whole-canvas merges a panel edit stopped, by id
+    /// ([`JobRunner::cancel_for_panel_edit`]).
+    edit_stopped: BTreeSet<u64>,
+    /// Set when an edit stopped a merge not yet reported
+    /// ([`JobRunner::take_merge_stopped`]).
+    merge_stopped: bool,
     /// The frame of the last previews run that finished with every panel,
     /// until taken ([`JobRunner::take_previews_frame`]).
     previews_frame: Option<ReferenceFrame>,
@@ -297,6 +313,8 @@ impl JobRunner {
             blends_ended: 0,
             exports_ended: 0,
             pending: Vec::new(),
+            edit_stopped: BTreeSet::new(),
+            merge_stopped: false,
             previews_frame: None,
             #[cfg(test)]
             gate: None,
@@ -318,6 +336,14 @@ impl JobRunner {
     /// kilobytes, not processing: no panel or pixel data is read there, and
     /// the analysis itself runs on the worker.
     pub fn start_analyze(&mut self, session: &mut OpenSession) -> u64 {
+        self.start_analyze_scoped(session, AnalyzeScope::All)
+    }
+
+    /// [`JobRunner::start_analyze`] limited to `scope`: with
+    /// [`AnalyzeScope::Needed`] only the groups marked as needing analysis
+    /// (and new ones). If the frame then moves, it restarts with every group
+    /// (see [`JobRunner::poll`]), reporting no failure.
+    pub fn start_analyze_scoped(&mut self, session: &mut OpenSession, scope: AnalyzeScope) -> u64 {
         let id = self.new_id(ANALYZE_LABEL.into());
         if let Some(r) = self.running.as_ref().filter(|r| !r.previews) {
             r.token.cancel();
@@ -334,7 +360,7 @@ impl JobRunner {
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
         self.queue.push_back(Queued {
             id,
-            kind: Kind::Analyze,
+            kind: Kind::Analyze { scope },
         });
         self.start_next(session);
         id
@@ -389,6 +415,24 @@ impl JobRunner {
         group: &str,
         rect: Option<[u64; 4]>,
     ) -> u64 {
+        let settings = session.mosaic.config.settings_for(group).1;
+        self.start_blend_with(session, group, rect, settings)
+    }
+
+    /// [`JobRunner::start_blend`] with explicit `settings` (validated by
+    /// the caller) instead of the group's committed ones: an ROI merge of
+    /// the merge settings draft. A whole-canvas merge with them is fresh
+    /// when they differ from the group's last whole merge; an ROI merge
+    /// never is ([`mmm_core::mosaic::plan_blend_with`]), and one whose
+    /// settings differ makes the group out of date
+    /// ([`mmm_core::mosaic::region_differs`]).
+    pub fn start_blend_with(
+        &mut self,
+        session: &mut OpenSession,
+        group: &str,
+        rect: Option<[u64; 4]>,
+        settings: BlendSettings,
+    ) -> u64 {
         let id = self.new_id(job_label("Merge", group, session));
         self.begin(JobTarget::Blend, id, group);
         if rect.is_none() {
@@ -405,7 +449,7 @@ impl JobRunner {
                 dropped.push(q.id);
                 false
             }
-            Kind::Blend { .. } | Kind::Analyze | Kind::Previews | Kind::Export(_) => true,
+            Kind::Blend { .. } | Kind::Analyze { .. } | Kind::Previews | Kind::Export(_) => true,
         });
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
@@ -414,6 +458,7 @@ impl JobRunner {
             kind: Kind::Blend {
                 group: group.to_string(),
                 rect,
+                settings,
             },
         });
         self.start_next(session);
@@ -478,24 +523,50 @@ impl JobRunner {
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
     }
 
-    /// Cancel every blend: the running one winds down (reported by
-    /// [`JobRunner::poll`] when it has), queued ones are dropped at once.
-    /// For blend-local settings edits, which only need the stores' writer
-    /// locks.
-    pub fn cancel_blends(&mut self) {
-        if let Some(r) = self.running.as_ref().filter(|r| r.blend.is_some()) {
-            r.token.cancel();
-        }
-        let mut dropped = Vec::new();
-        self.queue.retain(|q| {
-            let keep = !matches!(q.kind, Kind::Blend { .. });
-            if !keep {
-                dropped.push(q.id);
-            }
-            keep
-        });
-        self.pending
-            .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+    /// [`JobRunner::cancel_all_but_exports`] for a panel edit, remembering
+    /// the whole-canvas merges it stops (running or queued, not yet being
+    /// cancelled): they are [`JobRunner::stopped_by_edit`], and
+    /// [`JobRunner::take_merge_stopped`] says once that the edit stopped
+    /// some. Cancelling again later stops nothing new.
+    pub fn cancel_for_panel_edit(&mut self) {
+        let running = self
+            .running
+            .iter()
+            .filter(|r| !r.export && !r.token.is_cancelled())
+            .map(|r| r.id);
+        let queued = self
+            .queue
+            .iter()
+            .filter(|q| matches!(q.kind, Kind::Blend { .. }))
+            .map(|q| q.id);
+        let stopped: Vec<u64> = running
+            .chain(queued)
+            .filter(|id| self.whole_canvas(*id) && self.in_run(*id) == Some(JobTarget::Blend))
+            .collect();
+        self.merge_stopped |= !stopped.is_empty();
+        self.edit_stopped.extend(stopped);
+        self.cancel_all_but_exports();
+    }
+
+    /// Whether a panel edit stopped merge `id`
+    /// ([`JobRunner::cancel_for_panel_edit`]).
+    pub fn stopped_by_edit(&self, id: u64) -> bool {
+        self.edit_stopped.contains(&id)
+    }
+
+    /// Whether a panel edit has stopped whole-canvas merges since the last
+    /// call (once per edit, however many merges it stopped).
+    pub fn take_merge_stopped(&mut self) -> bool {
+        std::mem::take(&mut self.merge_stopped)
+    }
+
+    /// Whether a whole-canvas merge is queued while an export runs.
+    pub fn merge_waits_for_export(&self) -> bool {
+        self.running.as_ref().is_some_and(|r| r.export)
+            && self
+                .queue
+                .iter()
+                .any(|q| matches!(q.kind, Kind::Blend { .. }) && self.whole_canvas(q.id))
     }
 
     /// Cancel every job, exports included, and wait up to `wait` for the
@@ -558,7 +629,10 @@ impl JobRunner {
         self.running
             .as_ref()
             .is_some_and(|r| r.blend.is_none() && !r.previews && !r.export)
-            || self.queue.iter().any(|q| matches!(q.kind, Kind::Analyze))
+            || self
+                .queue
+                .iter()
+                .any(|q| matches!(q.kind, Kind::Analyze { .. }))
     }
 
     /// Whether events raised outside [`JobRunner::poll`] (queued jobs
@@ -690,6 +764,17 @@ impl JobRunner {
                 .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
     }
 
+    /// Whether a whole-canvas blend of `group` is queued or running (an
+    /// ROI's blend does not count).
+    pub fn whole_blend_pending(&self, group: &str) -> bool {
+        self.running.as_ref().is_some_and(|r| {
+            r.blend.as_ref().is_some_and(|p| p.group == group) && self.whole.contains(&r.id)
+        }) || self.queue.iter().any(|q| {
+            matches!(&q.kind, Kind::Blend { group: g, .. } if g == group)
+                && self.whole.contains(&q.id)
+        })
+    }
+
     /// The frame of the last previews run that finished and used every
     /// panel (set when its [`JobEvent::Finished`] is delivered), once.
     pub fn take_previews_frame(&mut self) -> Option<ReferenceFrame> {
@@ -792,10 +877,15 @@ impl JobRunner {
                 return;
             };
             let planned = match &q.kind {
-                Kind::Analyze => Ok(Planned::Resolve(Box::new(session.mosaic.clone()))),
-                Kind::Blend { group, rect } => {
-                    plan_blend(&session.mosaic, group, *rect).map(Planned::Blend)
+                Kind::Analyze { scope } => {
+                    Ok(Planned::Resolve(Box::new(session.mosaic.clone()), *scope))
                 }
+                Kind::Blend {
+                    group,
+                    rect,
+                    settings,
+                } => plan_blend_with(&session.mosaic, group, *rect, settings.clone())
+                    .map(Planned::Blend),
                 Kind::Previews => Ok(Planned::Previews(plan_previews(&session.mosaic))),
                 Kind::Export(job) => Ok(Planned::Export {
                     dir: session.mosaic.dir.clone(),
@@ -819,12 +909,12 @@ impl JobRunner {
         let blend = match &planned {
             Planned::Blend(plan) => Some(plan.clone()),
             Planned::Analyze(_)
-            | Planned::Resolve(_)
+            | Planned::Resolve(..)
             | Planned::Previews(_)
             | Planned::Export { .. } => None,
         };
         let resolving = match &planned {
-            Planned::Resolve(m) => Some(GroupInputs::of(m)),
+            Planned::Resolve(m, scope) => Some((GroupInputs::of(m), *scope)),
             Planned::Analyze(_)
             | Planned::Blend(_)
             | Planned::Previews(_)
@@ -874,7 +964,7 @@ impl JobRunner {
                     };
                     let ctl = JobCtl::new(worker_token, Some(&observer));
                     match &planned {
-                        Planned::Resolve(m) => Done::Resolved(m.groups()),
+                        Planned::Resolve(m, _) => Done::Resolved(m.groups()),
                         Planned::Analyze(plan) => {
                             let (outcome, result) = run_analyze(plan, &ctl);
                             let frame = ReferenceFrame::load(&plan.frame_path).ok();
@@ -941,7 +1031,10 @@ impl JobRunner {
                 Err(e) => return Some(failed(format!("{name}: {}", describe(&e)))),
             };
             let current = GroupInputs::of(&session.mosaic);
-            let fresh = r.resolving.as_ref() == Some(&current);
+            let (fresh, scope) = match &r.resolving {
+                Some((inputs, scope)) => (*inputs == current, *scope),
+                None => (false, AnalyzeScope::All),
+            };
             if fresh {
                 session.groups = Some(groups.clone());
             }
@@ -950,12 +1043,12 @@ impl JobRunner {
             }
             // Panels or grouping changed meanwhile: resolve again.
             let planned = if fresh {
-                match plan_analyze_with(&mut session.mosaic, groups) {
+                match plan_analyze_scoped(&mut session.mosaic, groups, scope) {
                     Ok(plan) => Planned::Analyze(plan),
                     Err(e) => return Some(failed(format!("{name}: {}", describe(&e)))),
                 }
             } else {
-                Planned::Resolve(Box::new(session.mosaic.clone()))
+                Planned::Resolve(Box::new(session.mosaic.clone()), scope)
             };
             self.spawn(id, planned);
             return None;
@@ -993,12 +1086,25 @@ impl JobRunner {
                 }
                 // Applied even when cancelled: the finished groups stay.
                 let applied = session.mosaic.apply_analyze(&outcome);
-                match (result, applied) {
-                    (_, Err(e)) => failed(format!("{name}: {}", describe(&e))),
-                    (Ok(()), Ok(())) => JobEvent::Finished { id, label: name },
-                    (Err(e), Ok(())) if e.is_cancelled() => JobEvent::Cancelled { id },
-                    (Err(e), Ok(())) => failed(format!("{name}: {}", describe(&e))),
+                if let (Err(e), Ok(())) = (&result, &applied)
+                    && e.is_frame_moved()
+                    && !r.token.is_cancelled()
+                {
+                    // The groups left out were analysed on another canvas:
+                    // mark them all and analyse everything, with no failure
+                    // to report.
+                    let analysed: Vec<String> =
+                        session.mosaic.config.group_dirs.keys().cloned().collect();
+                    return match mark_needs_analyze(&mut session.mosaic, &analysed) {
+                        Ok(()) => {
+                            let m = Box::new(session.mosaic.clone());
+                            self.spawn(id, Planned::Resolve(m, AnalyzeScope::All));
+                            None
+                        }
+                        Err(e) => Some(failed(format!("{name}: {}", describe(&e)))),
+                    };
                 }
+                analysis_event(id, name, result, applied, r.token.is_cancelled())
             }
             (Done::Blend(Ok(rect)), Some(plan)) => match session.mosaic.apply_blend(plan, rect) {
                 Ok(()) => JobEvent::Finished { id, label: name },
@@ -1029,15 +1135,13 @@ impl Drop for JobRunner {
 }
 
 /// Discard a blend that will never be applied (cancelled or failed). Its
-/// tiles carry no settings guarantee: if `group`'s blend settings changed
-/// since `plan` (or it now needs analysis), the store is invalidated so no
-/// tile blended with superseded settings stays valid. Owner (UI) thread;
-/// the error is a message for the user.
+/// tiles were blended with the settings it carried, which a later commit
+/// does not make wrong, so they stay; only if `group` now needs analysis is
+/// the store invalidated. Owner (UI) thread; the error is a message for the
+/// user.
 pub fn discard_blend(session: &OpenSession, plan: &BlendPlan) -> Result<(), String> {
     let config = &session.mosaic.config;
-    if config.settings_for(&plan.group).1 == plan.settings
-        && !config.needs_analyze.contains(&plan.group)
-    {
+    if !config.needs_analyze.contains(&plan.group) {
         return Ok(());
     }
     invalidate_group(&session.mosaic, &plan.group).map_err(|e| {
@@ -1060,6 +1164,31 @@ fn job_label(verb: &str, group: &str, session: &OpenSession) -> String {
     }
 }
 
+/// The event for a finished analysis (not restarted): its outcome as
+/// applied, or the failure. A cancelled job reports `Cancelled` even when
+/// the error it ended with is a moved frame (found before the stop was
+/// noticed), never a failure.
+fn analysis_event(
+    id: u64,
+    name: String,
+    result: mmm_core::Result<()>,
+    applied: mmm_core::Result<()>,
+    cancelled: bool,
+) -> JobEvent {
+    let failed = |e: mmm_core::Error| JobEvent::Failed {
+        id,
+        message: format!("{name}: {}", describe(&e)),
+    };
+    match (result, applied) {
+        (_, Err(e)) => failed(e),
+        (Ok(()), Ok(())) => JobEvent::Finished { id, label: name },
+        (Err(e), Ok(())) if e.is_cancelled() || (e.is_frame_moved() && cancelled) => {
+            JobEvent::Cancelled { id }
+        }
+        (Err(e), Ok(())) => failed(e),
+    }
+}
+
 /// A core error as a message for the user.
 fn describe(e: &mmm_core::Error) -> String {
     if e.is_busy() {
@@ -1073,8 +1202,7 @@ fn describe(e: &mmm_core::Error) -> String {
 pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
-    use mmm_core::mosaic::{MosaicConfig, run_blend, set_blend_settings};
-    use mmm_core::settings::BlendSettings;
+    use mmm_core::mosaic::{MosaicConfig, run_blend};
     use mmm_core::tiles::TileStore;
 
     use super::*;
@@ -1589,24 +1717,80 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn discarded_blend_after_settings_change_is_invalidated() {
+    fn discarded_blend_is_invalidated_only_when_analysis_is_stale() {
         let (root, mut s, _r) = analyzed("job-discard");
         let plan = mmm_core::mosaic::plan_blend(&s.mosaic, "Ha", None).unwrap();
         // Unchanged settings: the partial tiles of an unapplied blend stay.
         run_blend(&plan, &mmm_core::job::JobCtl::none()).unwrap();
         discard_blend(&s, &plan).unwrap();
         assert!(valid0(&plan.result_path) > 0);
-        // A settings edit lands before the blend locks the store...
+        // A committed settings edit does not make them wrong: they stay.
         let new = BlendSettings {
             feather_px: s.mosaic.config.blend.feather_px + 10.0,
             ..s.mosaic.config.blend.clone()
         };
-        set_blend_settings(&mut s.mosaic, new).unwrap();
-        run_blend(&plan, &mmm_core::job::JobCtl::none()).unwrap();
+        mmm_core::mosaic::commit_blend_settings(&mut s.mosaic, new).unwrap();
+        discard_blend(&s, &plan).unwrap();
         assert!(valid0(&plan.result_path) > 0);
-        // ...so discarding the unapplied blend invalidates its tiles.
+        // A group that needs analysis invalidates them.
+        mmm_core::mosaic::mark_needs_analyze(&mut s.mosaic, &["Ha".to_string()]).unwrap();
         discard_blend(&s, &plan).unwrap();
         assert_eq!(valid0(&plan.result_path), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_queued_merge_keeps_the_settings_it_was_queued_with() {
+        let (root, mut s, mut r) = analyzed("job-queued-settings");
+        let old = s.mosaic.config.blend.clone();
+        let gate = r.hold();
+        r.start_previews(&s);
+        let id = r.start_blend(&mut s, "Ha", None);
+        let new = BlendSettings {
+            feather_px: old.feather_px + 10.0,
+            ..old.clone()
+        };
+        mmm_core::mosaic::commit_blend_settings(&mut s.mosaic, new.clone()).unwrap();
+        gate.open();
+        let events = drain(&mut r, &mut s);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id)),
+            "{events:?}"
+        );
+        assert_eq!(
+            mmm_core::mosaic::last_merge_settings(&s.mosaic.config, "Ha"),
+            Some(old)
+        );
+        assert!(mmm_core::mosaic::settings_changed(
+            &s.mosaic.config,
+            "Ha",
+            &new
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stopped_fresh_merge_leaves_the_group_out_of_date() {
+        use mmm_core::session_summary::{ResultState, result_state};
+        let (root, mut s, mut r) = analyzed("job-stopped-fresh");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        let store = s.mosaic.result_path("Ha");
+        assert_eq!(result_state(&store), ResultState::Complete);
+        let new = BlendSettings {
+            feather_px: s.mosaic.config.blend.feather_px + 10.0,
+            ..s.mosaic.config.blend.clone()
+        };
+        mmm_core::mosaic::commit_blend_settings(&mut s.mosaic, new).unwrap();
+        let gate = r.hold();
+        let id = r.start_blend(&mut s, "Ha", None);
+        r.cancel(id);
+        gate.open();
+        let events = drain(&mut r, &mut s);
+        assert_eq!(events, vec![JobEvent::Cancelled { id }]);
+        assert_ne!(result_state(&store), ResultState::Complete);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1741,5 +1925,61 @@ pub(crate) mod tests {
         assert!((1..=4).contains(&sent), "{sent}");
         assert!(t.ready(t0 + Duration::from_millis(100), true));
         assert!(t.ready(t0 + Duration::from_millis(140), false));
+    }
+
+    #[test]
+    fn a_moved_frame_restarts_the_analysis_for_every_group() {
+        use mmm_core::session_summary::{ResultState, result_state};
+        let root = temp_dir("job-frame-moved");
+        let (mut s, extra) = crate::testutil::solved_two_group_session(&root);
+        let mut r = runner();
+        r.start_analyze(&mut s);
+        drain(&mut r, &mut s);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        let frame = s.frame.clone().expect("analysed frame");
+        let oiii = s.mosaic.result_path("OIII");
+        assert_eq!(result_state(&oiii), ResultState::Complete);
+
+        // An edit that claims to touch only Ha, though its panel grows the
+        // canvas: the targeted analysis finds the frame moved.
+        let mut panels = s.mosaic.config.panels.clone();
+        panels.push(PanelEntry {
+            path: extra,
+            fingerprint: None,
+            manual_group: Some("Ha".into()),
+        });
+        let touched = std::collections::BTreeSet::from(["Ha".to_string()]);
+        let grouping = s.mosaic.config.grouping.clone();
+        mmm_core::mosaic::set_inputs_affecting(&mut s.mosaic, panels, grouping, Some(&touched))
+            .unwrap();
+        assert_eq!(result_state(&oiii), ResultState::Complete, "left alone");
+        let id = r.start_analyze_scoped(&mut s, AnalyzeScope::Needed);
+        let events = drain(&mut r, &mut s);
+        assert_eq!(
+            events,
+            vec![JobEvent::Finished {
+                id,
+                label: ANALYZE_LABEL.into()
+            }],
+            "restarted, no failure"
+        );
+        assert!(s.mosaic.config.needs_analyze.is_empty());
+        assert_ne!(s.frame.as_ref(), Some(&frame), "the new canvas");
+        assert_ne!(result_state(&oiii), ResultState::Complete, "re-analysed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cancelled_analysis_that_found_the_frame_moved_reports_cancelled() {
+        let moved = || Err(mmm_core::Error::FrameMoved);
+        assert_eq!(
+            analysis_event(4, "Analyse".into(), moved(), Ok(()), true),
+            JobEvent::Cancelled { id: 4 }
+        );
+        assert!(matches!(
+            analysis_event(4, "Analyse".into(), moved(), Ok(()), false),
+            JobEvent::Failed { id: 4, .. }
+        ));
     }
 }
