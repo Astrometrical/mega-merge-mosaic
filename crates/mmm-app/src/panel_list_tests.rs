@@ -1700,7 +1700,7 @@ fn removing_the_selected_panel_clears_the_selection() {
     assert!(selection(&h).is_empty());
     assert_eq!(h.state().w.plan().selected(), None);
     assert_eq!(h.state().toasts[1].toast.title, "Removed 7 panels");
-    h.get_by_label_contains("No panels yet");
+    h.get_by_label("No panels yet: add files or folders, or drop them anywhere on the window.");
     // Undo puts them back, then the first removal's Undo puts Ha_1 back
     // in its place.
     undo_toast(&mut h, 1);

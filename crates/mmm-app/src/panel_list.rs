@@ -1337,7 +1337,7 @@ impl PanelList {
         if shown.panels.is_empty() {
             ui.label(text(
                 Type::Body,
-                "No panels yet: add files, or drop panel files anywhere on the window.",
+                "No panels yet: add files or folders, or drop them anywhere on the window.",
             ));
         } else if let Some(e) = self.table_ui(ui, &shown, session, report, &mut out) {
             edit = Some(e);
