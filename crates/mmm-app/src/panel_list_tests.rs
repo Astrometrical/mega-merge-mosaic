@@ -1961,6 +1961,45 @@ fn a_legacy_filename_token_session_keeps_its_groups() {
 }
 
 #[test]
+fn a_header_key_in_another_case_is_kept() {
+    let root = temp_dir("list-key-case");
+    let mut session = two_group_session(&root);
+    // A legacy session's lower-case key.
+    let legacy = header("filter");
+    session.mosaic.config.grouping = legacy.clone();
+    session.mosaic.save().unwrap();
+    session.groups = session.mosaic.groups().ok();
+    let mut h = harness(session, vec![], runner());
+    wait(&mut h, State::settled);
+    assert_eq!(group_by_shows(&h), "FILTER header");
+    let edits = on_disk(h.state()).provenance.len();
+    let unchanged = |h: &Harness<'static, State>| {
+        let s = h.state();
+        assert_eq!(s.session.mosaic.config.grouping, legacy);
+        let saved = on_disk(s);
+        assert_eq!(saved.grouping, legacy);
+        assert_eq!(saved.provenance.len(), edits, "no edit");
+    };
+    // The same rule whatever the case: picking Header keyword… changes
+    // nothing (the analysis stays).
+    choose(&mut h, "Header keyword…");
+    wait(&mut h, |s| s.settled() && grouping_chosen(&on_disk(s).ui));
+    assert_eq!(group_by_shows(&h), "Header keyword…");
+    unchanged(&h);
+    // Nor does typing it in capitals, nor FILTER header.
+    type_keyword(&mut h, "Header key", "FILTER");
+    wait(&mut h, State::settled);
+    unchanged(&h);
+    choose(&mut h, "FILTER header");
+    wait(&mut h, State::settled);
+    assert_eq!(group_by_shows(&h), "FILTER header");
+    unchanged(&h);
+    heading(&h, "Ha · 4");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn filters_group_themselves_once() {
     let root = temp_dir("list-auto");
     let mut session = two_group_session(&root);

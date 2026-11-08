@@ -14,9 +14,10 @@
 //!   keyword's field, FILTER at first, committed on Enter or clicking
 //!   away, Esc reverting), or **By hand**. A legacy file-name token rule
 //!   shows as **Path keyword…** with its keyword and keeps resolving as it
-//!   did until the user edits the keyword or picks a choice. Any choice
-//!   notes in the session that the user has chosen
-//!   ([`GROUPING_CHOSEN_KEY`](crate::panel_edits::GROUPING_CHOSEN_KEY)).
+//!   did until the user edits the keyword or picks a choice. A key or
+//!   keyword typed (or picked) in another case only is the same rule:
+//!   nothing changes. Any choice notes in the session that the user has
+//!   chosen ([`GROUPING_CHOSEN_KEY`](crate::panel_edits::GROUPING_CHOSEN_KEY)).
 //! - **Automatic grouping.** Until the user has chosen, panels whose headers
 //!   carry two or more FILTER values while grouping is off are grouped by
 //!   **FILTER header** by themselves, once, in one edit, with a toast whose
@@ -228,6 +229,20 @@ fn kept_ungrouped(config: &MosaicConfig) -> bool {
     };
     config.accepted_checks.contains(&note)
         || (!config.grouping.enabled && config.grouping.rule != GroupRule::default())
+}
+
+/// Whether rules `a` and `b` group alike: equal, or header rules (or path
+/// keyword rules) whose keys differ only in case, which match whatever
+/// their case. Changing one into the other would only throw the analysis
+/// away.
+fn same_rule(a: &GroupRule, b: &GroupRule) -> bool {
+    match (a, b) {
+        (GroupRule::Header { key: x }, GroupRule::Header { key: y })
+        | (GroupRule::PathKeyword { keyword: x }, GroupRule::PathKeyword { keyword: y }) => {
+            x.trim().eq_ignore_ascii_case(y.trim())
+        }
+        _ => a == b,
+    }
 }
 
 /// Whether header keyword `key` is FILTER (keywords match whatever their
@@ -1571,10 +1586,17 @@ impl PanelList {
                 },
                 GroupBy::Manual => GroupRule::Manual,
             };
-            return Some(Grouping {
+            let grouping = Grouping {
                 enabled: c != GroupBy::Off,
                 rule,
-            });
+            };
+            if grouping.enabled == shown.grouping.enabled
+                && same_rule(&grouping.rule, &shown.grouping.rule)
+            {
+                // Nothing changes (a key in another case groups alike).
+                return Some(shown.grouping.clone());
+            }
+            return Some(grouping);
         }
         if !matches!(current, GroupBy::Header | GroupBy::Path) {
             return None;
@@ -1616,7 +1638,13 @@ impl PanelList {
                 return None;
             }
             let typed = typed.trim().to_string();
-            if typed.is_empty() || typed == *current {
+            // Header keys and path keywords match whatever their case; a
+            // legacy file-name token rule becomes a path keyword one.
+            let same = match rule {
+                GroupRule::FilenameToken { .. } => typed == *current,
+                _ => typed.eq_ignore_ascii_case(current.trim()),
+            };
+            if typed.is_empty() || same {
                 return None;
             }
             return Some(match rule {
