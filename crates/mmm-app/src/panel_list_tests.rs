@@ -2001,6 +2001,53 @@ fn a_rule_that_places_nothing_explains_why() {
 }
 
 #[test]
+fn conflicting_path_values_say_so() {
+    let root = temp_dir("list-conflict");
+    let data = root.join("data");
+    let dir = data.join("FILTER_Ha");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The folder says Ha, the names say otherwise.
+    let paths = vec![
+        panel(&dir, "M42_FILTER_OIII_1.xisf", &[("FILTER", "'Ha'")]),
+        panel(&dir, "M42_FILTER_SII_2.xisf", &[("FILTER", "'Ha'")]),
+    ];
+    let mut h = harness(session_of(&root, paths), vec![], runner());
+    wait(&mut h, State::settled);
+    choose(&mut h, "Path keyword…");
+    wait_grouping(
+        &mut h,
+        Grouping {
+            enabled: true,
+            rule: GroupRule::PathKeyword {
+                keyword: "FILTER".into(),
+            },
+        },
+    );
+    assert_eq!(
+        warning(&h, "No group · 2").as_deref(),
+        Some("no single FILTER value in the path")
+    );
+    // A panel with no FILTER in its path too: both reasons.
+    let plain = panel(&root, "M42_3.xisf", &[("FILTER", "'Ha'")]);
+    let reason = |paths: &[&Path]| {
+        no_group_reason(
+            &GroupRule::PathKeyword {
+                keyword: "FILTER".into(),
+            },
+            paths.iter().copied(),
+        )
+    };
+    assert_eq!(reason(&[&plain]), "no FILTER in the path");
+    let conflict = data.join("FILTER_Ha/M42_FILTER_OIII_1.xisf");
+    assert_eq!(
+        reason(&[&conflict, &plain]),
+        "no FILTER in the path, or no single value"
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_folder_without_panels_says_so() {
     let root = temp_dir("list-folder-says");
     // Per-filter subfolders, nothing at the top level.

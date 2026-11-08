@@ -15,7 +15,6 @@ pub fn token_after(file_name: &str, keyword: &str) -> Option<String> {
     tokens.find(|t| t.eq_ignore_ascii_case(keyword))?;
     tokens.find(|t| !t.is_empty()).map(str::to_string)
 }
-
 /// The value after `keyword` in `path` (PixInsight WBPP's path-keyword rule,
 /// hardened). Every folder and the file stem (no extension) are split into
 /// tokens on `_`, `-`, space, `.`, `/` and `\`, dropping empty tokens. The
@@ -23,31 +22,62 @@ pub fn token_after(file_name: &str, keyword: &str) -> Option<String> {
 /// token in its original case. No match, or the keyword as the last token,
 /// gives `None`. The keyword found more than once with values that differ
 /// (case-insensitively) gives `None`; the same value repeated gives the
-/// first occurrence's.
+/// first occurrence's. [`path_keyword`] says why there is none.
 pub fn path_keyword_value(path: &Path, keyword: &str) -> Option<String> {
+    match path_keyword(path, keyword) {
+        PathKeyword::Value(v) => Some(v),
+        PathKeyword::Missing | PathKeyword::Conflicting => None,
+    }
+}
+
+/// What a path says about a keyword ([`path_keyword`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathKeyword {
+    /// The keyword's value (as [`path_keyword_value`] gives it).
+    Value(String),
+    /// The keyword is not in the path, or has no value after it.
+    Missing,
+    /// The keyword is found with values that differ.
+    Conflicting,
+}
+
+/// The value after `keyword` in `path` as [`path_keyword_value`] reads it,
+/// or why there is none: values that differ ([`PathKeyword::Conflicting`])
+/// before a keyword with no value after it ([`PathKeyword::Missing`]).
+pub fn path_keyword(path: &Path, keyword: &str) -> PathKeyword {
     let mut text = String::new();
     if let Some(parent) = path.parent() {
         text.push_str(&parent.to_string_lossy());
         text.push('/');
     }
-    text.push_str(&path.file_stem()?.to_string_lossy());
+    let Some(stem) = path.file_stem() else {
+        return PathKeyword::Missing;
+    };
+    text.push_str(&stem.to_string_lossy());
     let tokens: Vec<&str> = text
         .split(['_', '-', ' ', '.', '/', '\\'])
         .filter(|t| !t.is_empty())
         .collect();
     let mut found: Option<&str> = None;
+    let mut without_value = false;
     for (i, t) in tokens.iter().enumerate() {
         if !t.eq_ignore_ascii_case(keyword) {
             continue;
         }
-        let value = *tokens.get(i + 1)?;
+        let Some(&value) = tokens.get(i + 1) else {
+            without_value = true;
+            continue;
+        };
         match found {
-            Some(f) if !f.eq_ignore_ascii_case(value) => return None,
+            Some(f) if !f.eq_ignore_ascii_case(value) => return PathKeyword::Conflicting,
             Some(_) => {}
             None => found = Some(value),
         }
     }
-    found.map(str::to_string)
+    match found {
+        Some(v) if !without_value => PathKeyword::Value(v.to_string()),
+        _ => PathKeyword::Missing,
+    }
 }
 
 /// The value of header keyword `key` in `panel`. `FILTER` goes through
@@ -274,6 +304,36 @@ mod tests {
     #[test]
     fn path_keyword_without_a_value() {
         assert_eq!(pk("/d/Orion_FILTER.xisf", "FILTER"), None);
+    }
+
+    #[test]
+    fn path_keyword_says_why_it_has_no_value() {
+        let why = |p: &str| path_keyword(Path::new(p), "FILTER");
+        assert_eq!(why("/d/FILTER_Ha/x.xisf"), PathKeyword::Value("Ha".into()));
+        assert_eq!(why("/d/Orion/x.xisf"), PathKeyword::Missing);
+        assert_eq!(why("/d/Orion_FILTER.xisf"), PathKeyword::Missing);
+        assert_eq!(
+            why("/d/FILTER_Ha/FILTER_OIII.xisf"),
+            PathKeyword::Conflicting
+        );
+        // A conflict is a conflict even with a keyword missing its value.
+        assert_eq!(
+            why("/d/FILTER_Ha/FILTER_OIII_FILTER.xisf"),
+            PathKeyword::Conflicting
+        );
+        assert_eq!(why("/d/FILTER_Ha/x_FILTER.xisf"), PathKeyword::Missing);
+        // The value is the one path_keyword_value gives.
+        for p in [
+            "/d/FILTER_Ha/m_FILTER_ha.xisf",
+            "/d/x.xisf",
+            "/d/FILTER_Ha/FILTER_OIII.xisf",
+        ] {
+            let value = match why(p) {
+                PathKeyword::Value(v) => Some(v),
+                _ => None,
+            };
+            assert_eq!(value, pk(p, "FILTER"), "{p}");
+        }
     }
 
     #[test]

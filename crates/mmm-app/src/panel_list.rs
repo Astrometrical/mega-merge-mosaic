@@ -92,7 +92,7 @@ use mega_ui::theme::{Tone, palette};
 use mega_ui::widgets::{ButtonKind, MegaButton, Toast, icon_button_of, submenu, text_input};
 use mmm_core::checks::{CheckCode, CheckKey, Severity, is_accepted};
 use mmm_core::formats::InputPanel;
-use mmm_core::mosaic::grouping::{Groups, header_value, resolve_groups};
+use mmm_core::mosaic::grouping::{Groups, PathKeyword, header_value, path_keyword, resolve_groups};
 use mmm_core::mosaic::{
     Fingerprint, GroupRule, Grouping, MosaicConfig, PanelEntry, UNGROUPED, fingerprint,
 };
@@ -470,14 +470,29 @@ fn scale_text(arcsec: f64) -> String {
     format!("{arcsec:.2}″")
 }
 
-/// Why `rule` placed a panel in no group: the "No group" heading's
-/// warning.
-fn no_group_reason(rule: &GroupRule) -> String {
+/// Why `rule` placed the panels `left_out` in no group: the "No group"
+/// heading's warning. A path keyword found with values that differ reads
+/// "no single {keyword} value in the path" (both reasons when some paths
+/// lack the keyword).
+fn no_group_reason<'p>(rule: &GroupRule, left_out: impl IntoIterator<Item = &'p Path>) -> String {
     match rule {
         GroupRule::Header { key } if key.trim().is_empty() => "no header keyword chosen".into(),
         GroupRule::Header { key } => format!("{} missing", key.trim().to_ascii_uppercase()),
         GroupRule::FilenameToken { keyword } => format!("no {keyword} in the file name"),
-        GroupRule::PathKeyword { keyword } => format!("no {keyword} in the path"),
+        GroupRule::PathKeyword { keyword } => {
+            let (mut missing, mut conflicting) = (false, false);
+            for p in left_out {
+                match path_keyword(p, keyword) {
+                    PathKeyword::Conflicting => conflicting = true,
+                    PathKeyword::Missing | PathKeyword::Value(_) => missing = true,
+                }
+            }
+            match (missing, conflicting) {
+                (false, true) => format!("no single {keyword} value in the path"),
+                (true, true) => format!("no {keyword} in the path, or no single value"),
+                _ => format!("no {keyword} in the path"),
+            }
+        }
         GroupRule::Manual => "not placed by hand".into(),
     }
 }
@@ -1689,16 +1704,19 @@ impl PanelList {
         if !placed.ungrouped.is_empty() {
             // A reason only for panels the rule left out (not those still
             // being read, nor those put there by hand).
-            let by_rule = placed
+            let left_out: Vec<&Path> = placed
                 .ungrouped
                 .iter()
-                .any(|p| !placed.unsorted.contains(p) && !manual.contains(p.as_path()));
+                .filter(|p| !placed.unsorted.contains(*p) && !manual.contains(p.as_path()))
+                .map(PathBuf::as_path)
+                .collect();
             out.push(SectionData {
                 heading: Some(HeadingData {
                     id: UNGROUPED.into(),
                     title: format!("{UNGROUPED} · {}", placed.ungrouped.len()),
                     color: None,
-                    warning: by_rule.then(|| no_group_reason(&shown.grouping.rule)),
+                    warning: (!left_out.is_empty())
+                        .then(|| no_group_reason(&shown.grouping.rule, left_out)),
                     rolls_up: false,
                 }),
                 rows: placed.ungrouped.iter().map(|p| row(p)).collect(),
