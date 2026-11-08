@@ -328,7 +328,7 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
                     "Panels use different filters ({}) but grouping is off.",
                     filters.into_iter().collect::<Vec<_>>().join(", ")
                 ),
-                remedy: Some("Turn grouping on to blend each filter separately.".into()),
+                remedy: Some("Turn grouping on to merge each filter separately.".into()),
             });
         }
     }
@@ -426,7 +426,7 @@ pub fn analysis_checks(group: &str, session: &Session, graph: &OverlapGraph) -> 
                         "{name} has a mean level of {mine:.4}, against {med:.4} for its overlapping neighbours."
                     ),
                     remedy: Some(
-                        "Check for a gradient or a different exposure; the blend will match levels, but large differences can leave residuals.".into(),
+                        "Check for a gradient or a different exposure; the merge will match levels, but large differences can leave residuals.".into(),
                     ),
                 });
             }
@@ -773,6 +773,118 @@ mod tests {
         assert_eq!(sl.len(), 1);
         assert_eq!(sl[0].severity, Severity::Note);
         assert_eq!(sl[0].panels, vec![PathBuf::from("/in/p3.xisf")]);
+    }
+
+    /// Every check the engine makes, of every code: the scenarios of the
+    /// tests above, run together.
+    fn every_check() -> Vec<Check> {
+        let d = tmp("every");
+        let mut checks = Vec::new();
+        // Solution, distortion (missing and present), scale.
+        let solved = vec![
+            solved_fits(&d, "lin.fits", 1.0e-3, false),
+            solved_fits(&d, "sip.fits", 1.0e-3, true),
+            solved_fits(&d, "odd.fits", 1.05e-3, true),
+        ];
+        checks.extend(run(&MosaicConfig::new(solved.clone()), &solved));
+        // Unsolved; mixed channels.
+        let raw = d.join("raw.xisf");
+        write_xisf(&raw, 16, 12, 1, &planes(1)).unwrap();
+        let rgb = d.join("rgb.xisf");
+        write_xisf_solved(&rgb, 16, 12, 3, &planes(3), &wcs(1e-3)).unwrap();
+        let mono = d.join("mono.xisf");
+        write_xisf_solved(&mono, 16, 12, 1, &planes(1), &wcs(1e-3)).unwrap();
+        let mixed = vec![raw, rgb, mono];
+        checks.extend(run(&MosaicConfig::new(mixed.clone()), &mixed));
+        // Filters differ while ungrouped.
+        let filters = vec![filtered(&d, "a.xisf", "Ha"), filtered(&d, "b.xisf", "OIII")];
+        checks.extend(run(&MosaicConfig::new(filters.clone()), &filters));
+        // Group counts differ; a panel no rule places.
+        let mut filters = filters;
+        filters.push(filtered(&d, "c.xisf", "Ha"));
+        let mut cfg = MosaicConfig::new(filters.clone());
+        cfg.grouping.enabled = true;
+        cfg.grouping.rule = crate::mosaic::GroupRule::Header {
+            key: "FILTER".into(),
+        };
+        let header = |p: &Path| {
+            crate::mosaic::grouping::header_value(&InputPanel::open(p).unwrap(), "FILTER")
+        };
+        checks.extend(input_checks(
+            &cfg,
+            &facts_of(&filters),
+            &resolve_groups(&cfg, &header),
+        ));
+        cfg.grouping.rule = crate::mosaic::GroupRule::FilenameToken {
+            keyword: "zzz".into(),
+        };
+        checks.extend(run(&cfg, &filters));
+        // A file missing, a file changed.
+        let (gone, changed) = (d.join("gone.xisf"), d.join("changed.xisf"));
+        for p in [&gone, &changed] {
+            write_xisf(p, 16, 12, 1, &planes(1)).unwrap();
+        }
+        let mut cfg = MosaicConfig::new(vec![gone.clone(), changed.clone()]);
+        for e in &mut cfg.panels {
+            e.fingerprint = Some(fingerprint(&e.path).unwrap());
+        }
+        std::fs::remove_file(&gone).unwrap();
+        write_xisf(&changed, 20, 12, 1, &vec![0.5; 20 * 12]).unwrap();
+        checks.extend(file_checks(&cfg));
+        // No overlap; a sky level apart.
+        let s = session(vec![
+            meta(0, 0.1),
+            meta(1, 0.1),
+            meta(2, 0.1),
+            meta(3, 0.35),
+        ]);
+        let g = OverlapGraph {
+            edges: vec![edge(0, 1), edge(0, 3), edge(1, 3)],
+        };
+        checks.extend(analysis_checks("Ha", &s, &g));
+        checks
+    }
+
+    #[test]
+    fn no_check_says_blend() {
+        let checks = every_check();
+        // Every code is made (a new code must join the scenarios).
+        for code in [
+            CheckCode::SolutionPresent,
+            CheckCode::DistortionModel,
+            CheckCode::ScaleMismatch,
+            CheckCode::MixedChannels,
+            CheckCode::GroupCountMismatch,
+            CheckCode::FiltersDifferUngrouped,
+            CheckCode::Ungrouped,
+            CheckCode::FileChanged,
+            CheckCode::FileMissing,
+            CheckCode::NoOverlap,
+            CheckCode::SkyLevelMismatch,
+        ] {
+            // Exhaustive: a code added to the enum fails to compile here
+            // until it is listed (and made) above.
+            match code {
+                CheckCode::SolutionPresent
+                | CheckCode::DistortionModel
+                | CheckCode::ScaleMismatch
+                | CheckCode::MixedChannels
+                | CheckCode::GroupCountMismatch
+                | CheckCode::FiltersDifferUngrouped
+                | CheckCode::Ungrouped
+                | CheckCode::FileChanged
+                | CheckCode::FileMissing
+                | CheckCode::NoOverlap
+                | CheckCode::SkyLevelMismatch => {}
+            }
+            assert!(!of(&checks, code).is_empty(), "no {code:?} check made");
+        }
+        // The app shows each message and remedy: the product says merge.
+        for c in &checks {
+            for t in std::iter::once(&c.message).chain(&c.remedy) {
+                assert!(!t.to_lowercase().contains("blend"), "{:?}: {t}", c.code);
+            }
+        }
     }
 
     #[test]

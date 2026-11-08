@@ -112,19 +112,19 @@ impl ExportReport {
         let mut parts = Vec::new();
         if self.stale_tiles > 0 {
             parts.push(format!(
-                "{} stale tile(s) (blended with earlier settings or inputs; exported as they are)",
+                "{} stale tile(s) (merged with earlier settings or inputs; exported as they are)",
                 self.stale_tiles
             ));
         }
         if self.missing_tiles > 0 {
             parts.push(format!(
-                "{} missing tile(s) (never blended; exported as zeros)",
+                "{} missing tile(s) (never merged; exported as zeros)",
                 self.missing_tiles
             ));
         }
         (!parts.is_empty()).then(|| {
             format!(
-                "the result is not fully blended: {} — blend the whole mosaic for a complete export",
+                "the result is not fully merged: {} — merge the whole mosaic for a complete export",
                 parts.join(", ")
             )
         })
@@ -137,7 +137,7 @@ fn open_result(result: &Path) -> Result<TileReader> {
     TileReader::open(result).map_err(|e| match e {
         Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
             Error::compute(format!(
-                "{} has not been blended yet — blend it before exporting",
+                "{} has not been merged yet — merge it before exporting",
                 result.display()
             ))
         }
@@ -188,13 +188,13 @@ pub fn export_group(
     let m = Mosaic::open(session)?;
     if !m.config.group_dirs.contains_key(group) {
         return Err(Error::compute(format!(
-            "group '{group}' has not been analysed or blended — nothing to export"
+            "group '{group}' has not been analysed or merged — nothing to export"
         )));
     }
     let result = m.result_path(group);
     if !result.exists() {
         return Err(Error::compute(format!(
-            "group '{group}' has not been blended yet — blend it before exporting"
+            "group '{group}' has not been merged yet — merge it before exporting"
         )));
     }
     let reader = open_result(&result)?;
@@ -204,7 +204,7 @@ pub fn export_group(
     if (g.width, g.height, g.channels as u64) != (cw, ch, cc) {
         return Err(Error::compute(format!(
             "the result of group '{group}' is {}×{}×{} but its analysed canvas is \
-             {cw}×{ch}×{cc} — blend it again before exporting",
+             {cw}×{ch}×{cc} — merge it again before exporting",
             g.width, g.height, g.channels
         )));
     }

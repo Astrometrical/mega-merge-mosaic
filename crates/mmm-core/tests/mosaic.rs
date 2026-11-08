@@ -902,7 +902,8 @@ fn settings_edit_between_plan_and_run_blend_is_caught() {
         // ...and applying the result catches it.
         let err = m.apply_blend(&plan, rect).unwrap_err();
         assert!(
-            err.to_string().contains("changed during the blend"),
+            err.to_string().contains("changed during the merge")
+                && !err.to_string().to_lowercase().contains("blend"),
             "{err}"
         );
         assert_eq!(valid0(&m.result_path("Ha")), 0, "round {round}");

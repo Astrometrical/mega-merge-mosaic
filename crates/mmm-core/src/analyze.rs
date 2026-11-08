@@ -126,7 +126,7 @@ where
                 .collect();
             Err(format!(
                 "input panels must all have the same number of channels, but {} — mono \
-                 and colour panels cannot be mixed in one mosaic; blend each set separately",
+                 and colour panels cannot be mixed in one mosaic; merge each set separately",
                 list.join(", ")
             ))
         }

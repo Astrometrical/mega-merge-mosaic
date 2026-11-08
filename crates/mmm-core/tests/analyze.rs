@@ -312,6 +312,7 @@ fn mixed_mono_and_rgb_inputs_error() {
         assert!(err.contains("mono.xisf"), "{input:?}: {err}");
         assert!(err.contains("rgb.xisf"), "{input:?}: {err}");
         assert!(!err.contains("astrometric"), "{input:?}: {err}");
+        assert!(!err.to_lowercase().contains("blend"), "{input:?}: {err}");
     }
 
     std::fs::remove_dir_all(&dir).unwrap();
