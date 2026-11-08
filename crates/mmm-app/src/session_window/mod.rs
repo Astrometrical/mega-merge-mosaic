@@ -271,18 +271,20 @@ impl SessionWindow {
     /// **Merge**: commit the merge settings draft, merge every group that
     /// needs it ([`steps::groups_to_merge`]: out of date, or its settings
     /// changed) over the whole canvas and show the mosaic, where the merge
-    /// goes; nothing while [`MosaicView::merge_block_reason`] gives a reason.
+    /// goes; nothing, and no switch, while [`MosaicView::merge_block_reason`]
+    /// gives a reason, the draft cannot be committed or nothing needs it.
     pub fn merge(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
         if self.mosaic.merge_block_reason(session, jobs).is_some() {
             return;
         }
         let groups = steps::groups_to_merge(session);
-        self.mosaic.merge_these(session, jobs, groups);
-        self.set_mode(CanvasMode::Mosaic);
+        if self.mosaic.merge_these(session, jobs, groups) {
+            self.set_mode(CanvasMode::Mosaic);
+        }
     }
-
     /// **Merge this group**: commit the draft and merge `group` alone over
-    /// the whole canvas, showing the mosaic. Other merges, running or
+    /// the whole canvas, showing the mosaic (only if a merge was queued).
+    /// Other merges, running or
     /// queued, keep the settings they were queued with.
     pub fn merge_group(&mut self, session: &mut OpenSession, jobs: &mut JobRunner, group: &str) {
         if self
@@ -292,9 +294,12 @@ impl SessionWindow {
         {
             return;
         }
-        self.mosaic
-            .merge_these(session, jobs, vec![group.to_string()]);
-        self.set_mode(CanvasMode::Mosaic);
+        if self
+            .mosaic
+            .merge_these(session, jobs, vec![group.to_string()])
+        {
+            self.set_mode(CanvasMode::Mosaic);
+        }
     }
 
     /// The inspector's fold and open sections (tests; nothing outside the

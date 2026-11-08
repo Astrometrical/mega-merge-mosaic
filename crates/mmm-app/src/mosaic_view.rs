@@ -307,7 +307,7 @@ pub struct MosaicView {
     settings: SettingsPanel,
     /// The tag over the image (why the shown groups are out of date, or
     /// that their settings changed), set by the window each frame.
-    tag: Option<String>,
+    tag: Option<CanvasTag>,
     /// The tag was clicked: the window reveals Merge settings.
     reveal_settings: bool,
 }
@@ -370,7 +370,7 @@ impl MosaicView {
     }
 
     /// Set the tag drawn over the image's top-left corner (`None`: none).
-    pub fn set_tag(&mut self, tag: Option<String>) {
+    pub fn set_tag(&mut self, tag: Option<CanvasTag>) {
         self.tag = tag;
     }
 
@@ -640,14 +640,17 @@ impl MosaicView {
     }
 
     /// Why **Merge this group** cannot be used on `group` now, if it
-    /// cannot: a merge of every group would be blocked, but only for what
-    /// concerns this group.
+    /// cannot: its whole-canvas merge is running or queued already, or
+    /// [`MosaicView::merge_guard`] gives a reason for it.
     pub fn merge_group_block_reason(
         &self,
         session: &OpenSession,
         jobs: &JobRunner,
         group: &str,
     ) -> Option<String> {
+        if jobs.whole_blend_pending(group) {
+            return Some(format!("Merging {group}…"));
+        }
         self.merge_guard(session, jobs, &[group.to_string()])
     }
 
@@ -738,16 +741,17 @@ impl MosaicView {
 
     /// Merge `groups` over the whole canvas with the merge settings draft
     /// (committed first, so the jobs queue with it); nothing while
-    /// [`MosaicView::merge_guard`] gives a reason for them. Groups running
-    /// or queued already keep the settings they were queued with.
+    /// [`MosaicView::merge_guard`] gives a reason for them (a failed commit
+    /// is raised as a problem). Groups running or queued already keep the
+    /// settings they were queued with. Whether anything was queued.
     pub fn merge_these(
         &mut self,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
         groups: Vec<String>,
-    ) {
+    ) -> bool {
         if groups.is_empty() || self.merge_guard(session, jobs, &groups).is_some() {
-            return;
+            return false;
         }
         let draft = load_draft(&session.mosaic.config);
         if draft != session.mosaic.config.blend
@@ -755,9 +759,9 @@ impl MosaicView {
         {
             self.settings
                 .set_problem(format!("Merge settings not saved: {e}"));
-            return;
+            return false;
         }
-        self.merge_groups(session, jobs, groups, None);
+        self.merge_groups(session, jobs, groups, None)
     }
 
     /// Merge the selected ROI for each group of the view (newer work wins
@@ -782,18 +786,19 @@ impl MosaicView {
         jobs: &mut JobRunner,
         groups: Vec<String>,
         rect: Option<[u64; 4]>,
-    ) {
+    ) -> bool {
         // The export check maps result stores a merge may recreate; an
         // analysis edit waiting to apply would cancel the merge anyway.
         if !self.export.idle() || self.settings.has_pending() {
-            return;
+            return false;
         }
+        let any = !groups.is_empty();
         for g in groups {
             let id = jobs.start_blend(session, &g, rect);
             self.merge_jobs.insert(id, g);
         }
+        any
     }
-
     /// Whether the export dialog may open now: the view has groups, no
     /// tracked analysis runs and the dialog is not open already
     /// ([`MosaicView::export_block_reason`] gives none).
@@ -913,10 +918,16 @@ impl MosaicView {
         self.settings.take_analysis_undo()
     }
 
-    /// Why the last analysis edit failed, once
-    /// ([`SettingsPanel::take_problem`]).
+    /// Why the last analysis edit failed, or the merge settings could not
+    /// be committed by a merge, once ([`SettingsPanel::take_problem`]).
     pub fn take_problem(&mut self) -> Option<String> {
         self.settings.take_problem()
+    }
+
+    /// Pretend the feather text is invalid (tests).
+    #[cfg(test)]
+    pub fn force_feather_error(&mut self) {
+        self.settings.force_feather_error();
     }
 
     /// Whether the merge settings draft changed since the last call
@@ -1486,20 +1497,36 @@ impl MosaicView {
     }
 }
 
-/// `tag` over the top-left corner of the image drawn in `rect`, on a panel
-/// so it reads over any image; clicked, true.
-fn tag_overlay(ui: &mut egui::Ui, rect: egui::Rect, tag: &str) -> bool {
+/// The tag over the top-left corner of the image: what it says, and whether
+/// it is a quiet note (the settings changed since the merge) rather than a
+/// warning (out of date).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasTag {
+    /// What it says.
+    pub text: String,
+    /// Drawn quieter: muted text, no panel behind it.
+    pub quiet: bool,
+}
+
+/// `tag` over the top-left corner of the image drawn in `rect`; a warning
+/// is on a panel so it reads over any image. Clicked, true.
+fn tag_overlay(ui: &mut egui::Ui, rect: egui::Rect, tag: &CanvasTag) -> bool {
     let mut over = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink(space::S))
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
+    let (fill, ink) = if tag.quiet {
+        (Color32::TRANSPARENT, palette::TEXT_MUTED)
+    } else {
+        (palette::SURFACE_800, palette::TEXT_BODY)
+    };
     egui::Frame::NONE
-        .fill(palette::SURFACE_800)
+        .fill(fill)
         .corner_radius(radius::SMALL)
         .inner_margin(egui::Margin::same(space::XS as i8))
         .show(&mut over, |ui| {
-            let label = text(Type::Small, tag).color(palette::TEXT_BODY);
+            let label = text(Type::Small, &tag.text).color(ink);
             let r = ui.add(
                 egui::Label::new(label)
                     .selectable(false)

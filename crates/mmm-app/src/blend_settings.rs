@@ -272,8 +272,9 @@ impl SettingsPanel {
         self.analysis_undo.take()
     }
 
-    /// Why the last analysis edit failed, once (for the window's Problem
-    /// toast).
+    /// Why the last analysis edit failed, or a merge could not commit the
+    /// draft ([`SettingsPanel::set_problem`]), once (for the window's
+    /// Problem toast).
     pub fn take_problem(&mut self) -> Option<String> {
         self.problem.take()
     }

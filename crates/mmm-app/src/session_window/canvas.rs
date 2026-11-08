@@ -7,12 +7,21 @@
 //! a mono view ([`SessionWindow::is_mono`]). The stretch
 //! toggles are the session's ([`DisplayStretch`] in `MosaicConfig.ui`):
 //! both canvases follow them.
+//!
+//! **Marks and tags** (spec §11): a group chip (a composite's takes its
+//! members' worst) shows a dot when its mosaic is out of date
+//! ([`out_of_date`]) or its merge settings changed ([`draft_changed`]). Its
+//! context menu offers **Merge this group** (committing the draft and
+//! merging that group only; off while it merges or merging is blocked). In
+//! Mosaic mode a tag over the image's top-left says why a shown group is out
+//! of date ([`out_of_date_reason`]) or, quieter, that its settings changed;
+//! clicking it reveals Merge settings.
 
 use std::path::Path;
 
 use mega_ui::theme::tokens::space;
 use mega_ui::widgets::{ChipMark, ChoiceChip, Segment, choice_chip, segmented_with};
-use mmm_core::mosaic::{last_analyze_settings, last_merge_settings};
+use mmm_core::mosaic::{OutOfDateReason, out_of_date_reason};
 
 use super::shortcuts::{self, keyed, views_hint};
 use super::steps::{draft_changed, out_of_date};
@@ -21,7 +30,7 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, add_composition};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
-use crate::mosaic_view::view_members;
+use crate::mosaic_view::{CanvasTag, view_members};
 use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{PlanFeed, group_members};
@@ -43,22 +52,15 @@ struct BarActions {
     merge_group: Option<String>,
 }
 
-/// Why a mosaic is out of date, for the canvas tag (spec §11): the first
-/// reason that holds for `group`.
+/// Why a mosaic is out of date, for the canvas tag (spec §11), from
+/// [`out_of_date_reason`] (the provenance trail, which outlives
+/// `needs_analyze`: the pipeline re-analyses by itself).
 fn out_of_date_why(session: &OpenSession, group: &str) -> &'static str {
-    let cfg = &session.mosaic.config;
-    if cfg.needs_analyze.contains(group) {
-        let changed =
-            last_analyze_settings(cfg, group).is_some_and(|last| last != cfg.settings_for(group).0);
-        if changed {
-            "Out of date — analysis settings changed"
-        } else {
-            "Out of date — panels changed"
-        }
-    } else if last_merge_settings(cfg, group).is_none() {
-        "Not merged yet"
-    } else {
-        "Out of date — merge didn't finish"
+    match out_of_date_reason(&session.mosaic.config, group) {
+        OutOfDateReason::AnalysisSettings => "Out of date — analysis settings changed",
+        OutOfDateReason::Panels => "Out of date — panels changed",
+        OutOfDateReason::NotMerged => "Not merged yet",
+        OutOfDateReason::MergeUnfinished => "Out of date — merge didn't finish",
     }
 }
 
@@ -76,14 +78,20 @@ fn mark_of(session: &OpenSession, groups: &[String]) -> Option<ChipMark> {
 
 /// The tag over the mosaic of the shown `members`: why the first one out
 /// of date is, else that the settings changed since the merge.
-fn canvas_tag(session: &OpenSession, members: &[String]) -> Option<String> {
+fn canvas_tag(session: &OpenSession, members: &[String]) -> Option<CanvasTag> {
     if let Some(g) = members.iter().find(|g| out_of_date(session, g)) {
-        return Some(out_of_date_why(session, g).to_string());
+        return Some(CanvasTag {
+            text: out_of_date_why(session, g).to_string(),
+            quiet: false,
+        });
     }
     members
         .iter()
         .any(|g| draft_changed(session, g))
-        .then(|| "Settings changed since this merge".to_string())
+        .then(|| CanvasTag {
+            text: "Settings changed since this merge".to_string(),
+            quiet: true,
+        })
 }
 
 impl SessionWindow {
@@ -374,8 +382,14 @@ impl SessionWindow {
                 let same_view = self.plan.view_key().map(str::to_string)
                     == self.mosaic.view_key(&session.mosaic.config.ui);
                 let plan_stretch = self.plan.stretch_for_view().filter(|_| same_view);
-                // A merge running says it all: no tag meanwhile.
-                let tag = if jobs.blending() {
+                // A whole-canvas merge of a shown group running says it
+                // all: no tag meanwhile (other merges leave it).
+                let merging = self
+                    .mosaic
+                    .members()
+                    .iter()
+                    .any(|g| jobs.whole_blend_pending(g));
+                let tag = if merging {
                     None
                 } else {
                     canvas_tag(session, self.mosaic.members())

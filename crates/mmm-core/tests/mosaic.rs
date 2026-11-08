@@ -1456,3 +1456,49 @@ fn a_moved_frame_fails_the_scoped_run() {
     assert!(outcome.completed.is_empty() && outcome.provenance.is_empty());
     assert_eq!(std::fs::read(&frame_path).unwrap(), before);
 }
+
+#[test]
+fn out_of_date_reason_follows_the_trail() {
+    use mmm_core::mosaic::{OutOfDateReason as R, ProvenanceEntry, out_of_date_reason};
+    use mmm_core::settings::{AnalyzeSettings, BlendSettings};
+    use serde_json::json;
+    let mut cfg = MosaicConfig::new(vec![]);
+    let a = AnalyzeSettings::default();
+    let mut other = a.clone();
+    other.gain = match a.gain {
+        mmm_core::photometry::GainMode::Fit => mmm_core::photometry::GainMode::Unity,
+        _ => mmm_core::photometry::GainMode::Fit,
+    };
+    let push = |cfg: &mut MosaicConfig, action: &str, group: Option<&str>, d: serde_json::Value| {
+        cfg.provenance.push(ProvenanceEntry::new(action, group, d));
+    };
+    let analyze = |s: &AnalyzeSettings| json!({ "groups": { "Ha": s } });
+    let blend = json!({ "whole": true, "settings": BlendSettings::default() });
+    // Never merged.
+    assert_eq!(out_of_date_reason(&cfg, "Ha"), R::NotMerged);
+    push(&mut cfg, "analyze", None, analyze(&a));
+    push(&mut cfg, "blend", Some("Ha"), blend.clone());
+    // Merged, nothing since: it did not finish.
+    assert_eq!(out_of_date_reason(&cfg, "Ha"), R::MergeUnfinished);
+    // Panels changed since (all groups, or the listed ones).
+    push(&mut cfg, "inputs", None, json!({ "affected": ["OIII"] }));
+    assert_eq!(out_of_date_reason(&cfg, "Ha"), R::MergeUnfinished);
+    push(&mut cfg, "inputs", None, json!({ "affected": ["Ha"] }));
+    assert_eq!(out_of_date_reason(&cfg, "Ha"), R::Panels);
+    // A re-analysis with the same settings changes nothing; other
+    // settings are the analysis' cause, shown after the panels' reason
+    // only when the panels did not change.
+    let mut c2 = MosaicConfig::new(vec![]);
+    push(&mut c2, "analyze", None, analyze(&a));
+    push(&mut c2, "blend", Some("Ha"), blend);
+    push(&mut c2, "analyze", None, analyze(&a));
+    assert_eq!(out_of_date_reason(&c2, "Ha"), R::MergeUnfinished);
+    push(&mut c2, "analyze", None, analyze(&other));
+    assert_eq!(out_of_date_reason(&c2, "Ha"), R::AnalysisSettings);
+    // Needing analysis wins.
+    c2.needs_analyze.insert("Ha".into());
+    assert_eq!(out_of_date_reason(&c2, "Ha"), R::AnalysisSettings);
+    let mut c3 = MosaicConfig::new(vec![]);
+    c3.needs_analyze.insert("Ha".into());
+    assert_eq!(out_of_date_reason(&c3, "Ha"), R::Panels);
+}

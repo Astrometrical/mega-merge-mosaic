@@ -141,7 +141,7 @@ fn choice_chip_draws_its_mark() {
             let r = choice_chip(
                 ui,
                 &ChoiceChip {
-                    label: ["Plain", "Stale", "Edited"][i],
+                    label: "Same",
                     color: None,
                     selected: false,
                     dashed: false,
@@ -156,15 +156,19 @@ fn choice_chip_draws_its_mark() {
     });
     h.run();
     // The dot takes room, and the state is said in words.
-    assert!(widths.get().iter().all(|w| *w > 0.0));
+    let [plain, stale, edited] = widths.get();
+    assert!(stale > plain && edited > plain, "{plain} {stale} {edited}");
+    let said: Vec<Option<String>> = h
+        .query_all_by_label("Same")
+        .map(|n| n.accesskit_node().description())
+        .collect();
     assert_eq!(
-        h.get_by_label("Stale").accesskit_node().description(),
-        Some("out of date".to_string())
+        said,
+        [
+            None,
+            Some("out of date".to_string()),
+            Some("settings changed".to_string())
+        ]
     );
-    assert_eq!(
-        h.get_by_label("Edited").accesskit_node().description(),
-        Some("settings changed".to_string())
-    );
-    assert_eq!(h.get_by_label("Plain").accesskit_node().description(), None);
     assert_ne!(ChipMark::Attention.color(), ChipMark::Changed.color());
 }

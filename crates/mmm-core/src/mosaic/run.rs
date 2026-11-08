@@ -776,6 +776,77 @@ pub fn last_analyze_settings(cfg: &MosaicConfig, group: &str) -> Option<AnalyzeS
         .find_map(|e| serde_json::from_value(e.detail.get("groups")?.get(group)?.clone()).ok())
 }
 
+/// Why a group's mosaic is out of date, as far as the provenance trail
+/// can tell (see [`out_of_date_reason`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutOfDateReason {
+    /// The group's analysis settings differ from those it was analysed with.
+    AnalysisSettings,
+    /// The panels changed.
+    Panels,
+    /// No whole-canvas merge is recorded.
+    NotMerged,
+    /// Nothing explains it: a merge that did not finish.
+    MergeUnfinished,
+}
+
+/// Why `group`'s mosaic is out of date, first match of: it needs analysis
+/// and its effective analysis settings differ from [`last_analyze_settings`]
+/// ([`OutOfDateReason::AnalysisSettings`]); it needs analysis
+/// ([`OutOfDateReason::Panels`]); no whole merge is recorded
+/// ([`OutOfDateReason::NotMerged`]); an `"inputs"` entry newer than the
+/// group's last whole merge touches it (no `affected` key, or it lists the
+/// group: `Panels`); an `"analyze"` entry listing the group, newer than
+/// that merge, has different settings for it from the newest one before
+/// the merge (`AnalysisSettings`: the pipeline already re-analysed, so
+/// `needs_analyze` is clear); else [`OutOfDateReason::MergeUnfinished`].
+/// Reads only the config, so it says nothing of whether the group *is* out
+/// of date.
+pub fn out_of_date_reason(cfg: &MosaicConfig, group: &str) -> OutOfDateReason {
+    if cfg.needs_analyze.contains(group) {
+        let changed =
+            last_analyze_settings(cfg, group).is_some_and(|last| last != cfg.settings_for(group).0);
+        return if changed {
+            OutOfDateReason::AnalysisSettings
+        } else {
+            OutOfDateReason::Panels
+        };
+    }
+    let Some(merge) = cfg.provenance.iter().rposition(|e| {
+        e.action == "blend"
+            && e.group.as_deref() == Some(group)
+            && e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false)
+    }) else {
+        return OutOfDateReason::NotMerged;
+    };
+    let after = &cfg.provenance[merge + 1..];
+    let touches = |e: &ProvenanceEntry| match e.detail.get("affected").and_then(|a| a.as_array()) {
+        None => true,
+        Some(list) => list.iter().any(|g| g.as_str() == Some(group)),
+    };
+    if after.iter().any(|e| e.action == "inputs" && touches(e)) {
+        return OutOfDateReason::Panels;
+    }
+    let of = |e: &ProvenanceEntry| -> Option<AnalyzeSettings> {
+        serde_json::from_value(e.detail.get("groups")?.get(group)?.clone()).ok()
+    };
+    let before = cfg.provenance[..merge]
+        .iter()
+        .rev()
+        .filter(|e| e.action == "analyze")
+        .find_map(of);
+    let changed = after
+        .iter()
+        .filter(|e| e.action == "analyze")
+        .filter_map(of)
+        .any(|s| before.as_ref().is_some_and(|b| *b != s));
+    if changed {
+        OutOfDateReason::AnalysisSettings
+    } else {
+        OutOfDateReason::MergeUnfinished
+    }
+}
+
 /// Whether `draft` global blend settings, resolved through `group`'s
 /// override, differ from those of the group's last whole-canvas merge.
 /// `false` when the group was never merged.

@@ -690,6 +690,17 @@ impl JobRunner {
                 .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
     }
 
+    /// Whether a whole-canvas blend of `group` is queued or running (an
+    /// ROI's blend does not count).
+    pub fn whole_blend_pending(&self, group: &str) -> bool {
+        self.running.as_ref().is_some_and(|r| {
+            r.blend.as_ref().is_some_and(|p| p.group == group) && self.whole.contains(&r.id)
+        }) || self.queue.iter().any(|q| {
+            matches!(&q.kind, Kind::Blend { group: g, .. } if g == group)
+                && self.whole.contains(&q.id)
+        })
+    }
+
     /// The frame of the last previews run that finished and used every
     /// panel (set when its [`JobEvent::Finished`] is delivered), once.
     pub fn take_previews_frame(&mut self) -> Option<ReferenceFrame> {
