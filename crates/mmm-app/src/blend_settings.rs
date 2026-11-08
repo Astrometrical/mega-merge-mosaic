@@ -49,9 +49,9 @@ use mmm_core::settings::{
 };
 use mmm_core::tiles::TileReader;
 
-use crate::blend_tab::{Poll, Task};
 use crate::jobs::{JobEvent, JobRunner};
 use crate::session::OpenSession;
+use crate::util::{Poll, Task};
 
 /// Wait before retrying an edit refused because a store was busy.
 pub const BUSY_RETRY: Duration = Duration::from_millis(500);

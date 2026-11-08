@@ -29,8 +29,8 @@ use mega_ui::theme::palette;
 pub use mmm_core::export::ExportFormat;
 use mmm_core::export::{ExportReport, export_check};
 
-use crate::blend_tab::{Poll, Task};
 use crate::session::OpenSession;
+use crate::util::{Poll, Task};
 
 /// Asks where to save an export. Called on a background thread.
 pub trait SavePicker: Send + Sync {

@@ -23,9 +23,9 @@ use mmm_core::mosaic::{Mosaic, MosaicConfig, PanelEntry};
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::session::Session;
 
-use crate::blend_tab::{Poll, Task};
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::session::OpenSession;
+use crate::util::{Poll, Task};
 
 /// One run's results.
 #[derive(Clone, Debug, Default, PartialEq)]

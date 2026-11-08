@@ -4,6 +4,7 @@ use mmm_core::mosaic::MosaicConfig;
 
 use super::*;
 use crate::start::tests::temp_dir;
+use crate::util::SAVE_INTERVAL;
 
 #[test]
 fn stretch_persisted_per_group_in_ui() {

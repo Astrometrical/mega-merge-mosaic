@@ -24,8 +24,8 @@ use mmm_core::reference::ReferenceFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::blend_tab::{Poll, Task};
 use crate::tile_source::{MosaicTileSource, fresh_fraction};
+use crate::util::{Poll, Task};
 
 /// Key in `MosaicConfig.ui` of the ROI list.
 pub const ROIS_KEY: &str = "rois";

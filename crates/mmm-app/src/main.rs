@@ -27,6 +27,7 @@ mod synth_mosaic;
 #[cfg(test)]
 mod testutil;
 mod tile_source;
+mod util;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

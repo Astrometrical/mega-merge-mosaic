@@ -52,7 +52,6 @@ use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 use mmm_core::stretch::{ChannelStats, StretchParams, apply, auto_stretch, channel_stats};
 
-use crate::blend_tab::{Debounce, Poll, Task, group_names};
 use crate::checks::ChecksReport;
 use crate::compositions::{
     Composition, ViewKind, composition_editor, composition_stretch_key, load_compositions,
@@ -64,6 +63,7 @@ use crate::status::format_canvas;
 use crate::stretch_panel::{
     PLAN_STRETCH_KEY, StretchChange, StretchState, save_stretch_at, saved_stretch_at, stretch_panel,
 };
+use crate::util::{Debounce, Poll, Task, group_names};
 
 /// Most preview textures uploaded in one frame (as the tiled viewer).
 pub const MAX_UPLOADS_PER_FRAME: usize = 32;

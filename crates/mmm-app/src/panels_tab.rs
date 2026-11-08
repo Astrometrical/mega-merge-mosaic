@@ -43,9 +43,9 @@ use mmm_core::mosaic::grouping::{Groups, header_value, resolve_groups};
 use mmm_core::mosaic::{GroupRule, Grouping, MosaicConfig, PanelEntry, UNGROUPED, set_inputs};
 use serde_json::Value;
 
-use crate::blend_tab::{Poll, Task};
 use crate::jobs::JobRunner;
 use crate::session::{OpenSession, normalize};
+use crate::util::{Poll, Task};
 
 /// File extensions accepted as panels (the dialog filter, drops and
 /// patterns), compared case-insensitively.
