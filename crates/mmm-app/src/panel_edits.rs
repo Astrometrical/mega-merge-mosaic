@@ -13,8 +13,8 @@
 //! edit once the groups it touches are known and the runner is idle; a newer
 //! edit replaces a waiting one (newer work wins). The list shows the waiting
 //! edit as if applied ([`PanelEdits::shown`]). `set_inputs_affecting` saves
-//! `mosaic.json` and invalidates the touched groups' state tables on
-//! exception to "no file I/O on the UI thread".
+//! `mosaic.json` and invalidates the touched groups' state tables on the UI
+//! thread: the documented exception to "no file I/O on the UI thread".
 //!
 //! Group colours ([`group_colors`]) are assigned when groups resolve and
 //! kept in `MosaicConfig.ui` ([`GROUP_COLORS_KEY`]); they are saved with the

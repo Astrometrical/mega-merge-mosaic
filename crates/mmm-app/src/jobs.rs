@@ -1099,7 +1099,6 @@ fn job_label(verb: &str, group: &str, session: &OpenSession) -> String {
     }
 }
 
-/// A core error as a message for the user.
 /// The event for a finished analysis (not restarted): its outcome as
 /// applied, or the failure. A cancelled job reports `Cancelled` even when
 /// the error it ended with is a moved frame (found before the stop was
@@ -1125,6 +1124,7 @@ fn analysis_event(
     }
 }
 
+/// A core error as a message for the user.
 fn describe(e: &mmm_core::Error) -> String {
     if e.is_busy() {
         format!("{e} — the result is in use by another job or program; try again when it ends")
