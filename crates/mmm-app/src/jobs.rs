@@ -51,10 +51,11 @@ use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
     AnalyzeOutcome, AnalyzePlan, BlendPlan, Grouping, Mosaic, PanelEntry, invalidate_group,
-    plan_analyze_with, plan_blend, run_analyze, run_blend,
+    plan_analyze_with, plan_blend_with, run_analyze, run_blend,
 };
 use mmm_core::preview::{Preview, PreviewPlan, PreviewRun, plan_previews, run_previews};
 use mmm_core::reference::ReferenceFrame;
+use mmm_core::settings::BlendSettings;
 
 use crate::session::OpenSession;
 
@@ -132,6 +133,9 @@ enum Kind {
     Blend {
         group: String,
         rect: Option<[u64; 4]>,
+        /// The committed settings when it was queued: the merge runs with
+        /// these, whatever is committed by the time it starts.
+        settings: BlendSettings,
     },
     Export(ExportJob),
 }
@@ -414,6 +418,7 @@ impl JobRunner {
             kind: Kind::Blend {
                 group: group.to_string(),
                 rect,
+                settings: session.mosaic.config.settings_for(group).1,
             },
         });
         self.start_next(session);
@@ -793,9 +798,12 @@ impl JobRunner {
             };
             let planned = match &q.kind {
                 Kind::Analyze => Ok(Planned::Resolve(Box::new(session.mosaic.clone()))),
-                Kind::Blend { group, rect } => {
-                    plan_blend(&session.mosaic, group, *rect).map(Planned::Blend)
-                }
+                Kind::Blend {
+                    group,
+                    rect,
+                    settings,
+                } => plan_blend_with(&session.mosaic, group, *rect, settings.clone())
+                    .map(Planned::Blend),
                 Kind::Previews => Ok(Planned::Previews(plan_previews(&session.mosaic))),
                 Kind::Export(job) => Ok(Planned::Export {
                     dir: session.mosaic.dir.clone(),
@@ -1029,15 +1037,13 @@ impl Drop for JobRunner {
 }
 
 /// Discard a blend that will never be applied (cancelled or failed). Its
-/// tiles carry no settings guarantee: if `group`'s blend settings changed
-/// since `plan` (or it now needs analysis), the store is invalidated so no
-/// tile blended with superseded settings stays valid. Owner (UI) thread;
-/// the error is a message for the user.
+/// tiles were blended with the settings it carried, which a later commit
+/// does not make wrong, so they stay; only if `group` now needs analysis is
+/// the store invalidated. Owner (UI) thread; the error is a message for the
+/// user.
 pub fn discard_blend(session: &OpenSession, plan: &BlendPlan) -> Result<(), String> {
     let config = &session.mosaic.config;
-    if config.settings_for(&plan.group).1 == plan.settings
-        && !config.needs_analyze.contains(&plan.group)
-    {
+    if !config.needs_analyze.contains(&plan.group) {
         return Ok(());
     }
     invalidate_group(&session.mosaic, &plan.group).map_err(|e| {
@@ -1073,8 +1079,7 @@ fn describe(e: &mmm_core::Error) -> String {
 pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
-    use mmm_core::mosaic::{MosaicConfig, run_blend, set_blend_settings};
-    use mmm_core::settings::BlendSettings;
+    use mmm_core::mosaic::{MosaicConfig, run_blend};
     use mmm_core::tiles::TileStore;
 
     use super::*;
@@ -1589,24 +1594,80 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn discarded_blend_after_settings_change_is_invalidated() {
+    fn discarded_blend_is_invalidated_only_when_analysis_is_stale() {
         let (root, mut s, _r) = analyzed("job-discard");
         let plan = mmm_core::mosaic::plan_blend(&s.mosaic, "Ha", None).unwrap();
         // Unchanged settings: the partial tiles of an unapplied blend stay.
         run_blend(&plan, &mmm_core::job::JobCtl::none()).unwrap();
         discard_blend(&s, &plan).unwrap();
         assert!(valid0(&plan.result_path) > 0);
-        // A settings edit lands before the blend locks the store...
+        // A committed settings edit does not make them wrong: they stay.
         let new = BlendSettings {
             feather_px: s.mosaic.config.blend.feather_px + 10.0,
             ..s.mosaic.config.blend.clone()
         };
-        set_blend_settings(&mut s.mosaic, new).unwrap();
-        run_blend(&plan, &mmm_core::job::JobCtl::none()).unwrap();
+        mmm_core::mosaic::commit_blend_settings(&mut s.mosaic, new).unwrap();
+        discard_blend(&s, &plan).unwrap();
         assert!(valid0(&plan.result_path) > 0);
-        // ...so discarding the unapplied blend invalidates its tiles.
+        // A group that needs analysis invalidates them.
+        mmm_core::mosaic::mark_needs_analyze(&mut s.mosaic, &["Ha".to_string()]).unwrap();
         discard_blend(&s, &plan).unwrap();
         assert_eq!(valid0(&plan.result_path), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_queued_merge_keeps_the_settings_it_was_queued_with() {
+        let (root, mut s, mut r) = analyzed("job-queued-settings");
+        let old = s.mosaic.config.blend.clone();
+        let gate = r.hold();
+        r.start_previews(&s);
+        let id = r.start_blend(&mut s, "Ha", None);
+        let new = BlendSettings {
+            feather_px: old.feather_px + 10.0,
+            ..old.clone()
+        };
+        mmm_core::mosaic::commit_blend_settings(&mut s.mosaic, new.clone()).unwrap();
+        gate.open();
+        let events = drain(&mut r, &mut s);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id)),
+            "{events:?}"
+        );
+        assert_eq!(
+            mmm_core::mosaic::last_merge_settings(&s.mosaic.config, "Ha"),
+            Some(old)
+        );
+        assert!(mmm_core::mosaic::settings_changed(
+            &s.mosaic.config,
+            "Ha",
+            &new
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stopped_fresh_merge_leaves_the_group_out_of_date() {
+        use mmm_core::session_summary::{ResultState, result_state};
+        let (root, mut s, mut r) = analyzed("job-stopped-fresh");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        let store = s.mosaic.result_path("Ha");
+        assert_eq!(result_state(&store), ResultState::Complete);
+        let new = BlendSettings {
+            feather_px: s.mosaic.config.blend.feather_px + 10.0,
+            ..s.mosaic.config.blend.clone()
+        };
+        mmm_core::mosaic::commit_blend_settings(&mut s.mosaic, new).unwrap();
+        let gate = r.hold();
+        let id = r.start_blend(&mut s, "Ha", None);
+        r.cancel(id);
+        gate.open();
+        let events = drain(&mut r, &mut s);
+        assert_eq!(events, vec![JobEvent::Cancelled { id }]);
+        assert_ne!(result_state(&store), ResultState::Complete);
         let _ = std::fs::remove_dir_all(&root);
     }
 

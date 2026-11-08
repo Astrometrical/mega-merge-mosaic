@@ -153,23 +153,22 @@ impl Mosaic {
     /// aligned rect it returned): append a `"blend"` provenance entry
     /// (group, rect, settings) and save.
     ///
-    /// If the group's effective blend settings no longer equal the plan's,
-    /// or the group was marked [`MosaicConfig::needs_analyze`] since (a
+    /// The provenance records `plan.settings` (the settings the run used),
+    /// whatever the committed settings are now: a later edit leaves the
+    /// result out of date ([`settings_changed`]) but not wrong.
+    ///
+    /// If the group was marked [`MosaicConfig::needs_analyze`] since (a
     /// `set_*` landed between [`plan_blend`] and the run taking the store's
     /// writer lock), the tiles just written are stale: the group's store is
-    /// invalidated, nothing is recorded, and an [`Error::Compute`] saying
-    /// the settings changed during the blend is returned ([`Error::Busy`]
-    /// if another writer holds the store).
+    /// invalidated, nothing is recorded, and an [`Error::Compute`] is
+    /// returned ([`Error::Busy`] if another writer holds the store).
     pub fn apply_blend(&mut self, plan: &BlendPlan, rect: [u64; 4]) -> Result<()> {
         let group = &plan.group;
-        if self.config.settings_for(group).1 != plan.settings
-            || self.config.needs_analyze.contains(group)
-        {
+        if self.config.needs_analyze.contains(group) {
             let mut stores = lock_stores(std::slice::from_ref(&plan.result_path))?;
             invalidate(&mut stores)?;
             return Err(Error::compute(format!(
-                "settings for group '{group}' changed during the merge — its tiles were \
-                 invalidated; merge again"
+                "analyze settings for group '{group}' changed during the merge — its tiles                  were invalidated; analyze, then merge again"
             )));
         }
         let mut next = self.config.clone();
@@ -378,10 +377,14 @@ pub struct BlendPlan {
     pub session_dir: PathBuf,
     /// The group's tiled result store.
     pub result_path: PathBuf,
-    /// The group's effective blend settings.
+    /// The blend settings the run uses (recorded in the provenance).
     pub settings: BlendSettings,
     /// Level-0 canvas rect to blend; `None` = the whole canvas.
     pub rect: Option<[u64; 4]>,
+    /// A whole-canvas merge whose settings differ from the group's last
+    /// whole-canvas merge: [`run_blend`] invalidates the whole store before
+    /// writing, so a stopped run leaves nothing that looks current.
+    pub fresh: bool,
 }
 
 /// Plan a blend of `rect` (level-0 canvas coordinates; `None` = the whole
@@ -391,6 +394,19 @@ pub struct BlendPlan {
 /// (no recorded directory) or whose analysis is out of date
 /// ([`MosaicConfig::needs_analyze`]): run [`analyze_all`] first.
 pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<BlendPlan> {
+    plan_blend_with(m, group, rect, m.config.settings_for(group).1)
+}
+
+/// [`plan_blend`] with explicit `settings` (those a queued merge was
+/// queued with) instead of the group's committed ones. The plan is
+/// [`BlendPlan::fresh`] when it is a whole-canvas merge and `settings`
+/// differ from [`last_merge_settings`].
+pub fn plan_blend_with(
+    m: &Mosaic,
+    group: &str,
+    rect: Option<[u64; 4]>,
+    settings: BlendSettings,
+) -> Result<BlendPlan> {
     if !m.config.group_dirs.contains_key(group) {
         return Err(Error::compute(format!(
             "group '{group}' has not been analyzed yet — analyze first"
@@ -405,7 +421,8 @@ pub fn plan_blend(m: &Mosaic, group: &str, rect: Option<[u64; 4]>) -> Result<Ble
         group: group.to_string(),
         session_dir: m.group_session_dir(group),
         result_path: m.result_path(group),
-        settings: m.config.settings_for(group).1,
+        fresh: rect.is_none() && last_merge_settings(&m.config, group).as_ref() != Some(&settings),
+        settings,
         rect,
     })
 }
@@ -454,6 +471,10 @@ pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
         Some(s) => s,
         None => TileStore::create(path, geometry)?,
     };
+    if plan.fresh {
+        store.invalidate_all();
+        store.flush_state()?;
+    }
     let blended = blend_tiles(
         &session,
         &phot,
@@ -675,15 +696,16 @@ pub fn commit_blend_settings(m: &mut Mosaic, blend: BlendSettings) -> Result<()>
 }
 
 /// The blend settings of `group`'s newest whole-canvas merge, from the
-/// provenance trail (`None` if never merged). Region merges (`whole` false)
+/// provenance trail (`None` if never merged, or if that entry's settings do
+/// not parse: an older entry never answers for it). Region merges (`whole` false)
 /// are skipped; entries without a `whole` key predate it and count as whole.
 pub fn last_merge_settings(cfg: &MosaicConfig, group: &str) -> Option<BlendSettings> {
     cfg.provenance
         .iter()
         .rev()
         .filter(|e| e.action == "blend" && e.group.as_deref() == Some(group))
-        .filter(|e| e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false))
-        .find_map(|e| serde_json::from_value(e.detail.get("settings")?.clone()).ok())
+        .find(|e| e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false))
+        .and_then(|e| serde_json::from_value(e.detail.get("settings")?.clone()).ok())
 }
 
 /// The analyze settings `group` was last analyzed with, from the newest

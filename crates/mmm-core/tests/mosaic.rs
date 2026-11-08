@@ -12,8 +12,8 @@ use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
     analyze_all, blend_group, commit_blend_settings, invalidate_group, last_analyze_settings,
     last_merge_settings, mark_needs_analyze, plan_analyze, plan_analyze_with, plan_blend,
-    run_analyze, run_blend, set_analyze_settings, set_blend_settings, set_group_override,
-    set_inputs, set_settings, settings_changed,
+    plan_blend_with, run_analyze, run_blend, set_analyze_settings, set_blend_settings,
+    set_group_override, set_inputs, set_settings, settings_changed,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -878,42 +878,92 @@ fn settings_edit_during_analyze_keeps_group_marked() {
 }
 
 #[test]
-fn settings_edit_between_plan_and_run_blend_is_caught() {
+fn a_blend_records_the_settings_it_ran_with() {
     let tmp = TempDir::new("raceblend");
     let mut m = two_group_mosaic(&tmp.0);
     analyze_all(&mut m, &JobCtl::none()).unwrap();
-    // First with no store yet, then with an existing, fully valid one.
-    for round in 0..2 {
-        if round == 1 {
-            blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
-            assert_fully_valid(&m.result_path("Ha"));
-        }
-        let provenance = m.config.provenance.len();
-        let plan = plan_blend(&m, "Ha", None).unwrap();
-        let new = BlendSettings {
-            feather_px: m.config.blend.feather_px + 10.0,
-            ..m.config.blend.clone()
-        };
-        assert_eq!(
-            set_blend_settings(&mut m, new).unwrap(),
-            ChangeImpact::Reblend
-        );
-        // The worker blends with the superseded settings...
-        let rect = run_blend(&plan, &JobCtl::none()).unwrap();
-        // ...and applying the result catches it.
-        let err = m.apply_blend(&plan, rect).unwrap_err();
-        assert!(
-            err.to_string().contains("changed during the merge")
-                && !err.to_string().to_lowercase().contains("blend"),
-            "{err}"
-        );
-        assert_eq!(valid0(&m.result_path("Ha")), 0, "round {round}");
-        assert_eq!(m.config.provenance.len(), provenance);
-        assert_eq!(
-            MosaicConfig::load(&m.dir).unwrap().provenance.len(),
-            provenance
-        );
-    }
+    let plan = plan_blend(&m, "Ha", None).unwrap();
+    let new = with_feather(&m.config.blend, 10.0);
+    assert_eq!(
+        set_blend_settings(&mut m, new.clone()).unwrap(),
+        ChangeImpact::Reblend
+    );
+    // The worker blends with the superseded settings; applying is fine.
+    let rect = run_blend(&plan, &JobCtl::none()).unwrap();
+    m.apply_blend(&plan, rect).unwrap();
+    assert_eq!(
+        last_merge_settings(&m.config, "Ha"),
+        Some(plan.settings.clone())
+    );
+    assert!(settings_changed(&m.config, "Ha", &new));
+}
+
+#[test]
+fn a_fresh_plan_invalidates_before_writing() {
+    let tmp = TempDir::new("freshplan");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_fully_valid(&m.result_path("Ha"));
+    let new = with_feather(&m.config.blend, 10.0);
+    commit_blend_settings(&mut m, new).unwrap();
+    let plan = plan_blend(&m, "Ha", None).unwrap();
+    assert!(plan.fresh);
+    let token = CancelToken::new();
+    token.cancel();
+    let err = run_blend(&plan, &JobCtl::new(token, None)).unwrap_err();
+    assert!(err.is_cancelled(), "{err}");
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+}
+
+#[test]
+fn a_same_settings_plan_is_not_fresh() {
+    let tmp = TempDir::new("notfresh");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    // Never merged: nothing to differ from, but nothing valid to protect
+    // either; a region merge is never fresh.
+    assert!(plan_blend(&m, "Ha", None).unwrap().fresh);
+    assert!(!plan_blend(&m, "Ha", Some([0, 0, 100, 100])).unwrap().fresh);
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert!(!plan_blend(&m, "Ha", None).unwrap().fresh);
+    let other = with_feather(&m.config.blend, 3.0);
+    let plan = plan_blend_with(&m, "Ha", None, other).unwrap();
+    assert!(plan.fresh);
+    assert!(
+        !plan_blend_with(&m, "Ha", Some([0, 0, 100, 100]), plan.settings.clone())
+            .unwrap()
+            .fresh
+    );
+}
+
+#[test]
+fn needs_analyze_still_refuses_the_apply() {
+    let tmp = TempDir::new("needsapply");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let plan = plan_blend(&m, "Ha", None).unwrap();
+    let rect = run_blend(&plan, &JobCtl::none()).unwrap();
+    mark_needs_analyze(&mut m, &["Ha".to_string()]).unwrap();
+    let provenance = m.config.provenance.len();
+    assert!(m.apply_blend(&plan, rect).is_err());
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert_eq!(m.config.provenance.len(), provenance);
+}
+
+#[test]
+fn an_unparseable_newest_entry_gives_none() {
+    let tmp = TempDir::new("unparseable");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert!(last_merge_settings(&m.config, "Ha").is_some());
+    m.config.push_provenance(
+        "blend",
+        Some("Ha"),
+        serde_json::json!({"group": "Ha", "settings": "garbage", "whole": true}),
+    );
+    assert_eq!(last_merge_settings(&m.config, "Ha"), None);
 }
 
 #[test]

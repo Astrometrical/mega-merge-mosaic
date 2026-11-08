@@ -48,9 +48,9 @@ pub use lock::{
 pub use run::{
     AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, BlendPlan, Mosaic, analyze_all, blend_group,
     commit_blend_settings, invalidate_group, last_analyze_settings, last_merge_settings,
-    mark_needs_analyze, plan_analyze, plan_analyze_with, plan_blend, result_store_paths,
-    run_analyze, run_blend, set_analyze_settings, set_blend_settings, set_group_override,
-    set_inputs, set_settings, settings_changed,
+    mark_needs_analyze, plan_analyze, plan_analyze_with, plan_blend, plan_blend_with,
+    result_store_paths, run_analyze, run_blend, set_analyze_settings, set_blend_settings,
+    set_group_override, set_inputs, set_settings, settings_changed,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
