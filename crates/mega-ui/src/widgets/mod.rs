@@ -20,7 +20,7 @@ pub use property::{property_grid, property_row, property_row_numeric, property_r
 pub use segmented::{Segment, segmented, segmented_with};
 pub use session_card::{CARD_HEIGHT, CARD_THUMB_HEIGHT, CARD_WIDTH, SessionCardData, session_card};
 pub use status_line::{overline, status};
-pub use step_strip::{StepState, StripEvent, StripStep, step_strip};
+pub use step_strip::{StepState, StripEvent, StripStep, step_strip, step_strip_width};
 pub use text_input::text_input;
 pub use toast::{MAX_TOASTS, TOAST_LIFETIME_S, Toast, ToastEvent, ToastId, Toasts};
 

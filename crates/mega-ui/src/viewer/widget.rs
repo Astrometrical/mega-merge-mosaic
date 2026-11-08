@@ -348,13 +348,16 @@ impl TiledViewer {
     }
 
     /// Start at `centre` and `zoom` in a viewport of `screen` size instead
-    /// of the home fit: the first [`TiledViewer::show`] draws this camera.
-    /// Home still fits the whole image.
+    /// of the home fit: the next [`TiledViewer::show`] draws this camera.
+    /// View commands queued before it ([`TiledViewer::home`], the zooms,
+    /// [`TiledViewer::zoom_to_rect`]) are dropped, so nothing moves the
+    /// view away from it. Home still fits the whole image.
     pub fn set_camera(&mut self, screen: Vec2, centre: (f64, f64), zoom: f64) {
         self.view.fit(&self.geom, screen, 0.0);
         self.view.finish_animation();
         self.view.set_view(centre, zoom, 0.0);
         self.needs_home = false;
+        self.commands.clear();
     }
 
     /// The tile opacity set with [`TiledViewer::set_opacity`].

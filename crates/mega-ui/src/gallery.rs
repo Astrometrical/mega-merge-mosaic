@@ -352,6 +352,7 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                 label: label.to_owned(),
                 state,
                 cancellable: false,
+                tooltip: None,
             };
             step_strip(
                 ui,

@@ -15,6 +15,7 @@ fn step(label: &str, state: StepState, cancellable: bool) -> StripStep {
         label: label.to_owned(),
         state,
         cancellable,
+        tooltip: None,
     }
 }
 
@@ -162,4 +163,108 @@ fn working_label_is_legible_on_fill_and_pill() {
         let c = crate::theme::contrast_ratio(TEXT_STRONG, bg);
         assert!(c >= 4.5, "{c:.2}:1 on {bg:?}");
     }
+}
+
+/// Long steps as a busy session shows them.
+fn busy() -> Vec<StripStep> {
+    let working = |l: &str| {
+        step(
+            l,
+            StepState::Working {
+                fraction: Some(0.5),
+            },
+            true,
+        )
+    };
+    vec![
+        working("Reading previews 21 / 36"),
+        working("Analysing…"),
+        working("Merging OIII · 2 of 3 · 43 %"),
+        working("Exporting 4 of 5"),
+    ]
+}
+
+#[test]
+fn a_narrow_strip_wraps_without_overlap() {
+    let width = 320.0;
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(width, 200.0))
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                if let Some(e) = step_strip(ui, &s.steps) {
+                    s.event = Some(e);
+                }
+            },
+            State {
+                steps: busy(),
+                event: None,
+            },
+        );
+    h.run();
+    let rects: Vec<(String, egui::Rect)> = busy()
+        .iter()
+        .map(|s| (s.label.clone(), h.get_by_label(&s.label).rect()))
+        .collect();
+    for (l, r) in &rects {
+        assert!(
+            r.min.x >= -0.5 && r.max.x <= width + 0.5,
+            "{l} at {r:?} is outside the strip's {width} pt"
+        );
+    }
+    for (i, (a, ra)) in rects.iter().enumerate() {
+        for (b, rb) in &rects[i + 1..] {
+            assert!(
+                !ra.shrink(0.5).intersects(rb.shrink(0.5)),
+                "{a} {ra:?} overlaps {b} {rb:?}"
+            );
+        }
+    }
+    let rows = rects
+        .iter()
+        .map(|(_, r)| r.center().y.round() as i32)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(rows.len() > 1, "one row: {rects:?}");
+}
+
+#[test]
+fn width_is_what_one_row_takes() {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(1200.0, 120.0))
+        .build_ui_state(
+            |ui, s: &mut (Vec<StripStep>, f32)| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                s.1 = step_strip_width(ui, &s.0);
+                step_strip(ui, &s.0);
+            },
+            (busy(), 0.0),
+        );
+    h.run();
+    let first = h.get_by_label("Reading previews 21 / 36").rect();
+    let last = h.get_by_label("Exporting 4 of 5").rect();
+    assert!((first.center().y - last.center().y).abs() < 0.5, "one row");
+    let drawn = last.max.x - first.min.x;
+    assert!(
+        (h.state().1 - drawn).abs() < 0.5,
+        "measured {} for {drawn} drawn",
+        h.state().1
+    );
+}
+
+#[test]
+fn a_step_shows_its_tooltip() {
+    let mut steps = four();
+    steps[3].tooltip = Some("Nothing to export yet".into());
+    let mut h = harness(steps);
+    h.run();
+    assert!(h.query_by_label("Nothing to export yet").is_none());
+    h.get_by_label("Export").hover();
+    for _ in 0..80 {
+        h.step();
+    }
+    h.get_by_label("Nothing to export yet");
 }

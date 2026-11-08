@@ -81,6 +81,7 @@ fn step(label: impl Into<String>, state: StepState) -> StripStep {
         label: label.into(),
         state,
         cancellable: false,
+        tooltip: None,
     }
 }
 
@@ -89,6 +90,7 @@ fn working(label: String, fraction: Option<f32>) -> StripStep {
         label,
         state: StepState::Working { fraction },
         cancellable: true,
+        tooltip: None,
     }
 }
 

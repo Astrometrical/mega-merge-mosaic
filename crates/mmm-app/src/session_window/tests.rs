@@ -974,6 +974,7 @@ fn strip(label: &str, state: StepState) -> StripStep {
         label: label.into(),
         state,
         cancellable: false,
+        tooltip: None,
     }
 }
 
@@ -1081,6 +1082,7 @@ fn steps_follow_the_session() {
             fraction: Some(0.0),
         },
         cancellable: true,
+        tooltip: None,
     };
     assert_eq!(
         steps(&s, &jobs, &pipeline, &checks),
@@ -1105,6 +1107,7 @@ fn steps_follow_the_session() {
         label: "Analysing…".into(),
         state: Working { fraction: None },
         cancellable: true,
+        tooltip: None,
     };
     assert_eq!(
         steps(&s, &jobs, &pipeline, &checks),

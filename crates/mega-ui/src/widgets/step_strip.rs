@@ -42,6 +42,8 @@ pub struct StripStep {
     /// Whether a working step can be cancelled (shows a cancel button while
     /// hovered or focused).
     pub cancellable: bool,
+    /// Shown on hover: why a click does nothing now, say.
+    pub tooltip: Option<String>,
 }
 
 /// What the user did in the strip.
@@ -65,14 +67,17 @@ const CANCEL: f32 = HEIGHT - 6.0;
 /// Draw the strip of `steps` left to right and report a click on a step
 /// ([`StripEvent::Open`]) or on a working step's cancel button
 /// ([`StripEvent::Cancel`]). In a row taller than a pill (beside buttons)
-/// the pills are centred on it.
+/// the pills are centred on it. When they do not fit the width available
+/// ([`step_strip_width`]) they wrap onto as many rows as they need.
 pub fn step_strip(ui: &mut Ui, steps: &[StripStep]) -> Option<StripEvent> {
     let mut event = None;
     // A row as high as a pill: `horizontal`'s is the (lower) interact
     // height, which a centring parent centres, so the pills hung below.
     let row = Vec2::new(ui.available_size_before_wrap().x, HEIGHT);
-    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = space::XS;
+    let wrap = step_strip_width(ui, steps) > row.x;
+    let layout = Layout::left_to_right(Align::Center).with_main_wrap(wrap);
+    ui.allocate_ui_with_layout(row, layout, |ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(space::XS);
         for (i, step) in steps.iter().enumerate() {
             if let Some(e) = pill(ui, i, step) {
                 event = Some(e);
@@ -82,39 +87,74 @@ pub fn step_strip(ui: &mut Ui, steps: &[StripStep]) -> Option<StripEvent> {
     event
 }
 
+/// The width [`step_strip`] takes to show `steps` on one row in `ui`.
+pub fn step_strip_width(ui: &Ui, steps: &[StripStep]) -> f32 {
+    let gaps = steps.len().saturating_sub(1) as f32 * space::XS;
+    steps.iter().map(|s| Pill::of(ui, s).width).sum::<f32>() + gaps
+}
+
+/// A pill's look and size, before it is drawn.
+struct Pill {
+    text_color: Color32,
+    outline: Color32,
+    galley: std::sync::Arc<egui::Galley>,
+    icon: Option<std::sync::Arc<egui::Galley>>,
+    cancellable: bool,
+    width: f32,
+}
+
+impl Pill {
+    fn of(ui: &Ui, step: &StripStep) -> Self {
+        let (text_color, outline, icon): (Color32, Color32, Option<(char, Color32)>) =
+            match step.state {
+                StepState::Todo => (TEXT_MUTED, BORDER, None),
+                StepState::Next => (TEXT_STRONG, ACCENT_500, None),
+                StepState::Done => (
+                    Tone::Success.color(),
+                    Tone::Success.accent(),
+                    Some((icons::CHECK, Tone::Success.color())),
+                ),
+                StepState::Warn => (
+                    Tone::Warning.color(),
+                    Tone::Warning.accent(),
+                    Some((icons::TRIANGLE_ALERT, Tone::Warning.color())),
+                ),
+                StepState::Working { .. } => (TEXT_STRONG, Tone::Info.accent(), None),
+            };
+        let cancellable = step.cancellable && matches!(step.state, StepState::Working { .. });
+        let font = TextStyle::Button.resolve(ui.style());
+        let galley = ui
+            .painter()
+            .layout_no_wrap(step.label.clone(), font.clone(), text_color);
+        let icon = icon.map(|(g, c)| {
+            ui.painter()
+                .layout_no_wrap(g.to_string(), icons::font(font.size + 1.0), c)
+        });
+        let icon_w = icon.as_ref().map_or(0.0, |g| g.size().x + space::XS);
+        // Reserved even while the button is hidden, so the pill never resizes.
+        let cancel_w = if cancellable { CANCEL + space::XS } else { 0.0 };
+        let width = galley.size().x + icon_w + cancel_w + 2.0 * PAD;
+        Pill {
+            text_color,
+            outline,
+            galley,
+            icon,
+            cancellable,
+            width,
+        }
+    }
+}
+
 fn pill(ui: &mut Ui, index: usize, step: &StripStep) -> Option<StripEvent> {
-    let (text_color, outline, icon): (Color32, Color32, Option<(char, Color32)>) = match step.state
-    {
-        StepState::Todo => (TEXT_MUTED, BORDER, None),
-        StepState::Next => (TEXT_STRONG, ACCENT_500, None),
-        StepState::Done => (
-            Tone::Success.color(),
-            Tone::Success.accent(),
-            Some((icons::CHECK, Tone::Success.color())),
-        ),
-        StepState::Warn => (
-            Tone::Warning.color(),
-            Tone::Warning.accent(),
-            Some((icons::TRIANGLE_ALERT, Tone::Warning.color())),
-        ),
-        StepState::Working { .. } => (TEXT_STRONG, Tone::Info.accent(), None),
-    };
-    let cancellable = step.cancellable && matches!(step.state, StepState::Working { .. });
-
-    let font = TextStyle::Button.resolve(ui.style());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(step.label.clone(), font.clone(), text_color);
-    let icon_galley = icon.map(|(g, c)| {
-        ui.painter()
-            .layout_no_wrap(g.to_string(), icons::font(font.size + 1.0), c)
-    });
-    let icon_w = icon_galley.as_ref().map_or(0.0, |g| g.size().x + space::XS);
-    // Reserved even while the button is hidden, so the pill never resizes.
-    let cancel_w = if cancellable { CANCEL + space::XS } else { 0.0 };
-    let width = galley.size().x + icon_w + cancel_w + 2.0 * PAD;
-
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, HEIGHT), Sense::click());
+    let Pill {
+        text_color,
+        outline,
+        galley,
+        icon: icon_galley,
+        cancellable,
+        width,
+    } = Pill::of(ui, step);
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(width, HEIGHT), Sense::click());
     let corner = (HEIGHT / 2.0) as u8;
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
@@ -154,6 +194,9 @@ fn pill(ui: &mut Ui, index: usize, step: &StripStep) -> Option<StripEvent> {
     focus_ring(ui, &response, corner);
     let label = step.label.clone();
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
+    if let Some(tip) = &step.tooltip {
+        response = response.on_hover_text(tip);
+    }
 
     let mut event = response.clicked().then_some(StripEvent::Open(index));
     if cancellable {
