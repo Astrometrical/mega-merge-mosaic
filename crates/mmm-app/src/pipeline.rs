@@ -58,7 +58,9 @@ pub fn auto_analyze(cfg: &MosaicConfig) -> bool {
 
 /// Turn automatic analysis on or off and save `mosaic.json` (a small save
 /// on the UI thread: the documented exception). The error is a message for
-/// the user; nothing changes then.
+/// the user; nothing changes then. No control turns it off any more (a
+/// session saved with it off is analysed from the Checks step); tests do.
+#[cfg(test)]
 pub fn set_auto_analyze(session: &mut OpenSession, on: bool) -> Result<(), String> {
     let mut next = session.mosaic.config.clone();
     if !next.ui.is_object() {
@@ -74,7 +76,7 @@ pub fn set_auto_analyze(session: &mut OpenSession, on: bool) -> Result<(), Strin
 /// Whether some group needs analysis: one is marked
 /// [`MosaicConfig::needs_analyze`], or a resolved group was never analysed
 /// (has no directory yet).
-fn wants_analysis(session: &OpenSession) -> bool {
+pub fn wants_analysis(session: &OpenSession) -> bool {
     let cfg = &session.mosaic.config;
     !cfg.needs_analyze.is_empty()
         || session.groups.as_ref().is_some_and(|g| {
@@ -373,6 +375,14 @@ impl Pipeline {
     /// cancelled them or they failed.
     pub fn previews_complete(&self) -> bool {
         self.previews_for.is_some() && self.previews_for == self.seen
+    }
+
+    /// Whether the previews of the current inputs stopped short (the user
+    /// cancelled them, or they failed) and wait for
+    /// [`Pipeline::request_previews`]: the pipeline does not run them again
+    /// by itself.
+    pub fn previews_paused(&self) -> bool {
+        self.previews_cancelled_for.is_some() && self.previews_cancelled_for == self.seen
     }
 
     /// Run the previews again (the user asked, e.g. after cancelling

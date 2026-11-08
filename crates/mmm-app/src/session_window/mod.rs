@@ -1,8 +1,16 @@
-//! The session window (spec §5, §7.1–§7.3): one canvas showing the plan
-//! ([`PlanView`]) or the merged mosaic ([`MosaicView`]) of the group or
-//! composite chosen, with a view bar across its top, and the inspector at
-//! its right.
+//! The session window (spec §5–§7.3): the top bar across the window, then
+//! one canvas showing the plan ([`PlanView`]) or the merged mosaic
+//! ([`MosaicView`]) of the group or composite chosen, with a view bar
+//! across its top, and the inspector at its right.
 //!
+//! - **Top bar** ([`top_bar`]): ‹, the session name, the step strip
+//!   ([`steps`]: Panels · Checks · Merge · Export, with the work in
+//!   progress) and the main button (**Add panels…**, **Merge** with the
+//!   merge settings' summary, or **Export…**).
+//! - **Panel list** ([`PanelsTab`]): while open it takes the canvas's
+//!   place (view bar included); the Panels step opens and closes it. A
+//!   session without panels opens on it. Files dropped on the window are
+//!   added whatever shows ([`SessionWindow::poll_panels`]).
 //! - **One view, one camera.** The window keeps the view (a group or a
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
@@ -18,9 +26,10 @@
 //!   Composites and Notes, in that order.
 //! - **Every frame.** The shell drives the window's hooks whether or not the
 //!   window is drawn: [`SessionWindow::on_event`] for each job event,
-//!   [`SessionWindow::poll_settings`], [`SessionWindow::track_analysis`]
-//!   and [`SessionWindow::poll`] (the merged mosaic's work, the plan's
-//!   texture release and the window's saves).
+//!   [`SessionWindow::poll_panels`], [`SessionWindow::poll_settings`],
+//!   [`SessionWindow::track_analysis`] and [`SessionWindow::poll`] (the
+//!   merged mosaic's work, the plan's texture release and the window's
+//!   saves).
 //! - **Saves.** The display stretch toggles, the composites and the notes
 //!   live in the session's `MosaicConfig.ui`, changed at once in memory and
 //!   written to `mosaic.json` on the UI thread at most once per
@@ -30,14 +39,19 @@
 
 mod canvas;
 mod sections;
+mod steps;
+mod top_bar;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use mega_ui::inspector::{InspectorState, inspector_width};
 use mega_ui::theme::palette;
+use mega_ui::theme::tokens::space;
 use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
+use mmm_core::session_summary::ResultState;
 use mmm_core::settings::ChangeImpact;
 use serde_json::Value;
 
@@ -46,6 +60,7 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{Composition, ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
+use crate::panels_tab::{FilesPicker, PanelsTab};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView};
 use crate::session::OpenSession;
@@ -87,12 +102,10 @@ pub struct SessionWindow {
     /// The view bar's choices' and toggles' one-row widths, as last drawn.
     bar_widths: Option<(f32, f32)>,
     save: Debounce,
-}
-
-impl Default for SessionWindow {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The panel list: the files and their grouping.
+    panels: PanelsTab,
+    /// The panel list shows in the canvas's place.
+    pub(crate) panel_list_open: bool,
 }
 
 /// Inspector section ids, in their fixed order.
@@ -104,8 +117,9 @@ const COMPOSITES: &str = "composites";
 const NOTES: &str = "notes";
 
 impl SessionWindow {
-    /// A window for a session just opened: the first group, Problems open.
-    pub fn new() -> Self {
+    /// A window for a session just opened: the first group, Problems open;
+    /// the panel list adds files picked with `picker`.
+    pub fn new(picker: Arc<dyn FilesPicker>) -> Self {
         let mut inspector = InspectorState::default();
         inspector.toggle(PROBLEMS);
         SessionWindow {
@@ -120,6 +134,8 @@ impl SessionWindow {
             selected: None,
             bar_widths: None,
             save: Debounce::default(),
+            panels: PanelsTab::new(picker),
+            panel_list_open: false,
         }
     }
 
@@ -129,8 +145,10 @@ impl SessionWindow {
         self.mode.unwrap_or(CanvasMode::Plan)
     }
 
-    /// Show the plan or the mosaic, where the shown canvas looks.
+    /// Show the plan or the mosaic, where the shown canvas looks; the panel
+    /// list closes, so the canvas shows.
     pub fn set_mode(&mut self, mode: CanvasMode) {
+        self.panel_list_open = false;
         if self.mode == Some(mode) {
             return;
         }
@@ -166,14 +184,14 @@ impl SessionWindow {
         self.set_mode(CanvasMode::Mosaic);
     }
 
-    /// The inspector's fold and open sections.
-    #[allow(dead_code)] // used by the top bar from Task 8 on
+    /// The inspector's fold and open sections (tests; nothing outside the
+    /// window reads them yet).
+    #[cfg(test)]
     pub fn inspector(&self) -> &InspectorState {
         &self.inspector
     }
 
     /// The inspector, to open a section ([`InspectorState::reveal`]).
-    #[allow(dead_code)] // used by the top bar from Task 8 on
     pub fn inspector_mut(&mut self) -> &mut InspectorState {
         &mut self.inspector
     }
@@ -188,25 +206,46 @@ impl SessionWindow {
         &self.mosaic
     }
 
-    /// The merged mosaic canvas, to start merges and exports.
-    pub fn mosaic_mut(&mut self) -> &mut MosaicView {
-        &mut self.mosaic
-    }
-
     /// React to a job event (from [`JobRunner::poll`]): the mosaic follows
-    /// it, and a finished merge marks the session merged.
+    /// it, and a finished merge marks the session merged; one of the whole
+    /// canvas leaves its group's result complete (until the summary writer
+    /// classifies the results again, [`OpenSession::results`]).
     pub fn on_event(&mut self, session: &mut OpenSession, jobs: &JobRunner, event: &JobEvent) {
         self.mosaic.on_event(event);
         if let JobEvent::Finished { id, .. } = event
-            && matches!(jobs.target(*id), Some((JobTarget::Blend, _)))
+            && let Some((JobTarget::Blend, group)) = jobs.target(*id)
         {
             session.merged = true;
+            if jobs.whole_canvas(*id) {
+                session
+                    .results
+                    .insert(group.to_string(), ResultState::Complete);
+            }
         }
     }
 
     /// See [`MosaicView::track_analysis`].
     pub fn track_analysis(&mut self, id: u64) {
         self.mosaic.track_analysis(id);
+    }
+
+    /// The panel list's background work, shown or not ([`PanelsTab::poll`]):
+    /// files picked, typed or dropped anywhere on the window are added, and
+    /// a waiting edit applies. Call every frame after the runner's poll,
+    /// before the pipeline's.
+    pub fn poll_panels(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        self.panels.poll(ctx, session, jobs);
+    }
+
+    /// An edit of the panels waits for the jobs to stop (or a busy store):
+    /// the automatic pipeline starts nothing meanwhile.
+    pub fn panels_editing(&self) -> bool {
+        self.panels.has_pending()
     }
 
     /// See [`MosaicView::settings_editing`].
@@ -260,8 +299,9 @@ impl SessionWindow {
         self.save.touch();
     }
 
-    /// Draw the window filling `ui`: the inspector at the right, the view
-    /// bar and the canvas in the rest, and the export dialog when open.
+    /// Draw the window filling `ui`: the top bar across it, the inspector
+    /// at the right, the view bar and the canvas (or the panel list) in the
+    /// rest, and the export dialog when open.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -273,6 +313,11 @@ impl SessionWindow {
         let ctx = ui.ctx().clone();
         self.follow_session(session);
         let mut out = SessionOutput::default();
+        let margin = egui::Margin::symmetric(space::M as i8, space::S as i8);
+        egui::Panel::top("session-top-bar")
+            .resizable(false)
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
+            .show(ui, |ui| self.top_bar(ui, session, jobs, pipeline, checks));
         egui::Panel::right("session-inspector")
             .resizable(false)
             .exact_size(inspector_width(&self.inspector))
@@ -282,15 +327,24 @@ impl SessionWindow {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| {
-                self.view_bar(ui, session, jobs, pipeline);
-                self.canvas_ui(ui, session, pipeline, checks);
+                if self.panel_list_open {
+                    self.panels.ui(ui, session, jobs);
+                } else {
+                    self.view_bar(ui, session, jobs, pipeline);
+                    self.canvas_ui(ui, session, pipeline, checks);
+                }
             });
         self.mosaic.export_ui(&ctx, session, jobs);
+        if !self.panel_list_open {
+            // Files dropped anywhere are added (the list draws its own).
+            self.panels.drop_overlay(&ctx);
+        }
         out
     }
 
-    /// Pick the mode on the first call, and keep the view one the session
-    /// has (else its first group) in both canvases.
+    /// On the first call, pick the mode, and open the panel list for a
+    /// session without panels (adding them comes first); keep the view one
+    /// the session has (else its first group) in both canvases.
     fn follow_session(&mut self, session: &OpenSession) {
         if self.mode.is_none() {
             self.mode = Some(if session.merged {
@@ -298,6 +352,7 @@ impl SessionWindow {
             } else {
                 CanvasMode::Plan
             });
+            self.panel_list_open |= session.mosaic.config.panels.is_empty();
         }
         let groups = group_names(session);
         let compositions = compositions_of(session);

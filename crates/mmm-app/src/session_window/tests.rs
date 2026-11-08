@@ -3,14 +3,18 @@
 //! it, then the window.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use egui::accesskit::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{By, NodeT, Queryable};
+use mega_ui::widgets::{StepState, StripStep};
 use mmm_core::checks::{Check, CheckCode, Severity};
 use mmm_core::mosaic::{MosaicConfig, SINGLE_GROUP};
 
+use super::steps::steps;
 use super::*;
 use crate::camera::Camera;
 use crate::checks::{ChecksEngine, ChecksReport};
@@ -18,11 +22,29 @@ use crate::compositions::{Composition, ViewKind, load_compositions, save_composi
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
 use crate::jobs::tests::{analyzed, drain};
+use crate::panels_tab::FilesPicker;
 use crate::pipeline::{Pipeline, set_auto_analyze};
 use crate::rois::{Roi, save_rois};
-use crate::session::{OpenSession, any_merged, notes};
+use crate::session::{OpenSession, any_merged, classify_results, create_blocking, notes};
 use crate::start::tests::{step_until, temp_dir};
 use crate::testutil::{two_group_mono_session, two_group_session};
+
+/// A file dialog that records being asked and picks nothing.
+#[derive(Default)]
+struct AskedFiles(AtomicBool);
+
+impl AskedFiles {
+    fn asked(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl FilesPicker for AskedFiles {
+    fn pick_files(&self) -> Option<Vec<PathBuf>> {
+        self.0.store(true, Ordering::SeqCst);
+        None
+    }
+}
 
 /// The window and what the shell hands it each frame.
 struct State {
@@ -35,18 +57,22 @@ struct State {
     run_pipeline: bool,
     /// The checks the window asked the shell to accept, in order.
     accepted: Vec<Check>,
+    /// The panel list's file dialog.
+    files: Arc<AskedFiles>,
 }
 
 impl State {
     fn new(session: OpenSession, jobs: JobRunner) -> Self {
+        let files = Arc::new(AskedFiles::default());
         State {
-            w: SessionWindow::new(),
+            w: SessionWindow::new(files.clone()),
             session,
             jobs,
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
             run_pipeline: false,
             accepted: Vec::new(),
+            files,
         }
     }
 }
@@ -71,6 +97,7 @@ fn harness_sized(state: State, size: egui::Vec2) -> Harness<'static, State> {
                 for e in &events {
                     s.w.on_event(&mut s.session, &s.jobs, e);
                 }
+                s.w.poll_panels(&ctx, &mut s.session, &mut s.jobs);
                 s.w.poll_settings(&ctx, &mut s.session, &mut s.jobs);
                 if s.run_pipeline {
                     let editing = s.w.settings_editing(&s.session);
@@ -99,7 +126,8 @@ fn runner() -> JobRunner {
     JobRunner::new(egui::Context::default())
 }
 
-/// An analysed two-group session with both groups merged.
+/// An analysed two-group session with both groups merged (and their
+/// results classified, as opening it would).
 fn merged(tag: &str) -> (PathBuf, OpenSession, JobRunner) {
     let (root, mut s, mut jobs) = analyzed(tag);
     jobs.start_blend(&mut s, "Ha", None);
@@ -107,7 +135,13 @@ fn merged(tag: &str) -> (PathBuf, OpenSession, JobRunner) {
     let _ = drain(&mut jobs, &mut s);
     s.merged = any_merged(&s);
     assert!(s.merged);
+    s.results = classify_results(&s);
     (root, s, jobs)
+}
+
+/// A new, empty session in `root`.
+fn empty(root: &std::path::Path) -> OpenSession {
+    create_blocking(&root.join("e.mmm-session")).unwrap()
 }
 
 /// One ROI, "ROI 1", whose label the mosaic paints at its top-left corner.
@@ -569,7 +603,10 @@ fn no_chips_for_a_single_group() {
     let mut h = harness(State::new(s, runner()));
     step_until(&mut h, |st| st.w.view().is_some());
     assert!(plus_chip(&h).is_none());
-    assert!(h.query_by_label_contains(" · ").is_none(), "no group chips");
+    let chip = By::new()
+        .label_contains(" · ")
+        .predicate(|n| n.toggled().is_some());
+    assert!(h.query(chip).is_none(), "no group chips");
     assert_eq!(
         h.state().w.view(),
         Some(&ViewKind::Group(SINGLE_GROUP.into()))
@@ -917,5 +954,324 @@ fn previews_paused_offer_resume() {
     h.get_by_label("Previews paused");
     h.get_by_label("Resume").click();
     step_until(&mut h, |st| st.pipeline.previews_complete());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A step the strip shows, not cancellable.
+fn strip(label: &str, state: StepState) -> StripStep {
+    StripStep {
+        label: label.into(),
+        state,
+        cancellable: false,
+    }
+}
+
+/// A report of `n` problems, one per panel of `s`.
+fn problems(s: &OpenSession, n: usize) -> ChecksReport {
+    ChecksReport {
+        checks: (0..n)
+            .map(|i| {
+                check(
+                    CheckCode::FileChanged,
+                    Severity::Problem,
+                    vec![s.mosaic.config.panels[i].path.clone()],
+                    &format!("Panel {i} changed"),
+                )
+            })
+            .collect(),
+        errors: Vec::new(),
+    }
+}
+
+#[test]
+fn steps_follow_the_session() {
+    use StepState::{Done, Next, Todo, Warn, Working};
+    // Empty: panels to add, nothing else to do yet.
+    let root = temp_dir("steps-empty");
+    let s = empty(&root);
+    let got = steps(&s, &runner(), &Pipeline::new(), &ChecksEngine::new());
+    assert_eq!(
+        got,
+        [
+            strip("Add panels", Todo),
+            strip("Checks", Todo),
+            strip("Merge", Todo),
+            strip("Export", Todo),
+        ]
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Previews running: Panels works on them, and can be cancelled.
+    let root = temp_dir("steps-previews");
+    let mut s = two_group_session(&root);
+    set_auto_analyze(&mut s, false).unwrap();
+    let mut jobs = runner();
+    let gate = jobs.hold();
+    let mut pipeline = Pipeline::new();
+    let ctx = egui::Context::default();
+    pipeline.poll(&ctx, Instant::now(), &mut s, &mut jobs, &[], false);
+    let checks = ChecksEngine::new();
+    let got = steps(&s, &jobs, &pipeline, &checks);
+    let reading = StripStep {
+        label: "Reading previews 0 / 8".into(),
+        state: Working {
+            fraction: Some(0.0),
+        },
+        cancellable: true,
+    };
+    assert_eq!(
+        got,
+        [
+            reading,
+            strip("Analyse", Next),
+            strip("Merge", Next),
+            strip("Export", Todo),
+        ]
+    );
+    // Cancelled: they wait to be asked for again.
+    let ids: Vec<u64> = jobs.views().iter().map(|v| v.id).collect();
+    for id in ids {
+        jobs.cancel(id);
+    }
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    pipeline.poll(&ctx, Instant::now(), &mut s, &mut jobs, &events, false);
+    assert!(!jobs.busy());
+    let got = steps(&s, &jobs, &pipeline, &checks);
+    assert_eq!(got[0], strip("Read previews", Next));
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Analysed, with two problems: merging is next.
+    let (root, s, jobs) = analyzed("steps-analysed");
+    let mut checks = ChecksEngine::new();
+    checks.set_report(problems(&s, 2));
+    assert_eq!(
+        steps(&s, &jobs, &Pipeline::new(), &checks),
+        [
+            strip("8 panels", Done),
+            strip("2 problems", Warn),
+            strip("Merge", Next),
+            strip("Export", Todo),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Merged, the checks passed.
+    let (root, s, jobs) = merged("steps-merged");
+    let mut checks = ChecksEngine::new();
+    checks.set_report(ChecksReport::default());
+    assert_eq!(
+        steps(&s, &jobs, &Pipeline::new(), &checks),
+        [
+            strip("8 panels", Done),
+            strip("Checks passed", Done),
+            strip("Merged", Done),
+            strip("Export", Todo),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checks_step_reveals_the_problems() {
+    let (root, s, jobs) = analyzed("window-checks-step");
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(problems(&state.session, 2));
+    // The inspector folded away, Problems closed.
+    state.w.inspector_mut().toggle("problems");
+    state.w.inspector_mut().folded = true;
+    let mut h = harness(state);
+    h.run_steps(3);
+    assert!(!h.state().w.inspector().is_open("problems"));
+    h.get_by_label("2 problems").click();
+    h.run_steps(2);
+    let inspector = h.state().w.inspector();
+    assert!(inspector.is_open("problems") && !inspector.folded);
+    h.get_by_label("Panel 1 changed");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn main_button_follows_the_work() {
+    // Empty: Add panels… opens the panel list and its file dialog.
+    let root = temp_dir("window-main-empty");
+    let state = State::new(empty(&root), runner());
+    let files = state.files.clone();
+    let mut h = harness(state);
+    h.run_steps(3);
+    h.state_mut().w.panel_list_open = false;
+    h.run_steps(2);
+    assert!(h.query_by_label("Merge").is_some(), "the Merge step");
+    h.get_by_label("Add panels…").click();
+    h.run_steps(2);
+    assert!(h.state().w.panel_list_open);
+    step_until(&mut h, |_| files.asked());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Analysed, nothing merged: Merge (beside the Merge step).
+    let (root, s, jobs) = analyzed("window-main-merge");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    h.run_steps(2);
+    assert!(h.query_by_label("Add panels…").is_none());
+    assert!(h.query_by_label("Export…").is_none());
+    let merge: Vec<egui::Rect> = h.query_all_by_label("Merge").map(|n| n.rect()).collect();
+    assert_eq!(merge.len(), 2, "the Merge step and the main button");
+    // The main button is the one at the right: it merges every group.
+    let gate = h.state_mut().jobs.hold();
+    let right = merge.iter().map(|r| r.center().x).fold(f32::MIN, f32::max);
+    h.query_all_by_label("Merge")
+        .find(|n| n.rect().center().x == right)
+        .unwrap()
+        .click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Everything merged: Export….
+    let (root, s, jobs) = merged("window-main-export");
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    h.get_by_label("Export…");
+    h.get_by_label("Merged");
+    assert!(h.query_by_label("Merge").is_none(), "nothing to merge");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn settings_summary_reveals_merge_settings() {
+    let (root, s, jobs) = analyzed("window-settings-summary");
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    assert!(!h.state().w.inspector().is_open("merge-settings"));
+    // One row, in order: the steps, Merge, then its settings' summary.
+    let summary = h.get_by_label("Pyramid · feather 256 px").rect();
+    let export = h.get_by_label("Export").rect();
+    let mut merges: Vec<egui::Rect> = h.query_all_by_label("Merge").map(|n| n.rect()).collect();
+    merges.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+    let (step, main) = (merges[0], merges[1]);
+    assert!(step.max.x <= export.min.x, "Merge step, then Export");
+    assert!(export.max.x < main.min.x && main.max.x < summary.min.x);
+    assert!(summary.max.x <= 1200.0, "inside the window");
+    for r in [step, export, main] {
+        assert!(
+            (r.center().y - summary.center().y).abs() < 1.0,
+            "one row: {r:?} {summary:?}"
+        );
+    }
+    h.get_by_label("Pyramid · feather 256 px").click();
+    h.run_steps(2);
+    assert!(h.state().w.inspector().is_open("merge-settings"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cancelling_a_working_step_cancels_its_job() {
+    let (root, s, jobs) = analyzed("window-cancel-step");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    // Merging, held before any progress.
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.w.merge(&mut st.session, &mut st.jobs);
+    }
+    h.run_steps(2);
+    let working = "Merging Ha · 1 of 2 · 0 %";
+    let cancel = format!("Cancel {working}");
+    assert!(
+        h.query_by_label(&cancel).is_none(),
+        "Cancel shows while hovered"
+    );
+    h.get_by_label(working).hover();
+    h.run_steps(2);
+    h.get_by_label(&cancel).click();
+    h.run_steps(2);
+    // The queued merge is dropped at once; the running one winds down.
+    assert_eq!(labels(&h.state().jobs), ["Blend Ha"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    h.run_steps(2);
+    assert!(!h.state().jobs.blending(), "no merge job left");
+    assert!(h.query_by_label_contains("Merging").is_none());
+    assert_eq!(h.query_all_by_label("Merge").count(), 2, "to merge again");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn empty_session_opens_on_the_panel_list() {
+    let root = temp_dir("window-empty");
+    let mut h = harness(State::new(empty(&root), runner()));
+    h.run_steps(3);
+    assert!(h.state().w.panel_list_open);
+    h.get_by_label("Add files…");
+    for l in ["Add panels", "Checks", "Merge", "Export", "Add panels…"] {
+        h.get_by_label(l);
+    }
+    assert!(
+        h.query_by_label("Plan").is_none(),
+        "the list over the canvas"
+    );
+    // Closed: the empty canvas, where nothing can be merged yet.
+    h.get_by_label("Add panels").click();
+    h.run_steps(3);
+    assert!(!h.state().w.panel_list_open);
+    assert!(disabled(&h, "Mosaic"));
+    for l in ["Plan", "Outlines", "ROIs", "Linked", "Strong"] {
+        let toggle = By::new().label(l).predicate(|n| n.toggled().is_some());
+        assert!(h.query(toggle).is_some(), "{l}");
+    }
+    // Every section draws.
+    for id in [
+        "problems",
+        "panels",
+        "rois",
+        "merge-settings",
+        "composites",
+        "notes",
+    ] {
+        h.state_mut().w.inspector_mut().reveal(id);
+    }
+    h.run_steps(3);
+    h.get_by_label("Not checked yet.");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn panels_step_toggles_the_panel_list() {
+    let root = temp_dir("window-panels-step");
+    let mut h = harness(State::new(two_group_session(&root), runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(2);
+    assert!(!h.state().w.panel_list_open, "a session with panels");
+    assert!(h.query_by_label("Add files…").is_none());
+    h.get_by_label("8 panels").click();
+    h.run_steps(2);
+    assert!(h.state().w.panel_list_open);
+    h.get_by_label("Add files…");
+    assert!(
+        h.query_by_label("Plan").is_none(),
+        "the list over the canvas"
+    );
+    h.get_by_label("8 panels").click();
+    h.run_steps(2);
+    assert!(!h.state().w.panel_list_open);
+    h.get_by_label("Plan");
+    assert!(h.query_by_label("Add files…").is_none());
     let _ = std::fs::remove_dir_all(&root);
 }

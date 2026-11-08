@@ -1,4 +1,5 @@
-//! The Panels tab (spec §5.2): choosing the panel files and grouping them.
+//! The panel list (spec §5, §10; drawn by the session window in place of
+//! its canvas while open): choosing the panel files and grouping them.
 //! File cards, and with grouping on, groups as columns of cards with
 //! "No group" first; never a spreadsheet.
 //!
@@ -641,7 +642,8 @@ impl PanelsTab {
     /// Take finished background work (dialog, typed path, dropped files,
     /// header reads), apply a waiting edit once the runner is idle, and
     /// start resolving the shown inputs if they changed. Call every frame,
-    /// after the runner's poll, whichever tab is shown.
+    /// after the runner's poll, whether or not the list is shown (files
+    /// dropped on the window are added whatever shows).
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -766,6 +768,19 @@ impl PanelsTab {
         }
     }
 
+    /// Open the file dialog (on a worker; [`PanelsTab::poll`] adds what
+    /// was picked), unless it is open already.
+    pub(crate) fn pick_files(&mut self, ctx: &egui::Context) {
+        if self.picking.is_some() {
+            return;
+        }
+        let picker = self.picker.clone();
+        self.picking = Task::spawn("mmm-pick-files", ctx, move || {
+            let picked = picker.pick_files()?;
+            Some(picked.iter().map(|p| normalize(p)).collect())
+        });
+    }
+
     /// The status line of `path`'s card.
     fn card_status(&self, path: &Path) -> (String, Color32) {
         match self.infos.get(path).and_then(|i| i.dims.as_ref()) {
@@ -886,11 +901,7 @@ impl PanelsTab {
                 .on_hover_text("Choose XISF or FITS panel files")
                 .clicked()
             {
-                let picker = self.picker.clone();
-                self.picking = Task::spawn("mmm-pick-files", ctx, move || {
-                    let picked = picker.pick_files()?;
-                    Some(picked.iter().map(|p| normalize(p)).collect())
-                });
+                self.pick_files(ctx);
             }
             let label = ui.label(RichText::new("Add path").color(palette::TEXT_MUTED));
             let field = ui
@@ -1315,8 +1326,10 @@ impl PanelsTab {
         clicked
     }
 
-    /// Show where files dragged over the window will go.
-    fn drop_overlay(&self, ctx: &egui::Context) {
+    /// Show where files dragged over the window will go (drawn by
+    /// [`PanelsTab::ui`]; call it while the tab is not drawn: the drop is
+    /// taken whatever shows).
+    pub(crate) fn drop_overlay(&self, ctx: &egui::Context) {
         if ctx.input(|i| i.raw.hovered_files.is_empty()) {
             return;
         }

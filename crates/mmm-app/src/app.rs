@@ -14,8 +14,8 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::mosaic_view::MosaicView;
-use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
-use crate::pipeline::{Pipeline, auto_analyze, set_auto_analyze};
+use crate::panels_tab::{FilesPicker, RfdFilesPicker};
+use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::session_window::{CanvasMode, SessionWindow};
 use crate::start::{RecentEntry, RfdDialogs, StartAction, StartScreen, unix_now};
@@ -30,42 +30,11 @@ const RECENT_KEY: &str = "recent_sessions";
 /// How long a job notice stays on screen.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 
-/// The session view's tabs (until the panel list moves into the session
-/// window).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tab {
-    /// The panel files and their grouping.
-    Panels,
-    /// The session window: the canvas (plan or mosaic) and the inspector.
-    Session,
-}
-
-impl Tab {
-    const ALL: [Tab; 2] = [Tab::Panels, Tab::Session];
-
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Panels => "Panels",
-            Tab::Session => "Mosaic",
-        }
-    }
-}
-
 /// A toast-style notice about a job that ended.
 struct Notice {
     text: String,
     color: Color32,
     until: Instant,
-}
-
-/// The tab a session opens on: Panels while it has no panels (adding
-/// them is the first step), else the session window.
-fn default_tab(session: &OpenSession) -> Tab {
-    if session.mosaic.config.panels.is_empty() {
-        Tab::Panels
-    } else {
-        Tab::Session
-    }
 }
 
 /// Opens another application window.
@@ -109,18 +78,15 @@ pub struct Shell {
     pub start: StartScreen,
     session: Option<OpenSession>,
     pending: Option<Pending>,
-    /// Opens the other windows ("Open another…", "New mosaic…").
+    /// Opens a session asked for while one is open in a window of its own.
     launcher: Arc<dyn Launcher>,
     /// Background jobs of the open session (made with the session).
     jobs: Option<JobRunner>,
     sys: SysMonitor,
     notices: Vec<Notice>,
-    tab: Tab,
     /// The session window (made afresh with each session).
     window: SessionWindow,
-    /// The Panels tab (made afresh with each session).
-    panels: PanelsTab,
-    /// The panel file dialog used by the Panels tab.
+    /// The panel file dialog used by the session window's panel list.
     files_picker: Arc<dyn FilesPicker>,
     /// The automatic previews and analysis (made afresh with each session).
     pipeline: Pipeline,
@@ -142,10 +108,7 @@ impl Shell {
             jobs: None,
             sys: SysMonitor::start(),
             notices: Vec::new(),
-            // Set when a session opens (`default_tab`).
-            tab: Tab::Session,
-            window: SessionWindow::new(),
-            panels: PanelsTab::new(Arc::new(RfdFilesPicker)),
+            window: SessionWindow::new(Arc::new(RfdFilesPicker)),
             files_picker: Arc::new(RfdFilesPicker),
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
@@ -167,16 +130,6 @@ impl Shell {
     /// True while a session is being opened or created.
     pub fn is_busy(&self) -> bool {
         self.pending.is_some()
-    }
-
-    /// The tab shown in the session view.
-    pub fn tab(&self) -> Tab {
-        self.tab
-    }
-
-    /// Show `tab`.
-    pub fn set_tab(&mut self, tab: Tab) {
-        self.tab = tab;
     }
 
     /// The session window.
@@ -245,10 +198,7 @@ impl Shell {
         let Some(outcome) = self.pending.as_mut().and_then(Pending::poll) else {
             return;
         };
-        let created = self
-            .pending
-            .take()
-            .is_some_and(|p| matches!(p.request, Request::Create(_)));
+        self.pending = None;
         self.start.set_busy(None);
         match outcome {
             Ok(opened) => {
@@ -278,17 +228,11 @@ impl Shell {
                     // Compressed panels decode to disk once, shared by
                     // previews and analysis (one session per process).
                     mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
-                    // A new session starts by adding its panels.
-                    self.tab = if created {
-                        Tab::Panels
-                    } else {
-                        default_tab(&opened)
-                    };
                     self.summary = SummaryWriter::new(opened.summary.clone());
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
-                    self.window = SessionWindow::new();
-                    self.panels = PanelsTab::new(self.files_picker.clone());
+                    // A session without panels opens on its panel list.
+                    self.window = SessionWindow::new(self.files_picker.clone());
                     self.pipeline = Pipeline::new();
                     self.checks = ChecksEngine::new();
                 }
@@ -300,10 +244,11 @@ impl Shell {
         }
     }
 
-    /// Apply finished jobs and post a notice for each, let the Panels tab
+    /// Apply finished jobs and post a notice for each, let the panel list
     /// take its background work and apply a waiting edit, run the
     /// automatic pipeline, let the session window follow (shown or not),
-    /// and run the checks.
+    /// run the checks, and keep the summary (and the session's result
+    /// states) current.
     fn poll_jobs(&mut self, ctx: &egui::Context) {
         let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
             return;
@@ -314,7 +259,7 @@ impl Shell {
         // An edit (panels, or the merge settings) waiting or having
         // cancelled jobs when the events were taken: jobs it cancelled are
         // restarted by the pipeline, not given up.
-        let editing = self.panels.has_pending() || self.window.settings_editing(session);
+        let editing = self.window.panels_editing() || self.window.settings_editing(session);
         for event in &events {
             self.window.on_event(session, jobs, event);
             let target = match event {
@@ -339,88 +284,35 @@ impl Shell {
             };
             self.notices.push(Notice { text, color, until });
         }
-        self.panels.poll(ctx, session, jobs);
+        self.window.poll_panels(ctx, session, jobs);
         self.window.poll_settings(ctx, session, jobs);
-        let editing = editing || self.panels.has_pending() || self.window.settings_editing(session);
+        let editing =
+            editing || self.window.panels_editing() || self.window.settings_editing(session);
         self.pipeline
             .poll(ctx, now, session, jobs, &events, editing);
         if let Some(id) = self.pipeline.take_started_analysis() {
             self.window.track_analysis(id);
         }
         // The session window (the merged mosaic's state above all) follows
-        // jobs and analyses even while the Panels tab is shown.
+        // jobs and analyses even while the panel list is shown.
         self.window.poll(ctx, session, jobs);
         self.checks.poll(ctx, session, jobs, &events);
         let last_view = self.window.view_key(&session.mosaic.config.ui);
         let counts = self.checks.counts(&session.mosaic.config);
         self.summary.poll(ctx, session, counts, last_view);
+        if let Some(results) = self.summary.take_results() {
+            session.results = results;
+        }
     }
 
-    /// The open session (the Panels tab and the session window build on
-    /// this).
+    /// The open session: the status bar, then the session window (its top
+    /// bar, canvas or panel list, and inspector).
     fn session_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let Some(session) = &self.session else { return };
-        let mut toggled = None;
-        let mut asked = None;
-        egui::Panel::top("session-bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(session.name())
-                        .size(16.0)
-                        .color(palette::TEXT_STRONG),
-                );
-                ui.label(
-                    RichText::new(session.mosaic.dir.display().to_string())
-                        .small()
-                        .color(palette::TEXT_MUTED),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Open another…").clicked() {
-                        launch(&*self.launcher, &mut self.notices, None);
-                    }
-                    if ui.button("New mosaic…").clicked() {
-                        launch(&*self.launcher, &mut self.notices, None);
-                    }
-                    let mut auto = auto_analyze(&session.mosaic.config);
-                    if ui
-                        .checkbox(&mut auto, "Auto-analyze")
-                        .on_hover_text(
-                            "Analyze by itself when the panels, grouping or settings change",
-                        )
-                        .changed()
-                    {
-                        toggled = Some(auto);
-                    }
-                    ui.separator();
-                    asked = work_buttons(ui, &self.window, self.jobs.as_ref(), session);
-                });
-            });
-            // Opening another session reports here too: the start window
-            // may be closed meanwhile.
-            if let Some(p) = &self.pending {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(
-                        RichText::new(format!(
-                            "{} {}…",
-                            verb(&p.request),
-                            p.request.path().display()
-                        ))
-                        .color(palette::TEXT_BODY),
-                    );
-                });
-            }
-            if let Some(e) = self.start.error().map(str::to_string) {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(e).color(palette::HA_400));
-                    if ui.small_button("Dismiss").clicked() {
-                        self.start.set_error(None);
-                    }
-                });
-            }
-        });
-        let views = self.jobs.as_ref().map(JobRunner::views).unwrap_or_default();
+        let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
+            return;
+        };
+        let views = jobs.views();
         egui::Panel::bottom("status-bar").show(ui, |ui| {
             status::show(
                 ui,
@@ -432,122 +324,22 @@ impl Shell {
                 self.sys.latest(),
             );
         });
-        if let Some(on) = toggled
-            && let Some(session) = self.session.as_mut()
-            && let Err(message) = set_auto_analyze(session, on)
-        {
-            tracing::warn!("{message}");
-            self.notices.push(Notice {
-                text: message,
-                color: palette::HA_400,
-                until: Instant::now() + NOTICE_TIME,
-            });
-        }
-        if let Some(work) = asked {
-            self.start_work(work);
-        }
-        egui::Panel::top("session-tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for tab in Tab::ALL {
-                    ui.selectable_value(&mut self.tab, tab, tab.label());
-                }
-            });
-        });
-        match (self.tab, self.session.as_mut(), self.jobs.as_mut()) {
-            (Tab::Session, Some(session), Some(jobs)) => {
-                let out = self
-                    .window
-                    .ui(ui, session, jobs, &mut self.pipeline, &self.checks);
-                for check in &out.accept {
-                    if let Err(message) = self.checks.accept(session, check) {
-                        tracing::warn!("{message}");
-                        self.notices.push(Notice {
-                            text: message,
-                            color: palette::HA_400,
-                            until: Instant::now() + NOTICE_TIME,
-                        });
-                    }
-                }
+        let out = self
+            .window
+            .ui(ui, session, jobs, &mut self.pipeline, &self.checks);
+        for check in &out.accept {
+            if let Err(message) = self.checks.accept(session, check) {
+                tracing::warn!("{message}");
+                self.notices.push(Notice {
+                    text: message,
+                    color: palette::HA_400,
+                    until: Instant::now() + NOTICE_TIME,
+                });
             }
-            (Tab::Panels, Some(session), Some(jobs)) => self.panels.ui(ui, session, jobs),
-            _ => {}
         }
         self.notices_ui(&ctx);
     }
 
-    /// Do what the session bar's work buttons asked: merging and exporting
-    /// show the session window.
-    fn start_work(&mut self, work: Work) {
-        let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
-            return;
-        };
-        match work {
-            Work::Merge => {
-                self.window.merge(session, jobs);
-                self.tab = Tab::Session;
-            }
-            Work::Export => {
-                self.window.mosaic_mut().open_export(session);
-                self.tab = Tab::Session;
-            }
-            Work::Cancel => {
-                for v in jobs.views() {
-                    jobs.cancel(v.id);
-                }
-            }
-        }
-    }
-}
-
-/// Merge, Export… and Cancel, laid out right to left (until the top bar's
-/// main button and step strip take them over); what was clicked.
-fn work_buttons(
-    ui: &mut egui::Ui,
-    window: &SessionWindow,
-    jobs: Option<&JobRunner>,
-    session: &OpenSession,
-) -> Option<Work> {
-    let jobs = jobs?;
-    let mut asked = None;
-    if ui
-        .add_enabled(jobs.busy(), egui::Button::new("Cancel"))
-        .on_hover_text("Cancel the running work")
-        .clicked()
-    {
-        asked = Some(Work::Cancel);
-    }
-    let mosaic = window.mosaic();
-    if ui
-        .add_enabled(mosaic.can_open_export(), egui::Button::new("Export…"))
-        .on_hover_text("Export this view's merged groups to FITS or TIFF")
-        .clicked()
-    {
-        asked = Some(Work::Export);
-    }
-    let why = mosaic.merge_block_reason(session, jobs);
-    if ui
-        .add_enabled(why.is_none(), egui::Button::new("Merge"))
-        .on_hover_text("Merge every group over the whole canvas")
-        .on_disabled_hover_text(why.unwrap_or_default())
-        .clicked()
-    {
-        asked = Some(Work::Merge);
-    }
-    asked
-}
-
-/// What the session bar's work buttons ask for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Work {
-    /// Merge every group ([`SessionWindow::merge`]).
-    Merge,
-    /// Open the export dialog.
-    Export,
-    /// Cancel every running or queued job.
-    Cancel,
-}
-
-impl Shell {
     /// Draw the live notices (newest at the bottom) above the status bar.
     fn notices_ui(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
@@ -705,11 +497,9 @@ impl SelfTest {
     /// has settled.
     fn advance(&mut self, shell: &mut Shell) {
         if self.phase == Phase::Mosaic {
-            // A session opens on its window (or Panels) showing the plan
-            // until something is merged; the walk starts at the mosaic.
-            if shell.tab() != Tab::Session {
-                shell.set_tab(Tab::Session);
-            }
+            // A session opens on the plan until something is merged (on
+            // its panel list without panels); the walk starts at the
+            // mosaic, which closes the list.
             shell.window_mut().set_mode(CanvasMode::Mosaic);
         }
         let w = shell.window();
@@ -1043,8 +833,9 @@ mod tests {
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert!(dir.join("mosaic.json").is_file());
         assert_eq!(h.state().start.recent()[0].path, dir);
-        // A session without panels opens on the Panels tab.
-        assert_eq!(h.state().tab(), Tab::Panels);
+        // A session without panels opens on its panel list.
+        assert!(h.state().window().panel_list_open);
+        h.get_by_label("Add panels…");
         let _ = std::fs::remove_dir_all(&parent);
     }
 
@@ -1103,7 +894,7 @@ mod tests {
             let dir = parent.join("Typed.mmm-session");
             assert!(dir.join("mosaic.json").is_file());
             assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
-            assert_eq!(h.state().tab(), Tab::Panels);
+            assert!(h.state().window().panel_list_open);
             let _ = std::fs::remove_dir_all(&parent);
         }
     }
@@ -1139,21 +930,23 @@ mod tests {
         h.step();
         step_until(&mut h, |s| s.session().is_some());
         let recent = h.state().start.recent().to_vec();
-        h.get_by_label("Open another…").click();
-        h.step();
-        h.get_by_label_contains("Cannot open a new window");
-        // A session opened in a window that cannot launch is not recorded.
+        // Another session goes to a window of its own, which cannot open:
+        // a notice says so, and the session is not recorded.
         let ctx = h.ctx.clone();
         h.state_mut().request(Request::Open(other), &ctx);
         step_until(&mut h, |s| !s.is_busy());
+        h.step();
+        h.get_by_label_contains("Cannot open a new window");
         assert_eq!(h.state().start.recent(), recent.as_slice());
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn open_another_launches_a_window() {
+    fn another_session_opens_in_a_new_window() {
         let root = temp_dir("shell-another");
         let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let other = root.join("Other.mmm-session");
+        drop(crate::session::create_blocking(&other).unwrap());
         let launcher = Arc::new(RecordingLauncher::default());
         let mut h = harness_launching(StubPicker(None), launcher.clone());
         h.run();
@@ -1161,14 +954,13 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.step();
         step_until(&mut h, |s| s.session().is_some());
-        h.get_by_label("Open another…").click();
-        h.step();
-        h.get_by_label("New mosaic…").click();
-        h.step();
-        assert_eq!(*launcher.0.lock().unwrap(), [None, None]);
-        // No floating start window over the session.
+        let ctx = h.ctx.clone();
+        h.state_mut().request(Request::Open(other.clone()), &ctx);
+        step_until(&mut h, |s| !s.is_busy());
+        assert_eq!(*launcher.0.lock().unwrap(), [Some(other)]);
+        // No floating start window over the session, which stays open.
         assert!(h.query_by_label("Open another session").is_none());
-        assert!(h.state().session().is_some());
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1262,18 +1054,16 @@ mod tests {
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert_eq!(h.state().start.recent()[0].path, dir);
 
-        // Opening it again (relative) in this window is refused, and the
-        // error shows in the session bar.
+        // Opening it again (relative) in this window is refused (the start
+        // screen says why).
         let ctx = h.ctx.clone();
         h.state_mut().request(Request::Open(rel), &ctx);
         h.step();
         step_until(&mut h, |s| !s.is_busy());
         h.run();
-        let shown = h
-            .get_all_by_label_contains("already open in this window")
-            .count();
-        assert!(shown >= 1);
-        h.get_by_label("Dismiss");
+        let error = h.state().start.error().unwrap_or_default();
+        assert!(error.contains("already open in this window"), "{error}");
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1288,7 +1078,6 @@ mod tests {
         h.step();
         step_until(&mut h, |s| s.session().is_some());
         h.get_by_label("2 groups");
-        h.get_by_label("Auto-analyze");
         // The pipeline previews the panels, then analyses them by itself.
         step_until(&mut h, |s| {
             s.session().unwrap().mosaic.config.group_dirs.len() == 2
@@ -1309,9 +1098,9 @@ mod tests {
         h.get_by_label("0 problems");
         h.get_by_label("8 notes");
         h.get_by_label("0 passed");
-        // A session with panels opens on the session window, on the plan
-        // while nothing is merged.
-        assert_eq!(h.state().tab(), Tab::Session);
+        // A session with panels opens on the canvas, on the plan while
+        // nothing is merged.
+        assert!(!h.state().window().panel_list_open);
         assert_eq!(h.state().window().mode(), CanvasMode::Plan);
         // The plan shows the first group's previews in place.
         step_until(&mut h, |s| s.window().plan().is_settled());
@@ -1330,8 +1119,16 @@ mod tests {
             .reveal("merge-settings");
         h.run_steps(2);
         h.get_by_label("Seam step median");
-        // Merge merges every group and shows the mosaic.
-        h.get_by_label("Merge").click();
+        // The main button (at the right of the Merge step) merges every
+        // group and shows the mosaic.
+        let right = h
+            .query_all_by_label("Merge")
+            .map(|n| n.rect().center().x)
+            .fold(f32::MIN, f32::max);
+        h.query_all_by_label("Merge")
+            .find(|n| n.rect().center().x == right)
+            .expect("the main button")
+            .click();
         h.step();
         assert_eq!(h.state().window().mode(), CanvasMode::Mosaic);
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
@@ -1339,6 +1136,13 @@ mod tests {
         h.get_by_label("Blend Ha finished");
         h.get_by_label("Blend OIII finished");
         assert!(h.state().session().unwrap().merged);
+        // Merged: Export… is the main button now, and stays so once the
+        // summary has classified the results.
+        h.get_by_label("Merged");
+        h.get_by_label("Export…");
+        step_until(&mut h, |s| !s.summary.busy());
+        h.run_steps(2);
+        h.get_by_label("Export…");
         // The result opens with an automatic display stretch, and the
         // viewer settles with its tiles loaded.
         step_until(&mut h, |s| {
@@ -1351,9 +1155,10 @@ mod tests {
             crate::tile_source::LINEAR,
             "auto stretch applied"
         );
-        // The Panels tab shows the panels in their groups.
-        h.state_mut().set_tab(Tab::Panels);
+        // The panel list shows the panels in their groups.
+        h.get_by_label("8 panels").click();
         h.step();
+        assert!(h.state().window().panel_list_open);
         h.get_by_label("Ha_0.xisf");
         let deadline = Instant::now() + Duration::from_secs(10);
         while h.query_by_label("OIII").is_none() {

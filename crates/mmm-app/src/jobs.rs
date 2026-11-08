@@ -39,7 +39,7 @@
 //! predecessor's outcome; its worker joins the predecessor's thread before
 //! running, so that wait never happens on the UI thread.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -107,6 +107,21 @@ pub enum JobTarget {
     Blend,
     /// An export of the group's result.
     Export,
+}
+
+/// Where a run of blends or exports stands ([`JobRunner::run_of`]): the
+/// jobs of one [`JobTarget`] since the last time none was running or
+/// queued.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    /// The job at the head of the run: running, else the first queued.
+    pub id: u64,
+    /// The head job's group.
+    pub group: String,
+    /// The head job's place in the run, from 1.
+    pub position: usize,
+    /// The jobs of the run: those that ended, and those running or queued.
+    pub count: usize,
 }
 
 /// What a queued job will do.
@@ -247,6 +262,12 @@ pub struct JobRunner {
     labels: BTreeMap<u64, String>,
     /// Blend and export jobs' group, by id (see [`JobRunner::target`]).
     targets: BTreeMap<u64, (JobTarget, String)>,
+    /// The blends of the whole canvas (not of an ROI), by id.
+    whole: BTreeSet<u64>,
+    /// Blends and exports that ended (ran to an end, whatever it was)
+    /// in the current run of each ([`JobRunner::run_of`]).
+    blends_ended: usize,
+    exports_ended: usize,
     /// Events raised outside `poll` (queued jobs cancelled), delivered by it.
     pending: Vec<JobEvent>,
     /// The frame of the last previews run that finished with every panel,
@@ -269,6 +290,9 @@ impl JobRunner {
             previous: None,
             labels: BTreeMap::new(),
             targets: BTreeMap::new(),
+            whole: BTreeSet::new(),
+            blends_ended: 0,
+            exports_ended: 0,
             pending: Vec::new(),
             previews_frame: None,
             #[cfg(test)]
@@ -361,8 +385,10 @@ impl JobRunner {
         rect: Option<[u64; 4]>,
     ) -> u64 {
         let id = self.new_id(format!("Blend {group}"));
-        self.targets
-            .insert(id, (JobTarget::Blend, group.to_string()));
+        self.begin(JobTarget::Blend, id, group);
+        if rect.is_none() {
+            self.whole.insert(id);
+        }
         if let Some(r) = &self.running
             && r.blend.as_ref().is_some_and(|p| p.group == group)
         {
@@ -402,8 +428,7 @@ impl JobRunner {
         format: ExportFormat,
     ) -> u64 {
         let id = self.new_id(format!("Export {group}"));
-        self.targets
-            .insert(id, (JobTarget::Export, group.to_string()));
+        self.begin(JobTarget::Export, id, group);
         self.queue.push_back(Queued {
             id,
             kind: Kind::Export(ExportJob {
@@ -517,12 +542,14 @@ impl JobRunner {
                 Ok(Msg::Preview(p)) => events.push(JobEvent::Preview(p)),
                 Ok(Msg::Done(done)) => {
                     let r = self.running.take().expect("running job");
+                    self.ended(r.id);
                     events.extend(self.finish(r, *done, session));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // The worker died without an outcome (a panic).
                     let r = self.running.take().expect("running job");
+                    self.ended(r.id);
                     let mut message =
                         format!("{} stopped unexpectedly (see the log)", self.name(r.id));
                     if let Some(plan) = &r.blend
@@ -630,9 +657,61 @@ impl JobRunner {
         self.targets.get(&id).map(|(t, g)| (*t, g.as_str()))
     }
 
+    /// Whether job `id` blends the whole canvas (not an ROI); also after it
+    /// ended.
+    pub fn whole_canvas(&self, id: u64) -> bool {
+        self.whole.contains(&id)
+    }
+
+    /// Where the run of `target` jobs stands, while one is running or
+    /// queued: its head job, and that job's place among the jobs started
+    /// since none of them was left (a queued job dropped, e.g. replaced by
+    /// newer work, does not count).
+    pub fn run_of(&self, target: JobTarget) -> Option<Run> {
+        let live: Vec<u64> = self
+            .running
+            .iter()
+            .map(|r| r.id)
+            .chain(self.queue.iter().map(|q| q.id))
+            .filter(|id| self.target(*id).is_some_and(|(t, _)| t == target))
+            .collect();
+        let id = *live.first()?;
+        let ended = match target {
+            JobTarget::Blend => self.blends_ended,
+            JobTarget::Export => self.exports_ended,
+        };
+        Some(Run {
+            id,
+            group: self.target(id)?.1.to_string(),
+            position: ended + 1,
+            count: ended + live.len(),
+        })
+    }
+
     /// The label of job `id` (also after it ended).
     pub fn label(&self, id: u64) -> Option<&str> {
         self.labels.get(&id).map(String::as_str)
+    }
+
+    /// Record a new `target` job `id` of `group`: a run of them starts
+    /// afresh when none is left.
+    fn begin(&mut self, target: JobTarget, id: u64, group: &str) {
+        if self.run_of(target).is_none() {
+            match target {
+                JobTarget::Blend => self.blends_ended = 0,
+                JobTarget::Export => self.exports_ended = 0,
+            }
+        }
+        self.targets.insert(id, (target, group.to_string()));
+    }
+
+    /// The running job `id` has ended: count it in its run.
+    fn ended(&mut self, id: u64) {
+        match self.target(id).map(|(t, _)| t) {
+            Some(JobTarget::Blend) => self.blends_ended += 1,
+            Some(JobTarget::Export) => self.exports_ended += 1,
+            None => {}
+        }
     }
 
     fn name(&self, id: u64) -> &str {
@@ -1099,6 +1178,42 @@ pub(crate) mod tests {
         assert_eq!(r.target(blend), Some((JobTarget::Blend, "Ha")));
         assert_eq!(r.target(export), Some((JobTarget::Export, "OIII")));
         assert_eq!(r.target(9999), None);
+        let _ = drain(&mut r, &mut s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runs_count_their_jobs() {
+        let (root, mut s, mut r) = analyzed("job-runs");
+        assert_eq!(r.run_of(JobTarget::Blend), None);
+        let gate = r.hold();
+        let ha = r.start_blend(&mut s, "Ha", None);
+        let oiii = r.start_blend(&mut s, "OIII", Some([0, 0, 64, 64]));
+        assert!(r.whole_canvas(ha) && !r.whole_canvas(oiii), "OIII: an ROI");
+        let run = |id, group: &str, position, count| Run {
+            id,
+            group: group.into(),
+            position,
+            count,
+        };
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(ha, "Ha", 1, 2)));
+        assert_eq!(r.run_of(JobTarget::Export), None);
+        gate.open();
+        // Ha ended: OIII, the second of two, runs.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while r.run_of(JobTarget::Blend).is_some_and(|x| x.id == ha) {
+            assert!(Instant::now() < deadline, "Ha never ended");
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = r.poll(&mut s);
+        }
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(oiii, "OIII", 2, 2)));
+        let _ = drain(&mut r, &mut s);
+        assert_eq!(r.run_of(JobTarget::Blend), None);
+        // The next run starts afresh.
+        let gate = r.hold();
+        let again = r.start_blend(&mut s, "Ha", None);
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(again, "Ha", 1, 1)));
+        gate.open();
         let _ = drain(&mut r, &mut s);
         let _ = std::fs::remove_dir_all(&root);
     }

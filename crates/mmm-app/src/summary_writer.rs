@@ -8,7 +8,9 @@
 //! itself, and the Shell marks it dirty when a job ends, cancelled ones
 //! included ([`SummaryWriter::on_job_event`]: a result changed). The work
 //! (classifying each group's result store, writing the file) runs on a
-//! background thread; the UI thread does no file I/O.
+//! background thread; the UI thread does no file I/O. The classified
+//! result states are handed back ([`SummaryWriter::take_results`]) unless
+//! something changed while they were read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -106,6 +108,13 @@ impl Settings {
     }
 }
 
+/// What a background write found: each group's result, and the summary it
+/// wrote (`None` if unchanged or the write failed).
+struct Written {
+    results: BTreeMap<String, ResultState>,
+    summary: Option<SessionSummary>,
+}
+
 /// Writes the session's summary in the background when it has changed.
 pub struct SummaryWriter {
     stamps: Stamps,
@@ -113,8 +122,10 @@ pub struct SummaryWriter {
     /// The last summary written (or found on opening).
     last: Option<SessionSummary>,
     inputs: Option<Inputs>,
-    /// The running write: the summary it wrote, or `None` if unchanged.
-    running: Option<Receiver<Option<SessionSummary>>>,
+    /// The running write.
+    running: Option<Receiver<Written>>,
+    /// Result states classified and not taken yet.
+    results: Option<BTreeMap<String, ResultState>>,
     /// How many summaries have been written (for tests).
     #[cfg(test)]
     writes: usize,
@@ -146,6 +157,7 @@ impl SummaryWriter {
             last: previous,
             inputs: None,
             running: None,
+            results: None,
             #[cfg(test)]
             writes: 0,
         }
@@ -196,6 +208,14 @@ impl SummaryWriter {
         }
     }
 
+    /// The result states the last write classified, once, if nothing that
+    /// could change them happened while they were read (a job ended, the
+    /// settings, panels or groups changed): the session's
+    /// [`OpenSession::results`].
+    pub fn take_results(&mut self) -> Option<BTreeMap<String, ResultState>> {
+        self.results.take()
+    }
+
     /// Take a finished write's outcome, notice changed inputs, and start a
     /// write when dirty and none is running. Cheap; call every frame. A
     /// finished write asks `ctx` for one repaint, so a change that landed
@@ -207,16 +227,18 @@ impl SummaryWriter {
         checks: Option<CheckCounts>,
         last_view: Option<String>,
     ) {
+        let mut classified = None;
         if let Some(rx) = &self.running {
             match rx.try_recv() {
                 Ok(written) => {
-                    if written.is_some() {
+                    if written.summary.is_some() {
                         #[cfg(test)]
                         {
                             self.writes += 1;
                         }
-                        self.last = written;
+                        self.last = written.summary;
                     }
+                    classified = Some(written.results);
                     self.running = None;
                 }
                 Err(TryRecvError::Disconnected) => self.running = None,
@@ -238,6 +260,13 @@ impl SummaryWriter {
         if self.inputs.as_ref() != Some(&inputs) {
             self.inputs = Some(inputs.clone());
             self.dirty = true;
+        }
+        // States read before a change may be out of date: the write the
+        // change starts reads them again.
+        if let Some(results) = classified
+            && !self.dirty
+        {
+            self.results = Some(results);
         }
         if !self.dirty {
             return;
@@ -269,23 +298,20 @@ impl SummaryWriter {
                     &results,
                     &stamps,
                 );
-                if last.as_ref().is_some_and(|l| same_facts(l, &summary)) {
-                    let _ = tx.send(None);
-                    ctx.request_repaint();
-                    return;
-                }
-                summary.written_at = unix_now();
-                match write_summary(&mosaic.dir, &summary) {
-                    Ok(()) => {
-                        let _ = tx.send(Some(summary));
-                        ctx.request_repaint();
+                let summary = if last.as_ref().is_some_and(|l| same_facts(l, &summary)) {
+                    None
+                } else {
+                    summary.written_at = unix_now();
+                    match write_summary(&mosaic.dir, &summary) {
+                        Ok(()) => Some(summary),
+                        Err(e) => {
+                            tracing::warn!("cannot write the session summary: {e}");
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("cannot write the session summary: {e}");
-                        let _ = tx.send(None);
-                        ctx.request_repaint();
-                    }
-                }
+                };
+                let _ = tx.send(Written { results, summary });
+                ctx.request_repaint();
             });
         match spawned {
             Ok(_) => self.running = Some(rx),
@@ -470,6 +496,18 @@ mod tests {
         let mut w = SummaryWriter::new(None);
         settle(&mut w, &ctx, &s);
         assert_eq!(written_result(&s, 0), ResultState::Complete);
+        // The states read are handed back, once.
+        let states = |ha, oiii| {
+            Some(BTreeMap::from([
+                ("Ha".to_string(), ha),
+                ("OIII".to_string(), oiii),
+            ]))
+        };
+        assert_eq!(
+            w.take_results(),
+            states(ResultState::Complete, ResultState::None)
+        );
+        assert_eq!(w.take_results(), None);
         // A blend-local change marks every result stale (no job ends).
         let mut blend = s.mosaic.config.blend.clone();
         blend.feather_px *= 2.0;
@@ -477,6 +515,10 @@ mod tests {
         set_settings(&mut s.mosaic, analyze, blend).unwrap();
         settle(&mut w, &ctx, &s);
         assert_eq!(written_result(&s, 0), ResultState::Stale);
+        assert_eq!(
+            w.take_results(),
+            states(ResultState::Stale, ResultState::None)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

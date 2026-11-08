@@ -208,7 +208,8 @@ pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>, auto: boo
     }
 }
 
-fn mode_name(m: BlendMode) -> &'static str {
+/// The merge mode's name, as the settings show it.
+pub(crate) fn mode_name(m: BlendMode) -> &'static str {
     match m {
         BlendMode::Pyramid => "Pyramid",
         BlendMode::TwoBand => "TwoBand",
@@ -255,7 +256,7 @@ fn gain_name(g: GainMode) -> &'static str {
 }
 
 /// Feather text as shown in the field.
-fn feather_text(v: f32) -> String {
+pub(crate) fn feather_text(v: f32) -> String {
     format!("{v}")
 }
 

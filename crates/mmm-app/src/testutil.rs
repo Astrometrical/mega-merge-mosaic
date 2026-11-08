@@ -27,6 +27,7 @@ fn open(mosaic: mmm_core::mosaic::Mosaic) -> OpenSession {
         lock: None,
         summary: None,
         merged: false,
+        results: Default::default(),
     }
 }
 

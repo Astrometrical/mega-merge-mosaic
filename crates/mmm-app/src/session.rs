@@ -2,6 +2,7 @@
 //! thread, and handing a second session to a new process (one session per
 //! window, spec §3).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -11,7 +12,7 @@ use mmm_core::mosaic::{
     lock_session,
 };
 use mmm_core::reference::ReferenceFrame;
-use mmm_core::session_summary::{SessionSummary, read_summary};
+use mmm_core::session_summary::{ResultState, SessionSummary, read_summary, result_state};
 use serde_json::Value;
 
 use crate::util::group_names;
@@ -41,6 +42,13 @@ pub struct OpenSession {
     /// ([`any_merged`], when opening), or a merge finished since (set by the
     /// session window). The canvas offers the mosaic from then on.
     pub merged: bool,
+    /// Each processing group's result, as its level-0 tiles were last
+    /// classified off the UI thread ([`classify_results`]): when opening,
+    /// then by the summary writer whenever something it shows changed (the
+    /// shell copies them in); a whole-canvas merge that finished counts as
+    /// complete at once (the session window). A group missing here has no
+    /// result. Says which groups need merging.
+    pub results: BTreeMap<String, ResultState>,
 }
 
 impl OpenSession {
@@ -165,8 +173,10 @@ fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
         lock,
         summary,
         merged: false,
+        results: BTreeMap::new(),
     };
     session.merged = any_merged(&session);
+    session.results = classify_results(&session);
     Ok(session)
 }
 
@@ -176,6 +186,19 @@ pub fn any_merged(session: &OpenSession) -> bool {
     group_names(session)
         .iter()
         .any(|g| session.mosaic.result_path(g).is_file())
+}
+
+/// Each processing group of `session` and its result, classified from the
+/// level-0 tile states of its result store ([`result_state`]). Blocking
+/// (reads each store's state table): call off the UI thread.
+pub fn classify_results(session: &OpenSession) -> BTreeMap<String, ResultState> {
+    group_names(session)
+        .into_iter()
+        .map(|g| {
+            let state = result_state(&session.mosaic.result_path(&g));
+            (g, state)
+        })
+        .collect()
 }
 
 /// The session lock on `dir`, or an actionable message.
@@ -209,6 +232,7 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
         lock,
         summary: None,
         merged: false,
+        results: BTreeMap::new(),
     })
 }
 
@@ -340,7 +364,17 @@ mod tests {
         s.groups = Some(analyze_all(&mut s.mosaic, &JobCtl::none()).unwrap());
         assert!(!open_blocking(&dir).unwrap().merged, "analysed only");
         blend_group(&mut s.mosaic, "OIII", None, &JobCtl::none()).unwrap();
-        assert!(open_blocking(&dir).unwrap().merged, "one group merged");
+        let opened = open_blocking(&dir).unwrap();
+        assert!(opened.merged, "one group merged");
+        // Each group's result, classified on opening.
+        let results: Vec<_> = opened.results.into_iter().collect();
+        assert_eq!(
+            results,
+            [
+                ("Ha".to_string(), ResultState::None),
+                ("OIII".to_string(), ResultState::Complete),
+            ]
+        );
         let created = create_blocking(&root.join("New.mmm-session")).unwrap();
         assert!(!created.merged);
         let _ = std::fs::remove_dir_all(&root);

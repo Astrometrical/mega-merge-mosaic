@@ -583,6 +583,7 @@ fn plan_places_solved_panels_before_previews() {
         lock: None,
         summary: None,
         merged: false,
+        results: Default::default(),
     };
     let mut h = harness(s);
     // No previews, no analysis: dashed outlines at the WCS footprints.

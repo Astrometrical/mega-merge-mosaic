@@ -1284,6 +1284,7 @@ fn previews_do_not_move_persisted_rois() {
         lock: None,
         summary: None,
         merged: false,
+        results: Default::default(),
     };
     // The previews run in the panels' frame...
     let mut jobs = JobRunner::new(egui::Context::default());
