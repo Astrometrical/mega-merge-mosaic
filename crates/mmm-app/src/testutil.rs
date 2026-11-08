@@ -6,6 +6,11 @@ use std::path::Path;
 use crate::session::OpenSession;
 pub(crate) use crate::synth_mosaic::CANVAS;
 
+/// How long a test waits for background work (worker threads, jobs, tile
+/// loads) to reach the state it checks: generous, so a slow, loaded machine
+/// never trips it. Every wait ends as soon as its condition holds.
+pub(crate) const PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A grouped Ha + OIII mosaic session in `root/m.mmm-session`, grouped by
 /// the `FILTER` header, not yet analyzed.
 pub(crate) fn two_group_session(root: &Path) -> OpenSession {

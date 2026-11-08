@@ -27,7 +27,7 @@ use crate::pipeline::{Pipeline, Step};
 use crate::rois::{Roi, save_rois};
 use crate::session::{OpenSession, any_merged, classify_results, create_blocking, notes};
 use crate::start::tests::{step_until, temp_dir};
-use crate::testutil::{two_group_mono_session, two_group_session};
+use crate::testutil::{PATIENCE, two_group_mono_session, two_group_session};
 
 /// A file dialog that records being asked and picks nothing.
 #[derive(Default)]
@@ -155,9 +155,10 @@ fn add_roi(s: &mut OpenSession) {
     save_rois(&mut s.mosaic.config.ui, &[roi]);
 }
 
-/// Step until `done` holds, stopping at the frame that made it so.
+/// Step until `done` holds, stopping at the frame that made it so (bounded
+/// by [`PATIENCE`]: background work).
 fn step_to(h: &mut Harness<'_, State>, done: impl Fn(&State) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PATIENCE;
     while !done(h.state()) {
         assert!(
             Instant::now() < deadline,
@@ -166,6 +167,14 @@ fn step_to(h: &mut Harness<'_, State>, done: impl Fn(&State) -> bool) {
         h.step();
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// The plan has drawn the frame's canvas with every panel of its view in
+/// place (the layout, read on a worker, has arrived): what it draws next
+/// depends on its camera only.
+fn plan_placed(st: &State) -> bool {
+    let plan = st.w.plan();
+    plan.canvas_frame().is_some() && !plan.items().is_empty() && plan.unplaced() == 0
 }
 
 /// The job labels running or queued, in order.
@@ -470,9 +479,10 @@ fn plan_and_mosaic_share_the_camera() {
     let mut state = State::new(s, jobs);
     state.w.set_mode(CanvasMode::Plan);
     let mut h = harness(state);
-    // The merged result is opened behind the plan.
+    // The plan's panels are in place, and the merged result is opened
+    // behind the plan (both on workers).
     step_until(&mut h, |st| {
-        st.w.plan().canvas_frame().is_some() && st.w.mosaic().source().is_some()
+        plan_placed(st) && st.w.mosaic().source().is_some()
     });
     // The plan zoomed in and panned...
     let fit = h.state().w.plan().camera().expect("the plan's camera");
@@ -508,7 +518,7 @@ fn camera_survives_the_mosaic_viewer_being_rebuilt() {
     add_roi(&mut s);
     let mut h = harness(State::new(s, jobs));
     step_until(&mut h, |st| {
-        st.w.plan().canvas_frame().is_some()
+        plan_placed(st)
             && st
                 .w
                 .mosaic()
@@ -875,14 +885,12 @@ fn a_selected_panel_shows_its_details_and_checks() {
         "in Problems and in the panel's checks"
     );
     assert!(h.query_by_label("Second panel unsolved").is_none());
-    // Accept there goes to the shell too. The inspector scrolls to it as
-    // a user would; the click waits for the scroll to settle.
+    // Accept there goes to the shell too (clicked through accessibility:
+    // wherever the inspector's scrolling has put it).
     h.get_all_by_label("Accept")
         .last()
         .expect("the panel's Accept")
-        .scroll_to_me();
-    let _ = h.run_ok();
-    h.get_all_by_label("Accept").last().unwrap().click();
+        .click_accesskit();
     h.run_steps(2);
     let accepted: Vec<&str> = h
         .state()

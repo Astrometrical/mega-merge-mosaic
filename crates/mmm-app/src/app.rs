@@ -990,7 +990,7 @@ mod tests {
                 .is_none()
         );
         h.get_by_label("New mosaic").click();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while h
             .query_by_role_and_label(role, "No dialog? Type a path")
             .is_none()
@@ -1014,7 +1014,7 @@ mod tests {
             h.run();
             h.get_by_label("New mosaic").click();
             let role = egui::accesskit::Role::TextInput;
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::testutil::PATIENCE;
             while h
                 .query_by_role_and_label(role, "No dialog? Type a path")
                 .is_none()
@@ -1202,7 +1202,7 @@ mod tests {
         h.state_mut().request(Request::Open(rel), &ctx);
         h.step();
         step_until(&mut h, |s| !s.is_busy());
-        h.run();
+        h.run_steps(2);
         let error = h.state().start.error().unwrap_or_default();
         assert!(error.contains("already open in this window"), "{error}");
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
@@ -1224,7 +1224,7 @@ mod tests {
             s.session().unwrap().mosaic.config.group_dirs.len() == 2
                 && !s.jobs.as_ref().unwrap().busy()
         });
-        h.run();
+        h.run_steps(2);
         assert_eq!(h.state().pipeline().previews().len(), 8);
         h.get_by_label("Analyze finished");
         // No status bar: its items are gone.
@@ -1234,7 +1234,7 @@ mod tests {
         step_until(&mut h, |s| {
             s.checks().report().is_some() && !s.checks().running()
         });
-        h.run();
+        h.run_steps(2);
         // A session with panels opens on the canvas, on the plan while
         // nothing is merged.
         assert!(!h.state().window().panel_list_open);
@@ -1297,7 +1297,7 @@ mod tests {
         h.step();
         assert!(h.state().window().panel_list_open);
         h.get_by_label("Ha_0.xisf");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while h.query_by_label("OIII").is_none() {
             assert!(Instant::now() < deadline, "no OIII column");
             h.step();
@@ -1331,7 +1331,7 @@ mod tests {
             s.session().unwrap().mosaic.config.group_dirs.len() == 2
                 && !s.jobs.as_ref().unwrap().busy()
         });
-        h.run();
+        h.run_steps(2);
         for label in ["Ready", "Checks:", "RAM", "CPU"] {
             assert!(h.query_by_label_contains(label).is_none(), "{label}");
         }
@@ -1360,17 +1360,18 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.step();
         let mut seen = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while h.state().session().is_none() {
             assert!(Instant::now() < deadline, "no session");
             h.step();
             seen.extend(titles(&h));
             std::thread::sleep(Duration::from_millis(5));
         }
-        h.step();
-        seen.extend(titles(&h));
-        h.run();
-        seen.extend(titles(&h));
+        // A few frames more (the pipeline is at work: no `run`): once.
+        for _ in 0..3 {
+            h.step();
+            seen.extend(titles(&h));
+        }
         assert_eq!(seen, ["m — Mega Merge Mosaic"]);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1551,7 +1552,7 @@ mod tests {
         // Once the job has stopped, the summary is written, then the lock
         // released, and the card is read again.
         gate.open();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while lock_session(&dir).is_err() {
             assert!(Instant::now() < deadline, "the lock is never released");
             std::thread::sleep(Duration::from_millis(5));

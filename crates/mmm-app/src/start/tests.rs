@@ -76,9 +76,11 @@ pub(crate) fn relative_to_cwd(path: &Path) -> PathBuf {
     rel
 }
 
-/// Step `harness` until `done` holds (bounded: background threads).
+/// Step `harness` until `done` holds (bounded by
+/// [`PATIENCE`](crate::testutil::PATIENCE): background threads), then one
+/// more frame.
 pub(crate) fn step_until<S>(harness: &mut Harness<'_, S>, done: impl Fn(&S) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !done(harness.state()) {
         assert!(Instant::now() < deadline, "timed out waiting for the UI");
         harness.step();
