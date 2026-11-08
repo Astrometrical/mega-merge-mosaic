@@ -50,7 +50,9 @@
 //!   [`tiles::blend_tiles`] blends a canvas rect into it and rebuilds the
 //!   parent levels, cancellably (finished tiles stay valid).
 //! - [`mosaic`] — the mosaic project: `mosaic.json` configuration, panel
-//!   grouping rules and the on-disk session layout; [`mosaic::Mosaic`] with
+//!   grouping rules (header keyword, WBPP-style path keyword with
+//!   [`mosaic::grouping::path_keyword`] saying why a path gives no value, by
+//!   hand) and the on-disk session layout; [`mosaic::Mosaic`] with
 //!   [`mosaic::analyze_all`] (every group onto one shared reference frame)
 //!   and [`mosaic::blend_group`] (a group into its tiled result), each split
 //!   into plan / run / apply for background jobs ([`mosaic::plan_analyze`],
@@ -77,6 +79,10 @@
 //! - [`checks`] — structured input, file and analysis checks (severity, code,
 //!   affected groups, remedy) and the accepted-warning bookkeeping, as data
 //!   for a UI or `mmm check`.
+//! - [`panel_header`] — a panel's header facts from one open (size,
+//!   channels, filter, exposure, frames and integration time, solution kind,
+//!   pixel scale) with [`panel_header::read_panel_header`], for panel lists;
+//!   [`checks::panel_facts`] is a projection of it.
 //! - [`stretch`] — display stretch maths: per-channel median/MAD statistics
 //!   and an auto stretch (display only; the data stays linear).
 //! - [`synth`] — synthetic ground-truth mosaics, exposed so integration tests
