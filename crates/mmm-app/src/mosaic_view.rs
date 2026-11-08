@@ -28,8 +28,9 @@
 //!   (sky ↔ canvas) and counting how many of an ROI's level-0 tiles are
 //!   fresh (per group of the view) run on workers ([`RoiPanel`]).
 //!   [`MosaicView::merge_roi`] starts one merge of the selected ROI per
-//!   group of the view (the job runner queues them; newer work wins per
-//!   group), once the ROIs follow the current frame;
+//!   group of the view with the merge settings draft, uncommitted (the job
+//!   runner queues them; newer work wins per group), once the ROIs follow
+//!   the current frame;
 //!   [`MosaicView::merge_these`] merges the groups it is given over the whole
 //!   canvas, committing the merge settings draft first.
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
@@ -100,9 +101,9 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
-use mega_ui::theme::palette;
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{radius, space};
+use mega_ui::theme::{palette, scrim};
 use mega_ui::viewer::{PyramidGeometry, TileSource, TiledViewer, Tool};
 use mmm_core::health::{Health, health};
 use mmm_core::mosaic::{FRAME_FILE, commit_blend_settings};
@@ -114,7 +115,7 @@ use mmm_core::stretch::StretchParams;
 use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
 
-use crate::blend_settings::{SettingsPanel, load_draft};
+use crate::blend_settings::{SettingsPanel, draft_for, load_draft};
 use crate::camera::Camera;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
@@ -765,10 +766,15 @@ impl MosaicView {
     }
 
     /// Merge the selected ROI for each group of the view (newer work wins
-    /// per group in the job runner); nothing while
+    /// per group in the job runner) with the merge settings draft, through
+    /// each group's override, without committing it (spec §11: change a
+    /// setting, merge an ROI, look); nothing while
     /// [`MosaicView::merge_roi_block_reason`] gives a reason (e.g. while the
     /// ROIs are being reprojected: the rect may still be from an older
-    /// frame).
+    /// frame, or while the feather text is invalid). A region merged with
+    /// settings other than its group's last whole merge makes the group out
+    /// of date ([`mmm_core::mosaic::region_differs`]) until Merge re-merges
+    /// it.
     pub fn merge_roi(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
         if self.merge_roi_block_reason(session, jobs).is_some() {
             return;
@@ -779,7 +785,9 @@ impl MosaicView {
         self.merge_groups(session, jobs, self.members.clone(), Some(rect));
     }
 
-    /// Merge `rect` (`None`: the whole canvas) of each of `groups`.
+    /// Merge `rect` of each of `groups`: `None` (the whole canvas) with the
+    /// committed settings (a whole merge commits the draft first), an ROI
+    /// with the draft ([`draft_for`]).
     fn merge_groups(
         &mut self,
         session: &mut OpenSession,
@@ -794,7 +802,13 @@ impl MosaicView {
         }
         let any = !groups.is_empty();
         for g in groups {
-            let id = jobs.start_blend(session, &g, rect);
+            let id = match rect {
+                None => jobs.start_blend(session, &g, None),
+                Some(_) => {
+                    let draft = draft_for(&session.mosaic.config, &g);
+                    jobs.start_blend_with(session, &g, rect, draft)
+                }
+            };
             self.merge_jobs.insert(id, g);
         }
         any
@@ -1505,12 +1519,14 @@ impl MosaicView {
 pub struct CanvasTag {
     /// What it says.
     pub text: String,
-    /// Drawn quieter: muted text, no panel behind it.
+    /// Drawn quieter: muted text on a translucent panel.
     pub quiet: bool,
 }
 
-/// `tag` over the top-left corner of the image drawn in `rect`; a warning
-/// is on a panel so it reads over any image. Clicked, true.
+/// `tag` over the top-left corner of the image drawn in `rect`, on a panel
+/// so it reads over any image: a warning's is opaque, a quiet tag's
+/// translucent (the image shows through) yet its muted text keeps AA
+/// contrast over a white image ([`scrim`]). Clicked, true.
 fn tag_overlay(ui: &mut egui::Ui, rect: egui::Rect, tag: &CanvasTag) -> bool {
     let mut over = ui.new_child(
         egui::UiBuilder::new()
@@ -1518,7 +1534,10 @@ fn tag_overlay(ui: &mut egui::Ui, rect: egui::Rect, tag: &CanvasTag) -> bool {
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     let (fill, ink) = if tag.quiet {
-        (Color32::TRANSPARENT, palette::TEXT_MUTED)
+        (
+            scrim(palette::SURFACE_800, palette::TEXT_MUTED),
+            palette::TEXT_MUTED,
+        )
     } else {
         (palette::SURFACE_800, palette::TEXT_BODY)
     };

@@ -58,6 +58,13 @@ pub struct GroupSummary {
     /// Absent in summaries written before this existed.
     #[serde(default)]
     pub settings_changed: bool,
+    /// A region of the group was merged, since its last whole-canvas
+    /// merge, with other settings ([`crate::mosaic::region_differs`]): the
+    /// result is complete but not of one merge, so the group is out of
+    /// date (never [`GroupSummary::settings_changed`] as well). Absent in
+    /// summaries written before this existed.
+    #[serde(default)]
+    pub region_differs: bool,
 }
 
 /// How much of a group's result store is current.
@@ -147,6 +154,7 @@ mod tests {
                 blended_at: Some(1_699_999_000),
                 exported_at: None,
                 settings_changed: false,
+                region_differs: false,
             }],
             problems: Some(1),
             notes: None,

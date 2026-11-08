@@ -3024,7 +3024,8 @@ fn the_tag_hides_only_for_a_whole_merge_of_a_shown_group() {
 
 #[test]
 fn the_settings_tag_is_quieter_than_the_out_of_date_tags() {
-    use mega_ui::theme::palette;
+    use mega_ui::theme::tokens::space;
+    use mega_ui::theme::{contrast_ratio, palette};
     let (root, mut s, jobs) = merged("window-tag-quiet");
     let old = s.mosaic.config.blend.feather_px;
     set_draft_feather(&mut s, old + 100.0);
@@ -3033,27 +3034,58 @@ fn the_settings_tag_is_quieter_than_the_out_of_date_tags() {
     state.w.select_view(ViewKind::Group("Ha".into()));
     let mut h = harness(state);
     h.run_steps(5);
-    let colour = |h: &Harness<'static, State>, text: &str| {
-        h.output().shapes.iter().find_map(|cs| match &cs.shape {
-            egui::Shape::Text(t) if t.galley.text() == text => {
-                Some(t.galley.job.sections[0].format.color)
-            }
-            _ => None,
-        })
+    // A tag's ink, and the fill of the panel right behind it (the smallest
+    // rect around its text).
+    let look = |h: &Harness<'static, State>, text: &str| {
+        let shapes = &h.output().shapes;
+        let (ink, at) = shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == text => Some((
+                    t.galley.job.sections[0].format.color,
+                    t.visual_bounding_rect(),
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{text} not drawn"));
+        let fill = shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Rect(r) if r.rect.contains_rect(at) => Some(r),
+                _ => None,
+            })
+            .min_by(|a, b| a.rect.area().total_cmp(&b.rect.area()))
+            .filter(|r| r.rect.width() < at.width() + 4.0 * space::S)
+            .map(|r| r.fill);
+        (ink, fill)
     };
-    assert_eq!(
-        colour(&h, "Settings changed since this merge"),
-        Some(palette::TEXT_MUTED)
+    // Premultiplied `c` over white: the brightest image under a tag.
+    let over_white = |c: egui::Color32| {
+        let ch = |v: u8| v.saturating_add(255 - c.a());
+        egui::Color32::from_rgb(ch(c.r()), ch(c.g()), ch(c.b()))
+    };
+    let (quiet_ink, quiet_fill) = look(&h, "Settings changed since this merge");
+    assert_eq!(quiet_ink, palette::TEXT_MUTED);
+    let quiet_fill = quiet_fill.expect("the quiet tag sits on a panel");
+    assert!(
+        quiet_fill.a() > 0 && quiet_fill.a() < 255,
+        "translucent: {quiet_fill:?}"
     );
+    let c = contrast_ratio(quiet_ink, over_white(quiet_fill));
+    assert!(c >= 4.5, "AA over a white image: {c}");
     h.state_mut()
         .session
         .results
         .insert("Ha".into(), ResultState::Partial);
     h.run_steps(3);
+    let (ink, fill) = look(&h, "Out of date — merge didn't finish");
     assert_eq!(
-        colour(&h, "Out of date — merge didn't finish"),
-        Some(palette::TEXT_BODY)
+        (ink, fill),
+        (palette::TEXT_BODY, Some(palette::SURFACE_800))
     );
+    // Quieter: muted ink on a panel the image shows through.
+    assert_ne!(quiet_ink, ink);
+    assert!(quiet_fill.a() < palette::SURFACE_800.a());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3178,5 +3210,106 @@ fn the_merge_step_merges_from_out_of_date_and_settings_changed() {
     assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A merged two-group session showing Ha on the mosaic, its draft feather
+/// 100 px above the committed one, whose "ROI 1" was merged through
+/// **Merge ROI** (so for Ha only). Returns the committed feather too.
+fn roi_merged_with_the_draft(tag: &str) -> (PathBuf, Harness<'static, State>, f32) {
+    let (root, mut s, jobs) = merged(tag);
+    add_roi(&mut s);
+    let old = s.mosaic.config.blend.feather_px;
+    set_draft_feather(&mut s, old + 100.0);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Mosaic);
+    state.w.select_view(ViewKind::Group("Ha".into()));
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    h.get_by_label("ROI 1").click();
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_roi_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    let gate = h.state_mut().jobs.hold();
+    h.get_by_label("Merge ROI").click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    h.run_steps(3);
+    (root, h, old)
+}
+
+#[test]
+fn an_roi_merge_uses_the_draft() {
+    let (root, h, old) = roi_merged_with_the_draft("window-roi-draft");
+    let cfg = &h.state().session.mosaic.config;
+    let last = cfg
+        .provenance
+        .iter()
+        .rev()
+        .find(|e| e.action == "blend")
+        .expect("the ROI merge's entry");
+    assert_eq!(last.group.as_deref(), Some("Ha"));
+    assert_eq!(last.detail["whole"], false);
+    let feather = last.detail["settings"]["feather_px"].as_f64();
+    assert_eq!(feather, Some(f64::from(old + 100.0)), "the draft's feather");
+    // Nothing committed: the draft stays a draft.
+    assert_eq!(cfg.blend.feather_px, old);
+    assert_eq!(
+        crate::blend_settings::load_draft(cfg).feather_px,
+        old + 100.0
+    );
+    assert_eq!(merged_feather(&h.state().session, "Ha"), Some(old));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_region_with_other_settings_makes_the_group_out_of_date() {
+    let (root, mut h, old) = roi_merged_with_the_draft("window-roi-differs");
+    let st = h.state();
+    // Its store is complete: the region's settings are what make it out of
+    // date, not the store.
+    assert_eq!(st.session.results.get("Ha"), Some(&ResultState::Complete));
+    assert!(out_of_date(&st.session, "Ha") && !draft_changed(&st.session, "Ha"));
+    assert!(draft_changed(&st.session, "OIII"));
+    assert_eq!(
+        shown_steps(st)[MERGE_STEP],
+        strip("Out of date", StepState::Next)
+    );
+    h.get_by_label("Out of date — region merged with other settings");
+    assert!(
+        h.query_by_label("Settings changed since this merge")
+            .is_none()
+    );
+    assert_eq!(chip_state(&h, "Ha · 4"), Some("out of date".to_string()));
+    // The main button offers Merge, which commits the draft and merges both
+    // (Ha out of date, OIII's settings changed).
+    until_mergeable(&mut h);
+    assert!(!rightmost_disabled(&h, "Merge"));
+    let gate = h.state_mut().jobs.hold();
+    click_rightmost(&h, "Merge");
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    h.run_steps(3);
+    let st = h.state();
+    assert_eq!(st.session.mosaic.config.blend.feather_px, old + 100.0);
+    for g in ["Ha", "OIII"] {
+        assert_eq!(merged_feather(&st.session, g), Some(old + 100.0), "{g}");
+        assert!(!out_of_date(&st.session, g) && !draft_changed(&st.session, g));
+    }
+    assert_eq!(
+        shown_steps(st)[MERGE_STEP],
+        strip("Merged", StepState::Done)
+    );
+    assert!(
+        h.query_by_label("Out of date — region merged with other settings")
+            .is_none()
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

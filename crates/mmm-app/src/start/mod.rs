@@ -28,7 +28,7 @@ use mega_ui::theme::Tone;
 
 use crate::session::{SESSION_EXT, normalize, session_name};
 
-mod facts;
+pub(crate) mod facts;
 mod hero;
 mod hero_views;
 mod layout;

@@ -6,7 +6,7 @@
 //! |---|---|
 //! | Panels | none: "Add panels"; previews running: "Reading previews {done} / {n}" (cancellable); previews stopped short: "Read previews" (next); else "{n} panels" (done) |
 //! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
-//! | Merge | a whole-canvas merge queued while an export runs: "Merge queued after export" (cancellable, no fraction); whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, or it needs analysis): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
+//! | Merge | a whole-canvas merge queued while an export runs: "Merge queued after export" (cancellable, no fraction); whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, it needs analysis, or a region of it was merged with other settings): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
 //! | Export | exports running or queued: "Exporting {i} of {n}" ("Exporting" for one) (cancellable); else "Export" |
 //!
 //! One step at most is next (highlighted): the first that waits for the
@@ -17,7 +17,7 @@
 
 use mega_ui::jobs::JobView;
 use mega_ui::widgets::{StepState, StripStep};
-use mmm_core::mosaic::settings_changed;
+use mmm_core::mosaic::{region_differs, settings_changed};
 use mmm_core::session_summary::ResultState;
 
 use super::sections::counted;
@@ -83,10 +83,14 @@ pub(super) fn offers_analysis(
 
 /// Whether `group`'s mosaic is out of date: its result is not complete
 /// (none yet, partly merged, a merge that stopped, or one made before the
-/// panels changed), or the group needs a new analysis.
+/// panels changed), the group needs a new analysis, or a region of it was
+/// merged with other settings than its last whole merge
+/// ([`region_differs`]: the store is complete but not of one merge).
 pub fn out_of_date(session: &OpenSession, group: &str) -> bool {
+    let cfg = &session.mosaic.config;
     session.results.get(group) != Some(&ResultState::Complete)
-        || session.mosaic.config.needs_analyze.contains(group)
+        || cfg.needs_analyze.contains(group)
+        || region_differs(cfg, group)
 }
 
 /// Whether `group` is up to date but its last whole-canvas merge used

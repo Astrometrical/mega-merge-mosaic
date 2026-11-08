@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mmm_core::mosaic::grouping::Groups;
-use mmm_core::mosaic::{Mosaic, MosaicConfig, settings_changed};
+use mmm_core::mosaic::{Mosaic, MosaicConfig, region_differs, settings_changed};
 use mmm_core::session_summary::{
     GroupSummary, ResultState, SUMMARY_FORMAT, SessionSummary, result_state, write_summary,
 };
@@ -40,7 +40,9 @@ type Stamps = BTreeMap<String, (Option<u64>, Option<u64>)>;
 /// The facts of a session as a [`SessionSummary`] (with `written_at` 0: the
 /// writer stamps it). Groups follow processing order; a group missing from
 /// `results` is [`ResultState::None`] and one missing from `stamps` has no
-/// stamps.
+/// stamps. A group a region of which was merged with other settings
+/// ([`region_differs`]) is recorded so (`GroupSummary::region_differs`) and
+/// never as settings changed: it is out of date, as the window says.
 pub fn summarize(
     cfg: &MosaicConfig,
     groups: Option<&Groups>,
@@ -58,12 +60,16 @@ pub fn summarize(
                 .map(|(name, panels)| {
                     let (blended_at, exported_at) = stamps.get(&name).copied().unwrap_or_default();
                     let result = results.get(&name).copied().unwrap_or_default();
+                    // Out of date though complete: never settings changed.
+                    let region_differs = region_differs(cfg, &name);
                     let settings_changed = result == ResultState::Complete
                         && !cfg.needs_analyze.contains(&name)
+                        && !region_differs
                         && settings_changed(cfg, &name, &draft);
                     GroupSummary {
                         result,
                         settings_changed,
+                        region_differs,
                         name,
                         panels,
                         blended_at,
@@ -708,6 +714,41 @@ mod tests {
         blend_group(&mut s.mosaic, "Ha", None, &JobCtl::none()).unwrap();
         settle(&mut w, &ctx, &s);
         assert_eq!(flags(), [false, false]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_region_merged_with_other_settings_is_out_of_date_not_settings_changed() {
+        use crate::start::facts::{CardState, card_state};
+        use mmm_core::mosaic::{plan_blend_with, run_blend};
+        let root = temp_dir("summary-region-differs");
+        let mut s = ha_merged(&root);
+        blend_group(&mut s.mosaic, "OIII", None, &JobCtl::none()).unwrap();
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        // The draft changed: settings changed, not out of date.
+        let mut draft = crate::blend_settings::load_draft(&s.mosaic.config);
+        draft.feather_px *= 2.0;
+        crate::blend_settings::save_draft(&mut s.mosaic.config.ui, &draft);
+        settle(&mut w, &ctx, &s);
+        let dir = s.mosaic.dir.clone();
+        let written = || read_summary(&dir).unwrap();
+        let card = |sum: &SessionSummary| card_state(sum.panels, true, Some(sum));
+        assert_eq!(card(&written()), CardState::SettingsChanged);
+        // A region of Ha merged with the draft: Ha's store stays complete,
+        // but it is out of date, and the card no longer reads Merged or
+        // Settings changed.
+        let plan = plan_blend_with(&s.mosaic, "Ha", Some([0, 0, 64, 64]), draft).unwrap();
+        let aligned = run_blend(&plan, &JobCtl::none()).unwrap();
+        s.mosaic.apply_blend(&plan, aligned).unwrap();
+        settle(&mut w, &ctx, &s);
+        let sum = written();
+        let ha = &sum.groups[0];
+        assert_eq!((ha.name.as_str(), ha.result), ("Ha", ResultState::Complete));
+        assert!(ha.region_differs && !ha.settings_changed, "{ha:?}");
+        let oiii = &sum.groups[1];
+        assert!(!oiii.region_differs && oiii.settings_changed, "{oiii:?}");
+        assert_eq!(card(&sum), CardState::ReMergeNeeded);
         let _ = std::fs::remove_dir_all(&root);
     }
 

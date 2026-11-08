@@ -136,8 +136,10 @@ enum Kind {
     Blend {
         group: String,
         rect: Option<[u64; 4]>,
-        /// The committed settings when it was queued: the merge runs with
-        /// these, whatever is committed by the time it starts.
+        /// The settings it was queued with (the committed ones, or the
+        /// draft for an ROI merge: [`JobRunner::start_blend_with`]): the
+        /// merge runs with these, whatever is committed by the time it
+        /// starts.
         settings: BlendSettings,
     },
     Export(ExportJob),
@@ -413,6 +415,24 @@ impl JobRunner {
         group: &str,
         rect: Option<[u64; 4]>,
     ) -> u64 {
+        let settings = session.mosaic.config.settings_for(group).1;
+        self.start_blend_with(session, group, rect, settings)
+    }
+
+    /// [`JobRunner::start_blend`] with explicit `settings` (validated by
+    /// the caller) instead of the group's committed ones: an ROI merge of
+    /// the merge settings draft. A whole-canvas merge with them is fresh
+    /// when they differ from the group's last whole merge; an ROI merge
+    /// never is ([`mmm_core::mosaic::plan_blend_with`]), and one whose
+    /// settings differ makes the group out of date
+    /// ([`mmm_core::mosaic::region_differs`]).
+    pub fn start_blend_with(
+        &mut self,
+        session: &mut OpenSession,
+        group: &str,
+        rect: Option<[u64; 4]>,
+        settings: BlendSettings,
+    ) -> u64 {
         let id = self.new_id(job_label("Merge", group, session));
         self.begin(JobTarget::Blend, id, group);
         if rect.is_none() {
@@ -438,7 +458,7 @@ impl JobRunner {
             kind: Kind::Blend {
                 group: group.to_string(),
                 rect,
-                settings: session.mosaic.config.settings_for(group).1,
+                settings,
             },
         });
         self.start_next(session);

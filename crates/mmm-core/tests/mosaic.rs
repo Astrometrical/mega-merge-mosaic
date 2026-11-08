@@ -1213,6 +1213,73 @@ fn last_merge_settings_is_per_group_and_whole_canvas() {
 }
 
 #[test]
+fn region_differs_after_an_roi_merge_with_other_settings() {
+    use mmm_core::mosaic::{ProvenanceEntry, region_differs};
+    use serde_json::json;
+    let a = BlendSettings::default();
+    let b = with_feather(&a, 7.0);
+    let push = |cfg: &mut MosaicConfig, group: &str, whole: Option<bool>, s: &BlendSettings| {
+        let mut d = json!({ "group": group, "settings": s });
+        if let Some(w) = whole {
+            d["whole"] = json!(w);
+        }
+        cfg.provenance
+            .push(ProvenanceEntry::new("blend", Some(group), d));
+    };
+    // No whole merge: not merged, so nothing to differ from.
+    let mut cfg = MosaicConfig::new(vec![]);
+    push(&mut cfg, "Ha", Some(false), &b);
+    assert!(!region_differs(&cfg, "Ha"));
+    // A whole merge with A, then a region with A: the same settings.
+    let mut cfg = MosaicConfig::new(vec![]);
+    push(&mut cfg, "Ha", Some(true), &a);
+    assert!(!region_differs(&cfg, "Ha"));
+    push(&mut cfg, "Ha", Some(false), &a);
+    assert!(!region_differs(&cfg, "Ha"));
+    // Another group's region with B leaves Ha alone.
+    push(&mut cfg, "OIII", Some(true), &a);
+    push(&mut cfg, "OIII", Some(false), &b);
+    assert!(!region_differs(&cfg, "Ha"));
+    assert!(region_differs(&cfg, "OIII"));
+    // A region with B: it differs, and a later region with A does not
+    // make it agree (the B tiles may still be there).
+    push(&mut cfg, "Ha", Some(false), &b);
+    assert!(region_differs(&cfg, "Ha"));
+    push(&mut cfg, "Ha", Some(false), &a);
+    assert!(region_differs(&cfg, "Ha"));
+    // A later whole merge (with either settings) covers it.
+    push(&mut cfg, "Ha", Some(true), &b);
+    assert!(!region_differs(&cfg, "Ha"));
+    // An entry without `whole` predates it and counts as whole.
+    push(&mut cfg, "Ha", Some(false), &a);
+    assert!(region_differs(&cfg, "Ha"));
+    push(&mut cfg, "Ha", None, &a);
+    assert!(!region_differs(&cfg, "Ha"));
+}
+
+#[test]
+fn an_roi_merge_with_other_settings_is_recorded_as_differing() {
+    use mmm_core::mosaic::region_differs;
+    let tmp = TempDir::new("regiondiffers");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    let roi = Some([10, 10, 100, 100]);
+    let same = plan_blend(&m, "Ha", roi).unwrap();
+    assert!(!same.fresh, "an ROI plan is never fresh");
+    let aligned = run_blend(&same, &JobCtl::none()).unwrap();
+    m.apply_blend(&same, aligned).unwrap();
+    assert!(!region_differs(&m.config, "Ha"));
+    let other = with_feather(&m.config.blend, 7.0);
+    let plan = plan_blend_with(&m, "Ha", roi, other).unwrap();
+    assert!(!plan.fresh, "an ROI plan is never fresh");
+    let aligned = run_blend(&plan, &JobCtl::none()).unwrap();
+    m.apply_blend(&plan, aligned).unwrap();
+    assert!(region_differs(&m.config, "Ha"));
+    assert!(!region_differs(&m.config, "OIII"));
+}
+
+#[test]
 fn last_analyze_settings_is_per_group() {
     let tmp = TempDir::new("lastanalyze");
     let mut m = two_group_mosaic(&tmp.0);
@@ -1473,7 +1540,8 @@ fn out_of_date_reason_follows_the_trail() {
         cfg.provenance.push(ProvenanceEntry::new(action, group, d));
     };
     let analyze = |s: &AnalyzeSettings| json!({ "groups": { "Ha": s } });
-    let blend = json!({ "whole": true, "settings": BlendSettings::default() });
+    let blend_of = |s: BlendSettings| json!({ "whole": true, "settings": s });
+    let blend = blend_of(BlendSettings::default());
     // Never merged.
     assert_eq!(out_of_date_reason(&cfg, "Ha"), R::NotMerged);
     push(&mut cfg, "analyze", None, analyze(&a));
@@ -1501,4 +1569,25 @@ fn out_of_date_reason_follows_the_trail() {
     let mut c3 = MosaicConfig::new(vec![]);
     c3.needs_analyze.insert("Ha".into());
     assert_eq!(out_of_date_reason(&c3, "Ha"), R::Panels);
+    // A region merged with other settings since the whole merge: said
+    // right after the needs-analysis reasons, ahead of the trail's others.
+    let mut c4 = MosaicConfig::new(vec![]);
+    let roi = |s: BlendSettings| json!({ "whole": false, "settings": s });
+    let mut b = BlendSettings::default();
+    b.feather_px += 7.0;
+    push(&mut c4, "analyze", None, analyze(&a));
+    push(
+        &mut c4,
+        "blend",
+        Some("Ha"),
+        blend_of(BlendSettings::default()),
+    );
+    push(&mut c4, "blend", Some("Ha"), roi(BlendSettings::default()));
+    assert_eq!(out_of_date_reason(&c4, "Ha"), R::MergeUnfinished);
+    push(&mut c4, "blend", Some("Ha"), roi(b));
+    assert_eq!(out_of_date_reason(&c4, "Ha"), R::RegionDiffers);
+    push(&mut c4, "inputs", None, json!({ "affected": ["Ha"] }));
+    assert_eq!(out_of_date_reason(&c4, "Ha"), R::RegionDiffers);
+    c4.needs_analyze.insert("Ha".into());
+    assert_eq!(out_of_date_reason(&c4, "Ha"), R::Panels);
 }

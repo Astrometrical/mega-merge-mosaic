@@ -9,8 +9,9 @@
 //! both canvases follow them.
 //!
 //! **Marks and tags** (spec §11): a group chip (a composite's takes its
-//! members' worst) shows a dot when its mosaic is out of date
-//! ([`out_of_date`]) or its merge settings changed ([`draft_changed`]). Its
+//! members' worst) shows a [`ChipMark`] (its tone's icon, and the state in
+//! its hover text) when its mosaic is out of date ([`out_of_date`]) or its
+//! merge settings changed ([`draft_changed`]). Its
 //! context menu offers **Merge this group** (committing the draft and
 //! merging that group only; off while it merges or merging is blocked). In
 //! Mosaic mode a tag over the image's top-left says why a shown group is out
@@ -59,6 +60,7 @@ fn out_of_date_why(session: &OpenSession, group: &str) -> &'static str {
     match out_of_date_reason(&session.mosaic.config, group) {
         OutOfDateReason::AnalysisSettings => "Out of date — analysis settings changed",
         OutOfDateReason::Panels => "Out of date — panels changed",
+        OutOfDateReason::RegionDiffers => "Out of date — region merged with other settings",
         OutOfDateReason::NotMerged => "Not merged yet",
         OutOfDateReason::MergeUnfinished => "Out of date — merge didn't finish",
     }

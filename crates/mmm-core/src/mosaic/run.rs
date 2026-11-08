@@ -441,7 +441,21 @@ pub struct BlendPlan {
     pub rect: Option<[u64; 4]>,
     /// A whole-canvas merge whose settings differ from the group's last
     /// whole-canvas merge: [`run_blend`] invalidates the whole store before
-    /// writing, so a stopped run leaves nothing that looks current.
+    /// writing, so a stopped run leaves nothing that looks current. A
+    /// region merge is never fresh (the sink invalidates just its rect;
+    /// one with other settings makes the group out of date instead, see
+    /// [`region_differs`]).
+    ///
+    /// The tile sink ([`crate::tiles::TileSink::new`]) also invalidates
+    /// the whole aligned rect of any whole-canvas merge, fresh or not, so
+    /// a finished whole merge always rewrites every tile. `fresh` is kept
+    /// for durability: it invalidates and flushes the state table before
+    /// [`crate::tiles::blend_tiles`] starts, whereas the sink's
+    /// invalidation sits only in the mapping until the run ends, through
+    /// the (possibly long) blend that reads every panel. A crash or cancel
+    /// before the sink exists (or before its invalidation reaches the disk)
+    /// still leaves the group out of date. Neither covers the other: keep
+    /// both.
     pub fresh: bool,
 }
 
@@ -529,6 +543,13 @@ pub fn run_blend(plan: &BlendPlan, ctl: &JobCtl) -> Result<[u64; 4]> {
         Some(s) => s,
         None => TileStore::create(path, geometry)?,
     };
+    // Durability, not redundancy: `TileSink::new` (inside `blend_tiles`)
+    // also invalidates the whole aligned rect of any whole-canvas merge,
+    // but only in the mapping, unflushed until the run ends, and
+    // `blend_tiles` can fail before the sink exists. Invalidating and
+    // flushing here, before the (possibly long) blend reads the panels,
+    // means a crash or cancel at any point still leaves the group out of
+    // date rather than its old-settings tiles looking current. Keep both.
     if plan.fresh {
         store.invalidate_all();
         store.flush_state()?;
@@ -753,17 +774,57 @@ pub fn commit_blend_settings(m: &mut Mosaic, blend: BlendSettings) -> Result<()>
     Ok(())
 }
 
+/// Whether `e` is a `"blend"` entry of `group`.
+fn is_merge_of(e: &ProvenanceEntry, group: &str) -> bool {
+    e.action == "blend" && e.group.as_deref() == Some(group)
+}
+
+/// Whether a `"blend"` entry was a whole-canvas merge: `whole` is not
+/// false (entries without the key predate it and count as whole).
+fn is_whole(e: &ProvenanceEntry) -> bool {
+    e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false)
+}
+
+/// The settings a `"blend"` entry records (`None` if they do not parse).
+fn merge_settings(e: &ProvenanceEntry) -> Option<BlendSettings> {
+    serde_json::from_value(e.detail.get("settings")?.clone()).ok()
+}
+
+/// Where `group`'s newest whole-canvas merge is in the provenance trail.
+fn last_whole_merge(cfg: &MosaicConfig, group: &str) -> Option<usize> {
+    cfg.provenance
+        .iter()
+        .rposition(|e| is_merge_of(e, group) && is_whole(e))
+}
+
 /// The blend settings of `group`'s newest whole-canvas merge, from the
 /// provenance trail (`None` if never merged, or if that entry's settings do
 /// not parse: an older entry never answers for it). Region merges (`whole` false)
 /// are skipped; entries without a `whole` key predate it and count as whole.
 pub fn last_merge_settings(cfg: &MosaicConfig, group: &str) -> Option<BlendSettings> {
-    cfg.provenance
+    last_whole_merge(cfg, group).and_then(|i| merge_settings(&cfg.provenance[i]))
+}
+
+/// Whether a region of `group` was merged, since its newest whole-canvas
+/// merge, with settings different from that merge's
+/// ([`last_merge_settings`]): some `"blend"` entry of the group with
+/// `whole` false, later in the provenance trail than the newest whole
+/// entry, records other settings. Its tiles then sit in the group's store
+/// beside the whole merge's, so the store is complete but not of one
+/// merge: a frontend treats the group as out of date (a whole merge
+/// rewrites it) rather than as merely having changed settings. A later
+/// region merge with the whole merge's settings does not clear it (the
+/// other tiles may remain outside it); only a whole merge does. `false`
+/// when no whole merge is recorded (the group is not merged at all).
+pub fn region_differs(cfg: &MosaicConfig, group: &str) -> bool {
+    let Some(whole) = last_whole_merge(cfg, group) else {
+        return false;
+    };
+    let merged = merge_settings(&cfg.provenance[whole]);
+    cfg.provenance[whole + 1..]
         .iter()
-        .rev()
-        .filter(|e| e.action == "blend" && e.group.as_deref() == Some(group))
-        .find(|e| e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false))
-        .and_then(|e| serde_json::from_value(e.detail.get("settings")?.clone()).ok())
+        .filter(|e| is_merge_of(e, group))
+        .any(|e| merge_settings(e) != merged)
 }
 
 /// The analyze settings `group` was last analyzed with, from the newest
@@ -788,12 +849,17 @@ pub enum OutOfDateReason {
     NotMerged,
     /// Nothing explains it: a merge that did not finish.
     MergeUnfinished,
+    /// A region was merged with other settings since the whole-canvas
+    /// merge ([`region_differs`]).
+    RegionDiffers,
 }
 
 /// Why `group`'s mosaic is out of date, first match of: it needs analysis
 /// and its effective analysis settings differ from [`last_analyze_settings`]
 /// ([`OutOfDateReason::AnalysisSettings`]); it needs analysis
-/// ([`OutOfDateReason::Panels`]); no whole merge is recorded
+/// ([`OutOfDateReason::Panels`]); a region was merged with other settings
+/// since the whole merge ([`region_differs`]:
+/// [`OutOfDateReason::RegionDiffers`]); no whole merge is recorded
 /// ([`OutOfDateReason::NotMerged`]); an `"inputs"` entry newer than the
 /// group's last whole merge touches it (no `affected` key, or it lists the
 /// group: `Panels`); an `"analyze"` entry listing the group, newer than
@@ -812,11 +878,10 @@ pub fn out_of_date_reason(cfg: &MosaicConfig, group: &str) -> OutOfDateReason {
             OutOfDateReason::Panels
         };
     }
-    let Some(merge) = cfg.provenance.iter().rposition(|e| {
-        e.action == "blend"
-            && e.group.as_deref() == Some(group)
-            && e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false)
-    }) else {
+    if region_differs(cfg, group) {
+        return OutOfDateReason::RegionDiffers;
+    }
+    let Some(merge) = last_whole_merge(cfg, group) else {
         return OutOfDateReason::NotMerged;
     };
     let after = &cfg.provenance[merge + 1..];
