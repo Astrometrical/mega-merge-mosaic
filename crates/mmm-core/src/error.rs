@@ -51,6 +51,12 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// The reference frame derived from the panels no longer equals the one
+    /// the other groups were analysed on, so a scoped analysis cannot be
+    /// trusted: analyse every group.
+    #[error("the reference frame moved; every group needs analysing")]
+    FrameMoved,
+
     /// The job was cancelled by the caller (see [`crate::job::CancelToken`]).
     #[error("cancelled")]
     Cancelled,
@@ -65,6 +71,11 @@ impl Error {
     /// True if this error is [`Error::Busy`].
     pub fn is_busy(&self) -> bool {
         matches!(self, Error::Busy { .. })
+    }
+
+    /// True if this error is [`Error::FrameMoved`].
+    pub fn is_frame_moved(&self) -> bool {
+        matches!(self, Error::FrameMoved)
     }
 
     /// Build an [`Error::Busy`] for `path`.

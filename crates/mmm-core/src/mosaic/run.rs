@@ -18,7 +18,7 @@
 //! <dir>/groups/<group dir>/result.mmmt   the group's tiled result
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -34,7 +34,7 @@ use crate::formats::InputPanel;
 use crate::job::JobCtl;
 use crate::overlap::OverlapGraph;
 use crate::photometry::Photometry;
-use crate::reference;
+use crate::reference::{self, ReferenceFrame};
 use crate::session::Session;
 use crate::settings::{
     AnalyzeSettings, BlendSettings, ChangeImpact, GroupOverride, analyze_change, blend_change,
@@ -219,8 +219,25 @@ pub struct AnalyzePlan {
     pub input: InputSelect,
     /// The groups as resolved when planning.
     pub resolved: Groups,
-    /// The processing groups to analyze, in order.
+    /// The processing groups to analyze, in order. Empty for a
+    /// [`AnalyzeScope::Needed`] plan when nothing needs analysing; running
+    /// such a plan does nothing (no frame is derived, no provenance added).
     pub groups: Vec<AnalyzeGroup>,
+    /// The saved analysed reference frame, set by a [`AnalyzeScope::Needed`]
+    /// plan when a frame file exists: [`run_analyze`] refuses with
+    /// [`Error::FrameMoved`] if the frame derived from the panels now
+    /// differs, because the groups left out were analysed on the old one.
+    pub expected_frame: Option<ReferenceFrame>,
+}
+
+/// Which groups a [`plan_analyze_scoped`] plan analyses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalyzeScope {
+    /// Every processing group.
+    All,
+    /// Only groups in [`MosaicConfig::needs_analyze`], plus resolved groups
+    /// never analysed (no recorded directory).
+    Needed,
 }
 
 /// What a [`run_analyze`] achieved, for [`Mosaic::apply_analyze`].
@@ -261,11 +278,35 @@ pub fn plan_analyze(m: &mut Mosaic) -> Result<AnalyzePlan> {
 /// owner thread that must not do file reads proportional to the panel
 /// count. `resolved` must come from the current panels and grouping.
 pub fn plan_analyze_with(m: &mut Mosaic, resolved: Groups) -> Result<AnalyzePlan> {
+    plan_analyze_scoped(m, resolved, AnalyzeScope::All)
+}
+
+/// [`plan_analyze_with`] limited by `scope`. A [`AnalyzeScope::Needed`] plan
+/// builds, locks, invalidates and marks only its groups (marks of vanished
+/// groups are still dropped), and records the saved analysed frame in
+/// [`AnalyzePlan::expected_frame`] (a missing or unreadable frame file gives
+/// `None`). A plan with no groups is valid and does nothing when run.
+pub fn plan_analyze_scoped(
+    m: &mut Mosaic,
+    resolved: Groups,
+    scope: AnalyzeScope,
+) -> Result<AnalyzePlan> {
     let mut next = m.clone();
+    let never_analyzed: BTreeSet<String> = resolved
+        .processing_groups()
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| !m.config.group_dirs.contains_key(n))
+        .collect();
     next.assign_group_dirs(&resolved);
     let groups: Vec<AnalyzeGroup> = resolved
         .processing_groups()
         .into_iter()
+        .filter(|(name, _)| {
+            scope == AnalyzeScope::All
+                || next.config.needs_analyze.contains(name)
+                || never_analyzed.contains(name)
+        })
         .map(|(name, paths)| AnalyzeGroup {
             session_dir: next.group_session_dir(&name),
             result_path: next.result_path(&name),
@@ -279,22 +320,33 @@ pub fn plan_analyze_with(m: &mut Mosaic, resolved: Groups) -> Result<AnalyzePlan
     // Groups that no longer resolve (a rule or manual-group change) can
     // never be analysed: drop their marks. Their directories stay in
     // `group_dirs`, so caches stay stable if the name comes back.
+    let resolved_names: BTreeSet<String> = resolved
+        .processing_groups()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     next.config
         .needs_analyze
-        .retain(|name| groups.iter().any(|g| &g.name == name));
+        .retain(|name| resolved_names.contains(name));
     next.config
         .needs_analyze
         .extend(groups.iter().map(|g| g.name.clone()));
     invalidate(&mut stores)?;
     next.save()?;
     *m = next;
+    let frame_path = m.dir.join(FRAME_FILE);
+    let expected_frame = match scope {
+        AnalyzeScope::All => None,
+        AnalyzeScope::Needed => ReferenceFrame::load(&frame_path).ok(),
+    };
     Ok(AnalyzePlan {
         dir: m.dir.clone(),
-        frame_path: m.dir.join(FRAME_FILE),
+        frame_path,
         panels: m.config.panels.iter().map(|p| p.path.clone()).collect(),
         input: m.config.analyze.input,
         resolved,
         groups,
+        expected_frame,
     })
 }
 
@@ -315,7 +367,13 @@ pub fn run_analyze(plan: &AnalyzePlan, ctl: &JobCtl) -> (AnalyzeOutcome, Result<
 
 fn run_analyze_into(plan: &AnalyzePlan, ctl: &JobCtl, out: &mut AnalyzeOutcome) -> Result<()> {
     ctl.check()?;
+    if plan.groups.is_empty() {
+        return Ok(());
+    }
     let frame = reference::derive(&plan.panels, plan.input)?;
+    if plan.expected_frame.as_ref().is_some_and(|e| *e != frame) {
+        return Err(Error::FrameMoved);
+    }
     frame.save(&plan.frame_path)?;
     let mut detail = serde_json::Map::new();
     for g in &plan.groups {
@@ -741,17 +799,48 @@ pub fn settings_changed(cfg: &MosaicConfig, group: &str, draft: &BlendSettings) 
 /// Refused with nothing changed (in memory or on disk) with [`Error::Busy`]
 /// when any store is held by a writer.
 pub fn set_inputs(m: &mut Mosaic, panels: Vec<PanelEntry>, grouping: Grouping) -> Result<()> {
+    set_inputs_affecting(m, panels, grouping, None)
+}
+
+/// [`set_inputs`] limited to `affected` groups (see [`super::grouping::affected_groups`]):
+/// only their stores are locked and invalidated and only they (those with a
+/// recorded directory) are marked in [`MosaicConfig::needs_analyze`]; other
+/// groups stay valid and unmarked. `None` means every group, exactly
+/// [`set_inputs`]. The `"inputs"` provenance entry gains an `"affected"`
+/// list of names when `affected` is `Some` (absent = all).
+pub fn set_inputs_affecting(
+    m: &mut Mosaic,
+    panels: Vec<PanelEntry>,
+    grouping: Grouping,
+    affected: Option<&BTreeSet<String>>,
+) -> Result<()> {
     if panels == m.config.panels && grouping == m.config.grouping {
         return Ok(());
     }
-    let mut stores = lock_stores(&all_result_stores(m)?)?;
+    let mut stores = match affected {
+        None => lock_stores(&all_result_stores(m)?)?,
+        Some(a) => {
+            let paths: Vec<PathBuf> = a.iter().map(|g| m.result_path(g)).collect();
+            lock_stores(&paths)?
+        }
+    };
     let mut next = m.config.clone();
-    next.needs_analyze.extend(next.group_dirs.keys().cloned());
-    next.push_provenance(
-        "inputs",
-        None,
-        json!({ "panels": panels.len(), "groups": next.group_dirs.len() }),
-    );
+    match affected {
+        None => next.needs_analyze.extend(next.group_dirs.keys().cloned()),
+        Some(a) => {
+            let marked: Vec<String> = a
+                .iter()
+                .filter(|g| next.group_dirs.contains_key(*g))
+                .cloned()
+                .collect();
+            next.needs_analyze.extend(marked);
+        }
+    }
+    let mut detail = json!({ "panels": panels.len(), "groups": next.group_dirs.len() });
+    if let Some(a) = affected {
+        detail["affected"] = json!(a);
+    }
+    next.push_provenance("inputs", None, detail);
     next.panels = panels;
     next.grouping = grouping;
     invalidate(&mut stores)?;

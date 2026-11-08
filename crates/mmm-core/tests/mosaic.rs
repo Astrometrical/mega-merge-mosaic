@@ -2,18 +2,21 @@
 //! groups, `blend_group` into each group's tiled result, and settings edits
 //! staling exactly the stores they affect.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mmm_core::Result;
 use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
+use mmm_core::mosaic::grouping::{Groups, affected_groups};
 use mmm_core::mosaic::{
-    FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
-    analyze_all, blend_group, commit_blend_settings, invalidate_group, last_analyze_settings,
-    last_merge_settings, mark_needs_analyze, plan_analyze, plan_analyze_with, plan_blend,
-    plan_blend_with, run_analyze, run_blend, set_analyze_settings, set_blend_settings,
-    set_group_override, set_inputs, set_settings, settings_changed,
+    AnalyzeScope, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE,
+    SINGLE_GROUP, analyze_all, blend_group, commit_blend_settings, invalidate_group,
+    last_analyze_settings, last_merge_settings, mark_needs_analyze, plan_analyze,
+    plan_analyze_scoped, plan_analyze_with, plan_blend, plan_blend_with, run_analyze, run_blend,
+    set_analyze_settings, set_blend_settings, set_group_override, set_inputs, set_inputs_affecting,
+    set_settings, settings_changed,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -1282,4 +1285,174 @@ fn set_settings_still_invalidates() {
         ChangeImpact::Reblend
     );
     assert_eq!(valid0(&m.result_path("Ha")), 0);
+}
+
+fn groups_of(pairs: &[(&str, &[&str])], ungrouped: &[&str]) -> Groups {
+    Groups {
+        groups: pairs
+            .iter()
+            .map(|(n, p)| (n.to_string(), p.iter().map(PathBuf::from).collect()))
+            .collect(),
+        ungrouped: ungrouped.iter().map(PathBuf::from).collect(),
+    }
+}
+
+#[test]
+fn affected_groups_finds_changed_members() {
+    let old = groups_of(&[("Ha", &["a", "b"]), ("OIII", &["c", "d"])], &[]);
+    let names = |g: &Groups| affected_groups(&old, g).into_iter().collect::<Vec<_>>();
+    // A panel moves from Ha to OIII: both change.
+    let moved = groups_of(&[("Ha", &["a"]), ("OIII", &["c", "d", "b"])], &[]);
+    assert_eq!(names(&moved), ["Ha", "OIII"]);
+    // A panel added to Ha.
+    let added = groups_of(&[("Ha", &["a", "b", "e"]), ("OIII", &["c", "d"])], &[]);
+    assert_eq!(names(&added), ["Ha"]);
+    // A panel removed from OIII.
+    let removed = groups_of(&[("Ha", &["a", "b"]), ("OIII", &["c"])], &[]);
+    assert_eq!(names(&removed), ["OIII"]);
+    // A new group, and a vanished one.
+    let new = groups_of(
+        &[("Ha", &["a", "b"]), ("OIII", &["c", "d"]), ("SII", &["e"])],
+        &[],
+    );
+    assert_eq!(names(&new), ["SII"]);
+    let vanished = groups_of(&[("Ha", &["a", "b"])], &[]);
+    assert_eq!(names(&vanished), ["OIII"]);
+    // Same membership (even reordered, ungrouped folded in): nothing.
+    let same = groups_of(&[("Ha", &["b", "a"])], &["c", "d"]);
+    let old_u = groups_of(&[("Ha", &["a", "b"])], &["d", "c"]);
+    assert!(affected_groups(&old_u, &same).is_empty());
+    assert!(affected_groups(&old, &old.clone()).is_empty());
+}
+
+#[test]
+fn inputs_affecting_one_group_spares_the_others() {
+    let (_tmp, mut m) = blended_two_groups("inputs-affecting");
+    let oiii_valid = valid0(&m.result_path("OIII"));
+    assert!(oiii_valid > 0);
+    let mut panels = m.config.panels.clone();
+    panels.remove(0);
+    let grouping = m.config.grouping.clone();
+    let affected: BTreeSet<String> = ["Ha".to_string()].into();
+    // OIII's store being held does not matter: it is not touched.
+    let held = TileStore::open(&m.result_path("OIII")).unwrap();
+    set_inputs_affecting(&mut m, panels, grouping, Some(&affected)).unwrap();
+    drop(held);
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
+    assert_eq!(valid0(&m.result_path("OIII")), oiii_valid);
+    assert_eq!(
+        m.config.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Ha"]
+    );
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(saved, m.config);
+    let last = saved.provenance.last().unwrap();
+    assert_eq!(last.action, "inputs");
+    assert_eq!(last.detail["affected"], serde_json::json!(["Ha"]));
+}
+
+#[test]
+fn set_inputs_still_marks_everything() {
+    // Regression guard (ruling R-P1): set_inputs stays "all groups".
+    let (_tmp, mut m) = blended_two_groups("inputs-all");
+    let mut panels = m.config.panels.clone();
+    panels.remove(0);
+    let grouping = m.config.grouping.clone();
+    set_inputs(&mut m, panels, grouping).unwrap();
+    assert_eq!(
+        m.config.needs_analyze.iter().cloned().collect::<Vec<_>>(),
+        ["Ha", "OIII"]
+    );
+    assert_eq!(valid0(&m.result_path("OIII")), 0);
+    let last = m.config.provenance.last().unwrap();
+    assert!(last.detail.get("affected").is_none());
+}
+
+#[test]
+fn needed_scope_analyses_only_marked_groups() {
+    let (_tmp, mut m) = blended_two_groups("needed-scope");
+    let oiii_dir = m.group_session_dir("OIII");
+    let snapshot = |dir: &Path| -> Vec<(PathBuf, std::time::SystemTime)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.path().is_file())
+            .map(|e| (e.path(), e.metadata().unwrap().modified().unwrap()))
+            .collect();
+        v.sort();
+        v
+    };
+    let before = snapshot(&oiii_dir);
+    assert!(!before.is_empty());
+    let oiii_valid = valid0(&m.result_path("OIII"));
+    mark_needs_analyze(&mut m, &["Ha".into()]).unwrap();
+    let resolved = m.groups().unwrap();
+    let plan = plan_analyze_scoped(&mut m, resolved, AnalyzeScope::Needed).unwrap();
+    assert_eq!(
+        plan.groups
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Ha"]
+    );
+    assert!(plan.expected_frame.is_some());
+    let (outcome, res) = run_analyze(&plan, &JobCtl::none());
+    res.unwrap();
+    m.apply_analyze(&outcome).unwrap();
+    assert!(m.config.needs_analyze.is_empty());
+    assert_eq!(snapshot(&oiii_dir), before);
+    assert_eq!(valid0(&m.result_path("OIII")), oiii_valid);
+    let last = m
+        .config
+        .provenance
+        .iter()
+        .rev()
+        .find(|e| e.action == "analyze")
+        .unwrap();
+    let names: Vec<&String> = last.detail["groups"].as_object().unwrap().keys().collect();
+    assert_eq!(names, ["Ha"]);
+}
+
+#[test]
+fn needed_scope_includes_never_analysed_and_may_be_empty() {
+    let (_tmp, mut m) = blended_two_groups("needed-empty");
+    let resolved = m.groups().unwrap();
+    // Nothing marked, everything analysed: a valid empty plan; running it
+    // does nothing.
+    let plan = plan_analyze_scoped(&mut m, resolved, AnalyzeScope::Needed).unwrap();
+    assert!(plan.groups.is_empty());
+    let frame_before = std::fs::read(&plan.frame_path).unwrap();
+    let (outcome, res) = run_analyze(&plan, &JobCtl::none());
+    res.unwrap();
+    assert_eq!(outcome, Default::default());
+    assert_eq!(std::fs::read(&plan.frame_path).unwrap(), frame_before);
+    // A group with no directory yet is included.
+    let tmp = TempDir::new("needed-new");
+    let mut fresh = two_group_mosaic(&tmp.0);
+    let resolved = fresh.groups().unwrap();
+    let plan = plan_analyze_scoped(&mut fresh, resolved, AnalyzeScope::Needed).unwrap();
+    assert_eq!(plan.groups.len(), 2);
+    assert!(plan.expected_frame.is_none());
+}
+
+#[test]
+fn a_moved_frame_fails_the_scoped_run() {
+    let (_tmp, mut m) = blended_two_groups("frame-moved");
+    let frame_path = m.dir.join(FRAME_FILE);
+    // The analysed frame is not what the panels derive now.
+    let moved = mmm_core::reference::ReferenceFrame::Aligned {
+        width: CANVAS.0 + 1,
+        height: CANVAS.1,
+        wcs: None,
+    };
+    moved.save(&frame_path).unwrap();
+    let before = std::fs::read(&frame_path).unwrap();
+    mark_needs_analyze(&mut m, &["Ha".into()]).unwrap();
+    let resolved = m.groups().unwrap();
+    let plan = plan_analyze_scoped(&mut m, resolved, AnalyzeScope::Needed).unwrap();
+    let (outcome, res) = run_analyze(&plan, &JobCtl::none());
+    let err = res.unwrap_err();
+    assert!(err.is_frame_moved(), "{err}");
+    assert!(outcome.completed.is_empty() && outcome.provenance.is_empty());
+    assert_eq!(std::fs::read(&frame_path).unwrap(), before);
 }
