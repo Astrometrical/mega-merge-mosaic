@@ -269,7 +269,7 @@ impl RoiPanel {
     /// Start the sync (reading the frame at `frame`) and freshness counts
     /// over `members` (each group of the view and its open result) on
     /// workers when asked for. A freshness task holds the sources: the
-    /// caller tracks any it gives up meanwhile (`blend_tab`).
+    /// caller tracks any it gives up meanwhile (`mosaic_view`).
     pub fn start_tasks(
         &mut self,
         ctx: &egui::Context,

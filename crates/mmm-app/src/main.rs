@@ -15,6 +15,7 @@ mod compositions;
 mod display_stretch;
 mod export;
 mod jobs;
+mod mosaic_view;
 mod panels_tab;
 mod pipeline;
 mod plan_tab;

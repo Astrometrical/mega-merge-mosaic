@@ -1,0 +1,1372 @@
+//! The merged mosaic canvas (spec §5–§7): the view's merged results drawn
+//! tile by tile in the shared frame, with its regions of interest. Only the
+//! canvas: the window around it picks the view ([`MosaicView::select_view`])
+//! and the look ([`CanvasLook`]), starts merges and exports through its
+//! methods, and shows the ROI list ([`MosaicView::rois_ui`]), the merge
+//! settings ([`MosaicView::settings_ui`]) and the health
+//! ([`MosaicView::health_ui`]) where it likes.
+//!
+//! - **Views.** Each group, then each composition (the plan's
+//!   compositions, [`crate::compositions`]). A composition view mixes its
+//!   groups' results in a [`CompositeTileSource`], each through that
+//!   group's own display stretch; the health is that of one member (the
+//!   health section picks it). A group not merged yet adds nothing and is
+//!   named above the image; groups on different canvases cannot be mixed:
+//!   the view says why instead.
+//! - **ROIs** ([`crate::rois`]): drawn on the canvas with the viewer's draw
+//!   tool, named, noted, selected (the viewer zooms to it) and deleted;
+//!   kept in `MosaicConfig.ui`. Reading the frame and reprojecting them
+//!   (sky ↔ canvas) and counting how many of an ROI's level-0 tiles are
+//!   fresh (per group of the view) run on workers ([`RoiPanel`]).
+//!   [`MosaicView::merge_roi`] starts one merge of the selected ROI per
+//!   group of the view (the job runner queues them; newer work wins per
+//!   group), once the ROIs follow the current frame;
+//!   [`MosaicView::merge_all`] merges every group over the whole canvas.
+//! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
+//!   analysis and merge settings, staged and applied with their cost shown
+//!   first. While its tile count runs or an edit waits to apply, merging is
+//!   blocked; an applied edit reloads the view's (now stale) tiles.
+//! - **Export** ([`crate::export`]) writes the view's groups' results to
+//!   FITS or TIFF as jobs, after warning about stale or missing tiles.
+//! - **Camera.** [`MosaicView::set_camera`] moves the canvas without
+//!   animation from the next frame the viewer paints. The viewer is
+//!   rebuilt when the view's results come and go (a view without any
+//!   result has none); the camera is kept across that, and across a new
+//!   canvas size: the next viewer's first painted frame is through it,
+//!   never its home fit.
+//! - **Stretch.** Always automatic: [`DisplayStretch::params`] of each
+//!   shown group's coarse pyramid statistics, with the look's Linked and
+//!   Strong ([`CanvasLook::stretch`]). No pumping: while a merge of a shown
+//!   group runs, the stretch in use is held (the previous result's; for a
+//!   group's first result in a group view, the plan's stretch handed to
+//!   [`MosaicView::show`]). It is worked out again when the merges of the
+//!   shown groups have ended, when the view changes and when the look
+//!   changes. The manual stretch earlier versions saved per group
+//!   (`blend_stretch` in `MosaicConfig.ui`) is ignored.
+//!
+//! Everything slow runs on background threads ([`Task`]): opening each
+//! result ([`open_result`]), the automatic stretch statistics, the health
+//! metrics, the ROI sync and freshness counts. The one write on the UI
+//! thread is the debounced `mosaic.json` save of the ROI list (at most once
+//! per [`SAVE_INTERVAL`](crate::util::SAVE_INTERVAL)), the same documented
+//! exception as the job runner's plan/apply saves.
+//!
+//! # No reader across a store recreation
+//!
+//! `run_blend` recreates (truncates) a group's store only when it is
+//! missing, unparseable, or its geometry differs from the group's analysed
+//! canvas; a live [`mmm_core::tiles::TileReader`] would then fault. This
+//! view guards the geometry path (the other two have no reader to fault),
+//! for every group it shows:
+//!
+//! - a source is kept only when [`open_result`] found the store's geometry
+//!   equal to the group's analysed canvas, so a merge reopens it in place;
+//! - the canvas changes only by analysis: after every analysis (finished,
+//!   cancelled or failed) every shown group's result is checked again, and
+//!   while an analysis is running or queued, or any shown group's check is
+//!   pending, merging is blocked ([`MosaicView::merge_block_reason`]; a
+//!   merge queued behind an analysis would start the moment it is applied,
+//!   before the check);
+//! - a source given up (out of date, view switched, replaced) is tracked by
+//!   a `Weak` until the viewer's loader threads and any statistics or
+//!   freshness task have dropped it; merging stays blocked until then. A
+//!   composite holds every member's reader, so a member given up stays
+//!   tracked until the composite itself is dropped: all member readers are
+//!   released before any member's store may be recreated;
+//! - with no source open, a merge's first progress update means it has
+//!   created its store (progress is only reported once tiles are written),
+//!   so the result is opened then and tiles appear while it runs; while a
+//!   merge of a shown group is queued or has not reported yet (e.g. after
+//!   switching to that group), no open of that group starts.
+//!
+//! Another program (the `mmm` CLI) recreating the store while it is shown
+//! is not guarded against.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+use egui::{Color32, RichText};
+use mega_ui::theme::palette;
+use mega_ui::theme::text::{Type, text};
+use mega_ui::theme::tokens::space;
+use mega_ui::viewer::{PyramidGeometry, TileSource, TiledViewer};
+use mmm_core::health::{Health, health};
+use mmm_core::mosaic::FRAME_FILE;
+use mmm_core::overlap::OverlapGraph;
+use mmm_core::photometry::Photometry;
+use mmm_core::session::Session;
+use mmm_core::settings::ChangeImpact;
+use mmm_core::stretch::StretchParams;
+use mmm_core::surfaces::Surfaces;
+use serde_json::Value;
+
+use crate::blend_settings::SettingsPanel;
+use crate::camera::Camera;
+use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
+use crate::display_stretch::DisplayStretch;
+use crate::export::{ExportAction, ExportDialog, RfdSavePicker};
+use crate::jobs::{JobEvent, JobRunner};
+use crate::plan_view::CanvasLook;
+use crate::rois::{Roi, RoiPanel};
+use crate::session::OpenSession;
+use crate::stretch_panel::channel_name;
+use crate::tile_source::{CompositeTileSource, MosaicTileSource, Opened, open_result};
+use crate::util::{Debounce, Poll, Task, group_names};
+
+/// How often to look again while a given-up source is still being released.
+const RELEASE_POLL: Duration = Duration::from_millis(20);
+
+/// Health of the shown group, or why there is none.
+type HealthResult = Result<Health, String>;
+
+/// Compute `health` for the group analysed in `session_dir` (blocking).
+fn load_health(session_dir: &std::path::Path, feather_px: f32) -> HealthResult {
+    let run = || -> mmm_core::Result<Health> {
+        let session = Session::open(session_dir)?;
+        let graph = OverlapGraph::load(&session.overlap_graph_path())?;
+        let phot = Photometry::load(&session.photometry_path())?;
+        let surfaces = if session.surfaces_path().exists() {
+            Some(Surfaces::load(&session.surfaces_path())?)
+        } else {
+            None
+        };
+        health(&session, &graph, &phot, surfaces.as_ref(), feather_px)
+    };
+    run().map_err(|e| e.to_string())
+}
+
+/// Where a group stands for merging; ordered worst first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Readiness {
+    /// Never analysed.
+    NotAnalyzed,
+    /// Analysis settings changed since the last analysis.
+    NeedsAnalyze,
+    /// Can be merged.
+    Analyzed,
+}
+
+/// The groups a view shows: the group itself, or a composition's mapped
+/// groups (each once, in channel order). An unknown composition shows
+/// nothing.
+fn view_members(view: &ViewKind, compositions: &[Composition]) -> Vec<String> {
+    match view {
+        ViewKind::Group(g) => vec![g.clone()],
+        ViewKind::Composition(i) => {
+            let mut out: Vec<String> = Vec::new();
+            for (g, _) in compositions
+                .get(*i)
+                .into_iter()
+                .flat_map(|c| c.channels.iter().flatten())
+            {
+                if !out.contains(g) {
+                    out.push(g.clone());
+                }
+            }
+            out
+        }
+    }
+}
+
+/// When a group's stretch is to be worked out again; ordered by urgency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Refresh {
+    /// Not asked for.
+    None,
+    /// Once no merge of a shown group is pending (the data has settled).
+    WhenIdle,
+    /// As soon as possible (the view or the look changed).
+    Now,
+}
+
+/// One group of the view: its open result and its display stretch.
+struct Member {
+    /// The open result (geometry checked, see the module docs).
+    source: Option<Arc<MosaicTileSource>>,
+    /// Why there is no source.
+    absent: Option<String>,
+    /// A pending [`open_result`], with the look's stretch it was asked for.
+    opening: Option<Task<(DisplayStretch, Opened)>>,
+    /// Open (again) once no open is pending.
+    reopen: bool,
+    /// Last seen `(job, progress updates)` of this group's running merge.
+    last_progress: Option<(u64, u64)>,
+    /// A pending automatic stretch of `source`, with the look's stretch it
+    /// was asked for.
+    auto: Option<Task<(DisplayStretch, Option<Vec<StretchParams>>)>>,
+    /// When to work the stretch out again.
+    refresh: Refresh,
+    /// The stretch last given to this group's result, kept while it is
+    /// opened again (what a merge holds).
+    stretch: Option<Vec<StretchParams>>,
+}
+
+impl Member {
+    /// A member to be opened.
+    fn new() -> Self {
+        Member {
+            source: None,
+            absent: None,
+            opening: None,
+            reopen: true,
+            last_progress: None,
+            auto: None,
+            refresh: Refresh::None,
+            stretch: None,
+        }
+    }
+
+    /// Nothing pending for this member.
+    fn idle(&self) -> bool {
+        self.opening.is_none()
+            && !self.reopen
+            && self.auto.is_none()
+            && (self.refresh == Refresh::None || self.source.is_none())
+    }
+
+    /// Give up the source (the viewer's loaders let go of it after their
+    /// current fetch), tracking it in `retired`.
+    fn retire(&mut self, retired: &mut Vec<Weak<MosaicTileSource>>) {
+        if let Some(src) = self.source.take() {
+            retired.push(Arc::downgrade(&src));
+        }
+        self.auto = None;
+    }
+}
+
+/// What the viewer shows: each member's source (by address, 0 for none)
+/// and the composition mapping, so the viewer source is rebuilt only when
+/// one of them changes.
+type ShownKey = (Vec<usize>, Vec<Option<(String, u32)>>);
+
+/// The merged mosaic canvas of the open session: what it draws, and the
+/// work behind it (see the module docs).
+pub struct MosaicView {
+    /// The view shown: a group or a composition.
+    view: Option<ViewKind>,
+    /// The groups of the view, in order.
+    members: Vec<String>,
+    /// The member whose health is shown.
+    group: Option<String>,
+    /// Each member's result and stretch state.
+    results: BTreeMap<String, Member>,
+    viewer: Option<TiledViewer>,
+    /// The geometry of `viewer`'s source.
+    viewer_geometry: Option<PyramidGeometry>,
+    /// What `viewer` was last given (see [`ShownKey`]).
+    shown_key: Option<ShownKey>,
+    /// Why the view cannot be drawn though its results are open (e.g. a
+    /// composition of groups on different canvases).
+    view_problem: Option<String>,
+    /// Sources given up but maybe still mapped by loader, statistics or
+    /// freshness threads (directly or inside a composite).
+    retired: Vec<Weak<MosaicTileSource>>,
+    /// A camera the viewer paints its next frame through: one set from
+    /// outside, or the last one shown when the viewer was rebuilt.
+    camera: Option<Camera>,
+    /// The look's stretch the members' stretches follow.
+    look: DisplayStretch,
+    /// The view the members' stretches were last worked out for.
+    stretch_view: Option<ViewKind>,
+    health: Option<HealthResult>,
+    health_task: Option<Task<(String, HealthResult)>>,
+    want_health: bool,
+    /// Where the health's group stands (as of the last frame shown).
+    readiness: Readiness,
+    save: Debounce,
+    /// The analysis this view tracks, until it ends.
+    analyze_job: Option<u64>,
+    /// The merges this view started, until they end: job id → group.
+    merge_jobs: BTreeMap<u64, String>,
+    loader_threads: usize,
+    /// Drawn at least once.
+    shown: bool,
+    /// The session's ROIs and their workers.
+    rois: RoiPanel,
+    /// The export dialog.
+    export: ExportDialog,
+    /// The merge settings panel.
+    settings: SettingsPanel,
+}
+
+impl Default for MosaicView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MosaicView {
+    /// A view showing nothing yet; the first group opens on the first frame.
+    pub fn new() -> Self {
+        MosaicView {
+            view: None,
+            members: Vec::new(),
+            group: None,
+            results: BTreeMap::new(),
+            viewer: None,
+            viewer_geometry: None,
+            shown_key: None,
+            view_problem: None,
+            retired: Vec::new(),
+            camera: None,
+            look: DisplayStretch::default(),
+            stretch_view: None,
+            health: None,
+            health_task: None,
+            want_health: false,
+            readiness: Readiness::NotAnalyzed,
+            save: Debounce::default(),
+            analyze_job: None,
+            merge_jobs: BTreeMap::new(),
+            loader_threads: std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .clamp(2, 8),
+            shown: false,
+            rois: RoiPanel::default(),
+            export: ExportDialog::new(Arc::new(RfdSavePicker)),
+            settings: SettingsPanel::new(),
+        }
+    }
+
+    /// Show `view` from the next frame on (its groups are resolved then; one
+    /// that no longer exists falls back to the first group).
+    pub fn select_view(&mut self, view: ViewKind) {
+        if self.view.as_ref() != Some(&view) {
+            self.rois.view_changed();
+            self.view = Some(view);
+        }
+    }
+
+    /// The view shown.
+    pub fn view(&self) -> Option<&ViewKind> {
+        self.view.as_ref()
+    }
+
+    /// The group whose health is shown (in a composition view, one of its
+    /// groups).
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    /// Where the canvas looks: a camera set and not painted yet (or kept
+    /// for the next viewer), else what the last frame showed; `None` with
+    /// neither.
+    #[allow(dead_code)] // used by the session window from Task 7 on
+    pub fn camera(&self) -> Option<Camera> {
+        self.camera.or_else(|| self.shown_camera())
+    }
+
+    /// Look through `camera` from the next frame the viewer paints, with no
+    /// animation (the zoom is clamped to the viewer's limits). Kept until a
+    /// viewer paints it, so it also applies to a viewer made later.
+    #[allow(dead_code)] // used by the session window from Task 7 on
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.camera = Some(camera);
+    }
+
+    /// What the viewer showed in its last frame.
+    fn shown_camera(&self) -> Option<Camera> {
+        let viewer = self.viewer.as_ref()?;
+        let (_, now) = viewer.last_frame()?;
+        Some(Camera::of(viewer.view(), now))
+    }
+
+    /// The shown group's open result, if any.
+    pub fn source(&self) -> Option<&Arc<MosaicTileSource>> {
+        self.member()?.source.as_ref()
+    }
+
+    /// Why the shown group has no result, if it has none. `None` while its
+    /// result is being opened (again): a reason from an earlier open may no
+    /// longer hold, and the view shows "Opening the result…" meanwhile.
+    pub fn absent(&self) -> Option<&str> {
+        let m = self.member()?;
+        if m.opening.is_some() || m.reopen {
+            return None;
+        }
+        m.absent.as_deref()
+    }
+
+    /// The group's health, once computed.
+    pub fn health(&self) -> Option<&HealthResult> {
+        self.health.as_ref()
+    }
+
+    /// The session's ROIs.
+    pub fn rois(&self) -> &[Roi] {
+        self.rois.rois()
+    }
+
+    fn member(&self) -> Option<&Member> {
+        self.results.get(self.group.as_ref()?)
+    }
+
+    /// What the viewer's place says instead of an image, if it has no
+    /// image to show.
+    pub fn shown_text(&self) -> Option<String> {
+        self.viewer.is_none().then(|| self.placeholder())
+    }
+
+    /// True once drawn with nothing pending: no open, statistics, health,
+    /// ROI or freshness task, and the viewer (if any) has drawn and loaded
+    /// its tiles. A session without groups settles at once.
+    pub fn is_settled(&self) -> bool {
+        self.shown
+            && self.results.values().all(Member::idle)
+            && self.health_task.is_none()
+            && self.rois.idle()
+            && self.export.idle()
+            && self.settings.idle()
+            && !self.settings.has_pending()
+            && self
+                .viewer
+                .as_ref()
+                .is_none_or(|v| v.last_frame().is_some() && !v.is_loading())
+    }
+
+    /// The view's key, as the plan keys it: the group's name, or
+    /// [`composition_stretch_key`] of the composition's name (read from
+    /// `ui`, the session's UI settings). `None` before a view is chosen.
+    pub fn view_key(&self, ui: &Value) -> Option<String> {
+        match self.view.as_ref()? {
+            ViewKind::Group(g) => Some(g.clone()),
+            ViewKind::Composition(i) => load_compositions(ui)
+                .get(*i)
+                .map(|c| composition_stretch_key(&c.name)),
+        }
+    }
+
+    /// Save a pending (debounced) ROI change now, whatever the rate limit:
+    /// the window is closing, or the session state is being saved. A small
+    /// `mosaic.json` write on the UI thread (the module's documented
+    /// exception).
+    pub fn flush_save(&mut self, session: &OpenSession) {
+        if !self.save.pending() {
+            return;
+        }
+        self.save.saved(Instant::now());
+        if let Err(e) = session.mosaic.save() {
+            tracing::warn!("ROIs not saved: {e}");
+        }
+    }
+
+    /// Treat analysis job `id`, started elsewhere (the automatic
+    /// pipeline), as this view's: merging is blocked until it ends, and the
+    /// results and health are checked again then.
+    pub fn track_analysis(&mut self, id: u64) {
+        self.analyze_job = Some(id);
+    }
+
+    /// React to a job that ended (from [`JobRunner::poll`]).
+    pub fn on_event(&mut self, event: &JobEvent) {
+        self.settings.on_event(event);
+        let id = match event {
+            JobEvent::Finished { id, .. }
+            | JobEvent::Cancelled { id }
+            | JobEvent::Failed { id, .. } => *id,
+            JobEvent::Preview(_) => return,
+        };
+        if self.analyze_job == Some(id) {
+            // The canvas (and frame) may have changed: check every result
+            // and reproject the ROIs.
+            self.analyze_job = None;
+            for m in self.results.values_mut() {
+                m.reopen = true;
+            }
+            self.want_health = true;
+            self.rois.want_sync = true;
+        } else if let Some(group) = self.merge_jobs.remove(&id) {
+            if let Some(m) = self.results.get_mut(&group) {
+                match &m.source {
+                    // The data has settled (unless another merge of a shown
+                    // group follows): its stretch is worked out again.
+                    Some(src) => {
+                        src.bump();
+                        m.refresh = m.refresh.max(Refresh::WhenIdle);
+                    }
+                    None => m.reopen = true,
+                }
+            }
+            if self.group.as_ref() == Some(&group) {
+                self.want_health = true;
+            }
+            self.rois.want_fresh = true;
+        }
+    }
+
+    /// A global settings edit waits to apply, or jobs cancelled for one
+    /// have not all been reported ([`SettingsPanel::editing`]): the
+    /// automatic pipeline starts nothing meanwhile and restarts what was
+    /// cancelled.
+    pub fn settings_editing(&self, session: &OpenSession) -> bool {
+        self.settings.editing(&session.mosaic.config)
+    }
+
+    /// The merge settings panel's background work and waiting edit (see
+    /// [`SettingsPanel::poll`]). Call every frame after the runner's poll,
+    /// whether or not the canvas is shown; the impact when an edit was
+    /// applied.
+    pub fn poll_settings(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) -> Option<ChangeImpact> {
+        let applied = self.settings.poll(ctx, session, jobs);
+        if let Some(impact) = applied {
+            self.on_settings_applied(impact);
+        }
+        applied
+    }
+
+    /// Settings were applied: the view's results went stale (their tiles
+    /// load again to show it), and ROI freshness and health are computed
+    /// again (health depends on the feather).
+    fn on_settings_applied(&mut self, impact: ChangeImpact) {
+        if impact == ChangeImpact::None {
+            return;
+        }
+        for m in self.results.values() {
+            if let Some(src) = &m.source {
+                src.bump();
+            }
+        }
+        self.rois.want_fresh = true;
+        self.want_health = true;
+    }
+
+    /// Why no merge of every group may start now, if any (`None`: merging
+    /// is allowed). The reason is for the user, e.g. on a disabled Merge
+    /// button. See the module docs for the guard behind most reasons.
+    pub fn merge_block_reason(&self, session: &OpenSession, jobs: &JobRunner) -> Option<String> {
+        self.merge_guard(session, jobs, &group_names(session))
+    }
+
+    /// Why no merge of the selected ROI may start now, if any (`None`:
+    /// [`MosaicView::merge_roi`] is allowed).
+    pub fn merge_roi_block_reason(
+        &self,
+        session: &OpenSession,
+        jobs: &JobRunner,
+    ) -> Option<String> {
+        if self.members.is_empty() {
+            return Some("There is nothing to merge in this view.".into());
+        }
+        if let Some(why) = self.merge_guard(session, jobs, &self.members) {
+            return Some(why);
+        }
+        if self.rois.selected_rect().is_none() {
+            return Some("Select or draw a region of interest first.".into());
+        }
+        if !self.rois.synced() {
+            return Some(
+                "Waiting for the regions of interest to follow the latest analysis.".into(),
+            );
+        }
+        None
+    }
+
+    /// Why no merge of `groups` may start now, if any: the store
+    /// recreation guard of the module docs, and every group analysed.
+    fn merge_guard(
+        &self,
+        session: &OpenSession,
+        jobs: &JobRunner,
+        groups: &[String],
+    ) -> Option<String> {
+        if groups.is_empty() {
+            return Some("There are no panels to merge yet.".into());
+        }
+        if self.analyze_job.is_some() || jobs.analyzing() {
+            return Some("Waiting for the analysis to finish.".into());
+        }
+        let readiness = groups
+            .iter()
+            .map(|g| group_readiness(session, g))
+            .min()
+            .unwrap_or(Readiness::NotAnalyzed);
+        match readiness {
+            Readiness::NotAnalyzed => {
+                return Some("The panels need an analysis before merging.".into());
+            }
+            Readiness::NeedsAnalyze => {
+                return Some(
+                    "The analysis settings changed: the panels need a new analysis before merging."
+                        .into(),
+                );
+            }
+            Readiness::Analyzed => {}
+        }
+        if !self.export.idle() {
+            return Some("Waiting for the export check.".into());
+        }
+        if !self.settings.idle() || self.settings.has_pending() {
+            return Some("Waiting for the merge settings change.".into());
+        }
+        if self
+            .results
+            .values()
+            .any(|m| m.opening.is_some() || m.reopen)
+        {
+            return Some("Checking the merged result…".into());
+        }
+        if !self.retired.is_empty() {
+            return Some("Releasing the previous result…".into());
+        }
+        None
+    }
+
+    /// Merge every group of the mosaic over the whole canvas (spec §5.4);
+    /// nothing while [`MosaicView::merge_block_reason`] gives a reason.
+    pub fn merge_all(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if self.merge_block_reason(session, jobs).is_some() {
+            return;
+        }
+        let groups = group_names(session);
+        self.merge_groups(session, jobs, groups, None);
+    }
+
+    /// Merge the selected ROI for each group of the view (newer work wins
+    /// per group in the job runner); nothing while
+    /// [`MosaicView::merge_roi_block_reason`] gives a reason (e.g. while the
+    /// ROIs are being reprojected: the rect may still be from an older
+    /// frame).
+    pub fn merge_roi(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if self.merge_roi_block_reason(session, jobs).is_some() {
+            return;
+        }
+        let Some(rect) = self.rois.selected_rect() else {
+            return;
+        };
+        self.merge_groups(session, jobs, self.members.clone(), Some(rect));
+    }
+
+    /// Merge `rect` (`None`: the whole canvas) of each of `groups`.
+    fn merge_groups(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        groups: Vec<String>,
+        rect: Option<[u64; 4]>,
+    ) {
+        // The export check and the settings tile count map result stores
+        // a merge may recreate; a settings edit waiting to apply would
+        // cancel the merge anyway.
+        if !self.export.idle() || !self.settings.idle() || self.settings.has_pending() {
+            return;
+        }
+        for g in groups {
+            let id = jobs.start_blend(session, &g, rect);
+            self.merge_jobs.insert(id, g);
+        }
+    }
+
+    /// Whether the export dialog may open now: the view has groups, no
+    /// tracked analysis runs and the dialog is not open already.
+    pub fn can_open_export(&self) -> bool {
+        !self.members.is_empty() && self.analyze_job.is_none() && !self.export.is_open()
+    }
+
+    /// Open the export dialog for the view's groups.
+    pub fn open_export(&mut self, session: &OpenSession) {
+        self.export.open(session, self.members.clone());
+    }
+
+    /// Draw the export dialog (if open) and act on the user's decision:
+    /// merge the chosen groups first, or start one export job per group.
+    pub fn export_ui(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        let can_merge = self.merge_guard(session, jobs, &self.members).is_none();
+        // Merges of the dialog's groups queued or running (whatever view is
+        // showing now): the export check maps the stores they may recreate.
+        let merging: BTreeSet<String> = self
+            .export
+            .groups()
+            .into_iter()
+            .filter(|g| jobs.blend_pending(g))
+            .collect();
+        match self.export.ui(ctx, session, can_merge, &merging) {
+            Some(ExportAction::BlendFirst(groups)) => {
+                self.merge_groups(session, jobs, groups, None);
+            }
+            Some(ExportAction::Export(dests, format)) => {
+                for (group, out) in dests {
+                    jobs.start_export(session, &group, out, format);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The ROI list: "+ new ROI" (the viewer's draw tool), and each ROI's
+    /// name, note and freshness; changes are saved (debounced).
+    pub fn rois_ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession) {
+        if self
+            .rois
+            .ui(ui, &mut session.mosaic.config.ui, self.viewer.as_mut())
+        {
+            self.save.touch();
+        }
+    }
+
+    /// The merge settings, staged and applied with their cost shown first.
+    pub fn settings_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        if let Some(impact) = self.settings.ui(ui, session, jobs) {
+            self.on_settings_applied(impact);
+        }
+    }
+
+    /// The health of the view's group (in a composition view, of the group
+    /// picked here): seam steps, flagged edges and gain ranges.
+    pub fn health_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Health").color(palette::TEXT_STRONG));
+        self.member_picker(ui);
+        let muted = |ui: &mut egui::Ui, t: &str| {
+            ui.label(RichText::new(t).color(palette::TEXT_MUTED));
+        };
+        match (&self.health, self.readiness) {
+            (_, Readiness::NotAnalyzed | Readiness::NeedsAnalyze) => {
+                muted(ui, "Shown once the group is analyzed.");
+            }
+            (None, _) => muted(ui, "Computing…"),
+            (Some(Err(e)), _) => muted(ui, &format!("Not available: {e}")),
+            (Some(Ok(h)), _) => health_grid(ui, h),
+        }
+    }
+
+    /// In a composition view: which group's health is shown.
+    fn member_picker(&mut self, ui: &mut egui::Ui) {
+        if self.members.len() < 2 {
+            return;
+        }
+        let mut chosen = self.group.clone().unwrap_or_default();
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Health of")
+                .selected_text(&chosen)
+                .show_ui(ui, |ui| {
+                    for g in &self.members {
+                        ui.selectable_value(&mut chosen, g.clone(), g);
+                    }
+                });
+        });
+        if self.group.as_ref() != Some(&chosen) {
+            self.group = Some(chosen);
+            self.health = None;
+            self.want_health = true;
+        }
+    }
+
+    /// Draw the canvas filling `ui`, through `look`, and handle its input
+    /// (a rectangle drawn with the ROI tool becomes an ROI). `plan_stretch`
+    /// is the plan's stretch of the same view, held for a group's first
+    /// merge (see the module docs).
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        look: &CanvasLook,
+        plan_stretch: Option<&[StretchParams]>,
+    ) {
+        let ctx = ui.ctx().clone();
+        self.shown = true;
+        self.rois.load_once(&session.mosaic.config.ui);
+        let groups = group_names(session);
+        let compositions = load_compositions(&session.mosaic.config.ui);
+        match self.resolve_view(&groups, &compositions) {
+            Some(view) => {
+                // A composition's mapping may change (in the plan): follow
+                // it.
+                let members = view_members(&view, &compositions);
+                if self.view.as_ref() != Some(&view) || self.members != members {
+                    self.apply_view(view, members);
+                }
+            }
+            None => {
+                self.retire_all();
+                self.results.clear();
+                self.members.clear();
+                self.view = None;
+                self.group = None;
+            }
+        }
+        self.update(&ctx, session, jobs, look.stretch, plan_stretch);
+        self.sync_viewer(&compositions);
+        self.readiness = self
+            .group
+            .as_ref()
+            .map_or(Readiness::NotAnalyzed, |g| group_readiness(session, g));
+        let canvas = self.view_canvas();
+        let overlays = self.rois.overlays();
+        let notes = self.member_notes();
+        let mut drawn = None;
+        match &mut self.viewer {
+            Some(viewer) => {
+                // A composition shows its merged groups; the others are
+                // named here.
+                for n in &notes {
+                    ui.label(text(Type::Small, n).color(palette::TEXT_MUTED));
+                }
+                // A held camera, in place of the home fit or the view
+                // before: the viewer paints this frame through it.
+                let size = ui.available_size();
+                if size.x > 0.0
+                    && size.y > 0.0
+                    && let Some(c) = self.camera.take()
+                {
+                    viewer.set_camera(size, c.centre, c.zoom);
+                }
+                viewer.set_overlays(overlays);
+                drawn = viewer.show(ui).drawn_rect;
+            }
+            None => {
+                let text = self.placeholder();
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new(text).color(palette::TEXT_MUTED));
+                });
+            }
+        }
+        if let (Some(r), Some(canvas)) = (drawn, canvas) {
+            self.on_drawn(session, r, canvas);
+        }
+    }
+
+    /// Give up every member's source and the viewer.
+    fn retire_all(&mut self) {
+        for m in self.results.values_mut() {
+            m.retire(&mut self.retired);
+        }
+        self.drop_viewer();
+        self.shown_key = None;
+    }
+
+    /// Drop the viewer, keeping where it looked for the next one.
+    fn drop_viewer(&mut self) {
+        if self.viewer.is_some() {
+            self.keep_camera();
+            self.viewer = None;
+            self.viewer_geometry = None;
+        }
+    }
+
+    /// Hold the camera the viewer shows now (unless one is held already),
+    /// for a viewer about to be replaced or re-homed.
+    fn keep_camera(&mut self) {
+        if self.camera.is_none() {
+            self.camera = self.shown_camera();
+        }
+    }
+
+    /// Show `view` with these `members` (its groups). Members already open
+    /// are kept; the others are given up, and new ones opened.
+    fn apply_view(&mut self, view: ViewKind, members: Vec<String>) {
+        let mut gone: Vec<String> = Vec::new();
+        for g in self.results.keys() {
+            if !members.contains(g) {
+                gone.push(g.clone());
+            }
+        }
+        for g in gone {
+            if let Some(mut m) = self.results.remove(&g) {
+                m.retire(&mut self.retired);
+            }
+        }
+        for g in &members {
+            self.results.entry(g.clone()).or_insert_with(Member::new);
+        }
+        if self.group.as_ref().is_none_or(|g| !members.contains(g)) {
+            self.group = members.first().cloned();
+            self.health = None;
+            self.want_health = true;
+        }
+        if self.view.as_ref() != Some(&view) {
+            self.rois.view_changed();
+        }
+        self.view = Some(view);
+        self.members = members;
+    }
+
+    /// Show `view` (a group, or a composition of `session`) now.
+    #[cfg(test)]
+    fn set_view(&mut self, session: &OpenSession, view: ViewKind) {
+        let compositions = load_compositions(&session.mosaic.config.ui);
+        let members = view_members(&view, &compositions);
+        self.apply_view(view, members);
+    }
+
+    /// Show group `group` from scratch (its result is opened again).
+    #[cfg(test)]
+    fn select(&mut self, group: String) {
+        if let Some(mut m) = self.results.remove(&group) {
+            m.retire(&mut self.retired);
+        }
+        self.apply_view(ViewKind::Group(group.clone()), vec![group]);
+    }
+
+    /// The view to show this frame: the current one while it is still
+    /// valid, else the first group.
+    fn resolve_view(&self, groups: &[String], compositions: &[Composition]) -> Option<ViewKind> {
+        match &self.view {
+            Some(ViewKind::Group(g)) if groups.contains(g) => self.view.clone(),
+            Some(ViewKind::Composition(i)) if *i < compositions.len() => self.view.clone(),
+            _ => groups.first().map(|g| ViewKind::Group(g.clone())),
+        }
+    }
+
+    /// What the viewer's place says when there is nothing to draw.
+    fn placeholder(&self) -> String {
+        if self.view.is_none() {
+            return "Add panels to start a mosaic.".into();
+        }
+        if self.members.is_empty() {
+            return "This composition maps no groups.".into();
+        }
+        if let Some(why) = &self.view_problem {
+            return why.clone();
+        }
+        let single = self.members.len() == 1;
+        for g in &self.members {
+            let Some(m) = self.results.get(g) else {
+                continue;
+            };
+            if m.opening.is_some() || m.reopen {
+                return "Opening the result…".into();
+            }
+            if let (None, Some(why)) = (&m.source, &m.absent) {
+                return if single {
+                    why.clone()
+                } else {
+                    format!("{g}: {why}")
+                };
+            }
+        }
+        String::new()
+    }
+
+    /// In a composition view, a note for each group without an open
+    /// result ("OIII: Not blended yet.").
+    fn member_notes(&self) -> Vec<String> {
+        if self.members.len() < 2 {
+            return Vec::new();
+        }
+        self.members
+            .iter()
+            .filter_map(|g| {
+                let m = self.results.get(g)?;
+                if m.source.is_some() {
+                    return None;
+                }
+                let why = match &m.absent {
+                    Some(why) if m.opening.is_none() && !m.reopen => why.as_str(),
+                    _ => "opening the result…",
+                };
+                Some(format!("{g}: {why}"))
+            })
+            .collect()
+    }
+
+    /// The view's canvas size (from its open results).
+    fn view_canvas(&self) -> Option<(u64, u64)> {
+        self.members
+            .iter()
+            .filter_map(|g| self.results.get(g)?.source.as_ref())
+            .map(|s| {
+                let g = s.tile_geometry();
+                (g.width, g.height)
+            })
+            .next()
+    }
+
+    /// Poll tasks, follow merge progress and the look, start pending work,
+    /// save.
+    fn update(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut OpenSession,
+        jobs: &JobRunner,
+        look: DisplayStretch,
+        plan_stretch: Option<&[StretchParams]>,
+    ) {
+        self.follow_look(look);
+        self.poll_opening();
+        self.retired.retain(|w| w.strong_count() > 0);
+        if !self.retired.is_empty() {
+            ctx.request_repaint_after(RELEASE_POLL);
+        }
+        self.follow_merge(ctx, jobs);
+        self.poll_auto();
+        if self.rois.poll(&mut session.mosaic.config.ui) {
+            self.save.touch();
+        }
+        if let Some(task) = &self.health_task {
+            match task.poll() {
+                Poll::Pending => {}
+                Poll::Done((g, h)) => {
+                    self.health_task = None;
+                    if self.group.as_ref() == Some(&g) {
+                        self.health = Some(h);
+                    }
+                }
+                Poll::Lost => {
+                    self.health_task = None;
+                    self.health = Some(Err("health computation failed (see the log)".into()));
+                }
+            }
+        }
+        // A merge of a shown group fills in the image: the stretches hold.
+        let merging = self.members.iter().any(|g| jobs.blend_pending(g));
+        // The plan's stretch stands in for a group's first result (a group
+        // view only: a composition's plan stretch is per display channel).
+        let plan = match &self.view {
+            Some(ViewKind::Group(_)) => plan_stretch.map(<[StretchParams]>::to_vec),
+            _ => None,
+        };
+        for (group, m) in &mut self.results {
+            // A merge of this group that is queued, or running but has not
+            // reported progress, may still create or recreate the store:
+            // open only once it reports (`follow_merge`) or ends.
+            if m.reopen && m.opening.is_none() && !jobs.blend_unstarted(group) {
+                m.reopen = false;
+                let result = session.mosaic.result_path(group);
+                let dir = session.mosaic.group_session_dir(group);
+                let held = if merging {
+                    m.stretch.clone().or_else(|| plan.clone())
+                } else {
+                    None
+                };
+                m.opening = Task::spawn("mmm-open-result", ctx, move || {
+                    (look, open_result(&result, &dir, held, look))
+                });
+            }
+            let due = match m.refresh {
+                Refresh::None => false,
+                Refresh::WhenIdle => !merging,
+                Refresh::Now => true,
+            };
+            if due
+                && m.auto.is_none()
+                && let Some(src) = m.source.clone()
+            {
+                m.refresh = Refresh::None;
+                m.auto = Task::spawn("mmm-auto-stretch", ctx, move || (look, src.auto(look)));
+            }
+        }
+        if self.want_health && self.health_task.is_none() {
+            self.want_health = false;
+            self.health = None;
+            if let Some(g) = self.group.clone()
+                && group_readiness(session, &g) == Readiness::Analyzed
+            {
+                let dir = session.mosaic.group_session_dir(&g);
+                let feather = session.mosaic.config.settings_for(&g).1.feather_px;
+                self.health_task = Task::spawn("mmm-health", ctx, move || {
+                    let h = load_health(&dir, feather);
+                    (g, h)
+                });
+            }
+        }
+        let members = self
+            .members
+            .iter()
+            .map(|g| {
+                (
+                    g.clone(),
+                    self.results.get(g).and_then(|m| m.source.clone()),
+                )
+            })
+            .collect();
+        self.rois
+            .start_tasks(ctx, session.mosaic.dir.join(FRAME_FILE), members);
+        let now = Instant::now();
+        if self.save.due(now) {
+            self.save.saved(now);
+            // Documented exception: a small mosaic.json write on the UI
+            // thread, at most once per SAVE_INTERVAL.
+            if let Err(e) = session.mosaic.save() {
+                tracing::warn!("ROIs not saved: {e}");
+            }
+        } else if let Some(wait) = self.save.wait(now) {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    /// Ask for every shown result's stretch again when the look's stretch
+    /// or the view has changed; a held stretch of a result not open is
+    /// dropped with the look it was worked out for.
+    fn follow_look(&mut self, look: DisplayStretch) {
+        let look_changed = self.look != look;
+        let view_changed = self.stretch_view != self.view;
+        self.look = look;
+        self.stretch_view = self.view.clone();
+        if !look_changed && !view_changed {
+            return;
+        }
+        for m in self.results.values_mut() {
+            if m.source.is_some() {
+                m.refresh = Refresh::Now;
+            } else if look_changed {
+                m.stretch = None;
+            }
+        }
+    }
+
+    fn poll_opening(&mut self) {
+        let look = self.look;
+        for m in self.results.values_mut() {
+            let Some(task) = &m.opening else { continue };
+            let (asked, opened) = match task.poll() {
+                Poll::Pending => continue,
+                Poll::Done(v) => v,
+                Poll::Lost => {
+                    m.opening = None;
+                    m.retire(&mut self.retired);
+                    m.absent = Some("Opening the result failed (see the log).".into());
+                    m.refresh = Refresh::None;
+                    continue;
+                }
+            };
+            m.opening = None;
+            match opened {
+                Opened::Ready {
+                    source,
+                    stretch,
+                    given,
+                } => {
+                    if let Some(old) = m.source.replace(Arc::new(source)) {
+                        self.retired.push(Arc::downgrade(&old));
+                    }
+                    m.absent = None;
+                    m.stretch = stretch;
+                    if !given {
+                        // Worked out from the data just now.
+                        m.refresh = Refresh::None;
+                    }
+                    if asked != look {
+                        m.refresh = Refresh::Now;
+                    }
+                }
+                Opened::Absent(why) => {
+                    m.retire(&mut self.retired);
+                    m.absent = Some(why);
+                    m.refresh = Refresh::None;
+                }
+            }
+        }
+    }
+
+    /// Give the viewer what the view shows now: the group's result, or the
+    /// composite of the composition's results. Rebuilt only when a member
+    /// source or the mapping changes; with nothing to show the viewer (and
+    /// its loaders' hold on the sources) is dropped. The camera survives
+    /// both (see the module docs).
+    fn sync_viewer(&mut self, compositions: &[Composition]) {
+        let ptr = |g: &String| {
+            self.results
+                .get(g)
+                .and_then(|m| m.source.as_ref())
+                .map_or(0, |s| Arc::as_ptr(s) as usize)
+        };
+        let mapping: Vec<Option<(String, u32)>> = match &self.view {
+            Some(ViewKind::Composition(i)) => compositions
+                .get(*i)
+                .map(|c| {
+                    c.channels
+                        .iter()
+                        .map(|ch| ch.as_ref().map(|(g, w)| (g.clone(), w.to_bits())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let key: ShownKey = (self.members.iter().map(ptr).collect(), mapping);
+        if self.shown_key.as_ref() == Some(&key) {
+            return;
+        }
+        let source_of = |g: &String| self.results.get(g).and_then(|m| m.source.clone());
+        self.view_problem = None;
+        // A group view needs its result; a composition shows the members
+        // that have one (a missing member adds nothing to a tile).
+        let wanted: Option<Arc<dyn TileSource>> = match &self.view {
+            _ if key.0.iter().all(|&p| p == 0) => None,
+            Some(ViewKind::Group(g)) => source_of(g).map(|s| s as Arc<dyn TileSource>),
+            Some(ViewKind::Composition(i)) => {
+                let channels: Vec<Option<(Arc<MosaicTileSource>, f32)>> = compositions
+                    .get(*i)
+                    .map(|c| {
+                        c.channels
+                            .iter()
+                            .map(|ch| ch.as_ref().and_then(|(g, w)| Some((source_of(g)?, *w))))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match CompositeTileSource::new(&channels) {
+                    Ok(c) => Some(Arc::new(c)),
+                    Err(why) => {
+                        self.view_problem = Some(why);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        self.shown_key = Some(key);
+        match wanted {
+            None => self.drop_viewer(),
+            Some(src) => {
+                let geometry = src.geometry();
+                // A new canvas size would re-home the viewer: keep where
+                // it looks instead.
+                if self.viewer_geometry != Some(geometry) {
+                    self.keep_camera();
+                }
+                self.viewer_geometry = Some(geometry);
+                match &mut self.viewer {
+                    Some(v) => v.set_source(src),
+                    None => self.viewer = Some(TiledViewer::new(src, self.loader_threads)),
+                }
+            }
+        }
+        self.rois.want_fresh = true;
+    }
+
+    /// Follow the running merge of a group of the view: bump its source's
+    /// generation on each progress update so new tiles load (through the
+    /// held stretch); open its result once the merge has created its store.
+    fn follow_merge(&mut self, ctx: &egui::Context, jobs: &JobRunner) {
+        let Some((id, group, updates)) = jobs.blend_progress() else {
+            return;
+        };
+        let Some(m) = self.results.get_mut(group) else {
+            return;
+        };
+        if updates == 0 || m.last_progress == Some((id, updates)) {
+            return;
+        }
+        m.last_progress = Some((id, updates));
+        match &m.source {
+            Some(src) => {
+                src.bump();
+                ctx.request_repaint();
+            }
+            None if m.opening.is_none() => m.reopen = true,
+            None => {}
+        }
+        self.rois.want_fresh = true;
+    }
+
+    /// Apply finished automatic stretches worked out for the current look.
+    fn poll_auto(&mut self) {
+        let look = self.look;
+        for m in self.results.values_mut() {
+            let Some(task) = &m.auto else { continue };
+            let (asked, stretch) = match task.poll() {
+                Poll::Pending => continue,
+                Poll::Done(v) => v,
+                Poll::Lost => (look, None),
+            };
+            m.auto = None;
+            // Another look since: asked for again (`follow_look`). No
+            // statistics (nothing merged yet): the stretch stays as it is
+            // until the next merge ends.
+            if asked != look {
+                continue;
+            }
+            let (Some(s), Some(src)) = (stretch, &m.source) else {
+                continue;
+            };
+            src.set_stretch(s.clone());
+            m.stretch = Some(s);
+        }
+    }
+
+    /// A rectangle drawn on the canvas becomes a new ROI, selected and
+    /// saved (debounced).
+    fn on_drawn(&mut self, session: &mut OpenSession, r: [f64; 4], canvas: (u64, u64)) {
+        if self.rois.on_drawn(&mut session.mosaic.config.ui, r, canvas) {
+            self.save.touch();
+        }
+    }
+}
+
+/// The health figures as a two-column grid.
+fn health_grid(ui: &mut egui::Ui, h: &Health) {
+    let flagged = h.seams.iter().filter(|s| s.flagged).count();
+    egui::Grid::new("mosaic-health")
+        .num_columns(2)
+        .spacing([space::M, space::XS])
+        .show(ui, |ui| {
+            let row = |ui: &mut egui::Ui, k: &str, v: String, c: Color32| {
+                ui.label(RichText::new(k).color(palette::TEXT_BODY));
+                ui.label(RichText::new(v).color(c));
+                ui.end_row();
+            };
+            row(
+                ui,
+                "Seam step median",
+                format_step(h.seam_delta_median),
+                palette::TEXT_STRONG,
+            );
+            row(
+                ui,
+                "Seam step max",
+                format_step(h.seam_delta_max),
+                palette::TEXT_STRONG,
+            );
+            row(
+                ui,
+                "Flagged edges",
+                format!("{flagged} of {}", h.seams.len()),
+                if flagged > 0 {
+                    palette::HA_400
+                } else {
+                    palette::GREEN_300
+                },
+            );
+            let n = h.gain_range.len();
+            for (c, (lo, hi)) in h.gain_range.iter().enumerate() {
+                let k = if n > 1 {
+                    format!("Gain range {}", channel_name(c, n))
+                } else {
+                    "Gain range".to_string()
+                };
+                row(ui, &k, format!("{lo:.3} – {hi:.3}"), palette::TEXT_STRONG);
+            }
+        });
+}
+
+/// Where `group` stands for merging.
+fn group_readiness(session: &OpenSession, group: &str) -> Readiness {
+    let config = &session.mosaic.config;
+    if !config.group_dirs.contains_key(group) {
+        Readiness::NotAnalyzed
+    } else if config.needs_analyze.contains(group) {
+        Readiness::NeedsAnalyze
+    } else {
+        Readiness::Analyzed
+    }
+}
+
+/// A seam step (linear data units) for display.
+fn format_step(v: f64) -> String {
+    if v == 0.0 {
+        "0".into()
+    } else if v.abs() < 1e-3 {
+        format!("{v:.2e}")
+    } else {
+        format!("{v:.4}")
+    }
+}
+
+#[cfg(test)]
+#[path = "mosaic_view_tests.rs"]
+mod tests;

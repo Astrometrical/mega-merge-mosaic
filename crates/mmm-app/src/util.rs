@@ -101,3 +101,23 @@ pub fn group_names(session: &OpenSession) -> Vec<String> {
         None => session.mosaic.config.group_dirs.keys().cloned().collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_at_most_once_per_interval() {
+        let t0 = Instant::now();
+        let mut d = Debounce::default();
+        assert!(!d.due(t0));
+        d.touch();
+        assert!(d.due(t0), "the first change saves at once");
+        d.saved(t0);
+        d.touch();
+        assert!(!d.due(t0 + Duration::from_millis(300)));
+        assert!(d.due(t0 + SAVE_INTERVAL));
+        d.saved(t0 + SAVE_INTERVAL);
+        assert!(!d.due(t0 + 3 * SAVE_INTERVAL), "nothing new to save");
+    }
+}

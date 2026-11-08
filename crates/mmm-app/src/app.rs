@@ -466,7 +466,13 @@ impl Shell {
             });
         });
         match (self.tab, self.session.as_mut(), self.jobs.as_mut()) {
-            (Tab::Blend, Some(session), Some(jobs)) => self.blend.ui(ui, session, jobs),
+            (Tab::Blend, Some(session), Some(jobs)) => {
+                // The plan's stretch of the same view holds a first merge.
+                let plan_stretch = (self.plan.view() == self.blend.view())
+                    .then(|| self.plan.stretch())
+                    .flatten();
+                self.blend.ui(ui, session, jobs, plan_stretch);
+            }
             (Tab::Panels, Some(session), Some(jobs)) => self.panels.ui(ui, session, jobs),
             (Tab::Plan, Some(session), Some(_)) => {
                 let now = Instant::now();
@@ -1281,7 +1287,6 @@ mod tests {
             crate::tile_source::LINEAR,
             "auto stretch applied"
         );
-        h.get_by_label("Automatic");
         // The Panels tab shows the panels in their groups.
         h.get_by_label("Panels").click();
         h.step();

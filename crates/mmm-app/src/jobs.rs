@@ -254,6 +254,8 @@ pub struct JobRunner {
     previews_frame: Option<ReferenceFrame>,
     #[cfg(test)]
     gate: Option<std::sync::Arc<tests::Gate>>,
+    #[cfg(test)]
+    stepper: Option<std::sync::Arc<tests::Stepper>>,
 }
 
 impl JobRunner {
@@ -271,6 +273,8 @@ impl JobRunner {
             previews_frame: None,
             #[cfg(test)]
             gate: None,
+            #[cfg(test)]
+            stepper: None,
         }
     }
 
@@ -346,9 +350,9 @@ impl JobRunner {
     /// A blend may recreate (truncate) its group's store, which would fault
     /// (SIGBUS) any [`mmm_core::tiles::TileReader`] still mapping it. The
     /// runner does not check that: callers must not start a blend while a
-    /// reader outside the job runner maps the store — the Blend tab gates
-    /// it on its tracked sources, the export check and the Blend settings
-    /// tile count (see [`crate::blend_tab`] and
+    /// reader outside the job runner maps the store — the mosaic view gates
+    /// it on its tracked sources, the export check and the merge settings
+    /// tile count (see [`crate::mosaic_view`] and
     /// [`crate::blend_settings`]).
     pub fn start_blend(
         &mut self,
@@ -471,6 +475,15 @@ impl JobRunner {
                 .queue
                 .iter()
                 .any(|q| matches!(q.kind, Kind::Blend { .. }))
+    }
+
+    /// Whether an analysis is running (resolving the groups or analysing
+    /// them) or queued.
+    pub fn analyzing(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.blend.is_none() && !r.previews && !r.export)
+            || self.queue.iter().any(|q| matches!(q.kind, Kind::Analyze))
     }
 
     /// Whether events raised outside [`JobRunner::poll`] (queued jobs
@@ -691,6 +704,8 @@ impl JobRunner {
         let previous = self.previous.take();
         #[cfg(test)]
         let gate = self.gate.clone();
+        #[cfg(test)]
+        let stepper = self.stepper.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("mmm-job-{id}"))
             .spawn(move || {
@@ -713,6 +728,10 @@ impl JobRunner {
                         if send {
                             let _ = progress_tx.send(Msg::Progress(stage.to_string(), done, total));
                             progress_ctx.request_repaint();
+                            #[cfg(test)]
+                            if let Some(s) = &stepper {
+                                s.wait();
+                            }
                         }
                     };
                     let ctl = JobCtl::new(worker_token, Some(&observer));
@@ -938,6 +957,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Holds a worker after each progress update it sends, until stepped
+    /// past it or opened.
+    pub(crate) struct Stepper {
+        /// Steps granted and not taken yet, and whether it is open.
+        state: std::sync::Mutex<(u64, bool)>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Stepper {
+        /// Let the held worker go on to its next progress update.
+        pub(crate) fn step(&self) {
+            self.state.lock().unwrap().0 += 1;
+            self.cv.notify_all();
+        }
+
+        /// Hold nothing any more.
+        pub(crate) fn open(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.cv.notify_all();
+        }
+
+        /// Block until stepped or opened (bounded: never hang a test).
+        pub(crate) fn wait(&self) {
+            let state = self.state.lock().unwrap();
+            let (mut state, timeout) = self
+                .cv
+                .wait_timeout_while(state, Duration::from_secs(30), |(steps, open)| {
+                    *steps == 0 && !*open
+                })
+                .unwrap();
+            assert!(!timeout.timed_out(), "stepper never stepped");
+            if !state.1 {
+                state.0 -= 1;
+            }
+        }
+    }
+
     impl JobRunner {
         /// Hold every worker started from now on until the gate opens.
         pub(crate) fn hold(&mut self) -> std::sync::Arc<Gate> {
@@ -947,6 +1003,17 @@ pub(crate) mod tests {
             });
             self.gate = Some(gate.clone());
             gate
+        }
+
+        /// Hold every worker started from now on after each progress
+        /// update it sends (see [`Stepper`]).
+        pub(crate) fn hold_progress(&mut self) -> std::sync::Arc<Stepper> {
+            let stepper = std::sync::Arc::new(Stepper {
+                state: std::sync::Mutex::new((0, false)),
+                cv: std::sync::Condvar::new(),
+            });
+            self.stepper = Some(stepper.clone());
+            stepper
         }
     }
 
@@ -994,6 +1061,33 @@ pub(crate) mod tests {
             .iter()
             .map(|p| p.action.clone())
             .collect()
+    }
+
+    #[test]
+    fn analyzing_follows_running_and_queued_analyses() {
+        let root = temp_dir("job-analyzing");
+        let mut s = two_group_session(&root);
+        let mut r = runner();
+        assert!(!r.analyzing());
+        let gate = r.hold();
+        r.start_previews(&s);
+        assert!(!r.analyzing(), "previews are not an analysis");
+        r.start_analyze(&mut s);
+        assert!(r.analyzing(), "queued behind the previews");
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        assert!(!r.analyzing());
+        let gate = r.hold();
+        r.start_analyze(&mut s);
+        assert!(r.analyzing(), "running");
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        let gate = r.hold();
+        r.start_blend(&mut s, "Ha", None);
+        assert!(!r.analyzing(), "a blend is not an analysis");
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
