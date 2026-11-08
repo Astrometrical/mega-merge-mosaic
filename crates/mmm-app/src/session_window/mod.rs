@@ -380,6 +380,17 @@ impl SessionWindow {
         if self.mosaic.take_draft_changed() {
             self.save.touch();
         }
+        if let Some(why) = self.mosaic.take_problem() {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Problem,
+                    title: why,
+                    detail: None,
+                    action: None,
+                },
+                undo: None,
+            });
+        }
         if let Some(previous) = self.mosaic.take_analysis_undo() {
             self.push_toast(WindowToast {
                 toast: mega_ui::widgets::Toast {

@@ -1324,7 +1324,6 @@ fn a_draft_edit_does_not_block_merging() {
     d.feather_px = 128.0;
     view.settings.edit_draft(&mut s.mosaic.config, d);
     assert_eq!(view.merge_block_reason(&s, &jobs), None);
-    assert!(view.is_settled() || !view.settings.has_pending());
     view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
     assert!(jobs.busy(), "the merge started");
     drain(&mut jobs, &mut s);
@@ -1365,7 +1364,10 @@ fn analysis_edit_waits_for_merges_and_blocks_merging() {
     // Waiting for the merge to stop: no merge may start meanwhile, and the
     // shell keeps the pipeline from starting anything.
     assert!(view.settings.has_pending());
-    assert!(view.merge_block_reason(&s, &jobs).is_some());
+    assert_eq!(
+        view.merge_block_reason(&s, &jobs).as_deref(),
+        Some("Waiting for the analysis settings change.")
+    );
     gate.open();
     let deadline = Instant::now() + crate::testutil::PATIENCE;
     let mut applied = None;

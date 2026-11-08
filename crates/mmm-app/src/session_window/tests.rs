@@ -2481,3 +2481,33 @@ fn an_old_session_shows_merged() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_failed_analysis_edit_raises_a_problem_toast() {
+    use mmm_core::photometry::GainMode;
+
+    let (root, s, jobs) = analyzed("window-analysis-problem");
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    {
+        let st = h.state_mut();
+        let file = st.session.mosaic.dir.join(mmm_core::mosaic::CONFIG_FILE);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let mut a = st.session.mosaic.config.analyze.clone();
+        a.gain = GainMode::Unity;
+        st.w.mosaic.edit_analysis(a, &mut st.session, &mut st.jobs);
+    }
+    h.run_steps(3);
+    let toasts = std::mem::take(&mut h.state_mut().toasts);
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert_eq!(toasts[0].toast.tone, mega_ui::theme::Tone::Problem);
+    assert!(
+        toasts[0]
+            .toast
+            .title
+            .starts_with("Could not change the settings")
+    );
+    assert!(toasts[0].undo.is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}

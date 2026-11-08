@@ -205,8 +205,8 @@ pub struct SettingsPanel {
     pending: Option<AnalyzeSettings>,
     /// When to retry a pending edit refused as busy.
     retry_at: Option<Instant>,
-    /// The last error, for the user.
-    error: Option<String>,
+    /// A failed edit's message, until the window takes it for a toast.
+    problem: Option<String>,
     /// Jobs were cancelled for an analysis edit and have not all been
     /// reported yet (see the module docs).
     cancelled_for_edit: bool,
@@ -267,6 +267,12 @@ impl SettingsPanel {
         self.analysis_undo.take()
     }
 
+    /// Why the last analysis edit failed, once (for the window's Problem
+    /// toast).
+    pub fn take_problem(&mut self) -> Option<String> {
+        self.problem.take()
+    }
+
     /// Whether the draft changed since the last call (the window then
     /// saves `mosaic.json`, rate-limited).
     pub fn take_draft_changed(&mut self) -> bool {
@@ -276,7 +282,7 @@ impl SettingsPanel {
     /// Make `draft` the merge settings draft in `cfg.ui` (nothing is
     /// invalidated, nothing is cancelled); the window saves it later.
     pub fn edit_draft(&mut self, cfg: &mut MosaicConfig, draft: BlendSettings) {
-        if draft == load_draft(cfg) {
+        if draft.validate().is_err() || draft == load_draft(cfg) {
             return;
         }
         save_draft(&mut cfg.ui, &draft);
@@ -314,7 +320,7 @@ impl SettingsPanel {
     ) -> Option<ChangeImpact> {
         self.pending = None;
         self.retry_at = None;
-        self.error = None;
+        self.problem = None;
         if self.cancel_for(&new, &session.mosaic.config, jobs) {
             self.pending = Some(new);
             return None;
@@ -334,7 +340,7 @@ impl SettingsPanel {
             Err(e) => {
                 let message = format!("Could not change the settings: {e}");
                 tracing::warn!("{message}");
-                self.error = Some(message);
+                self.problem = Some(message);
                 None
             }
         }
@@ -401,12 +407,9 @@ impl SettingsPanel {
         let draft = load_draft(cfg);
         let shown = self.pending.clone().unwrap_or_else(|| cfg.analyze.clone());
         let changed = changed_fields(cfg, &draft, &shown, groups);
-        let cost = session
-            .merged
-            .then_some("Reruns the analysis; merged results go stale");
+        let cost = session.merged;
         let mut edit = draft.clone();
         let mut edit_analyze = shown.clone();
-        let editable = self.pending.is_none();
         let caption = |ui: &mut egui::Ui, t: &str| {
             ui.label(RichText::new(t).small().color(palette::TEXT_SUBTLE));
         };
@@ -426,7 +429,6 @@ impl SettingsPanel {
                     mode_name,
                     "Pyramid: multiband base + star-safe seams. TwoBand: feathered base \
                      + star-safe seams. Feather: plain weighted average.",
-                    None,
                 );
                 self.feather_row(ui, changed.contains(&Field::Feather), &mut edit);
                 combo_row(
@@ -438,7 +440,6 @@ impl SettingsPanel {
                     on_off,
                     "Suppress cosmic-ray residue and satellite trails that survive in \
                      one panel of an overlap (TwoBand and Pyramid)",
-                    None,
                 );
                 combo_row(
                     ui,
@@ -449,14 +450,13 @@ impl SettingsPanel {
                     flatten_name,
                     "Global background flatten of the merged mosaic (refused on \
                      nebula-heavy mosaics)",
-                    None,
                 );
             });
         ui.add_space(6.0);
         caption(ui, "ANALYSIS · reruns analysis, every tile goes stale");
-        ui.add_enabled_ui(editable, |ui| {
+        {
             egui::Grid::new("blend-settings-analyze")
-                .num_columns(if cost.is_some() { 4 } else { 3 })
+                .num_columns(3)
                 .spacing([6.0, 4.0])
                 .show(ui, |ui| {
                     combo_row(
@@ -468,7 +468,6 @@ impl SettingsPanel {
                         input_name,
                         "How the panels are read: detected, registered full-canvas frames, \
                          or unaligned panels with astrometric solutions",
-                        cost,
                     );
                     combo_row(
                         ui,
@@ -478,7 +477,6 @@ impl SettingsPanel {
                         &[None, Some(0), Some(1), Some(2)],
                         surface_name,
                         "Residual surface correction order",
-                        cost,
                     );
                     combo_row(
                         ui,
@@ -489,10 +487,16 @@ impl SettingsPanel {
                         gain_name,
                         "Fit per-panel gains from the overlaps, or pin every gain at 1 \
                          (same rig and exposure)",
-                        cost,
                     );
                 });
-        });
+        }
+        if cost {
+            ui.label(
+                RichText::new("Re-runs the analysis; the mosaic goes out of date")
+                    .small()
+                    .color(palette::TEXT_MUTED),
+            );
+        }
         self.edit_draft(&mut session.mosaic.config, edit);
 
         for (group, o) in &session.mosaic.config.group_overrides {
@@ -509,7 +513,7 @@ impl SettingsPanel {
         }
 
         let mut applied = None;
-        if editable && edit_analyze != shown {
+        if edit_analyze != shown {
             applied = self.edit_analysis(edit_analyze, session, jobs);
         }
         if self.pending.is_some() {
@@ -521,14 +525,6 @@ impl SettingsPanel {
                     "Waiting for the running job to stop; the settings apply then…"
                 };
                 ui.label(RichText::new(text).small().color(palette::TEXT_BODY));
-            });
-        }
-        if let Some(e) = self.error.clone() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(e).small().color(palette::HA_400));
-                if ui.small_button("Dismiss").clicked() {
-                    self.error = None;
-                }
             });
         }
         applied
@@ -605,7 +601,6 @@ fn combo_row<T: Copy + PartialEq>(
     options: &[T],
     show: fn(T) -> &'static str,
     hover: &str,
-    note: Option<&str>,
 ) {
     mark(ui, changed);
     let label = ui.label(RichText::new(name).color(palette::TEXT_BODY));
@@ -618,9 +613,6 @@ fn combo_row<T: Copy + PartialEq>(
             }
         });
     r.response.labelled_by(label.id).on_hover_text(hover);
-    if let Some(note) = note {
-        ui.label(RichText::new(note).small().color(palette::TEXT_MUTED));
-    }
     ui.end_row();
 }
 

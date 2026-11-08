@@ -678,7 +678,7 @@ impl MosaicView {
             return Some(why.into());
         }
         if self.settings.has_pending() {
-            return Some("Waiting for the merge settings change.".into());
+            return Some("Waiting for the analysis settings change.".into());
         }
         if self
             .results
@@ -854,6 +854,12 @@ impl MosaicView {
     /// ([`SettingsPanel::take_analysis_undo`]).
     pub fn take_analysis_undo(&mut self) -> Option<AnalyzeSettings> {
         self.settings.take_analysis_undo()
+    }
+
+    /// Why the last analysis edit failed, once
+    /// ([`SettingsPanel::take_problem`]).
+    pub fn take_problem(&mut self) -> Option<String> {
+        self.settings.take_problem()
     }
 
     /// Whether the merge settings draft changed since the last call
