@@ -1335,7 +1335,7 @@ mod tests {
         h.step();
         assert_eq!(h.state().window().mode(), CanvasMode::Mosaic);
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
-        h.run();
+        h.run_steps(2);
         h.get_by_label("Blend Ha finished");
         h.get_by_label("Blend OIII finished");
         assert!(h.state().session().unwrap().merged);

@@ -52,8 +52,13 @@ impl State {
 }
 
 fn harness(state: State) -> Harness<'static, State> {
+    harness_sized(state, egui::vec2(1200.0, 800.0))
+}
+
+/// [`harness`] in a window of `size`.
+fn harness_sized(state: State, size: egui::Vec2) -> Harness<'static, State> {
     Harness::builder()
-        .with_size(egui::vec2(1200.0, 800.0))
+        .with_size(size)
         .with_step_dt(0.01)
         .with_max_steps(64)
         .build_ui_state(
@@ -275,7 +280,12 @@ fn plan_shows_until_something_is_merged() {
 
 #[test]
 fn mosaic_shows_by_default_once_merged() {
-    let (root, s, jobs) = merged("window-mosaic-first");
+    // Ha merged, OIII not: something is merged.
+    let (root, mut s, mut jobs) = analyzed("window-mosaic-first");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.merged = any_merged(&s);
+    assert!(s.merged);
     let mut h = harness(State::new(s, jobs));
     h.run_steps(2);
     assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
@@ -286,6 +296,10 @@ fn mosaic_shows_by_default_once_merged() {
         h.state().w.plan().canvas_frame().is_none(),
         "plan not drawn"
     );
+    // A group not merged yet says so in the canvas.
+    h.get_by_label("OIII · 4").click();
+    step_until(&mut h, |st| st.w.mosaic().absent().is_some());
+    h.get_by_label("Not blended yet.");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -299,6 +313,10 @@ fn merge_switches_to_the_mosaic() {
             .is_none()
     });
     assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    assert!(
+        h.query_by_label("Analyze").is_none(),
+        "analysis is automatic"
+    );
     let gate = h.state_mut().jobs.hold();
     {
         let st = h.state_mut();
@@ -312,6 +330,103 @@ fn merge_switches_to_the_mosaic() {
     h.run_steps(2);
     assert!(!disabled(&h, "Mosaic"));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mosaic_can_be_shown_while_the_first_merge_runs() {
+    let (root, s, jobs) = analyzed("window-first-merge");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    assert!(disabled(&h, "Mosaic"), "nothing merged yet");
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.w.merge(&mut st.session, &mut st.jobs);
+    }
+    h.run_steps(2);
+    assert!(!h.state().session.merged, "the merge has not finished");
+    // Back to the plan mid-merge, then to the mosaic to watch it fill in.
+    h.get_by_label("Plan").click();
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    assert!(!disabled(&h, "Mosaic"), "a merge has started");
+    h.get_by_label("Mosaic").click();
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    assert!(h.state().jobs.blending());
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Three groups (Ha, OIII and SII by hand) and two composites, in the
+/// analysed `s`.
+fn three_groups_two_composites(s: &mut OpenSession) {
+    for p in &mut s.mosaic.config.panels[6..] {
+        p.manual_group = Some("SII".into());
+    }
+    s.groups = s.mosaic.groups().ok();
+    let comps = [Composition::new("SHO"), Composition::new("HOO natural")];
+    save_compositions(&mut s.mosaic.config.ui, &comps);
+}
+
+/// The view bar's controls in a canvas `canvas_w` wide: Plan / Mosaic, a
+/// chip per group and composite, +, and the four toggles (the only toggle
+/// buttons in the window), each with its rect. Asserts none overlaps
+/// another, the canvas or the inspector.
+fn bar_controls(h: &Harness<'_, State>, canvas_w: f32) -> Vec<(String, egui::Rect)> {
+    let controls: Vec<(String, egui::Rect)> = h
+        .query_all(By::new().predicate(|n| n.toggled().is_some()))
+        .map(|n| (n.accesskit_node().label().unwrap_or_default(), n.rect()))
+        .collect();
+    let (canvas, _) = h.state().w.plan().canvas_frame().expect("the plan drawn");
+    for (label, r) in &controls {
+        assert!(
+            r.min.x >= -0.5 && r.max.x <= canvas_w + 0.5 && r.min.y >= -0.5,
+            "{label} at {r:?} is not inside the canvas area"
+        );
+        assert!(
+            r.max.y <= canvas.min.y + 0.5,
+            "{label} at {r:?} is over the canvas {canvas:?}"
+        );
+    }
+    for (i, (a, ra)) in controls.iter().enumerate() {
+        for (b, rb) in &controls[i + 1..] {
+            assert!(
+                !ra.shrink(0.5).intersects(rb.shrink(0.5)),
+                "{a} {ra:?} overlaps {b} {rb:?}"
+            );
+        }
+    }
+    controls
+}
+
+#[test]
+fn the_view_bar_wraps_without_overlap() {
+    for canvas_w in [700.0, 1400.0] {
+        let (root, mut s, jobs) = analyzed("window-narrow-bar");
+        three_groups_two_composites(&mut s);
+        let size = egui::vec2(canvas_w + mega_ui::theme::tokens::INSPECTOR_WIDTH, 800.0);
+        let mut h = harness_sized(State::new(s, jobs), size);
+        step_until(&mut h, |st| st.w.plan().canvas_frame().is_some());
+        h.run_steps(3);
+        h.get_by_label("SII · 2");
+        let controls = bar_controls(&h, canvas_w);
+        assert_eq!(controls.len(), 12, "{controls:?}");
+        // Narrow: the toggles on a row of their own, below the choices;
+        // wide: one row.
+        let top = |label: &str| {
+            let (_, r) = controls.iter().find(|(l, _)| l == label).unwrap();
+            r.center().y
+        };
+        let one_row = (top("Strong") - top("Plan")).abs() < 2.0;
+        assert_eq!(one_row, canvas_w > 1000.0, "canvas {canvas_w}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[test]
@@ -673,6 +788,15 @@ fn a_selected_panel_shows_its_details_and_checks() {
     step_until(&mut h, |st| {
         st.w.plan().items().iter().any(|i| i.path == first)
     });
+    // The flagged panel is outlined in Hα, the others in the accent.
+    for it in h.state().w.plan().items() {
+        let want = if it.path == first {
+            mega_ui::theme::palette::HA_500
+        } else {
+            mega_ui::theme::palette::ACCENT_500
+        };
+        assert_eq!(it.outline, want, "{:?}", it.path);
+    }
     // Click the first panel: its details open in the Panels section.
     let it = h
         .state()
@@ -698,8 +822,14 @@ fn a_selected_panel_shows_its_details_and_checks() {
     assert!(h.state().w.inspector().is_open("panels"));
     h.get_by_label("Ha_0.xisf");
     h.get_by_label("Checks for this panel");
+    // Its header facts (read on a worker) and the panels it overlaps.
     step_until(&mut h, |st| st.w.plan().has_info(&first));
+    h.get_by_label("600 × 420 (0.3 MP)");
     h.get_by_label("None (registered)");
+    assert!(
+        h.query_all_by_label("Ha_1.xisf").next().is_some(),
+        "overlaps listed"
+    );
     // Its own checks only: the other panel's note is not listed there.
     assert_eq!(
         h.query_all_by_label("First panel changed").count(),
@@ -707,6 +837,22 @@ fn a_selected_panel_shows_its_details_and_checks() {
         "in Problems and in the panel's checks"
     );
     assert!(h.query_by_label("Second panel unsolved").is_none());
+    // Accept there goes to the shell too. The inspector scrolls to it as
+    // a user would; the click waits for the scroll to settle.
+    h.get_all_by_label("Accept")
+        .last()
+        .expect("the panel's Accept")
+        .scroll_to_me();
+    let _ = h.run_ok();
+    h.get_all_by_label("Accept").last().unwrap().click();
+    h.run_steps(2);
+    let accepted: Vec<&str> = h
+        .state()
+        .accepted
+        .iter()
+        .map(|c| c.message.as_str())
+        .collect();
+    assert_eq!(accepted, ["First panel changed"]);
     // Esc clears the selection.
     h.key_press(egui::Key::Escape);
     h.run_steps(2);

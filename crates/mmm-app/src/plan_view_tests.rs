@@ -461,6 +461,24 @@ fn composition_view_uses_additive_layers() {
 }
 
 #[test]
+fn header_facts_are_read_again_for_new_inputs() {
+    let (root, s, _r) = analyzed("plan-view-reread");
+    let path = s.mosaic.config.panels[0].path.clone();
+    let mut h = harness(s);
+    h.run();
+    h.state_mut().view.select(Some(path.clone()));
+    step_until(&mut h, |s| s.view.has_info(&path));
+    h.get_by_label("600 × 420 (0.3 MP)");
+    // New inputs (a previews generation): the header is read again.
+    h.state_mut().generation = 2;
+    h.step();
+    assert!(!h.state().view.has_info(&path));
+    step_until(&mut h, |s| s.view.has_info(&path));
+    h.get_by_label("600 × 420 (0.3 MP)");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn copy_path_puts_path_on_clipboard() {
     let root = temp_dir("plan-copy");
     let s = two_group_session(&root);

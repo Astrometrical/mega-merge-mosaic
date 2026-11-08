@@ -1,8 +1,10 @@
 //! The canvas and its view bar: **Plan** / **Mosaic**, a chip per group
 //! (its colour, "{group} · {panels}") and per composite (dashed) then
 //! **+** — chips only with two or more groups — and at the right the
-//! **Outlines**, **ROIs**, **Linked** and **Strong** toggles. **Linked** is
-//! disabled for a mono view ([`SessionWindow::is_mono`]). The stretch
+//! **Outlines**, **ROIs**, **Linked** and **Strong** toggles (on a row of
+//! their own when the bar is too narrow). **Mosaic** can be chosen once
+//! something is merged or a merge has started. **Linked** is disabled for
+//! a mono view ([`SessionWindow::is_mono`]). The stretch
 //! toggles are the session's ([`DisplayStretch`] in `MosaicConfig.ui`):
 //! both canvases follow them.
 
@@ -15,6 +17,7 @@ use super::{COMPOSITES, CanvasMode, SessionWindow, compositions_of};
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, add_composition};
 use crate::display_stretch::DisplayStretch;
+use crate::jobs::JobRunner;
 use crate::panels_tab::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{PlanFeed, group_members};
@@ -35,87 +38,55 @@ struct BarActions {
 }
 
 impl SessionWindow {
-    /// The view bar across the top of the canvas area.
+    /// The view bar across the top of the canvas area. The choices (Plan /
+    /// Mosaic and the chips) and the toggles share one row when they fit
+    /// side by side (as measured the frame before); otherwise, and before
+    /// anything is measured, the choices wrap onto as many rows as they need
+    /// and the toggles take a row of their own, right-aligned. Nothing
+    /// overlaps.
     pub(super) fn view_bar(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
+        jobs: &JobRunner,
         pipeline: &Pipeline,
     ) {
         let groups = group_names(session);
-        let compositions = compositions_of(session);
         let mono = self.is_mono(session, pipeline);
+        // The mosaic can be shown once something is merged, or a merge
+        // has started (its result fills in as it runs).
+        let mosaic_ok = session.merged || jobs.blending();
         let mut act = BarActions::default();
         let margin = egui::Margin::symmetric(space::M as i8, space::S as i8);
         egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut mode = self.mode();
-                let options = [
-                    Segment {
-                        value: CanvasMode::Plan,
-                        label: "Plan",
-                        disabled: None,
-                    },
-                    Segment {
-                        value: CanvasMode::Mosaic,
-                        label: "Mosaic",
-                        disabled: (!session.merged).then_some(NOTHING_MERGED),
-                    },
-                ];
-                if segmented_with(ui, &mut mode, &options).changed() {
-                    act.mode = Some(mode);
-                }
-                if groups.len() >= 2 {
-                    ui.add_space(space::S);
-                    let colors = group_colors(
-                        &load_group_colors(&session.mosaic.config.ui),
-                        groups.iter().map(String::as_str),
-                    );
-                    let members = group_members(session, &groups);
-                    for g in &groups {
-                        let n = members.get(g).map_or(0, Vec::len);
-                        let label = format!("{g} · {n}");
-                        let view = ViewKind::Group(g.clone());
-                        let chip = ChoiceChip {
-                            label: &label,
-                            color: colors.get(g).copied(),
-                            selected: self.view.as_ref() == Some(&view),
-                            dashed: false,
-                        };
-                        if choice_chip(ui, &chip).clicked() {
-                            act.view = Some(view);
-                        }
-                    }
-                    for (i, c) in compositions.iter().enumerate() {
-                        let view = ViewKind::Composition(i);
-                        let chip = ChoiceChip {
-                            label: &c.name,
-                            color: None,
-                            selected: self.view.as_ref() == Some(&view),
-                            dashed: true,
-                        };
-                        if choice_chip(ui, &chip).clicked() {
-                            act.view = Some(view);
-                        }
-                    }
-                    let plus = ChoiceChip {
-                        label: "+",
-                        color: None,
-                        selected: false,
-                        dashed: false,
-                    };
-                    if choice_chip(ui, &plus)
-                        .on_hover_text("New composite")
-                        .clicked()
-                    {
-                        act.add_composite = true;
-                    }
-                }
-                // Right to left: Strong ends the row.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.toggles(ui, session, mono);
+            let one_row = self
+                .bar_widths
+                .is_some_and(|(left, right)| left + space::L + right <= ui.available_width());
+            let mut widths = (0.0, 0.0);
+            if one_row {
+                ui.horizontal(|ui| {
+                    widths.0 = self.choices(ui, session, &groups, mosaic_ok, &mut act);
+                    // Right to left: Strong ends the row.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        widths.1 = self.toggles(ui, session, mono);
+                    });
                 });
-            });
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    widths.0 = self.choices(ui, session, &groups, mosaic_ok, &mut act);
+                });
+                ui.add_space(space::XS);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        widths.1 = self.toggles(ui, session, mono);
+                    });
+                });
+            }
+            if self.bar_widths != Some(widths) {
+                // Lay the bar out again with what it measured.
+                self.bar_widths = Some(widths);
+                ui.ctx().request_repaint();
+            }
         });
         if let Some(mode) = act.mode {
             self.set_mode(mode);
@@ -131,19 +102,106 @@ impl SessionWindow {
         }
     }
 
-    /// The overlay and stretch toggles, laid out right to left.
-    fn toggles(&mut self, ui: &mut egui::Ui, session: &mut OpenSession, mono: bool) {
+    /// Plan / Mosaic, then (with two or more groups) a chip per group and
+    /// per composite and **+**; what was clicked goes to `act`. Returns the
+    /// width they take in one row.
+    fn choices(
+        &self,
+        ui: &mut egui::Ui,
+        session: &OpenSession,
+        groups: &[String],
+        mosaic_ok: bool,
+        act: &mut BarActions,
+    ) -> f32 {
+        let mut widths = Vec::new();
+        let mut extra = 0.0;
+        let mut mode = self.mode();
+        let options = [
+            Segment {
+                value: CanvasMode::Plan,
+                label: "Plan",
+                disabled: None,
+            },
+            Segment {
+                value: CanvasMode::Mosaic,
+                label: "Mosaic",
+                disabled: (!mosaic_ok).then_some(NOTHING_MERGED),
+            },
+        ];
+        let r = segmented_with(ui, &mut mode, &options);
+        widths.push(r.rect.width());
+        if r.changed() {
+            act.mode = Some(mode);
+        }
+        if groups.len() >= 2 {
+            ui.add_space(space::S);
+            extra += space::S;
+            let colors = group_colors(
+                &load_group_colors(&session.mosaic.config.ui),
+                groups.iter().map(String::as_str),
+            );
+            let members = group_members(session, groups);
+            let mut chip = |ui: &mut egui::Ui, chip: ChoiceChip<'_>| {
+                let r = choice_chip(ui, &chip);
+                widths.push(r.rect.width());
+                r
+            };
+            for g in groups {
+                let n = members.get(g).map_or(0, Vec::len);
+                let label = format!("{g} · {n}");
+                let view = ViewKind::Group(g.clone());
+                let c = ChoiceChip {
+                    label: &label,
+                    color: colors.get(g).copied(),
+                    selected: self.view.as_ref() == Some(&view),
+                    dashed: false,
+                };
+                if chip(ui, c).clicked() {
+                    act.view = Some(view);
+                }
+            }
+            for (i, comp) in compositions_of(session).iter().enumerate() {
+                let view = ViewKind::Composition(i);
+                let c = ChoiceChip {
+                    label: &comp.name,
+                    color: None,
+                    selected: self.view.as_ref() == Some(&view),
+                    dashed: true,
+                };
+                if chip(ui, c).clicked() {
+                    act.view = Some(view);
+                }
+            }
+            let plus = ChoiceChip {
+                label: "+",
+                color: None,
+                selected: false,
+                dashed: false,
+            };
+            if chip(ui, plus).on_hover_text("New composite").clicked() {
+                act.add_composite = true;
+            }
+        }
+        one_row_width(ui, &widths) + extra
+    }
+
+    /// The overlay and stretch toggles, laid out right to left. Returns
+    /// the width they take.
+    fn toggles(&mut self, ui: &mut egui::Ui, session: &mut OpenSession, mono: bool) -> f32 {
         let ui_value = &mut session.mosaic.config.ui;
         let mut stretch = DisplayStretch::load(ui_value);
         let before = stretch;
-        let toggle = |ui: &mut egui::Ui, label: &str, on: bool| {
+        let mut widths = Vec::new();
+        let mut toggle = |ui: &mut egui::Ui, label: &str, on: bool| {
             let chip = ChoiceChip {
                 label,
                 color: None,
                 selected: on,
                 dashed: false,
             };
-            choice_chip(ui, &chip)
+            let r = choice_chip(ui, &chip);
+            widths.push(r.rect.width());
+            r
         };
         if toggle(ui, "Strong", stretch.strong)
             .on_hover_text("A stronger automatic stretch that brings out faint gradients")
@@ -177,6 +235,7 @@ impl SessionWindow {
             stretch.save(ui_value);
             self.save.touch();
         }
+        one_row_width(ui, &widths) + space::S
     }
 
     /// The canvas filling the rest of `ui`: the plan or the mosaic.
@@ -242,4 +301,10 @@ impl SessionWindow {
                 .source()
                 .is_some_and(|s| s.tile_geometry().channels == 1)
     }
+}
+
+/// The width of controls `widths` wide side by side in `ui`'s spacing.
+fn one_row_width(ui: &egui::Ui, widths: &[f32]) -> f32 {
+    let gaps = widths.len().saturating_sub(1) as f32;
+    widths.iter().sum::<f32>() + gaps * ui.spacing().item_spacing.x
 }

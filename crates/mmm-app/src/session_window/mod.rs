@@ -9,8 +9,8 @@
 //!   canvas's [`Camera`] to both first, so nothing moves.
 //! - **Mode.** The window opens on the mosaic once something is merged
 //!   ([`OpenSession::merged`]), else on the plan; **Mosaic** cannot be
-//!   chosen before. [`SessionWindow::merge`] merges every group and shows
-//!   the mosaic.
+//!   chosen before something is merged or a merge has started.
+//!   [`SessionWindow::merge`] merges every group and shows the mosaic.
 //! - **View bar** ([`canvas`]): Plan / Mosaic, a chip per group and per
 //!   composite then **+** (with two or more groups), and the Outlines, ROIs,
 //!   Linked and Strong toggles.
@@ -84,6 +84,8 @@ pub struct SessionWindow {
     notes_mode: NotesMode,
     /// The panel selected on the plan last frame (a new one opens Panels).
     selected: Option<PathBuf>,
+    /// The view bar's choices' and toggles' one-row widths, as last drawn.
+    bar_widths: Option<(f32, f32)>,
     save: Debounce,
 }
 
@@ -116,6 +118,7 @@ impl SessionWindow {
             show_all_checks: false,
             notes_mode: NotesMode::default(),
             selected: None,
+            bar_widths: None,
             save: Debounce::default(),
         }
     }
@@ -279,7 +282,7 @@ impl SessionWindow {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| {
-                self.view_bar(ui, session, pipeline);
+                self.view_bar(ui, session, jobs, pipeline);
                 self.canvas_ui(ui, session, pipeline, checks);
             });
         self.mosaic.export_ui(&ctx, session, jobs);
