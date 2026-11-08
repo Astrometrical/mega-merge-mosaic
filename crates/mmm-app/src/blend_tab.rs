@@ -28,7 +28,7 @@
 //! result ([`open_result`]), the automatic display stretch statistics, the
 //! health metrics, the ROI sync and freshness counts. The one write on the
 //! UI thread is the debounced `mosaic.json` save of a manual display
-//! stretch or the ROI list (at most once per [`SAVE_INTERVAL`]), the same
+//! stretch or the ROI list (at most once per [`SAVE_INTERVAL`](crate::util::SAVE_INTERVAL)), the same
 //! documented exception as the job runner's plan/apply saves.
 //!
 //! # No reader across a store recreation
