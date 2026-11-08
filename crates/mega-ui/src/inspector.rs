@@ -92,21 +92,56 @@ pub fn inspector(
     ui: &mut Ui,
     state: &mut InspectorState,
     sections: &[Section<'_>],
+    body: impl FnMut(&mut Ui, &str),
+) {
+    draw(ui, state, sections, None, body);
+}
+
+/// [`inspector`] for an app that also folds and unfolds it with the
+/// keyboard shortcut `shortcut` (e.g. "I"): the fold button's tooltip names
+/// it ("Hide inspector (I)"). The app handles the key.
+pub fn inspector_with_shortcut(
+    ui: &mut Ui,
+    state: &mut InspectorState,
+    sections: &[Section<'_>],
+    shortcut: &str,
+    body: impl FnMut(&mut Ui, &str),
+) {
+    draw(ui, state, sections, Some(shortcut), body);
+}
+
+/// [`inspector`], the fold button's tooltip naming `shortcut` if any.
+fn draw(
+    ui: &mut Ui,
+    state: &mut InspectorState,
+    sections: &[Section<'_>],
+    shortcut: Option<&str>,
     mut body: impl FnMut(&mut Ui, &str),
 ) {
+    let fold_button = |glyph: char, label: &str| {
+        let button = icon_button_of(ButtonKind::Quiet, glyph, label);
+        match shortcut {
+            Some(key) => button.hover_text(format!("{label} ({key})")),
+            None => button,
+        }
+    };
     if state.folded {
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
             ui.add_space(space::S);
-            let show = icon_button_of(ButtonKind::Quiet, icons::CHEVRON_LEFT, "Show inspector");
-            if ui.add(show).clicked() {
+            if ui
+                .add(fold_button(icons::CHEVRON_LEFT, "Show inspector"))
+                .clicked()
+            {
                 state.folded = false;
             }
         });
         return;
     }
     ui.with_layout(Layout::top_down(Align::Max), |ui| {
-        let hide = icon_button_of(ButtonKind::Quiet, icons::CHEVRON_RIGHT, "Hide inspector");
-        if ui.add(hide).clicked() {
+        if ui
+            .add(fold_button(icons::CHEVRON_RIGHT, "Hide inspector"))
+            .clicked()
+        {
             state.folded = true;
         }
     });

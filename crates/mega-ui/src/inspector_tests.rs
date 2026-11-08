@@ -134,3 +134,27 @@ fn width_follows_fold() {
     s.folded = true;
     assert!(inspector_width(&s) < 60.0);
 }
+
+#[test]
+fn a_fold_shortcut_shows_in_the_tooltip() {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(320.0, 400.0))
+        .build_ui_state(
+            |ui, s: &mut InspectorState| {
+                if crate::testutil::themed(ui) {
+                    inspector_with_shortcut(ui, s, &[], "I", |_, _| {});
+                }
+            },
+            InspectorState::default(),
+        );
+    h.run();
+    // The button keeps its label; resting on it shows the key.
+    let at = h.get_by_label("Hide inspector").rect().center();
+    h.hover_at(at);
+    h.run_steps(8);
+    h.get_by_label("Hide inspector (I)");
+    h.get_by_label("Hide inspector").click();
+    h.run();
+    assert!(h.state().folded);
+    h.get_by_label("Show inspector");
+}

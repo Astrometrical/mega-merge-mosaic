@@ -1605,3 +1605,325 @@ fn no_user_visible_blend_wording() {
     assert_no_blend(&h, "plan");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The view bar's toggle `label` (the inspector has a "ROIs" heading too).
+fn toggle(label: &str) -> By<'_> {
+    By::new().label(label).predicate(|n| n.toggled().is_some())
+}
+
+/// Whether the view bar's toggle `label` is on.
+fn toggle_on(h: &Harness<'_, State>, label: &str) -> bool {
+    h.get(toggle(label)).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+}
+
+/// Save what the window holds back, as the shell does on closing.
+fn flush(h: &mut Harness<'static, State>) {
+    let st = h.state_mut();
+    st.w.flush_save(&mut st.session);
+}
+
+/// The session in `dir` opened again (lock and all), in a new window.
+fn reopen(dir: &std::path::Path) -> Harness<'static, State> {
+    let s = crate::session::open_blocking(dir).expect("the session opens again");
+    harness(State::new(s, runner()))
+}
+
+#[test]
+fn view_state_survives_reopening() {
+    let (root, mut s, jobs) = merged("window-view-state");
+    add_roi(&mut s);
+    let dir = s.mosaic.dir.clone();
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| st.w.view().is_some());
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic, "merged: the mosaic");
+    // The plan of OIII, zoomed in; Notes open in place of Problems, the
+    // inspector folded; ROIs off; Strong on.
+    h.get_by_label("Plan").click();
+    h.run_steps(2);
+    h.get_by_label("OIII · 4").click();
+    let oiii = Some(ViewKind::Group("OIII".into()));
+    step_to(&mut h, |st| st.w.view() == oiii.as_ref() && plan_placed(st));
+    zoom_plan_about(&mut h, (150.0, 130.0));
+    {
+        let inspector = h.state_mut().w.inspector_mut();
+        inspector.toggle(PROBLEMS);
+        inspector.toggle(NOTES);
+    }
+    h.get(toggle("ROIs")).click();
+    h.get(toggle("Strong")).click();
+    h.get_by_label("Hide inspector").click();
+    h.run_steps(2);
+    assert!(h.state().w.inspector().folded);
+    let cam = h.state().w.plan().camera().expect("the plan's camera");
+    flush(&mut h);
+    drop(h);
+
+    let mut h = reopen(&dir);
+    // The first frame with every panel in place is drawn through the
+    // camera: no fit is painted first.
+    step_to(&mut h, plan_placed);
+    let st = h.state();
+    assert_eq!(st.w.mode(), CanvasMode::Plan);
+    assert_eq!(st.w.view(), oiii.as_ref());
+    assert_eq!(st.w.plan().view(), oiii.as_ref());
+    assert_eq!(st.w.mosaic().view(), oiii.as_ref());
+    assert_camera(st.w.plan().camera(), cam);
+    assert_plan_painted_with(&h, cam);
+    let inspector = st.w.inspector();
+    assert!(inspector.folded);
+    assert!(inspector.is_open(NOTES) && !inspector.is_open(PROBLEMS));
+    assert!(!st.w.panel_list_open);
+    assert!(toggle_on(&h, "Outlines"));
+    assert!(!toggle_on(&h, "ROIs"));
+    assert!(toggle_on(&h, "Strong"), "the display stretch");
+
+    // The mosaic, Outlines off, ROIs on and the panel list open: kept too.
+    h.get_by_label("Mosaic").click();
+    h.run_steps(2);
+    h.get(toggle("Outlines")).click();
+    h.get(toggle("ROIs")).click();
+    h.run_steps(2);
+    h.get_by_label("8 panels").click();
+    h.run_steps(2);
+    assert!(h.state().w.panel_list_open);
+    flush(&mut h);
+    drop(h);
+    let mut h = reopen(&dir);
+    step_until(&mut h, |st| st.w.view().is_some());
+    assert!(h.state().w.panel_list_open);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    h.get_by_label("8 panels").click();
+    // The mosaic's first painted frame is through the camera too.
+    step_to(&mut h, |st| {
+        !st.w.panel_list_open && st.w.mosaic().viewer_frame().is_some()
+    });
+    assert_mosaic_painted_with(&h, cam);
+    assert_camera(h.state().w.mosaic().camera(), cam);
+    assert!(!toggle_on(&h, "Outlines"));
+    assert!(toggle_on(&h, "ROIs"));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn restored_view_that_no_longer_exists_falls_back() {
+    let saved_cam = Camera {
+        centre: (200.0, 150.0),
+        zoom: 3.0,
+    };
+    // A group gone, a composite gone, and a group still there.
+    for (key, shown) in [("SII", "Ha"), ("comp:Gone", "Ha"), ("OIII", "OIII")] {
+        let (root, mut s, jobs) = analyzed("window-view-gone");
+        assert!(!s.merged);
+        let saved = ViewState {
+            mode: CanvasMode::Mosaic,
+            view: Some(key.into()),
+            camera: Some(saved_cam),
+            inspector_folded: false,
+            inspector_open: vec![NOTES.into()],
+            panel_list_open: false,
+            outlines: true,
+            rois: true,
+        };
+        saved.save(&mut s.mosaic.config.ui);
+        let mut h = harness(State::new(s, jobs));
+        step_to(&mut h, plan_placed);
+        let st = h.state();
+        // Nothing merged: the plan.
+        assert_eq!(st.w.mode(), CanvasMode::Plan, "{key}");
+        let view = Some(ViewKind::Group(shown.into()));
+        assert_eq!(st.w.view(), view.as_ref(), "{key}");
+        assert_eq!(st.w.plan().view(), view.as_ref(), "{key}");
+        assert_eq!(st.w.mosaic().view(), view.as_ref(), "{key}");
+        // The camera comes back with its view only.
+        let cam = st.w.plan().camera().expect("the plan's camera");
+        let restored = (cam.zoom - saved_cam.zoom).abs() < 1e-6
+            && (cam.centre.0 - saved_cam.centre.0).abs() < 1e-6
+            && (cam.centre.1 - saved_cam.centre.1).abs() < 1e-6;
+        assert_eq!(restored, key == shown, "{key}: {cam:?}");
+        // The rest is restored all the same.
+        assert!(st.w.inspector().is_open(NOTES), "{key}");
+        assert!(!st.w.inspector().is_open(PROBLEMS), "{key}");
+        drop(h);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn shortcuts_toggle_the_canvas() {
+    use egui::{Key, Modifiers};
+    let (root, s, jobs) = merged("window-shortcuts");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(2);
+    let group = |g: &str| Some(ViewKind::Group(g.into()));
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    assert_eq!(h.state().w.view(), group("Ha").as_ref());
+    assert!(toggle_on(&h, "Outlines"));
+    let press = |h: &mut Harness<'static, State>, key: Key| {
+        h.key_press(key);
+        h.run_steps(2);
+    };
+    press(&mut h, Key::O);
+    assert!(!toggle_on(&h, "Outlines"));
+    press(&mut h, Key::M);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    press(&mut h, Key::M);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    // Next and previous, round the chips (no composites).
+    press(&mut h, Key::CloseBracket);
+    assert_eq!(h.state().w.view(), group("OIII").as_ref());
+    assert_eq!(h.state().w.mosaic().view(), group("OIII").as_ref());
+    press(&mut h, Key::CloseBracket);
+    assert_eq!(h.state().w.view(), group("Ha").as_ref());
+    press(&mut h, Key::OpenBracket);
+    assert_eq!(h.state().w.view(), group("OIII").as_ref());
+    press(&mut h, Key::R);
+    assert!(!toggle_on(&h, "ROIs"));
+    press(&mut h, Key::S);
+    press(&mut h, Key::L);
+    let want = DisplayStretch {
+        linked: true,
+        strong: true,
+    };
+    assert_eq!(
+        DisplayStretch::load(&h.state().session.mosaic.config.ui),
+        want
+    );
+    press(&mut h, Key::I);
+    assert!(h.state().w.inspector().folded);
+    press(&mut h, Key::I);
+    assert!(!h.state().w.inspector().folded);
+    // With a modifier held, a letter is no shortcut.
+    h.key_press_modifiers(Modifiers::CTRL, Key::O);
+    h.run_steps(2);
+    assert!(!toggle_on(&h, "Outlines"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn ctrl_enter_merges_when_merge_is_allowed() {
+    use egui::{Key, Modifiers};
+    let (root, s, jobs) = analyzed("window-ctrl-enter");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    // Nothing merged: M has no mosaic to show.
+    h.key_press(Key::M);
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    let gate = h.state_mut().jobs.hold();
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    // Merging already: nothing more.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
+    gate.open();
+    // Merged: the main button reads Export…, and Ctrl+Enter merges
+    // nothing.
+    step_until(&mut h, |st| {
+        !st.jobs.busy() && st.session.merged && !super::steps::needs_merge(&st.session)
+    });
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
+    h.run_steps(2);
+    assert!(!h.state().jobs.busy(), "no merge started");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn shortcuts_ignored_while_typing() {
+    use egui::Key;
+    let root = temp_dir("window-typing");
+    let mut h = harness(State::new(two_group_session(&root), runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.state_mut().w.inspector_mut().reveal(NOTES);
+    h.run_steps(2);
+    h.get_by_label("Add notes").click();
+    h.run_steps(2);
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    // A key typed as a keyboard types it: the key, then its text.
+    for (key, text) in [(Key::O, "o"), (Key::I, "i"), (Key::CloseBracket, "]")] {
+        h.key_press(key);
+        h.get_by_role(Role::MultilineTextInput).type_text(text);
+        h.run_steps(2);
+    }
+    assert_eq!(notes(&h.state().session.mosaic.config.ui), "oi]");
+    assert!(toggle_on(&h, "Outlines"), "outlines unchanged");
+    assert!(!h.state().w.inspector().folded);
+    assert_eq!(
+        h.state().w.view(),
+        Some(&ViewKind::Group("Ha".into())),
+        "no next view"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn shortcuts_ignored_in_the_export_dialog() {
+    use egui::Key;
+    let (root, s, jobs) = merged("window-export-keys");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| st.w.mosaic().can_open_export());
+    let State { w, session, .. } = h.state_mut();
+    w.mosaic.open_export(session);
+    h.run_steps(2);
+    h.key_press(Key::O);
+    h.key_press(Key::M);
+    h.run_steps(2);
+    assert!(toggle_on(&h, "Outlines"));
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Whether the tooltip `want` shows once the pointer has rested at `at`
+/// past the tooltip delay.
+fn tooltip_shows(h: &mut Harness<'static, State>, at: egui::Pos2, want: &str) -> bool {
+    h.hover_at(at);
+    h.run_steps(80);
+    h.query_all_by_label(want).next().is_some()
+}
+
+#[test]
+fn shortcuts_show_in_tooltips() {
+    use egui::{Key, KeyboardShortcut, Modifiers};
+    let (root, s, jobs) = analyzed("window-shortcut-tips");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    h.run_steps(2);
+    let outlines = h.get(toggle("Outlines")).rect().center();
+    let want = "Show the panels' outlines and numbers (O)";
+    assert!(tooltip_shows(&mut h, outlines, want), "{want}");
+    let plan = h.get_by_label("Plan").rect().center();
+    let want = "Switch between plan and mosaic (M)";
+    assert!(tooltip_shows(&mut h, plan, want), "{want}");
+    let chip = h.get_by_label("OIII · 4").rect().center();
+    let want = "Previous / next group or composite ([ / ])";
+    assert!(tooltip_shows(&mut h, chip, want), "{want}");
+    let hide = h.get_by_label("Hide inspector").rect().center();
+    assert!(tooltip_shows(&mut h, hide, "Hide inspector (I)"));
+    // The main button: the rightmost Merge.
+    let main = h
+        .query_all_by_label("Merge")
+        .map(|n| n.rect().center())
+        .fold(
+            egui::pos2(f32::MIN, 0.0),
+            |a, b| if b.x > a.x { b } else { a },
+        );
+    let keys = h
+        .ctx
+        .format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter));
+    let want = format!("Merge every group over the whole canvas ({keys})");
+    assert!(tooltip_shows(&mut h, main, &want), "{want}");
+    let _ = std::fs::remove_dir_all(&root);
+}

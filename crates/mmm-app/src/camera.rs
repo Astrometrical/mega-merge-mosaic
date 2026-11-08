@@ -4,9 +4,10 @@
 //! the canvas it shows.
 
 use mega_ui::viewer::View;
+use serde::{Deserialize, Serialize};
 
 /// A canvas's centre and zoom, without the animation state of a [`View`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Camera {
     /// The canvas point at the middle of the viewport (canvas pixels).
     pub centre: (f64, f64),

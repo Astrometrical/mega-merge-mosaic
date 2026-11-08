@@ -13,6 +13,7 @@ use std::path::Path;
 use mega_ui::theme::tokens::space;
 use mega_ui::widgets::{ChoiceChip, Segment, choice_chip, segmented_with};
 
+use super::shortcuts::{self, keyed, views_hint};
 use super::{COMPOSITES, CanvasMode, SessionWindow, compositions_of};
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, add_composition};
@@ -116,16 +117,19 @@ impl SessionWindow {
         let mut widths = Vec::new();
         let mut extra = 0.0;
         let mut mode = self.mode();
+        let switch = keyed("Switch between plan and mosaic", shortcuts::PLAN_MOSAIC);
         let options = [
             Segment {
                 value: CanvasMode::Plan,
                 label: "Plan",
                 disabled: None,
+                tooltip: Some(&switch),
             },
             Segment {
                 value: CanvasMode::Mosaic,
                 label: "Mosaic",
                 disabled: (!mosaic_ok).then_some(NOTHING_MERGED),
+                tooltip: Some(&switch),
             },
         ];
         let r = segmented_with(ui, &mut mode, &options);
@@ -141,6 +145,7 @@ impl SessionWindow {
                 groups.iter().map(String::as_str),
             );
             let members = group_members(session, groups);
+            let hint = views_hint();
             let mut chip = |ui: &mut egui::Ui, chip: ChoiceChip<'_>| {
                 let r = choice_chip(ui, &chip);
                 widths.push(r.rect.width());
@@ -156,7 +161,7 @@ impl SessionWindow {
                     selected: self.view.as_ref() == Some(&view),
                     dashed: false,
                 };
-                if chip(ui, c).clicked() {
+                if chip(ui, c).on_hover_text(&hint).clicked() {
                     act.view = Some(view);
                 }
             }
@@ -168,7 +173,7 @@ impl SessionWindow {
                     selected: self.view.as_ref() == Some(&view),
                     dashed: true,
                 };
-                if chip(ui, c).clicked() {
+                if chip(ui, c).on_hover_text(&hint).clicked() {
                     act.view = Some(view);
                 }
             }
@@ -203,8 +208,12 @@ impl SessionWindow {
             widths.push(r.rect.width());
             r
         };
+        let strong_tip = keyed(
+            "A stronger automatic stretch that brings out faint gradients",
+            shortcuts::STRONG,
+        );
         if toggle(ui, "Strong", stretch.strong)
-            .on_hover_text("A stronger automatic stretch that brings out faint gradients")
+            .on_hover_text(strong_tip)
             .clicked()
         {
             stretch.strong = !stretch.strong;
@@ -212,20 +221,26 @@ impl SessionWindow {
         let linked = ui
             .add_enabled_ui(!mono, |ui| toggle(ui, "Linked", stretch.linked))
             .inner
-            .on_hover_text("One automatic stretch for every colour channel")
+            .on_hover_text(keyed(
+                "One automatic stretch for every colour channel",
+                shortcuts::LINKED,
+            ))
             .on_disabled_hover_text(ONE_CHANNEL);
         if linked.clicked() {
             stretch.linked = !stretch.linked;
         }
         ui.add_space(space::S);
         if toggle(ui, "ROIs", self.look.rois)
-            .on_hover_text("Show the regions of interest")
+            .on_hover_text(keyed("Show the regions of interest", shortcuts::ROIS))
             .clicked()
         {
             self.look.rois = !self.look.rois;
         }
         if toggle(ui, "Outlines", self.look.outlines)
-            .on_hover_text("Show the panels' outlines and numbers")
+            .on_hover_text(keyed(
+                "Show the panels' outlines and numbers",
+                shortcuts::OUTLINES,
+            ))
             .clicked()
         {
             self.look.outlines = !self.look.outlines;
@@ -279,7 +294,7 @@ impl SessionWindow {
     /// link: a group view whose panels' previews all have one channel or,
     /// with no preview in yet, whose merged result has one. A composite
     /// mixes colour; a view nothing has been read of yet counts as colour.
-    fn is_mono(&self, session: &OpenSession, pipeline: &Pipeline) -> bool {
+    pub(super) fn is_mono(&self, session: &OpenSession, pipeline: &Pipeline) -> bool {
         let Some(ViewKind::Group(g)) = &self.view else {
             return false;
         };

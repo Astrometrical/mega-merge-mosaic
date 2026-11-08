@@ -15,6 +15,9 @@ pub struct Segment<'a, T> {
     /// Why the option cannot be chosen now, shown on hover; `None` when it
     /// can.
     pub disabled: Option<&'a str>,
+    /// Shown on hover while the option can be chosen (e.g. naming a
+    /// keyboard shortcut).
+    pub tooltip: Option<&'a str>,
 }
 
 /// Choose one of `options` into `value`. Returns the control's response,
@@ -30,6 +33,7 @@ pub fn segmented<T: PartialEq + Clone>(
             value: value.clone(),
             label,
             disabled: None,
+            tooltip: None,
         })
         .collect();
     segmented_with(ui, value, &options)
@@ -71,6 +75,8 @@ pub fn segmented_with<T: PartialEq + Clone>(
                     let mut r = ui.add_enabled(option.disabled.is_none(), b);
                     if let Some(why) = option.disabled {
                         r = r.on_disabled_hover_text(why);
+                    } else if let Some(tip) = option.tooltip {
+                        r = r.on_hover_text(tip);
                     }
                     if r.clicked() && !selected {
                         *value = option.value.clone();

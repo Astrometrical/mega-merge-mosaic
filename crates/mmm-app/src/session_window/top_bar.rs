@@ -27,7 +27,7 @@ use super::steps::{
     CHECKS_STEP, EXPORT_STEP, MERGE_STEP, PANELS_STEP, is_analysis, is_previews, jobs_where,
     needs_merge, steps,
 };
-use super::{CanvasMode, MERGE_SETTINGS, PROBLEMS, SessionWindow};
+use super::{CanvasMode, MERGE_SETTINGS, PROBLEMS, SessionWindow, shortcuts};
 use crate::blend_settings::{feather_text, mode_name};
 use crate::checks::ChecksEngine;
 use crate::jobs::{JobRunner, JobTarget};
@@ -110,6 +110,26 @@ impl SessionWindow {
         back
     }
 
+    /// Why the main button's **Merge** cannot be pressed now, if it cannot
+    /// (it shows only while [`needs_merge`]): a whole-canvas merge running,
+    /// or [`MosaicView::merge_block_reason`](crate::mosaic_view::MosaicView::merge_block_reason).
+    /// An ROI's merge is no reason to wait (it may be cut short).
+    fn merge_block(&self, session: &OpenSession, jobs: &JobRunner) -> Option<String> {
+        if jobs.run_of(JobTarget::Blend).is_some() {
+            Some(MERGING.to_string())
+        } else {
+            self.mosaic.merge_block_reason(session, jobs)
+        }
+    }
+
+    /// Whether the main button offers **Merge** and it can be pressed
+    /// (what `Ctrl+Enter` presses).
+    pub(super) fn can_merge(&self, session: &OpenSession, jobs: &JobRunner) -> bool {
+        !session.mosaic.config.panels.is_empty()
+            && needs_merge(session)
+            && self.merge_block(session, jobs).is_none()
+    }
+
     /// The main button (and, with **Merge**, the settings' summary after
     /// it), laid out right to left; what was clicked.
     fn main_button(
@@ -141,15 +161,11 @@ impl SessionWindow {
             {
                 asked = Some(Main::Settings);
             }
-            // An ROI's merge is no reason to wait (it may be cut short).
-            let why = if jobs.run_of(JobTarget::Blend).is_some() {
-                Some(MERGING.to_string())
-            } else {
-                self.mosaic.merge_block_reason(session, jobs)
-            };
+            let why = self.merge_block(session, jobs);
+            let keys = ui.ctx().format_shortcut(&shortcuts::MERGE);
             if ui
                 .add_enabled(why.is_none(), MegaButton::new(ButtonKind::Primary, "Merge"))
-                .on_hover_text("Merge every group over the whole canvas")
+                .on_hover_text(format!("Merge every group over the whole canvas ({keys})"))
                 .on_disabled_hover_text(why.unwrap_or_default())
                 .clicked()
             {

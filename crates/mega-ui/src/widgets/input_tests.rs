@@ -44,11 +44,13 @@ fn a_disabled_segment_cannot_be_chosen() {
                             value: 0,
                             label: "Plan",
                             disabled: None,
+                            tooltip: None,
                         },
                         Segment {
                             value: 1,
                             label: "Mosaic",
                             disabled: Some("Nothing merged yet"),
+                            tooltip: None,
                         },
                     ];
                     s.changed |= segmented_with(ui, &mut s.value, &opts).changed();

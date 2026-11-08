@@ -735,6 +735,11 @@ impl MosaicView {
         !self.members.is_empty() && self.analyze_job.is_none() && !self.export.is_open()
     }
 
+    /// Whether the export dialog is open.
+    pub fn export_open(&self) -> bool {
+        self.export.is_open()
+    }
+
     /// Open the export dialog for the view's groups.
     pub fn open_export(&mut self, session: &OpenSession) {
         self.export.open(session, self.members.clone());

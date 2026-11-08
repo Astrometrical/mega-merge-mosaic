@@ -175,9 +175,9 @@ impl Shell {
 
     /// Save anything held back: edits waiting for the jobs to stop (panels,
     /// merge settings) when none runs, then what a rate limit holds back
-    /// (the display stretch, ROIs, composites, notes). When the window
-    /// closes, and on leaving the session ([`Shell::close_session`]); also
-    /// from eframe's periodic save.
+    /// (the session window's view, the display stretch, ROIs, composites,
+    /// notes). When the window closes, and on leaving the session
+    /// ([`Shell::close_session`]); also from eframe's periodic save.
     pub fn flush_pending_saves(&mut self) {
         let Some(session) = &mut self.session else {
             return;
@@ -1391,6 +1391,29 @@ mod tests {
         shell.flush_pending_saves();
         let back = mmm_core::mosaic::MosaicConfig::load(&dir).unwrap();
         assert_eq!(back.ui["marker"], 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn view_state_flushed_by_shell() {
+        use crate::session_window::view_state::ViewState;
+        use mmm_core::mosaic::MosaicConfig;
+        let root = temp_dir("shell-view-state");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        h.run_steps(3);
+        let saved = |dir: &Path| ViewState::load(&MosaicConfig::load(dir).unwrap().ui);
+        step_until(&mut h, |_| {
+            saved(&dir).is_some_and(|v| v.view.as_deref() == Some("Ha"))
+        });
+        // Changed with no frame since: the rate limit holds it back, the
+        // flush writes it.
+        h.state_mut()
+            .window_mut()
+            .select_view(ViewKind::Group("OIII".into()));
+        h.state_mut().flush_pending_saves();
+        assert_eq!(saved(&dir).unwrap().view.as_deref(), Some("OIII"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

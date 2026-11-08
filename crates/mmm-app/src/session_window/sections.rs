@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use mega_ui::checks::{CheckAction, CheckItem, checks_list};
-use mega_ui::inspector::{Badge, Section, inspector};
+use mega_ui::inspector::{Badge, Section, inspector_with_shortcut};
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
 use mega_ui::theme::{Severity as UiSeverity, Tone};
@@ -26,6 +26,7 @@ use mega_ui::widgets::{ButtonKind, MegaButton, NotesMode, notes_view};
 use mmm_core::checks::{Check, Severity, is_accepted};
 use mmm_core::mosaic::MosaicConfig;
 
+use super::shortcuts;
 use super::{
     COMPOSITES, CanvasMode, MERGE_SETTINGS, NOTES, PANELS, PROBLEMS, ROIS, SessionOutput,
     SessionWindow, compositions_of,
@@ -114,7 +115,8 @@ impl SessionWindow {
             save,
             ..
         } = self;
-        inspector(ui, state, &sections, |ui, id| {
+        let fold = shortcuts::FOLD.symbol_or_name();
+        inspector_with_shortcut(ui, state, &sections, fold, |ui, id| {
             // Each body under its own id: the inspector draws them all in
             // like-identified scopes.
             ui.push_id(id, |ui| match id {
