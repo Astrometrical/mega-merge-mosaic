@@ -435,8 +435,12 @@ mod tests {
         write_xisf_with_header_xml,
     };
 
+    /// A fresh directory per call (tests run in parallel, several calling
+    /// with the same tag).
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mmm-checks-{tag}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mmm-checks-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
