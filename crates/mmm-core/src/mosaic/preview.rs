@@ -18,16 +18,19 @@ use crate::settings::BlendSettings;
 use crate::surfaces::Surfaces;
 use crate::tiles::{TILE, TileGeometry};
 
-/// Most output pixels one preview patch may hold (2048²).
+/// Most output pixels one preview patch may hold (2048²). A rect whose
+/// aligned size is larger is blended at 1/8 instead of full resolution (see
+/// [`preview_downsample`]).
 pub const PREVIEW_MAX_PIXELS: u64 = 4_194_304;
 
-/// The downsample the blend can run a region at: full resolution, or the
-/// 1/8 level the blend builds from its summaries ([`crate::blend::blend`]
-/// supports no other factor, with or without an ROI).
+/// The reduced downsample the blend can run a region at: the 1/8 level it
+/// builds from its summaries ([`crate::blend::blend`] supports only
+/// downsample 1 and 8, with or without an ROI).
 const L8_DOWNSAMPLE: u32 = 8;
 
 /// Everything a background preview needs, detached from the [`Mosaic`]
-/// (made by [`plan_preview`], run by [`run_preview`]).
+/// (made by [`plan_preview`], run by [`run_preview`]). Making it reads no
+/// file; [`run_preview`] aligns the rect and picks the downsample.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewPlan {
     /// The group name.
@@ -36,16 +39,18 @@ pub struct PreviewPlan {
     pub session_dir: PathBuf,
     /// The blend settings the preview uses.
     pub settings: BlendSettings,
-    /// Tile-aligned level-0 canvas rect to blend (`[x0, y0, x1, y1]`).
+    /// The REQUESTED level-0 canvas rect (`[x0, y0, x1, y1]`); the run
+    /// aligns it outward to tiles ([`TileGeometry::align_rect`]).
     pub rect: [u64; 4],
-    /// Downsample factor (1 or 8) chosen by [`preview_downsample`].
-    pub downsample: u32,
+    /// Output-pixel cap for the patch: [`PREVIEW_MAX_PIXELS`] from
+    /// [`plan_preview`]. A smaller value forces the 1/8 level sooner.
+    pub max_pixels: u64,
 }
 
 /// A previewed region, planar and held in memory only.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewPatch {
-    /// The tile-aligned level-0 rect it covers.
+    /// The tile-aligned level-0 rect actually blended.
     pub rect: [u64; 4],
     /// Width in patch pixels.
     pub width: u32,
@@ -53,30 +58,30 @@ pub struct PreviewPatch {
     pub height: u32,
     /// Channel count.
     pub channels: u32,
-    /// Level-0 pixels per patch pixel (1 or 8).
+    /// The downsample used: 1 (full resolution) or 8 (level-0 pixels per
+    /// patch pixel), see [`preview_downsample`].
     pub downsample: u32,
     /// Planar samples: `channels` planes of `height` rows of `width`.
     pub data: Vec<f32>,
 }
 
-/// The downsample for a `w`×`h` level-0 rect: 1 when it fits under
-/// [`PREVIEW_MAX_PIXELS`], else 8 (the only reduced level the blend
-/// supports) when it fits then; `None` when even that is over the cap.
-pub fn preview_downsample(w: u64, h: u64) -> Option<u32> {
+/// The downsample for a `w`×`h` level-0 rect under `max_pixels`: 1 when
+/// `w*h` fits, else 8 (the only reduced factor the blend supports, so never
+/// 2..7) when the 1/8 grid fits; `None` when even that is over the cap.
+/// Pass [`PREVIEW_MAX_PIXELS`] for the standard cap.
+pub fn preview_downsample(w: u64, h: u64, max_pixels: u64) -> Option<u32> {
     [1, L8_DOWNSAMPLE].into_iter().find(|&d| {
         let d = d as u64;
-        w.div_ceil(d) * h.div_ceil(d) <= PREVIEW_MAX_PIXELS
+        w.div_ceil(d) * h.div_ceil(d) <= max_pixels
     })
 }
 
 /// Plan a preview of `rect` (level-0 canvas coordinates) of `group` (owner
-/// thread). The rect is aligned outward to tiles
-/// ([`TileGeometry::align_rect`]) and the downsample chosen by
-/// [`preview_downsample`].
+/// thread). Reads no file: only the in-memory analysis checks run.
 ///
-/// Refuses (with [`Error::Compute`]) a group that has never been analysed,
-/// whose analysis is out of date, or whose aligned rect is empty or too
-/// large to preview even at 1/8.
+/// Refuses (with [`Error::Compute`]) a group that has never been analysed
+/// or whose analysis is out of date. [`run_preview`] aligns the rect and
+/// chooses the downsample, and refuses a rect that is empty or too large.
 pub fn plan_preview(
     m: &Mosaic,
     group: &str,
@@ -93,30 +98,12 @@ pub fn plan_preview(
             "analyze settings for group '{group}' changed since it was analyzed — analyze first"
         )));
     }
-    let session_dir = m.group_session_dir(group);
-    let (width, height, channels) = Session::open(&session_dir)?.canvas;
-    let geometry = TileGeometry {
-        width,
-        height,
-        channels: channels as u32,
-        tile: TILE,
-    };
-    let rect = geometry.align_rect(rect);
-    let (w, h) = (
-        rect[2].saturating_sub(rect[0]),
-        rect[3].saturating_sub(rect[1]),
-    );
-    if w == 0 || h == 0 {
-        return Err(Error::compute("preview region is outside the canvas"));
-    }
-    let downsample = preview_downsample(w, h)
-        .ok_or_else(|| Error::compute("preview region is too large to preview"))?;
     Ok(PreviewPlan {
         group: group.to_string(),
-        session_dir,
+        session_dir: m.group_session_dir(group),
         settings,
         rect,
-        downsample,
+        max_pixels: PREVIEW_MAX_PIXELS,
     })
 }
 
@@ -160,6 +147,23 @@ impl RowSink for PatchSink {
 pub fn run_preview(plan: &PreviewPlan, ctl: &JobCtl) -> Result<PreviewPatch> {
     ctl.check()?;
     let session = Session::open(&plan.session_dir)?;
+    let (width, height, channels) = session.canvas;
+    let geometry = TileGeometry {
+        width,
+        height,
+        channels: channels as u32,
+        tile: TILE,
+    };
+    let rect = geometry.align_rect(plan.rect);
+    let (w, h) = (
+        rect[2].saturating_sub(rect[0]),
+        rect[3].saturating_sub(rect[1]),
+    );
+    if w == 0 || h == 0 {
+        return Err(Error::compute("preview region is outside the canvas"));
+    }
+    let downsample = preview_downsample(w, h, plan.max_pixels)
+        .ok_or_else(|| Error::compute("preview region is too large to preview"))?;
     let graph = OverlapGraph::load(&session.overlap_graph_path())?;
     let phot = Photometry::load(&session.photometry_path())?;
     let surfaces = if session.surfaces_path().exists() {
@@ -168,9 +172,9 @@ pub fn run_preview(plan: &PreviewPlan, ctl: &JobCtl) -> Result<PreviewPatch> {
         None
     };
     let params = BlendParams {
-        downsample: plan.downsample,
+        downsample,
         extent: Some(Extent::Canvas),
-        roi: Some(plan.rect),
+        roi: Some(rect),
         ..plan.settings.to_params()
     };
     let mut sink = PatchSink::default();
@@ -183,11 +187,11 @@ pub fn run_preview(plan: &PreviewPlan, ctl: &JobCtl) -> Result<PreviewPatch> {
         &mut CtlSink::new(&mut sink, ctl, "preview"),
     )?;
     Ok(PreviewPatch {
-        rect: plan.rect,
+        rect,
         width: sink.w as u32,
         height: sink.h as u32,
         channels: sink.ch as u32,
-        downsample: plan.downsample,
+        downsample,
         data: sink.data,
     })
 }

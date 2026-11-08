@@ -1621,10 +1621,10 @@ fn a_preview_matches_the_whole_merge_there() {
     analyze_all(&mut m, &JobCtl::none()).unwrap();
     blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
     let plan = plan_preview(&m, "Ha", [100, 50, 400, 300], BlendSettings::default()).unwrap();
-    assert_eq!(plan.rect, [0, 0, 512, 420]);
-    assert_eq!(plan.downsample, 1);
+    assert_eq!(plan.rect, [100, 50, 400, 300]);
     let patch = run_preview(&plan, &JobCtl::none()).unwrap();
-    assert_eq!(patch.rect, plan.rect);
+    assert_eq!(patch.rect, [0, 0, 512, 420]);
+    assert_eq!(patch.downsample, 1);
     assert_eq!((patch.width, patch.height), (512, 420));
     assert_eq!(patch.channels as u64, CH);
     assert_eq!(patch.data.len(), 512 * 420 * CH as usize);
@@ -1668,13 +1668,13 @@ fn a_preview_writes_nothing() {
 
 #[test]
 fn a_large_roi_is_downsampled_under_the_cap() {
-    assert_eq!(preview_downsample(2048, 2048), Some(1));
-    assert_eq!(preview_downsample(2304, 2304), Some(8));
-    let d = preview_downsample(9255, 18310).unwrap();
+    assert_eq!(preview_downsample(2048, 2048, PREVIEW_MAX_PIXELS), Some(1));
+    assert_eq!(preview_downsample(2304, 2304, PREVIEW_MAX_PIXELS), Some(8));
+    let d = preview_downsample(9255, 18310, PREVIEW_MAX_PIXELS).unwrap();
     assert!(d > 1);
     assert!(9255u64.div_ceil(d as u64) * 18310u64.div_ceil(d as u64) <= PREVIEW_MAX_PIXELS);
     // Beyond what the L8 blend can reach under the cap: refused.
-    assert_eq!(preview_downsample(40_000, 40_000), None);
+    assert_eq!(preview_downsample(40_000, 40_000, PREVIEW_MAX_PIXELS), None);
 
     // A downsampled run delivers the 1/8 grid of the rect.
     let tmp = TempDir::new("preview-ds");
@@ -1687,7 +1687,7 @@ fn a_large_roi_is_downsampled_under_the_cap() {
         BlendSettings::default(),
     )
     .unwrap();
-    plan.downsample = 8;
+    plan.max_pixels = 100_000; // 600x420 no longer fits at full resolution
     let patch = run_preview(&plan, &JobCtl::none()).unwrap();
     assert_eq!(patch.downsample, 8);
     assert_eq!((patch.width, patch.height), (75, 53));
@@ -1718,4 +1718,17 @@ fn a_cancelled_preview_errs_cancelled() {
     token.cancel();
     let err = run_preview(&plan, &JobCtl::new(token, None)).unwrap_err();
     assert!(err.is_cancelled(), "{err}");
+}
+
+#[test]
+fn plan_preview_reads_no_files() {
+    let tmp = TempDir::new("preview-noread");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let dir = m.group_session_dir("Ha");
+    let moved = tmp.0.join("moved-session");
+    std::fs::rename(&dir, &moved).unwrap();
+    let plan = plan_preview(&m, "Ha", [0, 0, 300, 300], BlendSettings::default()).unwrap();
+    assert_eq!(plan.rect, [0, 0, 300, 300]);
+    assert!(run_preview(&plan, &JobCtl::none()).is_err());
 }
