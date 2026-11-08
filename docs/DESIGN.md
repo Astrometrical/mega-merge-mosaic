@@ -1147,29 +1147,55 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
 (§4–§7, §15). It replaces the Panels, Plan and Blend tabs, the session bar,
 the status bar and the Blend settings panel of phases 2 and 3 with one window
 (`crates/mmm-app/src/session_window/`). The UI says "merge" where the engine
-says blend; `mmm-core` keeps its names. No algorithm changed.
+says blend; `mmm-core` keeps its identifiers, provenance actions and
+progress stage codes, but every engine message the app can show (check
+messages and remedies, job errors, the export check) says merge too (a
+test makes a check of every `CheckCode` and asserts none says blend). No
+algorithm changed. The UI copy is British English ("Analyse", "colour").
 
 - **Top bar.** ‹ (back to the start screen), the session name, the **step
   strip** and the main button. The window title is "{name} — Mega Merge
-  Mosaic". There is no status bar and no session bar.
+  Mosaic". There is no status bar and no session bar. It is one row when
+  everything fits (measured each frame: the name, `step_strip_width`, and
+  what the main button leaves); otherwise the strip takes a row of its own
+  below (and wraps if even that is too narrow), and a name too long for what
+  is left is cut short with "…" (hover shows it whole). Nothing overlaps at
+  the app's 720 px minimum.
 - **Step strip** (`steps.rs`): Panels · Checks · Merge · Export. It is the
   status, the progress and the navigation at once: each step shows its state
-  (what is done, what is running, what is next) and clicking one opens what
-  belongs to it (the panel list, the Problems section, the Merge settings
-  section, Export). Checks reads "Checks" until there is something to say,
-  "Analysing…" while analysis runs (cancellable), "Checking…", "{n}
-  problem(s)" or "Checks passed", and **Analyse** only when the analysis
-  stalled after a cancel or failure (`Pipeline::analysis_stalled`); otherwise
-  analysis starts by itself. ROI merges are not shown in the strip.
+  (what is done, what is running, what is next) and clicking one acts:
+  Panels opens or closes the panel list, Checks opens the Problems section,
+  Merge merges every group while that is to do (merging or merged, it shows
+  the mosaic), Export opens the Export dialog. Checks reads "Checks" until
+  there is something to say, "Analysing…" while analysis runs (cancellable),
+  "Checking…", "{n} problem(s)" or "Checks passed", and **Analyse** only when
+  the analysis stalled after a cancel or failure
+  (`Pipeline::analysis_stalled`; clicking it analyses, whichever step is
+  highlighted); otherwise analysis starts by itself. Merging reads "Merging
+  {group} · {i} of {n} · {pct} %", without "{i} of {n}" for a single merge and
+  without the group in a session of one group (an OSC mosaic: "Merging · 43
+  %"; its jobs and toasts are "Merge" and "Merge finished"). A step that
+  cannot act now says why in its tooltip (Merge: the merge guard's reason;
+  Export: `MosaicView::export_block_reason`). ROI merges are not shown in
+  the strip.
 - **Main button.** **Add panels…** with no panels, **Merge** (with a summary
-  of the merge settings) once there are panels, **Export…** once something is
-  merged. `Ctrl/Cmd+Enter` presses it.
+  of the merge settings, which opens Merge settings) while any group lacks a
+  complete result (`needs_merge`: none yet, partly merged or out of date),
+  **Export…** once every group's result is complete (disabled, with its
+  reason as a tooltip, while the Export dialog cannot open).
+  `Ctrl/Cmd+Enter` presses **Merge**.
 - **Canvas.** The plan (`plan_view.rs`) or the merged mosaic
   (`mosaic_view.rs`) of the chosen group or composite, with one shared
   camera: switching between them, or to another view, hands the shown
-  canvas's camera to both first, so nothing moves. The window opens on the
-  mosaic once something is merged, else on the plan; Mosaic cannot be chosen
-  before something is merged or a merge has started. `MosaicView::poll` runs
+  canvas's camera to both first, so nothing moves. Going to an ROI (a click
+  on it in the ROIs section) hands both canvases the camera that frames it
+  (`Camera::framing`), so it works on the plan and the mosaic alike and a
+  later switch moves nothing (`TiledViewer::set_camera` drops view commands
+  queued before it). A composite's members not merged yet are named over
+  the image's bottom-left corner, so the image keeps the plan's place. The
+  window opens on the mosaic once something is merged, else on the plan;
+  Mosaic cannot be chosen before something is merged or a merge has
+  started. `MosaicView::poll` runs
   every frame whether or not the mosaic is drawn. The panel list (still the
   old `PanelsTab` UI) replaces the canvas, view bar included, while open; a
   session without panels opens on it, and files dropped on the window are
@@ -1178,7 +1204,9 @@ says blend; `mmm-core` keeps its names. No algorithm changed.
   (with two or more groups), and the Outlines, ROIs, Linked and Strong
   toggles. It wraps when the window is narrow.
 - **Inspector.** Foldable, at the right: Problems, Panels, ROIs, Merge
-  settings, Composites and Notes, in that order. The merge settings are the
+  settings, Composites and Notes, in that order; only the sections' contents
+  fold (Merge settings has no fold of its own inside). The merge settings
+  are the
   mosaic-wide `AnalyzeSettings` / `BlendSettings` with the CLI's value
   domains, edited and applied as before (staged edits, applied once the
   cancelled jobs have stopped; a global change marks every analysed group
@@ -1201,10 +1229,12 @@ says blend; `mmm-core` keeps its names. No algorithm changed.
 - **Shortcuts.** `I` inspector, `M` plan/mosaic, `[` and `]` previous and next
   view, `O` outlines, `R` ROIs, `L` Linked, `S` Strong, `Ctrl/Cmd+Enter` the
   main button; each is named in its tooltip, and none acts while a text field
-  has the keyboard or the Export dialog is open.
-- **Back to start** (`Shell::close_session`). Flushes the pending saves,
-  cancels the running jobs and waits up to 3 s (`STOP_WAIT`) for them to
-  stop, which can block the UI for that long. Disabled while an export runs.
+  has the keyboard (`Context::text_edit_focused`; a button or chip focused
+  by keyboard navigation does not stop them) or the Export dialog is open.
+- **Back to start** (`Shell::close_session`). Cancels the running jobs and
+  waits up to 3 s (`STOP_WAIT`) for them to stop, which can block the UI for
+  that long, then flushes the pending saves (an edit waiting for the jobs
+  applies only if they stopped). Disabled while an export runs.
   If a worker outlives the wait, the session is released from the UI's point
   of view at once, but a reaper thread (`mmm-session-reaper`) keeps the
   session lock until the abandoned workers have ended, so another window or
@@ -1253,7 +1283,10 @@ stays free of `mmm-core`.
   their first frame; hosts and test harnesses that can't use
   `theme::ensure_applied` and skip drawing for one frame.
 - **Components** (`mega_ui::widgets`): `MegaButton` (primary, secondary,
-  quiet, danger, ghost; large; icon buttons), `chip`, `status`, `overline`,
+  quiet, danger, ghost; large; icon buttons), `step_strip` (pills with
+  state, progress, Cancel and an optional tooltip; `step_strip_width`
+  measures one row, and the strip wraps when it does not fit), `chip`,
+  `status`, `overline`,
   `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
   `Toasts` (the only notifications; never modal), plus the restyled
   `checks::checks_list` and `jobs::job_panel`, `groups` (the group palette,
