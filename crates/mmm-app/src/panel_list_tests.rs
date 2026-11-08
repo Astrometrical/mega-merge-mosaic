@@ -554,6 +554,53 @@ fn a_large_session_draws_a_bounded_list() {
 }
 
 #[test]
+fn a_rule_change_keeps_the_rows_where_they_were_until_resolved() {
+    let root = temp_dir("list-rule-change");
+    let dir = root.join("panels");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut paths = Vec::new();
+    for filter in ["Ha", "OIII", "SII"] {
+        for i in 0..50 {
+            let name = format!("M42_FILTER_{filter}_{i:02}.xisf");
+            let card = format!("'{filter}'");
+            paths.push(panel(&dir, &name, &[("FILTER", &card)]));
+        }
+    }
+    let mut h = harness(session_of(&root, paths), vec![], runner());
+    wait(&mut h, State::settled);
+    heading(&h, "Ha · 50");
+    // The same groups by path keyword: every frame until they are
+    // resolved shows the groups as they were, never 150 rows in No group.
+    h.get_by_role_and_label(Role::ComboBox, "Group by").click();
+    steps(&mut h);
+    h.get_by_role_and_label(Role::Button, "Path keyword…")
+        .click();
+    let bound = 3 * (ROLL_UP_ROWS + 1);
+    let deadline = Instant::now() + PATIENCE;
+    let mut frames = 0;
+    loop {
+        h.step();
+        frames += 1;
+        let drawn = rows(&h);
+        assert!(drawn <= bound, "{drawn} rows laid out in frame {frames}");
+        assert!(!has_heading(&h, "No group · 150"), "frame {frames}");
+        let s = h.state();
+        let rule = &s.session.mosaic.config.grouping.rule;
+        if s.settled() && matches!(rule, GroupRule::PathKeyword { .. }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for the list");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    steps(&mut h);
+    for g in ["Ha", "OIII", "SII"] {
+        heading(&h, &format!("{g} · 50"));
+    }
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn add_files_dedupes() {
     let root = temp_dir("list-add");
     let files = root.join("files");

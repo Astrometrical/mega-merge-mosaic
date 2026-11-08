@@ -42,7 +42,9 @@
 //!   member's is known) in the group's colour, with "{d} fewer than
 //!   {largest group}" when it has fewer panels than the largest. Group
 //!   sections roll up to their first rows. With grouping off: one flat
-//!   section.
+//!   section. While a new rule is resolved, the rows stay where the last
+//!   rule put them (the flat list when grouping was off), rather than
+//!   all dropping into "No group".
 //! - **Selection.** A click selects a row, Shift-click the rows on screen
 //!   from the last one clicked, Ctrl-click (Cmd-click) adds or takes away
 //!   one. It follows the panels (a regrouped panel stays selected; a
@@ -366,23 +368,30 @@ fn resolve(inputs: PanelsEdit, mut infos: BTreeMap<PathBuf, PanelInfo>) -> Resol
 #[derive(Debug, Default, PartialEq)]
 struct Placement {
     /// Panels no rule placed (or placed in [`UNGROUPED`] by hand), and
-    /// those whose group is not resolved yet.
+    /// those never resolved yet.
     ungrouped: Vec<PathBuf>,
-    /// Named groups and their panels.
+    /// Named groups and their panels (some perhaps where another rule put
+    /// them, see `unsorted`).
     groups: BTreeMap<String, Vec<PathBuf>>,
-    /// Panels whose group is still being resolved.
+    /// Panels whose group is still being resolved: never resolved (in "No
+    /// group"), or shown where the last resolution, of another rule, put
+    /// them.
     unsorted: BTreeSet<PathBuf>,
 }
 
 /// Place `shown`'s panels: a manual group as set; otherwise the group of
-/// the last resolution (`resolved`), when it used the same grouping and
-/// placed the panel by the rule.
+/// the last resolution (`resolved`, a grouped one) if it placed the panel
+/// by the rule. While a resolution of another rule runs, the panels stay
+/// where the last one put them (counted as still being resolved), so the
+/// rows don't all drop into "No group" and come back.
 fn place(shown: &PanelsEdit, resolved: Option<(&PanelsEdit, &Groups)>) -> Placement {
     let mut out = Placement::default();
     let mut placed: BTreeMap<&Path, Option<&str>> = BTreeMap::new();
+    let mut stale = false;
     if let Some((inputs, groups)) = resolved
-        && inputs.grouping == shown.grouping
+        && inputs.grouping.enabled
     {
+        stale = inputs.grouping != shown.grouping;
         let by_rule: BTreeSet<&Path> = inputs
             .panels
             .iter()
@@ -406,7 +415,12 @@ fn place(shown: &PanelsEdit, resolved: Option<(&PanelsEdit, &Groups)>) -> Placem
         let group = match &p.manual_group {
             Some(g) => Some(g.as_str()),
             None => match placed.get(p.path.as_path()) {
-                Some(g) => *g,
+                Some(g) => {
+                    if stale {
+                        out.unsorted.insert(p.path.clone());
+                    }
+                    *g
+                }
                 None => {
                     out.unsorted.insert(p.path.clone());
                     None
@@ -433,12 +447,11 @@ impl Placement {
             .groups
             .iter()
             .flat_map(|(g, ps)| ps.iter().map(move |p| (p.as_path(), g.as_str())));
-        let ungrouped = self
-            .ungrouped
-            .iter()
-            .filter(|p| !self.unsorted.contains(*p))
-            .map(|p| (p.as_path(), UNGROUPED));
-        named.chain(ungrouped).collect()
+        let ungrouped = self.ungrouped.iter().map(|p| (p.as_path(), UNGROUPED));
+        named
+            .chain(ungrouped)
+            .filter(|(p, _)| !self.unsorted.contains(*p))
+            .collect()
     }
 }
 
@@ -1443,10 +1456,14 @@ impl PanelList {
         report: Option<&ChecksReport>,
         out: &mut PanelListOutput,
     ) -> Option<PanelsEdit> {
-        let placed = shown
-            .grouping
-            .enabled
-            .then(|| place(shown, self.resolved.as_ref().map(|(i, g)| (i, g))));
+        let resolved = self.resolved.as_ref().map(|(i, g)| (i, g));
+        let placed = match resolved {
+            _ if !shown.grouping.enabled => None,
+            // Grouping just turned on: the flat list as it was until its
+            // groups are in.
+            Some((inputs, _)) if !inputs.grouping.enabled => None,
+            _ => Some(place(shown, resolved)),
+        };
         let data = self.sections(shown, placed.as_ref(), session, report);
         let sections: Vec<Section<'_>> = data.iter().map(SectionData::section).collect();
         // The rows on screen as the table is drawn (for a Shift range).
