@@ -364,6 +364,12 @@ impl SessionWindow {
         &self.panels
     }
 
+    /// The panel list, to submit edits as the list does (tests).
+    #[cfg(test)]
+    pub(crate) fn panel_list_mut(&mut self) -> &mut PanelList {
+        &mut self.panels
+    }
+
     /// The panel list's background work, shown or not ([`PanelList::poll`]):
     /// files picked, typed or dropped anywhere on the window are added, and
     /// a waiting edit applies. Call every frame after the runner's poll,

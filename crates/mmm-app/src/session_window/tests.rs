@@ -2869,24 +2869,21 @@ fn analysis_in_a_merged_session_leaves_merge_settings_alone() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Edit `s`'s panels as the Panels tab does (`f` changes the list) and
-/// wait for the edit to apply.
-fn edit_panels(s: &mut OpenSession, jobs: &mut JobRunner, f: impl FnOnce(&mut Vec<PanelEntry>)) {
-    let ctx = egui::Context::default();
-    let mut edits = crate::panel_edits::PanelEdits::default();
-    let mut edit = crate::panel_edits::PanelsEdit::of(s);
-    f(&mut edit.panels);
-    edits.submit(edit, s, jobs);
-    let deadline = Instant::now() + PATIENCE;
-    while edits.has_pending() {
-        assert!(Instant::now() < deadline, "the edit never applied");
-        // Reap the jobs the edit cancelled (the pipeline may have one
-        // running): the edit applies only once the runner is idle.
-        jobs.poll(s);
-        edits.poll(&ctx, s, jobs);
-        std::thread::sleep(Duration::from_millis(2));
+/// Edit the session's panels through the window's panel list, as the
+/// Panels tab does (`f` changes the list), and step the window until the
+/// edit has applied. The frames reap the jobs it cancels and tell the
+/// window and the pipeline, as the shell does; an edit driven outside them
+/// could wait forever for a job nobody reaps, or hide its end from the
+/// pipeline.
+fn edit_panels(h: &mut Harness<'static, State>, f: impl FnOnce(&mut Vec<PanelEntry>)) {
+    {
+        let st = h.state_mut();
+        let mut edit = crate::panel_edits::PanelsEdit::of(&st.session);
+        f(&mut edit.panels);
+        st.w.panel_list_mut()
+            .submit_edit(edit, &mut st.session, &mut st.jobs);
     }
-    assert!(edits.take_errors().is_empty());
+    step_to(h, |st| !st.w.panels_editing());
 }
 
 /// A merged session shown as Ha's mosaic, the automatic pipeline running.
@@ -2915,22 +2912,19 @@ fn reanalysed(h: &mut Harness<'static, State>, applied: impl Fn(&State) -> bool)
 #[test]
 fn the_tag_after_a_panel_change_says_panels() {
     let (root, mut h) = shown_merged("window-tag-panels");
-    {
-        let st = h.state_mut();
-        edit_panels(&mut st.session, &mut st.jobs, |p| {
-            let last = p
-                .iter()
-                .rposition(|e| {
-                    e.path
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with("Ha")
-                })
-                .unwrap();
-            p.remove(last);
-        });
-    }
+    edit_panels(&mut h, |p| {
+        let last = p
+            .iter()
+            .rposition(|e| {
+                e.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("Ha")
+            })
+            .unwrap();
+        p.remove(last);
+    });
     reanalysed(&mut h, |st| st.session.mosaic.config.panels.len() == 7);
     // The pipeline cleared needs_analyze; Ha's result is still out of date.
     assert!(!h.state().session.mosaic.config.needs_analyze.contains("Ha"));
