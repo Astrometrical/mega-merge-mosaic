@@ -1448,13 +1448,17 @@ mod tests {
         assert!(titles(&h).is_empty(), "no session, no title change");
         type_into(&mut h, "Session folder", dir.to_str().unwrap());
         h.key_press(egui::Key::Enter);
-        h.step();
+        // Collect from every frame, the first included: the open may land
+        // (and the title go out) in the very step that takes the Enter.
         let mut seen = Vec::new();
         let deadline = Instant::now() + crate::testutil::PATIENCE;
-        while h.state().session().is_none() {
-            assert!(Instant::now() < deadline, "no session");
+        loop {
             h.step();
             seen.extend(titles(&h));
+            if h.state().session().is_some() && !seen.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no session, or no title for it");
             std::thread::sleep(Duration::from_millis(5));
         }
         // A few frames more (the pipeline is at work: no `run`): once.
