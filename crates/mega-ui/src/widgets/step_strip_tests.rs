@@ -54,6 +54,32 @@ fn steps_are_buttons_in_order() {
 }
 
 #[test]
+fn steps_centre_in_a_taller_row() {
+    use crate::widgets::{ButtonKind, MegaButton};
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(600.0, 120.0))
+        .build_ui(|ui| {
+            if !crate::testutil::themed(ui) {
+                return;
+            }
+            let row = Vec2::new(ui.available_width(), CONTROL_HEIGHT);
+            ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
+                ui.add(MegaButton::new(ButtonKind::Primary, "Go"));
+                step_strip(ui, &four());
+            });
+        });
+    h.run();
+    let button = h.get_by_label("Go").rect();
+    for l in ["Panels", "Export"] {
+        let pill = h.get_by_label(l).rect();
+        assert!(
+            (pill.center().y - button.center().y).abs() < 0.5,
+            "{l} at {pill:?}, the button at {button:?}"
+        );
+    }
+}
+
+#[test]
 fn clicking_a_step_opens_it() {
     let mut h = harness(four());
     h.run();

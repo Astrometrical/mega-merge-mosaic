@@ -2,8 +2,8 @@
 //! acting as navigation (Panels · Checks · Merge · Export).
 
 use egui::{
-    Color32, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, TextStyle, Ui, Vec2, WidgetInfo,
-    WidgetType, pos2,
+    Align, Color32, CornerRadius, Id, Layout, Rect, Sense, Stroke, StrokeKind, TextStyle, Ui, Vec2,
+    WidgetInfo, WidgetType, pos2,
 };
 
 use crate::icons;
@@ -64,10 +64,14 @@ const CANCEL: f32 = HEIGHT - 6.0;
 
 /// Draw the strip of `steps` left to right and report a click on a step
 /// ([`StripEvent::Open`]) or on a working step's cancel button
-/// ([`StripEvent::Cancel`]).
+/// ([`StripEvent::Cancel`]). In a row taller than a pill (beside buttons)
+/// the pills are centred on it.
 pub fn step_strip(ui: &mut Ui, steps: &[StripStep]) -> Option<StripEvent> {
     let mut event = None;
-    ui.horizontal(|ui| {
+    // A row as high as a pill: `horizontal`'s is the (lower) interact
+    // height, which a centring parent centres, so the pills hung below.
+    let row = Vec2::new(ui.available_size_before_wrap().x, HEIGHT);
+    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = space::XS;
         for (i, step) in steps.iter().enumerate() {
             if let Some(e) = pill(ui, i, step) {
