@@ -2100,30 +2100,7 @@ fn the_empty_plan_says_how_to_add_panels() {
 fn analyse_starts_a_stalled_analysis_while_another_step_is_next() {
     use StepState::{Next, Todo};
     let root = temp_dir("window-analyse-todo");
-    let mut s = two_group_session(&root);
-    let mut jobs = runner();
-    let mut pipeline = Pipeline::new();
-    // The previews cancelled (Read previews is next), then the analysis
-    // that followed them cancelled too.
-    let previews = jobs.hold();
-    let ctx = egui::Context::default();
-    pipeline.poll(&ctx, Instant::now(), &mut s, &mut jobs, &[], false);
-    let analysis = jobs.hold();
-    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
-        jobs.cancel(id);
-    }
-    previews.open();
-    pump(&mut s, &mut jobs, &mut pipeline, |_, p| {
-        p.step() == Some(Step::Analyze)
-    });
-    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
-        jobs.cancel(id);
-    }
-    analysis.open();
-    pump(&mut s, &mut jobs, &mut pipeline, |j, _| !j.busy());
-    let mut state = State::new(s, jobs);
-    state.pipeline = pipeline;
-    let mut h = harness(state);
+    let mut h = harness(stalled_analysis(&root));
     h.run_steps(3);
     let shown = shown_steps(h.state());
     assert_eq!(shown[0], strip("Read previews", Next));
@@ -2318,5 +2295,105 @@ fn shortcuts_work_with_a_button_focused() {
     h.run_steps(2);
     assert_eq!(notes(&h.state().session.mosaic.config.ui), "o");
     assert!(!toggle_on(&h, "Outlines"), "unchanged while typing");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A two-group session whose previews and then analysis were cancelled:
+/// the analysis is left to the user (Read previews is next, Analyse to
+/// do), nothing runs.
+fn stalled_analysis(root: &std::path::Path) -> State {
+    let mut s = two_group_session(root);
+    let mut jobs = runner();
+    let mut pipeline = Pipeline::new();
+    let previews = jobs.hold();
+    let ctx = egui::Context::default();
+    pipeline.poll(&ctx, Instant::now(), &mut s, &mut jobs, &[], false);
+    let analysis = jobs.hold();
+    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
+        jobs.cancel(id);
+    }
+    previews.open();
+    pump(&mut s, &mut jobs, &mut pipeline, |_, p| {
+        p.step() == Some(Step::Analyze)
+    });
+    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
+        jobs.cancel(id);
+    }
+    analysis.open();
+    pump(&mut s, &mut jobs, &mut pipeline, |j, _| !j.busy());
+    let mut state = State::new(s, jobs);
+    state.pipeline = pipeline;
+    state
+}
+
+#[test]
+fn a_working_analysing_step_never_restarts_the_analysis() {
+    let root = temp_dir("window-analysing-click");
+    let mut h = harness(stalled_analysis(&root));
+    h.run_steps(3);
+    assert_eq!(shown_steps(h.state())[1], strip("Analyse", StepState::Todo));
+    // The user restarts it (held, so it keeps running).
+    let gate = h.state_mut().jobs.hold();
+    h.get_by_label("Analyse").click();
+    h.run_steps(2);
+    assert!(h.state().jobs.analyzing());
+    let running: Vec<u64> = h.state().jobs.views().iter().map(|v| v.id).collect();
+    // Problems closed, to see the click open it.
+    h.state_mut().w.inspector_mut().toggle(PROBLEMS);
+    h.run_steps(2);
+    assert!(!h.state().w.inspector().is_open(PROBLEMS));
+    // A click on the working pill (not its Cancel): Problems, never a
+    // second analysis in place of the first.
+    h.get_by_label("Analysing\u{2026}").click();
+    h.run_steps(2);
+    let after: Vec<u64> = h.state().jobs.views().iter().map(|v| v.id).collect();
+    assert_eq!(after, running, "the analysis runs on");
+    assert!(h.state().w.inspector().is_open(PROBLEMS));
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_strip_never_wraps_beside_the_name() {
+    let name = "Orion SHO mosaic, winter 2026 reprocessing with new flats";
+    let (root, s, jobs) = analyzed_named("window-strip-row", name);
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(problems(&state.session, 2));
+    let mut h = harness_sized(state, egui::vec2(720.0, 800.0));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    // Across every width from the minimum to one that fits it all, the
+    // four pills share one row: beside the name, or below it.
+    let mut one_row_at = None;
+    for width in (720..=1600).step_by(2) {
+        h.set_size(egui::vec2(width as f32, 800.0));
+        h.run_steps(2);
+        let ys: Vec<f32> = shown_steps(h.state())
+            .iter()
+            .map(|s| {
+                h.query_all_by_label(&s.label)
+                    .map(|n| n.rect())
+                    .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
+                    .expect("the step drawn")
+                    .center()
+                    .y
+            })
+            .collect();
+        assert!(
+            ys.iter().all(|y| (y - ys[0]).abs() < 0.5),
+            "{width} pt: pills at {ys:?}"
+        );
+        let back = h.get_by_label("Back to the start screen").rect();
+        if one_row_at.is_none() && (ys[0] - back.center().y).abs() < 0.5 {
+            one_row_at = Some(width);
+        }
+    }
+    assert!(one_row_at.is_some(), "never one row");
+    drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -9,8 +9,8 @@
 //!
 //! The steps act as navigation: Panels opens or closes the panel list (and
 //! reads the previews again once they stopped short), Checks opens
-//! Problems (or, while the pipeline has left the analysis to the user,
-//! starts it), Merge merges every group while it is to do (merging or
+//! Problems (or, while it offers **Analyse**, [`offers_analysis`], starts
+//! the analysis; never while one runs), Merge merges every group while it is to do (merging or
 //! merged, it shows the mosaic), Export opens the Export dialog. A step
 //! that cannot act now says why in its tooltip (Merge: the main button's
 //! reason; Export: [`MosaicView::export_block_reason`]), as a disabled
@@ -36,7 +36,7 @@ use mega_ui::widgets::{
 
 use super::steps::{
     CHECKS_STEP, EXPORT_STEP, MERGE_STEP, PANELS_STEP, is_analysis, is_previews, jobs_where,
-    needs_merge, steps,
+    needs_merge, offers_analysis, steps,
 };
 use super::{CanvasMode, MERGE_SETTINGS, PROBLEMS, SessionWindow, shortcuts};
 use crate::blend_settings::{feather_text, mode_name};
@@ -111,7 +111,11 @@ impl SessionWindow {
                     )
                     .size()
                     .x;
-                let beside = name_width + space::L + step_strip_width(ui, &strip);
+                // The label is followed by the item spacing, then the gap.
+                let beside = name_width
+                    + ui.spacing().item_spacing.x
+                    + space::L
+                    + step_strip_width(ui, &strip);
                 if beside <= ui.available_width() {
                     ui.label(name);
                     ui.add_space(space::L);
@@ -142,7 +146,7 @@ impl SessionWindow {
             None => {}
         }
         match event {
-            Some(StripEvent::Open(i)) => self.open_step(i, &strip, session, jobs, pipeline),
+            Some(StripEvent::Open(i)) => self.open_step(i, &strip, session, jobs, pipeline, checks),
             Some(StripEvent::Cancel(i)) => cancel_step(i, jobs),
             None => {}
         }
@@ -243,9 +247,10 @@ impl SessionWindow {
         asked
     }
 
-    /// Step `i` was clicked, `strip` showing. Checks analyses whenever the
-    /// pipeline has left the analysis to the user, whether or not the step
-    /// is the one highlighted (another can be next).
+    /// Step `i` was clicked, `strip` showing. Checks analyses while it
+    /// offers **Analyse** ([`offers_analysis`]), whether or not it is the
+    /// step highlighted (another can be next); working, it opens Problems
+    /// (a running analysis is never restarted from its pill).
     fn open_step(
         &mut self,
         i: usize,
@@ -253,6 +258,7 @@ impl SessionWindow {
         session: &mut OpenSession,
         jobs: &mut JobRunner,
         pipeline: &mut Pipeline,
+        checks: &ChecksEngine,
     ) {
         match i {
             PANELS_STEP => {
@@ -262,7 +268,7 @@ impl SessionWindow {
                 self.panel_list_open = !self.panel_list_open;
             }
             // Waiting for an analysis nothing will start by itself.
-            CHECKS_STEP if pipeline.analysis_stalled(session) => {
+            CHECKS_STEP if offers_analysis(session, jobs, pipeline, checks) => {
                 let id = jobs.start_analyze(session);
                 self.track_analysis(id);
             }

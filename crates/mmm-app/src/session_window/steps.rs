@@ -62,6 +62,23 @@ pub fn steps(
     steps
 }
 
+/// Whether the Checks step offers **Analyse** (shown next, or to do when
+/// another step is next): the pipeline has left the analysis to the user
+/// ([`Pipeline::analysis_stalled`], which stays so while an analysis the
+/// user started runs) and the step shows nothing else (no analysis running
+/// or queued, no checks running).
+pub(super) fn offers_analysis(
+    session: &OpenSession,
+    jobs: &JobRunner,
+    pipeline: &Pipeline,
+    checks: &ChecksEngine,
+) -> bool {
+    !session.mosaic.config.panels.is_empty()
+        && !jobs.analyzing()
+        && !checks.running()
+        && pipeline.analysis_stalled(session)
+}
+
 /// Whether a merge is needed: the session has groups and one of them has
 /// no complete result (none yet, partly merged, or stale: merged before
 /// the panels, the analysis or the settings changed).
@@ -134,7 +151,7 @@ fn checks_step(
     if checks.running() {
         return step("Checking…", StepState::Working { fraction: None });
     }
-    if pipeline.analysis_stalled(session) {
+    if offers_analysis(session, jobs, pipeline, checks) {
         return step("Analyse", StepState::Next);
     }
     if wants_analysis(session) {

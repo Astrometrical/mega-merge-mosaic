@@ -1171,7 +1171,8 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   "Checking…", "{n} problem(s)" or "Checks passed", and **Analyse** only when
   the analysis stalled after a cancel or failure
   (`Pipeline::analysis_stalled`; clicking it analyses, whichever step is
-  highlighted); otherwise analysis starts by itself. Merging reads "Merging
+  highlighted; once running, a click on "Analysing…" opens Problems and
+  never restarts it); otherwise analysis starts by itself. Merging reads "Merging
   {group} · {i} of {n} · {pct} %", without "{i} of {n}" for a single merge and
   without the group in a session of one group (an OSC mosaic: "Merging · 43
   %"; its jobs and toasts are "Merge" and "Merge finished"). A step that
