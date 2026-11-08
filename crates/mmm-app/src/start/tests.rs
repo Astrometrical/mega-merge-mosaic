@@ -359,10 +359,11 @@ fn busy_session_is_not_the_hero() {
             .is_disabled()
     );
     let before = std::fs::read(busy.join(CONFIG_FILE)).unwrap();
-    h.get_by_role(Role::MultilineTextInput).focus();
-    h.step();
-    h.get_by_role(Role::MultilineTextInput)
-        .type_text("mine now");
+    let add = h.get_by_role_and_label(Role::Button, "Add notes");
+    assert!(add.accesskit_node().is_disabled());
+    add.click();
+    h.run();
+    assert!(h.query_by_role(Role::MultilineTextInput).is_none());
     pause(&mut h, 1.5);
     assert_eq!(h.state().screen.notes.text, "");
     assert_eq!(std::fs::read(busy.join(CONFIG_FILE)).unwrap(), before);
@@ -584,8 +585,8 @@ fn notes_save_after_a_pause() {
     let before = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
     let mut h = harness(vec![entry(&dir)]);
     settle(&mut h);
-    h.get_by_role(Role::MultilineTextInput).focus();
-    h.step();
+    h.get_by_role_and_label(Role::Button, "Add notes").click();
+    h.run();
     h.get_by_role(Role::MultilineTextInput)
         .type_text("redo DBE");
     h.step();
@@ -596,6 +597,59 @@ fn notes_save_after_a_pause() {
     step_until(&mut h, |_| {
         MosaicConfig::load(&dir).is_ok_and(|c| notes(&c.ui) == "redo DBE")
     });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn notes_read_as_text_and_done_saves_at_once() {
+    let root = temp_dir("start-notes-done");
+    let dir = session(&root, "Notes");
+    save_notes_blocking(&dir, "redo DBE").unwrap();
+    let mut h = harness(vec![entry(&dir)]);
+    settle(&mut h);
+    h.get_by_role_and_label(Role::Label, "redo DBE");
+    assert!(h.query_by_role(Role::MultilineTextInput).is_none());
+    h.get_by_role_and_label(Role::Button, "Edit").click();
+    h.run();
+    h.get_by_role(Role::MultilineTextInput)
+        .type_text(", then SPCC");
+    h.step();
+    h.get_by_role_and_label(Role::Button, "Done").click();
+    h.run_steps(3);
+    // Saving, without waiting for the pause after typing.
+    assert!(h.state().screen.notes.edited_at.is_none());
+    step_until(&mut h, |_| {
+        MosaicConfig::load(&dir).is_ok_and(|c| notes(&c.ui) == "redo DBE, then SPCC")
+    });
+    h.get_by_role_and_label(Role::Label, "redo DBE, then SPCC");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn edited_notes_leave_room_for_the_scroll_bar() {
+    let root = temp_dir("start-notes-scroll");
+    let dir = session(&root, "Long notes");
+    let long: Vec<String> = (1..=80).map(|i| format!("line {i}")).collect();
+    save_notes_blocking(
+        &dir,
+        &long.join(
+            "
+",
+        ),
+    )
+    .unwrap();
+    let mut h = harness(vec![entry(&dir)]);
+    settle(&mut h);
+    h.get_by_role_and_label(Role::Button, "Edit").click();
+    h.run();
+    // The block scrolls, its bar beside the text box, not over it.
+    let column = h.state().screen.hero_column(h.state().full.expect("drawn"));
+    let field = h.get_by_role(Role::MultilineTextInput).rect();
+    assert!(
+        field.right() <= column - 6.0,
+        "the text box ends at {}, the column at {column}",
+        field.right()
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -22,9 +22,9 @@ use crate::theme::tokens::{radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, MegaButton, SessionCardData, Toast, Toasts, chip, icon_button, notes_field,
-    overline, progress, property_grid, property_row, property_row_numeric, property_row_ui,
-    segmented, session_card, status, text_input,
+    ButtonKind, MegaButton, NotesMode, SessionCardData, Toast, Toasts, chip, icon_button,
+    notes_view, overline, progress, property_grid, property_row, property_row_numeric,
+    property_row_ui, segmented, session_card, status, text_input,
 };
 
 /// The gallery's interactive state.
@@ -32,6 +32,7 @@ pub struct GalleryState {
     segment: u8,
     name: String,
     notes: String,
+    notes_mode: NotesMode,
     checks: Vec<CheckItem>,
     toasts: Toasts,
     brand: Option<BrandImages>,
@@ -70,7 +71,10 @@ impl Default for GalleryState {
         GalleryState {
             segment: 0,
             name: "Carina Nebula SHO".into(),
-            notes: "Shooting the 4th row next new moon.".into(),
+            notes: "Shooting the 4th row next new moon.
+Panel 7: gradient in the lower left, redo DBE."
+                .into(),
+            notes_mode: NotesMode::default(),
             checks,
             toasts: Toasts::default(),
             brand: None,
@@ -300,7 +304,8 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                 &[(0, "Composite"), (1, "Hα"), (2, "OIII"), (3, "SII")],
             );
             ui.add_space(space::S);
-            notes_field(ui, &mut state.notes, "Notes about this session", true);
+            let (notes, mode) = (&mut state.notes, &mut state.notes_mode);
+            notes_view(ui, notes, mode, "Notes about this session", true);
         });
 
         section(ui, "Chips", |ui| {

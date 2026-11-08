@@ -13,7 +13,7 @@ pub mod toast;
 
 pub use button::{ButtonKind, MegaButton, focus_ring, icon_button, icon_button_of};
 pub use chip::{CHIP_MAX_WIDTH, chip};
-pub use notes::notes_field;
+pub use notes::{NOTES_LINES, NotesMode, NotesResponse, notes_view};
 pub use progress::{progress, progress_bar};
 pub use property::{property_grid, property_row, property_row_numeric, property_row_ui};
 pub use segmented::segmented;

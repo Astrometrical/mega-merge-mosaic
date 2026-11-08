@@ -1,10 +1,13 @@
-//! The session block's notes: edited in place, saved on a background
-//! thread a pause after the last keystroke or when the field loses focus,
-//! one save per session at a time (a later one waits its turn).
+//! The session block's notes: read as text, edited in place, saved on a
+//! background thread a pause after the last keystroke or at once when
+//! editing ends (or the text box loses focus), one save per session at a
+//! time (a later one waits its turn).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
+
+use mega_ui::widgets::NotesMode;
 
 use super::StartScreen;
 use crate::session::save_notes_blocking;
@@ -26,8 +29,10 @@ pub(super) struct NotesEditor {
     pub(super) loaded: bool,
     /// When the last unsaved edit was made (egui time).
     pub(super) edited_at: Option<f64>,
-    /// Save without waiting (the field lost focus).
+    /// Save without waiting (editing ended, or the text box lost focus).
     pub(super) save_now: bool,
+    /// Read (collapsed or expanded) or edited.
+    pub(super) mode: NotesMode,
 }
 
 /// A notes save running on a background thread.

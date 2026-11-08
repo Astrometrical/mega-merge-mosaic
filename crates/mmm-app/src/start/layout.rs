@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use egui::style::ScrollStyle;
 use egui::{
     Align, Color32, Id, Key, Label, Layout, Rect, ScrollArea, TextStyle, Ui, UiBuilder, Vec2,
 };
@@ -19,7 +20,7 @@ use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{CONTROL_HEIGHT, CONTROL_HEIGHT_LARGE, space};
 use mega_ui::widgets::{
     ButtonKind, CARD_HEIGHT, CARD_WIDTH, MegaButton, SessionCardData, chip, icon_button_of,
-    notes_field, overline, session_card, status, text_input,
+    notes_view, overline, session_card, status, text_input,
 };
 use mmm_core::mosaic::SINGLE_GROUP;
 
@@ -44,7 +45,7 @@ const LARGE_LOGO_H: f32 = 46.0;
 const LARGE_NAME_H: f32 = 22.0;
 /// What mmm does, on the first-run screen.
 const FIRST_RUN_LINE: &str = "Merge your stacked panels into one seamless mosaic.";
-/// The notes field's hint.
+/// The notes text box's hint.
 const NOTES_HINT: &str = "Notes about this session";
 
 impl StartScreen {
@@ -126,6 +127,9 @@ impl StartScreen {
                 .max_rect(rect)
                 .layout(Layout::top_down(Align::Min)),
         );
+        // A bar that takes its own room when the block scrolls (long notes
+        // being edited), rather than floating over the text box.
+        child.spacing_mut().scroll = ScrollStyle::solid();
         let mut height = 0.0;
         ScrollArea::vertical()
             .id_salt("start-block")
@@ -173,18 +177,21 @@ impl StartScreen {
             let editable = available && self.notes.loaded && enabled;
             // One id per session: undo never brings another session's text.
             let id = Id::new("mmm-start-notes").with(target);
+            let (text, mode) = (&mut self.notes.text, &mut self.notes.mode);
             let r = stable(ui, id, |ui| {
-                notes_field(ui, &mut self.notes.text, NOTES_HINT, editable)
+                notes_view(ui, text, mode, NOTES_HINT, editable)
             });
-            let r = if busy {
-                r.on_hover_text("Open in another window: its notes are read-only here.")
-            } else {
-                r
-            };
+            if busy && let Some(edit) = r.edit.clone() {
+                edit.on_disabled_hover_text(
+                    "Open in another window: its notes are read-only here.",
+                );
+            }
             if r.changed() {
                 self.notes.edited_at = Some(now);
             }
-            if r.lost_focus() && self.notes.edited_at.is_some() {
+            // Done, Esc, or a click away: save without waiting.
+            let left = r.done || r.field.as_ref().is_some_and(|f| f.lost_focus());
+            if left && self.notes.edited_at.is_some() {
                 self.notes.save_now = true;
             }
         }

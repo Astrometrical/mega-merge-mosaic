@@ -66,6 +66,9 @@ fn start_screen_snapshot() {
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let merged_dir = merged(&root);
+    let notes =
+        "Shooting the 4th row next new moon.\nPanel 7: gradient in the lower left, redo DBE.";
+    crate::session::save_notes_blocking(&merged_dir, notes).unwrap();
     let planned = session(&root, "Veil Nebula");
     let gone = root.join("Rosette.mmm-session");
     // Opened a few days ago (the screen says "2 days ago", whatever the

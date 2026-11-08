@@ -1222,7 +1222,7 @@ stays free of `mmm-core`.
   `theme::ensure_applied` and skip drawing for one frame.
 - **Components** (`mega_ui::widgets`): `MegaButton` (primary, secondary,
   quiet, danger, ghost; large; icon buttons), `chip`, `status`, `overline`,
-  `property_grid`, `segmented`, `text_input`, `notes_field`, `progress`,
+  `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
   `Toasts` (the only notifications; never modal), plus the restyled
   `checks::checks_list` and `jobs::job_panel`, `groups` (the group palette,
   whose order is frozen because sessions store its indices) and `brand`
@@ -1341,8 +1341,15 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   the start screen touches a session's lock, and an error other than
   contention reads as "not busy" (opening the session takes the real lock
   and reports a real error). A busy session's notes are read-only on the
-  screen, so a save never overwrites the other window's config; notes are
-  saved a second after typing stops (`start::notes`).
+  screen, so a save never overwrites the other window's config.
+- **Notes** (`widgets::notes_view`, `start::notes`): read as text, the
+  first `NOTES_LINES` (8) lines with **More** for the rest (**Less**
+  folds them again); **Edit** (**Add notes** when there are none) swaps in
+  a text box, focused with the cursor at the end, and **Done** or Esc
+  swaps it back, returning the focus to **Edit**. They are saved a second
+  after typing stops, or at once when editing ends or the box loses focus.
+  The session block's scroll bar takes its own room (egui's solid scroll
+  style), so long notes being edited never run under it.
 - **Recent list** (`start::recent`): up to 100 sessions, pinned first on the
   shelf, then by last opened.
 - **Testing.** Tests build sessions in temp folders from `testutil` /
