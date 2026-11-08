@@ -745,6 +745,25 @@ fn overlaid_text_lies_over_the_left_feather() {
 }
 
 #[test]
+fn shelf_heading_lines_up_with_all_sessions() {
+    let root = temp_dir("start-heading-row");
+    let dir = session(&root, "Veil Nebula");
+    let mut h = harness(vec![entry(&dir)]);
+    settle(&mut h);
+    let heading = h.get_by_label("RECENT SESSIONS").rect().center().y;
+    let all = h
+        .get_by_role_and_label(Role::Button, "All sessions")
+        .rect()
+        .center()
+        .y;
+    assert!(
+        (heading - all).abs() < 0.5,
+        "heading centre {heading}, button centre {all}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn first_run_offers_new_and_open() {
     let mut h = harness(Vec::new());
     h.run();

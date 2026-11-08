@@ -238,8 +238,11 @@ impl StartScreen {
         );
         ui.spacing_mut().item_spacing.y = space::S;
         // "All sessions" beside the heading, inside the hero's left
-        // feather: the image is not darkened further right.
-        ui.horizontal(|ui| {
+        // feather: the image is not darkened further right. The row is a
+        // control high from the start, so the heading centres on the
+        // button (egui centres each item in the row's height so far).
+        let row = vec2(ui.available_width(), CONTROL_HEIGHT);
+        ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             overline(ui, "Recent sessions");
             let all = MegaButton::new(ButtonKind::Quiet, "All sessions")
                 .trailing_icon(icons::CHEVRON_RIGHT);
