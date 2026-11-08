@@ -111,6 +111,7 @@ pub fn build_hero(facts: &CardFacts) -> HeroData {
         | CardState::PartlyMerged
         | CardState::Merged
         | CardState::MergedExported
+        | CardState::SettingsChanged
         | CardState::ReMergeNeeded => {}
     }
     let Ok(m) = Mosaic::open(&facts.path) else {

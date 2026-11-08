@@ -851,6 +851,27 @@ fn partly_merged_status_reads_so() {
 }
 
 #[test]
+fn a_settings_changed_card_reads_so() {
+    let f = facts::CardFacts {
+        path: PathBuf::from("p.mmm-session"),
+        name: "p".into(),
+        availability: facts::Availability::Available,
+        panels: Some(8),
+        groups: Vec::new(),
+        group_colors: Default::default(),
+        state: facts::CardState::SettingsChanged,
+        problems: None,
+        notes_count: None,
+        notes: String::new(),
+        summary: None,
+    };
+    let line = (Tone::Info, "Merge settings changed since the last merge");
+    assert_eq!(status_line(&f), Some(line));
+    let card = Some((Tone::Info, "Settings changed".to_string()));
+    assert_eq!(card_look(Some(&f)), (card, false));
+}
+
+#[test]
 fn ago_reads_naturally() {
     assert_eq!(ago(100, 90), "just now");
     assert_eq!(ago(10_000, 10_000 - 120), "2 minutes ago");

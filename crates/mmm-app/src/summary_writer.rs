@@ -22,12 +22,13 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mmm_core::mosaic::grouping::Groups;
-use mmm_core::mosaic::{Mosaic, MosaicConfig};
+use mmm_core::mosaic::{Mosaic, MosaicConfig, settings_changed};
 use mmm_core::session_summary::{
     GroupSummary, ResultState, SUMMARY_FORMAT, SessionSummary, result_state, write_summary,
 };
 use mmm_core::settings::{AnalyzeSettings, BlendSettings, GroupOverride};
 
+use crate::blend_settings::load_draft;
 use crate::checks::CheckCounts;
 use crate::jobs::{JobEvent, JobTarget};
 use crate::session::OpenSession;
@@ -49,14 +50,20 @@ pub fn summarize(
     results: &BTreeMap<String, ResultState>,
     stamps: &Stamps,
 ) -> SessionSummary {
+    let draft = load_draft(cfg);
     let groups = groups
         .map(|g| {
             g.processing_groups()
                 .into_iter()
                 .map(|(name, panels)| {
                     let (blended_at, exported_at) = stamps.get(&name).copied().unwrap_or_default();
+                    let result = results.get(&name).copied().unwrap_or_default();
+                    let settings_changed = result == ResultState::Complete
+                        && !cfg.needs_analyze.contains(&name)
+                        && settings_changed(cfg, &name, &draft);
                     GroupSummary {
-                        result: results.get(&name).copied().unwrap_or_default(),
+                        result,
+                        settings_changed,
                         name,
                         panels,
                         blended_at,
@@ -100,6 +107,12 @@ struct Settings {
     blend: BlendSettings,
     overrides: BTreeMap<String, GroupOverride>,
     needs_analyze: BTreeSet<String>,
+    /// The merge draft (edits to it change which groups read "settings
+    /// changed").
+    draft: BlendSettings,
+    /// Merges committed so far (each adds a provenance entry, which is what
+    /// "the last merge's settings" is read from).
+    provenance: usize,
 }
 
 impl Settings {
@@ -109,6 +122,8 @@ impl Settings {
             blend: cfg.blend.clone(),
             overrides: cfg.group_overrides.clone(),
             needs_analyze: cfg.needs_analyze.clone(),
+            draft: load_draft(cfg),
+            provenance: cfg.provenance.len(),
         }
     }
 }
@@ -659,6 +674,40 @@ mod tests {
             w.take_results(),
             states(ResultState::Stale, ResultState::None)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn summary_records_settings_changed() {
+        let root = temp_dir("summary-settings-changed");
+        let mut s = ha_merged(&root);
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        settle(&mut w, &ctx, &s);
+        let dir = s.mosaic.dir.clone();
+        let flags = || {
+            read_summary(&dir)
+                .unwrap()
+                .groups
+                .iter()
+                .map(|g| g.settings_changed)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(written_result(&s, 0), ResultState::Complete);
+        assert_eq!(flags(), [false, false]);
+        // Editing the draft (it lives in `ui`) marks the merged group.
+        let mut draft = crate::blend_settings::load_draft(&s.mosaic.config);
+        draft.feather_px *= 2.0;
+        crate::blend_settings::save_draft(&mut s.mosaic.config.ui, &draft);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Complete);
+        assert_eq!(flags(), [true, false], "only the merged group");
+        // Merging with the draft clears it (a committed merge adds provenance).
+        let a = s.mosaic.config.analyze.clone();
+        set_settings(&mut s.mosaic, a, draft.clone()).unwrap();
+        blend_group(&mut s.mosaic, "Ha", None, &JobCtl::none()).unwrap();
+        settle(&mut w, &ctx, &s);
+        assert_eq!(flags(), [false, false]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

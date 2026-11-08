@@ -43,6 +43,9 @@ pub enum CardState {
     MergedExported,
     /// A group's result is stale or partial.
     ReMergeNeeded,
+    /// Every group's result is current, but a group's last merge used
+    /// different merge settings from the draft.
+    SettingsChanged,
     /// Nothing known (no summary, no previews).
     Unknown,
 }
@@ -51,7 +54,10 @@ pub enum CardState {
 /// session summary (if any). A stale or partial group makes it
 /// [`CardState::ReMergeNeeded`] whatever the others are; then every group
 /// complete is merged, and some complete (the rest without a result)
-/// [`CardState::PartlyMerged`].
+/// [`CardState::PartlyMerged`]. Every group complete with some group's
+/// settings changed is [`CardState::SettingsChanged`], ahead of
+/// [`CardState::MergedExported`]: an export of the old settings doesn't make
+/// the session settled, and the changed settings are what the user can act on.
 pub fn card_state(
     panels: usize,
     has_previews: bool,
@@ -69,6 +75,9 @@ pub fn card_state(
             return CardState::ReMergeNeeded;
         }
         if !groups.is_empty() && groups.iter().all(|g| g.result == ResultState::Complete) {
+            if groups.iter().any(|g| g.settings_changed) {
+                return CardState::SettingsChanged;
+            }
             let exported = groups.iter().all(|g| match (g.blended_at, g.exported_at) {
                 (Some(b), Some(e)) => e >= b,
                 _ => false,
@@ -271,6 +280,7 @@ mod tests {
             result,
             blended_at: blended,
             exported_at: exported,
+            settings_changed: false,
         }
     }
 
@@ -356,6 +366,30 @@ mod tests {
         assert_eq!(card_state(3, true, None), PlanReady);
         assert_eq!(card_state(3, false, None), Unknown);
         assert_eq!(card_state(3, false, Some(&none)), Unknown);
+    }
+
+    #[test]
+    fn a_settings_changed_card_reads_so() {
+        use CardState::*;
+        let changed = |b, e| GroupSummary {
+            settings_changed: true,
+            ..group(ResultState::Complete, Some(b), Some(e))
+        };
+        let done = |b, e| group(ResultState::Complete, Some(b), Some(e));
+        // Every group complete, one with changed settings.
+        let s = summary(vec![done(1, 2), changed(1, 2)]);
+        assert_eq!(card_state(3, true, Some(&s)), SettingsChanged);
+        // Not exported either: still settings changed, not merged.
+        let s = summary(vec![changed(1, 0)]);
+        assert_eq!(card_state(3, true, Some(&s)), SettingsChanged);
+        // Out of date comes first.
+        let stale = group(ResultState::Stale, None, None);
+        let s = summary(vec![changed(1, 2), stale]);
+        assert_eq!(card_state(3, true, Some(&s)), ReMergeNeeded);
+        // Only with every group complete.
+        let unmerged = group(ResultState::None, None, None);
+        let s = summary(vec![changed(1, 2), unmerged]);
+        assert_eq!(card_state(3, true, Some(&s)), PartlyMerged);
     }
 
     #[test]

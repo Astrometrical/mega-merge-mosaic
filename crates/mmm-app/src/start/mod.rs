@@ -699,6 +699,9 @@ fn status_line(f: &CardFacts) -> Option<(Tone, &'static str)> {
                 Tone::Warning,
                 "Panels changed since the last merge — re-merge needed",
             ),
+            CardState::SettingsChanged => {
+                (Tone::Info, "Merge settings changed since the last merge")
+            }
             CardState::PartlyMerged => (Tone::Info, "Partly merged"),
             CardState::PlanReady => (Tone::Info, "Plan ready"),
             CardState::NoPanels => (Tone::Neutral, "No panels yet"),
@@ -714,9 +717,11 @@ fn card_look(facts: Option<&CardFacts>) -> (Option<(Tone, String)>, bool) {
         return (None, false);
     };
     let status = status_line(f).map(|(tone, label)| {
-        let stale =
-            f.availability == Availability::Available && f.state == CardState::ReMergeNeeded;
-        let label = if stale { "Re-merge needed" } else { label };
+        let label = match (&f.availability, f.state) {
+            (Availability::Available, CardState::ReMergeNeeded) => "Re-merge needed",
+            (Availability::Available, CardState::SettingsChanged) => "Settings changed",
+            _ => label,
+        };
         (tone, label.to_string())
     });
     (status, f.availability == Availability::Missing)
