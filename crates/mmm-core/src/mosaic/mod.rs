@@ -125,6 +125,14 @@ pub enum GroupRule {
         /// The keyword preceding the group token.
         keyword: String,
     },
+    /// Group by the path token following a keyword (PixInsight WBPP's
+    /// path-keyword rule); see [`grouping::path_keyword_value`].
+    PathKeyword {
+        /// The keyword preceding the group token.
+        keyword: String,
+    },
+    /// No rule: only manual assignments place panels.
+    Manual,
 }
 
 impl Default for GroupRule {

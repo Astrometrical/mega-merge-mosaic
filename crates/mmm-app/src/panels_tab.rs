@@ -962,6 +962,11 @@ impl PanelsTab {
 
     /// The rule picker; a new rule once the user commits one.
     fn rule_ui(&mut self, ui: &mut egui::Ui, rule: &GroupRule) -> Option<GroupRule> {
+        // The path-keyword and by-hand rules get their own picker in a later
+        // task; until then show them like a file-name token rule.
+        if matches!(rule, GroupRule::Manual) {
+            return None;
+        }
         let header = matches!(rule, GroupRule::Header { .. });
         let mut choose_header = header;
         egui::ComboBox::from_id_salt("panels-rule")
@@ -988,7 +993,10 @@ impl PanelsTab {
         }
         let (current, field_label, hint) = match rule {
             GroupRule::Header { key } => (key, "Header key", "FILTER"),
-            GroupRule::FilenameToken { keyword } => (keyword, "Token keyword", "filter"),
+            GroupRule::FilenameToken { keyword } | GroupRule::PathKeyword { keyword } => {
+                (keyword, "Token keyword", "filter")
+            }
+            GroupRule::Manual => return None,
         };
         let label = ui.label(RichText::new(field_label).color(palette::TEXT_MUTED));
         let mut text = self.rule_text.clone().unwrap_or_else(|| current.clone());
@@ -1023,6 +1031,11 @@ impl PanelsTab {
                         self.token_keyword = text.clone();
                         GroupRule::FilenameToken { keyword: text }
                     }
+                    GroupRule::PathKeyword { .. } => {
+                        self.token_keyword = text.clone();
+                        GroupRule::PathKeyword { keyword: text }
+                    }
+                    GroupRule::Manual => return None,
                 });
             }
         } else if field.has_focus() {
