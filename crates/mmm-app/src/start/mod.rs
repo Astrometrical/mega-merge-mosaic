@@ -252,6 +252,22 @@ impl StartScreen {
         self.stop_thumbnails();
     }
 
+    /// The session in `path` was just closed in this window (its summary
+    /// written, its lock released): its facts are read again, and its
+    /// card's thumbnail, the hero and the notes are made afresh from them.
+    pub fn session_closed(&mut self, path: &Path) {
+        self.facts.remove(path);
+        if !self.reload.iter().any(|p| p == path) {
+            self.reload.push(path.to_path_buf());
+        }
+        self.thumbs.remove(path);
+        self.hero_outdated(path);
+        // Notes read before it was opened; the window may have changed them.
+        if self.notes.path.as_deref() == Some(path) && self.notes.edited_at.is_none() {
+            self.notes = NotesEditor::default();
+        }
+    }
+
     /// True while recent sessions' facts are still loading.
     #[cfg(test)]
     pub fn checking_recent(&self) -> bool {
@@ -661,6 +677,11 @@ impl StartScreen {
     /// The status line and dimming of `path`'s card.
     pub(crate) fn card_look(&self, path: &Path) -> (Option<(Tone, String)>, bool) {
         card_look(self.facts.get(path))
+    }
+
+    /// The notes the session block shows.
+    pub(crate) fn notes_text(&self) -> &str {
+        &self.notes.text
     }
 }
 

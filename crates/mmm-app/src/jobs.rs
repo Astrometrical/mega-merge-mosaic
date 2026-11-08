@@ -39,7 +39,7 @@
 //! predecessor's outcome; its worker joins the predecessor's thread before
 //! running, so that wait never happens on the UI thread.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -62,7 +62,7 @@ use crate::session::OpenSession;
 pub const PROGRESS_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
 /// Label of an analysis job.
-pub const ANALYZE_LABEL: &str = "Analyze";
+pub const ANALYZE_LABEL: &str = "Analyse";
 /// Label of a previews job.
 pub const PREVIEWS_LABEL: &str = "Previews";
 /// Stage shown while a cancelled job winds down.
@@ -107,6 +107,21 @@ pub enum JobTarget {
     Blend,
     /// An export of the group's result.
     Export,
+}
+
+/// Where a run of merges or exports stands ([`JobRunner::run_of`]): the
+/// whole-canvas blends, or the exports, since the last time none of them
+/// was running or queued (an ROI's blend is in no run).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    /// The job at the head of the run: running, else the first queued.
+    pub id: u64,
+    /// The head job's group.
+    pub group: String,
+    /// The head job's place in the run, from 1.
+    pub position: usize,
+    /// The jobs of the run: those that ended, and those running or queued.
+    pub count: usize,
 }
 
 /// What a queued job will do.
@@ -247,6 +262,12 @@ pub struct JobRunner {
     labels: BTreeMap<u64, String>,
     /// Blend and export jobs' group, by id (see [`JobRunner::target`]).
     targets: BTreeMap<u64, (JobTarget, String)>,
+    /// The blends of the whole canvas (not of an ROI), by id.
+    whole: BTreeSet<u64>,
+    /// Whole-canvas blends and exports that ended (ran to an end, whatever
+    /// it was) in the current run of each ([`JobRunner::run_of`]).
+    blends_ended: usize,
+    exports_ended: usize,
     /// Events raised outside `poll` (queued jobs cancelled), delivered by it.
     pending: Vec<JobEvent>,
     /// The frame of the last previews run that finished with every panel,
@@ -254,6 +275,11 @@ pub struct JobRunner {
     previews_frame: Option<ReferenceFrame>,
     #[cfg(test)]
     gate: Option<std::sync::Arc<tests::Gate>>,
+    #[cfg(test)]
+    stepper: Option<std::sync::Arc<tests::Stepper>>,
+    /// Called once [`JobRunner::stop_all`] has cancelled the jobs.
+    #[cfg(test)]
+    on_stop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl JobRunner {
@@ -267,10 +293,17 @@ impl JobRunner {
             previous: None,
             labels: BTreeMap::new(),
             targets: BTreeMap::new(),
+            whole: BTreeSet::new(),
+            blends_ended: 0,
+            exports_ended: 0,
             pending: Vec::new(),
             previews_frame: None,
             #[cfg(test)]
             gate: None,
+            #[cfg(test)]
+            stepper: None,
+            #[cfg(test)]
+            on_stop: None,
         }
     }
 
@@ -346,9 +379,9 @@ impl JobRunner {
     /// A blend may recreate (truncate) its group's store, which would fault
     /// (SIGBUS) any [`mmm_core::tiles::TileReader`] still mapping it. The
     /// runner does not check that: callers must not start a blend while a
-    /// reader outside the job runner maps the store — the Blend tab gates
-    /// it on its tracked sources, the export check and the Blend settings
-    /// tile count (see [`crate::blend_tab`] and
+    /// reader outside the job runner maps the store — the mosaic view gates
+    /// it on its tracked sources, the export check and the merge settings
+    /// tile count (see [`crate::mosaic_view`] and
     /// [`crate::blend_settings`]).
     pub fn start_blend(
         &mut self,
@@ -356,9 +389,11 @@ impl JobRunner {
         group: &str,
         rect: Option<[u64; 4]>,
     ) -> u64 {
-        let id = self.new_id(format!("Blend {group}"));
-        self.targets
-            .insert(id, (JobTarget::Blend, group.to_string()));
+        let id = self.new_id(job_label("Merge", group, session));
+        self.begin(JobTarget::Blend, id, group);
+        if rect.is_none() {
+            self.whole.insert(id);
+        }
         if let Some(r) = &self.running
             && r.blend.as_ref().is_some_and(|p| p.group == group)
         {
@@ -397,9 +432,8 @@ impl JobRunner {
         out: std::path::PathBuf,
         format: ExportFormat,
     ) -> u64 {
-        let id = self.new_id(format!("Export {group}"));
-        self.targets
-            .insert(id, (JobTarget::Export, group.to_string()));
+        let id = self.new_id(job_label("Export", group, session));
+        self.begin(JobTarget::Export, id, group);
         self.queue.push_back(Queued {
             id,
             kind: Kind::Export(ExportJob {
@@ -464,6 +498,51 @@ impl JobRunner {
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
     }
 
+    /// Cancel every job, exports included, and wait up to `wait` for the
+    /// running one to stop, applying (or discarding) its outcome as
+    /// [`JobRunner::poll`] does (a cancelled analysis keeps the groups it
+    /// finished). The events of the jobs that ended, and whether every job
+    /// stopped in time (one that did not winds down on its own, and nothing
+    /// applies its outcome). Blocks the calling (UI) thread: for leaving the
+    /// session only.
+    pub fn stop_all(&mut self, session: &mut OpenSession, wait: Duration) -> (Vec<JobEvent>, bool) {
+        let deadline = Instant::now() + wait;
+        if let Some(r) = &self.running {
+            r.token.cancel();
+        }
+        let dropped: Vec<u64> = self.queue.drain(..).map(|q| q.id).collect();
+        self.pending
+            .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+        #[cfg(test)]
+        if let Some(f) = self.on_stop.take() {
+            f();
+        }
+        let mut events = self.poll(session);
+        while self.busy() {
+            if Instant::now() >= deadline {
+                return (events, false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(self.poll(session));
+        }
+        (events, true)
+    }
+
+    /// Let go of the workers, e.g. of a job that did not stop in
+    /// [`JobRunner::stop_all`]'s wait: the running job (cancelled) and every
+    /// queued one are forgotten, and nothing applies their outcomes. Their
+    /// worker threads, and the last one that ended, are returned: once all
+    /// have been joined, nothing this runner started runs any more (each
+    /// worker joins its predecessor first).
+    pub fn detach_workers(&mut self) -> Vec<JoinHandle<()>> {
+        self.queue.clear();
+        let running = self.running.take().map(|r| {
+            r.token.cancel();
+            r.handle
+        });
+        running.into_iter().chain(self.previous.take()).collect()
+    }
+
     /// Whether a blend is running or queued.
     pub fn blending(&self) -> bool {
         self.running.as_ref().is_some_and(|r| r.blend.is_some())
@@ -471,6 +550,15 @@ impl JobRunner {
                 .queue
                 .iter()
                 .any(|q| matches!(q.kind, Kind::Blend { .. }))
+    }
+
+    /// Whether an analysis is running (resolving the groups or analysing
+    /// them) or queued.
+    pub fn analyzing(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|r| r.blend.is_none() && !r.previews && !r.export)
+            || self.queue.iter().any(|q| matches!(q.kind, Kind::Analyze))
     }
 
     /// Whether events raised outside [`JobRunner::poll`] (queued jobs
@@ -504,12 +592,14 @@ impl JobRunner {
                 Ok(Msg::Preview(p)) => events.push(JobEvent::Preview(p)),
                 Ok(Msg::Done(done)) => {
                     let r = self.running.take().expect("running job");
+                    self.ended(r.id);
                     events.extend(self.finish(r, *done, session));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // The worker died without an outcome (a panic).
                     let r = self.running.take().expect("running job");
+                    self.ended(r.id);
                     let mut message =
                         format!("{} stopped unexpectedly (see the log)", self.name(r.id));
                     if let Some(plan) = &r.blend
@@ -617,9 +707,70 @@ impl JobRunner {
         self.targets.get(&id).map(|(t, g)| (*t, g.as_str()))
     }
 
+    /// Whether job `id` blends the whole canvas (not an ROI); also after it
+    /// ended.
+    pub fn whole_canvas(&self, id: u64) -> bool {
+        self.whole.contains(&id)
+    }
+
+    /// Where the run of `target` jobs stands, while one is running or
+    /// queued: its head job, and that job's place among the jobs started
+    /// since none of them was left (a queued job dropped, e.g. replaced by
+    /// newer work, does not count). The blends of a run are those of the
+    /// whole canvas: an ROI's blend is in none.
+    pub fn run_of(&self, target: JobTarget) -> Option<Run> {
+        let live: Vec<u64> = self
+            .running
+            .iter()
+            .map(|r| r.id)
+            .chain(self.queue.iter().map(|q| q.id))
+            .filter(|id| self.in_run(*id) == Some(target))
+            .collect();
+        let id = *live.first()?;
+        let ended = match target {
+            JobTarget::Blend => self.blends_ended,
+            JobTarget::Export => self.exports_ended,
+        };
+        Some(Run {
+            id,
+            group: self.target(id)?.1.to_string(),
+            position: ended + 1,
+            count: ended + live.len(),
+        })
+    }
+
     /// The label of job `id` (also after it ended).
     pub fn label(&self, id: u64) -> Option<&str> {
         self.labels.get(&id).map(String::as_str)
+    }
+
+    /// Record a new `target` job `id` of `group`: a run of them starts
+    /// afresh when none is left.
+    fn begin(&mut self, target: JobTarget, id: u64, group: &str) {
+        if self.run_of(target).is_none() {
+            match target {
+                JobTarget::Blend => self.blends_ended = 0,
+                JobTarget::Export => self.exports_ended = 0,
+            }
+        }
+        self.targets.insert(id, (target, group.to_string()));
+    }
+
+    /// The running job `id` has ended: count it in its run.
+    fn ended(&mut self, id: u64) {
+        match self.in_run(id) {
+            Some(JobTarget::Blend) => self.blends_ended += 1,
+            Some(JobTarget::Export) => self.exports_ended += 1,
+            None => {}
+        }
+    }
+
+    /// The run job `id` belongs to: a whole-canvas blend's or an export's.
+    fn in_run(&self, id: u64) -> Option<JobTarget> {
+        match self.target(id)?.0 {
+            JobTarget::Blend if !self.whole_canvas(id) => None,
+            t => Some(t),
+        }
     }
 
     fn name(&self, id: u64) -> &str {
@@ -691,6 +842,8 @@ impl JobRunner {
         let previous = self.previous.take();
         #[cfg(test)]
         let gate = self.gate.clone();
+        #[cfg(test)]
+        let stepper = self.stepper.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("mmm-job-{id}"))
             .spawn(move || {
@@ -713,6 +866,10 @@ impl JobRunner {
                         if send {
                             let _ = progress_tx.send(Msg::Progress(stage.to_string(), done, total));
                             progress_ctx.request_repaint();
+                            #[cfg(test)]
+                            if let Some(s) = &stepper {
+                                s.wait();
+                            }
                         }
                     };
                     let ctl = JobCtl::new(worker_token, Some(&observer));
@@ -892,6 +1049,17 @@ pub fn discard_blend(session: &OpenSession, plan: &BlendPlan) -> Result<(), Stri
     })
 }
 
+/// A merge's or an export's label (and so its toasts' title): "{verb}
+/// {group}", or `verb` alone in a session of one group (an OSC mosaic:
+/// the group name says nothing).
+fn job_label(verb: &str, group: &str, session: &OpenSession) -> String {
+    if crate::util::group_names(session).len() <= 1 {
+        verb.to_string()
+    } else {
+        format!("{verb} {group}")
+    }
+}
+
 /// A core error as a message for the user.
 fn describe(e: &mmm_core::Error) -> String {
     if e.is_busy() {
@@ -938,6 +1106,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Holds a worker after each progress update it sends, until stepped
+    /// past it or opened.
+    pub(crate) struct Stepper {
+        /// Steps granted and not taken yet, and whether it is open.
+        state: std::sync::Mutex<(u64, bool)>,
+        cv: std::sync::Condvar,
+    }
+
+    impl Stepper {
+        /// Let the held worker go on to its next progress update.
+        pub(crate) fn step(&self) {
+            self.state.lock().unwrap().0 += 1;
+            self.cv.notify_all();
+        }
+
+        /// Hold nothing any more.
+        pub(crate) fn open(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.cv.notify_all();
+        }
+
+        /// Block until stepped or opened (bounded: never hang a test).
+        pub(crate) fn wait(&self) {
+            let state = self.state.lock().unwrap();
+            let (mut state, timeout) = self
+                .cv
+                .wait_timeout_while(state, Duration::from_secs(30), |(steps, open)| {
+                    *steps == 0 && !*open
+                })
+                .unwrap();
+            assert!(!timeout.timed_out(), "stepper never stepped");
+            if !state.1 {
+                state.0 -= 1;
+            }
+        }
+    }
+
     impl JobRunner {
         /// Hold every worker started from now on until the gate opens.
         pub(crate) fn hold(&mut self) -> std::sync::Arc<Gate> {
@@ -947,6 +1152,23 @@ pub(crate) mod tests {
             });
             self.gate = Some(gate.clone());
             gate
+        }
+
+        /// Hold every worker started from now on after each progress
+        /// update it sends (see [`Stepper`]).
+        pub(crate) fn hold_progress(&mut self) -> std::sync::Arc<Stepper> {
+            let stepper = std::sync::Arc::new(Stepper {
+                state: std::sync::Mutex::new((0, false)),
+                cv: std::sync::Condvar::new(),
+            });
+            self.stepper = Some(stepper.clone());
+            stepper
+        }
+
+        /// Call `f` once [`JobRunner::stop_all`] has cancelled the jobs,
+        /// before it waits for them (e.g. to let a held worker go).
+        pub(crate) fn on_stop(&mut self, f: impl FnOnce() + Send + 'static) {
+            self.on_stop = Some(Box::new(f));
         }
     }
 
@@ -977,7 +1199,7 @@ pub(crate) mod tests {
             events,
             vec![JobEvent::Finished {
                 id,
-                label: "Analyze".into()
+                label: ANALYZE_LABEL.into()
             }]
         );
         (root, s, r)
@@ -997,6 +1219,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn analyzing_follows_running_and_queued_analyses() {
+        let root = temp_dir("job-analyzing");
+        let mut s = two_group_session(&root);
+        let mut r = runner();
+        assert!(!r.analyzing());
+        let gate = r.hold();
+        r.start_previews(&s);
+        assert!(!r.analyzing(), "previews are not an analysis");
+        r.start_analyze(&mut s);
+        assert!(r.analyzing(), "queued behind the previews");
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        assert!(!r.analyzing());
+        let gate = r.hold();
+        r.start_analyze(&mut s);
+        assert!(r.analyzing(), "running");
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        let gate = r.hold();
+        r.start_blend(&mut s, "Ha", None);
+        assert!(!r.analyzing(), "a blend is not an analysis");
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stop_all_cancels_every_job_and_waits_for_it() {
+        let (root, mut s, mut r) = analyzed("job-stop-all");
+        let gate = r.hold();
+        let ha = r.start_blend(&mut s, "Ha", None);
+        let export = r.start_export(&s, "OIII", root.join("o.fits"), ExportFormat::Fits);
+        // The running merge gets going while `stop_all` waits for it.
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            gate.open();
+        });
+        let (events, stopped) = r.stop_all(&mut s, Duration::from_secs(20));
+        opener.join().unwrap();
+        assert!(stopped);
+        assert!(!r.busy());
+        for id in [ha, export] {
+            assert!(events.contains(&JobEvent::Cancelled { id }), "{events:?}");
+        }
+        // A job that ignores the wait is let go of; its worker is handed
+        // over, to be joined once it has stopped.
+        let gate = r.hold();
+        r.start_blend(&mut s, "OIII", None);
+        let (_, stopped) = r.stop_all(&mut s, Duration::from_millis(20));
+        assert!(!stopped);
+        let workers = r.detach_workers();
+        assert!(!workers.is_empty());
+        assert!(!r.busy(), "nothing left to the runner");
+        gate.open();
+        for w in workers {
+            w.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn blend_and_export_jobs_know_their_group() {
         let (root, mut s, mut r) = analyzed("job-target");
         let blend = r.start_blend(&mut s, "Ha", None);
@@ -1010,6 +1293,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn runs_count_their_jobs() {
+        let (root, mut s, mut r) = analyzed("job-runs");
+        assert_eq!(r.run_of(JobTarget::Blend), None);
+        let gate = r.hold();
+        let ha = r.start_blend(&mut s, "Ha", None);
+        let oiii = r.start_blend(&mut s, "OIII", None);
+        let run = |id, group: &str, position, count| Run {
+            id,
+            group: group.into(),
+            position,
+            count,
+        };
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(ha, "Ha", 1, 2)));
+        assert_eq!(r.run_of(JobTarget::Export), None);
+        gate.open();
+        // Ha ended: OIII, the second of two, runs.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while r.run_of(JobTarget::Blend).is_some_and(|x| x.id == ha) {
+            assert!(Instant::now() < deadline, "Ha never ended");
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = r.poll(&mut s);
+        }
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(oiii, "OIII", 2, 2)));
+        let _ = drain(&mut r, &mut s);
+        assert_eq!(r.run_of(JobTarget::Blend), None);
+        // The next run starts afresh. An ROI's merge is in none: alone it
+        // makes no run, and its end leaves the run's count as it was.
+        let gate = r.hold();
+        let roi = r.start_blend(&mut s, "Ha", Some([0, 0, 64, 64]));
+        assert!(!r.whole_canvas(roi) && r.whole_canvas(oiii));
+        assert_eq!(r.run_of(JobTarget::Blend), None);
+        let again = r.start_blend(&mut s, "OIII", None);
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(again, "OIII", 1, 1)));
+        gate.open();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while r.views().first().is_some_and(|v| v.id == roi) {
+            assert!(Instant::now() < deadline, "the ROI's merge never ended");
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = r.poll(&mut s);
+        }
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(again, "OIII", 1, 1)));
+        let _ = drain(&mut r, &mut s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn blend_job_runs_and_applies() {
         let (root, mut s, mut r) = analyzed("job-blend");
         assert_eq!(s.canvas(), Some(CANVAS), "canvas from the reference frame");
@@ -1017,13 +1346,13 @@ pub(crate) mod tests {
         let id = r.start_blend(&mut s, "Ha", None);
         assert!(r.busy());
         assert_eq!(r.views().len(), 1);
-        assert_eq!(r.views()[0].label, "Blend Ha");
+        assert_eq!(r.views()[0].label, "Merge Ha");
         let events = drain(&mut r, &mut s);
         assert_eq!(
             events,
             vec![JobEvent::Finished {
                 id,
-                label: "Blend Ha".into()
+                label: "Merge Ha".into()
             }]
         );
         assert!(!r.busy());
@@ -1045,7 +1374,7 @@ pub(crate) mod tests {
         assert!(!r.views()[0].cancellable);
         gate.open();
         assert_eq!(drain(&mut r, &mut s), vec![JobEvent::Cancelled { id }]);
-        assert_eq!(r.label(id), Some("Blend Ha"));
+        assert_eq!(r.label(id), Some("Merge Ha"));
         assert_eq!(actions(&s), ["analyze"]);
         assert_eq!(MosaicConfig::load(&s.mosaic.dir).unwrap(), s.mosaic.config);
 
@@ -1092,7 +1421,7 @@ pub(crate) mod tests {
             drain(&mut r, &mut s),
             vec![JobEvent::Finished {
                 id,
-                label: "Blend Ha".into()
+                label: "Merge Ha".into()
             }]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1122,11 +1451,11 @@ pub(crate) mod tests {
                 JobEvent::Cancelled { id: old },
                 JobEvent::Finished {
                     id: other,
-                    label: "Blend OIII".into()
+                    label: "Merge OIII".into()
                 },
                 JobEvent::Finished {
                     id: new,
-                    label: "Blend Ha".into()
+                    label: "Merge Ha".into()
                 },
             ]
         );
@@ -1148,11 +1477,11 @@ pub(crate) mod tests {
             vec![
                 JobEvent::Finished {
                     id: ha,
-                    label: "Blend Ha".into()
+                    label: "Merge Ha".into()
                 },
                 JobEvent::Finished {
                     id: oiii,
-                    label: "Blend OIII".into()
+                    label: "Merge OIII".into()
                 },
             ]
         );
@@ -1174,7 +1503,7 @@ pub(crate) mod tests {
                 JobEvent::Cancelled { id: first },
                 JobEvent::Finished {
                     id: second,
-                    label: "Blend Ha".into()
+                    label: "Merge Ha".into()
                 },
             ]
         );
@@ -1225,7 +1554,7 @@ pub(crate) mod tests {
                 JobEvent::Cancelled { id: blend },
                 JobEvent::Finished {
                     id: analyze,
-                    label: "Analyze".into()
+                    label: ANALYZE_LABEL.into()
                 },
             ]
         );
@@ -1248,11 +1577,11 @@ pub(crate) mod tests {
             vec![
                 JobEvent::Finished {
                     id: analyze,
-                    label: "Analyze".into()
+                    label: ANALYZE_LABEL.into()
                 },
                 JobEvent::Finished {
                     id: blend,
-                    label: "Blend OIII".into()
+                    label: "Merge OIII".into()
                 },
             ]
         );
@@ -1324,7 +1653,7 @@ pub(crate) mod tests {
             drain(&mut r, &mut s),
             vec![JobEvent::Finished {
                 id,
-                label: "Analyze".into()
+                label: ANALYZE_LABEL.into()
             }]
         );
         // ...so it resolved again, and analysed the current groups.
@@ -1332,7 +1661,7 @@ pub(crate) mod tests {
         assert_eq!(names, ["OIII", "Red"]);
         let cached = s.groups.as_ref().unwrap();
         assert_eq!(cached.groups.keys().collect::<Vec<_>>(), ["OIII", "Red"]);
-        assert_eq!(s.group_count(), 2);
+        assert_eq!(cached.processing_groups().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1381,7 +1710,7 @@ pub(crate) mod tests {
                 },
                 JobEvent::Finished {
                     id: analyze,
-                    label: "Analyze".into()
+                    label: ANALYZE_LABEL.into()
                 },
             ]
         );

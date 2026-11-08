@@ -8,8 +8,9 @@
 //!   dropped when the inputs change (the shared frame may move) and filled
 //!   again by the next run, from the session's preview cache on disk.
 //! - Groups needing analysis ([`MosaicConfig::needs_analyze`], or resolved
-//!   groups never analysed) start an analysis while no job runs, unless
-//!   automatic analysis is paused ([`auto_analyze`], `ui.auto_analyze`).
+//!   groups never analysed) start an analysis while no job runs. Analysis
+//!   is always automatic: an `ui.auto_analyze` switch saved by earlier
+//!   versions is ignored (and left in `mosaic.json` as it is).
 //! - An input edit is coordinated with the Panels tab: while one is
 //!   pending the pipeline starts nothing (the tab cancels every job but
 //!   exports); once it applies, the debounce starts again. A changed input also cancels
@@ -17,9 +18,10 @@
 //!   apply ([`crate::blend_settings`]) counts as an edit too; once a global
 //!   one applies, the groups it marked are analysed again.
 //! - An analysis that ends (finished, failed, or cancelled by the user),
-//!   whether the pipeline or the Blend tab started it, is not started
+//!   whether the pipeline or something else started it, is not started
 //!   again automatically until the inputs, the analysis settings or the
-//!   groups to analyse change (no retry loops). Previews that end are not
+//!   groups to analyse change (no retry loops): the analysis is then
+//!   [`Pipeline::analysis_stalled`], left to the user. Previews that end are not
 //!   repeated for the same inputs either. Previews the user cancelled (or
 //!   that failed) stay incomplete ([`Pipeline::previews_complete`]) until
 //!   the inputs change or [`Pipeline::request_previews`] asks again;
@@ -45,36 +47,11 @@ use crate::session::OpenSession;
 
 /// Wait after the last input edit before the pipeline starts again.
 pub const DEBOUNCE: Duration = Duration::from_millis(1500);
-/// Key in `MosaicConfig.ui` of the automatic analysis switch.
-pub const AUTO_ANALYZE_KEY: &str = "auto_analyze";
-
-/// Whether automatic analysis is on (`ui.auto_analyze`, default on).
-pub fn auto_analyze(cfg: &MosaicConfig) -> bool {
-    cfg.ui
-        .get(AUTO_ANALYZE_KEY)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
-}
-
-/// Turn automatic analysis on or off and save `mosaic.json` (a small save
-/// on the UI thread: the documented exception). The error is a message for
-/// the user; nothing changes then.
-pub fn set_auto_analyze(session: &mut OpenSession, on: bool) -> Result<(), String> {
-    let mut next = session.mosaic.config.clone();
-    if !next.ui.is_object() {
-        next.ui = serde_json::json!({});
-    }
-    next.ui[AUTO_ANALYZE_KEY] = serde_json::Value::Bool(on);
-    next.save(&session.mosaic.dir)
-        .map_err(|e| format!("Could not save the automatic analysis setting: {e}"))?;
-    session.mosaic.config = next;
-    Ok(())
-}
 
 /// Whether some group needs analysis: one is marked
 /// [`MosaicConfig::needs_analyze`], or a resolved group was never analysed
 /// (has no directory yet).
-fn wants_analysis(session: &OpenSession) -> bool {
+pub fn wants_analysis(session: &OpenSession) -> bool {
     let cfg = &session.mosaic.config;
     !cfg.needs_analyze.is_empty()
         || session.groups.as_ref().is_some_and(|g| {
@@ -158,11 +135,8 @@ pub struct Pipeline {
     /// The inputs whose previews the user cancelled (or that failed): not
     /// run again until the inputs change or previews are requested.
     previews_cancelled_for: Option<Inputs>,
-    /// An automatic analysis ended with this key: not again until it
-    /// changes.
+    /// An analysis ended with this key: not again until it changes.
     stalled: Option<Key>,
-    /// Automatic analysis was on at the last poll.
-    auto_was: bool,
     previews: BTreeMap<PathBuf, Arc<Preview>>,
     /// The frame of the current inputs' last complete previews run, and
     /// whether it has been compared with the analysed frame yet.
@@ -212,7 +186,7 @@ impl Pipeline {
             };
             let finished = matches!(event, JobEvent::Finished { .. });
             let Some(job) = self.job.take_if(|j| j.id == id) else {
-                // An analysis started elsewhere (the Blend tab's Analyze):
+                // An analysis started elsewhere (not by the pipeline):
                 // once it has ended, failed or been cancelled by the user,
                 // it is not repeated automatically either.
                 if !editing
@@ -244,13 +218,6 @@ impl Pipeline {
                 Step::Analyze => self.stalled = Some(Key::of(cfg)),
             }
         }
-
-        let auto = auto_analyze(cfg);
-        if auto && !self.auto_was {
-            // Switched (back) on: try again whatever ended before.
-            self.stalled = None;
-        }
-        self.auto_was = auto;
 
         if self.seen.as_ref() != Some(&current) {
             // Opening starts at once; an edit waits for the debounce.
@@ -300,11 +267,7 @@ impl Pipeline {
             });
             return;
         }
-        if auto
-            && !jobs.busy()
-            && wants_analysis(session)
-            && self.stalled.as_ref() != Some(&Key::of(&session.mosaic.config))
-        {
+        if !jobs.busy() && wants_analysis(session) && !self.analysis_stalled(session) {
             let id = jobs.start_analyze(session);
             self.job = Some(Job {
                 id,
@@ -373,6 +336,22 @@ impl Pipeline {
     /// cancelled them or they failed.
     pub fn previews_complete(&self) -> bool {
         self.previews_for.is_some() && self.previews_for == self.seen
+    }
+
+    /// Whether `session` needs an analysis the pipeline will not start by
+    /// itself: one ended (cancelled by the user, failed, or left groups
+    /// still to analyse) and nothing it depends on has changed since. It is
+    /// left to the user then.
+    pub fn analysis_stalled(&self, session: &OpenSession) -> bool {
+        wants_analysis(session) && self.stalled.as_ref() == Some(&Key::of(&session.mosaic.config))
+    }
+
+    /// Whether the previews of the current inputs stopped short (the user
+    /// cancelled them, or they failed) and wait for
+    /// [`Pipeline::request_previews`]: the pipeline does not run them again
+    /// by itself.
+    pub fn previews_paused(&self) -> bool {
+        self.previews_cancelled_for.is_some() && self.previews_cancelled_for == self.seen
     }
 
     /// Run the previews again (the user asked, e.g. after cancelling
@@ -486,7 +465,7 @@ mod tests {
         assert_eq!(r.views()[0].label, "Previews");
         let mut seen = Seen::default();
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert_eq!(seen.previews, 8, "each preview delivered");
         assert_eq!(p.previews().len(), 8);
         assert!(p.previews_complete());
@@ -584,7 +563,7 @@ mod tests {
         let t = t + DEBOUNCE + Duration::from_millis(100);
         let mut seen = Seen::default();
         run_until(&mut p, &mut s, &mut r, t, false, &mut seen, idle);
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert!(
             seen.events
                 .iter()
@@ -602,19 +581,20 @@ mod tests {
         let root = temp_dir("pipe-manual");
         let mut s = two_group_session(&root);
         let (mut p, mut r) = (Pipeline::new(), runner());
-        set_auto_analyze(&mut s, false).unwrap();
         let t0 = Instant::now();
         let mut seen = Seen::default();
-        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        set_auto_analyze(&mut s, true).unwrap();
-        // The user analyses from the Blend tab before the pipeline polls,
-        // then cancels it.
+        // The pipeline's previews run (held); the user analyses (not the
+        // pipeline), queued behind them, then cancels it.
         let gate = r.hold();
+        p.poll(&egui::Context::default(), t0, &mut s, &mut r, &[], false);
+        assert_eq!(p.step(), Some(Step::Previews));
         let id = r.start_analyze(&mut s);
         r.cancel(id);
         gate.open();
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert!(seen.events.contains(&JobEvent::Cancelled { id }));
+        assert!(p.previews_complete());
+        assert!(p.analysis_stalled(&s), "left to the user");
         for _ in 0..20 {
             let events = r.poll(&mut s);
             p.poll(
@@ -633,8 +613,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A session with automatic analysis off whose first previews run the
-    /// user cancelled; returns the cancelled job's id.
+    /// A session whose first previews run the user cancelled (the analysis
+    /// follows all the same); returns the cancelled job's id.
     fn cancel_first_previews(
         p: &mut Pipeline,
         s: &mut OpenSession,
@@ -642,7 +622,6 @@ mod tests {
         t0: Instant,
         seen: &mut Seen,
     ) -> u64 {
-        set_auto_analyze(s, false).unwrap();
         let gate = r.hold();
         p.poll(&egui::Context::default(), t0, s, r, &[], false);
         assert_eq!(p.step(), Some(Step::Previews));
@@ -674,8 +653,9 @@ mod tests {
             );
             assert!(!r.busy(), "cancelled previews were restarted");
         }
-        assert_eq!(seen.started, ["Previews"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert!(!p.previews_complete());
+        assert!(p.previews_paused());
         assert_eq!(p.step(), None);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -727,11 +707,17 @@ mod tests {
         };
         old.save(&s.mosaic.dir.join(FRAME_FILE)).unwrap();
         s.frame = Some(old.clone());
-        set_auto_analyze(&mut s, false).unwrap();
         // Reopened: the previews find the mismatch and every group is
-        // marked (and its result staled); nothing is analysed.
+        // marked (and its result staled) before the analysis, held here,
+        // has done anything.
         let mut p = Pipeline::new();
-        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
+        let previews = r.hold();
+        p.poll(&egui::Context::default(), t0, &mut s, &mut r, &[], false);
+        let analysis = r.hold();
+        previews.open();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, |p, _| {
+            p.step() == Some(Step::Analyze)
+        });
         assert_eq!(
             s.mosaic
                 .config
@@ -748,8 +734,8 @@ mod tests {
             old,
             "previews never write the analysed frame"
         );
-        // Automatic analysis on: it runs, and the frames agree again.
-        set_auto_analyze(&mut s, true).unwrap();
+        // The analysis runs, and the frames agree again.
+        analysis.open();
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert!(s.mosaic.config.needs_analyze.is_empty());
         let previews = ReferenceFrame::load(&preview_frame_path(&s.mosaic.dir)).unwrap();
@@ -758,30 +744,28 @@ mod tests {
     }
 
     #[test]
-    fn auto_analyze_toggle_respected() {
-        let root = temp_dir("pipe-toggle");
+    fn stored_auto_analyze_off_is_ignored() {
+        let root = temp_dir("pipe-auto-off");
         let mut s = two_group_session(&root);
-        assert!(auto_analyze(&s.mosaic.config), "on by default");
-        set_auto_analyze(&mut s, false).unwrap();
-        assert!(!auto_analyze(&MosaicConfig::load(&s.mosaic.dir).unwrap()));
+        // An earlier version saved automatic analysis off.
+        s.mosaic.config.ui["auto_analyze"] = serde_json::Value::Bool(false);
+        s.mosaic.save().unwrap();
         let (mut p, mut r) = (Pipeline::new(), runner());
-        let t0 = Instant::now();
         let mut seen = Seen::default();
-        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        for _ in 0..20 {
-            run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        }
-        // Previews still run; analysis waits for the switch.
-        assert_eq!(seen.started, ["Previews"]);
-        assert!(s.mosaic.config.group_dirs.is_empty());
-        set_auto_analyze(&mut s, true).unwrap();
-        let ctx = egui::Context::default();
-        p.poll(&ctx, t0, &mut s, &mut r, &[], false);
-        assert_eq!(p.step(), Some(Step::Analyze));
-        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        run_until(
+            &mut p,
+            &mut s,
+            &mut r,
+            Instant::now(),
+            false,
+            &mut seen,
+            idle,
+        );
+        // Analysed by itself all the same; the key is left as it was.
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert_eq!(s.mosaic.config.group_dirs.len(), 2);
-        assert!(s.mosaic.config.needs_analyze.is_empty());
+        let saved = MosaicConfig::load(&s.mosaic.dir).unwrap();
+        assert_eq!(saved.ui["auto_analyze"], serde_json::Value::Bool(false));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -797,7 +781,7 @@ mod tests {
         let t0 = Instant::now();
         let mut seen = Seen::default();
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         let mut panel = SettingsPanel::new();
 
         // Blend-local: nothing reruns.
@@ -808,7 +792,7 @@ mod tests {
         for _ in 0..20 {
             run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         }
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
 
         // Global: the pipeline analyses again by itself.
         let mut e = SettingsEdit::of(&s.mosaic.config);
@@ -834,13 +818,14 @@ mod tests {
         let ctx = egui::Context::default();
         let t0 = Instant::now();
         // Previews first, with the analysis held back.
-        set_auto_analyze(&mut s, false).unwrap();
         let mut seen = Seen::default();
-        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        let gate = r.hold();
-        set_auto_analyze(&mut s, true).unwrap();
+        let previews = r.hold();
         p.poll(&ctx, t0, &mut s, &mut r, &[], false);
-        assert_eq!(p.step(), Some(Step::Analyze));
+        let gate = r.hold();
+        previews.open();
+        run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, |p, _| {
+            p.step() == Some(Step::Analyze)
+        });
         let first = p.take_started_analysis().unwrap();
 
         // A global edit cancels the automatic analysis, then is reverted
@@ -872,7 +857,7 @@ mod tests {
             if let Some(id) = again
                 && ended.contains(&JobEvent::Finished {
                     id,
-                    label: "Analyze".into(),
+                    label: "Analyse".into(),
                 })
             {
                 break;

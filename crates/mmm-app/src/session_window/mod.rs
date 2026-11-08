@@ -1,0 +1,594 @@
+//! The session window (spec §5–§7.3): the top bar across the window, then
+//! one canvas showing the plan ([`PlanView`]) or the merged mosaic
+//! ([`MosaicView`]) of the group or composite chosen, with a view bar
+//! across its top, and the inspector at its right.
+//!
+//! - **Top bar** ([`top_bar`]): ‹ (back to the start screen,
+//!   [`SessionOutput::back`]; not while an export runs), the session name,
+//!   the step strip ([`steps`]: Panels · Checks · Merge · Export, with the
+//!   work in progress) and the main button (**Add panels…**, **Merge**
+//!   with the merge settings' summary, or **Export…**).
+//! - **Panel list** ([`PanelsTab`]): while open it takes the canvas's
+//!   place (view bar included); the Panels step opens and closes it. A
+//!   session without panels opens on it. Files dropped on the window are
+//!   added whatever shows ([`SessionWindow::poll_panels`]).
+//! - **One view, one camera.** The window keeps the view (a group or a
+//!   composite) and pushes it into both canvases, so they always agree.
+//!   Switching between plan and mosaic, or to another view, hands the shown
+//!   canvas's [`Camera`] to both first, so nothing moves. Going to an ROI
+//!   ([`SessionWindow::frame`]) hands both the camera that frames it.
+//! - **Mode.** The window opens on the mosaic once something is merged
+//!   ([`OpenSession::merged`]), else on the plan; **Mosaic** cannot be
+//!   chosen before something is merged or a merge has started.
+//!   [`SessionWindow::merge`] merges every group and shows the mosaic.
+//! - **View bar** ([`canvas`]): Plan / Mosaic, a chip per group and per
+//!   composite then **+** (with two or more groups), and the Outlines, ROIs,
+//!   Linked and Strong toggles.
+//! - **Inspector** ([`sections`]): Problems, Panels, ROIs, Merge settings,
+//!   Composites and Notes, in that order.
+//! - **Every frame.** The shell drives the window's hooks whether or not the
+//!   window is drawn: [`SessionWindow::on_event`] for each job event,
+//!   [`SessionWindow::poll_panels`], [`SessionWindow::poll_settings`],
+//!   [`SessionWindow::track_analysis`] and [`SessionWindow::poll`] (the
+//!   merged mosaic's work, the plan's texture release and the window's
+//!   saves).
+//! - **View state** ([`view_state`]): plan or mosaic, the view, the camera,
+//!   the inspector's fold and open sections, the panel list and the
+//!   Outlines and ROIs toggles are written into `ui` whenever they change.
+//!   The first frame restores them: the mosaic only if it can show, else
+//!   the plan; a view the session no longer has falls back to the first
+//!   group (and the camera saved with it is dropped); the camera is handed
+//!   to both canvases before either draws, so each paints its first frame
+//!   through it (no fit is painted first). With nothing saved: the mosaic
+//!   once something is merged, the first group, Problems open, Outlines and
+//!   ROIs on.
+//! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `L`, `S`
+//!   and `Ctrl+Enter`, each named in its control's tooltip; none while a
+//!   text field has the keyboard or the Export dialog is open.
+//! - **Saves.** The view state, the display stretch toggles, the composites
+//!   and the notes live in the session's `MosaicConfig.ui`, changed at once
+//!   in memory and written to `mosaic.json` on the UI thread at most once
+//!   per [`SAVE_INTERVAL`](crate::util::SAVE_INTERVAL) ([`Debounce`]; the
+//!   documented exception), and at once by
+//!   [`SessionWindow::flush_save`] (the shell's
+//!   [`flush_pending_saves`](crate::app::Shell::flush_pending_saves): on
+//!   closing, eframe's periodic save and back to the start screen). The
+//!   session holds the lock, so the notes are saved with it (the start
+//!   screen reads them there).
+
+mod canvas;
+mod sections;
+mod shortcuts;
+mod steps;
+mod top_bar;
+pub mod view_state;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use mega_ui::inspector::{InspectorState, inspector_width};
+use mega_ui::theme::palette;
+use mega_ui::theme::tokens::space;
+use mega_ui::widgets::NotesMode;
+use mmm_core::checks::Check;
+use mmm_core::session_summary::ResultState;
+use mmm_core::settings::ChangeImpact;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::camera::Camera;
+use crate::checks::ChecksEngine;
+use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
+use crate::jobs::{JobEvent, JobRunner, JobTarget};
+use crate::mosaic_view::MosaicView;
+use crate::panels_tab::{FilesPicker, PanelsTab};
+use crate::pipeline::Pipeline;
+use crate::plan_view::{CanvasLook, PlanView};
+use crate::session::OpenSession;
+use crate::util::{Debounce, group_names};
+use view_state::ViewState;
+
+/// What the canvas shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CanvasMode {
+    /// The panels in place, from their previews.
+    Plan,
+    /// The merged mosaic.
+    Mosaic,
+}
+
+/// What the window asks of the shell after a frame.
+#[derive(Debug, Default)]
+pub struct SessionOutput {
+    /// Accept these checks ([`ChecksEngine::accept`]).
+    pub accept: Vec<Check>,
+    /// ‹ was clicked: back to the start screen
+    /// ([`crate::app::Shell::close_session`]).
+    pub back: bool,
+}
+
+/// The open session's window: canvas, view bar and inspector (see the
+/// module docs).
+pub struct SessionWindow {
+    plan: PlanView,
+    mosaic: MosaicView,
+    inspector: InspectorState,
+    /// `None` until the first frame picks it from the session.
+    mode: Option<CanvasMode>,
+    /// The view both canvases show.
+    view: Option<ViewKind>,
+    /// Outlines and ROIs; the stretch is the session's, read each frame.
+    look: CanvasLook,
+    /// Problems lists every check, notes and passed ones too.
+    show_all_checks: bool,
+    notes_mode: NotesMode,
+    /// The panel selected on the plan last frame (a new one opens Panels).
+    selected: Option<PathBuf>,
+    /// The view bar's choices' and toggles' one-row widths, as last drawn.
+    bar_widths: Option<(f32, f32)>,
+    save: Debounce,
+    /// The view as last written into the session's `ui` (or found there).
+    saved_view: Option<ViewState>,
+    /// The panel list: the files and their grouping.
+    panels: PanelsTab,
+    /// The panel list shows in the canvas's place.
+    pub(crate) panel_list_open: bool,
+    /// The top bar's rect, as last drawn (tests).
+    #[cfg(test)]
+    pub(crate) top_bar_rect: Option<egui::Rect>,
+}
+
+/// Inspector section ids, in their fixed order.
+const PROBLEMS: &str = "problems";
+const PANELS: &str = "panels";
+const ROIS: &str = "rois";
+const MERGE_SETTINGS: &str = "merge-settings";
+const COMPOSITES: &str = "composites";
+const NOTES: &str = "notes";
+
+impl SessionWindow {
+    /// A window for a session just opened: the first group, Problems open;
+    /// the panel list adds files picked with `picker`.
+    pub fn new(picker: Arc<dyn FilesPicker>) -> Self {
+        let mut inspector = InspectorState::default();
+        inspector.toggle(PROBLEMS);
+        SessionWindow {
+            plan: PlanView::new(),
+            mosaic: MosaicView::new(),
+            inspector,
+            mode: None,
+            view: None,
+            look: CanvasLook::default(),
+            show_all_checks: false,
+            notes_mode: NotesMode::default(),
+            selected: None,
+            bar_widths: None,
+            save: Debounce::default(),
+            saved_view: None,
+            panels: PanelsTab::new(picker),
+            panel_list_open: false,
+            #[cfg(test)]
+            top_bar_rect: None,
+        }
+    }
+
+    /// What the canvas shows (the plan until the first frame has looked at
+    /// the session).
+    pub fn mode(&self) -> CanvasMode {
+        self.mode.unwrap_or(CanvasMode::Plan)
+    }
+
+    /// Show the plan or the mosaic, where the shown canvas looks; the panel
+    /// list closes, so the canvas shows.
+    pub fn set_mode(&mut self, mode: CanvasMode) {
+        self.panel_list_open = false;
+        if self.mode == Some(mode) {
+            return;
+        }
+        self.carry_camera();
+        self.mode = Some(mode);
+    }
+
+    /// The group or composite shown (once the first frame has picked one).
+    pub fn view(&self) -> Option<&ViewKind> {
+        self.view.as_ref()
+    }
+
+    /// Show `view` on both canvases, where the shown canvas looks (one that
+    /// no longer exists falls back to the first group).
+    pub fn select_view(&mut self, view: ViewKind) {
+        if self.view.as_ref() == Some(&view) {
+            return;
+        }
+        self.carry_camera();
+        self.plan.select_view(view.clone());
+        self.mosaic.select_view(view.clone());
+        self.view = Some(view);
+    }
+
+    /// Merge every group over the whole canvas and show the mosaic, where
+    /// the merge goes; nothing while
+    /// [`MosaicView::merge_block_reason`] gives a reason.
+    pub fn merge(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if self.mosaic.merge_block_reason(session, jobs).is_some() {
+            return;
+        }
+        self.mosaic.merge_all(session, jobs);
+        self.set_mode(CanvasMode::Mosaic);
+    }
+
+    /// The inspector's fold and open sections (tests; nothing outside the
+    /// window reads them yet).
+    #[cfg(test)]
+    pub fn inspector(&self) -> &InspectorState {
+        &self.inspector
+    }
+
+    /// The inspector, to open a section ([`InspectorState::reveal`]).
+    pub fn inspector_mut(&mut self) -> &mut InspectorState {
+        &mut self.inspector
+    }
+
+    /// The plan canvas.
+    pub fn plan(&self) -> &PlanView {
+        &self.plan
+    }
+
+    /// The merged mosaic canvas.
+    pub fn mosaic(&self) -> &MosaicView {
+        &self.mosaic
+    }
+
+    /// React to a job event (from [`JobRunner::poll`]): the mosaic follows
+    /// it, and a finished merge marks the session merged; one of the whole
+    /// canvas leaves its group's result complete (until the summary writer
+    /// classifies the results again, [`OpenSession::results`]).
+    pub fn on_event(&mut self, session: &mut OpenSession, jobs: &JobRunner, event: &JobEvent) {
+        self.mosaic.on_event(event);
+        if let JobEvent::Finished { id, .. } = event
+            && let Some((JobTarget::Blend, group)) = jobs.target(*id)
+        {
+            session.merged = true;
+            if jobs.whole_canvas(*id) {
+                session
+                    .results
+                    .insert(group.to_string(), ResultState::Complete);
+            }
+        }
+    }
+
+    /// See [`MosaicView::track_analysis`].
+    pub fn track_analysis(&mut self, id: u64) {
+        self.mosaic.track_analysis(id);
+    }
+
+    /// The panel list's background work, shown or not ([`PanelsTab::poll`]):
+    /// files picked, typed or dropped anywhere on the window are added, and
+    /// a waiting edit applies. Call every frame after the runner's poll,
+    /// before the pipeline's.
+    pub fn poll_panels(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        self.panels.poll(ctx, session, jobs);
+    }
+
+    /// An edit of the panels waits for the jobs to stop (or a busy store):
+    /// the automatic pipeline starts nothing meanwhile.
+    pub fn panels_editing(&self) -> bool {
+        self.panels.has_pending()
+    }
+
+    /// See [`MosaicView::settings_editing`].
+    pub fn settings_editing(&self, session: &OpenSession) -> bool {
+        self.mosaic.settings_editing(session)
+    }
+
+    /// See [`MosaicView::poll_settings`]. Call every frame after the
+    /// runner's poll, whether or not the window is drawn.
+    pub fn poll_settings(
+        &mut self,
+        ctx: &egui::Context,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) -> Option<ChangeImpact> {
+        self.mosaic.poll_settings(ctx, session, jobs)
+    }
+
+    /// The window's every-frame work, drawn or not: pick the mode and the
+    /// view (on the first frame, as saved), the mosaic's work
+    /// ([`MosaicView::poll`]), the plan's texture release, and the
+    /// rate-limited save (with the view, if it changed). Call every frame
+    /// after the runner's poll and [`SessionWindow::track_analysis`],
+    /// before drawing.
+    pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
+        self.follow_session(session, jobs);
+        self.mosaic.poll(ctx, session, jobs);
+        self.plan.release_if_hidden(Instant::now());
+        self.keep_view_state(session);
+        self.save_if_due(ctx, session);
+    }
+
+    /// The shown view's key, for the summary and the saved view: a group
+    /// name, or a composite's key (read from `ui`, the session's UI
+    /// settings).
+    pub fn view_key(&self, ui: &Value) -> Option<String> {
+        match self.view.as_ref()? {
+            ViewKind::Group(g) => Some(g.clone()),
+            ViewKind::Composition(i) => load_compositions(ui)
+                .get(*i)
+                .map(|c| composition_stretch_key(&c.name)),
+        }
+    }
+
+    /// An edit waits for the jobs to stop (panels, or applied merge
+    /// settings).
+    pub fn has_waiting_edits(&self) -> bool {
+        self.panels.has_pending() || self.mosaic.has_waiting_settings()
+    }
+
+    /// Apply the edits waiting for the jobs to stop (panels, merge
+    /// settings) now, if no job but an export runs: the session is being
+    /// left, and nothing would apply them later. One refused because a
+    /// store is held elsewhere stays waiting (logged).
+    pub fn apply_waiting_edits(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if jobs.busy_except_exports() {
+            return;
+        }
+        self.panels.apply_waiting(session, jobs);
+        self.mosaic.apply_waiting_settings(session, jobs);
+    }
+
+    /// Save a pending (rate-limited) change now, whatever the rate limit,
+    /// the view as it is included: the window is closing, or the session is
+    /// being left. A small `mosaic.json` write.
+    pub fn flush_save(&mut self, session: &mut OpenSession) {
+        self.keep_view_state(session);
+        if self.save.pending() {
+            self.save.saved(Instant::now());
+            if let Err(e) = session.mosaic.save() {
+                tracing::warn!("session settings not saved: {e}");
+            }
+        }
+        self.mosaic.flush_save(session);
+    }
+
+    /// Mark a change as unsaved (tests).
+    #[cfg(test)]
+    pub(crate) fn touch_save(&mut self) {
+        self.save.touch();
+    }
+
+    /// Draw the window filling `ui`: the top bar across it, the inspector
+    /// at the right, the view bar and the canvas (or the panel list) in the
+    /// rest, and the export dialog when open.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+        pipeline: &mut Pipeline,
+        checks: &ChecksEngine,
+    ) -> SessionOutput {
+        let ctx = ui.ctx().clone();
+        self.follow_session(session, jobs);
+        self.shortcuts(&ctx, session, jobs, pipeline);
+        let mut out = SessionOutput::default();
+        let margin = egui::Margin::symmetric(space::M as i8, space::S as i8);
+        let _top = egui::Panel::top("session-top-bar")
+            .resizable(false)
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
+            .show(ui, |ui| {
+                out.back = self.top_bar(ui, session, jobs, pipeline, checks);
+            });
+        #[cfg(test)]
+        {
+            self.top_bar_rect = Some(_top.response.rect);
+        }
+        egui::Panel::right("session-inspector")
+            .resizable(false)
+            .exact_size(inspector_width(&self.inspector))
+            .show(ui, |ui| {
+                self.inspector_ui(ui, session, jobs, pipeline, checks, &mut out);
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
+            .show(ui, |ui| {
+                if self.panel_list_open {
+                    self.panels.ui(ui, session, jobs);
+                } else {
+                    self.view_bar(ui, session, jobs, pipeline);
+                    self.canvas_ui(ui, session, pipeline, checks);
+                }
+            });
+        self.mosaic.export_ui(&ctx, session, jobs);
+        if !self.panel_list_open {
+            // Files dropped anywhere are added (the list draws its own).
+            self.panels.drop_overlay(&ctx);
+        }
+        // What this frame changed is saved from the next one.
+        if self.keep_view_state(session) {
+            ctx.request_repaint();
+        }
+        out
+    }
+
+    /// On the first call, restore the view the session saved
+    /// ([`SessionWindow::restore`]) or, with none saved, pick the mode;
+    /// either way open the panel list for a session without panels (adding
+    /// them comes first). Then keep the view one the session has (else its
+    /// first group) in both canvases.
+    fn follow_session(&mut self, session: &OpenSession, jobs: &JobRunner) {
+        if self.mode.is_none() {
+            let saved = ViewState::load(&session.mosaic.config.ui);
+            match &saved {
+                Some(s) => self.restore(s, session, jobs),
+                None => {
+                    self.mode = Some(if session.merged {
+                        CanvasMode::Mosaic
+                    } else {
+                        CanvasMode::Plan
+                    });
+                }
+            }
+            self.saved_view = saved;
+            self.panel_list_open |= session.mosaic.config.panels.is_empty();
+        }
+        let groups = group_names(session);
+        let compositions = compositions_of(session);
+        let valid = match &self.view {
+            Some(ViewKind::Group(g)) => groups.contains(g),
+            Some(ViewKind::Composition(i)) => *i < compositions.len(),
+            None => false,
+        };
+        if !valid {
+            self.view = groups.first().cloned().map(ViewKind::Group);
+        }
+        if let Some(view) = &self.view {
+            if self.plan.view() != Some(view) {
+                self.plan.select_view(view.clone());
+            }
+            if self.mosaic.view() != Some(view) {
+                self.mosaic.select_view(view.clone());
+            }
+        }
+    }
+
+    /// Show what `saved` says (a session just opened): the mosaic only if
+    /// it can be shown (something merged, or a merge running), else the
+    /// plan; its view if the session still has it, else (left to
+    /// [`SessionWindow::follow_session`]) the first group; its camera with
+    /// its view only, handed to both canvases before either draws (each
+    /// paints its first frame through it); the inspector, the panel list
+    /// and the toggles as saved.
+    fn restore(&mut self, saved: &ViewState, session: &OpenSession, jobs: &JobRunner) {
+        let mosaic_ok = session.merged || jobs.blending();
+        self.mode = Some(match saved.mode {
+            CanvasMode::Mosaic if mosaic_ok => CanvasMode::Mosaic,
+            _ => CanvasMode::Plan,
+        });
+        let view = saved.view.as_deref().and_then(|k| view_of_key(session, k));
+        if let Some(view) = view {
+            self.view = Some(view);
+            if let Some(c) = saved.camera {
+                self.plan.set_camera(c);
+                self.mosaic.set_camera(c);
+            }
+        }
+        self.inspector.folded = saved.inspector_folded;
+        self.inspector.open = saved.inspector_open.iter().cloned().collect();
+        self.panel_list_open = saved.panel_list_open;
+        self.look.outlines = saved.outlines;
+        self.look.numbers = saved.outlines;
+        self.look.rois = saved.rois;
+    }
+
+    /// The view as it is now (the stretch toggles are saved on their own).
+    fn view_state(&self, ui: &Value) -> ViewState {
+        ViewState {
+            mode: self.mode(),
+            view: self.view_key(ui),
+            camera: self.shown_camera(),
+            inspector_folded: self.inspector.folded,
+            inspector_open: self.inspector.open.iter().cloned().collect(),
+            panel_list_open: self.panel_list_open,
+            outlines: self.look.outlines,
+            rois: self.look.rois,
+        }
+    }
+
+    /// Write the view into the session's `ui` if it changed since last
+    /// written, and mark it for the rate-limited save; whether it did.
+    /// Nothing before the first frame has looked at the session (the saved
+    /// view is not restored yet).
+    fn keep_view_state(&mut self, session: &mut OpenSession) -> bool {
+        if self.mode.is_none() {
+            return false;
+        }
+        let now = self.view_state(&session.mosaic.config.ui);
+        if self.saved_view.as_ref() == Some(&now) {
+            return false;
+        }
+        now.save(&mut session.mosaic.config.ui);
+        self.saved_view = Some(now);
+        self.save.touch();
+        true
+    }
+
+    /// Where the shown canvas looks, if it has been drawn (or was handed a
+    /// camera).
+    fn shown_camera(&self) -> Option<Camera> {
+        match self.mode() {
+            CanvasMode::Plan => self.plan.camera(),
+            CanvasMode::Mosaic => self.mosaic.camera(),
+        }
+    }
+
+    /// Frame canvas rect `rect` (an ROI picked) on the canvas shown, as
+    /// last drawn: the camera that frames it is handed to both canvases, so
+    /// it shows from this frame and a later switch moves nothing. Nothing
+    /// before either canvas has been drawn (no viewport to fit).
+    pub(super) fn frame(&mut self, rect: [u64; 4]) {
+        let (shown, other) = match self.mode() {
+            CanvasMode::Plan => (self.plan.canvas_frame(), self.mosaic.viewer_frame()),
+            CanvasMode::Mosaic => (self.mosaic.viewer_frame(), self.plan.canvas_frame()),
+        };
+        let Some((viewport, _)) = shown.or(other) else {
+            return;
+        };
+        let c = Camera::framing(rect.map(|v| v as f64), viewport.size());
+        self.plan.set_camera(c);
+        self.mosaic.set_camera(c);
+    }
+
+    /// Hand the shown canvas's camera to both canvases, before the mode or
+    /// the view changes: whichever is drawn next looks at the same place.
+    fn carry_camera(&mut self) {
+        if let Some(c) = self.shown_camera() {
+            self.plan.set_camera(c);
+            self.mosaic.set_camera(c);
+        }
+    }
+
+    /// Save a pending change once the rate limit allows (documented
+    /// exception: a small `mosaic.json` write on the UI thread).
+    fn save_if_due(&mut self, ctx: &egui::Context, session: &OpenSession) {
+        let now = Instant::now();
+        if self.save.due(now) {
+            self.save.saved(now);
+            if let Err(e) = session.mosaic.save() {
+                tracing::warn!("session settings not saved: {e}");
+            }
+        } else if let Some(wait) = self.save.wait(now) {
+            ctx.request_repaint_after(wait);
+        }
+    }
+}
+
+/// The session's composites (none with grouping off: one group to show).
+fn compositions_of(session: &OpenSession) -> Vec<Composition> {
+    if session.mosaic.config.grouping.enabled {
+        load_compositions(&session.mosaic.config.ui)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The view `key` ([`SessionWindow::view_key`]) names in `session`, if it
+/// still has it: a group by its name, else a composite by its key.
+fn view_of_key(session: &OpenSession, key: &str) -> Option<ViewKind> {
+    if group_names(session).iter().any(|g| g == key) {
+        return Some(ViewKind::Group(key.to_string()));
+    }
+    compositions_of(session)
+        .iter()
+        .position(|c| composition_stretch_key(&c.name) == key)
+        .map(ViewKind::Composition)
+}
+
+#[cfg(test)]
+mod tests;

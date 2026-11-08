@@ -14,12 +14,11 @@ use mmm_core::session_summary::{SUMMARY_FILE, result_state, write_summary};
 use mmm_core::tiles::{TileGeometry, TileStore};
 
 use super::*;
-use crate::blend_tab::save_stretch;
 use crate::compositions::{Composition, save_compositions};
 use crate::start::RecentEntry;
 use crate::start::facts::{Availability, CardFacts, CardState, load_facts};
 use crate::start::tests::temp_dir;
-use crate::stretch_panel::save_stretch_at;
+use crate::stretch_panel::{BLEND_STRETCH_KEY, save_stretch_at};
 use crate::summary_writer::summarize;
 use crate::testutil::{CANVAS, two_group_session};
 use crate::tile_source::MosaicTileSource;
@@ -144,7 +143,7 @@ fn merged_session_has_a_view_per_group() {
     // The automatic stretch, until a Blend stretch is saved for the group.
     assert!(white_share(&hero.views[0]) < 0.5);
     edit_config(&dir, |cfg| {
-        save_stretch(&mut cfg.ui, "Ha", Some(&saturating()));
+        save_stretch_at(&mut cfg.ui, BLEND_STRETCH_KEY, "Ha", Some(&saturating()));
     });
     assert!(white_share(&build_hero(&facts).views[0]) > 0.5);
     // No last view: the first.

@@ -1,6 +1,6 @@
 use egui::Vec2;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 use super::chip::{CHIP_MAX_WIDTH, chip};
 use super::property::{property_grid, property_row, property_row_numeric};
@@ -67,4 +67,58 @@ fn property_rows_render_label_and_value() {
     for t in ["Canvas", "24 310 × 15 870 px", "Scale", "1.62″/px"] {
         h.get_by_label(t);
     }
+}
+
+#[test]
+fn choice_chip_reports_selected_state() {
+    use super::chip::{ChoiceChip, choice_chip};
+    for selected in [true, false] {
+        let mut h = harness(move |ui| {
+            choice_chip(
+                ui,
+                &ChoiceChip {
+                    label: "Hα",
+                    color: Some(palette::HA_500),
+                    selected,
+                    dashed: false,
+                },
+            )
+        });
+        h.run();
+        let node = h.get_by_label("Hα");
+        let want = if selected {
+            egui::accesskit::Toggled::True
+        } else {
+            egui::accesskit::Toggled::False
+        };
+        assert_eq!(node.accesskit_node().toggled(), Some(want));
+    }
+}
+
+#[test]
+fn choice_chip_click_is_reported() {
+    use super::chip::{ChoiceChip, choice_chip};
+    use std::{cell::Cell, rc::Rc};
+    let clicked = Rc::new(Cell::new(false));
+    let seen = clicked.clone();
+    let mut h = harness(move |ui| {
+        let r = choice_chip(
+            ui,
+            &ChoiceChip {
+                label: "Hα",
+                color: None,
+                selected: false,
+                dashed: true,
+            },
+        );
+        if r.clicked() {
+            seen.set(true);
+        }
+        r
+    });
+    h.run();
+    assert!(!clicked.get());
+    h.get_by_label("Hα").click();
+    h.run();
+    assert!(clicked.get());
 }

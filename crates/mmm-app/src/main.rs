@@ -8,16 +8,19 @@
 
 mod app;
 mod blend_settings;
-mod blend_tab;
+mod camera;
 mod checks;
 mod compositions;
+mod display_stretch;
 mod export;
 mod jobs;
+mod mosaic_view;
 mod panels_tab;
 mod pipeline;
-mod plan_tab;
+mod plan_view;
 mod rois;
 mod session;
+mod session_window;
 mod start;
 mod status;
 mod stretch_panel;
@@ -27,6 +30,7 @@ mod synth_mosaic;
 #[cfg(test)]
 mod testutil;
 mod tile_source;
+mod util;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

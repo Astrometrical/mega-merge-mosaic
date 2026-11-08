@@ -1,4 +1,5 @@
-//! The Panels tab (spec §5.2): choosing the panel files and grouping them.
+//! The panel list (spec §5, §10; drawn by the session window in place of
+//! its canvas while open): choosing the panel files and grouping them.
 //! File cards, and with grouping on, groups as columns of cards with
 //! "No group" first; never a spreadsheet.
 //!
@@ -43,9 +44,9 @@ use mmm_core::mosaic::grouping::{Groups, header_value, resolve_groups};
 use mmm_core::mosaic::{GroupRule, Grouping, MosaicConfig, PanelEntry, UNGROUPED, set_inputs};
 use serde_json::Value;
 
-use crate::blend_tab::{Poll, Task};
 use crate::jobs::JobRunner;
 use crate::session::{OpenSession, normalize};
+use crate::util::{Poll, Task};
 
 /// File extensions accepted as panels (the dialog filter, drops and
 /// patterns), compared case-insensitively.
@@ -593,6 +594,18 @@ impl PanelsTab {
         self.pending.is_some()
     }
 
+    /// Apply the waiting edit now, without waiting for its retry (the
+    /// session is being left); call only while no job but an export runs.
+    /// One refused again because a store is held elsewhere stays waiting.
+    pub fn apply_waiting(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
+        if let Some(edit) = self.pending.take() {
+            self.submit(edit, session, jobs);
+            if self.pending.is_some() {
+                tracing::warn!("the panel edit waits: a result is in use elsewhere");
+            }
+        }
+    }
+
     /// The inputs as shown: the waiting edit, else the session's.
     fn shown(&self, session: &OpenSession) -> PanelsEdit {
         self.pending
@@ -641,7 +654,8 @@ impl PanelsTab {
     /// Take finished background work (dialog, typed path, dropped files,
     /// header reads), apply a waiting edit once the runner is idle, and
     /// start resolving the shown inputs if they changed. Call every frame,
-    /// after the runner's poll, whichever tab is shown.
+    /// after the runner's poll, whether or not the list is shown (files
+    /// dropped on the window are added whatever shows).
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -766,6 +780,19 @@ impl PanelsTab {
         }
     }
 
+    /// Open the file dialog (on a worker; [`PanelsTab::poll`] adds what
+    /// was picked), unless it is open already.
+    pub(crate) fn pick_files(&mut self, ctx: &egui::Context) {
+        if self.picking.is_some() {
+            return;
+        }
+        let picker = self.picker.clone();
+        self.picking = Task::spawn("mmm-pick-files", ctx, move || {
+            let picked = picker.pick_files()?;
+            Some(picked.iter().map(|p| normalize(p)).collect())
+        });
+    }
+
     /// The status line of `path`'s card.
     fn card_status(&self, path: &Path) -> (String, Color32) {
         match self.infos.get(path).and_then(|i| i.dims.as_ref()) {
@@ -886,11 +913,7 @@ impl PanelsTab {
                 .on_hover_text("Choose XISF or FITS panel files")
                 .clicked()
             {
-                let picker = self.picker.clone();
-                self.picking = Task::spawn("mmm-pick-files", ctx, move || {
-                    let picked = picker.pick_files()?;
-                    Some(picked.iter().map(|p| normalize(p)).collect())
-                });
+                self.pick_files(ctx);
             }
             let label = ui.label(RichText::new("Add path").color(palette::TEXT_MUTED));
             let field = ui
@@ -1044,7 +1067,7 @@ impl PanelsTab {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(
-                                "These panels use different filters. Group them to blend each \
+                                "These panels use different filters. Group them to merge each \
                                  filter separately.",
                             )
                             .color(palette::TEXT_STRONG),
@@ -1315,8 +1338,10 @@ impl PanelsTab {
         clicked
     }
 
-    /// Show where files dragged over the window will go.
-    fn drop_overlay(&self, ctx: &egui::Context) {
+    /// Show where files dragged over the window will go (drawn by
+    /// [`PanelsTab::ui`]; call it while the tab is not drawn: the drop is
+    /// taken whatever shows).
+    pub(crate) fn drop_overlay(&self, ctx: &egui::Context) {
         if ctx.input(|i| i.raw.hovered_files.is_empty()) {
             return;
         }

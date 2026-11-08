@@ -17,7 +17,7 @@ struct State {
 }
 
 /// The panel over an analysed two-group session, polled and drawn each
-/// frame as the Blend tab does.
+/// frame as the merged mosaic view does.
 fn harness(tag: &str) -> (PathBuf, Harness<'static, State>) {
     let (root, session, jobs) = analyzed(tag);
     let h = Harness::builder()
@@ -89,7 +89,8 @@ fn panel_shows_current_values_and_override_note() {
         set_group_override(m, "Ha", o).unwrap();
     }
     h.run_steps(2);
-    h.get_by_label("Blend settings");
+    // The inspector's section is the only fold: no header of its own.
+    assert!(h.query_by_label("Merge settings").is_none());
     assert_eq!(value(&h, Role::ComboBox, "Mode"), "TwoBand");
     assert_eq!(value(&h, Role::TextInput, "Feather (px)"), "100");
     assert_eq!(value(&h, Role::ComboBox, "Flatten"), "1 (plane)");
@@ -102,7 +103,7 @@ fn panel_shows_current_values_and_override_note() {
             .is_none()
     );
     // Both kinds are captioned.
-    h.get_by_label("BLEND · reblend only");
+    h.get_by_label("MERGE · re-merge only");
     h.get_by_label("ANALYSIS · reruns analysis, every tile goes stale");
     // Nothing staged: no Apply.
     assert!(h.query_by_label("Apply").is_none());
@@ -131,7 +132,9 @@ fn staging_shows_cost_and_revert_discards() {
     h.run_steps(1);
     // Only Ha has a result store (OIII was never blended).
     assert_eq!(h.state().panel.counts(), Some((6, 6)));
-    h.get_by_label_contains("Existing results go stale; reblend to see the change (6 of 6 tiles)");
+    h.get_by_label_contains(
+        "Existing results go stale; merge again to see the change (6 of 6 tiles)",
+    );
     h.get_by_label("Revert").click();
     h.run_steps(2);
     assert!(h.state().panel.draft().is_none());
@@ -291,6 +294,31 @@ fn apply_during_a_blend_cancels_it_and_applies_when_idle() {
 }
 
 #[test]
+fn a_waiting_edit_applies_when_the_session_is_left() {
+    let (root, mut s, mut jobs) = analyzed("settings-apply-waiting");
+    let gate = jobs.hold();
+    jobs.start_blend(&mut s, "Ha", None);
+    let mut panel = SettingsPanel::new();
+    let mut e = SettingsEdit::of(&s.mosaic.config);
+    e.blend.feather_px = 100.0;
+    panel.stage(e, &s.mosaic.config);
+    assert_eq!(panel.apply(&mut s, &mut jobs), None);
+    assert!(panel.has_pending(), "waits for the merge to stop");
+    // Leaving the session: the jobs stop, then the edit applies at once.
+    gate.open();
+    let (_, stopped) = jobs.stop_all(&mut s, std::time::Duration::from_secs(20));
+    assert!(stopped);
+    assert_eq!(
+        panel.apply_waiting(&mut s, &mut jobs),
+        Some(ChangeImpact::Reblend)
+    );
+    assert!(!panel.has_pending());
+    let saved = mmm_core::mosaic::MosaicConfig::load(&s.mosaic.dir).unwrap();
+    assert_eq!(saved.blend.feather_px, 100.0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn blend_local_edit_spares_a_running_analysis() {
     let (root, mut s, mut jobs) = analyzed("settings-spare-analysis");
     let ctx = egui::Context::default();
@@ -321,7 +349,7 @@ fn blend_local_edit_spares_a_running_analysis() {
     events.extend(drain(&mut jobs, &mut s));
     assert!(events.contains(&JobEvent::Finished {
         id: analysis,
-        label: "Analyze".into()
+        label: crate::jobs::ANALYZE_LABEL.into()
     }));
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -396,19 +424,18 @@ fn last_blend_reads_provenance() {
 #[test]
 fn cost_text_says_what_goes_stale() {
     assert_eq!(
-        cost_text(ChangeImpact::Reblend, Some((3, 12)), true),
-        "Existing results go stale; reblend to see the change (3 of 12 tiles)."
+        cost_text(ChangeImpact::Reblend, Some((3, 12))),
+        "Existing results go stale; merge again to see the change (3 of 12 tiles)."
     );
     assert_eq!(
-        cost_text(ChangeImpact::Reanalyze, Some((0, 0)), true),
+        cost_text(ChangeImpact::Reanalyze, Some((0, 0))),
         "Analysis reruns and every result goes stale."
     );
-    // Automatic analysis off: the user runs it.
     assert_eq!(
-        cost_text(ChangeImpact::Reanalyze, Some((2, 6)), false),
-        "Analysis will need to rerun and every result goes stale (2 of 6 tiles)."
+        cost_text(ChangeImpact::Reanalyze, Some((2, 6))),
+        "Analysis reruns and every result goes stale (2 of 6 tiles)."
     );
-    assert!(cost_text(ChangeImpact::Reblend, None, true).contains("counting"));
+    assert!(cost_text(ChangeImpact::Reblend, None).contains("counting"));
     assert_eq!(
         count_tiles(&[PathBuf::from("/nonexistent/result.mmmt")]),
         (0, 0)

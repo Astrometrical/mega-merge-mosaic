@@ -4,7 +4,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 
 use super::notes::{NOTES_LINES, NotesMode, notes_view};
-use super::segmented::segmented;
+use super::segmented::{Segment, segmented, segmented_with};
 
 #[derive(Default)]
 struct Seg {
@@ -30,6 +30,42 @@ fn segmented_click_changes_value() {
     h.run();
     assert_eq!(h.state().value, 2);
     assert!(h.state().changed);
+}
+
+#[test]
+fn a_disabled_segment_cannot_be_chosen() {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(500.0, 100.0))
+        .build_ui_state(
+            |ui, s: &mut Seg| {
+                if crate::testutil::themed(ui) {
+                    let opts = [
+                        Segment {
+                            value: 0,
+                            label: "Plan",
+                            disabled: None,
+                            tooltip: None,
+                        },
+                        Segment {
+                            value: 1,
+                            label: "Mosaic",
+                            disabled: Some("Nothing merged yet"),
+                            tooltip: None,
+                        },
+                    ];
+                    s.changed |= segmented_with(ui, &mut s.value, &opts).changed();
+                }
+            },
+            Seg::default(),
+        );
+    h.run();
+    let mosaic = h.get_by_label("Mosaic");
+    assert!(mosaic.accesskit_node().is_disabled());
+    assert!(!h.get_by_label("Plan").accesskit_node().is_disabled());
+    mosaic.click();
+    h.run();
+    assert_eq!(h.state().value, 0);
+    assert!(!h.state().changed);
 }
 
 /// What the notes harness keeps between frames.

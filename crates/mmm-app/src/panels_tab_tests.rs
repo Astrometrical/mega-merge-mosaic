@@ -468,6 +468,34 @@ fn edit_while_job_running_is_queued_then_applied() {
 }
 
 #[test]
+fn a_waiting_edit_applies_when_the_session_is_left() {
+    let root = temp_dir("panels-apply-waiting");
+    let mut session = two_group_session(&root);
+    let mut jobs = runner();
+    let gate = jobs.hold();
+    jobs.start_analyze(&mut session);
+    let mut tab = PanelsTab::new(Arc::new(StubFiles(vec![])));
+    let mut edit = PanelsEdit::of(&session);
+    edit.panels.remove(0);
+    tab.submit(edit, &mut session, &mut jobs);
+    assert!(tab.has_pending(), "waits for the analysis to stop");
+    // Leaving the session: the jobs stop, then the edit applies at once.
+    gate.open();
+    let (_, stopped) = jobs.stop_all(&mut session, std::time::Duration::from_secs(20));
+    assert!(stopped);
+    tab.apply_waiting(&mut session, &mut jobs);
+    assert!(!tab.has_pending());
+    assert_eq!(
+        MosaicConfig::load(&session.mosaic.dir)
+            .unwrap()
+            .panels
+            .len(),
+        7
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn group_colors_are_stable_and_physical() {
     let mut map = BTreeMap::new();
     assert!(assign_group_colors(&mut map, ["Ha", "Foo"]));
@@ -586,7 +614,7 @@ fn panels_edit_spares_exports() {
         panic!("the edit should wait for the blend");
     };
     let labels: Vec<String> = jobs.views().into_iter().map(|v| v.label).collect();
-    assert_eq!(labels, ["Blend OIII", "Export Ha"], "export kept");
+    assert_eq!(labels, ["Merge OIII", "Export Ha"], "export kept");
     let second = jobs.hold();
     first.open();
     let mut events = Vec::new();

@@ -126,7 +126,7 @@ impl RowSink for TileSink<'_> {
     fn begin(&mut self, w: u64, h: u64, ch: u64) -> Result<()> {
         if w != self.rect[2] - self.rect[0] || h != self.height() || ch != self.ch as u64 {
             return Err(Error::compute(format!(
-                "tile sink expects {}×{}×{}, blend produces {w}×{h}×{ch}",
+                "tile sink expects {}×{}×{}, the merge produces {w}×{h}×{ch}",
                 self.width(),
                 self.height(),
                 self.ch
@@ -172,7 +172,7 @@ impl RowSink for TileSink<'_> {
     fn finish(&mut self) -> Result<()> {
         if self.next_y != self.height() {
             return Err(Error::compute(format!(
-                "tile sink: blend delivered {} of {} rows",
+                "tile sink: the merge delivered {} of {} rows",
                 self.next_y,
                 self.height()
             )));

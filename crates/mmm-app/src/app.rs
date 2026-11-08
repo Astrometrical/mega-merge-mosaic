@@ -1,71 +1,52 @@
 //! The application shell: the start screen until a session is open, then
-//! the session view. [`Shell`] is plain egui (testable without eframe);
+//! the session window, until its ‹ goes back to the start screen
+//! ([`Shell::close_session`]). [`Shell`] is plain egui (testable without eframe);
 //! [`MmmApp`] wraps it for eframe with persistence and the self-test.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, RichText};
-use mega_ui::theme::palette;
+use mega_ui::theme::{Tone, palette};
+use mega_ui::widgets::{Toast, Toasts};
+use mmm_core::mosaic::SessionLock;
 
-use crate::blend_tab::BlendTab;
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
-use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
-use crate::pipeline::{Pipeline, Step, auto_analyze, set_auto_analyze};
-use crate::plan_tab::{PlanFeed, PlanTab};
+use crate::mosaic_view::MosaicView;
+use crate::panels_tab::{FilesPicker, RfdFilesPicker};
+use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
+use crate::session_window::{CanvasMode, SessionWindow};
 use crate::start::{RecentEntry, RfdDialogs, StartAction, StartScreen, unix_now};
-use crate::status::{self, SysMonitor};
-use crate::summary_writer::SummaryWriter;
+use crate::summary_writer::{FinalWrite, SummaryWriter};
+use crate::util::group_names;
 
 /// Directory, inside the session, where compressed panels are decoded.
 const DECODED_DIR: &str = "decoded";
 /// eframe storage key of the recent sessions.
 const RECENT_KEY: &str = "recent_sessions";
-/// How long a job notice stays on screen.
-const NOTICE_TIME: Duration = Duration::from_secs(6);
+/// The window title when no session is open.
+const APP_TITLE: &str = "Mega Merge Mosaic";
+/// Longest leaving the session waits for its jobs to stop.
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
-/// The session view's tabs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tab {
-    /// The panel files and their grouping.
-    Panels,
-    /// Every panel in place, from its preview.
-    Plan,
-    /// Blend controls and the result viewer.
-    Blend,
+/// The window title for a session named `name`.
+fn session_title(name: &str) -> String {
+    format!("{name} — {APP_TITLE}")
 }
 
-impl Tab {
-    const ALL: [Tab; 3] = [Tab::Panels, Tab::Plan, Tab::Blend];
-
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Panels => "Panels",
-            Tab::Plan => "Plan",
-            Tab::Blend => "Blend",
-        }
-    }
-}
-
-/// A toast-style notice about a job that ended.
-struct Notice {
-    text: String,
-    color: Color32,
-    until: Instant,
-}
-
-/// The tab a session opens on: Panels while it has no panels (adding
-/// them is the first step), else Plan.
-fn default_tab(session: &OpenSession) -> Tab {
-    if session.mosaic.config.panels.is_empty() {
-        Tab::Panels
-    } else {
-        Tab::Plan
+/// A toast with just a message.
+fn toast(tone: Tone, title: String) -> Toast {
+    Toast {
+        tone,
+        title,
+        detail: None,
+        action: None,
     }
 }
 
@@ -87,18 +68,14 @@ impl Launcher for ProcessLauncher {
     }
 }
 
-/// Open a window through `launcher`; a failure becomes a notice. Whether
-/// a window opened.
-fn launch(launcher: &dyn Launcher, notices: &mut Vec<Notice>, session: Option<&Path>) -> bool {
+/// Open a window through `launcher`; a failure becomes a toast at time
+/// `now`. Whether a window opened.
+fn launch(launcher: &dyn Launcher, toasts: &mut Toasts, now: f64, session: Option<&Path>) -> bool {
     match launcher.open_window(session) {
         Ok(()) => true,
         Err(text) => {
             tracing::warn!("{text}");
-            notices.push(Notice {
-                text,
-                color: palette::HA_400,
-                until: Instant::now() + NOTICE_TIME,
-            });
+            toasts.push(toast(Tone::Problem, text), now);
             false
         }
     }
@@ -110,20 +87,20 @@ pub struct Shell {
     pub start: StartScreen,
     session: Option<OpenSession>,
     pending: Option<Pending>,
-    /// Opens the other windows ("Open another…", "New mosaic…").
+    /// Opens a session asked for while one is open in a window of its own.
     launcher: Arc<dyn Launcher>,
     /// Background jobs of the open session (made with the session).
     jobs: Option<JobRunner>,
-    sys: SysMonitor,
-    notices: Vec<Notice>,
-    tab: Tab,
-    /// The Blend tab (made afresh with each session).
-    blend: BlendTab,
-    /// The Panels tab (made afresh with each session).
-    panels: PanelsTab,
-    /// The Plan tab (made afresh with each session).
-    plan: PlanTab,
-    /// The panel file dialog used by the Panels tab.
+    /// Job outcomes and failures to open windows.
+    toasts: Toasts,
+    /// Every toast's title pushed, in order (tests: a toast expires).
+    #[cfg(test)]
+    toasted: Vec<String>,
+    /// The window title last sent.
+    title: String,
+    /// The session window (made afresh with each session).
+    window: SessionWindow,
+    /// The panel file dialog used by the session window's panel list.
     files_picker: Arc<dyn FilesPicker>,
     /// The automatic previews and analysis (made afresh with each session).
     pipeline: Pipeline,
@@ -132,28 +109,36 @@ pub struct Shell {
     /// Keeps the session's `summary.json` current (made afresh with each
     /// session).
     summary: SummaryWriter,
+    /// Longest leaving the session waits for its jobs ([`STOP_WAIT`]).
+    stop_wait: Duration,
+    /// Sessions left while a job still ran, sent by their reaper once it
+    /// has released the lock ([`reap`]).
+    reaped_tx: Sender<PathBuf>,
+    reaped_rx: Receiver<PathBuf>,
 }
 
 impl Shell {
     /// A shell showing `start`.
     pub fn new(start: StartScreen) -> Self {
+        let (reaped_tx, reaped_rx) = mpsc::channel();
         Shell {
             start,
             session: None,
             pending: None,
             launcher: Arc::new(ProcessLauncher),
             jobs: None,
-            sys: SysMonitor::start(),
-            notices: Vec::new(),
-            // Set when a session opens (`default_tab`).
-            tab: Tab::Plan,
-            blend: BlendTab::new(),
-            panels: PanelsTab::new(Arc::new(RfdFilesPicker)),
-            plan: PlanTab::new(),
+            toasts: Toasts::default(),
+            #[cfg(test)]
+            toasted: Vec::new(),
+            title: APP_TITLE.to_string(),
+            window: SessionWindow::new(Arc::new(RfdFilesPicker)),
             files_picker: Arc::new(RfdFilesPicker),
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
             summary: SummaryWriter::new(None),
+            stop_wait: STOP_WAIT,
+            reaped_tx,
+            reaped_rx,
         }
     }
 
@@ -173,37 +158,17 @@ impl Shell {
         self.pending.is_some()
     }
 
-    /// The tab shown in the session view.
-    pub fn tab(&self) -> Tab {
-        self.tab
+    /// The session window.
+    pub fn window(&self) -> &SessionWindow {
+        &self.window
     }
 
-    /// The Blend tab.
-    pub fn blend(&self) -> &BlendTab {
-        &self.blend
+    /// The session window, to change what it shows.
+    pub fn window_mut(&mut self) -> &mut SessionWindow {
+        &mut self.window
     }
 
-    /// The Blend tab, mutably.
-    pub fn blend_mut(&mut self) -> &mut BlendTab {
-        &mut self.blend
-    }
-
-    /// Show `tab`.
-    pub fn set_tab(&mut self, tab: Tab) {
-        self.tab = tab;
-    }
-
-    /// The Plan tab.
-    pub fn plan(&self) -> &PlanTab {
-        &self.plan
-    }
-
-    /// The Plan tab, to change its view.
-    pub fn plan_mut(&mut self) -> &mut PlanTab {
-        &mut self.plan
-    }
-
-    /// The automatic pipeline (its previews feed Plan).
+    /// The automatic pipeline (its previews feed the plan).
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }
@@ -213,13 +178,108 @@ impl Shell {
         &self.checks
     }
 
-    /// Save anything held back by a rate limit (the display stretch), e.g.
-    /// when the window closes.
+    /// Every toast's title pushed so far, in order, whether or not it is
+    /// still on screen.
+    #[cfg(test)]
+    pub fn toasted(&self) -> &[String] {
+        &self.toasted
+    }
+
+    /// Save anything held back: edits waiting for the jobs to stop (panels,
+    /// merge settings) when none runs, then what a rate limit holds back
+    /// (the session window's view, the display stretch, ROIs, composites,
+    /// notes). When the window closes, and on leaving the session
+    /// ([`Shell::close_session`]); also from eframe's periodic save.
     pub fn flush_pending_saves(&mut self) {
-        if let Some(session) = &self.session {
-            self.blend.flush_save(session);
-            self.plan.flush_save(session);
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if let Some(jobs) = &mut self.jobs {
+            self.window.apply_waiting_edits(session, jobs);
         }
+        self.window.flush_save(session);
+    }
+
+    /// Leave the open session for the start screen, in this window (‹,
+    /// spec §15). Refused while an export runs or waits (`Err` says why).
+    /// Otherwise every other job is cancelled (all can be run again) and
+    /// waited for, at most [`STOP_WAIT`]; pending saves are flushed
+    /// ([`Shell::flush_pending_saves`]); the session is dropped with its
+    /// window, pipeline, checks and summary writer; the decode cache is
+    /// forgotten; the start screen reads the session's facts again; the
+    /// title names no session.
+    ///
+    /// With every job stopped, the summary is written on this thread and
+    /// the lock released at once. A job that ignores the wait (a decode
+    /// cannot be interrupted) is let go of without hanging the window: a
+    /// reaper thread keeps the session's lock until the job's worker has
+    /// ended, then writes the summary and releases the lock (the start
+    /// screen shows the session open in another window meanwhile, and
+    /// reads it again after). An edit that was waiting for the jobs is then
+    /// dropped (logged). Either way nothing writes into the session once
+    /// its lock is released. Without a session open, nothing to do.
+    pub fn close_session(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        let mut stopped = true;
+        if let Some(jobs) = &mut self.jobs {
+            if let Some(why) = SessionWindow::back_block_reason(jobs) {
+                return Err(why.to_string());
+            }
+            let (events, done) = jobs.stop_all(session, self.stop_wait);
+            stopped = done;
+            for event in &events {
+                let target = match event {
+                    JobEvent::Finished { id, .. } => jobs.target(*id),
+                    _ => None,
+                };
+                self.summary.on_job_event(event, target, unix_now());
+            }
+        }
+        // With a job still running, waiting edits stay unapplied.
+        self.flush_pending_saves();
+        let leftover = match &mut self.jobs {
+            Some(jobs) if !stopped => {
+                tracing::warn!(
+                    "a job did not stop within {:?} of leaving the session; the session \
+                     stays locked until it has",
+                    self.stop_wait
+                );
+                if self.window.has_waiting_edits() {
+                    tracing::warn!(
+                        "an edit waiting for the jobs to stop is dropped: a job did not stop"
+                    );
+                }
+                jobs.detach_workers()
+            }
+            _ => Vec::new(),
+        };
+        let Some(mut session) = self.session.take() else {
+            return Ok(());
+        };
+        let checks = self.checks.counts(&session.mosaic.config);
+        let last_view = self.window.view_key(&session.mosaic.config.ui);
+        let dir = session.mosaic.dir.clone();
+        if leftover.is_empty() {
+            self.summary.finish(&session, checks, last_view);
+        } else {
+            let summary = self.summary.close(&session, checks, last_view);
+            let reaped = self.reaped_tx.clone();
+            reap(leftover, summary, session.lock.take(), &dir, reaped, ctx);
+        }
+        self.jobs = None;
+        drop(session);
+        self.window = SessionWindow::new(self.files_picker.clone());
+        self.pipeline = Pipeline::new();
+        self.checks = ChecksEngine::new();
+        self.summary = SummaryWriter::new(None);
+        mmm_core::decoded::clear_cache_dir();
+        tracing::info!("closed session {}", dir.display());
+        self.start.session_closed(&dir);
+        self.update_title(ctx);
+        ctx.request_repaint();
+        Ok(())
     }
 
     /// Open or create a session on a background thread. With a session
@@ -242,6 +302,7 @@ impl Shell {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         self.poll_jobs(&ctx);
+        self.update_title(&ctx);
         if self.session.is_none() {
             // The start screen's hero fills the window: no panel margin.
             let frame = egui::Frame::NONE.fill(palette::SURFACE_900);
@@ -253,17 +314,33 @@ impl Shell {
         } else {
             self.session_ui(ui);
         }
+        // Toasts float above either screen.
+        let now = ctx.input(|i| i.time);
+        let _ = self.toasts.show(&ctx, now);
     }
 
-    /// Apply a finished open/create.
+    /// Name the session in the window title (sent when it changes).
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let title = match &self.session {
+            Some(open) => session_title(&open.name()),
+            None => APP_TITLE.to_string(),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+    }
+
+    /// Apply a finished open/create; the start screen reads a session again
+    /// once its reaper has released it.
     fn poll(&mut self, ctx: &egui::Context) {
+        while let Ok(dir) = self.reaped_rx.try_recv() {
+            self.start.session_closed(&dir);
+        }
         let Some(outcome) = self.pending.as_mut().and_then(Pending::poll) else {
             return;
         };
-        let created = self
-            .pending
-            .take()
-            .is_some_and(|p| matches!(p.request, Request::Create(_)));
+        self.pending = None;
         self.start.set_busy(None);
         match outcome {
             Ok(opened) => {
@@ -279,34 +356,19 @@ impl Shell {
                         "{} is already open in this window.",
                         dir.display()
                     )));
-                } else if self.session.is_some() {
-                    // One session per window: the other one gets its own.
-                    // A created session holds the lock; release it so the
-                    // child can take it.
+                } else if self.session.is_some() || opened.lock.is_none() {
+                    // One session per window: the other one gets its own
+                    // (also when this window's session was closed since it
+                    // was asked for: it was only checked, without the
+                    // lock). A created session holds the lock; release it
+                    // so the child can take it.
                     drop(opened);
-                    if launch(&*self.launcher, &mut self.notices, Some(&dir)) {
+                    let now = ctx.input(|i| i.time);
+                    if launch(&*self.launcher, &mut self.toasts, now, Some(&dir)) {
                         self.start.record_opened(&dir, unix_now());
                     }
                 } else {
-                    tracing::info!("opened session {}", dir.display());
-                    self.start.record_opened(&dir, unix_now());
-                    // Compressed panels decode to disk once, shared by
-                    // previews and analysis (one session per process).
-                    mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
-                    // A new session starts by adding its panels.
-                    self.tab = if created {
-                        Tab::Panels
-                    } else {
-                        default_tab(&opened)
-                    };
-                    self.summary = SummaryWriter::new(opened.summary.clone());
-                    self.session = Some(opened);
-                    self.jobs = Some(JobRunner::new(ctx.clone()));
-                    self.blend = BlendTab::new();
-                    self.panels = PanelsTab::new(self.files_picker.clone());
-                    self.plan = PlanTab::new();
-                    self.pipeline = Pipeline::new();
-                    self.checks = ChecksEngine::new();
+                    self.open_here(opened, ctx);
                 }
             }
             Err(message) => {
@@ -316,216 +378,143 @@ impl Shell {
         }
     }
 
-    /// Apply finished jobs and post a notice for each, let the Panels tab
-    /// take its background work and apply a waiting edit, then run the
-    /// automatic pipeline and the checks.
+    /// Show `opened` (its lock taken) in this window: recorded as opened,
+    /// its decode cache set, and a fresh job runner, window, pipeline,
+    /// checks and summary writer made for it.
+    fn open_here(&mut self, opened: OpenSession, ctx: &egui::Context) {
+        let dir = opened.mosaic.dir.clone();
+        tracing::info!("opened session {}", dir.display());
+        self.start.record_opened(&dir, unix_now());
+        // Compressed panels decode to disk once, shared by previews and
+        // analysis (one session per process).
+        mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
+        self.summary = SummaryWriter::new(opened.summary.clone());
+        self.session = Some(opened);
+        self.jobs = Some(JobRunner::new(ctx.clone()));
+        // A session without panels opens on its panel list.
+        self.window = SessionWindow::new(self.files_picker.clone());
+        self.pipeline = Pipeline::new();
+        self.checks = ChecksEngine::new();
+    }
+
+    /// Apply finished jobs and toast each outcome, let the panel list
+    /// take its background work and apply a waiting edit, run the
+    /// automatic pipeline, let the session window follow (shown or not),
+    /// run the checks, and keep the summary (and the session's result
+    /// states) current.
     fn poll_jobs(&mut self, ctx: &egui::Context) {
         let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
             return;
         };
         let now = Instant::now();
-        let until = now + NOTICE_TIME;
+        let clock = ctx.input(|i| i.time);
         let events = jobs.poll(session);
-        // An edit (panels, or global Blend settings) waiting or having
+        // An edit (panels, or the merge settings) waiting or having
         // cancelled jobs when the events were taken: jobs it cancelled are
         // restarted by the pipeline, not given up.
-        let editing = self.panels.has_pending() || self.blend.settings_editing(session);
+        let editing = self.window.panels_editing() || self.window.settings_editing(session);
         for event in &events {
-            self.blend.on_event(event);
+            self.window.on_event(session, jobs, event);
             let target = match event {
                 JobEvent::Finished { id, .. } => jobs.target(*id),
                 _ => None,
             };
             self.summary.on_job_event(event, target, unix_now());
             let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
-            let (text, color) = match event {
-                // Previews run by themselves and often: no notices but
+            let (tone, text) = match event {
+                // Previews run by themselves and often: no toasts but
                 // failures.
                 JobEvent::Preview(_) => continue,
                 JobEvent::Finished { label, .. } if label == PREVIEWS_LABEL => continue,
                 JobEvent::Cancelled { id } if name(id) == PREVIEWS_LABEL => continue,
-                JobEvent::Finished { label, .. } => {
-                    (format!("{label} finished"), palette::GREEN_300)
-                }
-                JobEvent::Cancelled { id } => {
-                    (format!("{} cancelled", name(id)), palette::TEXT_BODY)
-                }
-                JobEvent::Failed { message, .. } => (message.clone(), palette::HA_400),
+                JobEvent::Finished { label, .. } => (Tone::Success, format!("{label} finished")),
+                JobEvent::Cancelled { id } => (Tone::Neutral, format!("{} cancelled", name(id))),
+                JobEvent::Failed { message, .. } => (Tone::Problem, message.clone()),
             };
-            self.notices.push(Notice { text, color, until });
+            #[cfg(test)]
+            self.toasted.push(text.clone());
+            self.toasts.push(toast(tone, text), clock);
         }
-        self.panels.poll(ctx, session, jobs);
-        self.blend.poll_settings(ctx, session, jobs);
-        let editing = editing || self.panels.has_pending() || self.blend.settings_editing(session);
+        self.window.poll_panels(ctx, session, jobs);
+        self.window.poll_settings(ctx, session, jobs);
+        let editing =
+            editing || self.window.panels_editing() || self.window.settings_editing(session);
         self.pipeline
             .poll(ctx, now, session, jobs, &events, editing);
         if let Some(id) = self.pipeline.take_started_analysis() {
-            self.blend.track_analysis(id);
+            self.window.track_analysis(id);
         }
+        // The session window (the merged mosaic's state above all) follows
+        // jobs and analyses even while the panel list is shown.
+        self.window.poll(ctx, session, jobs);
         self.checks.poll(ctx, session, jobs, &events);
-        self.plan.release_if_hidden(now);
-        // The last view: that of the active tab (Blend or Plan), else the other's.
-        let last_view = pick_view_key(
-            self.tab,
-            self.blend.view_key(&session.mosaic.config.ui),
-            self.plan.view_key().map(str::to_string),
-        );
+        let last_view = self.window.view_key(&session.mosaic.config.ui);
         let counts = self.checks.counts(&session.mosaic.config);
         self.summary.poll(ctx, session, counts, last_view);
+        if let Some(results) = self.summary.take_results() {
+            session.results = results;
+        }
     }
 
-    /// The open session (the Panels, Plan and Blend tabs build on this).
+    /// The open session: the session window (its top bar, canvas or panel
+    /// list, and inspector).
     fn session_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let Some(session) = &self.session else { return };
-        let mut toggled = None;
-        egui::Panel::top("session-bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(session.name())
-                        .size(16.0)
-                        .color(palette::TEXT_STRONG),
-                );
-                ui.label(
-                    RichText::new(session.mosaic.dir.display().to_string())
-                        .small()
-                        .color(palette::TEXT_MUTED),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Open another…").clicked() {
-                        launch(&*self.launcher, &mut self.notices, None);
-                    }
-                    if ui.button("New mosaic…").clicked() {
-                        launch(&*self.launcher, &mut self.notices, None);
-                    }
-                    let mut auto = auto_analyze(&session.mosaic.config);
-                    if ui
-                        .checkbox(&mut auto, "Auto-analyze")
-                        .on_hover_text(
-                            "Analyze by itself when the panels, grouping or settings change",
-                        )
-                        .changed()
-                    {
-                        toggled = Some(auto);
-                    }
-                });
-            });
-            // Opening another session reports here too: the start window
-            // may be closed meanwhile.
-            if let Some(p) = &self.pending {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(
-                        RichText::new(format!(
-                            "{} {}…",
-                            verb(&p.request),
-                            p.request.path().display()
-                        ))
-                        .color(palette::TEXT_BODY),
-                    );
-                });
-            }
-            if let Some(e) = self.start.error().map(str::to_string) {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(e).color(palette::HA_400));
-                    if ui.small_button("Dismiss").clicked() {
-                        self.start.set_error(None);
-                    }
-                });
-            }
-        });
-        let views = self.jobs.as_ref().map(JobRunner::views).unwrap_or_default();
-        egui::Panel::bottom("status-bar").show(ui, |ui| {
-            status::show(
-                ui,
-                &views,
-                self.checks.counts(&session.mosaic.config),
-                // Plan reads the frame as soon as previews derive it.
-                session.canvas().or(self.plan.frame_canvas()),
-                session.group_count(),
-                self.sys.latest(),
-            );
-        });
-        if let Some(on) = toggled
-            && let Some(session) = self.session.as_mut()
-            && let Err(message) = set_auto_analyze(session, on)
-        {
-            tracing::warn!("{message}");
-            self.notices.push(Notice {
-                text: message,
-                color: palette::HA_400,
-                until: Instant::now() + NOTICE_TIME,
-            });
-        }
-        egui::Panel::top("session-tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for tab in Tab::ALL {
-                    ui.selectable_value(&mut self.tab, tab, tab.label());
-                }
-            });
-        });
-        match (self.tab, self.session.as_mut(), self.jobs.as_mut()) {
-            (Tab::Blend, Some(session), Some(jobs)) => self.blend.ui(ui, session, jobs),
-            (Tab::Panels, Some(session), Some(jobs)) => self.panels.ui(ui, session, jobs),
-            (Tab::Plan, Some(session), Some(_)) => {
-                let now = Instant::now();
-                let feed = PlanFeed {
-                    previews: self.pipeline.previews(),
-                    generation: self.pipeline.generation(),
-                    complete: self.pipeline.previews_complete(),
-                    previews_busy: self.pipeline.step() == Some(Step::Previews)
-                        || self.pipeline.waiting(now),
-                    checks: self.checks.report(),
-                };
-                let out = self.plan.ui(ui, session, &feed);
-                if out.resume_previews {
-                    self.pipeline.request_previews();
-                }
-                for check in &out.accept {
-                    if let Err(message) = self.checks.accept(session, check) {
-                        tracing::warn!("{message}");
-                        self.notices.push(Notice {
-                            text: message,
-                            color: palette::HA_400,
-                            until: now + NOTICE_TIME,
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-        self.notices_ui(&ctx);
-    }
-}
-
-impl Shell {
-    /// Draw the live notices (newest at the bottom) above the status bar.
-    fn notices_ui(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        self.notices.retain(|n| n.until > now);
-        let Some(next) = self.notices.iter().map(|n| n.until).min() else {
+        let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
             return;
         };
-        ctx.request_repaint_after(next - now);
-        egui::Area::new(egui::Id::new("job-notices"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -36.0))
-            .show(ctx, |ui| {
-                for n in &self.notices {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.label(RichText::new(&n.text).color(n.color));
-                    });
-                }
-            });
+        let out = self
+            .window
+            .ui(ui, session, jobs, &mut self.pipeline, &self.checks);
+        for check in &out.accept {
+            if let Err(message) = self.checks.accept(session, check) {
+                tracing::warn!("{message}");
+                #[cfg(test)]
+                self.toasted.push(message.clone());
+                self.toasts
+                    .push(toast(Tone::Problem, message), ctx.input(|i| i.time));
+            }
+        }
+        if out.back
+            && let Err(why) = self.close_session(&ctx)
+        {
+            #[cfg(test)]
+            self.toasted.push(why.clone());
+            self.toasts
+                .push(toast(Tone::Neutral, why), ctx.input(|i| i.time));
+        }
     }
 }
 
-/// The view last shown for the summary: the Blend tab's key while it is the
-/// active tab, otherwise the Plan tab's; the other tab's when the active
-/// one has none.
-fn pick_view_key(tab: Tab, blend: Option<String>, plan: Option<String>) -> Option<String> {
-    match tab {
-        Tab::Blend => blend.or(plan),
-        Tab::Plan | Tab::Panels => plan.or(blend),
+/// Keep a session left while its jobs' `workers` still run locked until
+/// they have ended: on a thread of its own, join them, run the summary's
+/// last write, release `lock`, then send `dir` to `reaped` and repaint
+/// `ctx`. Nothing of the session's is written after the lock is released.
+fn reap(
+    workers: Vec<JoinHandle<()>>,
+    summary: FinalWrite,
+    lock: Option<SessionLock>,
+    dir: &Path,
+    reaped: Sender<PathBuf>,
+    ctx: &egui::Context,
+) {
+    let dir = dir.to_path_buf();
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("mmm-session-reaper".into())
+        .spawn(move || {
+            for w in workers {
+                let _ = w.join();
+            }
+            summary.write();
+            drop(lock);
+            tracing::info!("released session {} once its last job ended", dir.display());
+            let _ = reaped.send(dir);
+            ctx.request_repaint();
+        });
+    // Without a thread, the lock goes with the closure: released at once.
+    if let Err(e) = spawned {
+        tracing::error!("cannot start the session reaper: {e}; the session is released now");
     }
 }
 
@@ -575,18 +564,20 @@ struct SelfTest {
     phase: Phase,
 }
 
-/// The self-test's walk through the session's tabs.
+/// The self-test's walk through the session window's canvas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Waiting for the Blend tab to settle.
-    Blend,
-    /// Waiting for the Blend tab's first composition to settle.
-    BlendComposition,
-    /// Waiting for the Plan tab's first view to settle.
+    /// Waiting for the mosaic of the first group to settle.
+    Mosaic,
+    /// Waiting for the mosaic of the first composite to settle.
+    MosaicComposition,
+    /// Waiting for the plan of the view shown (the composite, if any) to
+    /// settle.
     Plan,
-    /// Waiting for the Plan tab's first composition to settle.
-    PlanComposition,
-    /// Every tab visited.
+    /// Waiting for the plan of the first group to settle (after a
+    /// composite's).
+    PlanGroup,
+    /// Every view visited.
     Done,
 }
 
@@ -659,50 +650,55 @@ impl SelfTest {
         ctx.request_repaint();
     }
 
-    /// Visit Blend, then Plan (the first group, then the first
-    /// composition, if any), each once it has settled.
+    /// Visit the mosaic (the first group, then the first composite, if
+    /// any), then the plan (that view, then the first group), each once it
+    /// has settled.
     fn advance(&mut self, shell: &mut Shell) {
-        if self.phase == Phase::Blend && shell.tab() != Tab::Blend {
-            // A session opens on Plan (or Panels); the walk starts at Blend.
-            shell.set_tab(Tab::Blend);
+        if self.phase == Phase::Mosaic {
+            // A session opens on the plan until something is merged (on
+            // its panel list without panels); the walk starts at the
+            // mosaic, which closes the list.
+            shell.window_mut().set_mode(CanvasMode::Mosaic);
         }
+        let w = shell.window();
         match self.phase {
-            Phase::Blend
-                if self.session_frames >= SELFTEST_SESSION_FRAMES
-                    && shell.tab() == Tab::Blend
-                    && shell.blend().is_settled() =>
+            Phase::Mosaic
+                if self.session_frames >= SELFTEST_SESSION_FRAMES && w.mosaic().is_settled() =>
             {
-                log_blend_tab(shell.blend());
+                log_mosaic(w.mosaic());
                 if has_composition(shell) {
-                    shell.blend_mut().select_view(ViewKind::Composition(0));
-                    self.phase = Phase::BlendComposition;
+                    shell.window_mut().select_view(ViewKind::Composition(0));
+                    self.phase = Phase::MosaicComposition;
                 } else {
-                    shell.set_tab(Tab::Plan);
+                    shell.window_mut().set_mode(CanvasMode::Plan);
                     self.phase = Phase::Plan;
                 }
             }
-            Phase::BlendComposition
-                if matches!(shell.blend().view(), Some(ViewKind::Composition(_)))
-                    && shell.blend().is_settled() =>
+            Phase::MosaicComposition
+                if matches!(w.mosaic().view(), Some(ViewKind::Composition(_)))
+                    && w.mosaic().is_settled() =>
             {
-                log_blend_tab(shell.blend());
-                shell.set_tab(Tab::Plan);
+                log_mosaic(w.mosaic());
+                shell.window_mut().set_mode(CanvasMode::Plan);
                 self.phase = Phase::Plan;
             }
-            Phase::Plan if shell.tab() == Tab::Plan && shell.plan().is_settled() => {
-                log_plan_tab(shell);
-                self.phase = if has_composition(shell) {
-                    shell.plan_mut().select_view(ViewKind::Composition(0));
-                    Phase::PlanComposition
-                } else {
-                    Phase::Done
+            Phase::Plan if w.mode() == CanvasMode::Plan && w.plan().is_settled() => {
+                log_plan(shell);
+                let first = shell
+                    .session()
+                    .and_then(|s| group_names(s).into_iter().next());
+                self.phase = match first {
+                    Some(g) if matches!(w.view(), Some(ViewKind::Composition(_))) => {
+                        shell.window_mut().select_view(ViewKind::Group(g));
+                        Phase::PlanGroup
+                    }
+                    _ => Phase::Done,
                 };
             }
-            Phase::PlanComposition
-                if matches!(shell.plan().view(), Some(ViewKind::Composition(_)))
-                    && shell.plan().is_settled() =>
+            Phase::PlanGroup
+                if matches!(w.plan().view(), Some(ViewKind::Group(_))) && w.plan().is_settled() =>
             {
-                log_plan_tab(shell);
+                log_plan(shell);
                 self.phase = Phase::Done;
             }
             _ => {}
@@ -727,34 +723,34 @@ fn has_composition(shell: &Shell) -> bool {
         .is_some_and(|s| !load_compositions(&s.mosaic.config.ui).is_empty())
 }
 
-/// Log what the self-test's Blend tab shows.
-fn log_blend_tab(blend: &BlendTab) {
+/// Log what the self-test's mosaic shows.
+fn log_mosaic(mosaic: &MosaicView) {
     tracing::info!(
-        "self-test: Blend tab view {:?}: {}; {} ROIs",
-        blend.view(),
-        blend
+        "self-test: Mosaic of {:?}: {}; {} ROIs",
+        mosaic.view(),
+        mosaic
             .shown_text()
             .unwrap_or_else(|| "viewer shown".to_string()),
-        blend.rois().len()
+        mosaic.rois().len()
     );
-    let group = blend.group().unwrap_or("(none)");
-    match (blend.source(), blend.absent()) {
+    let group = mosaic.group().unwrap_or("(none)");
+    match (mosaic.source(), mosaic.absent()) {
         (Some(src), _) => {
             let g = src.tile_geometry();
             let stretch = src.stretch();
             tracing::info!(
-                "self-test: Blend tab shows group {group}: {} × {} × {} result, display stretch {stretch:?}",
+                "self-test: Mosaic shows group {group}: {} × {} × {} result, display stretch {stretch:?}",
                 g.width,
                 g.height,
                 g.channels
             );
         }
         (None, why) => tracing::info!(
-            "self-test: Blend tab, group {group}: no result ({})",
+            "self-test: Mosaic, group {group}: no result ({})",
             why.unwrap_or("none")
         ),
     }
-    match blend.health() {
+    match mosaic.health() {
         Some(Ok(h)) => tracing::info!(
             "self-test: health: seam step median {:.3e}, max {:.3e}, {} of {} edges flagged",
             h.seam_delta_median,
@@ -763,23 +759,23 @@ fn log_blend_tab(blend: &BlendTab) {
             h.seams.len()
         ),
         Some(Err(e)) => tracing::info!("self-test: health unavailable: {e}"),
-        None => tracing::info!("self-test: no health (group not analyzed)"),
+        None => tracing::info!("self-test: no health (group not analysed)"),
     }
 }
 
-/// Log what the self-test's Plan tab shows.
-fn log_plan_tab(shell: &Shell) {
-    let plan = shell.plan();
+/// Log what the self-test's plan shows.
+fn log_plan(shell: &Shell) {
+    let plan = shell.window().plan();
     let items = plan.items();
     let textured = items.iter().filter(|i| !i.layers.is_empty()).count();
     let layers: usize = items.iter().map(|i| i.layers.len()).sum();
     tracing::info!(
-        "self-test: Plan tab shows {:?}: {} panels placed, {textured} with previews ({layers} layers), \
+        "self-test: Plan shows {:?}: {} panels placed, {textured} with previews ({layers} layers), \
          frame {:?}, display stretch {:?}",
         plan.view(),
         items.len(),
         plan.frame_canvas(),
-        plan.stretch()
+        plan.stretch_for_view()
     );
     tracing::info!(
         "self-test: {} previews in memory; checks {}",
@@ -881,7 +877,7 @@ impl MmmApp {
             timed_out: selftest_watchdog(&cc.egui_ctx, SELFTEST_TIMEOUT, Some(SELFTEST_BACKSTOP)),
             outcome,
             done: false,
-            phase: Phase::Blend,
+            phase: Phase::Mosaic,
         });
         MmmApp {
             shell,
@@ -931,7 +927,7 @@ mod tests {
     use std::sync::Arc;
 
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
     use crate::start::tests::{
@@ -954,6 +950,7 @@ mod tests {
             .with_size(egui::vec2(1000.0, 800.0))
             // The start screen's background work (facts, hero, thumbnails)
             // asks for a repaint as each piece finishes.
+            .with_step_dt(0.01)
             .with_max_steps(64)
             .build_ui_state(
                 |ui, s: &mut Shell| {
@@ -995,8 +992,9 @@ mod tests {
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert!(dir.join("mosaic.json").is_file());
         assert_eq!(h.state().start.recent()[0].path, dir);
-        // A session without panels opens on the Panels tab.
-        assert_eq!(h.state().tab(), Tab::Panels);
+        // A session without panels opens on its panel list.
+        assert!(h.state().window().panel_list_open);
+        h.get_by_label("Add panels…");
         let _ = std::fs::remove_dir_all(&parent);
     }
 
@@ -1010,7 +1008,7 @@ mod tests {
                 .is_none()
         );
         h.get_by_label("New mosaic").click();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while h
             .query_by_role_and_label(role, "No dialog? Type a path")
             .is_none()
@@ -1034,7 +1032,7 @@ mod tests {
             h.run();
             h.get_by_label("New mosaic").click();
             let role = egui::accesskit::Role::TextInput;
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::testutil::PATIENCE;
             while h
                 .query_by_role_and_label(role, "No dialog? Type a path")
                 .is_none()
@@ -1055,13 +1053,13 @@ mod tests {
             let dir = parent.join("Typed.mmm-session");
             assert!(dir.join("mosaic.json").is_file());
             assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
-            assert_eq!(h.state().tab(), Tab::Panels);
+            assert!(h.state().window().panel_list_open);
             let _ = std::fs::remove_dir_all(&parent);
         }
     }
 
     #[test]
-    fn failed_launch_shows_a_notice_and_records_nothing() {
+    fn failed_launch_shows_a_toast_and_records_nothing() {
         struct Failing;
         impl Launcher for Failing {
             fn open_window(&self, _: Option<&Path>) -> Result<(), String> {
@@ -1076,6 +1074,7 @@ mod tests {
             .with_launcher(Arc::new(Failing));
         let mut h = Harness::builder()
             .with_size(egui::vec2(1000.0, 800.0))
+            .with_step_dt(0.01)
             .with_max_steps(64)
             .build_ui_state(
                 |ui, s: &mut Shell| {
@@ -1091,21 +1090,23 @@ mod tests {
         h.step();
         step_until(&mut h, |s| s.session().is_some());
         let recent = h.state().start.recent().to_vec();
-        h.get_by_label("Open another…").click();
-        h.step();
-        h.get_by_label_contains("Cannot open a new window");
-        // A session opened in a window that cannot launch is not recorded.
+        // Another session goes to a window of its own, which cannot open:
+        // a toast says so, and the session is not recorded.
         let ctx = h.ctx.clone();
         h.state_mut().request(Request::Open(other), &ctx);
         step_until(&mut h, |s| !s.is_busy());
+        h.step();
+        h.get_by_label_contains("Cannot open a new window");
         assert_eq!(h.state().start.recent(), recent.as_slice());
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn open_another_launches_a_window() {
+    fn another_session_opens_in_a_new_window() {
         let root = temp_dir("shell-another");
         let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let other = root.join("Other.mmm-session");
+        drop(crate::session::create_blocking(&other).unwrap());
         let launcher = Arc::new(RecordingLauncher::default());
         let mut h = harness_launching(StubPicker(None), launcher.clone());
         h.run();
@@ -1113,14 +1114,13 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.step();
         step_until(&mut h, |s| s.session().is_some());
-        h.get_by_label("Open another…").click();
-        h.step();
-        h.get_by_label("New mosaic…").click();
-        h.step();
-        assert_eq!(*launcher.0.lock().unwrap(), [None, None]);
-        // No floating start window over the session.
+        let ctx = h.ctx.clone();
+        h.state_mut().request(Request::Open(other.clone()), &ctx);
+        step_until(&mut h, |s| !s.is_busy());
+        assert_eq!(*launcher.0.lock().unwrap(), [Some(other)]);
+        // No floating start window over the session, which stays open.
         assert!(h.query_by_label("Open another session").is_none());
-        assert!(h.state().session().is_some());
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1146,13 +1146,24 @@ mod tests {
     }
 
     #[test]
-    fn last_view_follows_the_active_tab() {
-        let s = |x: &str| Some(x.to_string());
-        assert_eq!(pick_view_key(Tab::Blend, s("Ha"), s("OIII")), s("Ha"));
-        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), s("OIII")), s("OIII"));
-        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), None), s("Ha"));
-        assert_eq!(pick_view_key(Tab::Blend, None, s("OIII")), s("OIII"));
-        assert_eq!(pick_view_key(Tab::Panels, None, None), None);
+    fn last_view_follows_the_window() {
+        use mmm_core::session_summary::read_summary;
+        let root = temp_dir("shell-last-view");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let mut h = harness(StubPicker(None));
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        let last = |dir: &Path| read_summary(dir).and_then(|s| s.last_view);
+        step_until(&mut h, |_| last(&dir).as_deref() == Some("Ha"));
+        // The view picked in the window, whichever canvas shows it.
+        h.state_mut()
+            .window_mut()
+            .select_view(ViewKind::Group("OIII".into()));
+        step_until(&mut h, |_| last(&dir).as_deref() == Some("OIII"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1203,23 +1214,21 @@ mod tests {
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert_eq!(h.state().start.recent()[0].path, dir);
 
-        // Opening it again (relative) in this window is refused, and the
-        // error shows in the session bar.
+        // Opening it again (relative) in this window is refused (the start
+        // screen says why).
         let ctx = h.ctx.clone();
         h.state_mut().request(Request::Open(rel), &ctx);
         h.step();
         step_until(&mut h, |s| !s.is_busy());
-        h.run();
-        let shown = h
-            .get_all_by_label_contains("already open in this window")
-            .count();
-        assert!(shown >= 1);
-        h.get_by_label("Dismiss");
+        h.run_steps(2);
+        let error = h.state().start.error().unwrap_or_default();
+        assert!(error.contains("already open in this window"), "{error}");
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn jobs_show_in_status_bar_and_notices() {
+    fn job_outcomes_show_as_toasts() {
         let root = temp_dir("shell-jobs");
         let dir = crate::testutil::two_group_session(&root).mosaic.dir;
         let mut h = harness(StubPicker(None));
@@ -1228,75 +1237,91 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.step();
         step_until(&mut h, |s| s.session().is_some());
-        h.get_by_label("2 groups");
-        h.get_by_label("Auto-analyze");
         // The pipeline previews the panels, then analyses them by itself.
         step_until(&mut h, |s| {
             s.session().unwrap().mosaic.config.group_dirs.len() == 2
                 && !s.jobs.as_ref().unwrap().busy()
         });
-        h.run();
+        h.run_steps(2);
         assert_eq!(h.state().pipeline().previews().len(), 8);
-        h.get_by_label("Analyze finished");
-        h.get_by_label("Ready");
-        h.get_by_label("Canvas 600 × 420 (0.3 MP)");
-        h.get_by_label("2 groups");
+        assert_eq!(h.state().toasted(), ["Analyse finished"]);
+        // No status bar: its items are gone.
+        assert!(h.query_by_label("Ready").is_none());
+        assert!(h.query_by_label("Canvas 600 × 420 (0.3 MP)").is_none());
         // The checks (unsolved registered panels: a note each).
         step_until(&mut h, |s| {
             s.checks().report().is_some() && !s.checks().running()
         });
-        h.run();
-        h.get_by_label("Checks:");
-        h.get_by_label("0 problems");
-        h.get_by_label("8 notes");
-        h.get_by_label("0 passed");
-        // A session with panels opens on the Plan tab.
-        assert_eq!(h.state().tab(), Tab::Plan);
-        // The Blend tab shows the first group, Ha; it was never blended.
-        h.get_by_label("Blend").click();
-        h.step();
-        step_until(&mut h, |s| s.tab() == Tab::Blend);
-        assert_eq!(h.state().blend().group(), Some("Ha"));
-        step_until(&mut h, |s| s.blend().absent().is_some());
-        h.get_by_label("Not blended yet.");
-        step_until(&mut h, |s| s.blend().health().is_some());
-        assert!(matches!(h.state().blend().health(), Some(Ok(_))));
+        h.run_steps(2);
+        // A session with panels opens on the canvas, on the plan while
+        // nothing is merged.
+        assert!(!h.state().window().panel_list_open);
+        assert_eq!(h.state().window().mode(), CanvasMode::Plan);
+        // The plan shows the first group's previews in place.
+        step_until(&mut h, |s| s.window().plan().is_settled());
+        assert_eq!(h.state().window().plan().items().len(), 4);
+        h.get_by_label("Ha · 4");
+        h.get_by_label("OIII · 4");
+        // Behind it, the mosaic of Ha: never merged, but analysed (health).
+        assert_eq!(h.state().window().mosaic().group(), Some("Ha"));
+        step_until(&mut h, |s| s.window().mosaic().absent().is_some());
+        step_until(&mut h, |s| s.window().mosaic().health().is_some());
+        assert!(matches!(h.state().window().mosaic().health(), Some(Ok(_))));
+        // The health ends the Merge settings section.
+        h.state_mut()
+            .window_mut()
+            .inspector_mut()
+            .reveal("merge-settings");
+        h.run_steps(2);
         h.get_by_label("Seam step median");
-        h.get_by_label("Blend whole mosaic").click();
+        // The main button (at the right of the Merge step) merges every
+        // group and shows the mosaic.
+        let right = h
+            .query_all_by_label("Merge")
+            .map(|n| n.rect().center().x)
+            .fold(f32::MIN, f32::max);
+        h.query_all_by_label("Merge")
+            .find(|n| n.rect().center().x == right)
+            .expect("the main button")
+            .click();
         h.step();
+        assert_eq!(h.state().window().mode(), CanvasMode::Mosaic);
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
-        h.run();
-        h.get_by_label("Blend Ha finished");
-        h.get_by_label("Blend OIII finished");
+        h.run_steps(2);
+        let toasted = h.state().toasted();
+        for t in ["Merge Ha finished", "Merge OIII finished"] {
+            assert!(toasted.iter().any(|x| x == t), "{t}: {toasted:?}");
+        }
+        assert!(h.state().session().unwrap().merged);
+        // Merged: Export… is the main button now, and stays so once the
+        // summary has classified the results.
+        h.get_by_label("Merged");
+        h.get_by_label("Export…");
+        step_until(&mut h, |s| !s.summary.busy());
+        h.run_steps(2);
+        h.get_by_label("Export…");
         // The result opens with an automatic display stretch, and the
         // viewer settles with its tiles loaded.
         step_until(&mut h, |s| {
-            s.blend().source().is_some() && s.blend().is_settled()
+            s.window().mosaic().source().is_some() && s.window().mosaic().is_settled()
         });
-        let src = h.state().blend().source().unwrap().clone();
+        let src = h.state().window().mosaic().source().unwrap().clone();
         assert_eq!(src.tile_geometry().width, CANVAS_W);
         assert_ne!(
             src.stretch()[0],
             crate::tile_source::LINEAR,
             "auto stretch applied"
         );
-        h.get_by_label("Automatic");
-        // The Panels tab shows the panels in their groups.
-        h.get_by_label("Panels").click();
+        // The panel list shows the panels in their groups.
+        h.get_by_label("8 panels").click();
         h.step();
-        step_until(&mut h, |s| s.tab() == Tab::Panels);
+        assert!(h.state().window().panel_list_open);
         h.get_by_label("Ha_0.xisf");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         while h.query_by_label("OIII").is_none() {
             assert!(Instant::now() < deadline, "no OIII column");
             h.step();
         }
-        // Plan shows the first group's previews in place.
-        h.get_by_label("Plan").click();
-        h.step();
-        step_until(&mut h, |s| s.tab() == Tab::Plan && s.plan().is_settled());
-        assert_eq!(h.state().plan().items().len(), 4);
-        h.get_by_label("View");
         let actions: Vec<_> = h
             .state()
             .session()
@@ -1307,8 +1332,67 @@ mod tests {
             .iter()
             .map(|p| p.action.clone())
             .collect();
-        // "Blend whole mosaic" blends every group.
+        // Merge merged every group.
         assert_eq!(actions, ["analyze", "blend", "blend"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_status_bar() {
+        let root = temp_dir("shell-no-status");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let mut h = harness(StubPicker(None));
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        step_until(&mut h, |s| {
+            s.session().unwrap().mosaic.config.group_dirs.len() == 2
+                && !s.jobs.as_ref().unwrap().busy()
+        });
+        h.run_steps(2);
+        for label in ["Ready", "Checks:", "RAM", "CPU"] {
+            assert!(h.query_by_label_contains(label).is_none(), "{label}");
+        }
+        assert!(h.query_by_label("2 groups").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn title_names_the_session() {
+        let root = temp_dir("shell-title");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let mut h = harness(StubPicker(None));
+        h.run();
+        let titles = |h: &Harness<'static, Shell>| -> Vec<String> {
+            h.output().viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .filter_map(|c| match c {
+                    egui::ViewportCommand::Title(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(titles(&h).is_empty(), "no session, no title change");
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        while h.state().session().is_none() {
+            assert!(Instant::now() < deadline, "no session");
+            h.step();
+            seen.extend(titles(&h));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A few frames more (the pipeline is at work: no `run`): once.
+        for _ in 0..3 {
+            h.step();
+            seen.extend(titles(&h));
+        }
+        assert_eq!(seen, ["m — Mega Merge Mosaic"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1323,10 +1407,253 @@ mod tests {
         session.mosaic.config.ui = serde_json::json!({ "marker": 1 });
         let dir = session.mosaic.dir.clone();
         shell.session = Some(session);
-        shell.blend.touch_save();
+        shell.window.touch_save();
         shell.flush_pending_saves();
         let back = mmm_core::mosaic::MosaicConfig::load(&dir).unwrap();
         assert_eq!(back.ui["marker"], 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn view_state_flushed_by_shell() {
+        use crate::session_window::view_state::ViewState;
+        use mmm_core::mosaic::MosaicConfig;
+        let root = temp_dir("shell-view-state");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        h.run_steps(3);
+        let saved = |dir: &Path| ViewState::load(&MosaicConfig::load(dir).unwrap().ui);
+        step_until(&mut h, |_| {
+            saved(&dir).is_some_and(|v| v.view.as_deref() == Some("Ha"))
+        });
+        // Changed with no frame since: the rate limit holds it back, the
+        // flush writes it.
+        h.state_mut()
+            .window_mut()
+            .select_view(ViewKind::Group("OIII".into()));
+        h.state_mut().flush_pending_saves();
+        assert_eq!(saved(&dir).unwrap().view.as_deref(), Some("OIII"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The ‹ button's label.
+    const BACK: &str = "Back to the start screen";
+
+    /// The window titles sent in the last frame.
+    fn titles(h: &Harness<'static, Shell>) -> Vec<String> {
+        h.output().viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::ViewportCommand::Title(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A shell (asking `launcher` for other windows) with the session in
+    /// `dir` open, as the start screen opens one; its job runner holds every
+    /// worker at the gate returned until it opens.
+    fn harness_open(
+        dir: &Path,
+        launcher: Arc<RecordingLauncher>,
+    ) -> (Harness<'static, Shell>, Arc<crate::jobs::tests::Gate>) {
+        let mut h = harness_launching(StubPicker(None), launcher);
+        let opened = crate::session::open_blocking(dir).unwrap();
+        let ctx = h.ctx.clone();
+        let shell = h.state_mut();
+        shell.open_here(opened, &ctx);
+        let gate = shell.jobs.as_mut().unwrap().hold();
+        (h, gate)
+    }
+
+    #[test]
+    fn back_returns_to_the_start_screen() {
+        use crate::session::{notes, set_notes};
+        use mmm_core::mosaic::MosaicConfig;
+        let root = temp_dir("shell-back");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let launcher = Arc::new(RecordingLauncher::default());
+        let (mut h, gate) = harness_open(&dir, launcher.clone());
+        gate.open();
+        h.run_steps(3);
+        assert!(h.query_by_label("Resume session").is_none());
+        // Notes typed in the session window: saved, then a later edit held
+        // back by the rate limit.
+        let type_notes = |h: &mut Harness<'static, Shell>, text: &str| {
+            let shell = h.state_mut();
+            set_notes(&mut shell.session.as_mut().unwrap().mosaic.config.ui, text);
+            shell.window.touch_save();
+        };
+        let on_disk = |dir: &Path| notes(&MosaicConfig::load(dir).unwrap().ui);
+        type_notes(&mut h, "Draft");
+        step_until(&mut h, |_| on_disk(&dir) == "Draft");
+        type_notes(&mut h, "Redo DBE");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, BACK)
+            .click();
+        h.step();
+        assert!(h.state().session().is_none());
+        assert_eq!(on_disk(&dir), "Redo DBE", "flushed on leaving");
+        assert_eq!(titles(&h), ["Mega Merge Mosaic"]);
+        // The start screen, the session's card read again (its notes as
+        // the window saved them).
+        step_until(&mut h, |s| !s.start.checking_recent());
+        h.run();
+        h.get_by_label("Resume session");
+        assert_eq!(h.state().start.notes_text(), "Redo DBE");
+        // It opens again in this window.
+        h.get_by_label("Resume session").click();
+        step_until(&mut h, |s| s.session().is_some());
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
+        assert!(launcher.0.lock().unwrap().is_empty(), "no other window");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_cancels_running_work_and_releases_the_lock() {
+        use mmm_core::mosaic::{CONFIG_FILE, MosaicConfig, lock_session};
+        use mmm_core::session_summary::SUMMARY_FILE;
+        let root = temp_dir("shell-back-cancel");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, previews) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        // The previews pass; the analysis after them is held before it
+        // starts.
+        step_until(&mut h, |s| s.jobs.as_ref().unwrap().busy());
+        let analysis = h.state_mut().jobs.as_mut().unwrap().hold();
+        previews.open();
+        let running = |s: &Shell| {
+            let views = s.jobs.as_ref().unwrap().views();
+            views
+                .first()
+                .is_some_and(|v| v.label == crate::jobs::ANALYZE_LABEL)
+        };
+        step_until(&mut h, running);
+        assert!(running(h.state()), "analysing");
+        let before = MosaicConfig::load(&dir).unwrap();
+        // It gets going once ‹ has cancelled it, while ‹ waits for it.
+        h.state_mut()
+            .jobs
+            .as_mut()
+            .unwrap()
+            .on_stop(move || analysis.open());
+        h.get_by_role_and_label(egui::accesskit::Role::Button, BACK)
+            .click();
+        h.step();
+        assert!(h.state().session().is_none());
+        assert!(h.state().jobs.is_none(), "no jobs");
+        drop(lock_session(&dir).expect("the session's lock is released"));
+        // Cancelled, not run to the end: nothing analysed.
+        let after = MosaicConfig::load(&dir).unwrap();
+        assert_eq!(after.group_dirs, before.group_dirs);
+        assert_eq!(after.provenance, before.provenance);
+        let config = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
+        let summary = std::fs::read(dir.join(SUMMARY_FILE)).expect("a summary");
+        // A moment later, nothing has written into the session.
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(dir.join(CONFIG_FILE)).unwrap(), config);
+        assert_eq!(std::fs::read(dir.join(SUMMARY_FILE)).unwrap(), summary);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_keeps_the_lock_until_a_job_that_ignores_cancelling_stops() {
+        use egui::accesskit::Role;
+        use mmm_core::mosaic::lock_session;
+        use mmm_core::session_summary::SUMMARY_FILE;
+        let root = temp_dir("shell-back-stuck");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        h.state_mut().stop_wait = Duration::from_millis(50);
+        // The previews' worker is held at the gate: it cannot see a cancel
+        // (like a decode, which nothing interrupts).
+        step_until(&mut h, |s| s.jobs.as_ref().unwrap().busy());
+        h.get_by_role_and_label(Role::Button, BACK).click();
+        h.step();
+        assert!(h.state().session().is_none(), "back without waiting");
+        assert!(lock_session(&dir).is_err(), "locked while the job runs");
+        // The card says so, and opening it meanwhile is refused like any
+        // busy session's.
+        let busy = |s: &Shell| {
+            s.start
+                .card_look(&dir)
+                .0
+                .is_some_and(|(_, t)| t == "Open in another window")
+        };
+        step_until(&mut h, |s| !s.start.checking_recent() && busy(s));
+        let ctx = h.ctx.clone();
+        h.state_mut().request(Request::Open(dir.clone()), &ctx);
+        step_until(&mut h, |s| !s.is_busy());
+        assert!(h.state().session().is_none());
+        let error = h.state().start.error().unwrap_or_default().to_string();
+        assert!(
+            error.contains("open in another window or process"),
+            "{error}"
+        );
+        // Once the job has stopped, the summary is written, then the lock
+        // released, and the card is read again.
+        gate.open();
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        while lock_session(&dir).is_err() {
+            assert!(Instant::now() < deadline, "the lock is never released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(dir.join(SUMMARY_FILE).is_file());
+        step_until(&mut h, |s| !s.start.checking_recent() && !busy(s));
+        h.run();
+        h.get_by_label("Resume session").click();
+        step_until(&mut h, |s| s.session().is_some());
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_is_disabled_while_exporting() {
+        use egui::accesskit::Role;
+        use mmm_core::export::ExportFormat;
+        let (root, mut s, mut jobs) = crate::jobs::tests::analyzed("shell-back-export");
+        jobs.start_blend(&mut s, "Ha", None);
+        let _ = crate::jobs::tests::drain(&mut jobs, &mut s);
+        let dir = s.mosaic.dir.clone();
+        drop((s, jobs));
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        {
+            let shell = h.state_mut();
+            let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
+            jobs.start_export(session, "Ha", root.join("Ha.fits"), ExportFormat::Fits);
+        }
+        h.run_steps(3);
+        let back = |h: &Harness<'static, Shell>| {
+            h.get_by_role_and_label(Role::Button, BACK)
+                .accesskit_node()
+                .is_disabled()
+        };
+        assert!(back(&h), "disabled while exporting");
+        // Its tooltip says why.
+        let why = "Exporting: cancel it or wait to go back";
+        h.get_by_role_and_label(Role::Button, BACK).hover();
+        for _ in 0..200 {
+            if h.query_by_label(why).is_some() {
+                break;
+            }
+            h.step();
+        }
+        h.get_by_label(why);
+        let ctx = h.ctx.clone();
+        assert_eq!(h.state_mut().close_session(&ctx), Err(why.to_string()));
+        assert!(h.state().session().is_some());
+        // Once the export has ended, ‹ goes back.
+        gate.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        assert!(!back(&h));
+        h.get_by_role_and_label(Role::Button, BACK).click();
+        h.step();
+        assert!(h.state().session().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

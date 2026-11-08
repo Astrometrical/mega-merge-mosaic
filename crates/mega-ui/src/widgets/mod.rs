@@ -8,17 +8,19 @@ pub mod property;
 pub mod segmented;
 pub mod session_card;
 pub mod status_line;
+pub mod step_strip;
 pub mod text_input;
 pub mod toast;
 
 pub use button::{ButtonKind, MegaButton, focus_ring, icon_button, icon_button_of};
-pub use chip::{CHIP_MAX_WIDTH, chip};
+pub use chip::{CHIP_MAX_WIDTH, ChoiceChip, chip, choice_chip};
 pub use notes::{NOTES_LINES, NotesMode, NotesResponse, notes_view};
 pub use progress::{progress, progress_bar};
 pub use property::{property_grid, property_row, property_row_numeric, property_row_ui};
-pub use segmented::segmented;
+pub use segmented::{Segment, segmented, segmented_with};
 pub use session_card::{CARD_HEIGHT, CARD_THUMB_HEIGHT, CARD_WIDTH, SessionCardData, session_card};
 pub use status_line::{overline, status};
+pub use step_strip::{StepState, StripEvent, StripStep, step_strip, step_strip_width};
 pub use text_input::text_input;
 pub use toast::{MAX_TOASTS, TOAST_LIFETIME_S, Toast, ToastEvent, ToastId, Toasts};
 

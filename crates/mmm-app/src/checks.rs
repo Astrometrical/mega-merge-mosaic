@@ -23,9 +23,9 @@ use mmm_core::mosaic::{Mosaic, MosaicConfig, PanelEntry};
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::session::Session;
 
-use crate::blend_tab::{Poll, Task};
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, PREVIEWS_LABEL};
 use crate::session::OpenSession;
+use crate::util::{Poll, Task};
 
 /// One run's results.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -93,7 +93,7 @@ pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>) -> ChecksReport {
         match loaded {
             Ok((session, graph)) => checks.extend(analysis_checks(&group, &session, &graph)),
             Err(e) => errors.push(format!(
-                "Cannot read the analysis of group {group}: {e}. Analyze again."
+                "Cannot read the analysis of group {group}: {e}. Analyse again."
             )),
         }
     }
@@ -188,6 +188,13 @@ impl ChecksEngine {
     /// The last report, once a run has finished.
     pub fn report(&self) -> Option<&ChecksReport> {
         self.report.as_ref()
+    }
+
+    /// Show `report` as the last run's (tests: a run is never started
+    /// unless the engine is polled).
+    #[cfg(test)]
+    pub(crate) fn set_report(&mut self, report: ChecksReport) {
+        self.report = Some(report);
     }
 
     /// A run is in progress.
@@ -292,6 +299,7 @@ mod tests {
         let errors = &e.report().unwrap().errors;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("group Ha"), "{errors:?}");
+        assert!(errors[0].ends_with("Analyse again."), "{errors:?}");
         assert_eq!(e.counts(&s.mosaic.config).unwrap().problems, 1);
 
         // Accepting a note saves its keys; it is no longer counted.

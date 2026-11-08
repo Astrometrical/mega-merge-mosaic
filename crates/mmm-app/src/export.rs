@@ -1,5 +1,5 @@
-//! The Blend tab's export dialog: write the view's groups' blended results
-//! to FITS or TIFF files (`mmm_core::export`).
+//! The export dialog (owned by the merged mosaic view): write the view's
+//! groups' blended results to FITS or TIFF files (`mmm_core::export`).
 //!
 //! The dialog chooses the groups (those of the current view), the format
 //! and the destination: a typed path or the native save dialog
@@ -29,8 +29,8 @@ use mega_ui::theme::palette;
 pub use mmm_core::export::ExportFormat;
 use mmm_core::export::{ExportReport, export_check};
 
-use crate::blend_tab::{Poll, Task};
 use crate::session::OpenSession;
+use crate::util::{Poll, Task};
 
 /// Asks where to save an export. Called on a background thread.
 pub trait SavePicker: Send + Sync {
@@ -49,7 +49,7 @@ impl SavePicker for RfdSavePicker {
             ExportFormat::Tiff => &["tif", "tiff"],
         };
         rfd::FileDialog::new()
-            .set_title("Export the blended result")
+            .set_title("Export the merged result")
             .add_filter(format.name(), extensions)
             .set_file_name(name)
             .save_file()
@@ -59,7 +59,7 @@ impl SavePicker for RfdSavePicker {
 /// What the user decided in the dialog.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExportAction {
-    /// Blend these groups over the whole canvas (no export).
+    /// Merge these groups over the whole canvas (no export).
     BlendFirst(Vec<String>),
     /// Export each group to its file.
     Export(Vec<(String, PathBuf)>, ExportFormat),
@@ -237,7 +237,7 @@ impl ExportDialog {
     }
 
     /// Draw the dialog (if open); the user's decision, once made.
-    /// `can_blend` enables "Blend whole mosaic first"; `blending` are the
+    /// `can_blend` enables "Merge whole mosaic first"; `blending` are the
     /// groups with a blend queued or running (Export waits for them).
     pub fn ui(
         &mut self,
@@ -439,7 +439,7 @@ impl ExportDialog {
             let names: Vec<&str> = busy.iter().map(|g| g.as_str()).collect();
             ui.label(
                 RichText::new(format!(
-                    "Waiting for the blend of {} to end.",
+                    "Waiting for the merge of {} to end.",
                     names.join(", ")
                 ))
                 .color(palette::TEXT_MUTED),
@@ -469,7 +469,7 @@ impl ExportDialog {
         self.error = None;
         let config = &session.mosaic.config;
         if let Some(g) = chosen.iter().find(|g| !config.group_dirs.contains_key(*g)) {
-            self.error = Some(format!("{g} has not been analysed and blended yet."));
+            self.error = Some(format!("{g} has not been analysed and merged yet."));
             return;
         }
         let snap = Snapshot {
@@ -547,7 +547,7 @@ fn warn_ui(
     can_blend: bool,
 ) -> Option<Choice> {
     ui.label(
-        RichText::new("The blended result is not up to date.")
+        RichText::new("The merged result is not up to date.")
             .strong()
             .color(palette::HA_400),
     );
@@ -562,9 +562,9 @@ fn warn_ui(
     let mut choice = None;
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(can_blend, egui::Button::new("Blend whole mosaic first"))
-            .on_hover_text("Blend these groups over the whole canvas, then export again")
-            .on_disabled_hover_text("Blending is not possible right now")
+            .add_enabled(can_blend, egui::Button::new("Merge whole mosaic first"))
+            .on_hover_text("Merge these groups over the whole canvas, then export again")
+            .on_disabled_hover_text("Merging is not possible right now")
             .clicked()
         {
             choice = Some(Choice::BlendFirst);

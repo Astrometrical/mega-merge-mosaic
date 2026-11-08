@@ -1,7 +1,8 @@
-//! The Blend tab's **Blend settings** panel (spec §5.4): the mosaic-wide
-//! analyze and blend settings, exactly the `mmm analyze` / `mmm blend`
-//! options the session keeps ([`AnalyzeSettings`], [`BlendSettings`]), with
-//! the CLI's value domains.
+//! The merge settings panel (spec §5.4; the session window's Merge
+//! settings section, through [`crate::mosaic_view::MosaicView`]): the
+//! mosaic-wide analyze and blend settings, exactly the `mmm analyze` /
+//! `mmm blend` options the session keeps ([`AnalyzeSettings`],
+//! [`BlendSettings`]), with the CLI's value domains.
 //!
 //! - **Two kinds.** Mode, feather, defect veto and flatten are
 //!   *blend-local*: analysis is kept, existing results go stale and a
@@ -49,9 +50,9 @@ use mmm_core::settings::{
 };
 use mmm_core::tiles::TileReader;
 
-use crate::blend_tab::{Poll, Task};
 use crate::jobs::{JobEvent, JobRunner};
 use crate::session::OpenSession;
+use crate::util::{Poll, Task};
 
 /// Wait before retrying an edit refused because a store was busy.
 pub const BUSY_RETRY: Duration = Duration::from_millis(500);
@@ -185,9 +186,9 @@ pub fn count_tiles(paths: &[PathBuf]) -> (usize, usize) {
     (valid, total)
 }
 
-/// What applying an edit costs, for the user. `auto`: automatic analysis
-/// is on (a global change then reruns it by itself).
-pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>, auto: bool) -> String {
+/// What applying an edit costs, for the user (a global change reruns the
+/// analysis by itself).
+pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>) -> String {
     let tiles = match counts {
         None => " (counting tiles…)".to_string(),
         Some((_, 0)) => String::new(),
@@ -196,18 +197,16 @@ pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>, auto: boo
     match impact {
         ChangeImpact::None => String::new(),
         ChangeImpact::Reblend => {
-            format!("Existing results go stale; reblend to see the change{tiles}.")
-        }
-        ChangeImpact::Reanalyze if auto => {
-            format!("Analysis reruns and every result goes stale{tiles}.")
+            format!("Existing results go stale; merge again to see the change{tiles}.")
         }
         ChangeImpact::Reanalyze => {
-            format!("Analysis will need to rerun and every result goes stale{tiles}.")
+            format!("Analysis reruns and every result goes stale{tiles}.")
         }
     }
 }
 
-fn mode_name(m: BlendMode) -> &'static str {
+/// The merge mode's name, as the settings show it.
+pub(crate) fn mode_name(m: BlendMode) -> &'static str {
     match m {
         BlendMode::Pyramid => "Pyramid",
         BlendMode::TwoBand => "TwoBand",
@@ -254,11 +253,11 @@ fn gain_name(g: GainMode) -> &'static str {
 }
 
 /// Feather text as shown in the field.
-fn feather_text(v: f32) -> String {
+pub(crate) fn feather_text(v: f32) -> String {
     format!("{v}")
 }
 
-/// The panel's state (owned by the Blend tab).
+/// The panel's state (owned by the merged mosaic view).
 #[derive(Default)]
 pub struct SettingsPanel {
     /// Staged edits (`None`: the session's settings are shown).
@@ -447,6 +446,23 @@ impl SettingsPanel {
         }
     }
 
+    /// Apply the waiting edit now, without waiting for its retry (the
+    /// session is being left); call only while no job but an export runs.
+    /// One refused again because a store is held elsewhere stays waiting.
+    /// The impact when it was applied.
+    pub fn apply_waiting(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) -> Option<ChangeImpact> {
+        let edit = self.pending.take()?;
+        let applied = self.submit(edit, session, jobs);
+        if self.pending.is_some() {
+            tracing::warn!("the settings edit waits: a result is in use elsewhere");
+        }
+        applied
+    }
+
     /// Take a finished tile count, start one when needed, and apply a
     /// waiting edit once the runner is idle. Call every frame after the
     /// runner's poll, whichever tab is shown. The impact when an edit was
@@ -505,24 +521,10 @@ impl SettingsPanel {
         applied
     }
 
-    /// Draw the panel; the impact when an edit was applied now.
+    /// Draw the panel (no heading or fold of its own: the inspector's
+    /// Merge settings section holds it); the impact when an edit was
+    /// applied now.
     pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        session: &mut OpenSession,
-        jobs: &mut JobRunner,
-    ) -> Option<ChangeImpact> {
-        let mut applied = None;
-        egui::CollapsingHeader::new(RichText::new("Blend settings").color(palette::TEXT_STRONG))
-            .id_salt("blend-settings")
-            .default_open(true)
-            .show(ui, |ui| {
-                applied = self.body(ui, session, jobs);
-            });
-        applied
-    }
-
-    fn body(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
@@ -537,7 +539,7 @@ impl SettingsPanel {
             ui.label(RichText::new(t).small().color(palette::TEXT_SUBTLE));
         };
 
-        caption(ui, "BLEND · reblend only");
+        caption(ui, "MERGE · re-merge only");
         ui.add_enabled_ui(editable, |ui| {
             egui::Grid::new("blend-settings-blend")
                 .num_columns(3)
@@ -655,13 +657,9 @@ impl SettingsPanel {
             };
             ui.add_space(4.0);
             ui.label(
-                RichText::new(cost_text(
-                    impact,
-                    counts,
-                    crate::pipeline::auto_analyze(&session.mosaic.config),
-                ))
-                .small()
-                .color(palette::TEXT_BODY),
+                RichText::new(cost_text(impact, counts))
+                    .small()
+                    .color(palette::TEXT_BODY),
             );
             ui.horizontal(|ui| {
                 if ui
@@ -682,8 +680,8 @@ impl SettingsPanel {
             }
         } else if let Some(impact) = self.applied {
             let note = match impact {
-                ChangeImpact::Reblend => "Applied. Blend again to see the change.",
-                ChangeImpact::Reanalyze => "Applied. Analysis reruns, then blend again.",
+                ChangeImpact::Reblend => "Applied. Merge again to see the change.",
+                ChangeImpact::Reanalyze => "Applied. Analysis reruns, then merge again.",
                 ChangeImpact::None => "",
             };
             if !note.is_empty() {
@@ -756,7 +754,7 @@ fn mark(ui: &mut egui::Ui, changed: bool) {
                 .small()
                 .color(palette::ACCENT_400),
         )
-        .on_hover_text("Changed since the last blend");
+        .on_hover_text("Changed since the last merge");
     } else {
         ui.label("");
     }

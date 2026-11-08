@@ -12,6 +12,7 @@ pub mod gallery;
 pub mod groups;
 pub mod hero;
 pub mod icons;
+pub mod inspector;
 pub mod jobs;
 pub mod motion;
 pub mod plan;

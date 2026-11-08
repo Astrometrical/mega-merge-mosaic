@@ -6,10 +6,33 @@ use std::path::Path;
 use crate::session::OpenSession;
 pub(crate) use crate::synth_mosaic::CANVAS;
 
+/// How long a test waits for background work (worker threads, jobs, tile
+/// loads) to reach the state it checks: generous, so a slow, loaded machine
+/// never trips it. Every wait ends as soon as its condition holds.
+pub(crate) const PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A grouped Ha + OIII mosaic session in `root/m.mmm-session`, grouped by
 /// the `FILTER` header, not yet analyzed.
 pub(crate) fn two_group_session(root: &Path) -> OpenSession {
-    let mosaic = crate::synth_mosaic::two_group_mosaic(root);
+    open(crate::synth_mosaic::two_group_mosaic(root))
+}
+
+/// [`two_group_session`] in `root/{name}.mmm-session` (a session is
+/// named after its folder).
+pub(crate) fn two_group_session_named(root: &Path, name: &str) -> OpenSession {
+    let made = crate::synth_mosaic::two_group_mosaic(root);
+    let dir = root.join(format!("{name}.mmm-session"));
+    std::fs::rename(&made.dir, &dir).unwrap();
+    open(mmm_core::mosaic::Mosaic::open(&dir).unwrap())
+}
+
+/// [`two_group_session`] with mono (one-channel) panels.
+pub(crate) fn two_group_mono_session(root: &Path) -> OpenSession {
+    open(crate::synth_mosaic::two_group_mosaic_of(root, 1))
+}
+
+/// `mosaic` as opened, its groups resolved, without a lock.
+fn open(mosaic: mmm_core::mosaic::Mosaic) -> OpenSession {
     let groups = mosaic.groups().ok();
     OpenSession {
         mosaic,
@@ -17,6 +40,8 @@ pub(crate) fn two_group_session(root: &Path) -> OpenSession {
         groups,
         lock: None,
         summary: None,
+        merged: false,
+        results: Default::default(),
     }
 }
 

@@ -118,6 +118,8 @@ pub struct PlanCanvas {
     view: View,
     /// The extent the view was last fitted to; a new extent re-homes.
     homed_extent: Option<[f64; 4]>,
+    /// A view to show in place of fitting an extent: (extent, centre, zoom).
+    view_for: Option<([f64; 4], (f64, f64), f64)>,
     commands: Vec<Command>,
     last_frame: Option<(Rect, f64)>,
 }
@@ -134,6 +136,7 @@ impl PlanCanvas {
         Self {
             view: View::new(),
             homed_extent: None,
+            view_for: None,
             commands: Vec::new(),
             last_frame: None,
         }
@@ -142,6 +145,25 @@ impl PlanCanvas {
     /// The current view (canvas coordinates are the view's image pixels).
     pub fn view(&self) -> &View {
         &self.view
+    }
+
+    /// The view, to move it from outside. The canvas still fits the extent
+    /// on its first frame and whenever the extent changes; to show a view in
+    /// place of such a fit, use [`PlanCanvas::set_view_for`].
+    pub fn view_mut(&mut self) -> &mut View {
+        &mut self.view
+    }
+
+    /// Show the view at `centre` and `zoom` (canvas coordinates; the zoom is
+    /// clamped to the view's limits) from the next frame that draws
+    /// `extent`, with no animation, in place of fitting `extent`: that frame
+    /// still fits a new extent (which sets the zoom limits), then jumps to
+    /// this view before handling input and painting, so the fit is never
+    /// shown. If the next frame drawn has another extent, this is forgotten
+    /// and that extent is fitted as usual. For a camera shared with another
+    /// canvas.
+    pub fn set_view_for(&mut self, extent: [f64; 4], centre: (f64, f64), zoom: f64) {
+        self.view_for = Some((extent, centre, zoom));
     }
 
     /// Viewport rect and `ui.input().time` of the last frame shown, for
@@ -183,6 +205,11 @@ impl PlanCanvas {
             self.view.fit_rect(extent, rect.size(), now);
             self.view.finish_animation();
             self.homed_extent = Some(extent);
+        }
+        if let Some((for_extent, centre, zoom)) = self.view_for.take()
+            && for_extent == extent
+        {
+            self.view.set_view(centre, zoom, now);
         }
         self.view.update(now);
         for c in std::mem::take(&mut self.commands) {

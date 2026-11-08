@@ -944,11 +944,11 @@ below is UI-agnostic and the CLI is its first consumer.
 Phase 2 adds the first runnable desktop app on top of the phase 1 core. No
 algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-design.md`.
 
-- **Crates.** `crates/mega-ui` is a generic egui library (theme, status bar,
+- **Crates.** `crates/mega-ui` is a generic egui library (theme, toasts,
   background job runner, and a tiled pyramid viewer with smooth zoom/pan) and
   must not depend on `mmm-core`, so it can be lifted into other apps.
   `crates/mmm-app` is the eframe app (binary `mega-merge-mosaic`): start
-  screen, session bar, and the Blend tab, with mmm-core adapters
+  screen and the session window (below), with mmm-core adapters
   (`tile_source`, `jobs`). egui/eframe are pinned at 0.36 in the workspace
   `Cargo.toml`.
 - **Job contract.** The app uses the plan / run / apply split and the
@@ -979,8 +979,9 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
 - **Display stretch is CPU, per visible tile**, on the loader threads, not a
   GPU shader. This keeps the viewer renderer-agnostic and needs no paint
   callbacks; cost is screen-size work per slider change (may lag on 4K). A GPU
-  path is a follow-up. A saved `blend_stretch` entry means manual (kept across
-  opens and blends); Auto clears it.
+  path is a follow-up. The stretch is always automatic (see the session
+  window); the hand-set `blend_stretch` and `plan_stretch` entries of earlier
+  versions are ignored there, and only the start screen still reads them.
 - **Renderer.** eframe `glow` (OpenGL), matching workflow-platform; `wgpu` is
   deferred.
 - **WSLg record (2026-11-03).** `mega-merge-mosaic --selftest` (renders the
@@ -993,36 +994,35 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   get driver name for fd -1" warnings on stderr are harmless.
 - **Self-test session.** `cargo run -p mmm-app --example make_selftest_session -- DIR`
   builds a synthetic analysed and blended two-group session with an HOO
-  composition (`DIR/m.mmm-session`) for `--selftest`, which visits Blend, then
-  Plan's first group and the composition, each once settled. Automated checks
+  composition (`DIR/m.mmm-session`) for `--selftest`, which opens the session,
+  shows the Mosaic of the first group, then of the composition, then the
+  Plan, each once settled. Automated checks
   launch the GUI only through `--selftest`.
-- **Plan tab (phase 3).** Previews (one ≤512 px image per panel, placed in the
-  shared frame) become RGBA8 through the Plan display stretch on a small
+- **Plan canvas.** Previews (one ≤512 px image per panel, placed in the
+  shared frame) become RGBA8 through the automatic display stretch on a small
   converter pool; the UI thread uploads at most 32 textures a frame. The
   canvas extent is the frame canvas (read on a worker), so arriving previews
   never reset the zoom; a panel without a preview yet is a dashed outline at
   its analysed bbox or, in a solved frame, at its header-only WCS footprint
   (`preview::footprint`, found on a worker once per previews generation).
-  Textures are dropped after Plan has been hidden 5 s and rebuilt on return. Plan stretches live in `ui.plan_stretch`, keyed by group
-  name or `comp:<name>` for a composition (names unique and non-empty).
-  Compositions draw each channel's group as additive layers tinted pure R, G
-  or B × weight; overlaps within one group add up (a known limitation).
-- **Blend ROIs and composition views** (phase 3): ROIs live in `ui.rois`
-  (name, note, sky corners when the frame has a WCS, canvas rect), are
-  reprojected through the analysed frame on a worker, and show their size
-  and the fraction of fresh level-0 tiles per group of the view. Blend ROI
-  blends the selected ROI once per group of the view (not while the ROIs
-  are being reprojected); Blend whole mosaic blends every group.
-  Composition views mix each member group's tiles (through its own Blend
-  stretch) on the viewer's loader threads (`CompositeTileSource`); members
-  must share one canvas, and a member not blended yet adds nothing and is
-  named above the image.
-- **Not yet built (phase 2 list, superseded):** export, Panels and Plan
-  tabs were built in phase 3, below.
+  Textures are dropped after the plan has been hidden 5 s and rebuilt on
+  return. Composites draw each channel's group as additive layers tinted pure
+  R, G or B × weight; overlaps within one group add up (a known limitation).
+- **ROIs and composite views**: ROIs live in `ui.rois` (name, note, sky
+  corners when the frame has a WCS, canvas rect), are reprojected through
+  the analysed frame on a worker, and show their size and the fraction of
+  fresh level-0 tiles per group of the view. Merging an ROI merges it once
+  per group of the view (not while the ROIs are being reprojected). Composite
+  views mix each member group's tiles (through its own stretch) on the
+  viewer's loader threads (`CompositeTileSource`); members must share one
+  canvas, and a member not merged yet adds nothing and is named above the
+  image.
+- **Not yet built (phase 2 list, superseded):** export and the panel list
+  were built in phase 3, below.
 
 ## Standalone app (phase 3, 2026-11)
 
-Phase 3 adds the Panels and Plan tabs, cached previews, an automatic
+Phase 3 adds the panel list and the plan, cached previews, an automatic
 preview-then-analysis pipeline, a checks engine, Blend ROIs, composition
 views and export. No algorithm changed. Core additions are bookkeeping
 (`set_inputs`, the lock), `preview` and `export`.
@@ -1074,23 +1074,25 @@ views and export. No algorithm changed. Core additions are bookkeeping
   store is held), so panel files changed on disk since the analysis are
   caught; once per previews run.
 - **Automatic pipeline** (`pipeline.rs`). On open, and 1.5 s (`DEBOUNCE`) after
-  the last input edit, it runs previews, then analysis when `ui.auto_analyze`
-  (the "Auto-analyze" toggle, default on) is set, nothing else is running
-  (so it never cancels a user's blend) and some group needs it. The Panels tab
-  cancels running jobs before an edit and applies it once they have stopped;
+  the last input edit, it runs previews, then analysis when nothing else is
+  running (so it never cancels a user's merge) and some group needs it.
+  Analysis is always automatic: there is no toggle, and a stored
+  `auto_analyze: false` is ignored. The panel list cancels running jobs before an edit and applies it once they have stopped;
   exports are spared and not waited for (they read the result without a
   writer lock and write stale tiles as they are);
   the pipeline waits while an edit is pending and re-runs a job that ended for
   stale inputs. User cancels are final: a cancelled or failed previews run is
   not retried, and an ended analysis is not restarted, until the inputs
-  change (or the user presses Resume / turns Auto-analyze back on). An
-  analysis still auto-starts after a cancelled previews run.
+  change (or the user presses Resume or **Analyse**). An analysis still
+  auto-starts after a cancelled previews run. An analysis the pipeline left to
+  the user (cancelled or failed, `Pipeline::analysis_stalled`) is the one case
+  where the Checks step offers **Analyse**.
 - **Checks engine** (`checks.rs`). Runs `panel_facts`, input and file checks,
   and analysis checks for every analysed, current group on a worker, on open,
-  when groups or panels change and after any pipeline job ends; the status
-  bar shows problems, notes and passed. Accepting a check adds its keys to
+  when groups or panels change and after any pipeline job ends; the Checks step and the
+  inspector's Problems section show problems, notes and passed. Accepting a check adds its keys to
   `accepted_checks` in `mosaic.json`; accepted problems stop counting.
-- **Panels tab.** Add files (picker, drag and drop, or a typed path with one
+- **Panel list** (`panels_tab.rs`, opened from the Panels step). Add files (picker, drag and drop, or a typed path with one
   `*` in the file name; duplicates ignored), per-panel cards, Remove, and
   grouping. Grouping is **off by default** (plain grid); turning it on shows
   the header-key rule and one column per group, with **No group** first and an
@@ -1099,32 +1101,28 @@ views and export. No algorithm changed. Core additions are bookkeeping
   filters get physical colours (Ha red, OIII cyan, SII orange-red `#E0703A`,
   R/G/B, L white), other names take the first unused entry after the six
   physical ones, cycling through those (never a physical colour).
-- **Plan tab (additions).** A View selector lists the groups and the
-  compositions (hidden when grouping is off); compositions are keyed
-  `comp:<name>` in `ui.plan_stretch`. Layers are additive. Clicking a panel
-  selects it: the side panel shows its path, **Show in folder**, Copy path,
-  header facts, overlapping panels and its checks (with Accept). Outline and
-  number toggles. When previews are incomplete and none are running, "Previews
-  paused" with **Resume** (`Pipeline::request_previews`). Textures are
-  released after Plan has been hidden 5 s. Overlap-handling is topmost-wins
-  in group views; compositions add overlapping previews of one group, so
-  overlap bands look brighter (accepted for a rough preview).
-- **Blend ROIs** are sky-anchored: a rectangle drawn with the viewer's draw
+- **Plan (additions).** The view bar lists the groups and the composites
+  (hidden when grouping is off). Layers are additive. Clicking a panel
+  selects it: the inspector shows its path, **Show in folder**, Copy path,
+  header facts, overlapping panels and its checks (with Accept). Outline
+  toggle. When previews are incomplete and none are running, "Previews
+  paused" with **Resume** (`Pipeline::request_previews`). Overlap-handling is
+  topmost-wins in group views; composites add overlapping previews of one
+  group, so overlap bands look brighter (accepted for a rough preview).
+- **ROIs** are sky-anchored: a rectangle drawn with the viewer's draw
   tool is stored as two opposite sky corners plus a canvas rect and is
   reprojected through the analysed frame after each analysis, so it follows
   the frame when the analysis of changed panels moves it (a rotated
   re-derive grows the box slightly; without a WCS the canvas rect is used as
-  stored). **Blend ROI** blends the selected ROI once per
-  group of the current view; **Blend whole mosaic** blends every group.
-  Composition views in Blend mix the member groups' tiles; a member not blended
-  yet adds nothing and is named above the image.
+  stored). Merging an ROI merges it once per group of the current view
+  (ROI merges stay out of the step strip); **Merge** merges every group.
 - **Export.** `mmm_core::export` writes a group's result for the whole canvas
   as linear 32-bit float, **unclamped**: FITS (WCS cards plus `HISTORY`
   provenance: mmm version and the group's latest blend settings) or TIFF
   (`ImageDescription` carries the same provenance). It reads the tile store
   tile row by tile row without a writer lock; stale tiles are exported as
   they are, missing tiles as zeros. `export_check` counts stale and missing
-  level-0 tiles first and both frontends warn (the app offers *Blend whole
+  level-0 tiles first and both frontends warn (the app offers *Merge whole
   mosaic first* or *Export anyway*). The app's Export is disabled while a
   blend of a chosen group is queued or running (the check maps the store the
   blend may recreate); it takes the groups, destinations and format when
@@ -1143,59 +1141,124 @@ views and export. No algorithm changed. Core additions are bookkeeping
   streaming TIFF writer, the Plan overlap-handling setting (group views are
   topmost-wins), the FITS flipped-WCS option in export, packaging and signing.
 
-## Standalone app: Blend settings panel (2026-11)
+## Standalone app: the session window (project 3, 2026-11)
 
-The Blend tab's right column starts with a collapsible **Blend settings**
-panel (`blend_settings.rs`, spec §5.4). It edits the mosaic-wide
-`AnalyzeSettings` / `BlendSettings` only, i.e. exactly the options the CLI
-keeps in a session, with the CLI's value domains:
+Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
+(§4–§7, §15). It replaces the Panels, Plan and Blend tabs, the session bar,
+the status bar and the Blend settings panel of phases 2 and 3 with one window
+(`crates/mmm-app/src/session_window/`). The UI says "merge" where the engine
+says blend; `mmm-core` keeps its identifiers, provenance actions and
+progress stage codes, but every engine message the app can show (check
+messages and remedies, job errors, the export check) says merge too (a
+test makes a check of every `CheckCode` and asserts none says blend). No
+algorithm changed. The UI copy is British English ("Analyse", "colour").
 
-- **Blend-local** (caption "BLEND · reblend only"): Mode
-  (Pyramid/TwoBand/Feather), Feather (px, finite and > 0: validated with
-  `BlendSettings::validate` as typed; a refused value shows the error and
-  disables Apply), Defect veto (On/Off), Flatten (Off/1/2).
-- **Global** (caption "ANALYSIS · reruns analysis, every tile goes stale"):
-  Input (Auto/Aligned/Solved), Surface (Off/0/1/2), Gain (Fit/Unity).
-  The spec's "photometry" is Gain; "star lock" and "seam transition" are
-  not mmm settings (the seam/star handling is part of the blend mode), so
-  the panel has no fields for them.
+- **Top bar.** ‹ (back to the start screen), the session name, the **step
+  strip** and the main button. The window title is "{name} — Mega Merge
+  Mosaic". There is no status bar and no session bar. It is one row when
+  everything fits (measured each frame: the name, `step_strip_width`, and
+  what the main button leaves); otherwise the strip takes a row of its own
+  below (and wraps if even that is too narrow), and a name too long for what
+  is left is cut short with "…" (hover shows it whole). Nothing overlaps at
+  the app's 720 px minimum.
+- **Step strip** (`steps.rs`): Panels · Checks · Merge · Export. It is the
+  status, the progress and the navigation at once: each step shows its state
+  (what is done, what is running, what is next) and clicking one acts:
+  Panels opens or closes the panel list, Checks opens the Problems section,
+  Merge merges every group while that is to do (merging or merged, it shows
+  the mosaic), Export opens the Export dialog. Checks reads "Checks" until
+  there is something to say, "Analysing…" while analysis runs (cancellable),
+  "Checking…", "{n} problem(s)" or "Checks passed", and **Analyse** only when
+  the analysis stalled after a cancel or failure
+  (`Pipeline::analysis_stalled`; clicking it analyses, whichever step is
+  highlighted; once running, a click on "Analysing…" opens Problems and
+  never restarts it); otherwise analysis starts by itself. Merging reads "Merging
+  {group} · {i} of {n} · {pct} %", without "{i} of {n}" for a single merge and
+  without the group in a session of one group (an OSC mosaic: "Merging · 43
+  %"; its jobs and toasts are "Merge" and "Merge finished"). A step that
+  cannot act now says why in its tooltip (Merge: the merge guard's reason;
+  Export: `MosaicView::export_block_reason`). ROI merges are not shown in
+  the strip.
+- **Main button.** **Add panels…** with no panels, **Merge** (with a summary
+  of the merge settings, which opens Merge settings) while any group lacks a
+  complete result (`needs_merge`: none yet, partly merged or out of date),
+  **Export…** once every group's result is complete (disabled, with its
+  reason as a tooltip, while the Export dialog cannot open).
+  `Ctrl/Cmd+Enter` presses **Merge**.
+- **Canvas.** The plan (`plan_view.rs`) or the merged mosaic
+  (`mosaic_view.rs`) of the chosen group or composite, with one shared
+  camera: switching between them, or to another view, hands the shown
+  canvas's camera to both first, so nothing moves. Going to an ROI (a click
+  on it in the ROIs section) hands both canvases the camera that frames it
+  (`Camera::framing`), so it works on the plan and the mosaic alike and a
+  later switch moves nothing (`TiledViewer::set_camera` drops view commands
+  queued before it). A composite's members not merged yet are named over
+  the image's bottom-left corner, so the image keeps the plan's place. The
+  window opens on the mosaic once something is merged, else on the plan;
+  Mosaic cannot be chosen before something is merged or a merge has
+  started. `MosaicView::poll` runs
+  every frame whether or not the mosaic is drawn. The panel list (still the
+  old `PanelsTab` UI) replaces the canvas, view bar included, while open; a
+  session without panels opens on it, and files dropped on the window are
+  added whatever shows.
+- **View bar.** Plan / Mosaic, a chip per group and per composite and **+**
+  (with two or more groups), and the Outlines, ROIs, Linked and Strong
+  toggles. It wraps when the window is narrow.
+- **Inspector.** Foldable, at the right: Problems, Panels, ROIs, Merge
+  settings, Composites and Notes, in that order; only the sections' contents
+  fold (Merge settings has no fold of its own inside). The merge settings
+  are the
+  mosaic-wide `AnalyzeSettings` / `BlendSettings` with the CLI's value
+  domains, edited and applied as before (staged edits, applied once the
+  cancelled jobs have stopped; a global change marks every analysed group
+  `needs_analyze`).
+- **Display stretch** (`display_stretch.rs`). Always automatic, never set by
+  hand, one rule for the plan and the mosaic: an automatic stretch per
+  channel, with **Linked** (one stretch for all channels) and **Strong** (a
+  harder stretch) toggles saved under `ui.display_stretch`. The old
+  `plan_stretch` / `blend_stretch` are ignored by the session window.
+- **View state** (`view_state.rs`). Plan or mosaic, the view, the camera, the
+  inspector's fold and open sections, the panel list and the Outlines and ROIs
+  toggles are saved in `ui.session_view` and restored on reopen: the mosaic
+  only if it can show, else the plan; a view the session no longer has falls
+  back to the first group (its camera is dropped); the camera reaches both
+  canvases before either draws, so no fit is painted first. Saves are made in
+  memory at once and written to `mosaic.json` at most once per
+  `SAVE_INTERVAL` on the UI thread (the documented exception), and at once by
+  the shared `Shell::flush_pending_saves` (closing, eframe's periodic save,
+  back to the start screen).
+- **Shortcuts.** `I` inspector, `M` plan/mosaic, `[` and `]` previous and next
+  view, `O` outlines, `R` ROIs, `L` Linked, `S` Strong, `Ctrl/Cmd+Enter` the
+  main button; each is named in its tooltip, and none acts while a text field
+  has the keyboard (`Context::text_edit_focused`; a button or chip focused
+  by keyboard navigation does not stop them) or the Export dialog is open.
+- **Back to start** (`Shell::close_session`). Cancels the running jobs and
+  waits up to 3 s (`STOP_WAIT`) for them to stop, which can block the UI for
+  that long, then flushes the pending saves (an edit waiting for the jobs
+  applies only if they stopped). Disabled while an export runs.
+  If a worker outlives the wait, the session is released from the UI's point
+  of view at once, but a reaper thread (`mmm-session-reaper`) keeps the
+  session lock until the abandoned workers have ended, so another window or
+  the CLI never opens a session that is still being written.
+- **Toasts** (`mega_ui::widgets::Toasts`) replace the notices: a merge or an
+  export that ended, a failure. Never modal.
 
-Edits are **staged**: nothing changes until **Apply**; **Revert** discards
-the draft (and an edit still waiting to apply). While a draft differs, the
-panel states its cost: "Existing results go stale; reblend to see the
-change (N of M tiles)" or "Analysis reruns and every result goes stale
-(N of M tiles)" ("Analysis will need to rerun…" with Auto-analyze off),
-N being the valid level-0 tiles of the existing group results and M their
-total — the stores `set_settings` invalidates
-(`mosaic::result_store_paths`, listed on the worker). The counts are read
-on a worker with `TileReader`s, started only while no job but an export
-runs; while a count runs no blend may start, so no store is recreated
-under its mapping (`JobRunner::start_blend` documents that callers own
-this gate).
+## Coming in project 3
 
-**Apply** follows the Panels tab's pending-edit pattern, cancelling only
-the jobs in the way: every blend for a blend-local change (`set_settings`
-needs only the stores' writer locks; a running analysis continues), every
-job but exports for a global one. The shell polls the panel every frame
-and applies through `set_settings` once those have stopped (busy store:
-retried every 500 ms). While an edit waits, Blend is disabled. A global
-edit counts as an edit for the pipeline (`SettingsPanel::editing`: it
-starts nothing and re-runs what the cancel interrupted) from the cancel
-until every cancelled job has been reported — also when the edit is
-reverted meanwhile, so the cancels are never taken for the user's and the
-automatic work restarts. A blend-local apply stales every result (shown dimmed
-and hatched) and the user reblends an ROI or the whole mosaic; a global
-apply also marks every analysed group `needs_analyze`, so the automatic
-pipeline analyses again (Blend is refused until it has).
+Plans 2–6 of project 3 change the session window as follows; none of it is
+built yet.
 
-Fields whose shown value differs from the settings the **last blend** used
-carry an accent dot. The baseline comes from provenance: the newest
-`"blend"` entry of a group without overrides (its recorded settings), and
-for the analysis fields the newest `"analyze"` entry before it. Nothing is
-marked before the first blend; the dot clears once a blend (ROI or whole)
-runs with the current settings. Per-group overrides (set with `mmm set
---group`) are respected but not edited; the panel notes each group that
-has them ("Ha has its own overrides (CLI)").
+- **Plan 2, panel list and grouping.** The panel list sits beside the plan
+  instead of replacing the canvas, with sections, **Group by** and WBPP
+  keywords.
+- **Plan 3, draft merge settings.** Settings become drafts, with per-group
+  staleness (which groups are out of date, not just the mosaic).
+- **Plan 4, ROIs.** An ROI list with transient previews, drawing an ROI on the
+  plan, and the Draw ROI shortcut.
+- **Plan 5, composites and export.** A composites popover and the new Export
+  dialog.
+- **Plan 6, checks and overlays.** New checks and badges, click-to-zoom from
+  a problem, and a seams overlay.
 
 ## Mega UI standard (2026-11)
 
@@ -1221,7 +1284,10 @@ stays free of `mmm-core`.
   their first frame; hosts and test harnesses that can't use
   `theme::ensure_applied` and skip drawing for one frame.
 - **Components** (`mega_ui::widgets`): `MegaButton` (primary, secondary,
-  quiet, danger, ghost; large; icon buttons), `chip`, `status`, `overline`,
+  quiet, danger, ghost; large; icon buttons), `step_strip` (pills with
+  state, progress, Cancel and an optional tooltip; `step_strip_width`
+  measures one row, and the strip wraps when it does not fit), `chip`,
+  `status`, `overline`,
   `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
   `Toasts` (the only notifications; never modal), plus the restyled
   `checks::checks_list` and `jobs::job_panel`, `groups` (the group palette,

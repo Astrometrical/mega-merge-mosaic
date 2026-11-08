@@ -104,6 +104,7 @@ pub struct MegaButton {
     trailing: Option<char>,
     large: bool,
     square: bool,
+    hover: Option<String>,
 }
 
 impl MegaButton {
@@ -116,7 +117,16 @@ impl MegaButton {
             trailing: None,
             large: false,
             square: false,
+            hover: None,
         }
+    }
+
+    /// Show `text` on hover; an icon button shows it in place of its
+    /// tooltip (e.g. to name a keyboard shortcut too). The accessible label
+    /// stays the button's text.
+    pub fn hover_text(mut self, text: impl Into<String>) -> Self {
+        self.hover = Some(text.into());
+        self
     }
 
     /// Large size: 38 points high with 14 pt semibold text. At most one per
@@ -219,10 +229,10 @@ impl Widget for MegaButton {
         focus_ring(ui, &response, radius::CONTROL);
         let text = self.text;
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, &text));
-        if self.square {
-            response.on_hover_text(text)
-        } else {
-            response
+        match self.hover {
+            Some(hover) => response.on_hover_text(hover),
+            None if self.square => response.on_hover_text(text),
+            None => response,
         }
     }
 }

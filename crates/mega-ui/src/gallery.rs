@@ -15,6 +15,7 @@ use crate::checks::{CheckItem, checks_list};
 use crate::groups::GROUP_PALETTE;
 use crate::hero::{HeroStage, HeroView};
 use crate::icons;
+use crate::inspector::{Badge, InspectorState, Section, inspector, inspector_width};
 use crate::starfield::Starfield;
 use crate::theme::palette::*;
 use crate::theme::text::{Type, text};
@@ -22,9 +23,10 @@ use crate::theme::tokens::{radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, MegaButton, NotesMode, SessionCardData, Toast, Toasts, chip, icon_button,
-    notes_view, overline, progress, property_grid, property_row, property_row_numeric,
-    property_row_ui, segmented, session_card, status, text_input,
+    ButtonKind, ChoiceChip, MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast,
+    Toasts, chip, choice_chip, icon_button, notes_view, overline, progress, property_grid,
+    property_row, property_row_numeric, property_row_ui, segmented, session_card, status,
+    step_strip, text_input,
 };
 
 /// The gallery's interactive state.
@@ -33,6 +35,7 @@ pub struct GalleryState {
     name: String,
     notes: String,
     notes_mode: NotesMode,
+    inspector: InspectorState,
     checks: Vec<CheckItem>,
     toasts: Toasts,
     brand: Option<BrandImages>,
@@ -75,6 +78,11 @@ impl Default for GalleryState {
 Panel 7: gradient in the lower left, redo DBE."
                 .into(),
             notes_mode: NotesMode::default(),
+            inspector: {
+                let mut s = InspectorState::default();
+                s.toggle("problems");
+                s
+            },
             checks,
             toasts: Toasts::default(),
             brand: None,
@@ -317,6 +325,81 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                 chip(ui, "L", None);
                 chip(ui, "OSC", None);
                 chip(ui, "Ha_3nm_2026-10-12_flat-corrected_master_light", None);
+            });
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                for (label, color, selected, dashed) in [
+                    ("Hα", Some(GROUP_PALETTE[0]), true, false),
+                    ("OIII", Some(GROUP_PALETTE[2]), false, false),
+                    ("Composite", None, false, true),
+                    ("Composite", None, true, true),
+                ] {
+                    choice_chip(
+                        ui,
+                        &ChoiceChip {
+                            label,
+                            color,
+                            selected,
+                            dashed,
+                        },
+                    );
+                }
+            });
+        });
+
+        section(ui, "Step strip", |ui| {
+            let step = |label: &str, state| StripStep {
+                label: label.to_owned(),
+                state,
+                cancellable: false,
+                tooltip: None,
+            };
+            step_strip(
+                ui,
+                &[
+                    step("Todo", StepState::Todo),
+                    step("Next", StepState::Next),
+                    step("Done", StepState::Done),
+                    step("Warn", StepState::Warn),
+                    StripStep {
+                        cancellable: true,
+                        ..step(
+                            "Merging",
+                            StepState::Working {
+                                fraction: Some(0.43),
+                            },
+                        )
+                    },
+                ],
+            );
+        });
+
+        section(ui, "Inspector", |ui| {
+            let sections = [
+                Section {
+                    id: "display",
+                    title: "Display",
+                    badge: None,
+                },
+                Section {
+                    id: "problems",
+                    title: "Problems",
+                    badge: Some(Badge {
+                        text: "2".to_owned(),
+                        tone: Tone::Warning,
+                    }),
+                },
+                Section {
+                    id: "notes",
+                    title: "Notes",
+                    badge: None,
+                },
+            ];
+            let width = inspector_width(&state.inspector);
+            ui.allocate_ui(Vec2::new(width, 240.0), |ui| {
+                inspector(ui, &mut state.inspector, &sections, |ui, id| {
+                    ui.label(format!("{id} body"));
+                });
             });
         });
 

@@ -342,6 +342,9 @@ fn export_reports_stale_and_missing() {
         height: CANVAS.1,
     };
     assert_eq!(export_check(&result).unwrap(), want);
+    let warning = want.warning().expect("a warning");
+    assert!(warning.contains("not fully merged"), "{warning}");
+    assert!(!warning.to_lowercase().contains("blend"), "{warning}");
 
     let out = tmp.0.join("partial.fits");
     let report = export_group(
@@ -424,7 +427,17 @@ fn export_of_unblended_group_says_so() {
     )
     .unwrap_err()
     .to_string();
-    assert!(err.contains("not been blended"), "{err}");
+    assert!(err.contains("not been merged"), "{err}");
+    assert!(!err.to_lowercase().contains("blend"), "{err}");
+    // (The message names the store, whose folder this test calls
+    // "unblended".)
+    let store = m.result_path(SINGLE_GROUP);
+    let err = export_check(&store)
+        .unwrap_err()
+        .to_string()
+        .replace(&store.display().to_string(), "the store");
+    assert!(err.contains("not been merged"), "{err}");
+    assert!(!err.to_lowercase().contains("blend"), "{err}");
     let err = export_group(&m.dir, "nope", &out, ExportFormat::Fits, &JobCtl::none())
         .unwrap_err()
         .to_string();

@@ -1087,6 +1087,27 @@ fn view_mut_moves_the_camera() {
 }
 
 #[test]
+fn set_camera_drops_queued_view_commands() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = harness(TiledViewer::new_synchronous(src));
+    h.run();
+    // A zoom queued for the next frame, then a camera set from outside:
+    // the camera wins, and nothing animates away from it.
+    let v = h.state_mut();
+    v.zoom_to_rect([1000.0, 1000.0, 3000.0, 2000.0]);
+    v.zoom_in();
+    v.home();
+    v.set_camera(SCREEN, (12_000.0, 4_000.0), 0.5);
+    h.run();
+    let (c, z) = centre_zoom(h.state());
+    assert!(
+        (c.0 - 12_000.0).abs() < 1e-6 && (c.1 - 4_000.0).abs() < 1e-6,
+        "{c:?}"
+    );
+    assert!((z - 0.5).abs() < 1e-9, "{z}");
+}
+
+#[test]
 fn opacity_scales_tile_tint() {
     let src = TestSource::new(5000, 5000);
     let mut viewer = TiledViewer::new_synchronous(src);

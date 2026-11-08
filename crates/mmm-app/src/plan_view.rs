@@ -1,32 +1,40 @@
-//! The Plan tab (spec §5.3): every panel in place in the shared frame, drawn
-//! from its low-resolution preview as each one arrives, with outlines,
-//! numbers, selection, the panel's properties and its checks.
+//! The plan canvas (spec §5.3): every panel in place in the shared frame,
+//! drawn from its low-resolution preview as each one arrives, with outlines,
+//! numbers and selection. Only the canvas: the window around it picks the
+//! view ([`PlanView::select_view`]) and the look ([`CanvasLook`]), and shows
+//! the selected panel's details where it likes
+//! ([`PlanView::selection_ui`]).
 //!
 //! - **Views.** Each group, then each composition (a colour mix of groups,
-//!   [`crate::compositions`]). With grouping off there is one view and no
-//!   selector.
-//! - **Off the UI thread.** Previews become RGBA8 images through the Plan
-//!   display stretch on a small worker pool ([`Converter`]); the UI thread
-//!   only uploads finished images, at most [`MAX_UPLOADS_PER_FRAME`] a
-//!   frame. The automatic display stretch (statistics of the view's
-//!   previews), the frame and analysis layout ([`load_layout`]) and the
-//!   selected panel's header ([`read_info`]) are each read on a worker too.
+//!   [`crate::compositions`]). With grouping off there is one view.
+//! - **Off the UI thread.** Previews become RGBA8 images through the display
+//!   stretch on a small worker pool ([`Converter`]); the UI thread only
+//!   uploads finished images, at most [`MAX_UPLOADS_PER_FRAME`] a frame.
+//!   The automatic display stretch (statistics of the view's previews), the
+//!   frame and analysis layout ([`load_layout`]) and the selected panel's
+//!   header ([`read_info`]) are each read on a worker too.
 //! - **Placement.** A panel is drawn at its preview's rect. Until its
 //!   preview arrives it is drawn as a dashed outline where the last
 //!   analysis placed it or, failing that, at its header-only WCS footprint
 //!   in a solved frame ([`load_footprints`], once per previews generation
 //!   and frame). The canvas extent is the shared frame's canvas, which does
 //!   not move as previews arrive (so the user's zoom is kept).
-//! - **Memory.** The textures are dropped once the tab has been hidden for
-//!   [`RELEASE_AFTER`] ([`PlanTab::release_if_hidden`]) and rebuilt from the
-//!   in-memory previews when it is shown again.
-//! - **Stretch.** One display stretch per view, independent of Blend's:
-//!   automatic (recomputed as previews arrive and once they are all in)
-//!   until the user sets one, which is saved in `MosaicConfig.ui` under
-//!   [`PLAN_STRETCH_KEY`] by group name, or by
-//!   [`composition_stretch_key`] for a composition. The save is a small
-//!   `mosaic.json` write on the UI thread, rate-limited as in Blend (the
-//!   documented exception).
+//! - **Camera.** [`PlanView::set_camera`] moves the canvas without
+//!   animation, from the next frame drawn. The canvas fits its extent on its
+//!   first frame and whenever the extent changes; the camera is shown in
+//!   place of those fits ([`PlanCanvas::set_view_for`]), so they are never
+//!   painted. Set before the frame's canvas is known (the extent is then the
+//!   drawn panels'), it is kept for each new extent until the canvas draws
+//!   the frame's.
+//! - **Memory.** The textures are dropped once the view has been hidden for
+//!   [`RELEASE_AFTER`] ([`PlanView::release_if_hidden`]) and rebuilt from
+//!   the in-memory previews when it is shown again.
+//! - **Stretch.** Always automatic: [`DisplayStretch::params`] of the view's
+//!   preview statistics, with the look's Linked and Strong
+//!   ([`CanvasLook::stretch`]). It is recomputed as previews arrive, once
+//!   they are all in, and when the view or the look changes. The manual
+//!   stretch earlier versions saved per view (`plan_stretch` in
+//!   `MosaicConfig.ui`) is ignored.
 //! - **Compositions** add their channels' layers: each mapped group's
 //!   previews are drawn as additive layers tinted red, green or blue times
 //!   the channel's weight. Overlapping previews of one group add up too
@@ -40,38 +48,32 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{Color32, ColorImage, RichText};
-use mega_ui::checks::{CheckAction, CheckItem, checks_list};
 use mega_ui::plan::{Layer, PlacedItem, PlanCanvas};
-use mega_ui::theme::{Severity as UiSeverity, palette};
-use mmm_core::checks::{Check, Severity, SolutionKind, is_accepted, panel_facts};
+use mega_ui::theme::palette;
+use mega_ui::theme::tokens::space;
+use mmm_core::checks::{Severity, SolutionKind, is_accepted, panel_facts};
 use mmm_core::formats::InputPanel;
 use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::preview::{Preview, footprint, preview_frame_path};
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
-use mmm_core::stretch::{ChannelStats, StretchParams, apply, auto_stretch, channel_stats};
+use mmm_core::stretch::{ChannelStats, StretchParams, apply, channel_stats};
 
-use crate::blend_tab::{Debounce, Poll, Task, group_names};
+use crate::camera::Camera;
 use crate::checks::ChecksReport;
-use crate::compositions::{
-    Composition, ViewKind, composition_editor, composition_stretch_key, load_compositions,
-    save_compositions, unique_composition_name,
-};
+use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
+use crate::display_stretch::DisplayStretch;
 use crate::panels_tab::{group_colors, load_group_colors};
 use crate::session::OpenSession;
 use crate::status::format_canvas;
-use crate::stretch_panel::{
-    PLAN_STRETCH_KEY, StretchChange, StretchState, save_stretch_at, saved_stretch_at, stretch_panel,
-};
+use crate::util::{Poll, Task, group_names};
 
 /// Most preview textures uploaded in one frame (as the tiled viewer).
 pub const MAX_UPLOADS_PER_FRAME: usize = 32;
 /// Most samples the automatic stretch statistics read per channel.
 const STATS_MAX_SAMPLES: usize = 1 << 20;
-/// Width of the side panel.
-const SIDE_WIDTH: f32 = 300.0;
-/// The Plan textures are dropped once the tab has been hidden this long.
+/// The plan textures are dropped once the view has been hidden this long.
 pub const RELEASE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 /// Most preview converter threads.
 const MAX_CONVERTERS: usize = 4;
@@ -82,7 +84,7 @@ const CHANNEL_COLORS: [Color32; 3] = [
     Color32::from_rgb(0, 0, 255),
 ];
 
-/// What the Plan tab reads from the shell's pipeline and checks each frame.
+/// What the plan reads from the shell's pipeline and checks each frame.
 pub struct PlanFeed<'a> {
     /// The previews received for the current inputs, by panel path.
     pub previews: &'a BTreeMap<PathBuf, Arc<Preview>>,
@@ -90,19 +92,33 @@ pub struct PlanFeed<'a> {
     pub generation: u64,
     /// Every preview of the current inputs has been run.
     pub complete: bool,
-    /// Previews are running or about to start (no Resume is offered).
-    pub previews_busy: bool,
     /// The last checks report, if any.
     pub checks: Option<&'a ChecksReport>,
 }
 
-/// What the user asked of the shell in a frame.
-#[derive(Debug, Default)]
-pub struct PlanOutput {
-    /// Run the (paused) previews again.
-    pub resume_previews: bool,
-    /// Accept these checks.
-    pub accept: Vec<Check>,
+/// How the window around a canvas wants it drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanvasLook {
+    /// Panel outlines.
+    pub outlines: bool,
+    /// Panel numbers.
+    pub numbers: bool,
+    /// The regions of interest (the merged mosaic draws them; the plan
+    /// does not yet).
+    pub rois: bool,
+    /// The automatic display stretch's toggles.
+    pub stretch: DisplayStretch,
+}
+
+impl Default for CanvasLook {
+    fn default() -> Self {
+        CanvasLook {
+            outlines: true,
+            numbers: true,
+            rois: true,
+            stretch: DisplayStretch::default(),
+        }
+    }
 }
 
 /// How a preview becomes an image.
@@ -288,11 +304,11 @@ fn sample_planes(previews: &[Arc<Preview>], mode: Mode, channels: usize) -> (Vec
 /// stretch entry group, its previews and how they are shown — one Native
 /// set for a group view, three Mono sets (R, G, B) for a composition. An
 /// entry with no previews (an empty composition channel) gets the stretch
-/// of zero statistics and, when `linked`, takes no part in the shared
-/// stretch, which every entry then gets.
+/// of zero statistics and, when `stretch` is linked, takes no part in the
+/// shared stretch, which every entry then gets.
 fn view_auto_stretch(
     sets: Vec<(Vec<Arc<Preview>>, Mode)>,
-    linked: bool,
+    stretch: DisplayStretch,
 ) -> Option<Vec<StretchParams>> {
     let zero = ChannelStats {
         median: 0.0,
@@ -316,12 +332,12 @@ fn view_auto_stretch(
         return None;
     }
     let present: Vec<ChannelStats> = stats.iter().flatten().copied().collect();
-    if linked && !present.is_empty() {
-        let shared = auto_stretch(&present, true)[0];
+    if stretch.linked && !present.is_empty() {
+        let shared = stretch.params(&present)[0];
         return Some(vec![shared; stats.len()]);
     }
     let all: Vec<ChannelStats> = stats.iter().map(|s| s.unwrap_or(zero)).collect();
-    Some(auto_stretch(&all, linked))
+    Some(stretch.params(&all))
 }
 
 /// The shared frame's canvas and what the last analyses say about the
@@ -400,7 +416,7 @@ pub fn load_footprints(frame: &ReferenceFrame, panels: &[PathBuf]) -> BTreeMap<P
         .collect()
 }
 
-/// Header facts of a panel for the side panel.
+/// Header facts of a panel for its details.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelInfo {
     /// Width in pixels.
@@ -495,7 +511,7 @@ struct AutoKey {
     /// Preview count, rounded up to a power of two (recomputed as they
     /// arrive, a few times).
     bucket: usize,
-    linked: bool,
+    stretch: DisplayStretch,
     mapping: Vec<Option<String>>,
 }
 
@@ -537,41 +553,56 @@ pub fn group_members(session: &OpenSession, names: &[String]) -> BTreeMap<String
     }
 }
 
+/// Whether `path` is one of the session's panels.
+fn is_panel(session: &OpenSession, path: &Path) -> bool {
+    session.mosaic.config.panels.iter().any(|p| p.path == path)
+}
+
 /// The view resolved for a frame.
 struct ViewSpec {
-    /// Stretch and texture identity (group name, or `comp:<name>`).
+    /// Texture identity and summary key (group name, or `comp:<name>`).
     key: String,
     /// The groups drawn, in order.
     groups: Vec<DrawnGroup>,
-    /// Channels of the stretch.
-    channels: usize,
     /// Per composition slot, its group (empty for a group view).
     mapping: Vec<Option<String>>,
 }
 
-/// The Plan tab's state for the open session.
-pub struct PlanTab {
+/// A camera set from outside, kept for each extent the canvas draws until
+/// it draws the frame's (see the module docs).
+#[derive(Clone, Copy, Debug)]
+struct HeldCamera {
+    camera: Camera,
+    /// The extent it was last handed to the canvas for.
+    extent: Option<[f64; 4]>,
+    /// The canvas has drawn a frame through it since it was handed over.
+    drawn: bool,
+}
+
+/// The plan canvas of the open session: what it draws, and the work behind
+/// it (see the module docs).
+pub struct PlanView {
     view: Option<ViewKind>,
     canvas: PlanCanvas,
-    show_outlines: bool,
-    show_numbers: bool,
     selected: Option<PathBuf>,
-    show_all_checks: bool,
+    held_camera: Option<HeldCamera>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
     textures: HashMap<TexKey, egui::TextureHandle>,
     /// Sent to the converter in the current epoch.
     requested: HashSet<TexKey>,
+    /// Conversions of the current epoch uploaded.
+    uploaded: usize,
     converter: Option<Converter>,
     uploads: VecDeque<(TexKey, ColorImage)>,
+    /// Each texture's image as uploaded (tests read its texels).
+    #[cfg(test)]
+    uploaded_images: HashMap<TexKey, ColorImage>,
     epoch: u64,
     /// The view's display stretch, once known.
     stretch: Option<Vec<StretchParams>>,
-    manual: bool,
-    linked: bool,
     auto: Option<Task<(AutoKey, Option<Vec<StretchParams>>)>>,
     auto_for: Option<AutoKey>,
-    save: Debounce,
     layout: Layout,
     layout_task: Option<Task<Layout>>,
     layout_for: Option<LayoutKey>,
@@ -582,7 +613,7 @@ pub struct PlanTab {
     footprints_for: Option<(u64, ReferenceFrame)>,
     /// The previews generation the header facts belong to.
     info_generation: u64,
-    /// When the tab was last drawn (textures are dropped once hidden).
+    /// When the view was last drawn (textures are dropped once hidden).
     last_shown: Option<Instant>,
     info: BTreeMap<PathBuf, Result<PanelInfo, String>>,
     info_task: Option<Task<(PathBuf, Result<PanelInfo, String>)>>,
@@ -594,34 +625,32 @@ pub struct PlanTab {
     settled: bool,
 }
 
-impl Default for PlanTab {
+impl Default for PlanView {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl PlanTab {
-    /// A tab showing the first group once drawn.
+impl PlanView {
+    /// A view showing the first group once drawn.
     pub fn new() -> Self {
-        PlanTab {
+        PlanView {
             view: None,
             canvas: PlanCanvas::new(),
-            show_outlines: true,
-            show_numbers: true,
             selected: None,
-            show_all_checks: false,
+            held_camera: None,
             textures_for: None,
             textures: HashMap::new(),
             requested: HashSet::new(),
+            uploaded: 0,
             converter: None,
             uploads: VecDeque::new(),
+            #[cfg(test)]
+            uploaded_images: HashMap::new(),
             epoch: 0,
             stretch: None,
-            manual: false,
-            linked: false,
             auto: None,
             auto_for: None,
-            save: Debounce::default(),
             layout: Layout::default(),
             layout_task: None,
             layout_for: None,
@@ -640,7 +669,8 @@ impl PlanTab {
         }
     }
 
-    /// Show `view`.
+    /// Show `view` (one that no longer exists falls back to the first group
+    /// when drawn).
     pub fn select_view(&mut self, view: ViewKind) {
         self.view = Some(view);
     }
@@ -650,16 +680,42 @@ impl PlanTab {
         self.view.as_ref()
     }
 
-    /// Select the panel `path` (or none).
+    /// Where the canvas looks: a camera set and not drawn yet, else what the
+    /// last frame showed; `None` with neither.
+    pub fn camera(&self) -> Option<Camera> {
+        if let Some(held) = self.held_camera
+            && !held.drawn
+        {
+            return Some(held.camera);
+        }
+        let (_, now) = self.canvas.last_frame()?;
+        Some(Camera::of(self.canvas.view(), now))
+    }
+
+    /// Look through `camera` from the next frame on, with no animation (see
+    /// the module docs for how it survives the canvas fitting its extent).
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.held_camera = Some(HeldCamera {
+            camera,
+            extent: None,
+            drawn: false,
+        });
+    }
+
+    /// The selected panel.
+    pub fn selected(&self) -> Option<&Path> {
+        self.selected.as_deref()
+    }
+
+    /// Select the panel `path` (or none); the canvas selects by click.
     #[cfg(test)]
     pub fn select(&mut self, path: Option<PathBuf>) {
         self.selected = path;
     }
 
-    /// The selected panel.
-    #[cfg(test)]
-    pub fn selected(&self) -> Option<&Path> {
-        self.selected.as_deref()
+    /// The automatic display stretch in use, once known.
+    pub fn stretch_for_view(&self) -> Option<&[StretchParams]> {
+        self.stretch.as_deref()
     }
 
     /// What the last frame drew, item by item.
@@ -667,12 +723,20 @@ impl PlanTab {
         &self.last_items
     }
 
-    /// The display stretch of the view, once known.
-    pub fn stretch(&self) -> Option<&[StretchParams]> {
-        self.stretch.as_deref()
+    /// Panels of the view with no place to draw them yet (no preview, no
+    /// analysis and no footprint), last frame.
+    pub fn unplaced(&self) -> usize {
+        self.unplaced
     }
 
-    /// Drop the textures (and pending conversions) if the tab has not been
+    /// True once the last frame had every preview in (complete), each drawn
+    /// with all its layers through the current stretch, and no worker task,
+    /// conversion or upload pending.
+    pub fn is_settled(&self) -> bool {
+        self.settled
+    }
+
+    /// Drop the textures (and pending conversions) if the view has not been
     /// drawn for [`RELEASE_AFTER`]; they are rebuilt from the previews when
     /// it is shown again. Call every frame.
     pub fn release_if_hidden(&mut self, now: Instant) {
@@ -687,54 +751,42 @@ impl PlanTab {
         }
     }
 
+    /// The canvas's rect and time in the last frame drawn.
+    pub fn canvas_frame(&self) -> Option<(egui::Rect, f64)> {
+        self.canvas.last_frame()
+    }
+
     /// The shared frame's canvas, once read.
     pub fn frame_canvas(&self) -> Option<(u64, u64)> {
         self.layout.frame.as_ref().map(ReferenceFrame::canvas)
     }
 
-    /// True once the last frame had every preview in (complete), each drawn
-    /// with all its layers, and no worker task or upload pending.
-    pub fn is_settled(&self) -> bool {
-        self.settled
-    }
-
-    /// The shown view's stretch key (a group name, or a composition's key).
+    /// The shown view's key (a group name, or a composition's
+    /// [`composition_stretch_key`]).
     pub fn view_key(&self) -> Option<&str> {
         self.view_key.as_deref()
     }
 
-    /// Save a pending (rate-limited) display stretch or composition change
-    /// now (the window is closing). A small `mosaic.json` write.
-    pub fn flush_save(&mut self, session: &OpenSession) {
-        if !self.save.pending() {
-            return;
-        }
-        self.save.saved(Instant::now());
-        if let Err(e) = session.mosaic.save() {
-            tracing::warn!("Plan settings not saved: {e}");
-        }
-    }
-
-    /// Draw the tab.
-    pub fn ui(
+    /// Draw the canvas filling `ui`, and handle its input: a click selects
+    /// a panel, a click on no panel or Esc clears the selection.
+    pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        session: &mut OpenSession,
+        session: &OpenSession,
         feed: &PlanFeed<'_>,
-    ) -> PlanOutput {
+        look: &CanvasLook,
+    ) {
         let ctx = ui.ctx().clone();
-        let mut out = PlanOutput::default();
         self.last_shown = Some(Instant::now());
         if self.info_generation != feed.generation {
             // The panel files may have changed: read their headers again.
             self.info_generation = feed.generation;
             self.info.clear();
         }
-        let grouping = session.mosaic.config.grouping.enabled;
         let groups = group_names(session);
         // Group membership, once per frame.
         let members = group_members(session, &groups);
-        let compositions = if grouping {
+        let compositions = if session.mosaic.config.grouping.enabled {
             load_compositions(&session.mosaic.config.ui)
         } else {
             Vec::new()
@@ -747,38 +799,15 @@ impl PlanTab {
         if !valid {
             self.view = groups.first().cloned().map(ViewKind::Group);
         }
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|p| !is_panel(session, p))
+        {
+            self.selected = None;
+        }
         let spec = self.view_spec(session, &groups, &members, &compositions, feed);
-        self.update(&ctx, session, feed, spec.as_ref());
-
-        egui::Panel::top("plan-toolbar").show(ui, |ui| {
-            self.toolbar(
-                ui,
-                session,
-                &groups,
-                &compositions,
-                grouping,
-                feed,
-                &mut out,
-            );
-        });
-        egui::Panel::right("plan-side")
-            .resizable(false)
-            .exact_size(SIDE_WIDTH)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(ViewKind::Composition(i)) = self.view.clone()
-                        && let Some(c) = compositions.get(i)
-                    {
-                        self.composition_ui(ui, session, &groups, &compositions, i, c);
-                        ui.add_space(12.0);
-                    }
-                    self.stretch_ui(ui, session, spec.as_ref());
-                    ui.add_space(12.0);
-                    self.selection_ui(ui);
-                    ui.add_space(12.0);
-                    self.checks_ui(ui, session, feed, &mut out);
-                });
-            });
+        self.update(&ctx, session, feed, spec.as_ref(), look.stretch);
         let items = match &spec {
             Some(spec) => self.build_items(session, spec, feed),
             None => {
@@ -787,39 +816,19 @@ impl PlanTab {
                 Vec::new()
             }
         };
-        let extent = self.extent(session, &items);
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
-            .show(ui, |ui| match extent {
-                Some(extent) => {
-                    let r =
-                        self.canvas
-                            .show(ui, extent, &items, self.show_outlines, self.show_numbers);
-                    let path_of = |id: u64| {
-                        session
-                            .mosaic
-                            .config
-                            .panels
-                            .get(id as usize)
-                            .map(|p| p.path.clone())
-                    };
-                    if let Some(id) = r.clicked {
-                        self.selected = path_of(id);
-                    } else if r.clicked_empty {
-                        self.selected = None;
-                    }
-                }
-                None => {
-                    let text = if session.mosaic.config.panels.is_empty() {
-                        "Add panels in the Panels tab to plan a mosaic."
-                    } else {
-                        "Placing the panels…"
-                    };
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new(text).color(palette::TEXT_MUTED));
-                    });
-                }
-            });
+        match self.extent(session, &items) {
+            Some((extent, fixed)) => self.canvas_ui(ui, session, extent, fixed, &items, look),
+            None => {
+                let text = if session.mosaic.config.panels.is_empty() {
+                    "Add panels to plan a mosaic: use Add panels… or drop the files here."
+                } else {
+                    "Placing the panels…"
+                };
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new(text).color(palette::TEXT_MUTED));
+                });
+            }
+        }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.egui_wants_keyboard_input() {
             self.selected = None;
         }
@@ -829,9 +838,55 @@ impl PlanTab {
             && self.auto.is_none()
             && self.info_task.is_none()
             && self.uploads.is_empty()
+            && self.uploaded == self.requested.len()
             && self.missing_layers == 0;
-        self.save_if_due(&ctx, session);
-        out
+    }
+
+    /// The canvas over `extent` (`fixed`: the frame's, not the drawn
+    /// panels'), through a held camera.
+    fn canvas_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &OpenSession,
+        extent: [f64; 4],
+        fixed: bool,
+        items: &[PlacedItem],
+        look: &CanvasLook,
+    ) {
+        let now = ui.input(|i| i.time);
+        if let Some(held) = &mut self.held_camera
+            && held.extent != Some(extent)
+        {
+            let Camera { centre, zoom } = held.camera;
+            self.canvas.set_view_for(extent, centre, zoom);
+            held.extent = Some(extent);
+            held.drawn = false;
+        }
+        let r = self
+            .canvas
+            .show(ui, extent, items, look.outlines, look.numbers);
+        if self.canvas.last_frame().is_some_and(|(_, t)| t == now) {
+            if let Some(held) = &mut self.held_camera {
+                held.drawn = true;
+            }
+            if fixed {
+                // No fit of a later extent to keep it from.
+                self.held_camera = None;
+            }
+        }
+        let path_of = |id: u64| {
+            session
+                .mosaic
+                .config
+                .panels
+                .get(id as usize)
+                .map(|p| p.path.clone())
+        };
+        if let Some(id) = r.clicked {
+            self.selected = path_of(id);
+        } else if r.clicked_empty {
+            self.selected = None;
+        }
     }
 
     /// The view to draw this frame, if any.
@@ -866,7 +921,6 @@ impl PlanTab {
                         panels,
                         layers: vec![(None, tint)],
                     }],
-                    channels,
                     mapping: Vec::new(),
                 })
             }
@@ -888,7 +942,6 @@ impl PlanTab {
                 Some(ViewSpec {
                     key: composition_stretch_key(&c.name),
                     groups: drawn,
-                    channels: 3,
                     mapping: c
                         .channels
                         .iter()
@@ -907,6 +960,7 @@ impl PlanTab {
         session: &OpenSession,
         feed: &PlanFeed<'_>,
         spec: Option<&ViewSpec>,
+        stretch: DisplayStretch,
     ) {
         self.poll_tasks();
         self.start_layout(ctx, session, feed);
@@ -918,12 +972,7 @@ impl PlanTab {
         // A new view (or composition name) starts its stretch afresh.
         if self.view_key.as_deref() != Some(&spec.key) {
             self.view_key = Some(spec.key.clone());
-            let saved = saved_stretch_at(&session.mosaic.config.ui, PLAN_STRETCH_KEY, &spec.key);
-            self.manual = saved.is_some();
-            self.linked = saved
-                .as_ref()
-                .is_some_and(|s| s.len() > 1 && s.iter().all(|p| *p == s[0]));
-            self.stretch = saved;
+            self.stretch = None;
             self.auto = None;
             self.auto_for = None;
             self.new_epoch();
@@ -933,10 +982,9 @@ impl PlanTab {
         if self.textures_for.as_ref() != Some(&tex_for) {
             self.textures_for = Some(tex_for);
             self.textures.clear();
-            self.uploads.clear();
             self.new_epoch();
         }
-        self.start_auto(ctx, feed, spec);
+        self.start_auto(ctx, feed, spec, stretch);
         self.start_conversions(ctx, feed, spec);
         self.take_conversions(ctx);
     }
@@ -983,7 +1031,6 @@ impl PlanTab {
             };
             self.auto = None;
             if let Some((key, Some(stretch))) = done
-                && !self.manual
                 && self.auto_for.as_ref() == Some(&key)
                 && self.stretch.as_ref() != Some(&stretch)
             {
@@ -1014,8 +1061,8 @@ impl PlanTab {
             return;
         }
         self.layout_for = Some(key);
-        // Plan shows the panels where the previews put them: the previews'
-        // frame, not the analysed one.
+        // The plan shows the panels where the previews put them: the
+        // previews' frame, not the analysed one.
         let previews = preview_frame_path(&session.mosaic.dir);
         let analysed_frame = session.mosaic.dir.join(FRAME_FILE);
         self.layout_task = Task::spawn("mmm-plan-layout", ctx, move || {
@@ -1057,9 +1104,15 @@ impl PlanTab {
     }
 
     /// Compute the automatic stretch when the view's previews have changed
-    /// enough (unless the user set one).
-    fn start_auto(&mut self, ctx: &egui::Context, feed: &PlanFeed<'_>, spec: &ViewSpec) {
-        if self.manual || self.auto.is_some() {
+    /// enough, or the look's stretch has.
+    fn start_auto(
+        &mut self,
+        ctx: &egui::Context,
+        feed: &PlanFeed<'_>,
+        spec: &ViewSpec,
+        stretch: DisplayStretch,
+    ) {
+        if self.auto.is_some() {
             return;
         }
         let of = |g: &str| -> Vec<Arc<Preview>> {
@@ -1094,16 +1147,15 @@ impl PlanTab {
             generation: feed.generation,
             complete: feed.complete,
             bucket: count.next_power_of_two(),
-            linked: self.linked,
+            stretch,
             mapping: spec.mapping.clone(),
         };
         if self.auto_for.as_ref() == Some(&key) {
             return;
         }
         self.auto_for = Some(key.clone());
-        let linked = self.linked;
         self.auto = Task::spawn("mmm-plan-auto-stretch", ctx, move || {
-            (key, view_auto_stretch(sets, linked))
+            (key, view_auto_stretch(sets, stretch))
         });
     }
 
@@ -1166,8 +1218,11 @@ impl PlanTab {
                 break;
             };
             let name = format!("plan:{}:{:?}", key.path.display(), key.slot);
+            #[cfg(test)]
+            self.uploaded_images.insert(key.clone(), image.clone());
             let tex = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
             self.textures.insert(key, tex);
+            self.uploaded += 1;
         }
         if !self.uploads.is_empty() {
             ctx.request_repaint();
@@ -1180,6 +1235,7 @@ impl PlanTab {
         self.epoch += 1;
         self.requested.clear();
         self.uploads.clear();
+        self.uploaded = 0;
         if let Some(conv) = &self.converter {
             conv.epoch.store(self.epoch, Ordering::Relaxed);
         }
@@ -1283,213 +1339,33 @@ impl PlanTab {
         items
     }
 
-    /// The canvas extent: the shared frame (stable as previews arrive), or
-    /// the union of the drawn rects before the frame is known.
-    fn extent(&self, session: &OpenSession, items: &[PlacedItem]) -> Option<[f64; 4]> {
+    /// The canvas extent and whether it is the shared frame's (stable as
+    /// previews arrive), else the union of the drawn rects before the frame
+    /// is known.
+    fn extent(&self, session: &OpenSession, items: &[PlacedItem]) -> Option<([f64; 4], bool)> {
         if let Some((w, h)) = self.frame_canvas().or(session.canvas()) {
-            return Some([0.0, 0.0, w as f64, h as f64]);
+            return Some(([0.0, 0.0, w as f64, h as f64], true));
         }
-        items.iter().map(|it| it.rect).reduce(|a, b| {
-            [
-                a[0].min(b[0]),
-                a[1].min(b[1]),
-                a[2].max(b[2]),
-                a[3].max(b[3]),
-            ]
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn toolbar(
-        &mut self,
-        ui: &mut egui::Ui,
-        session: &mut OpenSession,
-        groups: &[String],
-        compositions: &[Composition],
-        grouping: bool,
-        feed: &PlanFeed<'_>,
-        out: &mut PlanOutput,
-    ) {
-        ui.horizontal(|ui| {
-            if grouping {
-                let shown = match &self.view {
-                    Some(ViewKind::Group(g)) => g.clone(),
-                    Some(ViewKind::Composition(i)) => compositions
-                        .get(*i)
-                        .map(|c| c.name.clone())
-                        .unwrap_or_default(),
-                    None => String::new(),
-                };
-                let mut chosen = self.view.clone();
-                let mut add = false;
-                egui::ComboBox::from_label("View")
-                    .selected_text(shown)
-                    .show_ui(ui, |ui| {
-                        for g in groups {
-                            let v = Some(ViewKind::Group(g.clone()));
-                            ui.selectable_value(&mut chosen, v, g);
-                        }
-                        if !compositions.is_empty() {
-                            ui.separator();
-                        }
-                        for (i, c) in compositions.iter().enumerate() {
-                            let v = Some(ViewKind::Composition(i));
-                            ui.selectable_value(&mut chosen, v, &c.name);
-                        }
-                        ui.separator();
-                        add = ui.selectable_label(false, "+ composition").clicked();
-                    });
-                if add {
-                    let i = add_composition(session, groups, compositions);
-                    self.save.touch();
-                    chosen = Some(ViewKind::Composition(i));
-                }
-                if chosen != self.view {
-                    self.view = chosen;
-                }
-                ui.separator();
-            }
-            ui.checkbox(&mut self.show_outlines, "Outlines")
-                .on_hover_text("Panel outlines");
-            ui.checkbox(&mut self.show_numbers, "Numbers")
-                .on_hover_text("Panel numbers");
-            ui.separator();
-            let total = session.mosaic.config.panels.len();
-            if total > 0 && !feed.complete {
-                if feed.previews_busy {
-                    ui.spinner();
-                    ui.label(
-                        RichText::new(format!("Previews {} of {total}", feed.previews.len()))
-                            .color(palette::TEXT_BODY),
-                    );
-                } else {
-                    ui.label(RichText::new("Previews paused —").color(palette::TEXT_BODY));
-                    if ui
-                        .button("Resume")
-                        .on_hover_text("Build the remaining panel previews")
-                        .clicked()
-                    {
-                        out.resume_previews = true;
-                    }
-                }
-            }
-            if self.unplaced > 0 {
-                ui.label(
-                    RichText::new(format!("{} not placed yet", self.unplaced))
-                        .color(palette::TEXT_MUTED),
-                );
-            }
-        });
-    }
-
-    fn composition_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        session: &mut OpenSession,
-        groups: &[String],
-        compositions: &[Composition],
-        index: usize,
-        c: &Composition,
-    ) {
-        ui.label(RichText::new("Composition").color(palette::TEXT_STRONG));
-        let others: Vec<String> = compositions
+        items
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != index)
-            .map(|(_, o)| o.name.clone())
-            .collect();
-        let mut edited = c.clone();
-        let ui_value = &mut session.mosaic.config.ui;
-        let mut list = compositions.to_vec();
-        if ui
-            .push_id(("composition", index), |ui| {
-                composition_editor(ui, &mut edited, groups, &others)
+            .map(|it| it.rect)
+            .reduce(|a, b| {
+                [
+                    a[0].min(b[0]),
+                    a[1].min(b[1]),
+                    a[2].max(b[2]),
+                    a[3].max(b[3]),
+                ]
             })
-            .inner
-        {
-            if edited.name != c.name {
-                // The display stretch follows the composition's name.
-                let old = composition_stretch_key(&c.name);
-                let saved = saved_stretch_at(ui_value, PLAN_STRETCH_KEY, &old);
-                save_stretch_at(ui_value, PLAN_STRETCH_KEY, &old, None);
-                if let Some(s) = saved {
-                    let new = composition_stretch_key(&edited.name);
-                    save_stretch_at(ui_value, PLAN_STRETCH_KEY, &new, Some(&s));
-                }
-            }
-            list[index] = edited;
-            save_compositions(ui_value, &list);
-            self.save.touch();
-        }
-        if ui.button("Delete composition").clicked() {
-            save_stretch_at(
-                ui_value,
-                PLAN_STRETCH_KEY,
-                &composition_stretch_key(&c.name),
-                None,
-            );
-            list.remove(index);
-            save_compositions(ui_value, &list);
-            self.save.touch();
-            self.view = groups.first().cloned().map(ViewKind::Group);
-        }
+            .map(|e| (e, false))
     }
 
-    fn stretch_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        session: &mut OpenSession,
-        spec: Option<&ViewSpec>,
-    ) {
-        let channels = spec.map_or(0, |s| s.channels);
-        let default = StretchParams {
-            black: 0.0,
-            white: 1.0,
-            midtones: 0.5,
-        };
-        let mut state = StretchState {
-            stretch: self
-                .stretch
-                .clone()
-                .unwrap_or_else(|| vec![default; channels]),
-            channels,
-            linked: self.linked,
-            manual: self.manual,
-            auto_busy: self.auto.is_some(),
-        };
-        if state.stretch.len() < channels {
-            let last = state.stretch.last().copied().unwrap_or(default);
-            state.stretch.resize(channels, last);
-        }
-        let change = stretch_panel(ui, &mut state);
-        self.linked = state.linked;
-        let Some(key) = spec.map(|s| s.key.clone()) else {
-            return;
-        };
-        let ui_value = &mut session.mosaic.config.ui;
-        match change {
-            StretchChange::None => {}
-            StretchChange::Auto => {
-                self.manual = false;
-                self.auto_for = None;
-                self.auto = None;
-                save_stretch_at(ui_value, PLAN_STRETCH_KEY, &key, None);
-                self.save.touch();
-            }
-            StretchChange::Manual(s) => {
-                self.manual = true;
-                self.auto = None;
-                save_stretch_at(ui_value, PLAN_STRETCH_KEY, &key, Some(&s));
-                self.save.touch();
-                self.stretch = Some(s);
-                self.new_epoch();
-            }
-        }
-    }
-
-    fn selection_ui(&mut self, ui: &mut egui::Ui) {
+    /// The selected panel's details: its name and path, Show in folder and
+    /// Copy path, its header facts (read on a worker) and the panels it
+    /// overlaps; a hint when none is selected.
+    pub fn selection_ui(&mut self, ui: &mut egui::Ui, session: &OpenSession) {
         ui.label(RichText::new("Panel").color(palette::TEXT_STRONG));
-        let Some(path) = self.selected.clone() else {
+        let Some(path) = self.selected.clone().filter(|p| is_panel(session, p)) else {
             ui.label(RichText::new("Click a panel to select it.").color(palette::TEXT_MUTED));
             return;
         };
@@ -1531,7 +1407,7 @@ impl PlanTab {
         });
         egui::Grid::new("plan-panel-props")
             .num_columns(2)
-            .spacing([12.0, 4.0])
+            .spacing([space::M, space::XS])
             .show(ui, |ui| {
                 let row = |ui: &mut egui::Ui, k: &str, v: String| {
                     ui.label(RichText::new(k).color(palette::TEXT_BODY));
@@ -1570,95 +1446,20 @@ impl PlanTab {
             }
         }
     }
-
-    fn checks_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        session: &OpenSession,
-        feed: &PlanFeed<'_>,
-        out: &mut PlanOutput,
-    ) {
-        let cfg = &session.mosaic.config;
-        let filter = self.selected.clone().filter(|_| !self.show_all_checks);
-        let mut items = Vec::new();
-        let mut sources: Vec<Option<&Check>> = Vec::new();
-        if let Some(report) = feed.checks {
-            if filter.is_none() {
-                for e in &report.errors {
-                    items.push(CheckItem {
-                        severity: UiSeverity::Problem,
-                        title: e.clone(),
-                        detail: String::new(),
-                        accepted: false,
-                        acceptable: false,
-                    });
-                    sources.push(None);
-                }
-            }
-            for c in &report.checks {
-                if filter.as_ref().is_some_and(|p| !c.panels.contains(p)) {
-                    continue;
-                }
-                items.push(CheckItem {
-                    severity: match c.severity {
-                        Severity::Problem => UiSeverity::Problem,
-                        Severity::Note => UiSeverity::Note,
-                        Severity::Passed => UiSeverity::Passed,
-                    },
-                    title: c.message.clone(),
-                    detail: c.remedy.clone().unwrap_or_default(),
-                    accepted: is_accepted(cfg, c),
-                    acceptable: c.severity != Severity::Passed,
-                });
-                sources.push(Some(c));
-            }
-        }
-        let heading = if self.selected.is_some() && !self.show_all_checks {
-            "Checks for this panel"
-        } else {
-            "Checks"
-        };
-        let show_all = self.selected.is_some().then_some(&mut self.show_all_checks);
-        for action in checks_list(ui, heading, &items, show_all) {
-            let CheckAction::Accept(i) = action;
-            if let Some(Some(c)) = sources.get(i) {
-                out.accept.push((*c).clone());
-            }
-        }
-    }
-
-    /// Save a pending change once the rate limit allows (documented
-    /// exception: a small `mosaic.json` write on the UI thread).
-    fn save_if_due(&mut self, ctx: &egui::Context, session: &OpenSession) {
-        let now = Instant::now();
-        if self.save.due(now) {
-            self.save.saved(now);
-            if let Err(e) = session.mosaic.save() {
-                tracing::warn!("Plan settings not saved: {e}");
-            }
-        } else if let Some(wait) = self.save.wait(now) {
-            ctx.request_repaint_after(wait);
-        }
-    }
 }
 
-/// Add a new composition (HOO-like defaults from the first groups) to the
-/// session's `ui`; returns its index. Not saved (the caller rate-limits).
-fn add_composition(
-    session: &mut OpenSession,
-    groups: &[String],
-    compositions: &[Composition],
-) -> usize {
-    let taken: Vec<String> = compositions.iter().map(|c| c.name.clone()).collect();
-    let mut c = Composition::new(unique_composition_name(&taken));
-    if !groups.is_empty() {
-        let pick = |i: usize| Some((groups[i.min(groups.len() - 1)].clone(), 1.0));
-        c.channels = [pick(0), pick(1), pick(2)];
+#[cfg(test)]
+impl PlanView {
+    /// Screen position of canvas point `p` in the last frame drawn.
+    pub(crate) fn to_screen(&self, p: (f64, f64)) -> Option<egui::Pos2> {
+        let (rect, now) = self.canvas.last_frame()?;
+        Some(self.canvas.view().image_to_screen(p, rect, now))
     }
-    let mut list = compositions.to_vec();
-    list.push(c);
-    save_compositions(&mut session.mosaic.config.ui, &list);
-    list.len() - 1
+
+    /// Whether `path`'s header facts have been read.
+    pub(crate) fn has_info(&self, path: &Path) -> bool {
+        self.info.contains_key(path)
+    }
 }
 
 /// `c` with its RGB scaled by `w` (clamped to `[0, 255]`).
@@ -1677,5 +1478,5 @@ fn solution_text(k: SolutionKind) -> &'static str {
 }
 
 #[cfg(test)]
-#[path = "plan_tab_tests.rs"]
-mod tests;
+#[path = "plan_view_tests.rs"]
+pub(crate) mod tests;

@@ -36,9 +36,9 @@ use mmm_core::session_summary::{ResultState, SessionSummary};
 use mmm_core::stretch::{StretchParams, auto_stretch, channel_stats};
 
 use super::facts::{Availability, CardFacts, CardState};
-use crate::blend_tab::saved_stretch;
 use crate::compositions::{Composition, composition_stretch_key, load_compositions};
-use crate::stretch_panel::{PLAN_STRETCH_KEY, saved_stretch_at};
+use crate::display_stretch::DisplayStretch;
+use crate::stretch_panel::{PLAN_STRETCH_KEY, saved_stretch, saved_stretch_at};
 use crate::tile_source::{CompositeTileSource, Mix, MosaicTileSource, channel_tints, planar_image};
 
 /// Longest side, in pixels, of a planned session's overview pictures (never
@@ -179,7 +179,7 @@ fn merged_views(m: &Mosaic, summary: Option<&SessionSummary>) -> Vec<Keyed> {
         };
         let channels = source.tile_geometry().channels as usize;
         let saved = saved_stretch(ui, &g.name).filter(|s| s.len() == channels);
-        if let Some(s) = saved.or_else(|| source.auto(false)) {
+        if let Some(s) = saved.or_else(|| source.auto(DisplayStretch::default())) {
             source.set_stretch(s);
         }
         out.push(Keyed {

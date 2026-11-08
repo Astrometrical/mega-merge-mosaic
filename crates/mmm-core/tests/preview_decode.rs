@@ -72,5 +72,8 @@ fn compressed_panels_decode_into_the_session_cache() {
     assert_eq!(got[0].rect, [0.0, 0.0, 30.0, 40.0]);
     assert_eq!(got[1].rect, [30.0, 0.0, 60.0, 40.0]);
     assert!(got[1].data.iter().all(|v| (v - 0.35).abs() < 1e-6));
+    // The session closed: its cache is forgotten.
+    mmm_core::decoded::clear_cache_dir();
+    assert!(mmm_core::decoded::cache_dir().is_none());
     std::fs::remove_dir_all(&dir).ok();
 }

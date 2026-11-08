@@ -1,4 +1,4 @@
-//! The Blend tab's tile source: a group's tiled result store
+//! The merged mosaic's tile source: a group's tiled result store
 //! (`result.mmmt`) read through a [`TileReader`], display-stretched to RGBA
 //! on the viewer's loader threads. The start screen reads the same stores
 //! through a [`FileTileReader`] instead ([`MosaicTileSource::open_plain`]):
@@ -14,11 +14,11 @@
 //! **Store recreation.** A [`TileReader`] must never be alive while a blend
 //! recreates (truncates) its file: the mapping would fault (`SIGBUS`).
 //! `run_blend` recreates a store only when it is missing, unreadable, or of
-//! a different geometry than the group's analysed canvas. The Blend tab
+//! a different geometry than the group's analysed canvas. The mosaic view
 //! therefore keeps a source open only after [`open_result`] has checked
 //! that the store's geometry matches the group's `session.json` canvas (so
-//! a blend reopens it rather than recreating it), and re-checks after every
-//! analysis; see `blend_tab` for the full guard.
+//! a merge reopens it rather than recreating it), and re-checks after every
+//! analysis; see `mosaic_view` for the full guard.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,8 +27,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use egui::{Color32, ColorImage};
 use mega_ui::viewer::{Fetched, PyramidGeometry, TileKey, TileSource};
 use mmm_core::session::Session;
-use mmm_core::stretch::{ChannelStats, StretchParams, apply, auto_stretch, channel_stats};
+use mmm_core::stretch::{ChannelStats, StretchParams, apply, channel_stats};
 use mmm_core::tiles::{FileTileReader, TileGeometry, TileRead, TileReader, TileState};
+
+use crate::display_stretch::DisplayStretch;
 
 /// Copies of a tile torn by a concurrent write tried before giving up (the
 /// next generation bump fetches it again).
@@ -72,9 +74,9 @@ impl MosaicTileSource {
         }
     }
 
-    /// Open the store at `path` memory-mapped ([`TileReader`]), as the Blend
-    /// tab does: no store recreation may happen while it is open (module
-    /// docs). Blocking: call off the UI thread.
+    /// Open the store at `path` memory-mapped ([`TileReader`]), as the
+    /// mosaic view does: no store recreation may happen while it is open
+    /// (module docs). Blocking: call off the UI thread.
     pub fn open(path: &Path, stretch: Option<Vec<StretchParams>>) -> mmm_core::Result<Self> {
         Ok(Self::new(TileReader::open(path)?, stretch))
     }
@@ -155,9 +157,10 @@ impl MosaicTileSource {
         None
     }
 
-    /// The automatic (unlinked) display stretch from [`Self::coarse_stats`].
-    pub fn auto(&self, linked: bool) -> Option<Vec<StretchParams>> {
-        self.coarse_stats().map(|s| auto_stretch(&s, linked))
+    /// The automatic display stretch from [`Self::coarse_stats`], with
+    /// `stretch`'s Linked and Strong; `None` without statistics.
+    pub fn auto(&self, stretch: DisplayStretch) -> Option<Vec<StretchParams>> {
+        self.coarse_stats().map(|s| stretch.params(&s))
     }
 
     /// Level-0 tiles meeting canvas rect `r`: `(valid, total)`. Reads tile
@@ -308,16 +311,16 @@ pub fn channel_tints<T: Clone>(
 }
 
 /// A composition view (spec §5.3) as a [`TileSource`]: each mapped group's
-/// [`MosaicTileSource`] tile is fetched (through that group's own Blend
-/// display stretch) on the loader thread and mixed additively, tinted by
+/// [`MosaicTileSource`] tile is fetched (through that group's own display
+/// stretch) on the loader thread and mixed additively, tinted by
 /// its channel's colour times the weight, as the Plan composition layers
 /// are. A group mapped to several channels is fetched once with the summed
 /// tint.
 ///
 /// **Store recreation.** The composite holds every member's reader: all of
 /// them must be released (the composite dropped by the viewer's loaders)
-/// before any member's store may be recreated; the Blend tab tracks each
-/// member it gives up (see `blend_tab`).
+/// before any member's store may be recreated; the mosaic view tracks each
+/// member it gives up (see `mosaic_view`).
 pub struct CompositeTileSource {
     /// Each distinct member and its summed RGB tint.
     members: Vec<(Arc<MosaicTileSource>, [f32; 3])>,
@@ -342,7 +345,7 @@ impl CompositeTileSource {
         }) {
             return Err(format!(
                 "The groups of this composition are on different canvases ({} and {}); \
-                 analyze them together so they share one frame.",
+                 analyse them together so they share one frame.",
                 size(g0),
                 size(other.tile_geometry())
             ));
@@ -462,8 +465,11 @@ pub enum Opened {
     Ready {
         /// The open store.
         source: MosaicTileSource,
-        /// Whether the stretch is the saved one (else automatic).
-        saved: bool,
+        /// The display stretch it was given; `None` (linear) when none was
+        /// given and the store has no statistics yet.
+        stretch: Option<Vec<StretchParams>>,
+        /// Whether `stretch` is the one given (else automatic).
+        given: bool,
     },
     /// Nothing to show yet; the reason, for the user.
     Absent(String),
@@ -475,15 +481,17 @@ pub enum Opened {
 /// blend would recreate the file under the mapping, so the reader is
 /// dropped here and the result reported out of date.
 ///
-/// The display stretch is `saved` if given, else the automatic (unlinked)
-/// stretch from the coarsest level ([`MosaicTileSource::auto`]).
+/// The display stretch is `given` if it has one entry per channel (e.g. a
+/// stretch held while a merge runs), else the automatic stretch from the
+/// coarsest level with `stretch`'s toggles ([`MosaicTileSource::auto`]).
 pub fn open_result(
     result_path: &Path,
     session_dir: &Path,
-    saved: Option<Vec<StretchParams>>,
+    given: Option<Vec<StretchParams>>,
+    stretch: DisplayStretch,
 ) -> Opened {
     if !result_path.exists() {
-        return Opened::Absent("Not blended yet.".into());
+        return Opened::Absent("Not merged yet.".into());
     }
     let expected = match Session::open(session_dir) {
         Ok(s) => s.canvas,
@@ -491,27 +499,30 @@ pub fn open_result(
     };
     let source = match MosaicTileSource::open(result_path, None) {
         Ok(s) => s,
-        Err(e) => return Opened::Absent(format!("Cannot open the result ({e}); blend again.")),
+        Err(e) => return Opened::Absent(format!("Cannot open the result ({e}); merge again.")),
     };
     let g = source.tile_geometry();
     if (g.width, g.height, u64::from(g.channels)) != expected {
         return Opened::Absent(
-            "The result predates the latest analysis; blend to refresh it.".into(),
+            "The result predates the latest analysis; merge to refresh it.".into(),
         );
     }
-    let saved = saved.filter(|s| s.len() == g.channels as usize);
-    let used_saved = saved.is_some();
-    if let Some(s) = saved.or_else(|| source.auto(false)) {
-        source.set_stretch(s);
+    let given = given.filter(|s| s.len() == g.channels as usize);
+    let used_given = given.is_some();
+    let stretch = given.or_else(|| source.auto(stretch));
+    if let Some(s) = &stretch {
+        source.set_stretch(s.clone());
     }
     Opened::Ready {
         source,
-        saved: used_saved,
+        stretch,
+        given: used_given,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use mmm_core::stretch::auto_stretch;
     use mmm_core::tiles::TileStore;
 
     use super::*;
@@ -789,6 +800,7 @@ mod tests {
             why.contains("600 × 300") && why.contains("640 × 300"),
             "{why}"
         );
+        assert!(why.contains("analyse them together"), "{why}");
         // And nothing mapped: nothing to show.
         assert!(CompositeTileSource::new(&[None, None, None]).is_err());
         drop((ha_store, oiii_store, odd_store));
@@ -804,37 +816,65 @@ mod tests {
         let mut m = crate::synth_mosaic::two_group_mosaic(&root);
         let (result, dir) = (m.result_path("Ha"), m.group_session_dir("Ha"));
         assert!(matches!(
-            open_result(&result, &dir, None),
+            open_result(&result, &dir, None, DisplayStretch::default()),
             Opened::Absent(_)
         ));
         analyze_all(&mut m, &JobCtl::none()).unwrap();
-        let Opened::Absent(why) = open_result(&result, &dir, None) else {
+        let Opened::Absent(why) = open_result(&result, &dir, None, DisplayStretch::default())
+        else {
             panic!("no result yet");
         };
-        assert_eq!(why, "Not blended yet.");
+        assert_eq!(why, "Not merged yet.");
         blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
 
-        // Matching geometry: open, with an automatic stretch.
-        let Opened::Ready { source, saved } = open_result(&result, &dir, None) else {
+        // Matching geometry: open, with an automatic stretch with the
+        // display stretch's toggles.
+        let strong = DisplayStretch {
+            linked: false,
+            strong: true,
+        };
+        let Opened::Ready {
+            source,
+            stretch,
+            given,
+        } = open_result(&result, &dir, None, strong)
+        else {
             panic!("blended result opens");
         };
-        assert!(!saved);
+        assert!(!given);
         assert_ne!(source.stretch()[0], LINEAR);
+        assert_eq!(stretch, Some(source.stretch()));
+        assert_eq!(source.auto(strong), stretch);
+        assert_ne!(source.auto(DisplayStretch::default()), stretch);
         drop(source);
+        // A given stretch (one entry per channel) is used as it is...
         let mine = vec![LINEAR; 3];
-        let Opened::Ready { source, saved } = open_result(&result, &dir, Some(mine.clone())) else {
+        let Opened::Ready {
+            source,
+            stretch,
+            given,
+        } = open_result(&result, &dir, Some(mine.clone()), strong)
+        else {
             panic!("blended result opens");
         };
-        assert!(saved);
+        assert!(given);
         assert_eq!(source.stretch(), mine);
+        assert_eq!(stretch, Some(mine));
         drop(source);
+        // ...one of the wrong length is not.
+        let Opened::Ready { given, .. } = open_result(&result, &dir, Some(vec![LINEAR]), strong)
+        else {
+            panic!("blended result opens");
+        };
+        assert!(!given);
 
         // A store of another geometry would be recreated by the next blend:
         // it is reported out of date and no reader is kept.
         let mut g = TileStore::open(&result).unwrap().geometry();
         g.width += 1;
         drop(TileStore::create(&result, g).unwrap());
-        let Opened::Absent(why) = open_result(&result, &dir, None) else {
+        let Opened::Absent(why) = open_result(&result, &dir, None, DisplayStretch::default())
+        else {
             panic!("out of date");
         };
         assert!(why.contains("predates the latest analysis"), "{why}");
