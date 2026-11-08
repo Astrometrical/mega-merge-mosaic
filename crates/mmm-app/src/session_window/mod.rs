@@ -15,7 +15,12 @@
 //!   stay beside it; the Panels step opens and closes it, and switching
 //!   between plan and mosaic leaves it as it is. A session without panels
 //!   opens on it. Files dropped on the window are added whatever shows
-//!   ([`SessionWindow::poll_panels`]).
+//!   ([`SessionWindow::poll_panels`]). Rows and the plan are linked (spec
+//!   §7.4): a row pointed at lights its panel's outline on the plan and a
+//!   panel pointed at on the plan lights its row (the panels the view
+//!   shows); a row clicked selects its panel on the plan (the inspector
+//!   shows it), and a panel clicked on the plan selects its row, brought
+//!   into view. Esc clears the selection in both.
 //! - **One view, one camera.** The window keeps the view (a group or a
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
@@ -47,8 +52,10 @@
 //!   once something is merged, the first group, Problems open, Outlines and
 //!   ROIs on.
 //! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `L`, `S`
-//!   and `Ctrl+Enter`, each named in its control's tooltip; none while a
-//!   text field has the keyboard or the Export dialog is open.
+//!   and `Ctrl+Enter`, each named in its control's tooltip, `Delete`
+//!   (removes the panels selected in the open list) and `Esc` (clears the
+//!   selection); none while a text field has the keyboard or the Export
+//!   dialog is open.
 //! - **Saves.** The view state, the display stretch toggles, the composites
 //!   and the notes live in the session's `MosaicConfig.ui`, changed at once
 //!   in memory and written to `mosaic.json` on the UI thread at most once
@@ -76,6 +83,7 @@ use mega_ui::theme::palette;
 use mega_ui::theme::tokens::{CANVAS_MIN_WIDTH, PANEL_LIST_MIN_WIDTH, space};
 use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
+use mmm_core::mosaic::PanelEntry;
 use mmm_core::session_summary::ResultState;
 use mmm_core::settings::ChangeImpact;
 use serde::{Deserialize, Serialize};
@@ -86,8 +94,8 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
-use crate::panel_edits::{FilesPicker, PanelsEdit};
-use crate::panel_list::PanelList;
+use crate::panel_edits::FilesPicker;
+use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView};
 use crate::session::OpenSession;
@@ -116,11 +124,15 @@ pub struct SessionOutput {
     pub toasts: Vec<WindowToast>,
 }
 
-/// What an Undo toast's action restores ([`SessionWindow::undo`]).
+/// What an Undo toast's action restores ([`SessionWindow::undo`]): only
+/// what its action changed, into the inputs as they are by then (later,
+/// unrelated edits stay).
 #[derive(Clone, Debug)]
 pub enum Undo {
-    /// Restore the panels and grouping as they were.
-    Panels(PanelsEdit),
+    /// Put back removed panels, each as it was (its manual group too) at
+    /// its index in the inputs before the removal (or the end, if fewer
+    /// panels are left); one already back is left alone.
+    Readd(Vec<(usize, PanelEntry)>),
 }
 
 /// A toast the window asks the shell to show.
@@ -147,7 +159,8 @@ pub struct SessionWindow {
     /// Problems lists every check, notes and passed ones too.
     show_all_checks: bool,
     notes_mode: NotesMode,
-    /// The panel selected on the plan last frame (a new one opens Panels).
+    /// The plan's selected panel as last seen: a new one opens Panels, and
+    /// one picked on the plan selects its row in the panel list.
     selected: Option<PathBuf>,
     /// The view bar's choices' and toggles' one-row widths, as last drawn.
     bar_widths: Option<(f32, f32)>,
@@ -160,6 +173,9 @@ pub struct SessionWindow {
     toasts: Vec<WindowToast>,
     /// The panel list shows at the left of the canvas.
     pub(crate) panel_list_open: bool,
+    /// A text field had the keyboard when the last frame ended: an Esc now
+    /// left it (egui lets go of the field before the shortcuts see the key).
+    was_typing: bool,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -198,6 +214,7 @@ impl SessionWindow {
             panels: PanelList::new(picker),
             toasts: Vec::new(),
             panel_list_open: false,
+            was_typing: false,
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -379,17 +396,17 @@ impl SessionWindow {
         self.mosaic.apply_waiting_settings(session, jobs);
     }
 
-    /// Raise a toast: the shell shows it with the next frame's output.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Raise a toast: the shell shows it with this frame's output (the
+    /// next one's, raised after drawing).
     pub(crate) fn push_toast(&mut self, toast: WindowToast) {
         self.toasts.push(toast);
     }
 
-    /// Run an Undo toast's action: re-submit the stored edit like any other
-    /// (queued behind running jobs).
+    /// Run an Undo toast's action: an edit of the inputs as they are now,
+    /// applied like any other (queued behind running jobs).
     pub fn undo(&mut self, undo: Undo, session: &mut OpenSession, jobs: &mut JobRunner) {
         match undo {
-            Undo::Panels(edit) => self.panels.submit_edit(edit, session, jobs),
+            Undo::Readd(removed) => self.panels.readd(removed, session, jobs),
         }
     }
 
@@ -462,10 +479,12 @@ impl SessionWindow {
             {
                 self.list_rect = Some(list.response.rect);
             }
-            // Rows and the plan are linked in the list's next step.
-            out.toasts.extend(list.inner.toasts);
+            self.follow_list(list.inner);
         } else {
-            out.toasts.extend(self.panels.take_toasts());
+            for toast in self.panels.take_toasts() {
+                self.push_toast(toast);
+            }
+            self.plan.set_highlight(None);
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
@@ -481,7 +500,47 @@ impl SessionWindow {
         if self.keep_view_state(session) {
             ctx.request_repaint();
         }
+        self.was_typing = ctx.text_edit_focused();
         out
+    }
+
+    /// Act on what the panel list reported this frame: its toasts; the row
+    /// pointed at lights its panel on the plan; a row clicked (plainly)
+    /// selects its panel there, opening the inspector's Panels section for
+    /// a new one; a removed panel is no longer selected.
+    fn follow_list(&mut self, out: PanelListOutput) {
+        for toast in out.toasts {
+            self.push_toast(toast);
+        }
+        self.plan.set_highlight(out.hovered);
+        if let Some(path) = out.clicked {
+            if self.selected.as_ref() != Some(&path) {
+                self.inspector.reveal(PANELS);
+            }
+            self.plan.select(Some(path.clone()));
+            self.selected = Some(path);
+        }
+        self.panels_removed(&out.removed);
+    }
+
+    /// `removed` left the inputs: the plan's selection goes with them (now,
+    /// not once a queued edit applies).
+    fn panels_removed(&mut self, removed: &[PathBuf]) {
+        if self
+            .plan
+            .selected()
+            .is_some_and(|p| removed.iter().any(|r| r == p))
+        {
+            self.plan.select(None);
+            self.selected = None;
+        }
+    }
+
+    /// Clear the selection, in the list and on the plan (Esc).
+    fn clear_selection(&mut self) {
+        self.panels.clear_selection();
+        self.plan.select(None);
+        self.selected = None;
     }
 
     /// On the first call, restore the view the session saved

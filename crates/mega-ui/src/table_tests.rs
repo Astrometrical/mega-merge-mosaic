@@ -476,3 +476,90 @@ fn a_table_too_narrow_for_any_column_keeps_its_first() {
     let button = h.get_by_label("Panel actions").rect();
     assert!(row.contains_rect(button), "{button:?} not in {row:?}");
 }
+
+#[test]
+fn shown_ids_are_the_rows_on_screen() {
+    let sections = rolled_up();
+    let mut state = TableState::default();
+    // Rolled up: the first rows and the problem row.
+    assert_eq!(shown_ids(&state, &sections), [0, 1, 2, 7]);
+    state.expand("ha");
+    assert_eq!(shown_ids(&state, &sections), (0..10).collect::<Vec<_>>());
+    state.toggle_fold("ha");
+    assert!(shown_ids(&state, &sections).is_empty(), "folded");
+    // Sections in order; a flat list shows every row.
+    assert_eq!(
+        shown_ids(&TableState::default(), &two_sections()),
+        [1, 2, 3]
+    );
+    let flat = vec![Section {
+        heading: None,
+        rows: (0..5).map(|i| row(i, "p", "1", "Ha")).collect(),
+    }];
+    assert_eq!(shown_ids(&TableState::default(), &flat), [0, 1, 2, 3, 4]);
+}
+
+/// A rolled-up section "ha" of 40 rows p0..p39 and a section "oiii" with
+/// b1 (id 100), in a scroll area in a short window.
+fn scrolled() -> Harness<'static, State> {
+    let ha = (0..40)
+        .map(|i| row(i, &format!("p{i}"), "1.21", "Ha"))
+        .collect();
+    let sections = vec![
+        Section {
+            heading: Some(Heading {
+                rolls_up: true,
+                ..heading("ha", "Ha · 40")
+            }),
+            rows: ha,
+        },
+        Section {
+            heading: Some(heading("oiii", "OIII · 1")),
+            rows: vec![row(100, "b1", "1.21", "OIII")],
+        },
+    ];
+    Harness::builder()
+        .with_size(Vec2::new(600.0, 300.0))
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    sectioned_table(ui, &mut s.table, &s.columns, &s.sections, |_, _| {});
+                });
+            },
+            State {
+                table: TableState::default(),
+                columns: columns(),
+                sections,
+                all: Vec::new(),
+                last: Vec::new(),
+            },
+        )
+}
+
+#[test]
+fn revealing_a_row_opens_its_section_and_scrolls_to_it() {
+    let mut h = scrolled();
+    h.run();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(600.0, 300.0));
+    assert!(h.query_by_label("p30").is_none(), "rolled up");
+    // A row a rolled-up section hides: the section opens, the row shows.
+    h.state_mut().table.reveal(30);
+    h.run();
+    assert!(h.state().table.is_expanded("ha"));
+    let p30 = h.get_by_label("p30").rect();
+    assert!(screen.contains_rect(p30), "{p30:?} not on screen");
+    // A row in a folded section: the section unfolds, the row shows.
+    h.state_mut().table.toggle_fold("oiii");
+    h.run();
+    assert!(h.query_by_label("b1").is_none(), "folded");
+    h.state_mut().table.reveal(100);
+    h.run();
+    assert!(!h.state().table.is_folded("oiii"));
+    let b1 = h.get_by_label("b1").rect();
+    assert!(screen.contains_rect(b1), "{b1:?} not on screen");
+    // Once: the user scrolls on from there.
+    assert_eq!(h.state().table.revealing, None);
+}

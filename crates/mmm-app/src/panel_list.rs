@@ -18,7 +18,27 @@
 //!   {largest group}" when it has fewer panels than the largest. Group
 //!   sections roll up to their first rows. With grouping off: one flat
 //!   section.
-//! - **Rows** carry an actions menu: **Remove** (a toast offers Undo).
+//! - **Selection.** A click selects a row, Shift-click the rows on screen
+//!   from the last one clicked, Ctrl-click (Cmd-click) adds or takes away
+//!   one. It follows the panels (a regrouped panel stays selected; a
+//!   removed one leaves it). A plain click also selects the panel on the
+//!   plan, and a panel clicked there selects its row
+//!   ([`PanelList::select_only`]); the window links the rows and the plan
+//!   ([`crate::session_window`]), clears the selection on Esc and removes
+//!   it on Delete ([`PanelList::remove_selection`]). The row the pointer is
+//!   over is reported ([`PanelListOutput::hovered`]), and the row of the
+//!   panel pointed at on the plan is highlighted
+//!   ([`PanelList::set_highlight`]).
+//! - **Rows** carry an actions menu, acting on the selection when the row
+//!   is selected, else on the row: with grouping on, **Move to** with each
+//!   group, **New group…** (a name typed in the menu; the group is made of
+//!   the panels moved, groups having no existence of their own), **No
+//!   group** and **Let the rule decide**; then **Remove** (a toast offers
+//!   Undo, which puts back only the panels removed). Rows dragged onto a
+//!   section heading move there too. A panel moved by hand (its manual
+//!   group, saved in `mosaic.json`) is tagged "by hand"; its FILTER cell
+//!   still reads its header. A panel already in the group it is moved to
+//!   is left as it is.
 //!
 //! # Threads
 //!
@@ -37,17 +57,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use egui::{Align, Color32, Label, Layout, RichText, Stroke, TextWrapMode};
+use egui::{Align, Color32, Key, Label, Layout, Modifiers, Popup, RichText, Stroke, TextWrapMode};
 use mega_ui::icons;
-use mega_ui::table::{Column, Heading, Row, Section, TableEvent, TableState, sectioned_table};
+use mega_ui::table::{
+    Column, Heading, Row, Section, TableEvent, TableState, sectioned_table, shown_ids,
+};
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{CONTROL_HEIGHT, KEYWORD_INPUT_WIDTH, radius, space};
 use mega_ui::theme::{Tone, palette};
-use mega_ui::widgets::{ButtonKind, MegaButton, Toast, icon_button_of, text_input};
+use mega_ui::widgets::{ButtonKind, MegaButton, Toast, icon_button_of, submenu, text_input};
 use mmm_core::checks::{CheckCode, PanelFacts, Severity, input_checks, is_accepted};
 use mmm_core::formats::InputPanel;
 use mmm_core::mosaic::grouping::{Groups, header_value, resolve_groups};
-use mmm_core::mosaic::{Fingerprint, GroupRule, Grouping, MosaicConfig, UNGROUPED, fingerprint};
+use mmm_core::mosaic::{
+    Fingerprint, GroupRule, Grouping, MosaicConfig, PanelEntry, UNGROUPED, fingerprint,
+};
 use mmm_core::panel_header::{PanelHeader, read_panel_header};
 
 use crate::checks::ChecksReport;
@@ -70,6 +94,8 @@ const UNKNOWN: &str = "—";
 const READING: &str = "Reading…";
 /// The FILTER cell of a panel that can't be opened.
 const UNREADABLE: &str = "Unreadable";
+/// The tag of a row whose panel was moved by hand.
+const BY_HAND: &str = "by hand";
 
 /// The table's columns.
 const COLUMNS: [Column<'static>; 5] = [
@@ -99,14 +125,34 @@ const COLUMNS: [Column<'static>; 5] = [
 #[derive(Debug, Default)]
 pub struct PanelListOutput {
     /// The panel whose row the pointer is over.
-    // Read once rows and the plan are linked (the next step of the list).
-    #[allow(dead_code)]
     pub hovered: Option<PathBuf>,
-    /// The panel whose row was clicked.
-    #[allow(dead_code)]
+    /// The panel whose row was clicked with no modifier (selected alone).
     pub clicked: Option<PathBuf>,
+    /// The panels removed this frame.
+    pub removed: Vec<PathBuf>,
     /// Toasts to show (an edit refused, a removal to undo).
     pub toasts: Vec<WindowToast>,
+}
+
+/// What a row's actions menu asked for.
+#[derive(Clone, Debug, PartialEq)]
+enum RowAction {
+    /// Into this group by hand ([`UNGROUPED`]: No group), or back to the
+    /// rule (`None`).
+    MoveTo(Option<String>),
+    /// Out of the session.
+    Remove,
+}
+
+/// A new group's name being typed in a row's actions menu.
+#[derive(Debug)]
+struct Naming {
+    /// The row whose menu it is in.
+    row: u64,
+    /// The name so far.
+    name: String,
+    /// Give the field the keyboard on the next frame.
+    focus: bool,
 }
 
 /// What the headers say about one panel (cached by path).
@@ -280,6 +326,50 @@ fn place(shown: &PanelsEdit, resolved: Option<(&PanelsEdit, &Groups)>) -> Placem
     out
 }
 
+impl Placement {
+    /// Each placed panel's section: its group, or [`UNGROUPED`] (panels
+    /// whose group is still being resolved left out).
+    fn sections(&self) -> BTreeMap<&Path, &str> {
+        let named = self
+            .groups
+            .iter()
+            .flat_map(|(g, ps)| ps.iter().map(move |p| (p.as_path(), g.as_str())));
+        let ungrouped = self
+            .ungrouped
+            .iter()
+            .filter(|p| !self.unsorted.contains(*p))
+            .map(|p| (p.as_path(), UNGROUPED));
+        named.chain(ungrouped).collect()
+    }
+}
+
+/// The edit putting `targets` of `shown` in group `to` by hand
+/// ([`UNGROUPED`]: No group), or with `to` `None` giving them back to the
+/// rule; `None` when nothing changes. A panel `placed` in `to` already
+/// stays as it is (it does not move).
+fn moved(
+    shown: &PanelsEdit,
+    placed: &Placement,
+    targets: &BTreeSet<PathBuf>,
+    to: Option<&str>,
+) -> Option<PanelsEdit> {
+    let sections = placed.sections();
+    let mut edit = shown.clone();
+    let mut changed = false;
+    for p in edit.panels.iter_mut().filter(|p| targets.contains(&p.path)) {
+        let group = match to {
+            Some(g) if sections.get(p.path.as_path()) == Some(&g) => continue,
+            Some(g) => Some(g.to_string()),
+            None => None,
+        };
+        if p.manual_group != group {
+            p.manual_group = group;
+            changed = true;
+        }
+    }
+    changed.then_some(edit)
+}
+
 /// The named groups of `groups` in the order their first panel appears in
 /// `inputs` ([`UNGROUPED`] left out).
 fn first_seen<'a>(inputs: &PanelsEdit, groups: &'a Groups) -> Vec<&'a str> {
@@ -368,6 +458,97 @@ fn problem_toast(message: String) -> WindowToast {
     }
 }
 
+/// The actions menu of row `id`: with grouping on (`groups`: the groups
+/// to move to), **Move to** with each group, **New group…**, **No group**
+/// and **Let the rule decide**; then **Remove**. `naming` holds a new
+/// group's name while it is typed.
+fn row_menu(
+    ui: &mut egui::Ui,
+    id: u64,
+    groups: Option<&[String]>,
+    naming: &mut Option<Naming>,
+) -> Option<RowAction> {
+    let mut action = None;
+    if let Some(groups) = groups {
+        submenu(ui, "Move to", |ui| {
+            for g in groups {
+                if ui.button(g).clicked() {
+                    action = Some(RowAction::MoveTo(Some(g.clone())));
+                }
+            }
+            if !groups.is_empty() {
+                ui.separator();
+            }
+            match naming.as_mut().filter(|n| n.row == id) {
+                Some(n) => {
+                    if let Some(name) = new_group_field(ui, n) {
+                        action = Some(RowAction::MoveTo(Some(name)));
+                    }
+                }
+                None => {
+                    let new = ui
+                        .button("New group…")
+                        .on_hover_text("Make a group of these panels");
+                    if new.clicked() {
+                        *naming = Some(Naming {
+                            row: id,
+                            name: String::new(),
+                            focus: true,
+                        });
+                    }
+                }
+            }
+            if ui.button(UNGROUPED).clicked() {
+                action = Some(RowAction::MoveTo(Some(UNGROUPED.into())));
+            }
+            let rule = ui
+                .button("Let the rule decide")
+                .on_hover_text("Back to where Group by places these panels");
+            if rule.clicked() {
+                action = Some(RowAction::MoveTo(None));
+            }
+            if action.is_some() {
+                ui.close();
+            }
+        });
+        ui.separator();
+    }
+    let remove = ui.button("Remove").on_hover_text(format!(
+        "Remove from the session ({})",
+        Key::Delete.symbol_or_name()
+    ));
+    if remove.clicked() {
+        action = Some(RowAction::Remove);
+    }
+    action
+}
+
+/// The new group's name field in a row's menu, with **Create**: the name
+/// (trimmed) once committed with Enter or Create; none while empty.
+fn new_group_field(ui: &mut egui::Ui, naming: &mut Naming) -> Option<String> {
+    let label = ui.label(text(Type::Small, "New group name"));
+    let mut commit = false;
+    ui.horizontal(|ui| {
+        let field = ui
+            .add(
+                egui::TextEdit::singleline(&mut naming.name)
+                    .hint_text("Group name")
+                    .desired_width(KEYWORD_INPUT_WIDTH),
+            )
+            .labelled_by(label.id);
+        if std::mem::take(&mut naming.focus) {
+            field.request_focus();
+        }
+        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let ready = !naming.name.trim().is_empty();
+        let create = ui
+            .add_enabled(ready, MegaButton::new(ButtonKind::Secondary, "Create"))
+            .clicked();
+        commit = ready && (enter || create);
+    });
+    commit.then(|| naming.name.trim().to_string())
+}
+
 /// The text of each panel's unaccepted problems in `report` (message, then
 /// remedy), by panel.
 fn panel_problems(
@@ -399,6 +580,10 @@ struct RowData {
     id: u64,
     cells: Vec<String>,
     problem: Option<String>,
+    /// [`BY_HAND`] for a panel moved by hand (grouping on).
+    tag: Option<&'static str>,
+    selected: bool,
+    highlighted: bool,
 }
 
 /// One section heading, owned.
@@ -420,13 +605,14 @@ impl SectionData {
     /// The section for [`sectioned_table`], borrowing this one.
     fn section(&self) -> Section<'_> {
         Section {
+            // Rows dragged onto a heading move into its section.
             heading: self.heading.as_ref().map(|h| Heading {
                 id: &h.id,
                 title: h.title.clone(),
                 color: h.color,
                 warning: h.warning.clone(),
                 rolls_up: h.rolls_up,
-                drop_target: false,
+                drop_target: true,
             }),
             rows: self
                 .rows
@@ -435,9 +621,9 @@ impl SectionData {
                     id: r.id,
                     cells: r.cells.clone(),
                     problem: r.problem.as_deref(),
-                    tag: None,
-                    selected: false,
-                    highlighted: false,
+                    tag: r.tag,
+                    selected: r.selected,
+                    highlighted: r.highlighted,
                 })
                 .collect(),
         }
@@ -513,6 +699,15 @@ pub struct PanelList {
     filters_differ: bool,
     /// The table's folded and opened sections.
     table: TableState,
+    /// The selected panels.
+    selection: BTreeSet<PathBuf>,
+    /// The row last clicked (plainly or with Ctrl): where a Shift-click
+    /// range starts.
+    anchor: Option<PathBuf>,
+    /// The panel whose row is highlighted (pointed at on the plan).
+    highlight: Option<PathBuf>,
+    /// A new group's name being typed in a row's menu.
+    naming: Option<Naming>,
     /// Toasts raised and not yet handed to the window.
     toasts: Vec<WindowToast>,
 }
@@ -538,7 +733,133 @@ impl PanelList {
             resolved: None,
             filters_differ: false,
             table: TableState::default(),
+            selection: BTreeSet::new(),
+            anchor: None,
+            highlight: None,
+            naming: None,
             toasts: Vec::new(),
+        }
+    }
+
+    /// Select panel `path` alone (it was clicked on the plan); `reveal`
+    /// brings its row into view the next time the list is drawn.
+    pub fn select_only(&mut self, path: &Path, reveal: bool) {
+        self.selection = BTreeSet::from([path.to_path_buf()]);
+        self.anchor = Some(path.to_path_buf());
+        if reveal {
+            self.table.reveal(row_id(path));
+        }
+    }
+
+    /// Select nothing.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.anchor = None;
+    }
+
+    /// Highlight panel `path`'s row (or none): it is pointed at on the plan.
+    /// Whether that changed what the list shows.
+    pub fn set_highlight(&mut self, path: Option<PathBuf>) -> bool {
+        let changed = self.highlight != path;
+        self.highlight = path;
+        changed
+    }
+
+    /// Remove the selected panels (a toast offers to put them back) and
+    /// select nothing; the panels removed (none with nothing selected).
+    pub fn remove_selection(
+        &mut self,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) -> Vec<PathBuf> {
+        let shown = self.edits.shown(session);
+        let targets = std::mem::take(&mut self.selection);
+        self.anchor = None;
+        let Some((edit, removed)) = self.remove(&shown, &targets) else {
+            return Vec::new();
+        };
+        self.edits.submit(edit, session, jobs);
+        self.collect_errors();
+        removed
+    }
+
+    /// Put back panels removed earlier (an Undo): each as it was, at its
+    /// index from before (or the end), into the inputs as they are now; one
+    /// already back is left alone. Applied as any edit (queued behind
+    /// running jobs).
+    pub(crate) fn readd(
+        &mut self,
+        mut removed: Vec<(usize, PanelEntry)>,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        let mut edit = self.edits.shown(session);
+        let before = edit.panels.len();
+        removed.sort_by_key(|(at, _)| *at);
+        for (at, entry) in removed {
+            if edit.panels.iter().any(|p| p.path == entry.path) {
+                continue;
+            }
+            let at = at.min(edit.panels.len());
+            edit.panels.insert(at, entry);
+        }
+        if edit.panels.len() > before {
+            self.edits.submit(edit, session, jobs);
+            self.collect_errors();
+        }
+    }
+
+    /// Update the selection for a click on panel `path`'s row with
+    /// `modifiers` held, `order` being the panels of the rows on screen:
+    /// Shift selects the rows from the anchor to it (added to the selection
+    /// with Ctrl or Cmd held too), Ctrl or Cmd adds or takes it away, a
+    /// plain click selects it alone. Whether it was a plain click.
+    fn click(&mut self, path: &Path, modifiers: Modifiers, order: &[PathBuf]) -> bool {
+        let add = modifiers.command || modifiers.ctrl;
+        if modifiers.shift {
+            let at = |p: &Path| order.iter().position(|o| o == p);
+            let range = self.anchor.as_deref().and_then(at).zip(at(path));
+            if let Some((a, b)) = range {
+                if !add {
+                    self.selection.clear();
+                }
+                let (from, to) = (a.min(b), a.max(b));
+                self.selection.extend(order[from..=to].iter().cloned());
+                return false;
+            }
+        } else if add {
+            if !self.selection.remove(path) {
+                self.selection.insert(path.to_path_buf());
+            }
+            self.anchor = Some(path.to_path_buf());
+            return false;
+        }
+        self.select_only(path, false);
+        true
+    }
+
+    /// The panels a row's action on row `id` acts on: the selection (as
+    /// `shown` has it) if the row is selected, else the row's panel.
+    fn targets(&self, shown: &PanelsEdit, id: u64) -> BTreeSet<PathBuf> {
+        let Some(path) = panel_of(shown, id) else {
+            return BTreeSet::new();
+        };
+        if self.selection.contains(path) {
+            self.selection.clone()
+        } else {
+            BTreeSet::from([path.to_path_buf()])
+        }
+    }
+
+    /// Forget selected panels `shown` no longer has.
+    fn keep_selection(&mut self, shown: &PanelsEdit) {
+        if self.selection.is_empty() && self.anchor.is_none() {
+            return;
+        }
+        let present: BTreeSet<&Path> = shown.panels.iter().map(|p| p.path.as_path()).collect();
+        self.selection.retain(|p| present.contains(p.as_path()));
+        if self.anchor.as_deref().is_some_and(|a| !present.contains(a)) {
+            self.anchor = None;
         }
     }
 
@@ -552,18 +873,6 @@ impl PanelList {
     /// [`PanelEdits::apply_waiting`].
     pub fn apply_waiting(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
         self.edits.apply_waiting(session, jobs);
-    }
-
-    /// Apply `edit` from outside the list (an Undo toast): as any edit,
-    /// queued behind running jobs.
-    pub(crate) fn submit_edit(
-        &mut self,
-        edit: PanelsEdit,
-        session: &mut OpenSession,
-        jobs: &mut JobRunner,
-    ) {
-        self.edits.submit(edit, session, jobs);
-        self.collect_errors();
     }
 
     /// The toasts raised since last asked (an edit refused while the list
@@ -722,7 +1031,12 @@ impl PanelList {
         // Fill the column, whatever shows: a resizable panel keeps the width
         // its contents take, so a short hint would shrink it for good.
         ui.set_min_width(ui.available_width());
+        if !Popup::is_any_open(&ctx) {
+            // The menu it was typed in closed.
+            self.naming = None;
+        }
         let shown = self.edits.shown(session);
+        self.keep_selection(&shown);
         let mut out = PanelListOutput::default();
         let mut edit: Option<PanelsEdit> = None;
         self.toolbar(ui, &ctx, &shown, &mut edit);
@@ -736,59 +1050,126 @@ impl PanelList {
                 Type::Body,
                 "No panels yet: add files, or drop panel files anywhere on the window.",
             ));
-        } else {
-            let data = self.sections(&shown, session, report);
-            let sections: Vec<Section<'_>> = data.iter().map(SectionData::section).collect();
-            let mut remove: Option<u64> = None;
-            let table = &mut self.table;
-            let events = egui::ScrollArea::vertical()
-                .id_salt("panel-list-rows")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    sectioned_table(ui, table, &COLUMNS, &sections, |ui, id| {
-                        if ui.button("Remove").clicked() {
-                            remove = Some(id);
-                        }
-                    })
-                })
-                .inner;
-            let path = |id: u64| panel_of(&shown, id).map(|p| p.to_path_buf());
-            for event in events {
-                match event {
-                    TableEvent::Hover(id) => out.hovered = path(id),
-                    TableEvent::Click { id, .. } => out.clicked = path(id),
-                    TableEvent::Drop { .. } => {}
-                }
-            }
-            if let Some(id) = remove
-                && let Some(e) = self.remove(&shown, id)
-            {
-                edit = Some(e);
-            }
+        } else if let Some(e) = self.table_ui(ui, &shown, session, report, &mut out) {
+            edit = Some(e);
         }
         if let Some(e) = edit {
             self.edits.submit(e, session, jobs);
+        }
+        for p in &out.removed {
+            self.selection.remove(p);
         }
         out.toasts = self.take_toasts();
         out
     }
 
-    /// The edit removing row `id`'s panel from `shown`, with a toast that
-    /// puts it back.
-    fn remove(&mut self, shown: &PanelsEdit, id: u64) -> Option<PanelsEdit> {
-        let at = shown.panels.iter().position(|p| row_id(&p.path) == id)?;
+    /// The table of `shown`'s panels, and what was done in it (reported in
+    /// `out`): the selection follows clicks; a row's menu or rows dropped
+    /// on a heading give the edit returned.
+    fn table_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        shown: &PanelsEdit,
+        session: &OpenSession,
+        report: Option<&ChecksReport>,
+        out: &mut PanelListOutput,
+    ) -> Option<PanelsEdit> {
+        let placed = shown
+            .grouping
+            .enabled
+            .then(|| place(shown, self.resolved.as_ref().map(|(i, g)| (i, g))));
+        let data = self.sections(shown, placed.as_ref(), session, report);
+        let sections: Vec<Section<'_>> = data.iter().map(SectionData::section).collect();
+        // The rows on screen as the table is drawn (for a Shift range).
+        let order = shown_ids(&self.table, &sections);
+        // Groups to move to, with grouping on.
+        let groups: Option<Vec<String>> =
+            placed.as_ref().map(|p| p.groups.keys().cloned().collect());
+        let mut action: Option<(u64, RowAction)> = None;
+        let (table, naming) = (&mut self.table, &mut self.naming);
+        let events = egui::ScrollArea::vertical()
+            .id_salt("panel-list-rows")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                sectioned_table(ui, table, &COLUMNS, &sections, |ui, id| {
+                    if let Some(a) = row_menu(ui, id, groups.as_deref(), naming) {
+                        action = Some((id, a));
+                    }
+                })
+            })
+            .inner;
+        let path = |id: u64| panel_of(shown, id).map(Path::to_path_buf);
+        let mut edit = None;
+        for event in events {
+            match event {
+                TableEvent::Hover(id) => out.hovered = path(id),
+                TableEvent::Click { id, modifiers } => {
+                    let Some(p) = path(id) else { continue };
+                    let order: Vec<PathBuf> = order.iter().filter_map(|&i| path(i)).collect();
+                    if self.click(&p, modifiers, &order) {
+                        out.clicked = Some(p);
+                    }
+                }
+                TableEvent::Drop { ids, section } => {
+                    let targets = ids.iter().filter_map(|&i| path(i)).collect();
+                    if let Some(placed) = &placed
+                        && let Some(e) = moved(shown, placed, &targets, Some(&section))
+                    {
+                        edit = Some(e);
+                    }
+                }
+            }
+        }
+        let Some((id, action)) = action else {
+            return edit;
+        };
+        let targets = self.targets(shown, id);
+        match action {
+            RowAction::MoveTo(to) => placed
+                .as_ref()
+                .and_then(|placed| moved(shown, placed, &targets, to.as_deref()))
+                .or(edit),
+            RowAction::Remove => match self.remove(shown, &targets) {
+                Some((e, removed)) => {
+                    out.removed = removed;
+                    Some(e)
+                }
+                None => edit,
+            },
+        }
+    }
+
+    /// The edit removing `targets` from `shown`, with a toast whose Undo
+    /// puts back just those (each where it was), and the panels removed;
+    /// `None` if `shown` has none of them.
+    fn remove(
+        &mut self,
+        shown: &PanelsEdit,
+        targets: &BTreeSet<PathBuf>,
+    ) -> Option<(PanelsEdit, Vec<PathBuf>)> {
+        let removed: Vec<(usize, PanelEntry)> = shown
+            .panels
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| targets.contains(&p.path))
+            .map(|(at, p)| (at, p.clone()))
+            .collect();
+        if removed.is_empty() {
+            return None;
+        }
         let mut edit = shown.clone();
-        edit.panels.remove(at);
+        edit.panels.retain(|p| !targets.contains(&p.path));
+        let paths = removed.iter().map(|(_, p)| p.path.clone()).collect();
         self.toasts.push(WindowToast {
             toast: Toast {
                 tone: Tone::Neutral,
-                title: removed_title(1),
+                title: removed_title(removed.len()),
                 detail: None,
                 action: Some("Undo".into()),
             },
-            undo: Some(Undo::Panels(shown.clone())),
+            undo: Some(Undo::Readd(removed)),
         });
-        Some(edit)
+        Some((edit, paths))
     }
 
     /// Add files, Add folder, More (Type a path…), and Group by with the
@@ -1023,32 +1404,42 @@ impl PanelList {
         }
     }
 
-    /// The table's sections for `shown` (see the module docs).
+    /// The table's sections for `shown`, its panels `placed` in groups with
+    /// grouping on (see the module docs).
     fn sections(
         &self,
         shown: &PanelsEdit,
+        placed: Option<&Placement>,
         session: &OpenSession,
         report: Option<&ChecksReport>,
     ) -> Vec<SectionData> {
         let cfg = &session.mosaic.config;
         let problems = panel_problems(report, cfg);
-        let row = |path: &Path| self.row(path, problems.get(path));
-        if !shown.grouping.enabled {
+        // Panels moved by hand (which counts with grouping on only).
+        let manual: BTreeSet<&Path> = shown
+            .panels
+            .iter()
+            .filter(|p| p.manual_group.is_some())
+            .map(|p| p.path.as_path())
+            .collect();
+        let row = |path: &Path| {
+            let mut row = self.row(path, problems.get(path));
+            row.selected = self.selection.contains(path);
+            row.highlighted = self.highlight.as_deref() == Some(path);
+            if placed.is_some() && manual.contains(path) {
+                row.tag = Some(BY_HAND);
+            }
+            row
+        };
+        let Some(placed) = placed else {
             let rows = shown.panels.iter().map(|p| row(&p.path)).collect();
             return vec![SectionData {
                 heading: None,
                 rows,
             }];
-        }
-        let placed = place(shown, self.resolved.as_ref().map(|(i, g)| (i, g)));
+        };
         let mut out = Vec::new();
         if !placed.ungrouped.is_empty() {
-            let manual: BTreeSet<&Path> = shown
-                .panels
-                .iter()
-                .filter(|p| p.manual_group.is_some())
-                .map(|p| p.path.as_path())
-                .collect();
             // A reason only for panels the rule left out (not those still
             // being read, nor those put there by hand).
             let by_rule = placed
@@ -1130,6 +1521,9 @@ impl PanelList {
             id: row_id(path),
             cells,
             problem: (!texts.is_empty()).then(|| texts.join("\n\n")),
+            tag: None,
+            selected: false,
+            highlighted: false,
         }
     }
 
@@ -1180,6 +1574,23 @@ impl PanelList {
 
     fn pending(&self) -> Option<&PanelsEdit> {
         self.edits.pending()
+    }
+
+    /// The selected panels.
+    pub(crate) fn selection(&self) -> &BTreeSet<PathBuf> {
+        &self.selection
+    }
+
+    /// Apply `edit` from outside the list: as any edit, queued behind
+    /// running jobs.
+    pub(crate) fn submit_edit(
+        &mut self,
+        edit: PanelsEdit,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        self.edits.submit(edit, session, jobs);
+        self.collect_errors();
     }
 }
 

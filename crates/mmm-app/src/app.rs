@@ -1560,7 +1560,12 @@ mod tests {
         assert_eq!(previous.panels.len(), 8);
         // Remove two panels, and offer to put them back.
         let mut fewer = previous.clone();
-        fewer.panels.truncate(6);
+        let removed: Vec<_> = fewer
+            .panels
+            .drain(6..)
+            .enumerate()
+            .map(|(i, p)| (6 + i, p))
+            .collect();
         {
             let shell = h.state_mut();
             let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
@@ -1572,7 +1577,7 @@ mod tests {
                     detail: None,
                     action: Some("Undo".into()),
                 },
-                undo: Some(Undo::Panels(previous.clone())),
+                undo: Some(Undo::Readd(removed)),
             });
         }
         assert_eq!(on_disk(&dir), 6);

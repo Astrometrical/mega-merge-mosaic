@@ -28,7 +28,7 @@ use crate::widgets::{
     ButtonKind, ChoiceChip, MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast,
     Toasts, chip, choice_chip, icon_button, notes_view, overline, progress, property_grid,
     property_row, property_row_numeric, property_row_ui, segmented, session_card, status,
-    step_strip, text_input,
+    step_strip, submenu, text_input,
 };
 
 /// The gallery's interactive state.
@@ -258,9 +258,12 @@ fn table_section(ui: &mut Ui, state: &mut TableState, selection: &mut BTreeSet<u
         },
     ];
     let events = sectioned_table(ui, state, &columns, &sections, |ui, _id| {
-        ui.menu_button("Move to", |ui| {
-            let _ = ui.button("Ha");
-            let _ = ui.button("OIII");
+        submenu(ui, "Move to", |ui| {
+            for group in ["Ha", "OIII"] {
+                if ui.button(group).clicked() {
+                    ui.close();
+                }
+            }
         });
         let _ = ui.button("Remove");
     });

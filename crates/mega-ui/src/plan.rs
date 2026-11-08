@@ -5,7 +5,9 @@
 //! image [`Layer`]s stretched over it. Drag pans, the scroll wheel zooms about
 //! the cursor, a click reports the topmost item under the pointer and a
 //! double-click zooms to it. `+`, `−`, `Home` and `Zoom to selection` buttons
-//! sit top-left.
+//! sit top-left. A selected item and a highlighted one (pointed at
+//! elsewhere, e.g. its row in a list) are outlined whether or not outlines
+//! are shown, the selection over the highlight.
 
 use egui::{
     Align2, Color32, Event, FontId, MouseWheelUnit, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
@@ -27,6 +29,9 @@ const ZOOM_MARGIN: f64 = 0.05;
 const MARKER_RADIUS: f32 = 9.0;
 /// Dash and gap of the outline of an item with no layers yet, in points.
 const DASH: (f32, f32) = (6.0, 4.0);
+/// Strength of a highlighted item's outline: the selection outline
+/// ([`SELECTED_STROKE`] in the light accent) at part opacity.
+const HIGHLIGHT_STRENGTH: f32 = 0.6;
 
 /// One image drawn in a [`PlacedItem`], stretched over the item's rect.
 ///
@@ -81,6 +86,10 @@ pub struct PlacedItem {
     /// Drawn with a 2.5 px accent outline, whether or not outlines are shown;
     /// the target of "Zoom to selection".
     pub selected: bool,
+    /// Highlighted (e.g. its row is hovered in a list beside the canvas):
+    /// drawn with the selection outline at part strength, whether or not
+    /// outlines are shown, under the selection outline of a selected item.
+    pub highlighted: bool,
 }
 
 impl PlacedItem {
@@ -322,8 +331,9 @@ impl PlanCanvas {
         }
     }
 
-    /// Images in slice order, then outlines, labels and markers over them
-    /// (selected outlines last, so they are never hidden).
+    /// Images in slice order, then outlines, labels and markers over them,
+    /// then highlighted outlines and selected outlines last (so they are
+    /// never hidden; the selection over the highlight).
     fn paint(
         &self,
         painter: &egui::Painter,
@@ -355,7 +365,7 @@ impl PlanCanvas {
             if !r.intersects(rect) {
                 continue;
             }
-            if show_outlines && !it.selected {
+            if show_outlines && !it.selected && !it.highlighted {
                 let stroke = Stroke::new(OUTLINE_STROKE, it.outline);
                 if it.layers.is_empty() {
                     let ring = [
@@ -393,6 +403,11 @@ impl PlanCanvas {
                     palette::TEXT_STRONG,
                 );
             }
+        }
+        let highlight = palette::ACCENT_400.gamma_multiply(HIGHLIGHT_STRENGTH);
+        for it in items.iter().filter(|it| it.highlighted) {
+            let stroke = Stroke::new(SELECTED_STROKE, highlight);
+            painter.rect_stroke(screen(it.rect), 0.0, stroke, StrokeKind::Inside);
         }
         for it in items.iter().filter(|it| it.selected) {
             let stroke = Stroke::new(SELECTED_STROKE, palette::ACCENT_400);

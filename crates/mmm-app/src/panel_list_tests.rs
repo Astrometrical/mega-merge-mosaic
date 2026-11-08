@@ -928,12 +928,15 @@ fn row_ids_stay_with_their_panels() {
         h.get_by_role_and_label(Role::ListItem, "Ha_2.xisf")
             .is_focused()
     );
-    // An earlier panel goes (as an Undo might take it away).
+    // An earlier panel goes (from elsewhere: the list only shows it).
     {
         let s = h.state_mut();
         let mut edit = PanelsEdit::of(&s.session);
         edit.panels.remove(0);
-        s.w.undo(Undo::Panels(edit), &mut s.session, &mut s.jobs);
+        assert!(matches!(
+            edit.apply(&mut s.session, &mut s.jobs),
+            Applied::Done
+        ));
     }
     wait(&mut h, |s| {
         s.settled() && s.session.mosaic.config.panels.len() == 7
@@ -1025,6 +1028,491 @@ fn rows_show_their_problems() {
         tip.rect()
     );
     assert_eq!(rows(&h), 2 * ROLL_UP_ROWS + 1);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Click panel `name`'s row with `modifiers` held.
+fn click_row(h: &mut Harness<'static, State>, name: &str, modifiers: egui::Modifiers) {
+    h.get_by_role_and_label(Role::ListItem, name)
+        .click_modifiers(modifiers);
+    steps(h);
+}
+
+/// Open panel `name`'s actions menu.
+fn open_menu(h: &mut Harness<'static, State>, name: &str) {
+    h.get_by_role_and_label(Role::ListItem, name).hover();
+    steps(h);
+    h.get_by_label("Panel actions").click();
+    steps(h);
+}
+
+/// Move panel `name` (with the selection, if it is selected) to `target`
+/// through its menu: a group, "No group" or "Let the rule decide".
+fn move_row(h: &mut Harness<'static, State>, name: &str, target: &str) {
+    open_menu(h, name);
+    h.get_by_role_and_label(Role::Button, "Move to").click();
+    steps(h);
+    h.get_by_role_and_label(Role::Button, target).click();
+    steps(h);
+}
+
+/// The selected panels' names, sorted.
+fn selection(h: &Harness<'static, State>) -> Vec<String> {
+    let list = h.state().list();
+    let mut names: Vec<String> = list.selection().iter().map(|p| name_of(p)).collect();
+    names.sort();
+    names
+}
+
+/// Whether panel `name`'s row reads as selected.
+fn is_selected(h: &Harness<'static, State>, name: &str) -> bool {
+    h.get_by_role_and_label(Role::ListItem, name)
+        .accesskit_node()
+        .is_selected()
+        == Some(true)
+}
+
+/// Panel `name`'s manual group in the session.
+fn manual(s: &State, name: &str) -> Option<String> {
+    let panels = &s.session.mosaic.config.panels;
+    let p = panels.iter().find(|p| name_of(&p.path) == name);
+    p.unwrap_or_else(|| panic!("no panel {name}"))
+        .manual_group
+        .clone()
+}
+
+/// Drag from `from` to `to` (screen), as a pointer does.
+fn drag(h: &mut Harness<'static, State>, from: egui::Pos2, to: egui::Pos2) {
+    h.drag_at(from);
+    steps(h);
+    h.hover_at(from + egui::vec2(0.0, mega_ui::theme::tokens::space::L));
+    steps(h);
+    h.hover_at(to);
+    steps(h);
+    h.drop_at(to);
+    steps(h);
+}
+
+/// Panel `path`'s centre on the plan, as last drawn.
+fn on_plan(h: &Harness<'static, State>, path: &Path) -> egui::Pos2 {
+    let plan = h.state().w.plan();
+    let items = plan.items();
+    let it = items.iter().find(|i| i.path == path).expect("drawn").rect;
+    plan.to_screen(((it[0] + it[2]) / 2.0, (it[1] + it[3]) / 2.0))
+        .unwrap()
+}
+
+/// Click panel `path` on the plan.
+fn click_plan(h: &mut Harness<'static, State>, path: &Path) {
+    let p = on_plan(h, path);
+    h.hover_at(p);
+    h.drag_at(p);
+    h.event(egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    steps(h);
+}
+
+/// The fill painted behind panel `name`'s row, if any.
+fn row_fill(h: &Harness<'static, State>, name: &str) -> Option<egui::Color32> {
+    let row = h.get_by_role_and_label(Role::ListItem, name).rect();
+    let near = |r: Rect| (r.min - row.min).length() < 0.5 && (r.max - row.max).length() < 0.5;
+    h.output().shapes.iter().find_map(|c| match &c.shape {
+        egui::Shape::Rect(r) if r.fill != egui::Color32::TRANSPARENT && near(r.rect) => {
+            Some(r.fill)
+        }
+        _ => None,
+    })
+}
+
+/// Run the undo of the `i`th toast raised.
+fn undo_toast(h: &mut Harness<'static, State>, i: usize) {
+    let s = h.state_mut();
+    let undo = s.toasts[i].undo.clone().expect("an undo");
+    s.w.undo(undo, &mut s.session, &mut s.jobs);
+}
+
+#[test]
+fn shift_and_ctrl_extend_the_selection() {
+    use egui::Modifiers;
+    let root = temp_dir("list-select");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    click_row(&mut h, "Ha_1.xisf", Modifiers::NONE);
+    assert_eq!(selection(&h), ["Ha_1.xisf"]);
+    assert!(is_selected(&h, "Ha_1.xisf"));
+    // Shift: the rows on screen from the anchor (Ha_3 is rolled up).
+    click_row(&mut h, "OIII_1.xisf", Modifiers::SHIFT);
+    assert_eq!(
+        selection(&h),
+        ["Ha_1.xisf", "Ha_2.xisf", "OIII_0.xisf", "OIII_1.xisf"]
+    );
+    assert!(is_selected(&h, "OIII_0.xisf") && !is_selected(&h, "Ha_0.xisf"));
+    // Ctrl (Cmd): one row in or out.
+    click_row(&mut h, "Ha_2.xisf", Modifiers::COMMAND);
+    click_row(&mut h, "Ha_0.xisf", Modifiers::CTRL);
+    assert_eq!(
+        selection(&h),
+        ["Ha_0.xisf", "Ha_1.xisf", "OIII_0.xisf", "OIII_1.xisf"]
+    );
+    assert!(!is_selected(&h, "Ha_2.xisf"));
+    // Shift from the new anchor, adding with Ctrl held.
+    click_row(&mut h, "OIII_2.xisf", Modifiers::SHIFT | Modifiers::COMMAND);
+    assert_eq!(selection(&h).len(), 6, "{:?}", selection(&h));
+    // A plain click selects that row only (and the panel on the plan).
+    click_row(&mut h, "OIII_2.xisf", Modifiers::NONE);
+    assert_eq!(selection(&h), ["OIII_2.xisf"]);
+    let oiii_2 = h.state().session.mosaic.config.panels[6].path.clone();
+    assert_eq!(h.state().w.plan().selected(), Some(oiii_2.as_path()));
+    // Esc clears it.
+    h.key_press(egui::Key::Escape);
+    steps(&mut h);
+    assert!(selection(&h).is_empty());
+    assert!(!is_selected(&h, "OIII_2.xisf"));
+    assert_eq!(h.state().w.plan().selected(), None);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn move_to_puts_rows_in_a_group_by_hand() {
+    use egui::Modifiers;
+    use mmm_core::mosaic::UNGROUPED;
+    let root = temp_dir("list-move");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    click_row(&mut h, "Ha_0.xisf", Modifiers::NONE);
+    click_row(&mut h, "Ha_1.xisf", Modifiers::COMMAND);
+    // The menu of a selected row moves the selection.
+    move_row(&mut h, "Ha_0.xisf", "OIII");
+    wait(&mut h, |s| s.settled() && manual(s, "Ha_1.xisf").is_some());
+    let s = h.state();
+    assert_eq!(manual(s, "Ha_0.xisf").as_deref(), Some("OIII"));
+    assert_eq!(manual(s, "Ha_1.xisf").as_deref(), Some("OIII"));
+    assert_eq!(on_disk(s).panels, s.session.mosaic.config.panels, "saved");
+    heading(&h, "OIII · 6");
+    heading(&h, "Ha · 2");
+    // Tagged by hand; the FILTER cell keeps the header's value.
+    assert_eq!(cells(&h, "Ha_0.xisf")[..2], ["by hand", "Ha"]);
+    assert_eq!(cells(&h, "OIII_0.xisf")[0], "OIII", "no tag");
+    let ha_0 = h.get_by_role_and_label(Role::ListItem, "Ha_0.xisf").rect();
+    assert!(ha_0.top() > heading(&h, "OIII · 6").rect().top());
+    // The selection moved with them.
+    assert_eq!(selection(&h), ["Ha_0.xisf", "Ha_1.xisf"]);
+    // An unselected row's menu moves that row only: to No group.
+    move_row(&mut h, "OIII_0.xisf", "No group");
+    wait(&mut h, |s| {
+        s.settled() && manual(s, "OIII_0.xisf").is_some()
+    });
+    assert_eq!(manual(h.state(), "OIII_0.xisf").as_deref(), Some(UNGROUPED));
+    assert_eq!(manual(h.state(), "Ha_0.xisf").as_deref(), Some("OIII"));
+    heading(&h, "No group · 1");
+    assert_eq!(warning(&h, "No group · 1"), None, "put there by hand");
+    assert_eq!(cells(&h, "OIII_0.xisf")[..2], ["by hand", "OIII"]);
+    // Let the rule decide: back where the FILTER header puts it.
+    move_row(&mut h, "Ha_0.xisf", "Let the rule decide");
+    wait(&mut h, |s| s.settled() && manual(s, "Ha_1.xisf").is_none());
+    assert_eq!(manual(h.state(), "Ha_0.xisf"), None);
+    heading(&h, "Ha · 4");
+    assert_eq!(cells(&h, "Ha_0.xisf")[0], "Ha", "no tag");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn new_group_takes_the_selection() {
+    use egui::Modifiers;
+    let root = temp_dir("list-new-group");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    click_row(&mut h, "OIII_0.xisf", Modifiers::NONE);
+    click_row(&mut h, "OIII_1.xisf", Modifiers::COMMAND);
+    open_menu(&mut h, "OIII_1.xisf");
+    h.get_by_role_and_label(Role::Button, "Move to").click();
+    steps(&mut h);
+    h.get_by_role_and_label(Role::Button, "New group…").click();
+    steps(&mut h);
+    // A name typed in the menu itself.
+    h.get_by_role_and_label(Role::TextInput, "New group name")
+        .focus();
+    steps(&mut h);
+    h.get_by_role_and_label(Role::TextInput, "New group name")
+        .type_text("Red");
+    steps(&mut h);
+    assert!(manual(h.state(), "OIII_0.xisf").is_none(), "on Enter only");
+    h.key_press(egui::Key::Enter);
+    wait(&mut h, |s| {
+        s.settled() && manual(s, "OIII_1.xisf").is_some()
+    });
+    let s = h.state();
+    assert_eq!(manual(s, "OIII_0.xisf").as_deref(), Some("Red"));
+    assert_eq!(manual(s, "OIII_1.xisf").as_deref(), Some("Red"));
+    assert_eq!(manual(s, "OIII_2.xisf"), None);
+    assert_eq!(on_disk(s).panels, s.session.mosaic.config.panels);
+    heading(&h, "Red · 2");
+    heading(&h, "OIII · 2");
+    assert!(h.query_by_label("New group name").is_none(), "menu closed");
+    // The new group has its colour.
+    let colors = load_group_colors(&h.state().session.mosaic.config.ui);
+    assert!(colors.contains_key("Red"), "{colors:?}");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropping_rows_on_a_heading_moves_them() {
+    use egui::Modifiers;
+    let root = temp_dir("list-drop");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    click_row(&mut h, "Ha_0.xisf", Modifiers::NONE);
+    click_row(&mut h, "Ha_1.xisf", Modifiers::COMMAND);
+    let row = |h: &Harness<'static, State>, name: &str| {
+        h.get_by_role_and_label(Role::ListItem, name)
+            .rect()
+            .center()
+    };
+    // A selected row carries the selection.
+    let (from, to) = (
+        row(&h, "Ha_0.xisf"),
+        heading(&h, "OIII · 4").rect().center(),
+    );
+    drag(&mut h, from, to);
+    wait(&mut h, |s| s.settled() && manual(s, "Ha_1.xisf").is_some());
+    assert_eq!(manual(h.state(), "Ha_0.xisf").as_deref(), Some("OIII"));
+    assert_eq!(manual(h.state(), "Ha_1.xisf").as_deref(), Some("OIII"));
+    heading(&h, "OIII · 6");
+    assert_eq!(cells(&h, "Ha_1.xisf")[..2], ["by hand", "Ha"]);
+    // A row dropped on its own section does not move.
+    let edits = h.state().session.mosaic.config.provenance.len();
+    let (from, to) = (
+        row(&h, "OIII_0.xisf"),
+        heading(&h, "OIII · 6").rect().center(),
+    );
+    drag(&mut h, from, to);
+    wait(&mut h, State::settled);
+    assert_eq!(manual(h.state(), "OIII_0.xisf"), None);
+    assert_eq!(h.state().session.mosaic.config.provenance.len(), edits);
+    // An unselected row carries itself.
+    let (from, to) = (
+        row(&h, "OIII_0.xisf"),
+        heading(&h, "Ha · 2").rect().center(),
+    );
+    drag(&mut h, from, to);
+    wait(&mut h, |s| {
+        s.settled() && manual(s, "OIII_0.xisf").is_some()
+    });
+    assert_eq!(manual(h.state(), "OIII_0.xisf").as_deref(), Some("Ha"));
+    assert_eq!(manual(h.state(), "OIII_1.xisf"), None);
+    heading(&h, "Ha · 3");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn remove_offers_undo() {
+    use egui::Modifiers;
+    use mmm_core::mosaic::UNGROUPED;
+    let root = temp_dir("list-remove-undo");
+    let mut session = two_group_session(&root);
+    // OIII_0 is pinned to its group by hand.
+    session.mosaic.config.panels[4].manual_group = Some("OIII".into());
+    session.mosaic.save().unwrap();
+    let before = session.mosaic.config.panels.clone();
+    let mut h = harness(session, vec![], runner());
+    wait(&mut h, State::settled);
+    click_row(&mut h, "Ha_0.xisf", Modifiers::NONE);
+    click_row(&mut h, "OIII_0.xisf", Modifiers::COMMAND);
+    remove_row(&mut h, "OIII_0.xisf");
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 6
+    });
+    for name in ["Ha_0.xisf", "OIII_0.xisf"] {
+        let row = h.query_by_role_and_label(Role::ListItem, name);
+        assert!(row.is_none(), "{name} shows");
+    }
+    assert_eq!(on_disk(h.state()).panels.len(), 6);
+    let toast = &h.state().toasts[0];
+    assert_eq!(toast.toast.title, "Removed 2 panels");
+    assert_eq!(toast.toast.action.as_deref(), Some("Undo"));
+    assert!(matches!(&toast.undo, Some(Undo::Readd(r)) if r.len() == 2));
+    // A later edit of another panel...
+    move_row(&mut h, "Ha_1.xisf", "No group");
+    wait(&mut h, |s| s.settled() && manual(s, "Ha_1.xisf").is_some());
+    // ...survives the Undo, which puts back only what it removed: where
+    // they were, as they were.
+    undo_toast(&mut h, 0);
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 8
+    });
+    let mut want = before;
+    want[1].manual_group = Some(UNGROUPED.into());
+    assert_eq!(h.state().session.mosaic.config.panels, want);
+    assert_eq!(on_disk(h.state()).panels, want);
+    h.get_by_role_and_label(Role::ListItem, "Ha_0.xisf");
+    assert_eq!(cells(&h, "OIII_0.xisf")[..2], ["by hand", "OIII"]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn delete_removes_the_selection() {
+    use egui::Modifiers;
+    let root = temp_dir("list-delete");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    click_row(&mut h, "Ha_0.xisf", Modifiers::NONE);
+    click_row(&mut h, "Ha_2.xisf", Modifiers::COMMAND);
+    // Not while a text field has the keyboard.
+    h.get_by_role_and_label(Role::TextInput, "Header key")
+        .focus();
+    steps(&mut h);
+    h.key_press(egui::Key::Delete);
+    steps(&mut h);
+    h.key_press(egui::Key::Escape);
+    steps(&mut h);
+    assert_eq!(h.state().session.mosaic.config.panels.len(), 8);
+    assert_eq!(selection(&h), ["Ha_0.xisf", "Ha_2.xisf"]);
+    h.key_press(egui::Key::Delete);
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 6
+    });
+    let left = ["Ha_1", "Ha_3", "OIII_0", "OIII_1", "OIII_2", "OIII_3"];
+    let left: Vec<String> = left.iter().map(|n| format!("{n}.xisf")).collect();
+    assert_eq!(h.state().panel_names(), left);
+    let toast = h.state().toasts.last().expect("a toast");
+    assert_eq!(toast.toast.title, "Removed 2 panels");
+    assert!(selection(&h).is_empty());
+    // Nothing selected: Delete does nothing.
+    h.key_press(egui::Key::Delete);
+    steps(&mut h);
+    assert_eq!(h.state().session.mosaic.config.panels.len(), 6);
+    assert_eq!(h.state().toasts.len(), 1);
+    // Nor while the list is closed.
+    click_row(&mut h, "Ha_1.xisf", Modifiers::NONE);
+    h.state_mut().w.panel_list_open = false;
+    steps(&mut h);
+    h.key_press(egui::Key::Delete);
+    steps(&mut h);
+    assert_eq!(h.state().session.mosaic.config.panels.len(), 6);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_row_click_selects_the_panel_in_the_plan() {
+    let (root, session, jobs) = crate::jobs::tests::analyzed("list-row-plan");
+    let ha_1 = session.mosaic.config.panels[1].path.clone();
+    let ha_3 = session.mosaic.config.panels[3].path.clone();
+    let mut h = harness(session, vec![], jobs);
+    wait(&mut h, |s| s.settled() && !s.w.plan().items().is_empty());
+    click_row(&mut h, "Ha_1.xisf", egui::Modifiers::NONE);
+    assert_eq!(h.state().w.plan().selected(), Some(ha_1.as_path()));
+    // Its details show in the inspector's Panels section.
+    assert!(h.state().w.inspector().is_open("panels"));
+    h.get_by_label(&ha_1.display().to_string());
+    // A click on the plan selects its row, brought into view (Ha_3 was
+    // rolled up).
+    let hidden = h.query_by_role_and_label(Role::ListItem, "Ha_3.xisf");
+    assert!(hidden.is_none());
+    click_plan(&mut h, &ha_3);
+    assert_eq!(h.state().w.plan().selected(), Some(ha_3.as_path()));
+    assert_eq!(selection(&h), ["Ha_3.xisf"]);
+    assert!(is_selected(&h, "Ha_3.xisf"));
+    assert!(!is_selected(&h, "Ha_1.xisf"));
+    let list = h.state().w.list_rect.unwrap();
+    let row = h.get_by_role_and_label(Role::ListItem, "Ha_3.xisf").rect();
+    assert!(list.contains_rect(row), "{row:?} not in {list:?}");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hover_links_rows_and_outlines() {
+    let (root, session, jobs) = crate::jobs::tests::analyzed("list-hover");
+    let ha_2 = session.mosaic.config.panels[2].path.clone();
+    let mut h = harness(session, vec![], jobs);
+    wait(&mut h, |s| s.settled() && !s.w.plan().items().is_empty());
+    let lit = |h: &Harness<'static, State>| -> Vec<String> {
+        let items = h.state().w.plan().items();
+        let lit = items.iter().filter(|i| i.highlighted);
+        lit.map(|i| name_of(&i.path)).collect()
+    };
+    assert!(lit(&h).is_empty());
+    // A row's panel lights up on the plan.
+    h.get_by_role_and_label(Role::ListItem, "Ha_1.xisf").hover();
+    steps(&mut h);
+    assert_eq!(lit(&h), ["Ha_1.xisf"]);
+    // Only panels the plan shows (it shows Ha).
+    h.get_by_role_and_label(Role::ListItem, "OIII_1.xisf")
+        .hover();
+    steps(&mut h);
+    assert!(lit(&h).is_empty());
+    // A panel pointed at on the plan lights up its row.
+    let p = on_plan(&h, &ha_2);
+    h.hover_at(p);
+    steps(&mut h);
+    assert!(lit(&h).is_empty(), "no row is hovered");
+    assert!(row_fill(&h, "Ha_2.xisf").is_some(), "Ha_2's row lit");
+    for name in ["Ha_0.xisf", "Ha_1.xisf", "OIII_0.xisf"] {
+        assert_eq!(row_fill(&h, name), None, "{name} lit");
+    }
+    // Pointing elsewhere: nothing lit.
+    h.hover_at(egui::pos2(WINDOW.x - 10.0, WINDOW.y - 10.0));
+    steps(&mut h);
+    assert_eq!(row_fill(&h, "Ha_2.xisf"), None);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn removing_the_selected_panel_clears_the_selection() {
+    use egui::Modifiers;
+    let (root, session, jobs) = crate::jobs::tests::analyzed("list-remove-selected");
+    let before = session.mosaic.config.panels.clone();
+    let ha_1 = before[1].path.clone();
+    let mut h = harness(session, vec![], jobs);
+    wait(&mut h, |s| s.settled() && !s.w.plan().items().is_empty());
+    click_row(&mut h, "Ha_1.xisf", Modifiers::NONE);
+    assert_eq!(h.state().w.plan().selected(), Some(ha_1.as_path()));
+    remove_row(&mut h, "Ha_1.xisf");
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 7
+    });
+    assert!(selection(&h).is_empty());
+    assert_eq!(h.state().w.plan().selected(), None);
+    let shown = ha_1.display().to_string();
+    assert!(h.query_by_label(&shown).is_none(), "its details are gone");
+    // Every panel: open OIII in full, select from first to last, Delete.
+    h.get_by_label("… 1 more").click();
+    steps(&mut h);
+    click_row(&mut h, "Ha_0.xisf", Modifiers::NONE);
+    click_row(&mut h, "OIII_3.xisf", Modifiers::SHIFT);
+    assert_eq!(selection(&h).len(), 7);
+    h.key_press(egui::Key::Delete);
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.is_empty()
+    });
+    assert!(selection(&h).is_empty());
+    assert_eq!(h.state().w.plan().selected(), None);
+    assert_eq!(h.state().toasts[1].toast.title, "Removed 7 panels");
+    h.get_by_label_contains("No panels yet");
+    // Undo puts them back, then the first removal's Undo puts Ha_1 back
+    // in its place.
+    undo_toast(&mut h, 1);
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 7
+    });
+    assert!(selection(&h).is_empty());
+    undo_toast(&mut h, 0);
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 8
+    });
+    assert_eq!(h.state().session.mosaic.config.panels, before);
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }

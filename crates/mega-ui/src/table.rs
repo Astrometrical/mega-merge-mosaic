@@ -4,7 +4,9 @@
 //! mono face. A section can roll up to its first rows (rows with a problem
 //! always show) behind a "… N more" row. Rows carry an actions menu (shown
 //! on hover or focus), are clicked with modifiers (the caller owns the
-//! selection) and drag onto headings that take drops.
+//! selection; [`shown_ids`] gives the rows on screen, for Shift-click
+//! ranges) and drag onto headings that take drops. [`TableState::reveal`]
+//! brings a row into view (an item selected elsewhere).
 //!
 //! The caller places the table in a `ScrollArea` and persists
 //! [`TableState`]. Rows outside the visible area are laid out but not
@@ -104,6 +106,9 @@ pub struct TableState {
     pub folded: BTreeSet<String>,
     /// Rolling-up sections the user opened in full ("… N more").
     pub expanded: BTreeSet<String>,
+    /// The row to bring into view the next time the table is drawn
+    /// ([`TableState::reveal`]).
+    revealing: Option<u64>,
 }
 
 impl TableState {
@@ -128,6 +133,64 @@ impl TableState {
     pub fn expand(&mut self, id: &str) {
         self.expanded.insert(id.to_owned());
     }
+
+    /// Bring row `id` into view the next time the table is drawn (e.g. its
+    /// item was selected elsewhere): its section unfolds, and opens in
+    /// full if rolled up past the row, and the enclosing `ScrollArea`
+    /// scrolls to it. Once: forgotten after that frame, found or not.
+    pub fn reveal(&mut self, id: u64) {
+        self.revealing = Some(id);
+    }
+
+    /// Whether `section` rolls up (from its heading) as things stand.
+    fn rolled(&self, section: &Section<'_>) -> bool {
+        section
+            .heading
+            .as_ref()
+            .is_some_and(|h| h.rolls_up && !self.is_expanded(h.id))
+    }
+
+    /// Unfold and open what hides the row being revealed, if it is in
+    /// `sections`.
+    fn open_for_reveal(&mut self, sections: &[Section<'_>]) {
+        let Some(id) = self.revealing else {
+            return;
+        };
+        let found = sections
+            .iter()
+            .find_map(|s| Some((s, s.rows.iter().position(|r| r.id == id)?)));
+        let Some((section, at)) = found else {
+            return;
+        };
+        let Some(heading) = &section.heading else {
+            return;
+        };
+        self.folded.remove(heading.id);
+        let (shown, _) = shown_rows(&section.rows, self.rolled(section));
+        if !shown.contains(&at) {
+            self.expand(heading.id);
+        }
+    }
+}
+
+/// Ids of the rows [`sectioned_table`] shows for `sections` with `state`, in
+/// display order: none of a folded section, and of a rolled-up one only
+/// its first [`ROLL_UP_ROWS`] and the rows with a problem. A Shift-click
+/// range runs over these, so it never takes in rows the user cannot see.
+pub fn shown_ids(state: &TableState, sections: &[Section<'_>]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for section in sections {
+        if section
+            .heading
+            .as_ref()
+            .is_some_and(|h| state.is_folded(h.id))
+        {
+            continue;
+        }
+        let (shown, _) = shown_rows(&section.rows, state.rolled(section));
+        out.extend(shown.into_iter().map(|i| section.rows[i].id));
+    }
+    out
 }
 
 /// What the user did in the table this frame.
@@ -228,6 +291,8 @@ pub fn sectioned_table(
 ) -> Vec<TableEvent> {
     let mut events = Vec::new();
     let id = ui.id().with("mega-sectioned-table");
+    state.open_for_reveal(sections);
+    let reveal = state.revealing.take();
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let width = ui.available_width();
@@ -250,12 +315,15 @@ pub fn sectioned_table(
                 if state.is_folded(heading.id) {
                     continue;
                 }
-                rolled = heading.rolls_up && !state.is_expanded(heading.id);
+                rolled = state.rolled(section);
             }
             let (shown, hidden) = shown_rows(&section.rows, rolled);
             for &r in &shown {
                 let row = &section.rows[r];
-                table.row_line(ui, row, &mut row_menu, &mut hovered, &mut events);
+                let rect = table.row_line(ui, row, &mut row_menu, &mut hovered, &mut events);
+                if reveal == Some(row.id) {
+                    ui.scroll_to_rect(rect, None);
+                }
             }
             if hidden > 0
                 && let Some(heading) = &section.heading
@@ -525,7 +593,7 @@ impl Table<'_> {
     }
 
     /// One row: its fill, cells, problem icon and tag, and while hovered or
-    /// focused (or its menu is open) its actions button.
+    /// focused (or its menu is open) its actions button. Returns its rect.
     fn row_line(
         &self,
         ui: &mut Ui,
@@ -533,7 +601,7 @@ impl Table<'_> {
         row_menu: &mut dyn FnMut(&mut Ui, u64),
         hovered: &mut bool,
         events: &mut Vec<TableEvent>,
-    ) {
+    ) -> Rect {
         let rect = allocate_line(ui, self.width, ROW_HEIGHT);
         let id = self.id.with(("row", row.id));
         let response = ui.interact(rect, id, Sense::click_and_drag());
@@ -623,6 +691,7 @@ impl Table<'_> {
         if show_actions {
             self.actions_button(ui, rect, row.id, button_key, menu_id, row_menu);
         }
+        rect
     }
 
     /// Paint the first cell: its text (cut short to leave room), then the

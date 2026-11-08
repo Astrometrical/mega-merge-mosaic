@@ -1,9 +1,12 @@
 //! The plan canvas (spec §5.3): every panel in place in the shared frame,
 //! drawn from its low-resolution preview as each one arrives, with outlines,
 //! numbers and selection. Only the canvas: the window around it picks the
-//! view ([`PlanView::select_view`]) and the look ([`CanvasLook`]), and shows
+//! view ([`PlanView::select_view`]) and the look ([`CanvasLook`]), shows
 //! the selected panel's details where it likes
-//! ([`PlanView::selection_ui`]).
+//! ([`PlanView::selection_ui`]), and links it to the panel list: it selects
+//! ([`PlanView::select`]) and highlights ([`PlanView::set_highlight`]) the
+//! panel of a row, and reads the panel under the pointer
+//! ([`PlanView::hovered`]).
 //!
 //! - **Views.** Each group, then each composition (a colour mix of groups,
 //!   [`crate::compositions`]). With grouping off there is one view.
@@ -512,6 +515,8 @@ pub struct ItemSnapshot {
     pub outline: Color32,
     /// The panel number shown.
     pub label: String,
+    /// Highlighted ([`PlanView::set_highlight`]: its row is pointed at).
+    pub highlighted: bool,
 }
 
 /// What the automatic stretch was last computed for.
@@ -597,6 +602,10 @@ pub struct PlanView {
     view: Option<ViewKind>,
     canvas: PlanCanvas,
     selected: Option<PathBuf>,
+    /// The panel under the pointer in the last frame drawn.
+    hovered: Option<PathBuf>,
+    /// The panel to highlight (pointed at elsewhere).
+    highlight: Option<PathBuf>,
     held_camera: Option<HeldCamera>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
@@ -652,6 +661,8 @@ impl PlanView {
             view: None,
             canvas: PlanCanvas::new(),
             selected: None,
+            hovered: None,
+            highlight: None,
             held_camera: None,
             textures_for: None,
             textures: HashMap::new(),
@@ -722,10 +733,22 @@ impl PlanView {
         self.selected.as_deref()
     }
 
-    /// Select the panel `path` (or none); the canvas selects by click.
-    #[cfg(test)]
+    /// Select the panel `path` (or none), as a click on it does (e.g. its
+    /// row was clicked in the panel list).
     pub fn select(&mut self, path: Option<PathBuf>) {
         self.selected = path;
+    }
+
+    /// The panel under the pointer in the last frame drawn (one of the
+    /// view's), if any.
+    pub fn hovered(&self) -> Option<&Path> {
+        self.hovered.as_deref()
+    }
+
+    /// Highlight panel `path`'s outline (or none) from the next frame drawn,
+    /// if the view shows it (e.g. its row is pointed at in the panel list).
+    pub fn set_highlight(&mut self, path: Option<PathBuf>) {
+        self.highlight = path;
     }
 
     /// The automatic display stretch in use, once known.
@@ -783,7 +806,9 @@ impl PlanView {
     }
 
     /// Draw the canvas filling `ui`, and handle its input: a click selects
-    /// a panel, a click on no panel or Esc clears the selection.
+    /// a panel, a click on no panel clears the selection (Esc is the
+    /// window's: [`PlanView::select`]), and the panel under the pointer is
+    /// noted ([`PlanView::hovered`]).
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -793,6 +818,8 @@ impl PlanView {
     ) {
         let ctx = ui.ctx().clone();
         self.last_shown = Some(Instant::now());
+        // Set again if the canvas is drawn and the pointer is on a panel.
+        self.hovered = None;
         if self.info_generation != feed.generation {
             // The panel files may have changed: read their headers again.
             self.info_generation = feed.generation;
@@ -843,9 +870,6 @@ impl PlanView {
                     ui.label(RichText::new(text).color(palette::TEXT_MUTED));
                 });
             }
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.egui_wants_keyboard_input() {
-            self.selected = None;
         }
         self.settled = feed.complete
             && self.layout_task.is_none()
@@ -902,6 +926,7 @@ impl PlanView {
         } else if r.clicked_empty {
             self.selected = None;
         }
+        self.hovered = r.hovered.and_then(path_of);
     }
 
     /// The view to draw this frame, if any.
@@ -1335,12 +1360,14 @@ impl PlanView {
                 } else {
                     palette::ACCENT_500
                 };
+                let highlighted = self.highlight.as_ref() == Some(&path);
                 snaps.push(ItemSnapshot {
                     path: path.clone(),
                     rect,
                     layers: drawn.iter().map(|l| (l.tint, l.additive)).collect(),
                     outline,
                     label: number.to_string(),
+                    highlighted,
                 });
                 items.push(PlacedItem {
                     id: id as u64,
@@ -1350,6 +1377,7 @@ impl PlanView {
                     label: number.to_string(),
                     marker: flag.then_some(palette::HA_500),
                     selected: self.selected.as_ref() == Some(&path),
+                    highlighted,
                 });
             }
         }

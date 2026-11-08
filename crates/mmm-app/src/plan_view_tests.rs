@@ -397,6 +397,51 @@ fn plan_draws_partial_previews() {
 }
 
 #[test]
+fn a_highlight_lights_its_panel_and_the_pointer_names_one() {
+    let (root, s, _r) = analyzed("plan-highlight");
+    let ha = panels(&s, "Ha");
+    let oiii = panels(&s, "OIII");
+    let mut h = harness(s);
+    step_until(&mut h, |s| s.view.items().len() == 4);
+    let lit = |h: &Harness<'_, State>| -> Vec<PathBuf> {
+        let items = h.state().view.items();
+        items
+            .iter()
+            .filter(|i| i.highlighted)
+            .map(|i| i.path.clone())
+            .collect()
+    };
+    assert!(lit(&h).is_empty());
+    h.state_mut().view.set_highlight(Some(ha[1].clone()));
+    h.step();
+    assert_eq!(lit(&h), [ha[1].clone()]);
+    // A panel the view does not show lights nothing.
+    h.state_mut().view.set_highlight(Some(oiii[0].clone()));
+    h.step();
+    assert!(lit(&h).is_empty());
+    h.state_mut().view.set_highlight(None);
+    // The panel under the pointer.
+    let it = h
+        .state()
+        .view
+        .items()
+        .iter()
+        .find(|i| i.path == ha[2])
+        .unwrap()
+        .rect;
+    let centre = ((it[0] + it[2]) / 2.0, (it[1] + it[3]) / 2.0);
+    let p = h.state().view.to_screen(centre).unwrap();
+    h.hover_at(p);
+    h.step();
+    assert_eq!(h.state().view.hovered(), Some(ha[2].as_path()));
+    // Off the canvas (over the details): none.
+    h.hover_at(egui::pos2(1190.0, 790.0));
+    h.step();
+    assert_eq!(h.state().view.hovered(), None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn composition_view_uses_additive_layers() {
     let (root, mut s, _r) = analyzed("plan-composition");
     let mut hoo = Composition::new("HOO");

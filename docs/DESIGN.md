@@ -1099,9 +1099,20 @@ views and export. No algorithm changed. Core additions are bookkeeping
   INTEGRATION, SCALE, SIZE from one header read per panel
   (`read_panel_header`, cached by path and fingerprint on a worker); with
   grouping on, **No group** first (its heading says why) then a rolled-up
-  section per group ("Ha · 12 · 38h 20m", "1 fewer than Ha"). Rows have an
-  actions menu (Remove, with Undo in a toast). **Group by** chooses Don't
-  group, a header keyword or a filename token.
+  section per group ("Ha · 12 · 38h 20m", "1 fewer than Ha"). Rows select
+  with click, Shift-click (the rows on screen) and Ctrl/Cmd-click; the
+  actions menu (on the selection when the row is selected) has **Move to**
+  (each group, **New group…** named in the menu and made of the panels
+  moved, **No group**, **Let the rule decide**) and **Remove**; rows also
+  drag onto a section heading. A panel moved by hand (`manual_group`) is
+  tagged "by hand" and keeps its FILTER cell. Remove and Delete (Backspace
+  on macOS) on the selection offer Undo in a toast, which puts back only
+  the removed panels where they were (`Undo::Readd`), keeping later edits.
+  Rows and the plan are linked (spec §7.4): hovering either lights the
+  other (`PlacedItem::highlighted`, `Row::highlighted`), a row click
+  selects the panel on the plan (the inspector shows it) and a plan click
+  selects and reveals its row (`TableState::reveal`); Esc clears both.
+  **Group by** chooses Don't group, a header keyword or a filename token.
   Group colours are stable and persisted in `ui.group_colors`: well-known
   filters get physical colours (Ha red, OIII cyan, SII orange-red `#E0703A`,
   R/G/B, L white), other names take the first unused entry after the six
@@ -1234,7 +1245,11 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   back to the start screen).
 - **Shortcuts.** `I` inspector, `M` plan/mosaic, `[` and `]` previous and next
   view, `O` outlines, `R` ROIs, `L` Linked, `S` Strong, `Ctrl/Cmd+Enter` the
-  main button; each is named in its tooltip, and none acts while a text field
+  main button; each is named in its tooltip. `Delete` (also `Backspace` on
+  macOS) removes the panels selected in the open panel list, and `Esc`
+  clears the selection (unless it closes a menu or leaves a text field: egui
+  lets go of the field before the shortcuts run, so the window remembers
+  whether one had the keyboard last frame). None acts while a text field
   has the keyboard (`Context::text_edit_focused`; a button or chip focused
   by keyboard navigation does not stop them) or the Export dialog is open.
 - **Back to start** (`Shell::close_session`). Cancels the running jobs and
@@ -1294,6 +1309,8 @@ stays free of `mmm-core`.
   measures one row, and the strip wraps when it does not fit), `chip`,
   `status`, `overline`,
   `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
+  `submenu` (a menu entry with an icon-font chevron, staying open for a
+  text field inside),
   `Toasts` (the only notifications; never modal), plus the restyled
   `checks::checks_list` and `jobs::job_panel`, `groups` (the group palette,
   whose order is frozen because sessions store its indices) and `brand`
