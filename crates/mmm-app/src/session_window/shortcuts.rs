@@ -12,8 +12,9 @@
 //! | `Ctrl+Enter` (`Cmd+Enter` on macOS) | **Merge**, while the main button offers it | the main button |
 //!
 //! The letters and brackets count with no modifier held. None acts while a
-//! widget has the keyboard (a text field: notes, names, a path) or the
-//! Export dialog is open. The canvas's own (`M`, the brackets and the
+//! text field has the keyboard (notes, names, a path) or the Export dialog
+//! is open; a focused button or chip (keyboard navigation) does not stop
+//! them. The canvas's own (`M`, the brackets and the
 //! toggles) act only while the canvas shows, not the panel list. A key that
 //! is a shortcut is consumed, so no widget sees it too.
 
@@ -70,7 +71,7 @@ impl SessionWindow {
         jobs: &mut JobRunner,
         pipeline: &Pipeline,
     ) {
-        if ctx.egui_wants_keyboard_input() || self.mosaic.export_open() {
+        if ctx.text_edit_focused() || self.mosaic.export_open() {
             return;
         }
         let pressed = |key: Key| {

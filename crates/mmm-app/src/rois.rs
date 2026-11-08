@@ -9,8 +9,10 @@
 //! list itself is UI state, saved like the display stretch.
 //!
 //! [`RoiPanel`] is the ROI list (the session window's ROIs section) and its
-//! workers: the list (new, select and zoom, rename, note, delete), the
+//! workers: the list (new, select, rename, note, delete), the
 //! reprojection, and how fresh each group of the view is inside each ROI.
+//! Selecting an ROI asks to go to it ([`RoiOutcome::go_to`]): the window
+//! frames it on whichever canvas shows, through the camera both share.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -72,6 +74,15 @@ pub fn save_rois(ui: &mut Value, rois: &[Roi]) {
     if let (Some(obj), Ok(v)) = (ui.as_object_mut(), serde_json::to_value(rois)) {
         obj.insert(ROIS_KEY.to_string(), v);
     }
+}
+
+/// What the ROI list did this frame ([`RoiPanel::ui`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RoiOutcome {
+    /// The list changed (written to `ui`).
+    pub changed: bool,
+    /// An ROI was picked: go to its canvas rect (`[x0, y0, x1, y1]`).
+    pub go_to: Option<[u64; 4]>,
 }
 
 /// A name for a new ROI that none of `taken` has: "ROI 1", "ROI 2", ….
@@ -375,17 +386,18 @@ impl RoiPanel {
             .collect()
     }
 
-    /// The panel: "+ new ROI" (the viewer's draw tool), and each ROI with
+    /// The panel: "+ new ROI" (`viewer`'s draw tool), and each ROI with
     /// its size and freshness; the selected one with Name, Note and
-    /// Delete. Selecting zooms `viewer` to the ROI. True if the list
-    /// changed (written to `ui`); a rename or note edit does not count
+    /// Delete. Selecting one asks to go to it ([`RoiOutcome::go_to`]; the
+    /// caller moves the camera). A change of the list is written to `ui`
+    /// ([`RoiOutcome::changed`]); a rename or note edit does not count
     /// freshness again.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         cfg_ui: &mut Value,
-        mut viewer: Option<&mut TiledViewer>,
-    ) -> bool {
+        viewer: Option<&mut TiledViewer>,
+    ) -> RoiOutcome {
         ui.label(RichText::new("Regions of interest").color(palette::TEXT_STRONG));
         let drawing = viewer.as_ref().is_some_and(|v| v.tool() == Tool::DrawRect);
         if ui
@@ -393,7 +405,7 @@ impl RoiPanel {
             .on_hover_text("Drag a rectangle on the image")
             .on_disabled_hover_text("Shown once there is a result to draw on")
             .clicked()
-            && let Some(v) = viewer.as_deref_mut()
+            && let Some(v) = viewer
         {
             v.set_tool(Tool::DrawRect);
         }
@@ -405,7 +417,7 @@ impl RoiPanel {
         }
         if self.rois.is_empty() {
             muted(ui, "None yet.");
-            return false;
+            return RoiOutcome::default();
         }
         let mut select = None;
         let mut delete = None;
@@ -445,23 +457,27 @@ impl RoiPanel {
                 }
             });
         }
-        if let Some(i) = select {
+        let go_to = select.map(|i| {
             self.selected = Some(i);
-            if let Some(v) = viewer {
-                v.zoom_to_rect(self.rois[i].canvas.map(|c| c as f64));
-            }
-        }
+            self.rois[i].canvas
+        });
         if let Some(i) = delete {
             self.rois.remove(i);
             self.selected = None;
             self.geometry_changed(cfg_ui);
-            return true;
+            return RoiOutcome {
+                changed: true,
+                go_to: None,
+            };
         }
         if edited {
             // Names and notes only: saved, but nothing to recount.
             save_rois(cfg_ui, &self.rois);
         }
-        edited
+        RoiOutcome {
+            changed: edited,
+            go_to,
+        }
     }
 }
 

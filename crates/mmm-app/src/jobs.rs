@@ -62,7 +62,7 @@ use crate::session::OpenSession;
 pub const PROGRESS_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
 /// Label of an analysis job.
-pub const ANALYZE_LABEL: &str = "Analyze";
+pub const ANALYZE_LABEL: &str = "Analyse";
 /// Label of a previews job.
 pub const PREVIEWS_LABEL: &str = "Previews";
 /// Stage shown while a cancelled job winds down.
@@ -389,7 +389,7 @@ impl JobRunner {
         group: &str,
         rect: Option<[u64; 4]>,
     ) -> u64 {
-        let id = self.new_id(format!("Merge {group}"));
+        let id = self.new_id(job_label("Merge", group, session));
         self.begin(JobTarget::Blend, id, group);
         if rect.is_none() {
             self.whole.insert(id);
@@ -432,7 +432,7 @@ impl JobRunner {
         out: std::path::PathBuf,
         format: ExportFormat,
     ) -> u64 {
-        let id = self.new_id(format!("Export {group}"));
+        let id = self.new_id(job_label("Export", group, session));
         self.begin(JobTarget::Export, id, group);
         self.queue.push_back(Queued {
             id,
@@ -1049,6 +1049,17 @@ pub fn discard_blend(session: &OpenSession, plan: &BlendPlan) -> Result<(), Stri
     })
 }
 
+/// A merge's or an export's label (and so its toasts' title): "{verb}
+/// {group}", or `verb` alone in a session of one group (an OSC mosaic:
+/// the group name says nothing).
+fn job_label(verb: &str, group: &str, session: &OpenSession) -> String {
+    if crate::util::group_names(session).len() <= 1 {
+        verb.to_string()
+    } else {
+        format!("{verb} {group}")
+    }
+}
+
 /// A core error as a message for the user.
 fn describe(e: &mmm_core::Error) -> String {
     if e.is_busy() {
@@ -1188,7 +1199,7 @@ pub(crate) mod tests {
             events,
             vec![JobEvent::Finished {
                 id,
-                label: "Analyze".into()
+                label: ANALYZE_LABEL.into()
             }]
         );
         (root, s, r)
@@ -1543,7 +1554,7 @@ pub(crate) mod tests {
                 JobEvent::Cancelled { id: blend },
                 JobEvent::Finished {
                     id: analyze,
-                    label: "Analyze".into()
+                    label: ANALYZE_LABEL.into()
                 },
             ]
         );
@@ -1566,7 +1577,7 @@ pub(crate) mod tests {
             vec![
                 JobEvent::Finished {
                     id: analyze,
-                    label: "Analyze".into()
+                    label: ANALYZE_LABEL.into()
                 },
                 JobEvent::Finished {
                     id: blend,
@@ -1642,7 +1653,7 @@ pub(crate) mod tests {
             drain(&mut r, &mut s),
             vec![JobEvent::Finished {
                 id,
-                label: "Analyze".into()
+                label: ANALYZE_LABEL.into()
             }]
         );
         // ...so it resolved again, and analysed the current groups.
@@ -1699,7 +1710,7 @@ pub(crate) mod tests {
                 },
                 JobEvent::Finished {
                     id: analyze,
-                    label: "Analyze".into()
+                    label: ANALYZE_LABEL.into()
                 },
             ]
         );

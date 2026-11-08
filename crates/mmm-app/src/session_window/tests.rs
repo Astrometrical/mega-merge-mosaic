@@ -357,7 +357,7 @@ fn merge_switches_to_the_mosaic() {
     });
     assert_eq!(h.state().w.mode(), CanvasMode::Plan);
     assert!(
-        h.query_by_label("Analyze").is_none(),
+        h.query_by_label("Analyse").is_none(),
         "analysis is automatic"
     );
     let gate = h.state_mut().jobs.hold();
@@ -1440,7 +1440,7 @@ fn the_merge_steps_cancel_spares_an_roi_merge() {
         roi
     };
     h.run_steps(2);
-    let working = "Merging OIII · 1 of 1 · 0 %";
+    let working = "Merging OIII · 0 %";
     h.get_by_label(working).hover();
     h.run_steps(2);
     h.get_by_label(&format!("Cancel {working}")).click();
@@ -1928,5 +1928,395 @@ fn shortcuts_show_in_tooltips() {
         .format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter));
     let want = format!("Merge every group over the whole canvas ({keys})");
     assert!(tooltip_shows(&mut h, main, &want), "{want}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn picking_an_roi_frames_it_on_the_shown_canvas() {
+    use mega_ui::viewer::MAX_ZOOM;
+    let (root, mut s, jobs) = merged("window-roi-go-to");
+    add_roi(&mut s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_until(&mut h, |st| {
+        plan_placed(st) && st.w.mosaic().source().is_some()
+    });
+    h.run_steps(2);
+    let fit = h.state().w.plan().camera().expect("the plan's camera");
+    // Picked in the list while the plan shows: the plan frames it.
+    h.get_by_label("ROI 1").click();
+    h.run_steps(3);
+    let (rect, _) = h.state().w.plan().canvas_frame().expect("the plan drawn");
+    let zoom = (f64::from(rect.width()) / 100.0)
+        .min(f64::from(rect.height()) / 60.0)
+        .min(MAX_ZOOM);
+    let want = Camera {
+        centre: (150.0, 130.0),
+        zoom,
+    };
+    assert!(want.zoom > fit.zoom * 1.1, "{fit:?} then {want:?}");
+    assert_camera(h.state().w.plan().camera(), want);
+    assert_plan_painted_with(&h, want);
+    // On to the mosaic: it shows the same, and nothing moves afterwards.
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    assert_mosaic_painted_with(&h, want);
+    h.run_steps(150);
+    assert_camera(h.state().w.mosaic().camera(), want);
+    assert_mosaic_painted_with(&h, want);
+    // Panned away on the mosaic, picked again: the mosaic frames it.
+    let (rect, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    drag(&mut h, rect.center(), egui::vec2(-60.0, 20.0));
+    assert!(h.state().w.mosaic().camera().unwrap().centre != want.centre);
+    h.get_by_label("ROI 1").click();
+    h.run_steps(3);
+    assert_camera(h.state().w.mosaic().camera(), want);
+    assert_mosaic_painted_with(&h, want);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [`analyzed`] in a session folder named `name` (the top bar shows it).
+fn analyzed_named(tag: &str, name: &str) -> (PathBuf, OpenSession, JobRunner) {
+    let root = temp_dir(tag);
+    let mut s = crate::testutil::two_group_session_named(&root, name);
+    let mut jobs = runner();
+    jobs.start_analyze(&mut s);
+    let _ = drain(&mut jobs, &mut s);
+    assert_eq!(s.mosaic.config.group_dirs.len(), 2, "analysed");
+    (root, s, jobs)
+}
+
+/// The top bar's buttons and labels, each with its rect. Asserts none
+/// overlaps another and all are inside a window `width` wide.
+fn top_bar_controls(h: &Harness<'_, State>, width: f32) -> Vec<(String, egui::Rect)> {
+    let bar = h.state().w.top_bar_rect.expect("the top bar drawn");
+    let controls: Vec<(String, egui::Rect)> = h
+        .root()
+        .children_recursive()
+        .filter(|n| {
+            matches!(n.accesskit_node().role(), Role::Button | Role::Label)
+                && bar.contains(n.rect().center())
+        })
+        .map(|n| {
+            // A label's text is its value.
+            let node = n.accesskit_node();
+            let text = node.label().or(node.value()).unwrap_or_default();
+            (text, n.rect())
+        })
+        .collect();
+    for (label, r) in &controls {
+        assert!(
+            r.min.x >= -0.5 && r.max.x <= width + 0.5 && bar.expand(0.5).contains_rect(*r),
+            "{label} at {r:?} is not inside the window ({width} wide) and its top bar {bar:?}"
+        );
+    }
+    for (i, (a, ra)) in controls.iter().enumerate() {
+        for (b, rb) in &controls[i + 1..] {
+            assert!(
+                !ra.shrink(0.5).intersects(rb.shrink(0.5)),
+                "{a} {ra:?} overlaps {b} {rb:?}"
+            );
+        }
+    }
+    controls
+}
+
+#[test]
+fn the_top_bar_fits_narrow_windows() {
+    let name = "Orion SHO mosaic, winter 2026 reprocessing with new flats";
+    for width in [720.0, 960.0] {
+        for merging in [false, true] {
+            let tag = format!("window-top-bar-{width}-{merging}");
+            let (root, s, jobs) = analyzed_named(&tag, name);
+            let mut state = State::new(s, jobs);
+            state.checks.set_report(problems(&state.session, 2));
+            let mut h = harness_sized(state, egui::vec2(width, 800.0));
+            step_until(&mut h, |st| {
+                st.w.mosaic()
+                    .merge_block_reason(&st.session, &st.jobs)
+                    .is_none()
+            });
+            let gate = merging.then(|| {
+                let gate = h.state_mut().jobs.hold();
+                let st = h.state_mut();
+                st.w.merge(&mut st.session, &mut st.jobs);
+                gate
+            });
+            h.run_steps(3);
+            let controls = top_bar_controls(&h, width);
+            let what = format!("{width} pt, merging {merging}: {controls:?}");
+            // Back, the name, the four steps, Merge and its settings' summary.
+            assert!(controls.len() >= 8, "{what}");
+            let step = if merging {
+                "Merging Ha \u{b7} 1 of 2 \u{b7} 0 %"
+            } else {
+                "2 problems"
+            };
+            for label in [
+                "Back to the start screen",
+                step,
+                "Pyramid \u{b7} feather 256 px",
+            ] {
+                assert!(controls.iter().any(|(l, _)| l == label), "{label}: {what}");
+            }
+            assert!(
+                controls.iter().any(|(l, _)| l.starts_with("Orion SHO")),
+                "the name: {what}"
+            );
+            if let Some(gate) = gate {
+                gate.open();
+                step_until(&mut h, |st| !st.jobs.busy());
+            }
+            drop(h);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}
+
+/// What the plan says while the session has no panels.
+const EMPTY_PLAN: &str =
+    "Add panels to plan a mosaic: use Add panels\u{2026} or drop the files here.";
+
+#[test]
+fn the_empty_plan_says_how_to_add_panels() {
+    let root = temp_dir("window-empty-plan");
+    let mut h = harness(State::new(empty(&root), runner()));
+    h.run_steps(3);
+    h.state_mut().w.panel_list_open = false;
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    let text = all_text(&h);
+    assert!(text.iter().any(|t| t == EMPTY_PLAN), "{text:?}");
+    assert!(!text.iter().any(|t| t.contains(" tab")), "{text:?}");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn analyse_starts_a_stalled_analysis_while_another_step_is_next() {
+    use StepState::{Next, Todo};
+    let root = temp_dir("window-analyse-todo");
+    let mut s = two_group_session(&root);
+    let mut jobs = runner();
+    let mut pipeline = Pipeline::new();
+    // The previews cancelled (Read previews is next), then the analysis
+    // that followed them cancelled too.
+    let previews = jobs.hold();
+    let ctx = egui::Context::default();
+    pipeline.poll(&ctx, Instant::now(), &mut s, &mut jobs, &[], false);
+    let analysis = jobs.hold();
+    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
+        jobs.cancel(id);
+    }
+    previews.open();
+    pump(&mut s, &mut jobs, &mut pipeline, |_, p| {
+        p.step() == Some(Step::Analyze)
+    });
+    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
+        jobs.cancel(id);
+    }
+    analysis.open();
+    pump(&mut s, &mut jobs, &mut pipeline, |j, _| !j.busy());
+    let mut state = State::new(s, jobs);
+    state.pipeline = pipeline;
+    let mut h = harness(state);
+    h.run_steps(3);
+    let shown = shown_steps(h.state());
+    assert_eq!(shown[0], strip("Read previews", Next));
+    assert_eq!(shown[1], strip("Analyse", Todo));
+    // Pressed though it is not the next step: it analyses.
+    let again = h.state_mut().jobs.hold();
+    h.get_by_label("Analyse").click();
+    h.run_steps(2);
+    assert!(h.state().jobs.analyzing(), "the analysis started");
+    again.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Whether hovering `at` shows the tooltip `want` (and it was not showing
+/// before, the pointer resting on the canvas).
+fn hover_says(h: &mut Harness<'static, State>, at: egui::Pos2, want: &str) -> bool {
+    let (rest, _) = h.state().w.mosaic().viewer_frame().expect("the mosaic");
+    h.hover_at(rest.center());
+    h.run_steps(80);
+    assert!(
+        h.query_all_by_label(want).next().is_none(),
+        "{want} already"
+    );
+    tooltip_shows(h, at, want)
+}
+
+#[test]
+fn steps_that_cannot_act_say_why() {
+    let (root, s, jobs) = merged("window-why-not");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic().can_open_export() && st.w.mosaic().viewer_frame().is_some()
+    });
+    // An analysis running (held): nothing merges or exports until it ends.
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        let id = st.jobs.start_analyze(&mut st.session);
+        st.w.track_analysis(id);
+    }
+    h.run_steps(2);
+    assert_eq!(shown_steps(h.state())[2], strip("Merge", StepState::Todo));
+    assert!(rightmost_disabled(&h, "Export\u{2026}"), "the main button");
+    let why = "Waiting for the analysis to finish.";
+    let merge = h.get_by_label("Merge").rect().center();
+    assert!(hover_says(&mut h, merge, why), "the Merge step");
+    let export = h.get_by_label("Export").rect().center();
+    assert!(hover_says(&mut h, export, why), "the Export step");
+    let main = h.get_by_label("Export\u{2026}").rect().center();
+    assert!(hover_says(&mut h, main, why), "Export\u{2026}");
+    // Clicked anyway: nothing starts.
+    h.get_by_label("Merge").click();
+    h.get_by_label("Export").click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs).len(), 1, "the analysis only");
+    assert!(!h.state().w.mosaic().export_open());
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_composite_with_an_unmerged_member_keeps_the_canvas_in_place() {
+    let (root, mut s, mut jobs) = analyzed("window-composite-note");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.merged = any_merged(&s);
+    s.results = classify_results(&s);
+    add_roi(&mut s);
+    let mut comp = Composition::new("HO");
+    comp.channels = [Some(("Ha".into(), 1.0)), Some(("OIII".into(), 1.0)), None];
+    save_compositions(&mut s.mosaic.config.ui, &[comp]);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    state.w.select_view(ViewKind::Composition(0));
+    let mut h = harness(state);
+    step_until(&mut h, |st| {
+        plan_placed(st) && st.w.mosaic().source().is_some()
+    });
+    h.run_steps(2);
+    let cam = h.state().w.plan().camera().expect("the plan's camera");
+    let (plan, _) = h.state().w.plan().canvas_frame().unwrap();
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    h.run_steps(3);
+    // OIII, not merged, is named over the image...
+    assert!(
+        all_text(&h).iter().any(|t| t.starts_with("OIII: ")),
+        "{:?}",
+        all_text(&h)
+    );
+    // ...which is drawn in the plan's place, through its camera.
+    let (mosaic, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    assert!(
+        (mosaic.min - plan.min).length() < 0.5 && (mosaic.max - plan.max).length() < 0.5,
+        "the mosaic in {mosaic:?}, the plan in {plan:?}"
+    );
+    assert_camera(h.state().w.mosaic().camera(), cam);
+    let (got, _) = painted(&h, mosaic, "ROI 1").expect("ROI label painted");
+    let want = screen(plan, cam, (100.0, 100.0)) + egui::vec2(4.0, 2.0);
+    assert!((got - want).length() < 1.0, "{got:?} != {want:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_one_group_merge_names_no_group() {
+    let root = temp_dir("steps-one-group");
+    let mut s = two_group_session(&root);
+    s.mosaic.config.grouping.enabled = false;
+    s.groups = s.mosaic.groups().ok();
+    let mut jobs = runner();
+    jobs.start_analyze(&mut s);
+    let _ = drain(&mut jobs, &mut s);
+    let gate = jobs.hold();
+    let id = jobs.start_blend(&mut s, SINGLE_GROUP, None);
+    assert_eq!(jobs.label(id), Some("Merge"), "the job (and its toasts)");
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    let want = StripStep {
+        label: "Merging \u{b7} 0 %".into(),
+        state: StepState::Working {
+            fraction: Some(0.0),
+        },
+        cancellable: true,
+        tooltip: None,
+    };
+    assert_eq!(got[2], want);
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    assert!(
+        events.contains(&crate::jobs::JobEvent::Finished {
+            id,
+            label: "Merge".into()
+        }),
+        "{events:?}"
+    );
+    // One export: "Exporting", no "1 of 1"; the job is "Export".
+    let gate = jobs.hold();
+    let out = root.join("one.fits");
+    let id = jobs.start_export(&s, SINGLE_GROUP, out, crate::export::ExportFormat::Fits);
+    assert_eq!(jobs.label(id), Some("Export"));
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    assert_eq!(got[3].label, "Exporting");
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    assert!(
+        events.contains(&crate::jobs::JobEvent::Finished {
+            id,
+            label: "Export".into()
+        }),
+        "{events:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn shortcuts_work_with_a_button_focused() {
+    use egui::Key;
+    let (root, s, jobs) = merged("window-shortcut-focus");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(2);
+    assert!(toggle_on(&h, "Outlines"));
+    // Tab along the controls to a chip.
+    let mut tabs = 0;
+    while !h.get_by_label("OIII \u{b7} 4").is_focused() {
+        assert!(tabs < 80, "the chip never took the focus");
+        h.key_press(Key::Tab);
+        h.run_steps(1);
+        tabs += 1;
+    }
+    h.key_press(Key::O);
+    h.run_steps(2);
+    assert!(!toggle_on(&h, "Outlines"), "O toggles with a chip focused");
+    assert!(
+        h.get_by_label("OIII \u{b7} 4").is_focused(),
+        "the focus stays"
+    );
+    // Typing in the notes still types.
+    h.state_mut().w.inspector_mut().reveal(NOTES);
+    h.run_steps(2);
+    h.get_by_label("Add notes").click();
+    h.run_steps(2);
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.key_press(Key::O);
+    h.get_by_role(Role::MultilineTextInput).type_text("o");
+    h.run_steps(2);
+    assert_eq!(notes(&h.state().session.mosaic.config.ui), "o");
+    assert!(!toggle_on(&h, "Outlines"), "unchanged while typing");
     let _ = std::fs::remove_dir_all(&root);
 }

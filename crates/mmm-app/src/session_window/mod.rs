@@ -15,7 +15,8 @@
 //! - **One view, one camera.** The window keeps the view (a group or a
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
-//!   canvas's [`Camera`] to both first, so nothing moves.
+//!   canvas's [`Camera`] to both first, so nothing moves. Going to an ROI
+//!   ([`SessionWindow::frame`]) hands both the camera that frames it.
 //! - **Mode.** The window opens on the mosaic once something is merged
 //!   ([`OpenSession::merged`]), else on the plan; **Mosaic** cannot be
 //!   chosen before something is merged or a merge has started.
@@ -134,6 +135,9 @@ pub struct SessionWindow {
     panels: PanelsTab,
     /// The panel list shows in the canvas's place.
     pub(crate) panel_list_open: bool,
+    /// The top bar's rect, as last drawn (tests).
+    #[cfg(test)]
+    pub(crate) top_bar_rect: Option<egui::Rect>,
 }
 
 /// Inspector section ids, in their fixed order.
@@ -165,6 +169,8 @@ impl SessionWindow {
             saved_view: None,
             panels: PanelsTab::new(picker),
             panel_list_open: false,
+            #[cfg(test)]
+            top_bar_rect: None,
         }
     }
 
@@ -373,12 +379,16 @@ impl SessionWindow {
         self.shortcuts(&ctx, session, jobs, pipeline);
         let mut out = SessionOutput::default();
         let margin = egui::Margin::symmetric(space::M as i8, space::S as i8);
-        egui::Panel::top("session-top-bar")
+        let _top = egui::Panel::top("session-top-bar")
             .resizable(false)
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .show(ui, |ui| {
                 out.back = self.top_bar(ui, session, jobs, pipeline, checks);
             });
+        #[cfg(test)]
+        {
+            self.top_bar_rect = Some(_top.response.rect);
+        }
         egui::Panel::right("session-inspector")
             .resizable(false)
             .exact_size(inspector_width(&self.inspector))
@@ -516,6 +526,23 @@ impl SessionWindow {
             CanvasMode::Plan => self.plan.camera(),
             CanvasMode::Mosaic => self.mosaic.camera(),
         }
+    }
+
+    /// Frame canvas rect `rect` (an ROI picked) on the canvas shown, as
+    /// last drawn: the camera that frames it is handed to both canvases, so
+    /// it shows from this frame and a later switch moves nothing. Nothing
+    /// before either canvas has been drawn (no viewport to fit).
+    pub(super) fn frame(&mut self, rect: [u64; 4]) {
+        let (shown, other) = match self.mode() {
+            CanvasMode::Plan => (self.plan.canvas_frame(), self.mosaic.viewer_frame()),
+            CanvasMode::Mosaic => (self.mosaic.viewer_frame(), self.plan.canvas_frame()),
+        };
+        let Some((viewport, _)) = shown.or(other) else {
+            return;
+        };
+        let c = Camera::framing(rect.map(|v| v as f64), viewport.size());
+        self.plan.set_camera(c);
+        self.mosaic.set_camera(c);
     }
 
     /// Hand the shown canvas's camera to both canvases, before the mode or

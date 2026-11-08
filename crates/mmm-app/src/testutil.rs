@@ -17,6 +17,15 @@ pub(crate) fn two_group_session(root: &Path) -> OpenSession {
     open(crate::synth_mosaic::two_group_mosaic(root))
 }
 
+/// [`two_group_session`] in `root/{name}.mmm-session` (a session is
+/// named after its folder).
+pub(crate) fn two_group_session_named(root: &Path, name: &str) -> OpenSession {
+    let made = crate::synth_mosaic::two_group_mosaic(root);
+    let dir = root.join(format!("{name}.mmm-session"));
+    std::fs::rename(&made.dir, &dir).unwrap();
+    open(mmm_core::mosaic::Mosaic::open(&dir).unwrap())
+}
+
 /// [`two_group_session`] with mono (one-channel) panels.
 pub(crate) fn two_group_mono_session(root: &Path) -> OpenSession {
     open(crate::synth_mosaic::two_group_mosaic_of(root, 1))

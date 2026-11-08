@@ -751,6 +751,11 @@ impl PlanView {
         }
     }
 
+    /// The canvas's rect and time in the last frame drawn.
+    pub fn canvas_frame(&self) -> Option<(egui::Rect, f64)> {
+        self.canvas.last_frame()
+    }
+
     /// The shared frame's canvas, once read.
     pub fn frame_canvas(&self) -> Option<(u64, u64)> {
         self.layout.frame.as_ref().map(ReferenceFrame::canvas)
@@ -815,7 +820,7 @@ impl PlanView {
             Some((extent, fixed)) => self.canvas_ui(ui, session, extent, fixed, &items, look),
             None => {
                 let text = if session.mosaic.config.panels.is_empty() {
-                    "Add panels in the Panels tab to plan a mosaic."
+                    "Add panels to plan a mosaic: use Add panels… or drop the files here."
                 } else {
                     "Placing the panels…"
                 };
@@ -1445,11 +1450,6 @@ impl PlanView {
 
 #[cfg(test)]
 impl PlanView {
-    /// The canvas's rect and time in the last frame drawn.
-    pub(crate) fn canvas_frame(&self) -> Option<(egui::Rect, f64)> {
-        self.canvas.last_frame()
-    }
-
     /// Screen position of canvas point `p` in the last frame drawn.
     pub(crate) fn to_screen(&self, p: (f64, f64)) -> Option<egui::Pos2> {
         let (rect, now) = self.canvas.last_frame()?;

@@ -8,8 +8,9 @@
 //!   progress (with **Resume** once paused), and the selected panel's
 //!   details and checks.
 //! - **ROIs**: the ROI list ([`MosaicView::rois_ui`]) and **Merge ROI**.
-//!   Drawing an ROI needs the mosaic for now: starting to draw switches the
-//!   canvas to it.
+//!   Picking an ROI frames it on the canvas shown
+//!   ([`SessionWindow::frame`]). Drawing an ROI needs the mosaic for now:
+//!   starting to draw switches the canvas to it.
 //! - **Merge settings** ([`MosaicView::settings_ui`]), then the health.
 //! - **Composites**: each composite's editor and **Delete composite**.
 //! - **Notes**: the session's notes, saved with the session (debounced).
@@ -50,6 +51,8 @@ struct Actions {
     mode: Option<CanvasMode>,
     /// The composite at this index was deleted.
     deleted: Option<usize>,
+    /// An ROI was picked: frame this canvas rect.
+    go_to: Option<[u64; 4]>,
 }
 
 impl SessionWindow {
@@ -135,6 +138,9 @@ impl SessionWindow {
         });
         if let Some(mode) = act.mode {
             self.set_mode(mode);
+        }
+        if let Some(rect) = act.go_to {
+            self.frame(rect);
         }
         if let Some(i) = act.deleted {
             self.composite_deleted(session, i);
@@ -337,7 +343,7 @@ fn rois_ui(
     act: &mut Actions,
 ) {
     let drawing = mosaic.drawing();
-    mosaic.rois_ui(ui, session);
+    act.go_to = mosaic.rois_ui(ui, session);
     // ROIs are drawn on the mosaic (until the plan takes them).
     if !drawing && mosaic.drawing() && mode == CanvasMode::Plan {
         act.mode = Some(CanvasMode::Mosaic);

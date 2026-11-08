@@ -18,10 +18,12 @@
 //!   groups' results in a [`CompositeTileSource`], each through that
 //!   group's own display stretch; the health is that of one member (the
 //!   health section picks it). A group not merged yet adds nothing and is
-//!   named above the image; groups on different canvases cannot be mixed:
-//!   the view says why instead.
+//!   named over the image's bottom-left corner (an overlay: the image keeps
+//!   the plan's place); groups on different canvases cannot be mixed: the
+//!   view says why instead.
 //! - **ROIs** ([`crate::rois`]): drawn on the canvas with the viewer's draw
-//!   tool, named, noted, selected (the viewer zooms to it) and deleted;
+//!   tool, named, noted, selected (the window then frames it,
+//!   [`MosaicView::rois_ui`]) and deleted;
 //!   kept in `MosaicConfig.ui`. Reading the frame and reprojecting them
 //!   (sky ↔ canvas) and counting how many of an ROI's level-0 tiles are
 //!   fresh (per group of the view) run on workers ([`RoiPanel`]).
@@ -98,7 +100,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText};
 use mega_ui::theme::palette;
 use mega_ui::theme::text::{Type, text};
-use mega_ui::theme::tokens::space;
+use mega_ui::theme::tokens::{radius, space};
 use mega_ui::viewer::{PyramidGeometry, TileSource, TiledViewer, Tool};
 use mmm_core::health::{Health, health};
 use mmm_core::mosaic::FRAME_FILE;
@@ -376,6 +378,11 @@ impl MosaicView {
     /// viewer paints it, so it also applies to a viewer made later.
     pub fn set_camera(&mut self, camera: Camera) {
         self.camera = Some(camera);
+    }
+
+    /// The viewer's rect and time in the last frame it painted.
+    pub fn viewer_frame(&self) -> Option<(egui::Rect, f64)> {
+        self.viewer.as_ref()?.last_frame()
     }
 
     /// What the viewer showed in its last frame.
@@ -730,9 +737,23 @@ impl MosaicView {
     }
 
     /// Whether the export dialog may open now: the view has groups, no
-    /// tracked analysis runs and the dialog is not open already.
+    /// tracked analysis runs and the dialog is not open already
+    /// ([`MosaicView::export_block_reason`] gives none).
     pub fn can_open_export(&self) -> bool {
-        !self.members.is_empty() && self.analyze_job.is_none() && !self.export.is_open()
+        self.export_block_reason().is_none()
+    }
+
+    /// Why the export dialog cannot open now, if it cannot.
+    pub fn export_block_reason(&self) -> Option<&'static str> {
+        if self.export.is_open() {
+            Some("The Export dialog is open.")
+        } else if self.members.is_empty() {
+            Some("There is nothing to export in this view.")
+        } else if self.analyze_job.is_some() {
+            Some("Waiting for the analysis to finish.")
+        } else {
+            None
+        }
     }
 
     /// Whether the export dialog is open.
@@ -784,14 +805,18 @@ impl MosaicView {
     }
 
     /// The ROI list: "+ new ROI" (the viewer's draw tool), and each ROI's
-    /// name, note and freshness; changes are saved (debounced).
-    pub fn rois_ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession) {
-        if self
+    /// name, note and freshness; changes are saved (debounced). The canvas
+    /// rect of an ROI just picked, to go to: the caller frames it on the
+    /// canvas it shows (both canvases share the camera, so nothing here
+    /// moves the viewer).
+    pub fn rois_ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession) -> Option<[u64; 4]> {
+        let out = self
             .rois
-            .ui(ui, &mut session.mosaic.config.ui, self.viewer.as_mut())
-        {
+            .ui(ui, &mut session.mosaic.config.ui, self.viewer.as_mut());
+        if out.changed {
             self.save.touch();
         }
+        out.go_to
     }
 
     /// The merge settings, staged and applied with their cost shown first.
@@ -816,7 +841,7 @@ impl MosaicView {
         };
         match (&self.health, self.readiness) {
             (_, Readiness::NotAnalyzed | Readiness::NeedsAnalyze) => {
-                muted(ui, "Shown once the group is analyzed.");
+                muted(ui, "Shown once the group is analysed.");
             }
             (None, _) => muted(ui, "Computing…"),
             (Some(Err(e)), _) => muted(ui, &format!("Not available: {e}")),
@@ -875,11 +900,6 @@ impl MosaicView {
         let mut drawn = None;
         match &mut self.viewer {
             Some(viewer) => {
-                // A composition shows its merged groups; the others are
-                // named here.
-                for n in &notes {
-                    ui.label(text(Type::Small, n).color(palette::TEXT_MUTED));
-                }
                 // A held camera, in place of the home fit or the view
                 // before: the viewer paints this frame through it.
                 let size = ui.available_size();
@@ -891,6 +911,11 @@ impl MosaicView {
                 }
                 viewer.set_overlays(overlays);
                 drawn = viewer.show(ui).drawn_rect;
+                // A composition shows its merged groups; the others are
+                // named over the image, which keeps the plan's place.
+                if let Some((rect, _)) = viewer.last_frame() {
+                    notes_overlay(ui, rect, &notes);
+                }
             }
             None => {
                 let text = self.placeholder();
@@ -1361,12 +1386,29 @@ impl MosaicView {
     }
 }
 
-#[cfg(test)]
-impl MosaicView {
-    /// The viewer's rect and time in the last frame it painted.
-    pub(crate) fn viewer_frame(&self) -> Option<(egui::Rect, f64)> {
-        self.viewer.as_ref()?.last_frame()
+/// `notes` (the members of a composition not shown) over the bottom-left
+/// corner of the image drawn in `rect`, on a panel so they read over any
+/// image, first note on top. Labels only: a drag there still pans.
+fn notes_overlay(ui: &mut egui::Ui, rect: egui::Rect, notes: &[String]) {
+    if notes.is_empty() {
+        return;
     }
+    let mut over = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(space::S))
+            .layout(egui::Layout::bottom_up(egui::Align::Min)),
+    );
+    egui::Frame::NONE
+        .fill(palette::SURFACE_800)
+        .corner_radius(radius::SMALL)
+        .inner_margin(egui::Margin::same(space::XS as i8))
+        .show(&mut over, |ui| {
+            // Bottom up: the last note first.
+            for n in notes.iter().rev() {
+                let note = text(Type::Small, n).color(palette::TEXT_MUTED);
+                ui.add(egui::Label::new(note).selectable(false));
+            }
+        });
 }
 
 /// The health figures as a two-column grid.

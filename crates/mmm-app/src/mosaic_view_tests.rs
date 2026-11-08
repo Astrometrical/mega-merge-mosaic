@@ -1385,3 +1385,21 @@ fn settings_edit_waits_for_merges_and_blocks_merging() {
     assert!(view.rois.want_fresh && view.want_health);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn health_waits_for_the_analysis() {
+    use egui_kittest::kittest::Queryable;
+
+    let root = temp_dir("mosaic-health-unanalysed");
+    let mut state = State::new(
+        two_group_session(&root),
+        JobRunner::new(egui::Context::default()),
+    );
+    state.canvas = false;
+    state.inspector = true;
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.view.view().is_some());
+    h.run_steps(2);
+    h.get_by_label("Shown once the group is analysed.");
+    let _ = std::fs::remove_dir_all(&root);
+}

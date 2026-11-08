@@ -89,7 +89,8 @@ fn panel_shows_current_values_and_override_note() {
         set_group_override(m, "Ha", o).unwrap();
     }
     h.run_steps(2);
-    h.get_by_label("Merge settings");
+    // The inspector's section is the only fold: no header of its own.
+    assert!(h.query_by_label("Merge settings").is_none());
     assert_eq!(value(&h, Role::ComboBox, "Mode"), "TwoBand");
     assert_eq!(value(&h, Role::TextInput, "Feather (px)"), "100");
     assert_eq!(value(&h, Role::ComboBox, "Flatten"), "1 (plane)");
@@ -348,7 +349,7 @@ fn blend_local_edit_spares_a_running_analysis() {
     events.extend(drain(&mut jobs, &mut s));
     assert!(events.contains(&JobEvent::Finished {
         id: analysis,
-        label: "Analyze".into()
+        label: crate::jobs::ANALYZE_LABEL.into()
     }));
     let _ = std::fs::remove_dir_all(&root);
 }

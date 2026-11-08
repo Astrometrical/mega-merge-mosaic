@@ -93,7 +93,7 @@ pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>) -> ChecksReport {
         match loaded {
             Ok((session, graph)) => checks.extend(analysis_checks(&group, &session, &graph)),
             Err(e) => errors.push(format!(
-                "Cannot read the analysis of group {group}: {e}. Analyze again."
+                "Cannot read the analysis of group {group}: {e}. Analyse again."
             )),
         }
     }
@@ -299,6 +299,7 @@ mod tests {
         let errors = &e.report().unwrap().errors;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("group Ha"), "{errors:?}");
+        assert!(errors[0].ends_with("Analyse again."), "{errors:?}");
         assert_eq!(e.counts(&s.mosaic.config).unwrap().problems, 1);
 
         // Accepting a note saves its keys; it is no longer counted.

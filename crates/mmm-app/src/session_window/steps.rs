@@ -6,8 +6,8 @@
 //! |---|---|
 //! | Panels | none: "Add panels"; previews running: "Reading previews {done} / {n}" (cancellable); previews stopped short: "Read previews" (next); else "{n} panels" (done) |
 //! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
-//! | Merge | whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable); no groups, or analysis needed or running: "Merge"; a group without a complete result: "Merge" (next); else "Merged" (done) |
-//! | Export | exports running or queued: "Exporting {i} of {n}" (cancellable); else "Export" |
+//! | Merge | whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; a group without a complete result: "Merge" (next); else "Merged" (done) |
+//! | Export | exports running or queued: "Exporting {i} of {n}" ("Exporting" for one) (cancellable); else "Export" |
 //!
 //! One step at most is next (highlighted): the first that waits for the
 //! user; a later one shows as to do. Steps working by themselves are no
@@ -152,10 +152,14 @@ fn merge_step(session: &OpenSession, jobs: &JobRunner, views: &[JobView]) -> Str
     if let Some(run) = jobs.run_of(JobTarget::Blend) {
         let f = fraction(views, run.id).unwrap_or(0.0);
         let pct = (f * 100.0).floor() as u32;
-        let label = format!(
-            "Merging {} · {} of {} · {pct} %",
-            run.group, run.position, run.count
-        );
+        let mut label = "Merging".to_string();
+        if group_names(session).len() > 1 {
+            label.push_str(&format!(" {}", run.group));
+        }
+        if run.count > 1 {
+            label.push_str(&format!(" · {} of {}", run.position, run.count));
+        }
+        label.push_str(&format!(" · {pct} %"));
         return working(label, Some(f));
     }
     if group_names(session).is_empty() || wants_analysis(session) || jobs.analyzing() {
@@ -170,7 +174,11 @@ fn merge_step(session: &OpenSession, jobs: &JobRunner, views: &[JobView]) -> Str
 fn export_step(jobs: &JobRunner, views: &[JobView]) -> StripStep {
     match jobs.run_of(JobTarget::Export) {
         Some(run) => working(
-            format!("Exporting {} of {}", run.position, run.count),
+            if run.count > 1 {
+                format!("Exporting {} of {}", run.position, run.count)
+            } else {
+                "Exporting".to_string()
+            },
             Some(fraction(views, run.id).unwrap_or(0.0)),
         ),
         None => step("Export", StepState::Todo),

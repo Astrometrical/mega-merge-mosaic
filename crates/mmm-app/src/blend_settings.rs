@@ -521,24 +521,10 @@ impl SettingsPanel {
         applied
     }
 
-    /// Draw the panel; the impact when an edit was applied now.
+    /// Draw the panel (no heading or fold of its own: the inspector's
+    /// Merge settings section holds it); the impact when an edit was
+    /// applied now.
     pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        session: &mut OpenSession,
-        jobs: &mut JobRunner,
-    ) -> Option<ChangeImpact> {
-        let mut applied = None;
-        egui::CollapsingHeader::new(RichText::new("Merge settings").color(palette::TEXT_STRONG))
-            .id_salt("blend-settings")
-            .default_open(true)
-            .show(ui, |ui| {
-                applied = self.body(ui, session, jobs);
-            });
-        applied
-    }
-
-    fn body(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,

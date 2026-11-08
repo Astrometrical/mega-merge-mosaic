@@ -9,11 +9,21 @@
 //!
 //! The steps act as navigation: Panels opens or closes the panel list (and
 //! reads the previews again once they stopped short), Checks opens
-//! Problems (or starts the analysis the pipeline left to the user), Merge
-//! merges every group while it is to do (merging or merged, it shows the
-//! mosaic), Export opens the Export dialog. A working step's **Cancel**
-//! cancels its jobs. An ROI's merge belongs to its ROI: it neither holds
-//! **Merge** back nor stops with the Merge step's Cancel.
+//! Problems (or, while the pipeline has left the analysis to the user,
+//! starts it), Merge merges every group while it is to do (merging or
+//! merged, it shows the mosaic), Export opens the Export dialog. A step
+//! that cannot act now says why in its tooltip (Merge: the main button's
+//! reason; Export: [`MosaicView::export_block_reason`]), as a disabled
+//! **Export…** does. A working step's **Cancel** cancels its jobs. An
+//! ROI's merge belongs to its ROI: it neither holds **Merge** back nor
+//! stops with the Merge step's Cancel.
+//!
+//! **Fit.** One row when it all fits: ‹, the name, the strip, the main
+//! button. Otherwise the strip takes a row of its own below (wrapping if
+//! even that is too narrow), and a name too long for what is left is cut
+//! short with "…" (its tooltip shows it whole). Nothing overlaps.
+//!
+//! [`MosaicView::export_block_reason`]: crate::mosaic_view::MosaicView::export_block_reason
 
 use egui::{Align, Layout};
 use mega_ui::icons;
@@ -21,6 +31,7 @@ use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{CONTROL_HEIGHT, space};
 use mega_ui::widgets::{
     ButtonKind, MegaButton, StepState, StripEvent, StripStep, icon_button_of, step_strip,
+    step_strip_width,
 };
 
 use super::steps::{
@@ -61,9 +72,10 @@ impl SessionWindow {
         jobs.run_of(JobTarget::Export).map(|_| EXPORTING)
     }
 
-    /// The top bar, one row filling `ui`'s width: the main button at the
-    /// right first, so it always shows; the rest from the left. Whether ‹
-    /// was clicked.
+    /// The top bar filling `ui`'s width (see the module docs' **Fit**): a
+    /// row with the main button at the right first, so it always shows,
+    /// and ‹, the name and (when they fit beside it) the strip from the
+    /// left; else the strip on a row of its own. Whether ‹ was clicked.
     pub(super) fn top_bar(
         &mut self,
         ui: &mut egui::Ui,
@@ -72,10 +84,12 @@ impl SessionWindow {
         pipeline: &mut Pipeline,
         checks: &ChecksEngine,
     ) -> bool {
-        let strip = steps(session, jobs, pipeline, checks);
+        let mut strip = steps(session, jobs, pipeline, checks);
+        self.explain_idle_steps(&mut strip, session, jobs);
         let mut event = None;
         let mut main = None;
         let mut back = false;
+        let mut strip_below = false;
         let row = egui::vec2(ui.available_width(), CONTROL_HEIGHT);
         ui.allocate_ui_with_layout(row, Layout::right_to_left(Align::Center), |ui| {
             main = self.main_button(ui, session, jobs);
@@ -87,11 +101,36 @@ impl SessionWindow {
                     .on_disabled_hover_text(blocked.unwrap_or_default())
                     .clicked();
                 ui.add_space(space::XS);
-                ui.label(text(Type::Heading, session.name()));
-                ui.add_space(space::L);
-                event = step_strip(ui, &strip);
+                let name = text(Type::Heading, session.name());
+                let name_width = egui::WidgetText::from(name.clone())
+                    .into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::TextStyle::Body,
+                    )
+                    .size()
+                    .x;
+                let beside = name_width + space::L + step_strip_width(ui, &strip);
+                if beside <= ui.available_width() {
+                    ui.label(name);
+                    ui.add_space(space::L);
+                    event = step_strip(ui, &strip);
+                } else {
+                    // Cut short to what is left; the tooltip shows it all,
+                    // and so does its accessible label.
+                    let full = session.name();
+                    ui.add(egui::Label::new(name).truncate()).widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &full)
+                    });
+                    strip_below = true;
+                }
             });
         });
+        if strip_below {
+            ui.add_space(space::XS);
+            event = step_strip(ui, &strip);
+        }
         match main {
             Some(Main::AddPanels) => {
                 self.panel_list_open = true;
@@ -108,6 +147,22 @@ impl SessionWindow {
             None => {}
         }
         back
+    }
+
+    /// Give the steps a click would leave idle their reason as a tooltip:
+    /// Merge while it is to do but blocked (it would merge), Export while
+    /// the Export dialog cannot open.
+    fn explain_idle_steps(
+        &self,
+        strip: &mut [StripStep; 4],
+        session: &OpenSession,
+        jobs: &JobRunner,
+    ) {
+        let merge = &mut strip[MERGE_STEP];
+        if matches!(merge.state, StepState::Todo | StepState::Next) {
+            merge.tooltip = self.mosaic.merge_block_reason(session, jobs);
+        }
+        strip[EXPORT_STEP].tooltip = self.mosaic.export_block_reason().map(str::to_string);
     }
 
     /// Why the main button's **Merge** cannot be pressed now, if it cannot
@@ -171,20 +226,26 @@ impl SessionWindow {
             {
                 asked = Some(Main::Merge);
             }
-        } else if ui
-            .add_enabled(
-                self.mosaic.can_open_export(),
-                MegaButton::new(ButtonKind::Primary, "Export…"),
-            )
-            .on_hover_text("Export this view's merged groups to FITS or TIFF")
-            .clicked()
-        {
-            asked = Some(Main::Export);
+        } else {
+            let why = self.mosaic.export_block_reason();
+            if ui
+                .add_enabled(
+                    why.is_none(),
+                    MegaButton::new(ButtonKind::Primary, "Export…"),
+                )
+                .on_hover_text("Export this view's merged groups to FITS or TIFF")
+                .on_disabled_hover_text(why.unwrap_or_default())
+                .clicked()
+            {
+                asked = Some(Main::Export);
+            }
         }
         asked
     }
 
-    /// Step `i` was clicked, `strip` showing.
+    /// Step `i` was clicked, `strip` showing. Checks analyses whenever the
+    /// pipeline has left the analysis to the user, whether or not the step
+    /// is the one highlighted (another can be next).
     fn open_step(
         &mut self,
         i: usize,
@@ -201,7 +262,7 @@ impl SessionWindow {
                 self.panel_list_open = !self.panel_list_open;
             }
             // Waiting for an analysis nothing will start by itself.
-            CHECKS_STEP if strip[i].state == StepState::Next => {
+            CHECKS_STEP if pipeline.analysis_stalled(session) => {
                 let id = jobs.start_analyze(session);
                 self.track_analysis(id);
             }

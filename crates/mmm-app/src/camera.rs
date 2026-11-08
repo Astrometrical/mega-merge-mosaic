@@ -3,7 +3,7 @@
 //! one camera moves between them and nothing jumps when the window switches
 //! the canvas it shows.
 
-use mega_ui::viewer::View;
+use mega_ui::viewer::{MAX_ZOOM, View};
 use serde::{Deserialize, Serialize};
 
 /// A canvas's centre and zoom, without the animation state of a [`View`].
@@ -21,6 +21,21 @@ impl Camera {
         Camera {
             centre: view.centre(now),
             zoom: view.zoom(now),
+        }
+    }
+
+    /// The camera that fits canvas rect `rect` (`[x0, y0, x1, y1]`) to a
+    /// viewport of `viewport` size, centred, no closer than the canvases'
+    /// [`MAX_ZOOM`].
+    pub fn framing(rect: [f64; 4], viewport: egui::Vec2) -> Self {
+        let w = (rect[2] - rect[0]).max(1e-9);
+        let h = (rect[3] - rect[1]).max(1e-9);
+        let zoom = (f64::from(viewport.x) / w)
+            .min(f64::from(viewport.y) / h)
+            .min(MAX_ZOOM);
+        Camera {
+            centre: ((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0),
+            zoom,
         }
     }
 }

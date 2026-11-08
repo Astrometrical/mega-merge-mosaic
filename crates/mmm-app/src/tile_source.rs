@@ -345,7 +345,7 @@ impl CompositeTileSource {
         }) {
             return Err(format!(
                 "The groups of this composition are on different canvases ({} and {}); \
-                 analyze them together so they share one frame.",
+                 analyse them together so they share one frame.",
                 size(g0),
                 size(other.tile_geometry())
             ));
@@ -800,6 +800,7 @@ mod tests {
             why.contains("600 × 300") && why.contains("640 × 300"),
             "{why}"
         );
+        assert!(why.contains("analyse them together"), "{why}");
         // And nothing mapped: nothing to show.
         assert!(CompositeTileSource::new(&[None, None, None]).is_err());
         drop((ha_store, oiii_store, odd_store));

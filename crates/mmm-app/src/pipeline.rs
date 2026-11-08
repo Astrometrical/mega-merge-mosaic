@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(r.views()[0].label, "Previews");
         let mut seen = Seen::default();
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert_eq!(seen.previews, 8, "each preview delivered");
         assert_eq!(p.previews().len(), 8);
         assert!(p.previews_complete());
@@ -563,7 +563,7 @@ mod tests {
         let t = t + DEBOUNCE + Duration::from_millis(100);
         let mut seen = Seen::default();
         run_until(&mut p, &mut s, &mut r, t, false, &mut seen, idle);
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert!(
             seen.events
                 .iter()
@@ -653,7 +653,7 @@ mod tests {
             );
             assert!(!r.busy(), "cancelled previews were restarted");
         }
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert!(!p.previews_complete());
         assert!(p.previews_paused());
         assert_eq!(p.step(), None);
@@ -762,7 +762,7 @@ mod tests {
             idle,
         );
         // Analysed by itself all the same; the key is left as it was.
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         assert_eq!(s.mosaic.config.group_dirs.len(), 2);
         let saved = MosaicConfig::load(&s.mosaic.dir).unwrap();
         assert_eq!(saved.ui["auto_analyze"], serde_json::Value::Bool(false));
@@ -781,7 +781,7 @@ mod tests {
         let t0 = Instant::now();
         let mut seen = Seen::default();
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
         let mut panel = SettingsPanel::new();
 
         // Blend-local: nothing reruns.
@@ -792,7 +792,7 @@ mod tests {
         for _ in 0..20 {
             run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         }
-        assert_eq!(seen.started, ["Previews", "Analyze"]);
+        assert_eq!(seen.started, ["Previews", "Analyse"]);
 
         // Global: the pipeline analyses again by itself.
         let mut e = SettingsEdit::of(&s.mosaic.config);
@@ -857,7 +857,7 @@ mod tests {
             if let Some(id) = again
                 && ended.contains(&JobEvent::Finished {
                     id,
-                    label: "Analyze".into(),
+                    label: "Analyse".into(),
                 })
             {
                 break;

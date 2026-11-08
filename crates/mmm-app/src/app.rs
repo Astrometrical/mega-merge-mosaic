@@ -93,6 +93,9 @@ pub struct Shell {
     jobs: Option<JobRunner>,
     /// Job outcomes and failures to open windows.
     toasts: Toasts,
+    /// Every toast's title pushed, in order (tests: a toast expires).
+    #[cfg(test)]
+    toasted: Vec<String>,
     /// The window title last sent.
     title: String,
     /// The session window (made afresh with each session).
@@ -125,6 +128,8 @@ impl Shell {
             launcher: Arc::new(ProcessLauncher),
             jobs: None,
             toasts: Toasts::default(),
+            #[cfg(test)]
+            toasted: Vec::new(),
             title: APP_TITLE.to_string(),
             window: SessionWindow::new(Arc::new(RfdFilesPicker)),
             files_picker: Arc::new(RfdFilesPicker),
@@ -171,6 +176,13 @@ impl Shell {
     /// The checks engine.
     pub fn checks(&self) -> &ChecksEngine {
         &self.checks
+    }
+
+    /// Every toast's title pushed so far, in order, whether or not it is
+    /// still on screen.
+    #[cfg(test)]
+    pub fn toasted(&self) -> &[String] {
+        &self.toasted
     }
 
     /// Save anything held back: edits waiting for the jobs to stop (panels,
@@ -419,6 +431,8 @@ impl Shell {
                 JobEvent::Cancelled { id } => (Tone::Neutral, format!("{} cancelled", name(id))),
                 JobEvent::Failed { message, .. } => (Tone::Problem, message.clone()),
             };
+            #[cfg(test)]
+            self.toasted.push(text.clone());
             self.toasts.push(toast(tone, text), clock);
         }
         self.window.poll_panels(ctx, session, jobs);
@@ -455,6 +469,8 @@ impl Shell {
         for check in &out.accept {
             if let Err(message) = self.checks.accept(session, check) {
                 tracing::warn!("{message}");
+                #[cfg(test)]
+                self.toasted.push(message.clone());
                 self.toasts
                     .push(toast(Tone::Problem, message), ctx.input(|i| i.time));
             }
@@ -462,6 +478,8 @@ impl Shell {
         if out.back
             && let Err(why) = self.close_session(&ctx)
         {
+            #[cfg(test)]
+            self.toasted.push(why.clone());
             self.toasts
                 .push(toast(Tone::Neutral, why), ctx.input(|i| i.time));
         }
@@ -741,7 +759,7 @@ fn log_mosaic(mosaic: &MosaicView) {
             h.seams.len()
         ),
         Some(Err(e)) => tracing::info!("self-test: health unavailable: {e}"),
-        None => tracing::info!("self-test: no health (group not analyzed)"),
+        None => tracing::info!("self-test: no health (group not analysed)"),
     }
 }
 
@@ -1226,7 +1244,7 @@ mod tests {
         });
         h.run_steps(2);
         assert_eq!(h.state().pipeline().previews().len(), 8);
-        h.get_by_label("Analyze finished");
+        assert_eq!(h.state().toasted(), ["Analyse finished"]);
         // No status bar: its items are gone.
         assert!(h.query_by_label("Ready").is_none());
         assert!(h.query_by_label("Canvas 600 × 420 (0.3 MP)").is_none());
@@ -1270,8 +1288,10 @@ mod tests {
         assert_eq!(h.state().window().mode(), CanvasMode::Mosaic);
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
         h.run_steps(2);
-        h.get_by_label("Merge Ha finished");
-        h.get_by_label("Merge OIII finished");
+        let toasted = h.state().toasted();
+        for t in ["Merge Ha finished", "Merge OIII finished"] {
+            assert!(toasted.iter().any(|x| x == t), "{t}: {toasted:?}");
+        }
         assert!(h.state().session().unwrap().merged);
         // Merged: Export… is the main button now, and stays so once the
         // summary has classified the results.
@@ -1504,7 +1524,9 @@ mod tests {
         previews.open();
         let running = |s: &Shell| {
             let views = s.jobs.as_ref().unwrap().views();
-            views.first().is_some_and(|v| v.label == "Analyze")
+            views
+                .first()
+                .is_some_and(|v| v.label == crate::jobs::ANALYZE_LABEL)
         };
         step_until(&mut h, running);
         assert!(running(h.state()), "analysing");
