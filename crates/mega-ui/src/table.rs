@@ -8,7 +8,11 @@
 //!
 //! The caller places the table in a `ScrollArea` and persists
 //! [`TableState`]. Rows outside the visible area are laid out but not
-//! painted; a rolled-up section bounds the rows it lays out.
+//! painted; a rolled-up section bounds the rows it lays out. The table
+//! never paints past the width it is given: when the columns do not fit,
+//! the first column is cut short (down to a floor), then columns are left
+//! out from the right, whole, headings included; the actions button stays
+//! at the right end of its row.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -168,7 +172,8 @@ const PAD: f32 = space::S;
 const COLUMN_GAP: f32 = space::L;
 /// Rows under headings start below the colour dot, past the chevron.
 const INDENT: f32 = ICON_SIZE + space::XS;
-/// Narrowest the first column gets; the table overflows below it.
+/// Narrowest the first column gets beside other columns: below it they are
+/// left out from the right.
 const MIN_FIRST_WIDTH: f32 = 120.0;
 /// Tag pill height.
 const TAG_HEIGHT: f32 = 18.0;
@@ -188,7 +193,7 @@ struct Geometry {
     first_x: f32,
     /// Width of the first column.
     first_w: f32,
-    /// Left and width of each further column.
+    /// Left and width of each further column shown (those that fit).
     cols: Vec<(f32, f32)>,
     /// Left of the actions button.
     actions_x: f32,
@@ -211,8 +216,9 @@ struct Table<'t> {
 /// the row with the given id (e.g. a **Move to** submenu, **Remove**); the table
 /// draws the button that opens it (a quiet "⋯", "Panel actions") while
 /// the row is hovered or focused. Takes the available width: the first
-/// column flexes, the others fit their contents. One table per `Ui` (give
-/// a second one its own `ui.push_id`).
+/// column flexes, the others fit their contents (and are left out from the
+/// right when they do not fit beside a readable first column). One table
+/// per `Ui` (give a second one its own `ui.push_id`).
 pub fn sectioned_table(
     ui: &mut Ui,
     state: &mut TableState,
@@ -350,7 +356,11 @@ fn cell_font(ui: &Ui, columns: &[Column<'_>], i: usize) -> FontId {
 /// Column positions for a table `width` wide. The columns after the first
 /// fit the widest of their heading and every cell (in every section, shown
 /// or not, so they hold still as sections fold and expand); the first
-/// takes the rest. Rows under headings are indented past the chevron.
+/// takes the rest. When that leaves the first column narrower than
+/// [`MIN_FIRST_WIDTH`], columns are left out from the right, whole, until
+/// it is not (or none is left); its text is cut short past its width. The
+/// actions button always sits at the right end. Rows under headings are
+/// indented past the chevron.
 fn geometry(ui: &Ui, width: f32, columns: &[Column<'_>], sections: &[Section<'_>]) -> Geometry {
     let mut widths: Vec<f32> = columns
         .iter()
@@ -368,13 +378,18 @@ fn geometry(ui: &Ui, width: f32, columns: &[Column<'_>], sections: &[Section<'_>
     }
     let headed = sections.iter().any(|s| s.heading.is_some());
     let first_x = PAD + if headed { INDENT } else { 0.0 };
-    let tail: f32 =
-        widths.iter().map(|w| COLUMN_GAP + w).sum::<f32>() + space::S + CONTROL_HEIGHT + space::XS;
-    let first_w = (width - first_x - tail).max(MIN_FIRST_WIDTH);
+    // Room for the first column and the others, the actions slot left out.
+    let room = width - first_x - (space::S + CONTROL_HEIGHT + space::XS);
+    let others = |n: usize| widths[..n].iter().map(|w| COLUMN_GAP + w).sum::<f32>();
+    let mut shown = widths.len();
+    while shown > 0 && room - others(shown) < MIN_FIRST_WIDTH {
+        shown -= 1;
+    }
+    let first_w = (room - others(shown)).max(0.0);
     let mut x = first_x + first_w;
-    let cols = widths
-        .into_iter()
-        .map(|w| {
+    let cols = widths[..shown]
+        .iter()
+        .map(|&w| {
             x += COLUMN_GAP;
             let col = (x, w);
             x += w;
@@ -385,7 +400,7 @@ fn geometry(ui: &Ui, width: f32, columns: &[Column<'_>], sections: &[Section<'_>
         first_x,
         first_w,
         cols,
-        actions_x: x + space::S,
+        actions_x: (width - space::XS - CONTROL_HEIGHT).max(0.0),
     }
 }
 
@@ -422,8 +437,11 @@ impl Table<'_> {
         for (i, column) in self.columns.iter().enumerate() {
             let (x, w) = if i == 0 {
                 (self.g.first_x, self.g.first_w)
+            } else if let Some(&col) = self.g.cols.get(i - 1) {
+                col
             } else {
-                self.g.cols[i - 1]
+                // Left out for want of room, with its cells.
+                break;
             };
             let galley = overline_galley(ui, column.title);
             paint_in_cell(ui, rect, x, w, galley, column.numeric);

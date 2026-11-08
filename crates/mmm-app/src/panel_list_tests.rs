@@ -18,7 +18,7 @@ use mmm_core::mosaic::{GroupRule, Grouping, Mosaic, MosaicConfig, PanelEntry};
 use mmm_core::synth::{SynthWcs, write_xisf_solved, write_xisf_with_header_xml};
 
 use super::*;
-use crate::checks::ChecksEngine;
+use crate::checks::{ChecksEngine, ChecksReport};
 use crate::jobs::JobRunner;
 use crate::panel_edits::{
     Applied, FilesPicker, GROUP_PALETTE, PHYSICAL_SLOTS, PanelsEdit, assign_group_colors,
@@ -26,7 +26,7 @@ use crate::panel_edits::{
 };
 use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, create_blocking};
-use crate::session_window::{SessionWindow, WindowToast};
+use crate::session_window::{SessionWindow, Undo, WindowToast};
 use crate::start::tests::{step_until, temp_dir};
 use crate::testutil::{PATIENCE, open, two_group_session};
 
@@ -96,6 +96,19 @@ fn runner() -> JobRunner {
 /// The session window over `session` with the panel list open, its file
 /// dialog answering `picked`.
 fn harness(session: OpenSession, picked: Vec<PathBuf>, jobs: JobRunner) -> Harness<'static, State> {
+    harness_sized(session, picked, jobs, WINDOW)
+}
+
+/// The window size of [`harness`].
+const WINDOW: egui::Vec2 = egui::vec2(1400.0, 900.0);
+
+/// [`harness`] in a window of `size`.
+fn harness_sized(
+    session: OpenSession,
+    picked: Vec<PathBuf>,
+    jobs: JobRunner,
+    size: egui::Vec2,
+) -> Harness<'static, State> {
     let mut w = SessionWindow::new(Arc::new(StubFiles(picked)));
     w.panel_list_open = true;
     let state = State {
@@ -107,7 +120,7 @@ fn harness(session: OpenSession, picked: Vec<PathBuf>, jobs: JobRunner) -> Harne
         toasts: Vec::new(),
     };
     Harness::builder()
-        .with_size(egui::vec2(1400.0, 900.0))
+        .with_size(size)
         .with_step_dt(0.01)
         .with_max_steps(64)
         .build_ui_state(
@@ -600,6 +613,10 @@ fn add_files_dedupes() {
     // Unreadable files still get a row, saying so (no grouping: one flat
     // list).
     steps(&mut h);
+    // The list kept its width while it was empty (a narrow hint shrinks
+    // no panel).
+    let list = h.state().w.list_rect.expect("the list was drawn");
+    assert!(list.width() >= WINDOW.x / 2.0 - 1.0, "{list:?}");
     assert_eq!(cells(&h, "a.xisf"), ["Unreadable", "—", "—", "—"]);
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
@@ -835,4 +852,179 @@ fn integration_reads_hours_and_minutes() {
     assert_eq!(integration_text(90.0), "0h 02m");
     assert_eq!(integration_text(138_000.0), "38h 20m");
     assert_eq!(scale_text(1.2149), "1.21″");
+}
+
+/// The texts painted on the row of panel `name` (its name included, icons
+/// left out) and where, left to right.
+fn cell_rects(h: &Harness<'_, State>, name: &str) -> Vec<(String, Rect)> {
+    let row = h.get_by_role_and_label(Role::ListItem, name).rect();
+    let mut on_row: Vec<(String, Rect)> = painted(h)
+        .into_iter()
+        .filter(|(t, r)| !is_icon(t) && row.contains(r.center()))
+        .collect();
+    on_row.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
+    on_row
+}
+
+#[test]
+fn the_list_fits_its_narrowest_width() {
+    use mega_ui::theme::tokens::PANEL_LIST_MIN_WIDTH;
+    let root = temp_dir("list-narrow");
+    // Half this window is less than the narrowest list.
+    let size = egui::vec2(2.0 * PANEL_LIST_MIN_WIDTH - 20.0, 900.0);
+    let mut h = harness_sized(two_group_session(&root), vec![], runner(), size);
+    wait(&mut h, State::settled);
+    let list = h.state().w.list_rect.expect("the list was drawn");
+    assert!(
+        (list.width() - PANEL_LIST_MIN_WIDTH).abs() < 1.0,
+        "{list:?}"
+    );
+    // The toolbar fits.
+    for (role, label) in [
+        (Role::Button, "Add files…"),
+        (Role::Button, "More"),
+        (Role::ComboBox, "Group by"),
+        (Role::TextInput, "Header key"),
+    ] {
+        let r = h.get_by_role_and_label(role, label).rect();
+        assert!(list.contains_rect(r), "{label} at {r:?} not in {list:?}");
+    }
+    let row = h.get_by_role_and_label(Role::ListItem, "Ha_0.xisf").rect();
+    assert!(list.contains_rect(row), "{row:?} not in {list:?}");
+    // What shows lines up inside the row, nothing overlapping.
+    let cells = cell_rects(&h, "Ha_0.xisf");
+    assert!(cells.len() >= 2, "{cells:?}");
+    for (t, r) in &cells {
+        assert!(
+            r.left() >= row.left() && r.right() <= row.right() + 0.5,
+            "{t:?} at {r:?} outside {row:?}"
+        );
+    }
+    for pair in cells.windows(2) {
+        assert!(pair[0].1.right() <= pair[1].1.left(), "{pair:?} overlap");
+    }
+    // The actions button is in reach, inside its row.
+    h.get_by_role_and_label(Role::ListItem, "Ha_0.xisf").hover();
+    steps(&mut h);
+    let button = h.get_by_label("Panel actions").rect();
+    assert!(row.contains_rect(button), "{button:?} not in {row:?}");
+    assert!(list.contains_rect(button), "{button:?} not in {list:?}");
+    remove_row(&mut h, "Ha_0.xisf");
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 7
+    });
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn row_ids_stay_with_their_panels() {
+    let root = temp_dir("list-ids");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    h.get_by_role_and_label(Role::ListItem, "Ha_2.xisf").focus();
+    steps(&mut h);
+    assert!(
+        h.get_by_role_and_label(Role::ListItem, "Ha_2.xisf")
+            .is_focused()
+    );
+    // An earlier panel goes (as an Undo might take it away).
+    {
+        let s = h.state_mut();
+        let mut edit = PanelsEdit::of(&s.session);
+        edit.panels.remove(0);
+        s.w.undo(Undo::Panels(edit), &mut s.session, &mut s.jobs);
+    }
+    wait(&mut h, |s| {
+        s.settled() && s.session.mosaic.config.panels.len() == 7
+    });
+    assert!(
+        h.get_by_role_and_label(Role::ListItem, "Ha_2.xisf")
+            .is_focused(),
+        "the focus stays with its panel"
+    );
+    assert!(
+        !h.get_by_role_and_label(Role::ListItem, "Ha_3.xisf")
+            .is_focused()
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_canvas_keeps_its_room() {
+    use mega_ui::inspector::inspector_width;
+    use mega_ui::theme::tokens::CANVAS_MIN_WIDTH;
+    let root = temp_dir("list-max");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    let before = h.state().w.list_rect.expect("the list was drawn");
+    // Drag the list's edge almost to the window's right edge.
+    // The resize handle straddles the edge; grab it just inside.
+    let edge = egui::pos2(before.right() - 2.0, before.center().y);
+    let far = egui::pos2(WINDOW.x - 10.0, edge.y);
+    h.hover_at(edge);
+    steps(&mut h);
+    h.drag_at(edge);
+    steps(&mut h);
+    h.hover_at(far);
+    steps(&mut h);
+    h.drop_at(far);
+    steps(&mut h);
+    let after = h.state().w.list_rect.expect("the list was drawn");
+    assert!(after.width() > before.width() + 1.0, "{before:?} {after:?}");
+    let inspector = inspector_width(h.state().w.inspector());
+    let limit = WINDOW.x - inspector - CANVAS_MIN_WIDTH;
+    assert!(after.right() <= limit + 1.0, "{after:?} past {limit}");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rows_read_dashes_until_their_header_is_read() {
+    let list = PanelList::new(Arc::new(StubFiles(vec![])));
+    let row = list.row(Path::new("panels/p.xisf"), None);
+    assert_eq!(row.cells, ["p.xisf", "Reading…", "—", "—", "—"]);
+    assert_eq!(row.problem, None);
+}
+
+#[test]
+fn rows_show_their_problems() {
+    use mmm_core::checks::{Check, CheckCode, Severity};
+    let root = temp_dir("list-problems");
+    let mut h = harness(two_group_session(&root), vec![], runner());
+    wait(&mut h, State::settled);
+    assert!(
+        h.query_by_role_and_label(Role::ListItem, "Ha_3.xisf")
+            .is_none(),
+        "rolled up"
+    );
+    let ha_3 = h.state().session.mosaic.config.panels[3].path.clone();
+    assert_eq!(name_of(&ha_3), "Ha_3.xisf");
+    let check = Check {
+        code: CheckCode::SolutionPresent,
+        severity: Severity::Problem,
+        panels: vec![ha_3],
+        groups: vec!["Ha".into()],
+        message: "Ha_3.xisf has no astrometric solution.".into(),
+        remedy: Some("Plate-solve it, then add it again.".into()),
+    };
+    h.state_mut().checks.set_report(ChecksReport {
+        checks: vec![check],
+        errors: Vec::new(),
+    });
+    steps(&mut h);
+    // The rolled-up section shows the row with the problem, its ⚠ telling
+    // what it is.
+    let row = h.get_by_role_and_label(Role::ListItem, "Ha_3.xisf").rect();
+    let tip = h
+        .get_by_label("Ha_3.xisf has no astrometric solution.\nPlate-solve it, then add it again.");
+    assert!(
+        row.contains_rect(tip.rect()),
+        "{:?} not in {row:?}",
+        tip.rect()
+    );
+    assert_eq!(rows(&h), 2 * ROLL_UP_ROWS + 1);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
 }

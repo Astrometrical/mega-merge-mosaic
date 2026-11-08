@@ -10,7 +10,8 @@
 //!   with the merge settings' summary, or **Export…**).
 //! - **Panel list** ([`PanelList`]): while open it is a resizable column
 //!   at the left of the canvas (about half the window wide at first, never
-//!   narrower than [`PANEL_LIST_MIN_WIDTH`]), so the view bar and the plan
+//!   narrower than [`PANEL_LIST_MIN_WIDTH`], never so wide that the canvas
+//!   gets narrower than [`CANVAS_MIN_WIDTH`]), so the view bar and the plan
 //!   stay beside it; the Panels step opens and closes it, and switching
 //!   between plan and mosaic leaves it as it is. A session without panels
 //!   opens on it. Files dropped on the window are added whatever shows
@@ -72,7 +73,7 @@ use std::time::Instant;
 
 use mega_ui::inspector::{InspectorState, inspector_width};
 use mega_ui::theme::palette;
-use mega_ui::theme::tokens::{PANEL_LIST_MIN_WIDTH, space};
+use mega_ui::theme::tokens::{CANVAS_MIN_WIDTH, PANEL_LIST_MIN_WIDTH, space};
 use mega_ui::widgets::NotesMode;
 use mmm_core::checks::Check;
 use mmm_core::session_summary::ResultState;
@@ -445,12 +446,16 @@ impl SessionWindow {
                 self.inspector_ui(ui, session, jobs, pipeline, checks, &mut out);
             });
         if self.panel_list_open {
-            // About half the window at first; the user resizes it.
-            let width = (ctx.content_rect().width() / 2.0).max(PANEL_LIST_MIN_WIDTH);
+            // About half the window at first; the user resizes it, never
+            // squeezing the canvas below its minimum (unless the window is
+            // too small for both, when the list keeps its own).
+            let widest = (ui.available_width() - CANVAS_MIN_WIDTH).max(PANEL_LIST_MIN_WIDTH);
+            let width = (ctx.content_rect().width() / 2.0).clamp(PANEL_LIST_MIN_WIDTH, widest);
             let list = egui::Panel::left("panel-list")
                 .resizable(true)
                 .default_size(width)
                 .min_size(PANEL_LIST_MIN_WIDTH)
+                .max_size(widest)
                 .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
                 .show(ui, |ui| self.panels.ui(ui, session, jobs, checks.report()));
             #[cfg(test)]

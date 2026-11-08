@@ -86,28 +86,30 @@ fn rolled_up() -> Vec<Section<'static>> {
 }
 
 fn harness(sections: Vec<Section<'static>>) -> Harness<'static, State> {
-    Harness::builder()
-        .with_size(Vec2::new(600.0, 600.0))
-        .build_ui_state(
-            |ui, s: &mut State| {
-                if !crate::testutil::themed(ui) {
-                    return;
-                }
-                let events =
-                    sectioned_table(ui, &mut s.table, &s.columns, &s.sections, |ui, id| {
-                        ui.label(format!("menu for {id}"));
-                    });
-                s.all.extend(events.iter().cloned());
-                s.last = events;
-            },
-            State {
-                table: TableState::default(),
-                columns: columns(),
-                sections,
-                all: Vec::new(),
-                last: Vec::new(),
-            },
-        )
+    harness_sized(sections, Vec2::new(600.0, 600.0))
+}
+
+/// [`harness`] in a window of `size`.
+fn harness_sized(sections: Vec<Section<'static>>, size: Vec2) -> Harness<'static, State> {
+    Harness::builder().with_size(size).build_ui_state(
+        |ui, s: &mut State| {
+            if !crate::testutil::themed(ui) {
+                return;
+            }
+            let events = sectioned_table(ui, &mut s.table, &s.columns, &s.sections, |ui, id| {
+                ui.label(format!("menu for {id}"));
+            });
+            s.all.extend(events.iter().cloned());
+            s.last = events;
+        },
+        State {
+            table: TableState::default(),
+            columns: columns(),
+            sections,
+            all: Vec::new(),
+            last: Vec::new(),
+        },
+    )
 }
 
 /// The rect of the painted text `s`, if any is painted this frame.
@@ -401,4 +403,76 @@ fn headings_without_drop_target_take_no_drops() {
             .iter()
             .any(|e| matches!(e, TableEvent::Drop { .. }))
     );
+}
+
+/// Every text painted last frame and its rect.
+fn painted(h: &Harness<'_, State>) -> Vec<(String, Rect)> {
+    h.output()
+        .shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some((
+                t.galley.text().to_owned(),
+                Rect::from_min_size(t.pos, t.galley.size()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_narrow_table_hides_columns_from_the_right() {
+    let mut sections = two_sections();
+    sections[0].rows[0].cells[0] = "Orion_Mosaic_Panel_With_A_Long_Name_01.xisf".to_owned();
+    let mut h = harness_sized(sections, Vec2::new(300.0, 600.0));
+    h.run();
+    // The row (and the table) is as wide as the window lets it be.
+    let row = h.get_by_label("a2").rect();
+    // Nothing is painted past the table's right edge: the long name is cut
+    // short, and columns that don't fit are left out, never cut.
+    for (t, r) in painted(&h) {
+        assert!(
+            r.right() <= row.right() + 0.5,
+            "{t:?} at {r:?} past {row:?}"
+        );
+    }
+    let shows = |s: &str| text_rect(&h, s).is_some();
+    // FILTER, the last column, has no room: its heading and cells go.
+    assert!(!shows("FILTER") && !shows("OIII"), "FILTER hidden");
+    // A column shows whole or not at all.
+    let scale = ["SCALE", "1.5", "12.25", "123.125"];
+    let shown = scale.iter().filter(|s| shows(s)).count();
+    assert!(shown == 0 || shown == scale.len(), "SCALE partly shown");
+    // The first column still shows, cut short.
+    h.get_by_label("a2");
+    // The actions button sits inside the row, at its right end.
+    h.hover_at(row.center());
+    h.run();
+    let button = h.get_by_label("Panel actions").rect();
+    assert!(row.contains_rect(button), "{button:?} not in {row:?}");
+    assert!(
+        row.right() - button.right() < space::S,
+        "{button:?} {row:?}"
+    );
+}
+
+#[test]
+fn a_table_too_narrow_for_any_column_keeps_its_first() {
+    let mut h = harness_sized(two_sections(), Vec2::new(200.0, 600.0));
+    h.run();
+    let row = h.get_by_label("a1").rect();
+    for (t, r) in painted(&h) {
+        assert!(
+            r.right() <= row.right() + 0.5,
+            "{t:?} at {r:?} past {row:?}"
+        );
+    }
+    for s in ["SCALE", "FILTER", "1.5", "Ha", "OIII"] {
+        assert!(text_rect(&h, s).is_none(), "{s} shown");
+    }
+    assert!(text_rect(&h, "PANEL").is_some());
+    h.hover_at(row.center());
+    h.run();
+    let button = h.get_by_label("Panel actions").rect();
+    assert!(row.contains_rect(button), "{button:?} not in {row:?}");
 }

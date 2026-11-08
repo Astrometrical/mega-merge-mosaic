@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use egui::{Align, Color32, Layout, RichText, Stroke};
+use egui::{Align, Color32, Label, Layout, RichText, Stroke, TextWrapMode};
 use mega_ui::icons;
 use mega_ui::table::{Column, Heading, Row, Section, TableEvent, TableState, sectioned_table};
 use mega_ui::theme::text::{Type, text};
@@ -295,6 +295,21 @@ fn first_seen<'a>(inputs: &PanelsEdit, groups: &'a Groups) -> Vec<&'a str> {
         .filter_map(|p| by_path.get(p.path.as_path()).copied())
         .filter(|n| *n != UNGROUPED && seen.insert(*n))
         .collect()
+}
+
+/// The table id of `path`'s row: from the path, so a row keeps its id (and
+/// with it its focus, menu and selection) as other panels come and go.
+fn row_id(path: &Path) -> u64 {
+    egui::Id::new(("panel-row", path)).value()
+}
+
+/// The panel of `shown` whose row is `id`.
+fn panel_of(shown: &PanelsEdit, id: u64) -> Option<&Path> {
+    shown
+        .panels
+        .iter()
+        .map(|p| p.path.as_path())
+        .find(|p| row_id(p) == id)
 }
 
 /// The file name of `path`, for rows.
@@ -704,6 +719,9 @@ impl PanelList {
         report: Option<&ChecksReport>,
     ) -> PanelListOutput {
         let ctx = ui.ctx().clone();
+        // Fill the column, whatever shows: a resizable panel keeps the width
+        // its contents take, so a short hint would shrink it for good.
+        ui.set_min_width(ui.available_width());
         let shown = self.edits.shown(session);
         let mut out = PanelListOutput::default();
         let mut edit: Option<PanelsEdit> = None;
@@ -734,7 +752,7 @@ impl PanelList {
                     })
                 })
                 .inner;
-            let path = |id: u64| shown.panels.get(id as usize).map(|p| p.path.clone());
+            let path = |id: u64| panel_of(&shown, id).map(|p| p.to_path_buf());
             for event in events {
                 match event {
                     TableEvent::Hover(id) => out.hovered = path(id),
@@ -758,9 +776,7 @@ impl PanelList {
     /// The edit removing row `id`'s panel from `shown`, with a toast that
     /// puts it back.
     fn remove(&mut self, shown: &PanelsEdit, id: u64) -> Option<PanelsEdit> {
-        let at = usize::try_from(id)
-            .ok()
-            .filter(|i| *i < shown.panels.len())?;
+        let at = shown.panels.iter().position(|p| row_id(&p.path) == id)?;
         let mut edit = shown.clone();
         edit.panels.remove(at);
         self.toasts.push(WindowToast {
@@ -784,7 +800,8 @@ impl PanelList {
         shown: &PanelsEdit,
         edit: &mut Option<PanelsEdit>,
     ) {
-        ui.horizontal_wrapped(|ui| {
+        // Two rows, each fitting the narrowest list: adding, then grouping.
+        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = space::S;
             let add = MegaButton::new(ButtonKind::Secondary, "Add files…")
                 .hover_text("Choose XISF or FITS panel files");
@@ -803,7 +820,10 @@ impl PanelList {
             if self.picking.is_some() || self.expanding.is_some() || !self.normalizing.is_empty() {
                 ui.spinner();
             }
-            ui.add_space(space::M);
+        });
+        ui.add_space(space::XS);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
             if let Some(grouping) = self.group_by(ui, shown) {
                 *edit = Some(PanelsEdit {
                     panels: shown.panels.clone(),
@@ -818,7 +838,8 @@ impl PanelList {
     fn group_by(&mut self, ui: &mut egui::Ui, shown: &PanelsEdit) -> Option<Grouping> {
         let current = GroupBy::of(&shown.grouping);
         let mut chosen = current;
-        let label = ui.label(text(Type::Small, "Group by"));
+        let label =
+            ui.add(Label::new(text(Type::Small, "Group by")).wrap_mode(TextWrapMode::Extend));
         let combo = egui::ComboBox::from_id_salt("panel-list-group-by")
             .selected_text(current.label())
             .show_ui(ui, |ui| {
@@ -875,13 +896,17 @@ impl PanelList {
             GroupRule::PathKeyword { keyword } => (keyword, "Path keyword", DEFAULT_HEADER_KEY),
             GroupRule::Manual => return None,
         };
-        let label = ui.label(text(Type::Small, field_label));
+        let label =
+            ui.add(Label::new(text(Type::Small, field_label)).wrap_mode(TextWrapMode::Extend));
+        // As wide as a keyword needs, or what the row has left (the field's
+        // frame adds its margin).
+        let width = (ui.available_width() - space::S).clamp(0.0, KEYWORD_INPUT_WIDTH);
         let mut typed = self.rule_text.clone().unwrap_or_else(|| current.clone());
         let field = ui
             .add(
                 egui::TextEdit::singleline(&mut typed)
                     .hint_text(hint)
-                    .desired_width(KEYWORD_INPUT_WIDTH),
+                    .desired_width(width),
             )
             .labelled_by(label.id);
         if field.lost_focus() {
@@ -1007,13 +1032,7 @@ impl PanelList {
     ) -> Vec<SectionData> {
         let cfg = &session.mosaic.config;
         let problems = panel_problems(report, cfg);
-        let ids: BTreeMap<&Path, usize> = shown
-            .panels
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.path.as_path(), i))
-            .collect();
-        let row = |path: &Path| self.row(ids[path], path, problems.get(path));
+        let row = |path: &Path| self.row(path, problems.get(path));
         if !shown.grouping.enabled {
             let rows = shown.panels.iter().map(|p| row(&p.path)).collect();
             return vec![SectionData {
@@ -1087,13 +1106,13 @@ impl PanelList {
         })
     }
 
-    /// Row `id`: `path`'s cells from its header, and its problems (the
-    /// read error, then `problems`).
-    fn row(&self, id: usize, path: &Path, problems: Option<&Vec<String>>) -> RowData {
+    /// `path`'s row: its cells from its header ("—" for what is not known,
+    /// yet or at all), and its problems (the read error, then `problems`).
+    fn row(&self, path: &Path, problems: Option<&Vec<String>>) -> RowData {
         let mut cells = vec![file_name(path)];
         let mut texts = Vec::new();
         match self.infos.get(path).map(|i| &i.header) {
-            None => cells.extend([READING.into(), String::new(), String::new(), String::new()]),
+            None => cells.extend([READING, UNKNOWN, UNKNOWN, UNKNOWN].map(String::from)),
             Some(Ok(h)) => cells.extend([
                 h.filter.clone().unwrap_or_else(|| UNKNOWN.into()),
                 h.integration_s()
@@ -1108,7 +1127,7 @@ impl PanelList {
         }
         texts.extend(problems.into_iter().flatten().cloned());
         RowData {
-            id: id as u64,
+            id: row_id(path),
             cells,
             problem: (!texts.is_empty()).then(|| texts.join("\n\n")),
         }
