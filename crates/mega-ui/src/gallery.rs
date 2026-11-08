@@ -187,7 +187,7 @@ fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
     // Constant time keeps the stage on its first view, mid-drift.
     ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(rect);
-        hero.show(ui, image, 0.0);
+        hero.show(ui, image, rect.bottom(), 0.0);
     });
 }
 

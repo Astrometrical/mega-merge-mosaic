@@ -1,6 +1,9 @@
 //! The start screen's hero: a starfield with the selected session's mosaic
 //! drifting slowly behind it, crossfading between views, under gradients
-//! that keep the text on the left readable.
+//! that keep the text on the left readable. The page's content can also lie
+//! over the image's foot (the start screen's shelf): a scrim from that
+//! content's top, the floor, down keeps it readable over any image, and
+//! the label and controls sit just above it.
 //!
 //! Each view fills its image area (a cover fit, as the web's hero does),
 //! whatever the mosaic's aspect: a portrait mosaic in a landscape area is
@@ -37,7 +40,8 @@ const HOLD_MAX_S: f64 = 2.0;
 
 /// One image the hero can show: a label and the tiles to draw.
 pub struct HeroView {
-    /// Short name shown at the image's bottom right (e.g. a group name).
+    /// Short name shown at the right, just above the floor (e.g. a group
+    /// name).
     pub label: String,
     /// The mosaic's tiles.
     pub source: Arc<dyn TileSource>,
@@ -215,7 +219,13 @@ impl HeroStage {
     /// Draw the hero: the starfield over all of `ui.max_rect()`, the views
     /// in `image_rect`, the gradients, the label and the controls. `now` is
     /// in seconds.
-    pub fn show(&mut self, ui: &mut Ui, image_rect: Rect, now: f64) {
+    ///
+    /// `floor` is the top of the page content laid over the image's foot
+    /// (e.g. a shelf of cards), or the image's bottom when there is none.
+    /// From it down the image is darkened by 90 %, enough for
+    /// the faintest text to stay AA over a white image, easing to clear
+    /// above it; the label and controls sit just above it.
+    pub fn show(&mut self, ui: &mut Ui, image_rect: Rect, floor: f32, now: f64) {
         let full = ui.max_rect();
         self.starfield.paint(ui.painter(), full);
 
@@ -302,30 +312,30 @@ impl HeroStage {
         }
 
         paint_feather(ui, full, image_rect);
-        paint_gradients(ui, full);
+        paint_gradients(ui, full, floor);
 
         if n == 0 {
             if let Some(msg) = &self.message {
-                let rect = Rect::from_center_size(image_rect.center(), vec2(480.0, 24.0));
+                // Centred in the image above the floor.
+                let bottom = floor.clamp(image_rect.top(), image_rect.bottom());
+                let centre = pos2(image_rect.center().x, (image_rect.top() + bottom) / 2.0);
+                let rect = Rect::from_center_size(centre, vec2(480.0, 24.0));
                 ui.put(rect, egui::Label::new(text(Type::Body, msg.clone())));
             }
         } else {
-            self.controls(ui, image_rect, now);
+            self.controls(ui, image_rect, floor, now);
         }
 
         self.request_repaints(ui, eff, elapsed);
     }
 
-    fn controls(&mut self, ui: &mut Ui, image_rect: Rect, now: f64) {
+    /// The label and controls, right-aligned a page margin in from the
+    /// image's right edge, just above the floor.
+    fn controls(&mut self, ui: &mut Ui, image_rect: Rect, floor: f32, now: f64) {
+        let bottom = floor - space::L;
         let strip = Rect::from_min_max(
-            pos2(
-                image_rect.left(),
-                image_rect.bottom() - space::L - CONTROL_HEIGHT,
-            ),
-            pos2(
-                image_rect.right() - space::L,
-                image_rect.bottom() - space::L,
-            ),
+            pos2(image_rect.left(), bottom - CONTROL_HEIGHT),
+            pos2(image_rect.right() - space::XXL, bottom),
         );
         let mut action = None;
         let multiple = self.views.len() > 1;
@@ -427,6 +437,16 @@ fn drift_camera(geom: &PyramidGeometry, screen: Vec2, along: f64, dir: f64) -> (
     (zoom, (w / 2.0 + pan, h / 2.0))
 }
 
+/// Darkening of the image at and below the floor: over a white image it
+/// leaves the faintest text colour (`TEXT_SUBTLE`) AA, 4.5:1.
+const FLOOR_SCRIM: f32 = 0.9;
+/// Height of the scrim's rise above the floor, from [`FLOOR_SCRIM`] to
+/// clear, as a fraction of the drawing area's height...
+const SCRIM_RISE: f32 = 0.25;
+/// ...and never less than this, in points, so the label just above the
+/// floor stays AA in a short window.
+const SCRIM_RISE_MIN: f32 = 160.0;
+
 /// Fraction of the image's width feathered on its left and right edges.
 const FEATHER_SIDE: f32 = 0.15;
 /// Fraction of the image's height feathered on its bottom edge.
@@ -498,8 +518,31 @@ fn paint_feather(ui: &Ui, full: Rect, image: Rect) {
     }
 }
 
-/// The darkening gradients, as vertex-coloured meshes over `rect`.
-fn paint_gradients(ui: &Ui, rect: Rect) {
+/// The bottom scrim over `full`: [`FLOOR_SCRIM`] from the bottom up to
+/// `floor`, then easing linearly to clear over the rise above it.
+fn bottom_scrim(full: Rect, floor: f32) -> Mesh {
+    let floor = floor.clamp(full.top(), full.bottom());
+    let rise = (SCRIM_RISE * full.height()).max(SCRIM_RISE_MIN);
+    let dark = SURFACE_900.gamma_multiply(FLOOR_SCRIM);
+    let mut m = Mesh::default();
+    for (y, c) in [
+        (full.bottom(), dark),
+        (floor, dark),
+        (floor - rise, Color32::TRANSPARENT),
+    ] {
+        m.colored_vertex(pos2(full.left(), y), c);
+        m.colored_vertex(pos2(full.right(), y), c);
+    }
+    for row in [0, 2] {
+        m.add_triangle(row, row + 1, row + 2);
+        m.add_triangle(row + 1, row + 2, row + 3);
+    }
+    m
+}
+
+/// The darkening gradients, as vertex-coloured meshes over `rect`, with
+/// the bottom scrim from `floor` down.
+fn paint_gradients(ui: &Ui, rect: Rect, floor: f32) {
     let dark = |alpha: f32| SURFACE_900.gamma_multiply(alpha);
     let clear = Color32::TRANSPARENT;
     let painter = ui.painter();
@@ -515,16 +558,7 @@ fn paint_gradients(ui: &Ui, rect: Rect) {
     m.add_triangle(1, 2, 3);
     painter.add(Shape::mesh(m));
 
-    // Bottom to top: 0.97 falling to 0 at 45 % of the height.
-    let y45 = rect.bottom() - rect.height() * 0.45;
-    let mut m = Mesh::default();
-    for (y, c) in [(rect.bottom(), dark(0.97)), (y45, clear)] {
-        m.colored_vertex(pos2(rect.left(), y), c);
-        m.colored_vertex(pos2(rect.right(), y), c);
-    }
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(1, 2, 3);
-    painter.add(Shape::mesh(m));
+    painter.add(Shape::mesh(bottom_scrim(rect, floor)));
 
     // Vignette: clear in the middle, 0.6 around the edges.
     let mut m = Mesh::default();

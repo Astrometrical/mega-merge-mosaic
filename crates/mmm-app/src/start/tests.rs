@@ -706,6 +706,32 @@ fn all_sessions_searches_names_and_notes() {
 }
 
 #[test]
+fn hero_runs_under_the_shelf() {
+    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+    let root = temp_dir("hero-under-shelf");
+    let recent = vec![entry(&root.join("Gone.mmm-session"))];
+    let mut s = StartScreen::new(recent, Arc::new(StubPicker(None)));
+    let (image, floor) = s.hero_area(full);
+    // The image fills the window's right two thirds down to its bottom
+    // edge, under the shelf...
+    assert_eq!(image.right(), full.right());
+    assert_eq!(image.bottom(), full.bottom());
+    assert!((image.left() - full.width() / 3.0).abs() < 0.5, "{image:?}");
+    // ...whose top (a header row and a row of cards up) is the floor.
+    let shelf = mega_ui::theme::tokens::CONTROL_HEIGHT + mega_ui::widgets::CARD_HEIGHT;
+    assert!(floor <= full.bottom() - shelf, "{floor}");
+    assert!(floor > full.center().y, "{floor}");
+    // The All sessions grid reaches higher, and so does the floor.
+    s.all_sessions = true;
+    let (_, grid_floor) = s.hero_area(full);
+    assert!(grid_floor < floor, "{grid_floor} vs {floor}");
+    // No shelf on the first-run screen: the floor is the window's bottom.
+    let first = StartScreen::new(Vec::new(), Arc::new(StubPicker(None)));
+    assert_eq!(first.hero_area(full).1, full.bottom());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn first_run_offers_new_and_open() {
     let mut h = harness(Vec::new());
     h.run();

@@ -55,11 +55,16 @@ pub fn session_card(ui: &mut Ui, card: &SessionCardData) -> Response {
     if !ui.is_rect_visible(rect) {
         return response;
     }
+    let corner = CornerRadius::same(radius::CARD);
+    if card.dimmed {
+        // Faded, but opaque: what the card sits on (the hero's image under
+        // the shelf) never shows through it.
+        ui.painter().rect_filled(rect, corner, SURFACE_900);
+    }
     let mut ui = ui.new_child(UiBuilder::new().max_rect(rect));
     if card.dimmed {
         ui.set_opacity(DISABLED_ALPHA);
     }
-    let corner = CornerRadius::same(radius::CARD);
     let p = ui.painter().clone();
     p.rect_filled(rect, corner, SURFACE_800);
 

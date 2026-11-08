@@ -1286,7 +1286,13 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   (only a zoom past the viewer's `MAX_ZOOM`, an image far smaller than its
   area, could). The image area's edges feather into the page (`HeroStage`
   paints page-colour ramps on every edge not at the window's edge), so no
-  hard line shows.
+  hard line shows. The image runs full bleed to the window's right and
+  bottom edges, under the shelf: the shelf's top is the stage's *floor*,
+  from which down a scrim darkens the image by 0.9 (the faintest text,
+  `TEXT_SUBTLE`, stays AA over a white image), easing to clear over the
+  quarter of the height above it; the hero's label and controls sit just
+  above the floor. A missing session's faded card keeps an opaque backing,
+  so the image never shows through it.
 - **Load order.** The first frame draws at once with no facts. The default
   hero candidate's facts load first, then its hero views (so the first
   image is on screen in under a second with a warm disk), then the other

@@ -13,6 +13,10 @@ struct State {
 }
 
 fn harness(pinned: bool) -> Harness<'static, State> {
+    harness_with(pinned, false)
+}
+
+fn harness_with(pinned: bool, dimmed: bool) -> Harness<'static, State> {
     Harness::builder()
         .with_size(Vec2::new(400.0, 300.0))
         .with_step_dt(0.02)
@@ -25,7 +29,7 @@ fn harness(pinned: bool) -> Harness<'static, State> {
                     title: "Carina Nebula SHO",
                     status: Some((Tone::Warning, "Re-merge needed")),
                     pinned,
-                    dimmed: false,
+                    dimmed,
                     selected: false,
                     thumbnail: None,
                 };
@@ -140,4 +144,32 @@ fn status_row_does_not_swallow_clicks() {
     click_at(&mut h, pos);
     click_at(&mut h, pos);
     assert_eq!(h.state().double, 1);
+}
+
+#[test]
+fn dimmed_card_still_hides_what_is_behind_it() {
+    // A missing session's card is faded, but whatever it sits on (the
+    // hero's image under the shelf) must not show through it.
+    let mut h = harness_with(false, true);
+    h.run();
+    let card = h.state().rect.expect("drawn");
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Rect(r) => out.push(r.clone()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut rects = Vec::new();
+    for c in &h.output().shapes {
+        walk(&c.shape, &mut rects);
+    }
+    assert!(
+        // The card's own shape (its rounded corners), not the harness's
+        // background behind it.
+        rects.iter().any(|r| r.rect == card
+            && r.corner_radius == egui::CornerRadius::same(radius::CARD)
+            && r.fill.a() == 255),
+        "no opaque fill under the card: {rects:?}"
+    );
 }

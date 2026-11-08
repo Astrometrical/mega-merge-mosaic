@@ -6,6 +6,7 @@ use egui_kittest::kittest::Queryable;
 
 use super::*;
 use crate::theme::palette::SURFACE_900;
+use crate::theme::palette::TEXT_SUBTLE;
 use crate::theme::tokens::KEN_BURNS_ZOOM;
 use crate::viewer::ImageTileSource;
 use crate::viewer::{Fetched, PyramidGeometry, TileKey, TileSource};
@@ -16,6 +17,20 @@ const EPS: f64 = 0.01;
 struct State {
     stage: HeroStage,
     now: f64,
+    /// How far above the bottom of the drawing area [`harness`] puts the
+    /// floor.
+    floor_inset: f32,
+    /// The drawing area, as of the last frame.
+    full: Rect,
+}
+
+fn state(stage: HeroStage) -> State {
+    State {
+        stage,
+        now: 0.0,
+        floor_inset: 0.0,
+        full: Rect::NOTHING,
+    }
 }
 
 fn view(label: &str, color: Color32) -> HeroView {
@@ -47,10 +62,11 @@ fn harness(views: Vec<HeroView>, reduced: bool) -> Harness<'static, State> {
                     return;
                 }
                 let r = ui.max_rect();
+                s.full = r;
                 let image = Rect::from_min_max(pos2(r.left() + r.width() / 3.0, r.top()), r.max);
-                s.stage.show(ui, image, s.now);
+                s.stage.show(ui, image, r.bottom() - s.floor_inset, s.now);
             },
-            State { stage, now: 0.0 },
+            state(stage),
         )
 }
 
@@ -225,10 +241,10 @@ fn harness_in(
         .build_ui_state(
             move |ui, s: &mut State| {
                 if crate::testutil::themed(ui) {
-                    s.stage.show(ui, image, s.now);
+                    s.stage.show(ui, image, image.bottom(), s.now);
                 }
             },
-            State { stage, now: 0.0 },
+            state(stage),
         )
 }
 
@@ -445,9 +461,9 @@ fn image_edges_off_the_window_edge_are_feathered() {
                     return;
                 }
                 let image = Rect::from_min_max(pos2(300.0, -10.0), pos2(850.0, 400.0));
-                s.stage.show(ui, image, 0.0);
+                s.stage.show(ui, image, image.bottom(), 0.0);
             },
-            State { stage, now: 0.0 },
+            state(stage),
         );
     h.run_steps(3);
     let m = meshes(&h);
@@ -455,4 +471,88 @@ fn image_edges_off_the_window_edge_are_feathered() {
     assert!(has_ramp(&m, |p| (p.x - 850.0).abs() < 0.5));
     // The top overhangs the window: no ramp there.
     assert!(!has_ramp(&m, |p| (p.y + 10.0).abs() < 0.5));
+}
+
+/// A [`harness`] whose floor (the top of a shelf laid over the image's
+/// foot) is `inset` points above the bottom.
+fn harness_over(views: Vec<HeroView>, inset: f32) -> Harness<'static, State> {
+    let mut h = harness(views, true);
+    h.state_mut().floor_inset = inset;
+    h
+}
+
+#[test]
+fn label_and_controls_sit_just_above_the_floor() {
+    let mut h = harness_over(two_views(), 150.0);
+    frames(&mut h, 0.0);
+    let full = h.state().full;
+    let floor = full.bottom() - 150.0;
+    let next = h.get_by_label("Next image").rect();
+    let label = h.get_by_label("Ha").rect();
+    for (what, r) in [("Next", next), ("label", label)] {
+        assert!(
+            r.bottom() <= floor - space::S,
+            "{what} {r:?} reaches the floor {floor}"
+        );
+        assert!(
+            r.top() >= floor - 2.0 * CONTROL_HEIGHT,
+            "{what} {r:?} is far above the floor {floor}"
+        );
+    }
+    // Their right edge keeps the page margin, like the content below.
+    assert!(
+        (next.right() - (full.right() - space::XXL)).abs() < 1.0,
+        "{next:?}"
+    );
+}
+
+/// The painted bottom scrim: the six-vertex mesh, rows at the bottom, the
+/// floor and the top of its rise, opaque [`FLOOR_SCRIM`] at the bottom.
+fn scrim(h: &Harness<'_, State>) -> egui::Mesh {
+    let dark = SURFACE_900.gamma_multiply(FLOOR_SCRIM);
+    meshes(h)
+        .into_iter()
+        .find(|m| m.vertices.len() == 6 && m.vertices[0].color == dark)
+        .expect("a bottom scrim")
+}
+
+/// The colour `scrim` leaves at height `y` over a white image (the worst
+/// case for light text): premultiplied blending, as egui's renderers do.
+fn over_white(scrim: &egui::Mesh, y: f32) -> Color32 {
+    let rows: Vec<_> = scrim.vertices.iter().step_by(2).collect();
+    let src = rows
+        .windows(2)
+        .find_map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let (lo, hi) = (a.pos.y.min(b.pos.y), a.pos.y.max(b.pos.y));
+            (lo <= y && y <= hi && hi > lo).then(|| {
+                let t = (y - a.pos.y) / (b.pos.y - a.pos.y);
+                a.color.lerp_to_gamma(b.color, t)
+            })
+        })
+        .unwrap_or(Color32::TRANSPARENT);
+    let v = |c: u8| (f32::from(c) + 255.0 * (1.0 - f32::from(src.a()) / 255.0)).round() as u8;
+    Color32::from_rgb(v(src.r()), v(src.g()), v(src.b()))
+}
+
+#[test]
+fn text_on_and_above_the_floor_stays_legible_over_any_image() {
+    let mut h = harness_over(two_views(), 150.0);
+    frames(&mut h, 0.0);
+    let full = h.state().full;
+    let floor = full.bottom() - 150.0;
+    let s = scrim(&h);
+    // The shelf's faintest text (overlines) anywhere from the floor down.
+    for y in [floor, floor + 20.0, full.bottom() - 1.0] {
+        let bg = over_white(&s, y);
+        let ratio = crate::theme::contrast_ratio(TEXT_SUBTLE, bg);
+        assert!(ratio >= 4.5, "at {y}: {ratio} on {bg:?}");
+    }
+    // The hero's label, just above the floor, at its top edge.
+    let top = h.get_by_label("Ha").rect().top();
+    let bg = over_white(&s, top);
+    let ratio = crate::theme::contrast_ratio(TEXT_EMPHASIS, bg);
+    assert!(ratio >= 4.5, "label top {top}: {ratio} on {bg:?}");
+    // High up the image, nothing is darkened.
+    assert_eq!(over_white(&s, full.top() + 1.0), Color32::WHITE);
 }

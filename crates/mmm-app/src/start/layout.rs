@@ -37,10 +37,6 @@ const BLOCK_TOP: f32 = 0.25;
 /// How far above the window the hero image starts, as a fraction of its
 /// height.
 const IMAGE_OVERHANG: f32 = 0.02;
-/// How far above the window's bottom the hero image ends, as a fraction of
-/// its height; higher where the shelf reaches above that, so the hero's
-/// label and controls never sit under the cards.
-const IMAGE_BOTTOM_INSET: f32 = 0.18;
 /// Width of the first-run column.
 const FIRST_RUN_WIDTH: f32 = 480.0;
 /// How far above the window's centre the first-run column starts.
@@ -61,12 +57,12 @@ impl StartScreen {
         let full = ui.max_rect();
         let first_run = self.library.entries().is_empty();
         let bottom = self.bottom_area(full);
-        let image = image_rect(full, (!first_run).then_some(bottom.top()));
+        let (image, floor) = self.hero_area(full);
         // The night sky the starfield and the image sit on, whatever the
         // screen is drawn in.
         ui.painter().rect_filled(full, 0.0, SURFACE_900);
         ui.scope_builder(UiBuilder::new().max_rect(full), |ui| {
-            self.stage.show(ui, image, now);
+            self.stage.show(ui, image, floor, now);
         });
         if first_run {
             self.first_run(ui, full, out);
@@ -99,6 +95,18 @@ impl StartScreen {
         } else {
             self.shelf(ui, bottom, target, out);
         }
+    }
+
+    /// The hero's image area, full bleed to the window's right and bottom
+    /// edges, and its floor: the top of the shelf (or the grid) laid over
+    /// the image's foot, or the window's bottom on the first-run screen.
+    pub(super) fn hero_area(&self, full: Rect) -> (Rect, f32) {
+        let floor = if self.library.entries().is_empty() {
+            full.bottom()
+        } else {
+            self.bottom_area(full).top()
+        };
+        (image_rect(full), floor)
     }
 
     /// The shelf's (or the grid's) area along the bottom: a header row and
@@ -585,20 +593,14 @@ fn status_rows(ui: &mut Ui, f: &CardFacts) {
 }
 
 /// The hero image's area: the right two thirds of `full`, from a little
-/// above it to [`IMAGE_BOTTOM_INSET`] above its bottom, ending above
-/// `shelf_top` when given.
-fn image_rect(full: Rect, shelf_top: Option<f32>) -> Rect {
-    let h = full.height();
-    let mut bottom = full.bottom() - IMAGE_BOTTOM_INSET * h;
-    if let Some(top) = shelf_top {
-        bottom = bottom.min(top - space::S);
-    }
+/// above it down to its bottom edge (under the shelf).
+fn image_rect(full: Rect) -> Rect {
     Rect::from_min_max(
         pos2(
             full.left() + full.width() / 3.0,
-            full.top() - IMAGE_OVERHANG * h,
+            full.top() - IMAGE_OVERHANG * full.height(),
         ),
-        pos2(full.right(), bottom.max(full.top())),
+        full.max,
     )
 }
 
