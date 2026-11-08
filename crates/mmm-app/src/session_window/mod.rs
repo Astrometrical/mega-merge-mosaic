@@ -82,7 +82,7 @@ use crate::checks::ChecksEngine;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
-use crate::panels_tab::{FilesPicker, PanelsTab};
+use crate::panels_tab::{FilesPicker, PanelsEdit, PanelsTab};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView};
 use crate::session::OpenSession;
@@ -107,6 +107,26 @@ pub struct SessionOutput {
     /// ‹ was clicked: back to the start screen
     /// ([`crate::app::Shell::close_session`]).
     pub back: bool,
+    /// Toasts to show, each with the undo its action button runs.
+    pub toasts: Vec<WindowToast>,
+}
+
+/// What an Undo toast's action restores ([`SessionWindow::undo`]).
+#[derive(Clone, Debug)]
+// Nothing raises one yet: the panel list's Remove does (Task 7).
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum Undo {
+    /// Restore the panels and grouping as they were.
+    Panels(PanelsEdit),
+}
+
+/// A toast the window asks the shell to show.
+#[derive(Debug)]
+pub struct WindowToast {
+    /// What to show; its action (if any) runs `undo`.
+    pub toast: mega_ui::widgets::Toast,
+    /// What the toast's action restores.
+    pub undo: Option<Undo>,
 }
 
 /// The open session's window: canvas, view bar and inspector (see the
@@ -133,6 +153,8 @@ pub struct SessionWindow {
     saved_view: Option<ViewState>,
     /// The panel list: the files and their grouping.
     panels: PanelsTab,
+    /// Toasts raised since the last frame, handed to the shell by `ui`.
+    toasts: Vec<WindowToast>,
     /// The panel list shows in the canvas's place.
     pub(crate) panel_list_open: bool,
     /// The top bar's rect, as last drawn (tests).
@@ -168,6 +190,7 @@ impl SessionWindow {
             save: Debounce::default(),
             saved_view: None,
             panels: PanelsTab::new(picker),
+            toasts: Vec::new(),
             panel_list_open: false,
             #[cfg(test)]
             top_bar_rect: None,
@@ -343,6 +366,20 @@ impl SessionWindow {
         self.mosaic.apply_waiting_settings(session, jobs);
     }
 
+    /// Raise a toast: the shell shows it with the next frame's output.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn push_toast(&mut self, toast: WindowToast) {
+        self.toasts.push(toast);
+    }
+
+    /// Run an Undo toast's action: re-submit the stored edit like any other
+    /// (queued behind running jobs).
+    pub fn undo(&mut self, undo: Undo, session: &mut OpenSession, jobs: &mut JobRunner) {
+        match undo {
+            Undo::Panels(edit) => self.panels.submit_edit(edit, session, jobs),
+        }
+    }
+
     /// Save a pending (rate-limited) change now, whatever the rate limit,
     /// the view as it is included: the window is closing, or the session is
     /// being left. A small `mosaic.json` write.
@@ -406,6 +443,7 @@ impl SessionWindow {
                 }
             });
         self.mosaic.export_ui(&ctx, session, jobs);
+        out.toasts.append(&mut self.toasts);
         if !self.panel_list_open {
             // Files dropped anywhere are added (the list draws its own).
             self.panels.drop_overlay(&ctx);

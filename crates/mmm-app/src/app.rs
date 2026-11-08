@@ -3,6 +3,7 @@
 //! ([`Shell::close_session`]). [`Shell`] is plain egui (testable without eframe);
 //! [`MmmApp`] wraps it for eframe with persistence and the self-test.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -11,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mega_ui::theme::{Tone, palette};
-use mega_ui::widgets::{Toast, Toasts};
+use mega_ui::widgets::{Toast, ToastEvent, ToastId, Toasts};
 use mmm_core::mosaic::SessionLock;
 
 use crate::checks::ChecksEngine;
@@ -21,7 +22,7 @@ use crate::mosaic_view::MosaicView;
 use crate::panels_tab::{FilesPicker, RfdFilesPicker};
 use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
-use crate::session_window::{CanvasMode, SessionWindow};
+use crate::session_window::{CanvasMode, SessionWindow, Undo, WindowToast};
 use crate::start::{RecentEntry, RfdDialogs, StartAction, StartScreen, unix_now};
 use crate::summary_writer::{FinalWrite, SummaryWriter};
 use crate::util::group_names;
@@ -93,6 +94,9 @@ pub struct Shell {
     jobs: Option<JobRunner>,
     /// Job outcomes and failures to open windows.
     toasts: Toasts,
+    /// What each toast with an action undoes (dropped with the toast, and
+    /// with the session).
+    undos: BTreeMap<ToastId, Undo>,
     /// Every toast's title pushed, in order (tests: a toast expires).
     #[cfg(test)]
     toasted: Vec<String>,
@@ -128,6 +132,7 @@ impl Shell {
             launcher: Arc::new(ProcessLauncher),
             jobs: None,
             toasts: Toasts::default(),
+            undos: BTreeMap::new(),
             #[cfg(test)]
             toasted: Vec::new(),
             title: APP_TITLE.to_string(),
@@ -269,6 +274,7 @@ impl Shell {
             reap(leftover, summary, session.lock.take(), &dir, reaped, ctx);
         }
         self.jobs = None;
+        self.undos.clear();
         drop(session);
         self.window = SessionWindow::new(self.files_picker.clone());
         self.pipeline = Pipeline::new();
@@ -316,7 +322,20 @@ impl Shell {
         }
         // Toasts float above either screen.
         let now = ctx.input(|i| i.time);
-        let _ = self.toasts.show(&ctx, now);
+        for event in self.toasts.show(&ctx, now) {
+            match event {
+                ToastEvent::Action(id) => {
+                    if let Some(undo) = self.undos.remove(&id)
+                        && let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut())
+                    {
+                        self.window.undo(undo, session, jobs);
+                    }
+                }
+                ToastEvent::Dismissed(id) => {
+                    self.undos.remove(&id);
+                }
+            }
+        }
     }
 
     /// Name the session in the window title (sent when it changes).
@@ -391,6 +410,7 @@ impl Shell {
         self.summary = SummaryWriter::new(opened.summary.clone());
         self.session = Some(opened);
         self.jobs = Some(JobRunner::new(ctx.clone()));
+        self.undos.clear();
         // A session without panels opens on its panel list.
         self.window = SessionWindow::new(self.files_picker.clone());
         self.pipeline = Pipeline::new();
@@ -473,6 +493,16 @@ impl Shell {
                 self.toasted.push(message.clone());
                 self.toasts
                     .push(toast(Tone::Problem, message), ctx.input(|i| i.time));
+            }
+        }
+        let now = ctx.input(|i| i.time);
+        for WindowToast { toast, undo } in out.toasts {
+            let has_action = toast.action.is_some();
+            #[cfg(test)]
+            self.toasted.push(toast.title.clone());
+            let id = self.toasts.push(toast, now);
+            if let (true, Some(undo)) = (has_action, undo) {
+                self.undos.insert(id, undo);
             }
         }
         if out.back
@@ -1507,6 +1537,50 @@ mod tests {
         step_until(&mut h, |s| s.session().is_some());
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert!(launcher.0.lock().unwrap().is_empty(), "no other window");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_undo_toast_restores_the_edit() {
+        use crate::panels_tab::{Applied, PanelsEdit};
+        use mmm_core::mosaic::MosaicConfig;
+        let root = temp_dir("shell-undo");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| {
+            s.session().unwrap().mosaic.config.group_dirs.len() == 2
+                && !s.jobs.as_ref().unwrap().busy()
+        });
+        h.run_steps(2);
+        let on_disk = |dir: &Path| MosaicConfig::load(dir).unwrap().panels.len();
+        let previous = PanelsEdit::of(h.state().session().unwrap());
+        assert_eq!(previous.panels.len(), 8);
+        // Remove two panels, and offer to put them back.
+        let mut fewer = previous.clone();
+        fewer.panels.truncate(6);
+        {
+            let shell = h.state_mut();
+            let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
+            assert!(matches!(fewer.apply(session, jobs), Applied::Done));
+            shell.window.push_toast(WindowToast {
+                toast: Toast {
+                    tone: Tone::Neutral,
+                    title: "Removed 2 panels".into(),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::Panels(previous.clone())),
+            });
+        }
+        assert_eq!(on_disk(&dir), 6);
+        h.run_steps(2);
+        h.get_by_label("Removed 2 panels");
+        assert_eq!(h.state().undos.len(), 1);
+        h.get_by_label("Undo").click();
+        step_until(&mut h, |_| on_disk(&dir) == 8);
+        assert_eq!(MosaicConfig::load(&dir).unwrap().panels, previous.panels);
+        assert!(h.state().undos.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

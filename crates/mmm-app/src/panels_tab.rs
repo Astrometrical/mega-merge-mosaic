@@ -613,6 +613,17 @@ impl PanelsTab {
             .unwrap_or_else(|| PanelsEdit::of(session))
     }
 
+    /// Apply `edit` from outside the list (an Undo toast): as any edit,
+    /// queued behind running jobs.
+    pub(crate) fn submit_edit(
+        &mut self,
+        edit: PanelsEdit,
+        session: &mut OpenSession,
+        jobs: &mut JobRunner,
+    ) {
+        self.submit(edit, session, jobs);
+    }
+
     /// Apply `edit`, or keep it waiting (replacing any waiting one).
     fn submit(&mut self, edit: PanelsEdit, session: &mut OpenSession, jobs: &mut JobRunner) {
         self.pending = None;
