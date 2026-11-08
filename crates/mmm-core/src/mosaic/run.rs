@@ -168,7 +168,7 @@ impl Mosaic {
             let mut stores = lock_stores(std::slice::from_ref(&plan.result_path))?;
             invalidate(&mut stores)?;
             return Err(Error::compute(format!(
-                "analyze settings for group '{group}' changed during the merge — its tiles                  were invalidated; analyze, then merge again"
+                "analyze settings for group '{group}' changed during the merge — its tiles were invalidated; analyze, then merge again"
             )));
         }
         let mut next = self.config.clone();
