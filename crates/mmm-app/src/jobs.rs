@@ -109,9 +109,9 @@ pub enum JobTarget {
     Export,
 }
 
-/// Where a run of blends or exports stands ([`JobRunner::run_of`]): the
-/// jobs of one [`JobTarget`] since the last time none was running or
-/// queued.
+/// Where a run of merges or exports stands ([`JobRunner::run_of`]): the
+/// whole-canvas blends, or the exports, since the last time none of them
+/// was running or queued (an ROI's blend is in no run).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
     /// The job at the head of the run: running, else the first queued.
@@ -264,8 +264,8 @@ pub struct JobRunner {
     targets: BTreeMap<u64, (JobTarget, String)>,
     /// The blends of the whole canvas (not of an ROI), by id.
     whole: BTreeSet<u64>,
-    /// Blends and exports that ended (ran to an end, whatever it was)
-    /// in the current run of each ([`JobRunner::run_of`]).
+    /// Whole-canvas blends and exports that ended (ran to an end, whatever
+    /// it was) in the current run of each ([`JobRunner::run_of`]).
     blends_ended: usize,
     exports_ended: usize,
     /// Events raised outside `poll` (queued jobs cancelled), delivered by it.
@@ -666,14 +666,15 @@ impl JobRunner {
     /// Where the run of `target` jobs stands, while one is running or
     /// queued: its head job, and that job's place among the jobs started
     /// since none of them was left (a queued job dropped, e.g. replaced by
-    /// newer work, does not count).
+    /// newer work, does not count). The blends of a run are those of the
+    /// whole canvas: an ROI's blend is in none.
     pub fn run_of(&self, target: JobTarget) -> Option<Run> {
         let live: Vec<u64> = self
             .running
             .iter()
             .map(|r| r.id)
             .chain(self.queue.iter().map(|q| q.id))
-            .filter(|id| self.target(*id).is_some_and(|(t, _)| t == target))
+            .filter(|id| self.in_run(*id) == Some(target))
             .collect();
         let id = *live.first()?;
         let ended = match target {
@@ -707,10 +708,18 @@ impl JobRunner {
 
     /// The running job `id` has ended: count it in its run.
     fn ended(&mut self, id: u64) {
-        match self.target(id).map(|(t, _)| t) {
+        match self.in_run(id) {
             Some(JobTarget::Blend) => self.blends_ended += 1,
             Some(JobTarget::Export) => self.exports_ended += 1,
             None => {}
+        }
+    }
+
+    /// The run job `id` belongs to: a whole-canvas blend's or an export's.
+    fn in_run(&self, id: u64) -> Option<JobTarget> {
+        match self.target(id)?.0 {
+            JobTarget::Blend if !self.whole_canvas(id) => None,
+            t => Some(t),
         }
     }
 
@@ -1188,8 +1197,7 @@ pub(crate) mod tests {
         assert_eq!(r.run_of(JobTarget::Blend), None);
         let gate = r.hold();
         let ha = r.start_blend(&mut s, "Ha", None);
-        let oiii = r.start_blend(&mut s, "OIII", Some([0, 0, 64, 64]));
-        assert!(r.whole_canvas(ha) && !r.whole_canvas(oiii), "OIII: an ROI");
+        let oiii = r.start_blend(&mut s, "OIII", None);
         let run = |id, group: &str, position, count| Run {
             id,
             group: group.into(),
@@ -1209,11 +1217,22 @@ pub(crate) mod tests {
         assert_eq!(r.run_of(JobTarget::Blend), Some(run(oiii, "OIII", 2, 2)));
         let _ = drain(&mut r, &mut s);
         assert_eq!(r.run_of(JobTarget::Blend), None);
-        // The next run starts afresh.
+        // The next run starts afresh. An ROI's merge is in none: alone it
+        // makes no run, and its end leaves the run's count as it was.
         let gate = r.hold();
-        let again = r.start_blend(&mut s, "Ha", None);
-        assert_eq!(r.run_of(JobTarget::Blend), Some(run(again, "Ha", 1, 1)));
+        let roi = r.start_blend(&mut s, "Ha", Some([0, 0, 64, 64]));
+        assert!(!r.whole_canvas(roi) && r.whole_canvas(oiii));
+        assert_eq!(r.run_of(JobTarget::Blend), None);
+        let again = r.start_blend(&mut s, "OIII", None);
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(again, "OIII", 1, 1)));
         gate.open();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while r.views().first().is_some_and(|v| v.id == roi) {
+            assert!(Instant::now() < deadline, "the ROI's merge never ended");
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = r.poll(&mut s);
+        }
+        assert_eq!(r.run_of(JobTarget::Blend), Some(run(again, "OIII", 1, 1)));
         let _ = drain(&mut r, &mut s);
         let _ = std::fs::remove_dir_all(&root);
     }

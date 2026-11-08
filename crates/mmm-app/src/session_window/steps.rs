@@ -5,12 +5,15 @@
 //! | Step | State |
 //! |---|---|
 //! | Panels | none: "Add panels"; previews running: "Reading previews {done} / {n}" (cancellable); previews stopped short: "Read previews" (next); else "{n} panels" (done) |
-//! | Checks | no panels or no checks yet: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; analysis needed: "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
-//! | Merge | merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable); no groups: "Merge"; a group without a complete result: "Merge" (next); else "Merged" (done) |
+//! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
+//! | Merge | whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable); no groups, or analysis needed or running: "Merge"; a group without a complete result: "Merge" (next); else "Merged" (done) |
 //! | Export | exports running or queued: "Exporting {i} of {n}" (cancellable); else "Export" |
 //!
-//! Every merge counts, ROI merges too, until an ROI's label shows its own
-//! progress (spec §8).
+//! One step at most is next (highlighted): the first that waits for the
+//! user; a later one shows as to do. Steps working by themselves are no
+//! one's next action, so a step after one can be next (merging while the
+//! previews load). An ROI's merge shows on its ROI (spec §6, §8), never
+//! here.
 
 use mega_ui::jobs::JobView;
 use mega_ui::widgets::{StepState, StripStep};
@@ -40,12 +43,23 @@ pub fn steps(
     checks: &ChecksEngine,
 ) -> [StripStep; 4] {
     let views = jobs.views();
-    [
+    let mut steps = [
         panels_step(session, pipeline),
-        checks_step(session, jobs, &views, checks),
+        checks_step(session, jobs, &views, pipeline, checks),
         merge_step(session, jobs, &views),
         export_step(jobs, &views),
-    ]
+    ];
+    // One next step: the first.
+    let mut next = false;
+    for s in &mut steps {
+        if s.state == StepState::Next {
+            if next {
+                s.state = StepState::Todo;
+            }
+            next = true;
+        }
+    }
+    steps
 }
 
 /// Whether a merge is needed: the session has groups and one of them has
@@ -103,6 +117,7 @@ fn checks_step(
     session: &OpenSession,
     jobs: &JobRunner,
     views: &[JobView],
+    pipeline: &Pipeline,
     checks: &ChecksEngine,
 ) -> StripStep {
     let cfg = &session.mosaic.config;
@@ -117,8 +132,12 @@ fn checks_step(
     if checks.running() {
         return step("Checking…", StepState::Working { fraction: None });
     }
-    if wants_analysis(session) {
+    if pipeline.analysis_stalled(session) {
         return step("Analyse", StepState::Next);
+    }
+    if wants_analysis(session) {
+        // The pipeline starts it by itself.
+        return step("Checks", StepState::Todo);
     }
     match checks.counts(cfg) {
         None => step("Checks", StepState::Todo),
@@ -137,7 +156,7 @@ fn merge_step(session: &OpenSession, jobs: &JobRunner, views: &[JobView]) -> Str
         );
         return working(label, Some(f));
     }
-    if group_names(session).is_empty() {
+    if group_names(session).is_empty() || wants_analysis(session) || jobs.analyzing() {
         step("Merge", StepState::Todo)
     } else if needs_merge(session) {
         step("Merge", StepState::Next)

@@ -20,10 +20,10 @@ use crate::camera::Camera;
 use crate::checks::{ChecksEngine, ChecksReport};
 use crate::compositions::{Composition, ViewKind, load_compositions, save_compositions};
 use crate::display_stretch::DisplayStretch;
-use crate::jobs::JobRunner;
 use crate::jobs::tests::{analyzed, drain};
+use crate::jobs::{JobRunner, JobTarget};
 use crate::panels_tab::FilesPicker;
-use crate::pipeline::{Pipeline, set_auto_analyze};
+use crate::pipeline::{Pipeline, Step};
 use crate::rois::{Roi, save_rois};
 use crate::session::{OpenSession, any_merged, classify_results, create_blocking, notes};
 use crate::start::tests::{step_until, temp_dir};
@@ -685,8 +685,7 @@ fn deleting_a_composite_keeps_the_view() {
 #[test]
 fn linked_is_disabled_for_a_mono_view() {
     let root = temp_dir("window-mono");
-    let mut s = two_group_mono_session(&root);
-    set_auto_analyze(&mut s, false).unwrap();
+    let s = two_group_mono_session(&root);
     let mut state = State::new(s, runner());
     // The previews say how many channels the panels have.
     state.run_pipeline = true;
@@ -695,6 +694,8 @@ fn linked_is_disabled_for_a_mono_view() {
     h.run_steps(2);
     assert!(disabled(&h, "Linked"), "one channel: nothing to link");
     assert!(!disabled(&h, "Strong"));
+    // The analysis that follows the previews ends before the session goes.
+    step_until(&mut h, |st| !st.jobs.busy());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -933,20 +934,22 @@ fn stretch_toggles_save_the_display_stretch() {
 #[test]
 fn previews_paused_offer_resume() {
     let root = temp_dir("window-resume");
-    let mut s = two_group_session(&root);
-    set_auto_analyze(&mut s, false).unwrap();
+    let s = two_group_session(&root);
     let mut state = State::new(s, runner());
     state.run_pipeline = true;
     let gate = state.jobs.hold();
     let mut h = harness(state);
-    // The previews start by themselves; the user cancels them.
+    // The previews start by themselves; the user cancels them (the
+    // analysis follows all the same).
     step_until(&mut h, |st| st.jobs.busy());
     let ids: Vec<u64> = h.state().jobs.views().iter().map(|v| v.id).collect();
     for id in ids {
         h.state_mut().jobs.cancel(id);
     }
     gate.open();
-    step_until(&mut h, |st| !st.jobs.busy());
+    step_until(&mut h, |st| {
+        !st.jobs.busy() && st.session.mosaic.config.group_dirs.len() == 2
+    });
     h.run_steps(2);
     assert!(!h.state().pipeline.previews_complete());
     h.get_by_label("Panels").click();
@@ -965,6 +968,58 @@ fn strip(label: &str, state: StepState) -> StripStep {
         cancellable: false,
     }
 }
+
+/// Poll the runner, then the pipeline (as the shell does, nothing being
+/// edited), until `done` holds (bounded).
+fn pump(
+    s: &mut OpenSession,
+    jobs: &mut JobRunner,
+    pipeline: &mut Pipeline,
+    done: impl Fn(&JobRunner, &Pipeline) -> bool,
+) {
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done(jobs, pipeline) {
+        assert!(Instant::now() < deadline, "timed out waiting for the jobs");
+        std::thread::sleep(Duration::from_millis(2));
+        let events = jobs.poll(s);
+        pipeline.poll(&ctx, Instant::now(), s, jobs, &events, false);
+    }
+}
+
+/// The steps the strip shows for the harness's state.
+fn shown_steps(st: &State) -> [StripStep; 4] {
+    steps(&st.session, &st.jobs, &st.pipeline, &st.checks)
+}
+
+/// The rightmost node labelled `label` (the main button, right of a step
+/// of the same name), clicked.
+fn click_rightmost(h: &Harness<'static, State>, label: &str) {
+    let right = h
+        .query_all_by_label(label)
+        .map(|n| n.rect().center().x)
+        .fold(f32::MIN, f32::max);
+    h.query_all_by_label(label)
+        .find(|n| n.rect().center().x == right)
+        .expect("a node")
+        .click();
+}
+
+/// Whether the rightmost node labelled `label` is disabled.
+fn rightmost_disabled(h: &Harness<'static, State>, label: &str) -> bool {
+    let right = h
+        .query_all_by_label(label)
+        .map(|n| n.rect().center().x)
+        .fold(f32::MIN, f32::max);
+    h.query_all_by_label(label)
+        .find(|n| n.rect().center().x == right)
+        .expect("a node")
+        .accesskit_node()
+        .is_disabled()
+}
+
+/// An ROI of the synthetic canvas.
+const ROI: [u64; 4] = [0, 0, 64, 64];
 
 /// A report of `n` problems, one per panel of `s`.
 fn problems(s: &OpenSession, n: usize) -> ChecksReport {
@@ -1002,17 +1057,16 @@ fn steps_follow_the_session() {
     drop(s);
     let _ = std::fs::remove_dir_all(&root);
 
-    // Previews running: Panels works on them, and can be cancelled.
+    // Previews running: Panels works on them, and can be cancelled. The
+    // analysis follows by itself: nothing waits for the user.
     let root = temp_dir("steps-previews");
     let mut s = two_group_session(&root);
-    set_auto_analyze(&mut s, false).unwrap();
     let mut jobs = runner();
-    let gate = jobs.hold();
+    let previews = jobs.hold();
     let mut pipeline = Pipeline::new();
     let ctx = egui::Context::default();
     pipeline.poll(&ctx, Instant::now(), &mut s, &mut jobs, &[], false);
     let checks = ChecksEngine::new();
-    let got = steps(&s, &jobs, &pipeline, &checks);
     let reading = StripStep {
         label: "Reading previews 0 / 8".into(),
         state: Working {
@@ -1021,25 +1075,54 @@ fn steps_follow_the_session() {
         cancellable: true,
     };
     assert_eq!(
-        got,
+        steps(&s, &jobs, &pipeline, &checks),
         [
             reading,
-            strip("Analyse", Next),
-            strip("Merge", Next),
+            strip("Checks", Todo),
+            strip("Merge", Todo),
             strip("Export", Todo),
         ]
     );
-    // Cancelled: they wait to be asked for again.
-    let ids: Vec<u64> = jobs.views().iter().map(|v| v.id).collect();
-    for id in ids {
+    // Cancelled: they wait to be asked for again; the analysis starts
+    // (held here) and can be cancelled.
+    let analysis = jobs.hold();
+    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
         jobs.cancel(id);
     }
-    gate.open();
-    let events = drain(&mut jobs, &mut s);
-    pipeline.poll(&ctx, Instant::now(), &mut s, &mut jobs, &events, false);
-    assert!(!jobs.busy());
-    let got = steps(&s, &jobs, &pipeline, &checks);
-    assert_eq!(got[0], strip("Read previews", Next));
+    previews.open();
+    pump(&mut s, &mut jobs, &mut pipeline, |_, p| {
+        p.step() == Some(Step::Analyze)
+    });
+    let analysing = StripStep {
+        label: "Analysing…".into(),
+        state: Working { fraction: None },
+        cancellable: true,
+    };
+    assert_eq!(
+        steps(&s, &jobs, &pipeline, &checks),
+        [
+            strip("Read previews", Next),
+            analysing,
+            strip("Merge", Todo),
+            strip("Export", Todo),
+        ]
+    );
+    // The analysis cancelled: the pipeline leaves it to the user, but one
+    // step only is next.
+    for id in jobs.views().iter().map(|v| v.id).collect::<Vec<_>>() {
+        jobs.cancel(id);
+    }
+    analysis.open();
+    pump(&mut s, &mut jobs, &mut pipeline, |j, _| !j.busy());
+    assert_eq!(
+        steps(&s, &jobs, &pipeline, &checks),
+        [
+            strip("Read previews", Next),
+            strip("Analyse", Todo),
+            strip("Merge", Todo),
+            strip("Export", Todo),
+        ]
+    );
     let _ = std::fs::remove_dir_all(&root);
 
     // Analysed, with two problems: merging is next.
@@ -1273,5 +1356,176 @@ fn panels_step_toggles_the_panel_list() {
     assert!(!h.state().w.panel_list_open);
     h.get_by_label("Plan");
     assert!(h.query_by_label("Add files…").is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_roi_merge_leaves_a_merged_session_merged() {
+    let (root, s, jobs) = merged("window-roi-merged");
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    // An ROI merge runs (held): the strip and the main button ignore it.
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.jobs.start_blend(&mut st.session, "Ha", Some(ROI));
+    }
+    h.run_steps(2);
+    assert_eq!(shown_steps(h.state())[2], strip("Merged", StepState::Done));
+    h.get_by_label("Merged");
+    h.get_by_label("Export…");
+    assert!(h.query_by_label_contains("Merging").is_none());
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_starts_while_an_roi_merge_runs() {
+    let (root, s, jobs) = analyzed("window-roi-merge-all");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    // An ROI merge of a group not shown runs (held).
+    let gate = h.state_mut().jobs.hold();
+    let roi = {
+        let st = h.state_mut();
+        st.jobs.start_blend(&mut st.session, "OIII", Some(ROI))
+    };
+    h.run_steps(2);
+    assert_eq!(shown_steps(h.state())[2], strip("Merge", StepState::Next));
+    assert!(!rightmost_disabled(&h, "Merge"), "the main Merge");
+    click_rightmost(&h, "Merge");
+    h.run_steps(2);
+    // The whole-canvas merge of every group is under way.
+    let jobs = &h.state().jobs;
+    let run = jobs.run_of(JobTarget::Blend).expect("a merge run");
+    assert_ne!(run.id, roi);
+    assert!(jobs.whole_canvas(run.id));
+    assert_eq!((run.group.as_str(), run.count), ("Ha", 2));
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_merge_steps_cancel_spares_an_roi_merge() {
+    let (root, s, jobs) = analyzed("window-roi-cancel");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    // An ROI merge of Ha runs (held); a whole-canvas merge of OIII waits.
+    let gate = h.state_mut().jobs.hold();
+    let roi = {
+        let st = h.state_mut();
+        let roi = st.jobs.start_blend(&mut st.session, "Ha", Some(ROI));
+        st.jobs.start_blend(&mut st.session, "OIII", None);
+        roi
+    };
+    h.run_steps(2);
+    let working = "Merging OIII · 1 of 1 · 0 %";
+    h.get_by_label(working).hover();
+    h.run_steps(2);
+    h.get_by_label(&format!("Cancel {working}")).click();
+    h.run_steps(2);
+    // The ROI merge runs on.
+    let left: Vec<u64> = h.state().jobs.views().iter().map(|v| v.id).collect();
+    assert_eq!(left, [roi]);
+    assert!(!h.state().jobs.views()[0].stage.contains("Cancelling"));
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn analyse_step_restarts_a_stalled_analysis() {
+    let root = temp_dir("window-analyse");
+    let mut state = State::new(two_group_session(&root), runner());
+    state.run_pipeline = true;
+    let previews = state.jobs.hold();
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.pipeline.step() == Some(Step::Previews));
+    let analysis = h.state_mut().jobs.hold();
+    h.run_steps(2);
+    // The analysis follows the previews by itself: nothing to press.
+    assert_eq!(shown_steps(h.state())[1], strip("Checks", StepState::Todo));
+    assert!(h.query_by_label("Analyse").is_none());
+    previews.open();
+    step_until(&mut h, |st| {
+        st.jobs.analyzing() && st.pipeline.previews_complete()
+    });
+    h.run_steps(2);
+    // Cancelled from its step, the analysis is left to the user.
+    h.get_by_label("Analysing…").hover();
+    h.run_steps(2);
+    h.get_by_label("Cancel Analysing…").click();
+    h.run_steps(2);
+    analysis.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    h.run_steps(2);
+    assert_eq!(shown_steps(h.state())[1], strip("Analyse", StepState::Next));
+    assert!(
+        h.state().w.mosaic().can_open_export(),
+        "no analysis tracked"
+    );
+    // Pressed: it starts, and the mosaic tracks it.
+    let again = h.state_mut().jobs.hold();
+    h.get_by_label("Analyse").click();
+    h.run_steps(2);
+    assert!(h.state().jobs.analyzing());
+    assert!(
+        !h.state().w.mosaic().can_open_export(),
+        "the analysis is tracked"
+    );
+    again.open();
+    step_until(&mut h, |st| {
+        !st.jobs.busy() && st.session.mosaic.config.group_dirs.len() == 2
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_merged_step_shows_the_mosaic() {
+    let (root, s, jobs) = merged("window-merged-step");
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    let mut h = harness(state);
+    h.run_steps(3);
+    // Done: a look at the mosaic, never an hours-long merge.
+    h.get_by_label("Merged").click();
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    assert!(!h.state().jobs.busy(), "no merge started");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+
+    // Next: it merges.
+    let (root, s, jobs) = analyzed("window-merge-step");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    let gate = h.state_mut().jobs.hold();
+    let left = h
+        .query_all_by_label("Merge")
+        .map(|n| n.rect().center().x)
+        .fold(f32::MAX, f32::min);
+    h.query_all_by_label("Merge")
+        .find(|n| n.rect().center().x == left)
+        .unwrap()
+        .click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
     let _ = std::fs::remove_dir_all(&root);
 }

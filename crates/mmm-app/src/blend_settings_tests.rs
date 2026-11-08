@@ -396,19 +396,18 @@ fn last_blend_reads_provenance() {
 #[test]
 fn cost_text_says_what_goes_stale() {
     assert_eq!(
-        cost_text(ChangeImpact::Reblend, Some((3, 12)), true),
+        cost_text(ChangeImpact::Reblend, Some((3, 12))),
         "Existing results go stale; reblend to see the change (3 of 12 tiles)."
     );
     assert_eq!(
-        cost_text(ChangeImpact::Reanalyze, Some((0, 0)), true),
+        cost_text(ChangeImpact::Reanalyze, Some((0, 0))),
         "Analysis reruns and every result goes stale."
     );
-    // Automatic analysis off: the user runs it.
     assert_eq!(
-        cost_text(ChangeImpact::Reanalyze, Some((2, 6)), false),
-        "Analysis will need to rerun and every result goes stale (2 of 6 tiles)."
+        cost_text(ChangeImpact::Reanalyze, Some((2, 6))),
+        "Analysis reruns and every result goes stale (2 of 6 tiles)."
     );
-    assert!(cost_text(ChangeImpact::Reblend, None, true).contains("counting"));
+    assert!(cost_text(ChangeImpact::Reblend, None).contains("counting"));
     assert_eq!(
         count_tiles(&[PathBuf::from("/nonexistent/result.mmmt")]),
         (0, 0)

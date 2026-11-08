@@ -7,9 +7,11 @@
 //!
 //! The steps act as navigation: Panels opens or closes the panel list (and
 //! reads the previews again once they stopped short), Checks opens
-//! Problems (or starts the analysis it is waiting for), Merge merges every
-//! group (while merging, it shows the mosaic), Export opens the Export
-//! dialog. A working step's **Cancel** cancels its jobs.
+//! Problems (or starts the analysis the pipeline left to the user), Merge
+//! merges every group while it is to do (merging or merged, it shows the
+//! mosaic), Export opens the Export dialog. A working step's **Cancel**
+//! cancels its jobs. An ROI's merge belongs to its ROI: it neither holds
+//! **Merge** back nor stops with the Merge step's Cancel.
 
 use egui::{Align, Layout};
 use mega_ui::icons;
@@ -121,7 +123,8 @@ impl SessionWindow {
             {
                 asked = Some(Main::Settings);
             }
-            let why = if jobs.blending() {
+            // An ROI's merge is no reason to wait (it may be cut short).
+            let why = if jobs.run_of(JobTarget::Blend).is_some() {
                 Some(MERGING.to_string())
             } else {
                 self.mosaic.merge_block_reason(session, jobs)
@@ -169,8 +172,9 @@ impl SessionWindow {
                 self.track_analysis(id);
             }
             CHECKS_STEP => self.inspector_mut().reveal(PROBLEMS),
-            // Merging already: watch it.
-            MERGE_STEP if matches!(strip[i].state, StepState::Working { .. }) => {
+            // Merging already, or merged: a look at the mosaic. A status
+            // pill never starts an hours-long merge of what is complete.
+            MERGE_STEP if matches!(strip[i].state, StepState::Working { .. } | StepState::Done) => {
                 self.set_mode(CanvasMode::Mosaic);
             }
             MERGE_STEP => self.merge(session, jobs),
@@ -180,19 +184,22 @@ impl SessionWindow {
     }
 }
 
-/// Step `i`'s Cancel was clicked: cancel its jobs (running and queued).
+/// Step `i`'s Cancel was clicked: cancel its jobs (running and queued). An
+/// ROI's merge is not the Merge step's: it runs on.
 fn cancel_step(i: usize, jobs: &mut JobRunner) {
     let views = jobs.views();
+    let of = |target: JobTarget| {
+        jobs_where(&views, |v| match jobs.target(v.id) {
+            Some((JobTarget::Blend, _)) => target == JobTarget::Blend && jobs.whole_canvas(v.id),
+            Some((t, _)) => t == target,
+            None => false,
+        })
+    };
     let ids = match i {
         PANELS_STEP => jobs_where(&views, is_previews),
         CHECKS_STEP => jobs_where(&views, is_analysis),
-        MERGE_STEP => {
-            jobs.cancel_blends();
-            return;
-        }
-        EXPORT_STEP => jobs_where(&views, |v| {
-            matches!(jobs.target(v.id), Some((JobTarget::Export, _)))
-        }),
+        MERGE_STEP => of(JobTarget::Blend),
+        EXPORT_STEP => of(JobTarget::Export),
         _ => Vec::new(),
     };
     for id in ids {

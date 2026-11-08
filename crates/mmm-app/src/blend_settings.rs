@@ -186,9 +186,9 @@ pub fn count_tiles(paths: &[PathBuf]) -> (usize, usize) {
     (valid, total)
 }
 
-/// What applying an edit costs, for the user. `auto`: automatic analysis
-/// is on (a global change then reruns it by itself).
-pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>, auto: bool) -> String {
+/// What applying an edit costs, for the user (a global change reruns the
+/// analysis by itself).
+pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>) -> String {
     let tiles = match counts {
         None => " (counting tiles…)".to_string(),
         Some((_, 0)) => String::new(),
@@ -199,11 +199,8 @@ pub fn cost_text(impact: ChangeImpact, counts: Option<(usize, usize)>, auto: boo
         ChangeImpact::Reblend => {
             format!("Existing results go stale; reblend to see the change{tiles}.")
         }
-        ChangeImpact::Reanalyze if auto => {
-            format!("Analysis reruns and every result goes stale{tiles}.")
-        }
         ChangeImpact::Reanalyze => {
-            format!("Analysis will need to rerun and every result goes stale{tiles}.")
+            format!("Analysis reruns and every result goes stale{tiles}.")
         }
     }
 }
@@ -657,13 +654,9 @@ impl SettingsPanel {
             };
             ui.add_space(4.0);
             ui.label(
-                RichText::new(cost_text(
-                    impact,
-                    counts,
-                    crate::pipeline::auto_analyze(&session.mosaic.config),
-                ))
-                .small()
-                .color(palette::TEXT_BODY),
+                RichText::new(cost_text(impact, counts))
+                    .small()
+                    .color(palette::TEXT_BODY),
             );
             ui.horizontal(|ui| {
                 if ui
