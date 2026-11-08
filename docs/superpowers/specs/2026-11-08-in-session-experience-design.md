@@ -253,10 +253,27 @@ Toggles in the view bar, each available over both plan and mosaic:
   the seam-health check flagged after a merge is drawn in the warning colour.
 - **ROIs**: one toggle shows or hides all ROIs (outlines, labels and their
   merged previews).
-- **Stretch ▾**: the display stretch (display only; data stays linear). It
-  offers the normal automatic stretch and a **strong** one that exaggerates
-  faint gradients, so mismatched gradients and seams stand out. Plan and
-  mosaic keep their own stretches per group and composite, as now.
+- **Display stretch** (display only; the data stays linear). Always
+  automatic, simplified for this version to two toggles, with no manual
+  modes and no per-group settings:
+  - **Linked / Unlinked** (default **Unlinked**): whether colour channels
+    share one stretch or each get their own. It matters only for colour views
+    (OSC groups and composites); for a mono group it shows greyed out with a
+    tooltip, so the controls never shift. Unlinked hides colour casts, so
+    Linked is the one to use when checking a composite's colour.
+  - **Normal / Strong** (default **Normal**): Strong exaggerates faint
+    gradients, so mismatched gradients and seams stand out.
+  - The stretch is worked out again when what's shown changes (group,
+    composite, plan or mosaic) and when the data settles (previews done, a
+    merge completed). While a mosaic fills in during a merge, the plan's
+    stretch holds, so the image doesn't pump; it updates when the merge
+    completes.
+  - Its statistics come from low-resolution data (previews, pyramid levels),
+    never a dense pass over the canvas, and ignore zero (no data).
+  - ROI previews are drawn with the stretch of the canvas beneath them and
+    never change it, so a patch compares fairly with its surroundings.
+  - Both toggles belong to the session, not to a group, and are restored on
+    reopen. Per-group stretches saved by older versions are ignored.
 
 ### 7.4 Pointing at things
 
@@ -578,7 +595,7 @@ header** by itself (one click undoes it). Panels the rule can't place go to
   same notes the start screen shows.
 - **Reopening restores the view**: plan or mosaic, the group or composite,
   the camera, the inspector's fold state and open sections, whether the panel
-  list is open, the overlay toggles and the stretches. Saved in `mosaic.json`'s
+  list is open, the overlay toggles and the stretch toggles. Saved in `mosaic.json`'s
   `ui` with the rest of the app state.
 - **Undo in a toast** for removing panels, deleting ROIs and composites, and
   analysis-setting changes. (Merge-setting changes need none: they're a
@@ -631,6 +648,9 @@ four hard-coded ones).
   groups when the shared frame doesn't move.
 - Add folder and dropped folders take top-level image files only.
 - "Merge", never "blend", in the UI.
+- The display stretch is automatic, with only Linked/Unlinked (default
+  Unlinked) and Normal/Strong (default Normal), updating when the view or
+  its data changes.
 
 ## 18. Calls made by Claude, for review
 
@@ -653,7 +673,9 @@ four hard-coded ones).
 - Problems never block merging or exporting.
 - Problem badges on overlaps as well as panels; flagged seams tinted in the
   seams overlay; clicking a problem zooms to it.
-- A **strong** display stretch for gradients.
+- Stretch details: Linked greyed out for mono views; recomputed when the
+  data settles, held while a mosaic fills in; low-resolution statistics;
+  ROI previews use the canvas's stretch; old per-group stretches ignored.
 - A shared camera across plan, mosaic, groups and composites.
 - ROI previews prioritise the ROI nearest the view's centre. An ROI drawn
   while ROIs are shown merges at once.
@@ -684,6 +706,10 @@ four hard-coded ones).
 - WBPP's exact keyword rule (look it up and match it), and the panel list's
   final columns (what headers give reliably: e.g. integration from EXPTIME
   and NCOMBINE).
+- The automatic stretch's parameters for Normal and Strong, and what a
+  linked stretch is computed from for a composite. Whether the start
+  screen's hero switches to the automatic stretch too (it uses a session's
+  saved stretch when there is one), which would be simpler.
 - The exact keyboard shortcuts, roll-up threshold, file name tokens beyond
   `{session}` and `{name}`, and how "out of date" is shown on the mosaic.
 - Which new components go into `mega-ui` (likely: the step strip, the
