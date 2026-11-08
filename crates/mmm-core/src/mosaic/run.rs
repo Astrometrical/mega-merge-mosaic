@@ -176,7 +176,12 @@ impl Mosaic {
         next.push_provenance(
             "blend",
             Some(&plan.group),
-            json!({ "group": plan.group, "rect": rect, "settings": plan.settings }),
+            json!({
+                "group": plan.group,
+                "rect": rect,
+                "settings": plan.settings,
+                "whole": plan.rect.is_none(),
+            }),
         );
         next.save(&self.dir)?;
         self.config = next;
@@ -649,6 +654,58 @@ pub fn set_settings(
     next.save(&m.dir)?;
     m.config = next;
     Ok(impact)
+}
+
+/// Commit new global blend settings without invalidating anything: the
+/// settings are validated like [`set_settings`] (the base and every group's
+/// effective settings), stored and saved once. No store lock is taken, no
+/// tiles are invalidated and [`MosaicConfig::needs_analyze`] is untouched;
+/// the next merge uses the new settings, and [`settings_changed`] tells a
+/// frontend which groups' merged tiles no longer match.
+///
+/// Refused with nothing changed (in memory or on disk) when any resolved
+/// settings fail [`BlendSettings::validate`].
+pub fn commit_blend_settings(m: &mut Mosaic, blend: BlendSettings) -> Result<()> {
+    validate_blend(&m.config, &blend)?;
+    let mut next = m.config.clone();
+    next.blend = blend;
+    next.save(&m.dir)?;
+    m.config = next;
+    Ok(())
+}
+
+/// The blend settings of `group`'s newest whole-canvas merge, from the
+/// provenance trail (`None` if never merged). Region merges (`whole` false)
+/// are skipped; entries without a `whole` key predate it and count as whole.
+pub fn last_merge_settings(cfg: &MosaicConfig, group: &str) -> Option<BlendSettings> {
+    cfg.provenance
+        .iter()
+        .rev()
+        .filter(|e| e.action == "blend" && e.group.as_deref() == Some(group))
+        .filter(|e| e.detail.get("whole").and_then(|w| w.as_bool()) != Some(false))
+        .find_map(|e| serde_json::from_value(e.detail.get("settings")?.clone()).ok())
+}
+
+/// The analyze settings `group` was last analyzed with, from the newest
+/// `"analyze"` provenance entry that includes it (`None` if never analyzed).
+pub fn last_analyze_settings(cfg: &MosaicConfig, group: &str) -> Option<AnalyzeSettings> {
+    cfg.provenance
+        .iter()
+        .rev()
+        .filter(|e| e.action == "analyze")
+        .find_map(|e| serde_json::from_value(e.detail.get("groups")?.get(group)?.clone()).ok())
+}
+
+/// Whether `draft` global blend settings, resolved through `group`'s
+/// override, differ from those of the group's last whole-canvas merge.
+/// `false` when the group was never merged.
+pub fn settings_changed(cfg: &MosaicConfig, group: &str, draft: &BlendSettings) -> bool {
+    let over = cfg
+        .group_overrides
+        .get(group)
+        .map(|o| o.blend.clone())
+        .unwrap_or_default();
+    last_merge_settings(cfg, group).is_some_and(|s| s != draft.with(&over))
 }
 
 /// Replace the input panel list and grouping rule. Unchanged inputs are a

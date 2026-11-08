@@ -10,9 +10,10 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
     FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE, SINGLE_GROUP,
-    analyze_all, blend_group, invalidate_group, mark_needs_analyze, plan_analyze,
-    plan_analyze_with, plan_blend, run_analyze, run_blend, set_analyze_settings,
-    set_blend_settings, set_group_override, set_inputs, set_settings,
+    analyze_all, blend_group, commit_blend_settings, invalidate_group, last_analyze_settings,
+    last_merge_settings, mark_needs_analyze, plan_analyze, plan_analyze_with, plan_blend,
+    run_analyze, run_blend, set_analyze_settings, set_blend_settings, set_group_override,
+    set_inputs, set_settings, settings_changed,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -1093,4 +1094,142 @@ fn mark_needs_analyze_stales_and_marks_once() {
     mark_needs_analyze(&mut m, &["OIII".into()]).unwrap();
     drop(held);
     assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+}
+
+fn with_feather(b: &BlendSettings, d: f32) -> BlendSettings {
+    BlendSettings {
+        feather_px: b.feather_px + d,
+        ..b.clone()
+    }
+}
+
+#[test]
+fn commit_does_not_invalidate() {
+    let tmp = TempDir::new("commit");
+    let (_t, mut m) = {
+        let mut m = two_group_mosaic(&tmp.0);
+        analyze_all(&mut m, &JobCtl::none()).unwrap();
+        blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+        blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+        ((), m)
+    };
+    let (ha, oiii) = (valid0(&m.result_path("Ha")), valid0(&m.result_path("OIII")));
+    assert!(ha > 0 && oiii > 0);
+    let marked = m.config.needs_analyze.clone();
+    let new = with_feather(&m.config.blend, 10.0);
+    commit_blend_settings(&mut m, new.clone()).unwrap();
+    assert_eq!(valid0(&m.result_path("Ha")), ha);
+    assert_eq!(valid0(&m.result_path("OIII")), oiii);
+    assert_eq!(m.config.needs_analyze, marked);
+    assert_eq!(m.config.blend, new);
+    assert_eq!(MosaicConfig::load(&m.dir).unwrap().blend, new);
+}
+
+#[test]
+fn commit_refuses_invalid_settings() {
+    let tmp = TempDir::new("commitbad");
+    let mut m = Mosaic::create(&tmp.0.join("m"), MosaicConfig::new(vec![])).unwrap();
+    let before = std::fs::read(m.dir.join("mosaic.json")).unwrap();
+    let cfg = m.config.clone();
+    let bad = with_feather(&m.config.blend, -m.config.blend.feather_px);
+    let err = commit_blend_settings(&mut m, bad).unwrap_err();
+    assert!(err.to_string().contains("feather"), "{err}");
+    assert_eq!(m.config, cfg);
+    assert_eq!(std::fs::read(m.dir.join("mosaic.json")).unwrap(), before);
+}
+
+#[test]
+fn last_merge_settings_is_per_group_and_whole_canvas() {
+    let tmp = TempDir::new("lastmerge");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    assert_eq!(last_merge_settings(&m.config, "Ha"), None);
+    let first = m.config.blend.clone();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    commit_blend_settings(&mut m, with_feather(&first, 7.0)).unwrap();
+    blend_group(&mut m, "Ha", Some([10, 10, 100, 100]), &JobCtl::none()).unwrap();
+    assert_eq!(last_merge_settings(&m.config, "Ha"), Some(first.clone()));
+    // Group B's entry does not answer for A.
+    assert_eq!(last_merge_settings(&m.config, "OIII"), None);
+    blend_group(&mut m, "OIII", None, &JobCtl::none()).unwrap();
+    assert_eq!(
+        last_merge_settings(&m.config, "OIII"),
+        Some(with_feather(&first, 7.0))
+    );
+    assert_eq!(last_merge_settings(&m.config, "Ha"), Some(first));
+}
+
+#[test]
+fn last_analyze_settings_is_per_group() {
+    let tmp = TempDir::new("lastanalyze");
+    let mut m = two_group_mosaic(&tmp.0);
+    assert_eq!(last_analyze_settings(&m.config, "Ha"), None);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    assert_eq!(
+        last_analyze_settings(&m.config, "Ha"),
+        Some(m.config.settings_for("Ha").0)
+    );
+    assert_eq!(
+        last_analyze_settings(&m.config, "OIII"),
+        Some(m.config.settings_for("OIII").0)
+    );
+    assert_eq!(last_analyze_settings(&m.config, "Nope"), None);
+}
+
+#[test]
+fn settings_changed_respects_overrides() {
+    let tmp = TempDir::new("changed");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    // Never merged: nothing to compare against.
+    assert!(!settings_changed(&m.config, "Ha", &m.config.blend));
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    let draft = with_feather(&m.config.blend, 5.0);
+    assert!(!settings_changed(&m.config, "Ha", &m.config.blend));
+    assert!(settings_changed(&m.config, "Ha", &draft));
+    // An override pinning the changed field to the merged value: no change.
+    let pinned = m.config.blend.feather_px;
+    m.config.group_overrides.insert(
+        "Ha".into(),
+        GroupOverride {
+            blend: BlendOverride {
+                feather_px: Some(pinned),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(!settings_changed(&m.config, "Ha", &draft));
+}
+
+#[test]
+fn old_blend_entries_count_as_whole() {
+    let tmp = TempDir::new("oldblend");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    let mut e = m.config.provenance.pop().unwrap();
+    assert_eq!(e.detail["whole"], true);
+    e.detail.as_object_mut().unwrap().remove("whole");
+    m.config.provenance.push(e);
+    assert_eq!(
+        last_merge_settings(&m.config, "Ha"),
+        Some(m.config.blend.clone())
+    );
+}
+
+#[test]
+fn set_settings_still_invalidates() {
+    let tmp = TempDir::new("setstill");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert!(valid0(&m.result_path("Ha")) > 0);
+    let analyze = m.config.analyze.clone();
+    let new = with_feather(&m.config.blend, 10.0);
+    assert_eq!(
+        set_settings(&mut m, analyze, new).unwrap(),
+        ChangeImpact::Reblend
+    );
+    assert_eq!(valid0(&m.result_path("Ha")), 0);
 }
