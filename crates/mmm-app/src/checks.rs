@@ -254,7 +254,7 @@ mod tests {
     /// Poll until a report for the current state is in (bounded).
     fn settle(e: &mut ChecksEngine, s: &OpenSession, r: &JobRunner) {
         let ctx = egui::Context::default();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
         loop {
             e.poll(&ctx, s, r, &[]);
             if e.report().is_some() && !e.running() && !e.dirty {

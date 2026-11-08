@@ -84,7 +84,7 @@ fn harness(state: State) -> Harness<'static, State> {
 
 /// Step until `done` holds, stopping at the frame that made it so.
 fn step_to(h: &mut Harness<'_, State>, done: impl Fn(&State) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !done(h.state()) {
         assert!(Instant::now() < deadline, "timed out waiting for the view");
         h.step();
@@ -696,7 +696,7 @@ fn recompute_without_statistics_keeps_the_stretch() {
         linked: true,
         strong: false,
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     view.update(&ctx, &mut s, &jobs, linked, None);
     assert!(member(&mut view, "Ha").auto.is_some(), "asked for");
     while !member(&mut view, "Ha").idle() {
@@ -837,7 +837,7 @@ fn composition_shows_merged_members() {
     let ctx = egui::Context::default();
     let mut view = MosaicView::new();
     view.set_view(&s, ViewKind::Composition(0));
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !view.results.values().all(Member::idle) {
         assert!(Instant::now() < deadline, "results never opened");
         std::thread::sleep(Duration::from_millis(2));
@@ -1300,7 +1300,7 @@ fn previews_do_not_move_persisted_rois() {
     let ctx = egui::Context::default();
     let mut view = MosaicView::new();
     view.rois.load_once(&s.mosaic.config.ui);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     loop {
         update(&mut view, &ctx, &mut s, &jobs);
         if view.rois.synced() && view.rois.idle() {
@@ -1336,7 +1336,7 @@ fn no_merge_while_the_settings_tile_count_runs() {
     assert!(why.contains("settings"), "{why}");
     view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
     assert!(!jobs.busy(), "no merge started during the count");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !view.settings.idle() {
         assert!(Instant::now() < deadline, "the count never ended");
         std::thread::sleep(Duration::from_millis(2));
@@ -1368,7 +1368,7 @@ fn settings_edit_waits_for_merges_and_blocks_merging() {
     assert!(view.settings.has_pending());
     assert!(view.merge_block_reason(&s, &jobs).is_some());
     gate.open();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     let mut applied = None;
     while applied.is_none() {
         assert!(Instant::now() < deadline, "never applied");

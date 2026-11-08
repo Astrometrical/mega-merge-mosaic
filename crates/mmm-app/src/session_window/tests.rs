@@ -993,7 +993,7 @@ fn pump(
     done: impl Fn(&JobRunner, &Pipeline) -> bool,
 ) {
     let ctx = egui::Context::default();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !done(jobs, pipeline) {
         assert!(Instant::now() < deadline, "timed out waiting for the jobs");
         std::thread::sleep(Duration::from_millis(2));

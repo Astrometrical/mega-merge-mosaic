@@ -1784,7 +1784,7 @@ mod tests {
     fn watchdog_fires_after_deadline() {
         let ctx = egui::Context::default();
         let fired = selftest_watchdog(&ctx, std::time::Duration::from_millis(10), None);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
         while !fired.load(std::sync::atomic::Ordering::SeqCst) {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));

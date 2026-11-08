@@ -838,7 +838,7 @@ fn a_waiting_edit_applies_when_the_session_is_left() {
     assert!(list.has_pending(), "waits for the analysis to stop");
     // Leaving the session: the jobs stop, then the edit applies at once.
     gate.open();
-    let (_, stopped) = jobs.stop_all(&mut session, Duration::from_secs(20));
+    let (_, stopped) = jobs.stop_all(&mut session, crate::testutil::PATIENCE);
     assert!(stopped);
     list.apply_waiting(&mut session, &mut jobs);
     assert!(!list.has_pending());

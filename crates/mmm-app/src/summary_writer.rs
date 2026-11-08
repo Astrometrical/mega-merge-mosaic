@@ -548,9 +548,10 @@ mod tests {
         assert_eq!(s.groups[0].exported_at, Some(100));
     }
 
-    /// Poll `w` until no write runs and nothing is dirty, for up to 10 s.
+    /// Poll `w` until no write runs and nothing is dirty (bounded by
+    /// [`PATIENCE`](crate::testutil::PATIENCE)).
     fn settle(w: &mut SummaryWriter, ctx: &egui::Context, s: &OpenSession) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
         for _ in 0..3 {
             loop {
                 w.poll(ctx, s, None, None);

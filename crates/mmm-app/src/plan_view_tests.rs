@@ -169,7 +169,7 @@ fn assert_painted_with(h: &Harness<'_, State>, cam: Camera) {
 
 /// Step until `done` holds, stopping at the frame that made it so.
 fn step_to(h: &mut Harness<'_, State>, done: impl Fn(&State) -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
     while !done(h.state()) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -886,7 +886,7 @@ fn converter_drops_superseded_epochs() {
     while done.len() < jobs {
         let (e, _, _) = conv
             .rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(crate::testutil::PATIENCE)
             .expect("conversions finish");
         done.push(e);
     }

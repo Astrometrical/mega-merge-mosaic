@@ -306,7 +306,7 @@ fn a_waiting_edit_applies_when_the_session_is_left() {
     assert!(panel.has_pending(), "waits for the merge to stop");
     // Leaving the session: the jobs stop, then the edit applies at once.
     gate.open();
-    let (_, stopped) = jobs.stop_all(&mut s, std::time::Duration::from_secs(20));
+    let (_, stopped) = jobs.stop_all(&mut s, crate::testutil::PATIENCE);
     assert!(stopped);
     assert_eq!(
         panel.apply_waiting(&mut s, &mut jobs),
