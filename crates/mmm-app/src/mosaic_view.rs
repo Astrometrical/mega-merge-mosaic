@@ -533,6 +533,11 @@ impl MosaicView {
         applied
     }
 
+    /// An applied merge settings edit waits for the jobs to stop.
+    pub fn has_waiting_settings(&self) -> bool {
+        self.settings.has_pending()
+    }
+
     /// Apply a merge settings edit waiting for the jobs to stop now
     /// ([`SettingsPanel::apply_waiting`]); call only while no job but an
     /// export runs.

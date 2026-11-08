@@ -31,9 +31,10 @@ pub struct OpenSession {
     /// The groups as last resolved (when opening, off the UI thread, and by
     /// each analysis); `None` if resolution failed.
     pub groups: Option<Groups>,
-    /// The cross-process session lock, held for the session's lifetime;
-    /// `None` only for a check made to hand the session to a new process.
-    #[allow(dead_code)] // held for its Drop, never read
+    /// The cross-process session lock, held for the session's lifetime
+    /// (and, when a job outlives leaving the session, until it has ended:
+    /// see [`crate::app::Shell::close_session`]); `None` only for a check
+    /// made to hand the session to a new process.
     pub lock: Option<SessionLock>,
     /// The session's `summary.json` as found when opening (`None` if absent
     /// or unreadable); seeds the summary writer's blend and export stamps.

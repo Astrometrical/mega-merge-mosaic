@@ -285,6 +285,12 @@ impl SessionWindow {
         self.mosaic.view_key(ui)
     }
 
+    /// An edit waits for the jobs to stop (panels, or applied merge
+    /// settings).
+    pub fn has_waiting_edits(&self) -> bool {
+        self.panels.has_pending() || self.mosaic.has_waiting_settings()
+    }
+
     /// Apply the edits waiting for the jobs to stop (panels, merge
     /// settings) now, if no job but an export runs: the session is being
     /// left, and nothing would apply them later. One refused because a

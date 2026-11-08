@@ -277,6 +277,9 @@ pub struct JobRunner {
     gate: Option<std::sync::Arc<tests::Gate>>,
     #[cfg(test)]
     stepper: Option<std::sync::Arc<tests::Stepper>>,
+    /// Called once [`JobRunner::stop_all`] has cancelled the jobs.
+    #[cfg(test)]
+    on_stop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl JobRunner {
@@ -299,6 +302,8 @@ impl JobRunner {
             gate: None,
             #[cfg(test)]
             stepper: None,
+            #[cfg(test)]
+            on_stop: None,
         }
     }
 
@@ -508,6 +513,10 @@ impl JobRunner {
         let dropped: Vec<u64> = self.queue.drain(..).map(|q| q.id).collect();
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
+        #[cfg(test)]
+        if let Some(f) = self.on_stop.take() {
+            f();
+        }
         let mut events = self.poll(session);
         while self.busy() {
             if Instant::now() >= deadline {
@@ -517,6 +526,21 @@ impl JobRunner {
             events.extend(self.poll(session));
         }
         (events, true)
+    }
+
+    /// Let go of the workers, e.g. of a job that did not stop in
+    /// [`JobRunner::stop_all`]'s wait: the running job (cancelled) and every
+    /// queued one are forgotten, and nothing applies their outcomes. Their
+    /// worker threads, and the last one that ended, are returned: once all
+    /// have been joined, nothing this runner started runs any more (each
+    /// worker joins its predecessor first).
+    pub fn detach_workers(&mut self) -> Vec<JoinHandle<()>> {
+        self.queue.clear();
+        let running = self.running.take().map(|r| {
+            r.token.cancel();
+            r.handle
+        });
+        running.into_iter().chain(self.previous.take()).collect()
     }
 
     /// Whether a blend is running or queued.
@@ -1129,6 +1153,12 @@ pub(crate) mod tests {
             self.stepper = Some(stepper.clone());
             stepper
         }
+
+        /// Call `f` once [`JobRunner::stop_all`] has cancelled the jobs,
+        /// before it waits for them (e.g. to let a held worker go).
+        pub(crate) fn on_stop(&mut self, f: impl FnOnce() + Send + 'static) {
+            self.on_stop = Some(Box::new(f));
+        }
     }
 
     /// Poll until no job is running or queued (bounded); every event.
@@ -1222,13 +1252,19 @@ pub(crate) mod tests {
         for id in [ha, export] {
             assert!(events.contains(&JobEvent::Cancelled { id }), "{events:?}");
         }
-        // A job that ignores the wait is left to wind down.
+        // A job that ignores the wait is let go of; its worker is handed
+        // over, to be joined once it has stopped.
         let gate = r.hold();
         r.start_blend(&mut s, "OIII", None);
         let (_, stopped) = r.stop_all(&mut s, Duration::from_millis(20));
         assert!(!stopped);
+        let workers = r.detach_workers();
+        assert!(!workers.is_empty());
+        assert!(!r.busy(), "nothing left to the runner");
         gate.open();
-        let _ = drain(&mut r, &mut s);
+        for w in workers {
+            w.join().unwrap();
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

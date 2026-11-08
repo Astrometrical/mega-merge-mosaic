@@ -10,9 +10,11 @@
 //! (classifying each group's result store, writing the file) runs on a
 //! background thread; the UI thread does no file I/O. The classified
 //! result states are handed back ([`SummaryWriter::take_results`]) unless
-//! something changed while they were read. Leaving the session writes the
-//! summary one last time on the UI thread ([`SummaryWriter::finish`]); no
-//! background write lands after that.
+//! something changed while they were read. Leaving the session closes the
+//! writer ([`SummaryWriter::close`]: no background write lands after it)
+//! and writes the summary one last time: on the UI thread
+//! ([`SummaryWriter::finish`]), or, when a job outlives the leaving, on the
+//! thread that waits for it ([`FinalWrite`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -189,6 +191,32 @@ fn classify_and_write(
     Written { results, summary }
 }
 
+/// The summary's last write, from [`SummaryWriter::close`].
+pub struct FinalWrite {
+    mosaic: Mosaic,
+    groups: Option<Groups>,
+    inputs: Inputs,
+    stamps: Stamps,
+    last: Option<SessionSummary>,
+}
+
+impl FinalWrite {
+    /// Classify each group's result and write the summary, unless its
+    /// facts are unchanged. Blocking file I/O; run it once no job writes
+    /// the session's results any more (a store a job holds reads as no
+    /// result).
+    pub fn write(self) {
+        classify_and_write(
+            &self.mosaic,
+            self.groups.as_ref(),
+            &self.inputs,
+            &self.stamps,
+            self.last.as_ref(),
+            None,
+        );
+    }
+}
+
 /// Writes the session's summary in the background when it has changed.
 pub struct SummaryWriter {
     stamps: Stamps,
@@ -200,7 +228,7 @@ pub struct SummaryWriter {
     running: Option<Receiver<Written>>,
     /// Result states classified and not taken yet.
     results: Option<BTreeMap<String, ResultState>>,
-    /// Set (under the lock) by [`SummaryWriter::finish`]: background writes
+    /// Set (under the lock) by [`SummaryWriter::close`]: background writes
     /// check it, holding the lock while they write.
     closed: Arc<Mutex<bool>>,
     /// How many summaries have been written (for tests).
@@ -241,21 +269,18 @@ impl SummaryWriter {
         }
     }
 
-    /// Write the summary of `session` now, on this thread, and nothing
-    /// after: the session is being left. A background write under way
-    /// finishes first; one that has not written yet never does. Like a
-    /// background write, it reads each group's result state and skips the
-    /// file when the facts are unchanged. Blocking file I/O on the UI
-    /// thread, on the user's ‹ only.
-    pub fn finish(
+    /// Close the writer, the session being left: no background write lands
+    /// once this returns (one under way finishes first; one that has not
+    /// written yet never does). Returns the summary's last write, of
+    /// `session` as it is now, to run once nothing writes its results any
+    /// more ([`FinalWrite::write`]).
+    pub fn close(
         &mut self,
         session: &OpenSession,
         checks: Option<CheckCounts>,
         last_view: Option<String>,
-    ) {
-        let closed = Arc::clone(&self.closed);
-        let mut closed = closed.lock().unwrap_or_else(PoisonError::into_inner);
-        *closed = true;
+    ) -> FinalWrite {
+        *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
         if let Some(rx) = self.running.take()
             && let Ok(Written {
                 summary: Some(s), ..
@@ -263,23 +288,26 @@ impl SummaryWriter {
         {
             self.last = Some(s);
         }
-        let inputs = Inputs::of(session, checks, last_view);
-        let written = classify_and_write(
-            &session.mosaic,
-            session.groups.as_ref(),
-            &inputs,
-            &self.stamps,
-            self.last.as_ref(),
-            None,
-        );
-        if written.summary.is_some() {
-            #[cfg(test)]
-            {
-                self.writes += 1;
-            }
-            self.last = written.summary;
-        }
         self.dirty = false;
+        FinalWrite {
+            mosaic: session.mosaic.clone(),
+            groups: session.groups.clone(),
+            inputs: Inputs::of(session, checks, last_view),
+            stamps: self.stamps.clone(),
+            last: self.last.clone(),
+        }
+    }
+
+    /// [`SummaryWriter::close`], then the last write on this thread: for a
+    /// session left with every job stopped. Blocking file I/O on the UI
+    /// thread, on the user's ‹ only.
+    pub fn finish(
+        &mut self,
+        session: &OpenSession,
+        checks: Option<CheckCounts>,
+        last_view: Option<String>,
+    ) {
+        self.close(session, checks, last_view).write();
     }
 
     /// Note that something the summary shows may have changed (a job ended).

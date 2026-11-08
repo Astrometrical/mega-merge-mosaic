@@ -5,11 +5,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mega_ui::theme::{Tone, palette};
 use mega_ui::widgets::{Toast, Toasts};
+use mmm_core::mosaic::SessionLock;
 
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
@@ -20,7 +23,7 @@ use crate::pipeline::Pipeline;
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
 use crate::session_window::{CanvasMode, SessionWindow};
 use crate::start::{RecentEntry, RfdDialogs, StartAction, StartScreen, unix_now};
-use crate::summary_writer::SummaryWriter;
+use crate::summary_writer::{FinalWrite, SummaryWriter};
 use crate::util::group_names;
 
 /// Directory, inside the session, where compressed panels are decoded.
@@ -103,11 +106,18 @@ pub struct Shell {
     /// Keeps the session's `summary.json` current (made afresh with each
     /// session).
     summary: SummaryWriter,
+    /// Longest leaving the session waits for its jobs ([`STOP_WAIT`]).
+    stop_wait: Duration,
+    /// Sessions left while a job still ran, sent by their reaper once it
+    /// has released the lock ([`reap`]).
+    reaped_tx: Sender<PathBuf>,
+    reaped_rx: Receiver<PathBuf>,
 }
 
 impl Shell {
     /// A shell showing `start`.
     pub fn new(start: StartScreen) -> Self {
+        let (reaped_tx, reaped_rx) = mpsc::channel();
         Shell {
             start,
             session: None,
@@ -121,6 +131,9 @@ impl Shell {
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
             summary: SummaryWriter::new(None),
+            stop_wait: STOP_WAIT,
+            reaped_tx,
+            reaped_rx,
         }
     }
 
@@ -178,23 +191,32 @@ impl Shell {
     /// Leave the open session for the start screen, in this window (‹,
     /// spec §15). Refused while an export runs or waits (`Err` says why).
     /// Otherwise every other job is cancelled (all can be run again) and
-    /// waited for, at most [`STOP_WAIT`] (one that ignores it is left to
-    /// wind down, logged); pending saves are flushed
-    /// ([`Shell::flush_pending_saves`]) and the summary written, both on
-    /// this thread; the session is dropped (its lock released) with its
+    /// waited for, at most [`STOP_WAIT`]; pending saves are flushed
+    /// ([`Shell::flush_pending_saves`]); the session is dropped with its
     /// window, pipeline, checks and summary writer; the decode cache is
     /// forgotten; the start screen reads the session's facts again; the
-    /// title names no session. Nothing writes into the session after.
-    /// Without a session open, nothing to do.
+    /// title names no session.
+    ///
+    /// With every job stopped, the summary is written on this thread and
+    /// the lock released at once. A job that ignores the wait (a decode
+    /// cannot be interrupted) is let go of without hanging the window: a
+    /// reaper thread keeps the session's lock until the job's worker has
+    /// ended, then writes the summary and releases the lock (the start
+    /// screen shows the session open in another window meanwhile, and
+    /// reads it again after). An edit that was waiting for the jobs is then
+    /// dropped (logged). Either way nothing writes into the session once
+    /// its lock is released. Without a session open, nothing to do.
     pub fn close_session(&mut self, ctx: &egui::Context) -> Result<(), String> {
         let Some(session) = &mut self.session else {
             return Ok(());
         };
+        let mut stopped = true;
         if let Some(jobs) = &mut self.jobs {
             if let Some(why) = SessionWindow::back_block_reason(jobs) {
                 return Err(why.to_string());
             }
-            let (events, stopped) = jobs.stop_all(session, STOP_WAIT);
+            let (events, done) = jobs.stop_all(session, self.stop_wait);
+            stopped = done;
             for event in &events {
                 let target = match event {
                     JobEvent::Finished { id, .. } => jobs.target(*id),
@@ -202,22 +224,39 @@ impl Shell {
                 };
                 self.summary.on_job_event(event, target, unix_now());
             }
-            if !stopped {
-                tracing::warn!(
-                    "a job did not stop within {} s of leaving the session; it winds down on its own",
-                    STOP_WAIT.as_secs()
-                );
-            }
         }
+        // With a job still running, waiting edits stay unapplied.
         self.flush_pending_saves();
-        let Some(session) = self.session.take() else {
+        let leftover = match &mut self.jobs {
+            Some(jobs) if !stopped => {
+                tracing::warn!(
+                    "a job did not stop within {:?} of leaving the session; the session \
+                     stays locked until it has",
+                    self.stop_wait
+                );
+                if self.window.has_waiting_edits() {
+                    tracing::warn!(
+                        "an edit waiting for the jobs to stop is dropped: a job did not stop"
+                    );
+                }
+                jobs.detach_workers()
+            }
+            _ => Vec::new(),
+        };
+        let Some(mut session) = self.session.take() else {
             return Ok(());
         };
         let checks = self.checks.counts(&session.mosaic.config);
         let last_view = self.window.view_key(&session.mosaic.config.ui);
-        self.summary.finish(&session, checks, last_view);
-        self.jobs = None;
         let dir = session.mosaic.dir.clone();
+        if leftover.is_empty() {
+            self.summary.finish(&session, checks, last_view);
+        } else {
+            let summary = self.summary.close(&session, checks, last_view);
+            let reaped = self.reaped_tx.clone();
+            reap(leftover, summary, session.lock.take(), &dir, reaped, ctx);
+        }
+        self.jobs = None;
         drop(session);
         self.window = SessionWindow::new(self.files_picker.clone());
         self.pipeline = Pipeline::new();
@@ -280,8 +319,12 @@ impl Shell {
         }
     }
 
-    /// Apply a finished open/create.
+    /// Apply a finished open/create; the start screen reads a session again
+    /// once its reaper has released it.
     fn poll(&mut self, ctx: &egui::Context) {
+        while let Ok(dir) = self.reaped_rx.try_recv() {
+            self.start.session_closed(&dir);
+        }
         let Some(outcome) = self.pending.as_mut().and_then(Pending::poll) else {
             return;
         };
@@ -422,6 +465,38 @@ impl Shell {
             self.toasts
                 .push(toast(Tone::Neutral, why), ctx.input(|i| i.time));
         }
+    }
+}
+
+/// Keep a session left while its jobs' `workers` still run locked until
+/// they have ended: on a thread of its own, join them, run the summary's
+/// last write, release `lock`, then send `dir` to `reaped` and repaint
+/// `ctx`. Nothing of the session's is written after the lock is released.
+fn reap(
+    workers: Vec<JoinHandle<()>>,
+    summary: FinalWrite,
+    lock: Option<SessionLock>,
+    dir: &Path,
+    reaped: Sender<PathBuf>,
+    ctx: &egui::Context,
+) {
+    let dir = dir.to_path_buf();
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("mmm-session-reaper".into())
+        .spawn(move || {
+            for w in workers {
+                let _ = w.join();
+            }
+            summary.write();
+            drop(lock);
+            tracing::info!("released session {} once its last job ended", dir.display());
+            let _ = reaped.send(dir);
+            ctx.request_repaint();
+        });
+    // Without a thread, the lock goes with the closure: released at once.
+    if let Err(e) = spawned {
+        tracing::error!("cannot start the session reaper: {e}; the session is released now");
     }
 }
 
@@ -1393,7 +1468,7 @@ mod tests {
 
     #[test]
     fn back_cancels_running_work_and_releases_the_lock() {
-        use mmm_core::mosaic::{CONFIG_FILE, lock_session};
+        use mmm_core::mosaic::{CONFIG_FILE, MosaicConfig, lock_session};
         use mmm_core::session_summary::SUMMARY_FILE;
         let root = temp_dir("shell-back-cancel");
         let dir = crate::testutil::two_group_session(&root).mosaic.dir;
@@ -1409,20 +1484,25 @@ mod tests {
         };
         step_until(&mut h, running);
         assert!(running(h.state()), "analysing");
-        // It gets going while ‹ waits for it to stop.
-        let opener = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            analysis.open();
-        });
+        let before = MosaicConfig::load(&dir).unwrap();
+        // It gets going once ‹ has cancelled it, while ‹ waits for it.
+        h.state_mut()
+            .jobs
+            .as_mut()
+            .unwrap()
+            .on_stop(move || analysis.open());
         h.get_by_role_and_label(egui::accesskit::Role::Button, BACK)
             .click();
         h.step();
         assert!(h.state().session().is_none());
         assert!(h.state().jobs.is_none(), "no jobs");
         drop(lock_session(&dir).expect("the session's lock is released"));
+        // Cancelled, not run to the end: nothing analysed.
+        let after = MosaicConfig::load(&dir).unwrap();
+        assert_eq!(after.group_dirs, before.group_dirs);
+        assert_eq!(after.provenance, before.provenance);
         let config = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
         let summary = std::fs::read(dir.join(SUMMARY_FILE)).expect("a summary");
-        opener.join().unwrap();
         // A moment later, nothing has written into the session.
         let until = Instant::now() + Duration::from_millis(500);
         while Instant::now() < until {
@@ -1431,6 +1511,57 @@ mod tests {
         }
         assert_eq!(std::fs::read(dir.join(CONFIG_FILE)).unwrap(), config);
         assert_eq!(std::fs::read(dir.join(SUMMARY_FILE)).unwrap(), summary);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn back_keeps_the_lock_until_a_job_that_ignores_cancelling_stops() {
+        use egui::accesskit::Role;
+        use mmm_core::mosaic::lock_session;
+        use mmm_core::session_summary::SUMMARY_FILE;
+        let root = temp_dir("shell-back-stuck");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        h.state_mut().stop_wait = Duration::from_millis(50);
+        // The previews' worker is held at the gate: it cannot see a cancel
+        // (like a decode, which nothing interrupts).
+        step_until(&mut h, |s| s.jobs.as_ref().unwrap().busy());
+        h.get_by_role_and_label(Role::Button, BACK).click();
+        h.step();
+        assert!(h.state().session().is_none(), "back without waiting");
+        assert!(lock_session(&dir).is_err(), "locked while the job runs");
+        // The card says so, and opening it meanwhile is refused like any
+        // busy session's.
+        let busy = |s: &Shell| {
+            s.start
+                .card_look(&dir)
+                .0
+                .is_some_and(|(_, t)| t == "Open in another window")
+        };
+        step_until(&mut h, |s| !s.start.checking_recent() && busy(s));
+        let ctx = h.ctx.clone();
+        h.state_mut().request(Request::Open(dir.clone()), &ctx);
+        step_until(&mut h, |s| !s.is_busy());
+        assert!(h.state().session().is_none());
+        let error = h.state().start.error().unwrap_or_default().to_string();
+        assert!(
+            error.contains("open in another window or process"),
+            "{error}"
+        );
+        // Once the job has stopped, the summary is written, then the lock
+        // released, and the card is read again.
+        gate.open();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock_session(&dir).is_err() {
+            assert!(Instant::now() < deadline, "the lock is never released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(dir.join(SUMMARY_FILE).is_file());
+        step_until(&mut h, |s| !s.start.checking_recent() && !busy(s));
+        h.run();
+        h.get_by_label("Resume session").click();
+        step_until(&mut h, |s| s.session().is_some());
+        assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 
