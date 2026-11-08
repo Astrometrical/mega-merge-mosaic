@@ -72,13 +72,8 @@ fn harness(state: State) -> Harness<'static, State> {
                 }
                 if s.canvas {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        s.view.show(
-                            ui,
-                            &mut s.session,
-                            &mut s.jobs,
-                            &s.look,
-                            s.plan_stretch.as_deref(),
-                        );
+                        s.view
+                            .show(ui, &mut s.session, &s.look, s.plan_stretch.as_deref());
                     });
                 }
                 s.view.export_ui(&ctx, &mut s.session, &mut s.jobs);
@@ -400,6 +395,26 @@ fn rois_and_health_show_without_the_canvas() {
     h.get_by_label("ROI 1");
     h.get_by_label("Seam step median");
     assert!(h.query_by_label("None yet.").is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rois_are_drawn_only_when_the_look_has_them() {
+    let (root, state) = merged_ha("mosaic-rois-look");
+    let mut h = harness(state);
+    step_until(&mut h, |st| {
+        st.view.source().is_some() && st.view.is_settled()
+    });
+    let painted = |h: &Harness<'_, State>| {
+        h.output()
+            .shapes
+            .iter()
+            .any(|cs| matches!(&cs.shape, egui::Shape::Text(t) if t.galley.text() == "ROI 1"))
+    };
+    assert!(painted(&h));
+    h.state_mut().look.rois = false;
+    h.run_steps(2);
+    assert!(!painted(&h));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1268,6 +1283,7 @@ fn previews_do_not_move_persisted_rois() {
         groups,
         lock: None,
         summary: None,
+        merged: false,
     };
     // The previews run in the panels' frame...
     let mut jobs = JobRunner::new(egui::Context::default());

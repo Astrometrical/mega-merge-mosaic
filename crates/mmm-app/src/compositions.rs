@@ -1,6 +1,7 @@
-//! Compositions: named colour mixes of groups for the Plan view. Each of
-//! the three output channels (R, G, B) takes a group with a weight, or
-//! nothing. Stored in `MosaicConfig.ui` under [`COMPOSITIONS_KEY`].
+//! Compositions (composites, as the UI calls them): named colour mixes of
+//! groups, shown on the canvas like a group (plan or mosaic). Each of the
+//! three output channels (R, G, B) takes a group with a weight, or nothing.
+//! Stored in `MosaicConfig.ui` under [`COMPOSITIONS_KEY`].
 
 use egui::RichText;
 use mega_ui::theme::palette;
@@ -31,7 +32,7 @@ impl Composition {
     }
 }
 
-/// What the Plan view shows.
+/// What the canvas shows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewKind {
     /// One group by itself.
@@ -68,12 +69,29 @@ pub fn composition_stretch_key(name: &str) -> String {
 }
 
 /// A name for a new composition that none of `taken` has:
-/// "Composition 1", "Composition 2", ….
+/// "Composite 1", "Composite 2", ….
 pub fn unique_composition_name(taken: &[String]) -> String {
     (1..)
-        .map(|i| format!("Composition {i}"))
+        .map(|i| format!("Composite {i}"))
         .find(|n| !taken.contains(n))
         .unwrap_or_default()
+}
+
+/// Add a new composition to the compositions in `ui`, named by
+/// [`unique_composition_name`] and mapping the first of `groups` to R, G
+/// and B in turn (the last one repeated, HOO-like); returns its index. Not
+/// saved to disk (the caller rate-limits that).
+pub fn add_composition(ui: &mut Value, groups: &[String]) -> usize {
+    let mut list = load_compositions(ui);
+    let taken: Vec<String> = list.iter().map(|c| c.name.clone()).collect();
+    let mut c = Composition::new(unique_composition_name(&taken));
+    if let Some(last) = groups.len().checked_sub(1) {
+        let pick = |i: usize| Some((groups[i.min(last)].clone(), 1.0));
+        c.channels = [pick(0), pick(1), pick(2)];
+    }
+    list.push(c);
+    save_compositions(ui, &list);
+    list.len() - 1
 }
 
 /// Store `c` as the compositions in `ui`, keeping everything else there (a
@@ -122,9 +140,9 @@ pub fn composition_editor(
     });
     let name = draft.1.trim();
     let problem = if name.is_empty() {
-        Some("A composition needs a name.")
+        Some("A composite needs a name.")
     } else if others.iter().any(|o| o == name) {
-        Some("Another composition has this name.")
+        Some("Another composite has this name.")
     } else {
         None
     };
@@ -215,8 +233,26 @@ mod tests {
             "Ha",
             "a composition's stretch key never equals a group's"
         );
-        let taken = vec!["Composition 1".to_string(), "Composition 3".to_string()];
-        assert_eq!(unique_composition_name(&taken), "Composition 2");
+        let taken = vec!["Composite 1".to_string(), "Composite 3".to_string()];
+        assert_eq!(unique_composition_name(&taken), "Composite 2");
+    }
+
+    #[test]
+    fn added_composition_maps_the_first_groups() {
+        let mut ui = serde_json::json!({ "other": 1 });
+        let groups = vec!["Ha".to_string(), "OIII".to_string()];
+        assert_eq!(add_composition(&mut ui, &groups), 0);
+        assert_eq!(add_composition(&mut ui, &[]), 1);
+        let list = load_compositions(&ui);
+        assert_eq!(list[0].name, "Composite 1");
+        let mapped: Vec<Option<&str>> = list[0]
+            .channels
+            .iter()
+            .map(|c| c.as_ref().map(|(g, _)| g.as_str()))
+            .collect();
+        assert_eq!(mapped, [Some("Ha"), Some("OIII"), Some("OIII")]);
+        assert_eq!(list[1], Composition::new("Composite 2"));
+        assert_eq!(ui["other"], 1);
     }
 
     #[test]
@@ -262,13 +298,13 @@ mod tests {
             .type_text("SHO");
         h.run();
         assert_eq!(h.state().c.name, "HOO");
-        h.get_by_label("Another composition has this name.");
+        h.get_by_label("Another composite has this name.");
         // An empty name too.
         name_field(&mut h);
         h.key_press(egui::Key::Backspace);
         h.run();
         assert_eq!(h.state().c.name, "HOO");
-        h.get_by_label("A composition needs a name.");
+        h.get_by_label("A composite needs a name.");
 
         // A group picked for R gets weight 1.
         h.get_all_by_role(egui::accesskit::Role::ComboBox)

@@ -58,7 +58,6 @@ fn harness_of(state: State) -> Harness<'static, State> {
                     previews: &s.previews,
                     generation: s.generation,
                     complete: s.complete,
-                    previews_busy: false,
                     checks: None,
                 };
                 egui::Panel::right("details").show(ui, |ui| {
@@ -565,6 +564,7 @@ fn plan_places_solved_panels_before_previews() {
         groups,
         lock: None,
         summary: None,
+        merged: false,
     };
     let mut h = harness(s);
     // No previews, no analysis: dashed outlines at the WCS footprints.

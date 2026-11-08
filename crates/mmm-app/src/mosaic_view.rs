@@ -99,7 +99,7 @@ use egui::{Color32, RichText};
 use mega_ui::theme::palette;
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
-use mega_ui::viewer::{PyramidGeometry, TileSource, TiledViewer};
+use mega_ui::viewer::{PyramidGeometry, TileSource, TiledViewer, Tool};
 use mmm_core::health::{Health, health};
 use mmm_core::mosaic::FRAME_FILE;
 use mmm_core::overlap::OverlapGraph;
@@ -367,7 +367,6 @@ impl MosaicView {
     /// Where the canvas looks: a camera set and not painted yet (or kept
     /// for the next viewer), else what the last frame showed; `None` with
     /// neither.
-    #[allow(dead_code)] // used by the session window from Task 7 on
     pub fn camera(&self) -> Option<Camera> {
         self.camera.or_else(|| self.shown_camera())
     }
@@ -375,7 +374,6 @@ impl MosaicView {
     /// Look through `camera` from the next frame the viewer paints, with no
     /// animation (the zoom is clamped to the viewer's limits). Kept until a
     /// viewer paints it, so it also applies to a viewer made later.
-    #[allow(dead_code)] // used by the session window from Task 7 on
     pub fn set_camera(&mut self, camera: Camera) {
         self.camera = Some(camera);
     }
@@ -758,6 +756,14 @@ impl MosaicView {
         }
     }
 
+    /// Whether the viewer's ROI draw tool is on (a drag on the canvas
+    /// draws an ROI).
+    pub fn drawing(&self) -> bool {
+        self.viewer
+            .as_ref()
+            .is_some_and(|v| v.tool() == Tool::DrawRect)
+    }
+
     /// The ROI list: "+ new ROI" (the viewer's draw tool), and each ROI's
     /// name, note and freshness; changes are saved (debounced).
     pub fn rois_ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession) {
@@ -825,14 +831,13 @@ impl MosaicView {
     /// with the ROI tool becomes an ROI). Drawing only: the state it draws
     /// is brought up to date by [`MosaicView::poll`]. The look's stretch
     /// toggles are the session's, which `poll` follows (see the module
-    /// docs); `plan_stretch` is the plan's stretch of the same view, kept
-    /// for a group's first merge.
+    /// docs); the ROIs are drawn when the look has them. `plan_stretch` is
+    /// the plan's stretch of the same view, kept for a group's first merge.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
-        _jobs: &mut JobRunner,
-        _look: &CanvasLook,
+        look: &CanvasLook,
         plan_stretch: Option<&[StretchParams]>,
     ) {
         self.shown = true;
@@ -842,7 +847,11 @@ impl MosaicView {
             ui.ctx().request_repaint();
         }
         let canvas = self.view_canvas();
-        let overlays = self.rois.overlays();
+        let overlays = if look.rois {
+            self.rois.overlays()
+        } else {
+            Vec::new()
+        };
         let notes = self.member_notes();
         let mut drawn = None;
         match &mut self.viewer {
@@ -1330,6 +1339,14 @@ impl MosaicView {
         if self.rois.on_drawn(&mut session.mosaic.config.ui, r, canvas) {
             self.save.touch();
         }
+    }
+}
+
+#[cfg(test)]
+impl MosaicView {
+    /// The viewer's rect and time in the last frame it painted.
+    pub(crate) fn viewer_frame(&self) -> Option<(egui::Rect, f64)> {
+        self.viewer.as_ref()?.last_frame()
     }
 }
 

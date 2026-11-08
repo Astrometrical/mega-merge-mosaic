@@ -1,0 +1,775 @@
+//! The session window, driven as the shell drives it: the job runner's
+//! events, the window's every-frame hooks, the pipeline when a test runs
+//! it, then the window.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use egui::accesskit::Role;
+use egui_kittest::Harness;
+use egui_kittest::kittest::{By, NodeT, Queryable};
+use mmm_core::checks::{Check, CheckCode, Severity};
+use mmm_core::mosaic::{MosaicConfig, SINGLE_GROUP};
+
+use super::*;
+use crate::camera::Camera;
+use crate::checks::{ChecksEngine, ChecksReport};
+use crate::compositions::{Composition, ViewKind, load_compositions, save_compositions};
+use crate::display_stretch::DisplayStretch;
+use crate::jobs::JobRunner;
+use crate::jobs::tests::{analyzed, drain};
+use crate::pipeline::{Pipeline, set_auto_analyze};
+use crate::rois::{Roi, save_rois};
+use crate::session::{OpenSession, any_merged, notes};
+use crate::start::tests::{step_until, temp_dir};
+use crate::testutil::{two_group_mono_session, two_group_session};
+
+/// The window and what the shell hands it each frame.
+struct State {
+    w: SessionWindow,
+    session: OpenSession,
+    jobs: JobRunner,
+    pipeline: Pipeline,
+    checks: ChecksEngine,
+    /// The automatic pipeline runs (previews, then analysis when needed).
+    run_pipeline: bool,
+    /// The checks the window asked the shell to accept, in order.
+    accepted: Vec<Check>,
+}
+
+impl State {
+    fn new(session: OpenSession, jobs: JobRunner) -> Self {
+        State {
+            w: SessionWindow::new(),
+            session,
+            jobs,
+            pipeline: Pipeline::new(),
+            checks: ChecksEngine::new(),
+            run_pipeline: false,
+            accepted: Vec::new(),
+        }
+    }
+}
+
+fn harness(state: State) -> Harness<'static, State> {
+    Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .with_step_dt(0.01)
+        .with_max_steps(64)
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                let events = s.jobs.poll(&mut s.session);
+                for e in &events {
+                    s.w.on_event(&mut s.session, &s.jobs, e);
+                }
+                s.w.poll_settings(&ctx, &mut s.session, &mut s.jobs);
+                if s.run_pipeline {
+                    let editing = s.w.settings_editing(&s.session);
+                    s.pipeline.poll(
+                        &ctx,
+                        Instant::now(),
+                        &mut s.session,
+                        &mut s.jobs,
+                        &events,
+                        editing,
+                    );
+                    if let Some(id) = s.pipeline.take_started_analysis() {
+                        s.w.track_analysis(id);
+                    }
+                }
+                s.w.poll(&ctx, &mut s.session, &mut s.jobs);
+                let out =
+                    s.w.ui(ui, &mut s.session, &mut s.jobs, &mut s.pipeline, &s.checks);
+                s.accepted.extend(out.accept);
+            },
+            state,
+        )
+}
+
+fn runner() -> JobRunner {
+    JobRunner::new(egui::Context::default())
+}
+
+/// An analysed two-group session with both groups merged.
+fn merged(tag: &str) -> (PathBuf, OpenSession, JobRunner) {
+    let (root, mut s, mut jobs) = analyzed(tag);
+    jobs.start_blend(&mut s, "Ha", None);
+    jobs.start_blend(&mut s, "OIII", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.merged = any_merged(&s);
+    assert!(s.merged);
+    (root, s, jobs)
+}
+
+/// One ROI, "ROI 1", whose label the mosaic paints at its top-left corner.
+fn add_roi(s: &mut OpenSession) {
+    let roi = Roi {
+        name: "ROI 1".into(),
+        note: String::new(),
+        sky: None,
+        canvas: [100, 100, 200, 160],
+    };
+    save_rois(&mut s.mosaic.config.ui, &[roi]);
+}
+
+/// Step until `done` holds, stopping at the frame that made it so.
+fn step_to(h: &mut Harness<'_, State>, done: impl Fn(&State) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done(h.state()) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the window"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The job labels running or queued, in order.
+fn labels(jobs: &JobRunner) -> Vec<String> {
+    jobs.views().into_iter().map(|v| v.label).collect()
+}
+
+/// The **+** chip (the canvas's zoom-in button is a "+" too, but no
+/// toggle).
+fn plus_chip<'h>(h: &'h Harness<'static, State>) -> Option<egui_kittest::Node<'h>> {
+    h.query(By::new().label("+").predicate(|n| n.toggled().is_some()))
+}
+
+fn disabled(h: &Harness<'static, State>, label: &str) -> bool {
+    h.get_by_label(label).accesskit_node().is_disabled()
+}
+
+fn assert_camera(got: Option<Camera>, want: Camera) {
+    let got = got.expect("a camera");
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert!(
+        near(got.centre.0, want.centre.0)
+            && near(got.centre.1, want.centre.1)
+            && near(got.zoom, want.zoom),
+        "{got:?} != {want:?}"
+    );
+}
+
+/// Where `cam` puts canvas point `p` in a canvas drawn in `rect`.
+fn screen(rect: egui::Rect, cam: Camera, p: (f64, f64)) -> egui::Pos2 {
+    rect.center()
+        + egui::vec2(
+            ((p.0 - cam.centre.0) * cam.zoom) as f32,
+            ((p.1 - cam.centre.1) * cam.zoom) as f32,
+        )
+}
+
+/// The first text `text` painted inside `rect` in the last frame: its
+/// position and size.
+fn painted(
+    h: &Harness<'_, State>,
+    rect: egui::Rect,
+    text: &str,
+) -> Option<(egui::Pos2, egui::Vec2)> {
+    h.output().shapes.iter().find_map(|cs| match &cs.shape {
+        egui::Shape::Text(t) if t.galley.text() == text && rect.contains(t.pos) => {
+            Some((t.pos, t.galley.size()))
+        }
+        _ => None,
+    })
+}
+
+/// Asserts the last frame the mosaic painted put each ROI's label where
+/// `cam` puts the ROI's top-left corner: the painted frame itself.
+fn assert_mosaic_painted_with(h: &Harness<'_, State>, cam: Camera) {
+    let (rect, _) = h.state().w.mosaic().viewer_frame().expect("a viewer");
+    let mut checked = 0;
+    for r in h.state().w.mosaic().rois() {
+        // The viewer writes an overlay's label just inside its corner.
+        let corner = (r.canvas[0] as f64, r.canvas[1] as f64);
+        let want = screen(rect, cam, corner) + egui::vec2(4.0, 2.0);
+        let (got, _) = painted(h, rect, &r.name).expect("ROI label painted");
+        assert!(
+            (got - want).length() < 1.0,
+            "{} painted at {got:?}; the camera puts it at {want:?}",
+            r.name
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no ROI painted");
+}
+
+/// Asserts the last frame the plan painted put each visible panel's number
+/// where `cam` puts the panel's centre.
+fn assert_plan_painted_with(h: &Harness<'_, State>, cam: Camera) {
+    let (rect, _) = h.state().w.plan().canvas_frame().expect("the plan drawn");
+    let mut checked = 0;
+    for it in h.state().w.plan().items() {
+        let r = egui::Rect::from_two_pos(
+            screen(rect, cam, (it.rect[0], it.rect[1])),
+            screen(rect, cam, (it.rect[2], it.rect[3])),
+        );
+        if !rect.contains(r.center()) {
+            continue;
+        }
+        let (pos, size) = painted(h, rect, &it.label).expect("panel number painted");
+        let got = pos + size / 2.0;
+        assert!(
+            (got - r.center()).length() < 0.5,
+            "panel {} painted at {got:?}; the camera puts it at {:?}",
+            it.label,
+            r.center()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no panel painted");
+}
+
+/// Zoom the plan one wheel notch in about canvas point `p`, and let the
+/// animation end.
+fn zoom_plan_about(h: &mut Harness<'static, State>, p: (f64, f64)) {
+    let at = h.state().w.plan().to_screen(p).expect("the plan drawn");
+    h.hover_at(at);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 1.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(150);
+}
+
+/// Drag the canvas by `delta` from screen point `from`, and let the
+/// animation end.
+fn drag(h: &mut Harness<'static, State>, from: egui::Pos2, delta: egui::Vec2) {
+    h.hover_at(from);
+    h.drag_at(from);
+    h.step();
+    for i in 1..=4 {
+        h.hover_at(from + delta * (i as f32 / 4.0));
+        h.step();
+    }
+    h.event(egui::Event::PointerButton {
+        pos: from + delta,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(150);
+}
+
+#[test]
+fn plan_shows_until_something_is_merged() {
+    let (root, s, jobs) = analyzed("window-plan-first");
+    assert!(!s.merged);
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| st.w.plan().canvas_frame().is_some());
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    assert!(disabled(&h, "Mosaic"), "nothing merged yet");
+    assert!(!disabled(&h, "Plan"));
+    h.get_by_label("Mosaic").click();
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mosaic_shows_by_default_once_merged() {
+    let (root, s, jobs) = merged("window-mosaic-first");
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    assert!(!disabled(&h, "Mosaic"));
+    // The merged result is drawn.
+    step_until(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    assert!(
+        h.state().w.plan().canvas_frame().is_none(),
+        "plan not drawn"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_switches_to_the_mosaic() {
+    let (root, s, jobs) = analyzed("window-merge");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.w.merge(&mut st.session, &mut st.jobs);
+    }
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    assert_eq!(labels(&h.state().jobs), ["Blend Ha", "Blend OIII"]);
+    gate.open();
+    // Merged once the merges finish: Mosaic can be chosen from then on.
+    step_until(&mut h, |st| !st.jobs.busy() && st.session.merged);
+    h.run_steps(2);
+    assert!(!disabled(&h, "Mosaic"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn plan_and_mosaic_share_the_camera() {
+    let (root, mut s, jobs) = merged("window-camera");
+    add_roi(&mut s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    let mut h = harness(state);
+    // The merged result is opened behind the plan.
+    step_until(&mut h, |st| {
+        st.w.plan().canvas_frame().is_some() && st.w.mosaic().source().is_some()
+    });
+    // The plan zoomed in and panned...
+    let fit = h.state().w.plan().camera().expect("the plan's camera");
+    zoom_plan_about(&mut h, (150.0, 130.0));
+    let (rect, _) = h.state().w.plan().canvas_frame().unwrap();
+    drag(&mut h, rect.center(), egui::vec2(40.0, -30.0));
+    let cam = h.state().w.plan().camera().expect("the plan's camera");
+    assert!(cam.zoom > fit.zoom * 1.1 && cam.centre != fit.centre);
+    // ...the mosaic shows the same.
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    assert_camera(h.state().w.mosaic().camera(), cam);
+    assert_mosaic_painted_with(&h, cam);
+    // The mosaic panned: back on the plan, the plan shows the same.
+    let (rect, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    drag(&mut h, rect.center(), egui::vec2(-60.0, 20.0));
+    let before = cam;
+    let cam = h.state().w.mosaic().camera().expect("the mosaic's camera");
+    assert!(cam.centre != before.centre, "the mosaic panned");
+    h.get_by_label("Plan").click();
+    step_to(&mut h, |st| st.w.mode() == CanvasMode::Plan);
+    h.step();
+    assert_camera(h.state().w.plan().camera(), cam);
+    assert_plan_painted_with(&h, cam);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn camera_survives_the_mosaic_viewer_being_rebuilt() {
+    let (root, mut s, jobs) = analyzed("window-camera-rebuild");
+    add_roi(&mut s);
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| {
+        st.w.plan().canvas_frame().is_some()
+            && st
+                .w
+                .mosaic()
+                .merge_block_reason(&st.session, &st.jobs)
+                .is_none()
+    });
+    let fit = h.state().w.plan().camera().expect("the plan's camera");
+    zoom_plan_about(&mut h, (150.0, 130.0));
+    let cam = h.state().w.plan().camera().expect("the plan's camera");
+    assert!(cam.zoom > fit.zoom * 1.1);
+    // Merging: nothing to show until the merge has made Ha's result,
+    // then a viewer is built for it, its first painted frame through the
+    // plan's camera.
+    let stepper = h.state_mut().jobs.hold_progress();
+    {
+        let st = h.state_mut();
+        st.w.merge(&mut st.session, &mut st.jobs);
+    }
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    assert_mosaic_painted_with(&h, cam);
+    assert_camera(h.state().w.mosaic().camera(), cam);
+    stepper.open();
+    step_until(&mut h, |st| !st.jobs.busy() && st.w.mosaic().is_settled());
+    assert_mosaic_painted_with(&h, cam);
+    // Merging the shown group again leaves the camera alone.
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    {
+        let st = h.state_mut();
+        st.w.merge(&mut st.session, &mut st.jobs);
+    }
+    assert!(h.state().jobs.blend_pending("Ha"));
+    step_until(&mut h, |st| !st.jobs.busy() && st.w.mosaic().is_settled());
+    assert_mosaic_painted_with(&h, cam);
+    assert_camera(h.state().w.mosaic().camera(), cam);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn drawing_an_roi_shows_the_mosaic() {
+    let (root, s, jobs) = merged("window-draw-roi");
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    state.w.inspector_mut().reveal("rois");
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.w.mosaic().source().is_some());
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    h.get_by_label("+ new ROI").click();
+    h.run_steps(2);
+    assert!(h.state().w.mosaic().drawing());
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn chips_pick_the_view_in_both_modes() {
+    let (root, s, jobs) = merged("window-chips");
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| st.w.mosaic().view().is_some());
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    let group = |g: &str| Some(ViewKind::Group(g.into()));
+    h.get_by_label("OIII · 4").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert_eq!(st.w.view(), group("OIII").as_ref());
+    assert_eq!(st.w.plan().view(), group("OIII").as_ref());
+    assert_eq!(st.w.mosaic().view(), group("OIII").as_ref());
+    h.get_by_label("Plan").click();
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    h.get_by_label("Ha · 4").click();
+    h.run_steps(2);
+    let st = h.state();
+    assert_eq!(st.w.view(), group("Ha").as_ref());
+    assert_eq!(st.w.plan().view(), group("Ha").as_ref());
+    assert_eq!(st.w.mosaic().view(), group("Ha").as_ref());
+    // A colour view: Linked can be chosen.
+    assert!(!disabled(&h, "Linked"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn no_chips_for_a_single_group() {
+    let root = temp_dir("window-single-group");
+    let mut s = two_group_session(&root);
+    s.mosaic.config.grouping.enabled = false;
+    s.groups = s.mosaic.groups().ok();
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    assert!(plus_chip(&h).is_none());
+    assert!(h.query_by_label_contains(" · ").is_none(), "no group chips");
+    assert_eq!(
+        h.state().w.view(),
+        Some(&ViewKind::Group(SINGLE_GROUP.into()))
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn plus_adds_a_composite_and_opens_composites() {
+    let root = temp_dir("window-plus");
+    let s = two_group_session(&root);
+    let dir = s.mosaic.dir.clone();
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    assert!(!h.state().w.inspector().is_open("composites"));
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(2);
+    let st = h.state();
+    let list = load_compositions(&st.session.mosaic.config.ui);
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "Composite 1");
+    let comp = Some(ViewKind::Composition(0));
+    assert_eq!(st.w.view(), comp.as_ref());
+    assert_eq!(st.w.plan().view(), comp.as_ref());
+    assert_eq!(st.w.mosaic().view(), comp.as_ref());
+    assert!(st.w.inspector().is_open("composites"));
+    // Its chip, and its editor in the Composites section.
+    h.get_by_label("Composite 1");
+    h.get_by_label("Delete composite");
+    // Saved.
+    step_until(&mut h, |_| {
+        MosaicConfig::load(&dir).is_ok_and(|c| load_compositions(&c.ui).len() == 1)
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn deleting_a_composite_keeps_the_view() {
+    let root = temp_dir("window-delete-composite");
+    let mut s = two_group_session(&root);
+    let mut a = Composition::new("A");
+    a.channels[0] = Some(("Ha".into(), 1.0));
+    let mut b = Composition::new("B");
+    b.channels[0] = Some(("OIII".into(), 1.0));
+    save_compositions(&mut s.mosaic.config.ui, &[a, b]);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.state_mut().w.select_view(ViewKind::Composition(1));
+    h.state_mut().w.inspector_mut().reveal("composites");
+    h.run_steps(2);
+    // A goes: B, shown, moves up the list and stays shown.
+    h.get_all_by_label("Delete composite")
+        .next()
+        .expect("A's delete")
+        .click();
+    h.run_steps(2);
+    let st = h.state();
+    let names: Vec<String> = load_compositions(&st.session.mosaic.config.ui)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["B"]);
+    let b = Some(ViewKind::Composition(0));
+    assert_eq!(st.w.view(), b.as_ref());
+    assert_eq!(st.w.plan().view(), b.as_ref());
+    assert_eq!(st.w.mosaic().view(), b.as_ref());
+    // B goes too: the first group shows.
+    h.get_by_label("Delete composite").click();
+    h.run_steps(2);
+    let ha = Some(ViewKind::Group("Ha".into()));
+    assert_eq!(h.state().w.view(), ha.as_ref());
+    assert_eq!(h.state().w.plan().view(), ha.as_ref());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn linked_is_disabled_for_a_mono_view() {
+    let root = temp_dir("window-mono");
+    let mut s = two_group_mono_session(&root);
+    set_auto_analyze(&mut s, false).unwrap();
+    let mut state = State::new(s, runner());
+    // The previews say how many channels the panels have.
+    state.run_pipeline = true;
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.pipeline.previews_complete());
+    h.run_steps(2);
+    assert!(disabled(&h, "Linked"), "one channel: nothing to link");
+    assert!(!disabled(&h, "Strong"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn inspector_sections_are_in_order() {
+    let root = temp_dir("window-sections");
+    let mut h = harness(State::new(two_group_session(&root), runner()));
+    h.run_steps(3);
+    let mut last = f32::MIN;
+    for l in [
+        "PROBLEMS",
+        "PANELS",
+        "ROIS",
+        "MERGE SETTINGS",
+        "COMPOSITES",
+        "NOTES",
+    ] {
+        let y = h.get_by_label(l).rect().min.y;
+        assert!(y > last, "{l} at {y} after {last}");
+        last = y;
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn check(code: CheckCode, severity: Severity, panels: Vec<PathBuf>, message: &str) -> Check {
+    Check {
+        code,
+        severity,
+        panels,
+        groups: Vec::new(),
+        message: message.into(),
+        remedy: None,
+    }
+}
+
+#[test]
+fn problems_accept_a_check() {
+    let (root, s, jobs) = analyzed("window-accept");
+    let first = s.mosaic.config.panels[0].path.clone();
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(ChecksReport {
+        checks: vec![
+            check(
+                CheckCode::FileChanged,
+                Severity::Problem,
+                vec![first],
+                "First panel changed",
+            ),
+            check(
+                CheckCode::GroupCountMismatch,
+                Severity::Note,
+                Vec::new(),
+                "Groups differ",
+            ),
+        ],
+        errors: Vec::new(),
+    });
+    let mut h = harness(state);
+    h.run_steps(3);
+    // Problems is open: the problem and its count, not the note.
+    h.get_by_label("First panel changed");
+    h.get_by_label("1");
+    assert!(h.query_by_label("Groups differ").is_none());
+    h.get_by_label("Accept").click();
+    h.run_steps(2);
+    let accepted: Vec<&str> = h
+        .state()
+        .accepted
+        .iter()
+        .map(|c| c.message.as_str())
+        .collect();
+    assert_eq!(accepted, ["First panel changed"]);
+    // Every check, notes included.
+    h.get_by_label("See all checks ›").click();
+    h.run_steps(2);
+    h.get_by_label("Groups differ");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn notes_section_saves_notes() {
+    let root = temp_dir("window-notes");
+    let s = two_group_session(&root);
+    let dir = s.mosaic.dir.clone();
+    let mut h = harness(State::new(s, runner()));
+    h.run_steps(2);
+    h.get_by_label("Notes").click();
+    h.run_steps(2);
+    h.get_by_label("Add notes").click();
+    h.run_steps(2);
+    let field = h.get_by_role(Role::MultilineTextInput);
+    field.focus();
+    h.step();
+    h.get_by_role(Role::MultilineTextInput)
+        .type_text("Shoot row 4");
+    h.run_steps(2);
+    assert_eq!(notes(&h.state().session.mosaic.config.ui), "Shoot row 4");
+    // In mosaic.json (the start screen reads them there), debounced.
+    step_until(&mut h, |_| {
+        MosaicConfig::load(&dir).is_ok_and(|c| notes(&c.ui) == "Shoot row 4")
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_selected_panel_shows_its_details_and_checks() {
+    let (root, s, jobs) = analyzed("window-select");
+    let first = s.mosaic.config.panels[0].path.clone();
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(ChecksReport {
+        checks: vec![
+            check(
+                CheckCode::FileChanged,
+                Severity::Problem,
+                vec![first.clone()],
+                "First panel changed",
+            ),
+            check(
+                CheckCode::SolutionPresent,
+                Severity::Note,
+                vec![state.session.mosaic.config.panels[1].path.clone()],
+                "Second panel unsolved",
+            ),
+        ],
+        errors: Vec::new(),
+    });
+    let mut h = harness(state);
+    step_until(&mut h, |st| {
+        st.w.plan().items().iter().any(|i| i.path == first)
+    });
+    // Click the first panel: its details open in the Panels section.
+    let it = h
+        .state()
+        .w
+        .plan()
+        .items()
+        .iter()
+        .find(|i| i.path == first)
+        .unwrap()
+        .rect;
+    let centre = ((it[0] + it[2]) / 2.0, (it[1] + it[3]) / 2.0);
+    let p = h.state().w.plan().to_screen(centre).unwrap();
+    h.hover_at(p);
+    h.drag_at(p);
+    h.event(egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(2);
+    assert_eq!(h.state().w.plan().selected(), Some(first.as_path()));
+    assert!(h.state().w.inspector().is_open("panels"));
+    h.get_by_label("Ha_0.xisf");
+    h.get_by_label("Checks for this panel");
+    step_until(&mut h, |st| st.w.plan().has_info(&first));
+    h.get_by_label("None (registered)");
+    // Its own checks only: the other panel's note is not listed there.
+    assert_eq!(
+        h.query_all_by_label("First panel changed").count(),
+        2,
+        "in Problems and in the panel's checks"
+    );
+    assert!(h.query_by_label("Second panel unsolved").is_none());
+    // Esc clears the selection.
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().w.plan().selected(), None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stretch_toggles_save_the_display_stretch() {
+    let (root, s, jobs) = analyzed("window-stretch");
+    let dir = s.mosaic.dir.clone();
+    let mut state = State::new(s, jobs);
+    state.run_pipeline = true;
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.w.plan().is_settled());
+    let normal = h.state().w.plan().stretch_for_view().map(<[_]>::to_vec);
+    assert!(normal.is_some());
+    h.get_by_label("Strong").click();
+    h.run_steps(2);
+    let want = DisplayStretch {
+        linked: false,
+        strong: true,
+    };
+    assert_eq!(
+        DisplayStretch::load(&h.state().session.mosaic.config.ui),
+        want
+    );
+    // The canvas follows, and the toggles are saved (rate-limited).
+    step_until(&mut h, |st| {
+        st.w.plan().is_settled() && st.w.plan().stretch_for_view().map(<[_]>::to_vec) != normal
+    });
+    step_until(&mut h, |_| {
+        MosaicConfig::load(&dir).is_ok_and(|c| DisplayStretch::load(&c.ui) == want)
+    });
+    h.get_by_label("Linked").click();
+    h.run_steps(2);
+    assert!(DisplayStretch::load(&h.state().session.mosaic.config.ui).linked);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn previews_paused_offer_resume() {
+    let root = temp_dir("window-resume");
+    let mut s = two_group_session(&root);
+    set_auto_analyze(&mut s, false).unwrap();
+    let mut state = State::new(s, runner());
+    state.run_pipeline = true;
+    let gate = state.jobs.hold();
+    let mut h = harness(state);
+    // The previews start by themselves; the user cancels them.
+    step_until(&mut h, |st| st.jobs.busy());
+    let ids: Vec<u64> = h.state().jobs.views().iter().map(|v| v.id).collect();
+    for id in ids {
+        h.state_mut().jobs.cancel(id);
+    }
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    h.run_steps(2);
+    assert!(!h.state().pipeline.previews_complete());
+    h.get_by_label("Panels").click();
+    h.run_steps(2);
+    h.get_by_label("Previews paused");
+    h.get_by_label("Resume").click();
+    step_until(&mut h, |st| st.pipeline.previews_complete());
+    let _ = std::fs::remove_dir_all(&root);
+}

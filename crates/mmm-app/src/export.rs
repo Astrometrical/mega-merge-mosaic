@@ -1,5 +1,5 @@
-//! The Blend tab's export dialog: write the view's groups' blended results
-//! to FITS or TIFF files (`mmm_core::export`).
+//! The export dialog (owned by the merged mosaic view): write the view's
+//! groups' blended results to FITS or TIFF files (`mmm_core::export`).
 //!
 //! The dialog chooses the groups (those of the current view), the format
 //! and the destination: a typed path or the native save dialog

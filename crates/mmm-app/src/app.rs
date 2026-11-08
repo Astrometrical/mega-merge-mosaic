@@ -10,18 +10,18 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText};
 use mega_ui::theme::palette;
 
-use crate::blend_tab::BlendTab;
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, load_compositions};
 use crate::jobs::{JobEvent, JobRunner, PREVIEWS_LABEL};
+use crate::mosaic_view::MosaicView;
 use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
-use crate::pipeline::{Pipeline, Step, auto_analyze, set_auto_analyze};
-use crate::plan_tab::PlanTab;
-use crate::plan_view::PlanFeed;
+use crate::pipeline::{Pipeline, auto_analyze, set_auto_analyze};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
+use crate::session_window::{CanvasMode, SessionWindow};
 use crate::start::{RecentEntry, RfdDialogs, StartAction, StartScreen, unix_now};
 use crate::status::{self, SysMonitor};
 use crate::summary_writer::SummaryWriter;
+use crate::util::group_names;
 
 /// Directory, inside the session, where compressed panels are decoded.
 const DECODED_DIR: &str = "decoded";
@@ -30,25 +30,23 @@ const RECENT_KEY: &str = "recent_sessions";
 /// How long a job notice stays on screen.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 
-/// The session view's tabs.
+/// The session view's tabs (until the panel list moves into the session
+/// window).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     /// The panel files and their grouping.
     Panels,
-    /// Every panel in place, from its preview.
-    Plan,
-    /// Blend controls and the result viewer.
-    Blend,
+    /// The session window: the canvas (plan or mosaic) and the inspector.
+    Session,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Panels, Tab::Plan, Tab::Blend];
+    const ALL: [Tab; 2] = [Tab::Panels, Tab::Session];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Panels => "Panels",
-            Tab::Plan => "Plan",
-            Tab::Blend => "Blend",
+            Tab::Session => "Mosaic",
         }
     }
 }
@@ -61,12 +59,12 @@ struct Notice {
 }
 
 /// The tab a session opens on: Panels while it has no panels (adding
-/// them is the first step), else Plan.
+/// them is the first step), else the session window.
 fn default_tab(session: &OpenSession) -> Tab {
     if session.mosaic.config.panels.is_empty() {
         Tab::Panels
     } else {
-        Tab::Plan
+        Tab::Session
     }
 }
 
@@ -118,12 +116,10 @@ pub struct Shell {
     sys: SysMonitor,
     notices: Vec<Notice>,
     tab: Tab,
-    /// The Blend tab (made afresh with each session).
-    blend: BlendTab,
+    /// The session window (made afresh with each session).
+    window: SessionWindow,
     /// The Panels tab (made afresh with each session).
     panels: PanelsTab,
-    /// The Plan tab (made afresh with each session).
-    plan: PlanTab,
     /// The panel file dialog used by the Panels tab.
     files_picker: Arc<dyn FilesPicker>,
     /// The automatic previews and analysis (made afresh with each session).
@@ -147,10 +143,9 @@ impl Shell {
             sys: SysMonitor::start(),
             notices: Vec::new(),
             // Set when a session opens (`default_tab`).
-            tab: Tab::Plan,
-            blend: BlendTab::new(),
+            tab: Tab::Session,
+            window: SessionWindow::new(),
             panels: PanelsTab::new(Arc::new(RfdFilesPicker)),
-            plan: PlanTab::new(),
             files_picker: Arc::new(RfdFilesPicker),
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
@@ -179,32 +174,22 @@ impl Shell {
         self.tab
     }
 
-    /// The Blend tab.
-    pub fn blend(&self) -> &BlendTab {
-        &self.blend
-    }
-
-    /// The Blend tab, mutably.
-    pub fn blend_mut(&mut self) -> &mut BlendTab {
-        &mut self.blend
-    }
-
     /// Show `tab`.
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
     }
 
-    /// The Plan tab.
-    pub fn plan(&self) -> &PlanTab {
-        &self.plan
+    /// The session window.
+    pub fn window(&self) -> &SessionWindow {
+        &self.window
     }
 
-    /// The Plan tab, to change its view.
-    pub fn plan_mut(&mut self) -> &mut PlanTab {
-        &mut self.plan
+    /// The session window, to change what it shows.
+    pub fn window_mut(&mut self) -> &mut SessionWindow {
+        &mut self.window
     }
 
-    /// The automatic pipeline (its previews feed Plan).
+    /// The automatic pipeline (its previews feed the plan).
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }
@@ -214,12 +199,11 @@ impl Shell {
         &self.checks
     }
 
-    /// Save anything held back by a rate limit (the display stretch), e.g.
-    /// when the window closes.
+    /// Save anything held back by a rate limit (the display stretch, ROIs,
+    /// composites, notes), e.g. when the window closes.
     pub fn flush_pending_saves(&mut self) {
         if let Some(session) = &self.session {
-            self.blend.flush_save(session);
-            self.plan.flush_save(session);
+            self.window.flush_save(session);
         }
     }
 
@@ -303,9 +287,8 @@ impl Shell {
                     self.summary = SummaryWriter::new(opened.summary.clone());
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
-                    self.blend = BlendTab::new();
+                    self.window = SessionWindow::new();
                     self.panels = PanelsTab::new(self.files_picker.clone());
-                    self.plan = PlanTab::new();
                     self.pipeline = Pipeline::new();
                     self.checks = ChecksEngine::new();
                 }
@@ -319,8 +302,8 @@ impl Shell {
 
     /// Apply finished jobs and post a notice for each, let the Panels tab
     /// take its background work and apply a waiting edit, run the
-    /// automatic pipeline, let the merged mosaic follow (shown or not), and
-    /// run the checks.
+    /// automatic pipeline, let the session window follow (shown or not),
+    /// and run the checks.
     fn poll_jobs(&mut self, ctx: &egui::Context) {
         let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
             return;
@@ -328,12 +311,12 @@ impl Shell {
         let now = Instant::now();
         let until = now + NOTICE_TIME;
         let events = jobs.poll(session);
-        // An edit (panels, or global Blend settings) waiting or having
+        // An edit (panels, or the merge settings) waiting or having
         // cancelled jobs when the events were taken: jobs it cancelled are
         // restarted by the pipeline, not given up.
-        let editing = self.panels.has_pending() || self.blend.settings_editing(session);
+        let editing = self.panels.has_pending() || self.window.settings_editing(session);
         for event in &events {
-            self.blend.on_event(event);
+            self.window.on_event(session, jobs, event);
             let target = match event {
                 JobEvent::Finished { id, .. } => jobs.target(*id),
                 _ => None,
@@ -357,33 +340,29 @@ impl Shell {
             self.notices.push(Notice { text, color, until });
         }
         self.panels.poll(ctx, session, jobs);
-        self.blend.poll_settings(ctx, session, jobs);
-        let editing = editing || self.panels.has_pending() || self.blend.settings_editing(session);
+        self.window.poll_settings(ctx, session, jobs);
+        let editing = editing || self.panels.has_pending() || self.window.settings_editing(session);
         self.pipeline
             .poll(ctx, now, session, jobs, &events, editing);
         if let Some(id) = self.pipeline.take_started_analysis() {
-            self.blend.track_analysis(id);
+            self.window.track_analysis(id);
         }
-        // The merged mosaic's state follows jobs and analyses even while
-        // another tab is shown.
-        self.blend.poll(ctx, session, jobs);
+        // The session window (the merged mosaic's state above all) follows
+        // jobs and analyses even while the Panels tab is shown.
+        self.window.poll(ctx, session, jobs);
         self.checks.poll(ctx, session, jobs, &events);
-        self.plan.release_if_hidden(now);
-        // The last view: that of the active tab (Blend or Plan), else the other's.
-        let last_view = pick_view_key(
-            self.tab,
-            self.blend.view_key(&session.mosaic.config.ui),
-            self.plan.view_key().map(str::to_string),
-        );
+        let last_view = self.window.view_key(&session.mosaic.config.ui);
         let counts = self.checks.counts(&session.mosaic.config);
         self.summary.poll(ctx, session, counts, last_view);
     }
 
-    /// The open session (the Panels, Plan and Blend tabs build on this).
+    /// The open session (the Panels tab and the session window build on
+    /// this).
     fn session_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(session) = &self.session else { return };
         let mut toggled = None;
+        let mut asked = None;
         egui::Panel::top("session-bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -413,6 +392,8 @@ impl Shell {
                     {
                         toggled = Some(auto);
                     }
+                    ui.separator();
+                    asked = work_buttons(ui, &self.window, self.jobs.as_ref(), session);
                 });
             });
             // Opening another session reports here too: the start window
@@ -445,8 +426,8 @@ impl Shell {
                 ui,
                 &views,
                 self.checks.counts(&session.mosaic.config),
-                // Plan reads the frame as soon as previews derive it.
-                session.canvas().or(self.plan.frame_canvas()),
+                // The plan reads the frame as soon as previews derive it.
+                session.canvas().or(self.window.plan().frame_canvas()),
                 session.group_count(),
                 self.sys.latest(),
             );
@@ -462,6 +443,9 @@ impl Shell {
                 until: Instant::now() + NOTICE_TIME,
             });
         }
+        if let Some(work) = asked {
+            self.start_work(work);
+        }
         egui::Panel::top("session-tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
@@ -470,43 +454,97 @@ impl Shell {
             });
         });
         match (self.tab, self.session.as_mut(), self.jobs.as_mut()) {
-            (Tab::Blend, Some(session), Some(jobs)) => {
-                // The plan's stretch of the same view holds a first merge.
-                let plan_stretch = (self.plan.view() == self.blend.view())
-                    .then(|| self.plan.stretch())
-                    .flatten();
-                self.blend.ui(ui, session, jobs, plan_stretch);
-            }
-            (Tab::Panels, Some(session), Some(jobs)) => self.panels.ui(ui, session, jobs),
-            (Tab::Plan, Some(session), Some(_)) => {
-                let now = Instant::now();
-                let feed = PlanFeed {
-                    previews: self.pipeline.previews(),
-                    generation: self.pipeline.generation(),
-                    complete: self.pipeline.previews_complete(),
-                    previews_busy: self.pipeline.step() == Some(Step::Previews)
-                        || self.pipeline.waiting(now),
-                    checks: self.checks.report(),
-                };
-                let out = self.plan.ui(ui, session, &feed);
-                if out.resume_previews {
-                    self.pipeline.request_previews();
-                }
+            (Tab::Session, Some(session), Some(jobs)) => {
+                let out = self
+                    .window
+                    .ui(ui, session, jobs, &mut self.pipeline, &self.checks);
                 for check in &out.accept {
                     if let Err(message) = self.checks.accept(session, check) {
                         tracing::warn!("{message}");
                         self.notices.push(Notice {
                             text: message,
                             color: palette::HA_400,
-                            until: now + NOTICE_TIME,
+                            until: Instant::now() + NOTICE_TIME,
                         });
                     }
                 }
             }
+            (Tab::Panels, Some(session), Some(jobs)) => self.panels.ui(ui, session, jobs),
             _ => {}
         }
         self.notices_ui(&ctx);
     }
+
+    /// Do what the session bar's work buttons asked: merging and exporting
+    /// show the session window.
+    fn start_work(&mut self, work: Work) {
+        let Some((session, jobs)) = self.session.as_mut().zip(self.jobs.as_mut()) else {
+            return;
+        };
+        match work {
+            Work::Merge => {
+                self.window.merge(session, jobs);
+                self.tab = Tab::Session;
+            }
+            Work::Export => {
+                self.window.mosaic_mut().open_export(session);
+                self.tab = Tab::Session;
+            }
+            Work::Cancel => {
+                for v in jobs.views() {
+                    jobs.cancel(v.id);
+                }
+            }
+        }
+    }
+}
+
+/// Merge, Export… and Cancel, laid out right to left (until the top bar's
+/// main button and step strip take them over); what was clicked.
+fn work_buttons(
+    ui: &mut egui::Ui,
+    window: &SessionWindow,
+    jobs: Option<&JobRunner>,
+    session: &OpenSession,
+) -> Option<Work> {
+    let jobs = jobs?;
+    let mut asked = None;
+    if ui
+        .add_enabled(jobs.busy(), egui::Button::new("Cancel"))
+        .on_hover_text("Cancel the running work")
+        .clicked()
+    {
+        asked = Some(Work::Cancel);
+    }
+    let mosaic = window.mosaic();
+    if ui
+        .add_enabled(mosaic.can_open_export(), egui::Button::new("Export…"))
+        .on_hover_text("Export this view's merged groups to FITS or TIFF")
+        .clicked()
+    {
+        asked = Some(Work::Export);
+    }
+    let why = mosaic.merge_block_reason(session, jobs);
+    if ui
+        .add_enabled(why.is_none(), egui::Button::new("Merge"))
+        .on_hover_text("Merge every group over the whole canvas")
+        .on_disabled_hover_text(why.unwrap_or_default())
+        .clicked()
+    {
+        asked = Some(Work::Merge);
+    }
+    asked
+}
+
+/// What the session bar's work buttons ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Work {
+    /// Merge every group ([`SessionWindow::merge`]).
+    Merge,
+    /// Open the export dialog.
+    Export,
+    /// Cancel every running or queued job.
+    Cancel,
 }
 
 impl Shell {
@@ -527,16 +565,6 @@ impl Shell {
                     });
                 }
             });
-    }
-}
-
-/// The view last shown for the summary: the Blend tab's key while it is the
-/// active tab, otherwise the Plan tab's; the other tab's when the active
-/// one has none.
-fn pick_view_key(tab: Tab, blend: Option<String>, plan: Option<String>) -> Option<String> {
-    match tab {
-        Tab::Blend => blend.or(plan),
-        Tab::Plan | Tab::Panels => plan.or(blend),
     }
 }
 
@@ -586,18 +614,20 @@ struct SelfTest {
     phase: Phase,
 }
 
-/// The self-test's walk through the session's tabs.
+/// The self-test's walk through the session window's canvas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Waiting for the Blend tab to settle.
-    Blend,
-    /// Waiting for the Blend tab's first composition to settle.
-    BlendComposition,
-    /// Waiting for the Plan tab's first view to settle.
+    /// Waiting for the mosaic of the first group to settle.
+    Mosaic,
+    /// Waiting for the mosaic of the first composite to settle.
+    MosaicComposition,
+    /// Waiting for the plan of the view shown (the composite, if any) to
+    /// settle.
     Plan,
-    /// Waiting for the Plan tab's first composition to settle.
-    PlanComposition,
-    /// Every tab visited.
+    /// Waiting for the plan of the first group to settle (after a
+    /// composite's).
+    PlanGroup,
+    /// Every view visited.
     Done,
 }
 
@@ -670,50 +700,57 @@ impl SelfTest {
         ctx.request_repaint();
     }
 
-    /// Visit Blend, then Plan (the first group, then the first
-    /// composition, if any), each once it has settled.
+    /// Visit the mosaic (the first group, then the first composite, if
+    /// any), then the plan (that view, then the first group), each once it
+    /// has settled.
     fn advance(&mut self, shell: &mut Shell) {
-        if self.phase == Phase::Blend && shell.tab() != Tab::Blend {
-            // A session opens on Plan (or Panels); the walk starts at Blend.
-            shell.set_tab(Tab::Blend);
+        if self.phase == Phase::Mosaic {
+            // A session opens on its window (or Panels) showing the plan
+            // until something is merged; the walk starts at the mosaic.
+            if shell.tab() != Tab::Session {
+                shell.set_tab(Tab::Session);
+            }
+            shell.window_mut().set_mode(CanvasMode::Mosaic);
         }
+        let w = shell.window();
         match self.phase {
-            Phase::Blend
-                if self.session_frames >= SELFTEST_SESSION_FRAMES
-                    && shell.tab() == Tab::Blend
-                    && shell.blend().is_settled() =>
+            Phase::Mosaic
+                if self.session_frames >= SELFTEST_SESSION_FRAMES && w.mosaic().is_settled() =>
             {
-                log_blend_tab(shell.blend());
+                log_mosaic(w.mosaic());
                 if has_composition(shell) {
-                    shell.blend_mut().select_view(ViewKind::Composition(0));
-                    self.phase = Phase::BlendComposition;
+                    shell.window_mut().select_view(ViewKind::Composition(0));
+                    self.phase = Phase::MosaicComposition;
                 } else {
-                    shell.set_tab(Tab::Plan);
+                    shell.window_mut().set_mode(CanvasMode::Plan);
                     self.phase = Phase::Plan;
                 }
             }
-            Phase::BlendComposition
-                if matches!(shell.blend().view(), Some(ViewKind::Composition(_)))
-                    && shell.blend().is_settled() =>
+            Phase::MosaicComposition
+                if matches!(w.mosaic().view(), Some(ViewKind::Composition(_)))
+                    && w.mosaic().is_settled() =>
             {
-                log_blend_tab(shell.blend());
-                shell.set_tab(Tab::Plan);
+                log_mosaic(w.mosaic());
+                shell.window_mut().set_mode(CanvasMode::Plan);
                 self.phase = Phase::Plan;
             }
-            Phase::Plan if shell.tab() == Tab::Plan && shell.plan().is_settled() => {
-                log_plan_tab(shell);
-                self.phase = if has_composition(shell) {
-                    shell.plan_mut().select_view(ViewKind::Composition(0));
-                    Phase::PlanComposition
-                } else {
-                    Phase::Done
+            Phase::Plan if w.mode() == CanvasMode::Plan && w.plan().is_settled() => {
+                log_plan(shell);
+                let first = shell
+                    .session()
+                    .and_then(|s| group_names(s).into_iter().next());
+                self.phase = match first {
+                    Some(g) if matches!(w.view(), Some(ViewKind::Composition(_))) => {
+                        shell.window_mut().select_view(ViewKind::Group(g));
+                        Phase::PlanGroup
+                    }
+                    _ => Phase::Done,
                 };
             }
-            Phase::PlanComposition
-                if matches!(shell.plan().view(), Some(ViewKind::Composition(_)))
-                    && shell.plan().is_settled() =>
+            Phase::PlanGroup
+                if matches!(w.plan().view(), Some(ViewKind::Group(_))) && w.plan().is_settled() =>
             {
-                log_plan_tab(shell);
+                log_plan(shell);
                 self.phase = Phase::Done;
             }
             _ => {}
@@ -738,34 +775,34 @@ fn has_composition(shell: &Shell) -> bool {
         .is_some_and(|s| !load_compositions(&s.mosaic.config.ui).is_empty())
 }
 
-/// Log what the self-test's Blend tab shows.
-fn log_blend_tab(blend: &BlendTab) {
+/// Log what the self-test's mosaic shows.
+fn log_mosaic(mosaic: &MosaicView) {
     tracing::info!(
-        "self-test: Blend tab view {:?}: {}; {} ROIs",
-        blend.view(),
-        blend
+        "self-test: Mosaic of {:?}: {}; {} ROIs",
+        mosaic.view(),
+        mosaic
             .shown_text()
             .unwrap_or_else(|| "viewer shown".to_string()),
-        blend.rois().len()
+        mosaic.rois().len()
     );
-    let group = blend.group().unwrap_or("(none)");
-    match (blend.source(), blend.absent()) {
+    let group = mosaic.group().unwrap_or("(none)");
+    match (mosaic.source(), mosaic.absent()) {
         (Some(src), _) => {
             let g = src.tile_geometry();
             let stretch = src.stretch();
             tracing::info!(
-                "self-test: Blend tab shows group {group}: {} × {} × {} result, display stretch {stretch:?}",
+                "self-test: Mosaic shows group {group}: {} × {} × {} result, display stretch {stretch:?}",
                 g.width,
                 g.height,
                 g.channels
             );
         }
         (None, why) => tracing::info!(
-            "self-test: Blend tab, group {group}: no result ({})",
+            "self-test: Mosaic, group {group}: no result ({})",
             why.unwrap_or("none")
         ),
     }
-    match blend.health() {
+    match mosaic.health() {
         Some(Ok(h)) => tracing::info!(
             "self-test: health: seam step median {:.3e}, max {:.3e}, {} of {} edges flagged",
             h.seam_delta_median,
@@ -778,19 +815,19 @@ fn log_blend_tab(blend: &BlendTab) {
     }
 }
 
-/// Log what the self-test's Plan tab shows.
-fn log_plan_tab(shell: &Shell) {
-    let plan = shell.plan();
+/// Log what the self-test's plan shows.
+fn log_plan(shell: &Shell) {
+    let plan = shell.window().plan();
     let items = plan.items();
     let textured = items.iter().filter(|i| !i.layers.is_empty()).count();
     let layers: usize = items.iter().map(|i| i.layers.len()).sum();
     tracing::info!(
-        "self-test: Plan tab shows {:?}: {} panels placed, {textured} with previews ({layers} layers), \
+        "self-test: Plan shows {:?}: {} panels placed, {textured} with previews ({layers} layers), \
          frame {:?}, display stretch {:?}",
         plan.view(),
         items.len(),
         plan.frame_canvas(),
-        plan.stretch()
+        plan.stretch_for_view()
     );
     tracing::info!(
         "self-test: {} previews in memory; checks {}",
@@ -892,7 +929,7 @@ impl MmmApp {
             timed_out: selftest_watchdog(&cc.egui_ctx, SELFTEST_TIMEOUT, Some(SELFTEST_BACKSTOP)),
             outcome,
             done: false,
-            phase: Phase::Blend,
+            phase: Phase::Mosaic,
         });
         MmmApp {
             shell,
@@ -1157,13 +1194,24 @@ mod tests {
     }
 
     #[test]
-    fn last_view_follows_the_active_tab() {
-        let s = |x: &str| Some(x.to_string());
-        assert_eq!(pick_view_key(Tab::Blend, s("Ha"), s("OIII")), s("Ha"));
-        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), s("OIII")), s("OIII"));
-        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), None), s("Ha"));
-        assert_eq!(pick_view_key(Tab::Blend, None, s("OIII")), s("OIII"));
-        assert_eq!(pick_view_key(Tab::Panels, None, None), None);
+    fn last_view_follows_the_window() {
+        use mmm_core::session_summary::read_summary;
+        let root = temp_dir("shell-last-view");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let mut h = harness(StubPicker(None));
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        let last = |dir: &Path| read_summary(dir).and_then(|s| s.last_view);
+        step_until(&mut h, |_| last(&dir).as_deref() == Some("Ha"));
+        // The view picked in the window, whichever canvas shows it.
+        h.state_mut()
+            .window_mut()
+            .select_view(ViewKind::Group("OIII".into()));
+        step_until(&mut h, |_| last(&dir).as_deref() == Some("OIII"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1261,30 +1309,42 @@ mod tests {
         h.get_by_label("0 problems");
         h.get_by_label("8 notes");
         h.get_by_label("0 passed");
-        // A session with panels opens on the Plan tab.
-        assert_eq!(h.state().tab(), Tab::Plan);
-        // The Blend tab shows the first group, Ha; it was never blended.
-        h.get_by_label("Blend").click();
-        h.step();
-        step_until(&mut h, |s| s.tab() == Tab::Blend);
-        assert_eq!(h.state().blend().group(), Some("Ha"));
-        step_until(&mut h, |s| s.blend().absent().is_some());
-        h.get_by_label("Not blended yet.");
-        step_until(&mut h, |s| s.blend().health().is_some());
-        assert!(matches!(h.state().blend().health(), Some(Ok(_))));
+        // A session with panels opens on the session window, on the plan
+        // while nothing is merged.
+        assert_eq!(h.state().tab(), Tab::Session);
+        assert_eq!(h.state().window().mode(), CanvasMode::Plan);
+        // The plan shows the first group's previews in place.
+        step_until(&mut h, |s| s.window().plan().is_settled());
+        assert_eq!(h.state().window().plan().items().len(), 4);
+        h.get_by_label("Ha · 4");
+        h.get_by_label("OIII · 4");
+        // Behind it, the mosaic of Ha: never merged, but analysed (health).
+        assert_eq!(h.state().window().mosaic().group(), Some("Ha"));
+        step_until(&mut h, |s| s.window().mosaic().absent().is_some());
+        step_until(&mut h, |s| s.window().mosaic().health().is_some());
+        assert!(matches!(h.state().window().mosaic().health(), Some(Ok(_))));
+        // The health ends the Merge settings section.
+        h.state_mut()
+            .window_mut()
+            .inspector_mut()
+            .reveal("merge-settings");
+        h.run_steps(2);
         h.get_by_label("Seam step median");
-        h.get_by_label("Blend whole mosaic").click();
+        // Merge merges every group and shows the mosaic.
+        h.get_by_label("Merge").click();
         h.step();
+        assert_eq!(h.state().window().mode(), CanvasMode::Mosaic);
         step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
         h.run();
         h.get_by_label("Blend Ha finished");
         h.get_by_label("Blend OIII finished");
+        assert!(h.state().session().unwrap().merged);
         // The result opens with an automatic display stretch, and the
         // viewer settles with its tiles loaded.
         step_until(&mut h, |s| {
-            s.blend().source().is_some() && s.blend().is_settled()
+            s.window().mosaic().source().is_some() && s.window().mosaic().is_settled()
         });
-        let src = h.state().blend().source().unwrap().clone();
+        let src = h.state().window().mosaic().source().unwrap().clone();
         assert_eq!(src.tile_geometry().width, CANVAS_W);
         assert_ne!(
             src.stretch()[0],
@@ -1292,21 +1352,14 @@ mod tests {
             "auto stretch applied"
         );
         // The Panels tab shows the panels in their groups.
-        h.get_by_label("Panels").click();
+        h.state_mut().set_tab(Tab::Panels);
         h.step();
-        step_until(&mut h, |s| s.tab() == Tab::Panels);
         h.get_by_label("Ha_0.xisf");
         let deadline = Instant::now() + Duration::from_secs(10);
         while h.query_by_label("OIII").is_none() {
             assert!(Instant::now() < deadline, "no OIII column");
             h.step();
         }
-        // Plan shows the first group's previews in place.
-        h.get_by_label("Plan").click();
-        h.step();
-        step_until(&mut h, |s| s.tab() == Tab::Plan && s.plan().is_settled());
-        assert_eq!(h.state().plan().items().len(), 4);
-        h.get_by_label("View");
         let actions: Vec<_> = h
             .state()
             .session()
@@ -1317,7 +1370,7 @@ mod tests {
             .iter()
             .map(|p| p.action.clone())
             .collect();
-        // "Blend whole mosaic" blends every group.
+        // Merge merged every group.
         assert_eq!(actions, ["analyze", "blend", "blend"]);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1333,7 +1386,7 @@ mod tests {
         session.mosaic.config.ui = serde_json::json!({ "marker": 1 });
         let dir = session.mosaic.dir.clone();
         shell.session = Some(session);
-        shell.blend.touch_save();
+        shell.window.touch_save();
         shell.flush_pending_saves();
         let back = mmm_core::mosaic::MosaicConfig::load(&dir).unwrap();
         assert_eq!(back.ui["marker"], 1);

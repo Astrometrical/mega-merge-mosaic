@@ -1,7 +1,8 @@
-//! The Blend tab's **Blend settings** panel (spec §5.4): the mosaic-wide
-//! analyze and blend settings, exactly the `mmm analyze` / `mmm blend`
-//! options the session keeps ([`AnalyzeSettings`], [`BlendSettings`]), with
-//! the CLI's value domains.
+//! The merge settings panel (spec §5.4; the session window's Merge
+//! settings section, through [`crate::mosaic_view::MosaicView`]): the
+//! mosaic-wide analyze and blend settings, exactly the `mmm analyze` /
+//! `mmm blend` options the session keeps ([`AnalyzeSettings`],
+//! [`BlendSettings`]), with the CLI's value domains.
 //!
 //! - **Two kinds.** Mode, feather, defect veto and flatten are
 //!   *blend-local*: analysis is kept, existing results go stale and a
@@ -258,7 +259,7 @@ fn feather_text(v: f32) -> String {
     format!("{v}")
 }
 
-/// The panel's state (owned by the Blend tab).
+/// The panel's state (owned by the merged mosaic view).
 #[derive(Default)]
 pub struct SettingsPanel {
     /// Staged edits (`None`: the session's settings are shown).

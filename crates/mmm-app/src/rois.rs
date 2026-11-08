@@ -8,9 +8,9 @@
 //! is read and the conversion run on a worker ([`RoiPanel`]'s sync); the
 //! list itself is UI state, saved like the display stretch.
 //!
-//! [`RoiPanel`] is the Blend tab's ROI side panel and its workers: the
-//! list (new, select and zoom, rename, note, delete), the reprojection, and
-//! how fresh each group of the view is inside each ROI.
+//! [`RoiPanel`] is the ROI list (the session window's ROIs section) and its
+//! workers: the list (new, select and zoom, rename, note, delete), the
+//! reprojection, and how fresh each group of the view is inside each ROI.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -180,9 +180,9 @@ pub type MemberCounts = Vec<(String, Option<(usize, usize)>)>;
 /// [`MemberCounts`] of each ROI rect.
 type FreshCounts = Vec<([u64; 4], MemberCounts)>;
 
-/// The Blend tab's ROIs: the list (kept in `MosaicConfig.ui`), the
+/// The session's ROIs: the list (kept in `MosaicConfig.ui`), the
 /// selection, and the sync and freshness workers. Methods that change the
-/// list write it into the session's `ui` and return true; the tab then
+/// list write it into the session's `ui` and return true; the view then
 /// saves (debounced).
 #[derive(Default)]
 pub struct RoiPanel {

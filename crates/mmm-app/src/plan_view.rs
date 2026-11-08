@@ -92,8 +92,6 @@ pub struct PlanFeed<'a> {
     pub generation: u64,
     /// Every preview of the current inputs has been run.
     pub complete: bool,
-    /// Previews are running or about to start (no Resume is offered).
-    pub previews_busy: bool,
     /// The last checks report, if any.
     pub checks: Option<&'a ChecksReport>,
 }
@@ -105,6 +103,9 @@ pub struct CanvasLook {
     pub outlines: bool,
     /// Panel numbers.
     pub numbers: bool,
+    /// The regions of interest (the merged mosaic draws them; the plan
+    /// does not yet).
+    pub rois: bool,
     /// The automatic display stretch's toggles.
     pub stretch: DisplayStretch,
 }
@@ -114,6 +115,7 @@ impl Default for CanvasLook {
         CanvasLook {
             outlines: true,
             numbers: true,
+            rois: true,
             stretch: DisplayStretch::default(),
         }
     }
@@ -680,7 +682,6 @@ impl PlanView {
 
     /// Where the canvas looks: a camera set and not drawn yet, else what the
     /// last frame showed; `None` with neither.
-    #[allow(dead_code)] // used by the session window from Task 7 on
     pub fn camera(&self) -> Option<Camera> {
         if let Some(held) = self.held_camera
             && !held.drawn
@@ -693,7 +694,6 @@ impl PlanView {
 
     /// Look through `camera` from the next frame on, with no animation (see
     /// the module docs for how it survives the canvas fitting its extent).
-    #[allow(dead_code)] // used by the session window from Task 7 on
     pub fn set_camera(&mut self, camera: Camera) {
         self.held_camera = Some(HeldCamera {
             camera,
@@ -707,8 +707,8 @@ impl PlanView {
         self.selected.as_deref()
     }
 
-    /// Select the panel `path` (or none).
-    #[allow(dead_code)] // used by the session window from Task 7 on
+    /// Select the panel `path` (or none); the canvas selects by click.
+    #[cfg(test)]
     pub fn select(&mut self, path: Option<PathBuf>) {
         self.selected = path;
     }
@@ -1445,6 +1445,11 @@ impl PlanView {
 
 #[cfg(test)]
 impl PlanView {
+    /// The canvas's rect and time in the last frame drawn.
+    pub(crate) fn canvas_frame(&self) -> Option<(egui::Rect, f64)> {
+        self.canvas.last_frame()
+    }
+
     /// Screen position of canvas point `p` in the last frame drawn.
     pub(crate) fn to_screen(&self, p: (f64, f64)) -> Option<egui::Pos2> {
         let (rect, now) = self.canvas.last_frame()?;

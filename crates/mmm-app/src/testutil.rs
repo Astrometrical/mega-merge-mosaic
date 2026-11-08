@@ -9,7 +9,16 @@ pub(crate) use crate::synth_mosaic::CANVAS;
 /// A grouped Ha + OIII mosaic session in `root/m.mmm-session`, grouped by
 /// the `FILTER` header, not yet analyzed.
 pub(crate) fn two_group_session(root: &Path) -> OpenSession {
-    let mosaic = crate::synth_mosaic::two_group_mosaic(root);
+    open(crate::synth_mosaic::two_group_mosaic(root))
+}
+
+/// [`two_group_session`] with mono (one-channel) panels.
+pub(crate) fn two_group_mono_session(root: &Path) -> OpenSession {
+    open(crate::synth_mosaic::two_group_mosaic_of(root, 1))
+}
+
+/// `mosaic` as opened, its groups resolved, without a lock.
+fn open(mosaic: mmm_core::mosaic::Mosaic) -> OpenSession {
     let groups = mosaic.groups().ok();
     OpenSession {
         mosaic,
@@ -17,6 +26,7 @@ pub(crate) fn two_group_session(root: &Path) -> OpenSession {
         groups,
         lock: None,
         summary: None,
+        merged: false,
     }
 }
 

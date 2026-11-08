@@ -10,14 +10,15 @@ use mmm_core::synth::{SynthSpec, generate, write_xisf_with_header_xml};
 
 /// Synthetic canvas size.
 pub const CANVAS: (u64, u64) = (600, 420);
+/// Channels of the panels of [`two_group_mosaic`].
 const CH: u64 = 3;
 
-/// Synthesize a 2×2 aligned panel set and rewrite each panel with a
-/// `FILTER` header card; returns the tagged panel paths.
-fn filter_group(root: &Path, filter: &str, seed: u64) -> Vec<PathBuf> {
+/// Synthesize a 2×2 aligned panel set of `channels` channels and rewrite
+/// each panel with a `FILTER` header card; returns the tagged panel paths.
+fn filter_group(root: &Path, filter: &str, seed: u64, channels: u64) -> Vec<PathBuf> {
     let spec = SynthSpec {
         canvas: CANVAS,
-        channels: CH as u32,
+        channels: channels as u32,
         grid: (2, 2),
         overlap_frac: 0.25,
         n_stars: 40,
@@ -37,7 +38,7 @@ fn filter_group(root: &Path, filter: &str, seed: u64) -> Vec<PathBuf> {
     let res = generate(&spec, &root.join(format!("gen-{filter}"))).unwrap();
     let out = root.join("panels");
     std::fs::create_dir_all(&out).unwrap();
-    let n = (CANVAS.0 * CANVAS.1 * CH) as usize;
+    let n = (CANVAS.0 * CANVAS.1 * channels) as usize;
     res.panel_paths
         .iter()
         .enumerate()
@@ -55,7 +56,7 @@ fn filter_group(root: &Path, filter: &str, seed: u64) -> Vec<PathBuf> {
                 &path,
                 CANVAS.0,
                 CANVAS.1,
-                CH,
+                channels,
                 &planes,
                 &format!(r#"<FITSKeyword name="FILTER" value="'{filter}'" comment=""/>"#),
             )
@@ -68,8 +69,13 @@ fn filter_group(root: &Path, filter: &str, seed: u64) -> Vec<PathBuf> {
 /// A grouped Ha + OIII mosaic session in `root/m.mmm-session`, grouped by
 /// the `FILTER` header, not yet analyzed.
 pub fn two_group_mosaic(root: &Path) -> Mosaic {
-    let mut paths = filter_group(root, "Ha", 7);
-    paths.extend(filter_group(root, "OIII", 11));
+    two_group_mosaic_of(root, CH)
+}
+
+/// [`two_group_mosaic`] with panels of `channels` channels (1: mono).
+pub fn two_group_mosaic_of(root: &Path, channels: u64) -> Mosaic {
+    let mut paths = filter_group(root, "Ha", 7, channels);
+    paths.extend(filter_group(root, "OIII", 11, channels));
     let mut cfg = MosaicConfig::new(paths);
     cfg.grouping = Grouping {
         enabled: true,

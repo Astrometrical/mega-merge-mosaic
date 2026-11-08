@@ -17,7 +17,7 @@
 //!   apply ([`crate::blend_settings`]) counts as an edit too; once a global
 //!   one applies, the groups it marked are analysed again.
 //! - An analysis that ends (finished, failed, or cancelled by the user),
-//!   whether the pipeline or the Blend tab started it, is not started
+//!   whether the pipeline or something else started it, is not started
 //!   again automatically until the inputs, the analysis settings or the
 //!   groups to analyse change (no retry loops). Previews that end are not
 //!   repeated for the same inputs either. Previews the user cancelled (or
@@ -212,7 +212,7 @@ impl Pipeline {
             };
             let finished = matches!(event, JobEvent::Finished { .. });
             let Some(job) = self.job.take_if(|j| j.id == id) else {
-                // An analysis started elsewhere (the Blend tab's Analyze):
+                // An analysis started elsewhere (not by the pipeline):
                 // once it has ended, failed or been cancelled by the user,
                 // it is not repeated automatically either.
                 if !editing
@@ -607,7 +607,7 @@ mod tests {
         let mut seen = Seen::default();
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         set_auto_analyze(&mut s, true).unwrap();
-        // The user analyses from the Blend tab before the pipeline polls,
+        // The user analyses (not the pipeline) before the pipeline polls,
         // then cancels it.
         let gate = r.hold();
         let id = r.start_analyze(&mut s);

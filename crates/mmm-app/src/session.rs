@@ -14,6 +14,8 @@ use mmm_core::reference::ReferenceFrame;
 use mmm_core::session_summary::{SessionSummary, read_summary};
 use serde_json::Value;
 
+use crate::util::group_names;
+
 /// A mosaic session open in this window.
 #[derive(Debug)]
 pub struct OpenSession {
@@ -35,6 +37,10 @@ pub struct OpenSession {
     /// The session's `summary.json` as found when opening (`None` if absent
     /// or unreadable); seeds the summary writer's blend and export stamps.
     pub summary: Option<SessionSummary>,
+    /// Something has been merged: a processing group's result store exists
+    /// ([`any_merged`], when opening), or a merge finished since (set by the
+    /// session window). The canvas offers the mosaic from then on.
+    pub merged: bool,
 }
 
 impl OpenSession {
@@ -152,13 +158,24 @@ fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
     // Reads panel headers (Header rule): fine here, off the UI thread.
     let groups = mosaic.groups().ok();
     let summary = read_summary(dir);
-    Ok(OpenSession {
+    let mut session = OpenSession {
         mosaic,
         frame,
         groups,
         lock,
         summary,
-    })
+        merged: false,
+    };
+    session.merged = any_merged(&session);
+    Ok(session)
+}
+
+/// Whether any processing group of `session` has a result store on disk.
+/// Blocking (a stat per group): call off the UI thread.
+pub fn any_merged(session: &OpenSession) -> bool {
+    group_names(session)
+        .iter()
+        .any(|g| session.mosaic.result_path(g).is_file())
 }
 
 /// The session lock on `dir`, or an actionable message.
@@ -191,6 +208,7 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
         groups: Some(Groups::default()),
         lock,
         summary: None,
+        merged: false,
     })
 }
 
@@ -307,6 +325,24 @@ mod tests {
         drop(created);
         let opened = open_blocking(&dir).unwrap();
         assert!(opened.mosaic.config.panels.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opening_finds_whether_anything_is_merged() {
+        use mmm_core::job::JobCtl;
+        use mmm_core::mosaic::{analyze_all, blend_group};
+
+        let root = temp_dir("session-merged");
+        let mut s = crate::testutil::two_group_session(&root);
+        let dir = s.mosaic.dir.clone();
+        assert!(!open_blocking(&dir).unwrap().merged);
+        s.groups = Some(analyze_all(&mut s.mosaic, &JobCtl::none()).unwrap());
+        assert!(!open_blocking(&dir).unwrap().merged, "analysed only");
+        blend_group(&mut s.mosaic, "OIII", None, &JobCtl::none()).unwrap();
+        assert!(open_blocking(&dir).unwrap().merged, "one group merged");
+        let created = create_blocking(&root.join("New.mmm-session")).unwrap();
+        assert!(!created.merged);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -8,7 +8,6 @@
 
 mod app;
 mod blend_settings;
-mod blend_tab;
 mod camera;
 mod checks;
 mod compositions;
@@ -18,10 +17,10 @@ mod jobs;
 mod mosaic_view;
 mod panels_tab;
 mod pipeline;
-mod plan_tab;
 mod plan_view;
 mod rois;
 mod session;
+mod session_window;
 mod start;
 mod status;
 mod stretch_panel;

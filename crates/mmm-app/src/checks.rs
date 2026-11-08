@@ -190,6 +190,13 @@ impl ChecksEngine {
         self.report.as_ref()
     }
 
+    /// Show `report` as the last run's (tests: a run is never started
+    /// unless the engine is polled).
+    #[cfg(test)]
+    pub(crate) fn set_report(&mut self, report: ChecksReport) {
+        self.report = Some(report);
+    }
+
     /// A run is in progress.
     pub fn running(&self) -> bool {
         self.task.is_some()

@@ -17,7 +17,7 @@ struct State {
 }
 
 /// The panel over an analysed two-group session, polled and drawn each
-/// frame as the Blend tab does.
+/// frame as the merged mosaic view does.
 fn harness(tag: &str) -> (PathBuf, Harness<'static, State>) {
     let (root, session, jobs) = analyzed(tag);
     let h = Harness::builder()
