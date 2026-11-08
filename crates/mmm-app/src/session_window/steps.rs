@@ -6,7 +6,7 @@
 //! |---|---|
 //! | Panels | none: "Add panels"; previews running: "Reading previews {done} / {n}" (cancellable); previews stopped short: "Read previews" (next); else "{n} panels" (done) |
 //! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
-//! | Merge | whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; a group without a complete result: "Merge" (next); else "Merged" (done) |
+//! | Merge | whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, or it needs analysis): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
 //! | Export | exports running or queued: "Exporting {i} of {n}" ("Exporting" for one) (cancellable); else "Export" |
 //!
 //! One step at most is next (highlighted): the first that waits for the
@@ -17,9 +17,11 @@
 
 use mega_ui::jobs::JobView;
 use mega_ui::widgets::{StepState, StripStep};
+use mmm_core::mosaic::settings_changed;
 use mmm_core::session_summary::ResultState;
 
 use super::sections::counted;
+use crate::blend_settings::load_draft;
 use crate::checks::ChecksEngine;
 use crate::jobs::{ANALYZE_LABEL, JobRunner, JobTarget, PREVIEWS_LABEL};
 use crate::pipeline::{Pipeline, Step, wants_analysis};
@@ -79,13 +81,35 @@ pub(super) fn offers_analysis(
         && pipeline.analysis_stalled(session)
 }
 
-/// Whether a merge is needed: the session has groups and one of them has
-/// no complete result (none yet, partly merged, or stale: merged before
-/// the panels, the analysis or the settings changed).
-pub fn needs_merge(session: &OpenSession) -> bool {
+/// Whether `group`'s mosaic is out of date: its result is not complete
+/// (none yet, partly merged, a merge that stopped, or one made before the
+/// panels changed), or the group needs a new analysis.
+pub fn out_of_date(session: &OpenSession, group: &str) -> bool {
+    session.results.get(group) != Some(&ResultState::Complete)
+        || session.mosaic.config.needs_analyze.contains(group)
+}
+
+/// Whether `group` is up to date but its last whole-canvas merge used
+/// different effective merge settings from the draft (the draft with the
+/// group's override applied). Never blocks export.
+pub fn draft_changed(session: &OpenSession, group: &str) -> bool {
+    let cfg = &session.mosaic.config;
+    !out_of_date(session, group) && settings_changed(cfg, group, &load_draft(cfg))
+}
+
+/// Whether a merge is needed: some group is [`out_of_date`] or its
+/// [`draft_changed`].
+pub fn merge_needed(session: &OpenSession) -> bool {
+    !groups_to_merge(session).is_empty()
+}
+
+/// The groups a **Merge** merges: the ones out of date or with the draft
+/// changed, in order.
+pub fn groups_to_merge(session: &OpenSession) -> Vec<String> {
     group_names(session)
-        .iter()
-        .any(|g| session.results.get(g) != Some(&ResultState::Complete))
+        .into_iter()
+        .filter(|g| out_of_date(session, g) || draft_changed(session, g))
+        .collect()
 }
 
 /// The jobs `views` shows that `is` picks, in order (running first).
@@ -181,8 +205,15 @@ fn merge_step(session: &OpenSession, jobs: &JobRunner, views: &[JobView]) -> Str
     }
     if group_names(session).is_empty() || wants_analysis(session) || jobs.analyzing() {
         step("Merge", StepState::Todo)
-    } else if needs_merge(session) {
+    } else if !session.merged {
         step("Merge", StepState::Next)
+    } else if group_names(session).iter().any(|g| out_of_date(session, g)) {
+        step("Out of date", StepState::Next)
+    } else if group_names(session)
+        .iter()
+        .any(|g| draft_changed(session, g))
+    {
+        step("Settings changed", StepState::Next)
     } else {
         step("Merged", StepState::Done)
     }

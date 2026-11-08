@@ -11,14 +11,17 @@
 use std::path::Path;
 
 use mega_ui::theme::tokens::space;
-use mega_ui::widgets::{ChoiceChip, Segment, choice_chip, segmented_with};
+use mega_ui::widgets::{ChipMark, ChoiceChip, Segment, choice_chip, segmented_with};
+use mmm_core::mosaic::{last_analyze_settings, last_merge_settings};
 
 use super::shortcuts::{self, keyed, views_hint};
-use super::{COMPOSITES, CanvasMode, SessionWindow, compositions_of};
+use super::steps::{draft_changed, out_of_date};
+use super::{COMPOSITES, CanvasMode, MERGE_SETTINGS, SessionWindow, compositions_of};
 use crate::checks::ChecksEngine;
 use crate::compositions::{ViewKind, add_composition};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
+use crate::mosaic_view::view_members;
 use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{PlanFeed, group_members};
@@ -36,6 +39,51 @@ struct BarActions {
     mode: Option<CanvasMode>,
     view: Option<ViewKind>,
     add_composite: bool,
+    /// **Merge this group** was chosen on this group's chip.
+    merge_group: Option<String>,
+}
+
+/// Why a mosaic is out of date, for the canvas tag (spec §11): the first
+/// reason that holds for `group`.
+fn out_of_date_why(session: &OpenSession, group: &str) -> &'static str {
+    let cfg = &session.mosaic.config;
+    if cfg.needs_analyze.contains(group) {
+        let changed =
+            last_analyze_settings(cfg, group).is_some_and(|last| last != cfg.settings_for(group).0);
+        if changed {
+            "Out of date — analysis settings changed"
+        } else {
+            "Out of date — panels changed"
+        }
+    } else if last_merge_settings(cfg, group).is_none() {
+        "Not merged yet"
+    } else {
+        "Out of date — merge didn't finish"
+    }
+}
+
+/// The chip mark of the groups `groups` (a composite's members): the
+/// worst state among them.
+fn mark_of(session: &OpenSession, groups: &[String]) -> Option<ChipMark> {
+    if groups.iter().any(|g| out_of_date(session, g)) {
+        Some(ChipMark::Attention)
+    } else if groups.iter().any(|g| draft_changed(session, g)) {
+        Some(ChipMark::Changed)
+    } else {
+        None
+    }
+}
+
+/// The tag over the mosaic of the shown `members`: why the first one out
+/// of date is, else that the settings changed since the merge.
+fn canvas_tag(session: &OpenSession, members: &[String]) -> Option<String> {
+    if let Some(g) = members.iter().find(|g| out_of_date(session, g)) {
+        return Some(out_of_date_why(session, g).to_string());
+    }
+    members
+        .iter()
+        .any(|g| draft_changed(session, g))
+        .then(|| "Settings changed since this merge".to_string())
 }
 
 impl SessionWindow {
@@ -49,7 +97,7 @@ impl SessionWindow {
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
-        jobs: &JobRunner,
+        jobs: &mut JobRunner,
         pipeline: &Pipeline,
     ) {
         let groups = group_names(session);
@@ -66,7 +114,7 @@ impl SessionWindow {
             let mut widths = (0.0, 0.0);
             if one_row {
                 ui.horizontal(|ui| {
-                    widths.0 = self.choices(ui, session, &groups, mosaic_ok, &mut act);
+                    widths.0 = self.choices(ui, session, jobs, &groups, mosaic_ok, &mut act);
                     // Right to left: Strong ends the row.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         widths.1 = self.toggles(ui, session, mono);
@@ -74,7 +122,7 @@ impl SessionWindow {
                 });
             } else {
                 ui.horizontal_wrapped(|ui| {
-                    widths.0 = self.choices(ui, session, &groups, mosaic_ok, &mut act);
+                    widths.0 = self.choices(ui, session, jobs, &groups, mosaic_ok, &mut act);
                 });
                 ui.add_space(space::XS);
                 ui.horizontal(|ui| {
@@ -95,6 +143,9 @@ impl SessionWindow {
         if let Some(view) = act.view {
             self.select_view(view);
         }
+        if let Some(g) = act.merge_group {
+            self.merge_group(session, jobs, &g);
+        }
         if act.add_composite {
             let i = add_composition(&mut session.mosaic.config.ui, &groups);
             self.save.touch();
@@ -110,6 +161,7 @@ impl SessionWindow {
         &self,
         ui: &mut egui::Ui,
         session: &OpenSession,
+        jobs: &JobRunner,
         groups: &[String],
         mosaic_ok: bool,
         act: &mut BarActions,
@@ -160,10 +212,26 @@ impl SessionWindow {
                     color: colors.get(g).copied(),
                     selected: self.view.as_ref() == Some(&view),
                     dashed: false,
+                    mark: mark_of(session, std::slice::from_ref(g)),
                 };
-                if chip(ui, c).on_hover_text(&hint).clicked() {
+                let r = chip(ui, c).on_hover_text(&hint);
+                if r.clicked() {
                     act.view = Some(view);
                 }
+                let why = self.mosaic.merge_group_block_reason(session, jobs, g);
+                egui::Popup::context_menu(&r).show(|ui| {
+                    let item = ui.add_enabled(why.is_none(), egui::Button::new("Merge this group"));
+                    if item
+                        .on_hover_text(
+                            "Merge this group over the whole canvas with the Merge settings",
+                        )
+                        .on_disabled_hover_text(why.unwrap_or_default())
+                        .clicked()
+                    {
+                        act.merge_group = Some(g.clone());
+                        ui.close();
+                    }
+                });
             }
             for (i, comp) in compositions_of(session).iter().enumerate() {
                 let view = ViewKind::Composition(i);
@@ -172,6 +240,7 @@ impl SessionWindow {
                     color: None,
                     selected: self.view.as_ref() == Some(&view),
                     dashed: true,
+                    mark: mark_of(session, &view_members(&view, &compositions_of(session))),
                 };
                 if chip(ui, c).on_hover_text(&hint).clicked() {
                     act.view = Some(view);
@@ -182,6 +251,7 @@ impl SessionWindow {
                 color: None,
                 selected: false,
                 dashed: false,
+                mark: None,
             };
             if chip(ui, plus).on_hover_text("New composite").clicked() {
                 act.add_composite = true;
@@ -203,6 +273,7 @@ impl SessionWindow {
                 color: None,
                 selected: on,
                 dashed: false,
+                mark: None,
             };
             let r = choice_chip(ui, &chip);
             widths.push(r.rect.width());
@@ -258,6 +329,7 @@ impl SessionWindow {
         &mut self,
         ui: &mut egui::Ui,
         session: &mut OpenSession,
+        jobs: &JobRunner,
         pipeline: &Pipeline,
         checks: &ChecksEngine,
     ) {
@@ -302,7 +374,17 @@ impl SessionWindow {
                 let same_view = self.plan.view_key().map(str::to_string)
                     == self.mosaic.view_key(&session.mosaic.config.ui);
                 let plan_stretch = self.plan.stretch_for_view().filter(|_| same_view);
+                // A merge running says it all: no tag meanwhile.
+                let tag = if jobs.blending() {
+                    None
+                } else {
+                    canvas_tag(session, self.mosaic.members())
+                };
+                self.mosaic.set_tag(tag);
                 self.mosaic.show(ui, session, &self.look, plan_stretch);
+                if self.mosaic.take_reveal_settings() {
+                    self.inspector.reveal(MERGE_SETTINGS);
+                }
             }
         }
     }

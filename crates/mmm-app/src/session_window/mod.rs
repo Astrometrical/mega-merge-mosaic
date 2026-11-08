@@ -95,7 +95,7 @@ use serde_json::Value;
 use crate::camera::Camera;
 use crate::checks::ChecksEngine;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
-use crate::jobs::{JobEvent, JobRunner, JobTarget};
+use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
 use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
@@ -186,6 +186,8 @@ pub struct SessionWindow {
     /// A text field had the keyboard when the last frame ended: an Esc now
     /// left it (egui lets go of the field before the shortcuts see the key).
     was_typing: bool,
+    /// Merge settings was opened by itself after the first analysis.
+    settings_revealed: bool,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -225,6 +227,7 @@ impl SessionWindow {
             toasts: Vec::new(),
             panel_list_open: false,
             was_typing: false,
+            settings_revealed: false,
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -265,14 +268,32 @@ impl SessionWindow {
         self.view = Some(view);
     }
 
-    /// Merge every group over the whole canvas and show the mosaic, where
-    /// the merge goes; nothing while
-    /// [`MosaicView::merge_block_reason`] gives a reason.
+    /// **Merge**: commit the merge settings draft, merge every group that
+    /// needs it ([`steps::groups_to_merge`]: out of date, or its settings
+    /// changed) over the whole canvas and show the mosaic, where the merge
+    /// goes; nothing while [`MosaicView::merge_block_reason`] gives a reason.
     pub fn merge(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
         if self.mosaic.merge_block_reason(session, jobs).is_some() {
             return;
         }
-        self.mosaic.merge_all(session, jobs);
+        let groups = steps::groups_to_merge(session);
+        self.mosaic.merge_these(session, jobs, groups);
+        self.set_mode(CanvasMode::Mosaic);
+    }
+
+    /// **Merge this group**: commit the draft and merge `group` alone over
+    /// the whole canvas, showing the mosaic. Other merges, running or
+    /// queued, keep the settings they were queued with.
+    pub fn merge_group(&mut self, session: &mut OpenSession, jobs: &mut JobRunner, group: &str) {
+        if self
+            .mosaic
+            .merge_group_block_reason(session, jobs, group)
+            .is_some()
+        {
+            return;
+        }
+        self.mosaic
+            .merge_these(session, jobs, vec![group.to_string()]);
         self.set_mode(CanvasMode::Mosaic);
     }
 
@@ -304,6 +325,16 @@ impl SessionWindow {
     /// classifies the results again, [`OpenSession::results`]).
     pub fn on_event(&mut self, session: &mut OpenSession, jobs: &JobRunner, event: &JobEvent) {
         self.mosaic.on_event(event);
+        // Findability (spec §11): Merge settings opens by itself when the
+        // first analysis of a session never merged finishes, once.
+        if let JobEvent::Finished { label, .. } = event
+            && label == ANALYZE_LABEL
+            && !session.merged
+            && !self.settings_revealed
+        {
+            self.settings_revealed = true;
+            self.inspector.reveal(MERGE_SETTINGS);
+        }
         if let JobEvent::Finished { id, .. } = event
             && let Some((JobTarget::Blend, group)) = jobs.target(*id)
         {
@@ -554,7 +585,7 @@ impl SessionWindow {
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| {
                 self.view_bar(ui, session, jobs, pipeline);
-                self.canvas_ui(ui, session, pipeline, checks);
+                self.canvas_ui(ui, session, jobs, pipeline, checks);
             });
         self.mosaic.export_ui(&ctx, session, jobs);
         self.follow_settings();

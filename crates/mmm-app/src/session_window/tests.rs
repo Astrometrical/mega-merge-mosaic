@@ -14,7 +14,7 @@ use mega_ui::widgets::{StepState, StripStep};
 use mmm_core::checks::{Check, CheckCode, Severity};
 use mmm_core::mosaic::{MosaicConfig, SINGLE_GROUP};
 
-use super::steps::steps;
+use super::steps::{MERGE_STEP, draft_changed, out_of_date, steps};
 use super::*;
 use crate::camera::Camera;
 use crate::checks::{ChecksEngine, ChecksReport};
@@ -559,7 +559,7 @@ fn camera_survives_the_mosaic_viewer_being_rebuilt() {
     });
     {
         let st = h.state_mut();
-        st.w.merge(&mut st.session, &mut st.jobs);
+        st.w.merge_group(&mut st.session, &mut st.jobs, "Ha");
     }
     assert!(h.state().jobs.blend_pending("Ha"));
     step_until(&mut h, |st| !st.jobs.busy() && st.w.mosaic().is_settled());
@@ -1841,7 +1841,7 @@ fn ctrl_enter_merges_when_merge_is_allowed() {
     // Merged: the main button reads Export…, and Ctrl+Enter merges
     // nothing.
     step_until(&mut h, |st| {
-        !st.jobs.busy() && st.session.merged && !super::steps::needs_merge(&st.session)
+        !st.jobs.busy() && st.session.merged && !super::steps::merge_needed(&st.session)
     });
     h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
     h.run_steps(2);
@@ -2509,5 +2509,324 @@ fn a_failed_analysis_edit_raises_a_problem_toast() {
             .starts_with("Could not change the settings")
     );
     assert!(toasts[0].undo.is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The merge settings draft of `s` with its feather width set to `px`.
+fn set_draft_feather(s: &mut OpenSession, px: f32) {
+    let mut draft = crate::blend_settings::load_draft(&s.mosaic.config);
+    draft.feather_px = px;
+    crate::blend_settings::save_draft(&mut s.mosaic.config.ui, &draft);
+}
+
+/// The feather width of `group`'s last whole-canvas merge.
+fn merged_feather(s: &OpenSession, group: &str) -> Option<f32> {
+    mmm_core::mosaic::last_merge_settings(&s.mosaic.config, group).map(|b| b.feather_px)
+}
+
+/// Step until nothing in the window blocks a merge.
+fn until_mergeable(h: &mut Harness<'static, State>) {
+    step_until(h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+}
+
+/// The accessible description of the chip labelled `label` (a toggle).
+fn chip_state(h: &Harness<'static, State>, label: &str) -> Option<String> {
+    h.get_by_label(label).accesskit_node().description()
+}
+
+#[test]
+fn merge_commits_the_draft_and_merges_what_needs_it() {
+    let (root, mut s, jobs) = merged("window-merge-commits");
+    let old = s.mosaic.config.blend.feather_px;
+    set_draft_feather(&mut s, old + 100.0);
+    let mut h = harness(State::new(s, jobs));
+    until_mergeable(&mut h);
+    h.run_steps(3);
+    // Merge is offered, and the draft is not yet the config's.
+    assert!(h.state().w.can_merge(&h.state().session, &h.state().jobs));
+    assert_eq!(h.state().session.mosaic.config.blend.feather_px, old);
+    let gate = h.state_mut().jobs.hold();
+    click_rightmost(&h, "Merge");
+    h.run_steps(2);
+    assert_eq!(
+        h.state().session.mosaic.config.blend.feather_px,
+        old + 100.0
+    );
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let st = h.state();
+    for g in ["Ha", "OIII"] {
+        assert_eq!(merged_feather(&st.session, g), Some(old + 100.0), "{g}");
+        assert!(!draft_changed(&st.session, g));
+    }
+    assert_eq!(shown_steps(st)[2], strip("Merged", StepState::Done));
+    // Only what needs it merges: Ha went out of date.
+    h.state_mut()
+        .session
+        .results
+        .insert("Ha".into(), ResultState::Stale);
+    until_mergeable(&mut h);
+    let gate = h.state_mut().jobs.hold();
+    click_rightmost(&h, "Merge");
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn settings_changed_is_not_out_of_date() {
+    let (root, mut s, jobs) = merged("window-settings-changed");
+    let old = s.mosaic.config.blend.feather_px;
+    set_draft_feather(&mut s, old + 100.0);
+    let mut h = harness(State::new(s, jobs));
+    until_mergeable(&mut h);
+    h.run_steps(3);
+    let st = h.state();
+    assert_eq!(
+        shown_steps(st)[MERGE_STEP],
+        strip("Settings changed", StepState::Next)
+    );
+    assert!(draft_changed(&st.session, "Ha") && !out_of_date(&st.session, "Ha"));
+    // The main button merges; export stays allowed.
+    assert!(!rightmost_disabled(&h, "Merge"));
+    assert!(st.w.mosaic().export_block_reason().is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn out_of_date_wins() {
+    let (root, mut s, jobs) = merged("window-out-of-date-wins");
+    let old = s.mosaic.config.blend.feather_px;
+    set_draft_feather(&mut s, old + 100.0);
+    s.results.insert("Ha".into(), ResultState::Stale);
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    assert_eq!(
+        shown_steps(h.state())[MERGE_STEP],
+        strip("Out of date", StepState::Next)
+    );
+    // A group needing analysis is out of date too, though its result is
+    // complete.
+    let st = h.state_mut();
+    st.session
+        .results
+        .insert("Ha".into(), ResultState::Complete);
+    st.session.mosaic.config.needs_analyze.insert("OIII".into());
+    assert!(out_of_date(&st.session, "OIII"));
+    assert!(!draft_changed(&st.session, "OIII"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_this_group_merges_one() {
+    let (root, mut s, jobs) = merged("window-merge-this-group");
+    let old = s.mosaic.config.blend.feather_px;
+    set_draft_feather(&mut s, old + 100.0);
+    let mut h = harness(State::new(s, jobs));
+    until_mergeable(&mut h);
+    step_until(&mut h, |st| st.w.view().is_some());
+    let gate = h.state_mut().jobs.hold();
+    h.get_by_label("OIII · 4").click_secondary();
+    h.run_steps(3);
+    h.get_by_label("Merge this group").click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Merge OIII"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let st = h.state();
+    assert_eq!(merged_feather(&st.session, "OIII"), Some(old + 100.0));
+    assert_eq!(merged_feather(&st.session, "Ha"), Some(old));
+    assert!(draft_changed(&st.session, "Ha"));
+    // Merge then takes up what is left.
+    until_mergeable(&mut h);
+    let gate = h.state_mut().jobs.hold();
+    click_rightmost(&h, "Merge");
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_running_merge_keeps_its_settings_across_a_commit() {
+    let (root, s, jobs) = merged("window-merge-keeps-settings");
+    let old = s.mosaic.config.blend.feather_px;
+    let mut h = harness(State::new(s, jobs));
+    until_mergeable(&mut h);
+    step_until(&mut h, |st| st.w.view().is_some());
+    let gate = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.w.merge_group(&mut st.session, &mut st.jobs, "OIII");
+    }
+    assert_eq!(labels(&h.state().jobs), ["Merge OIII"]);
+    {
+        let st = h.state_mut();
+        set_draft_feather(&mut st.session, old + 100.0);
+        st.w.merge_group(&mut st.session, &mut st.jobs, "Ha");
+    }
+    assert_eq!(labels(&h.state().jobs), ["Merge OIII", "Merge Ha"]);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let st = h.state();
+    assert_eq!(
+        merged_feather(&st.session, "OIII"),
+        Some(old),
+        "B keeps its settings"
+    );
+    assert!(draft_changed(&st.session, "OIII"));
+    assert_eq!(st.session.results.get("OIII"), Some(&ResultState::Complete));
+    assert_eq!(merged_feather(&st.session, "Ha"), Some(old + 100.0));
+    assert_eq!(st.session.mosaic.config.blend.feather_px, old + 100.0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn chips_mark_their_state() {
+    let (root, mut s, jobs) = merged("window-chip-marks");
+    let old = s.mosaic.config.blend.feather_px;
+    let mut comp = Composition::new("HO");
+    comp.channels = [Some(("Ha".into(), 1.0)), Some(("OIII".into(), 1.0)), None];
+    save_compositions(&mut s.mosaic.config.ui, &[comp]);
+    let mut h = harness(State::new(s, jobs));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(2);
+    assert_eq!(chip_state(&h, "Ha · 4"), None);
+    assert_eq!(chip_state(&h, "OIII · 4"), None);
+    // Settings changed: both groups, and the composite.
+    set_draft_feather(&mut h.state_mut().session, old + 100.0);
+    h.run_steps(2);
+    let changed = Some("settings changed".to_string());
+    assert_eq!(chip_state(&h, "Ha · 4"), changed);
+    assert_eq!(chip_state(&h, "OIII · 4"), changed);
+    assert_eq!(chip_state(&h, "HO"), changed);
+    // Out of date wins, and the composite takes the worst.
+    h.state_mut()
+        .session
+        .results
+        .insert("Ha".into(), ResultState::Stale);
+    h.run_steps(2);
+    let stale = Some("out of date".to_string());
+    assert_eq!(chip_state(&h, "Ha · 4"), stale);
+    assert_eq!(chip_state(&h, "OIII · 4"), changed);
+    assert_eq!(chip_state(&h, "HO"), stale);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_canvas_tags_say_why() {
+    let (root, s, jobs) = merged("window-canvas-tags");
+    let old = s.mosaic.config.blend.feather_px;
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Mosaic);
+    state.w.select_view(ViewKind::Group("Ha".into()));
+    let mut h = harness(state);
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    h.run_steps(3);
+    let shown = |h: &Harness<'static, State>, t: &str| h.query_by_label(t).is_some();
+    // Up to date: no tag.
+    assert!(!shown(&h, "Settings changed since this merge"));
+    // Settings changed since the merge.
+    set_draft_feather(&mut h.state_mut().session, old + 100.0);
+    h.run_steps(3);
+    assert!(shown(&h, "Settings changed since this merge"));
+    // Clicking it reveals Merge settings.
+    assert!(!h.state().w.inspector().is_open("merge-settings"));
+    h.get_by_label("Settings changed since this merge").click();
+    h.run_steps(3);
+    assert!(h.state().w.inspector().is_open("merge-settings"));
+    // A merge that did not finish.
+    h.state_mut()
+        .session
+        .results
+        .insert("Ha".into(), ResultState::Partial);
+    h.run_steps(3);
+    assert!(shown(&h, "Out of date — merge didn't finish"));
+    // The panels changed after the analysis.
+    h.state_mut()
+        .session
+        .mosaic
+        .config
+        .needs_analyze
+        .insert("Ha".into());
+    h.run_steps(3);
+    assert!(shown(&h, "Out of date — panels changed"));
+    // The analysis settings changed.
+    {
+        use mmm_core::photometry::GainMode;
+        let cfg = &mut h.state_mut().session.mosaic.config;
+        cfg.analyze.gain = match cfg.analyze.gain {
+            GainMode::Unity => GainMode::Fit,
+            _ => GainMode::Unity,
+        };
+    }
+    h.run_steps(3);
+    assert!(shown(&h, "Out of date — analysis settings changed"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_group_never_merged_says_so() {
+    let (root, mut s, mut jobs) = analyzed("window-not-merged-tag");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.merged = any_merged(&s);
+    s.results = classify_results(&s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Mosaic);
+    state.w.select_view(ViewKind::Group("OIII".into()));
+    let mut h = harness(state);
+    h.run_steps(5);
+    h.get_by_label("Not merged yet");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_settings_open_when_analysis_first_finishes() {
+    let root = temp_dir("window-settings-open");
+    let mut state = State::new(two_group_session(&root), runner());
+    state.run_pipeline = true;
+    let mut h = harness(state);
+    assert!(!h.state().w.inspector().is_open("merge-settings"));
+    step_until(&mut h, |st| {
+        st.w.mosaic()
+            .merge_block_reason(&st.session, &st.jobs)
+            .is_none()
+    });
+    assert!(!h.state().session.merged);
+    assert!(h.state().w.inspector().is_open("merge-settings"));
+    // Closed by the user, it stays closed through a later analysis.
+    h.state_mut().w.inspector_mut().toggle("merge-settings");
+    assert!(!h.state().w.inspector().is_open("merge-settings"));
+    {
+        let st = h.state_mut();
+        let id = st.jobs.start_analyze(&mut st.session);
+        st.w.track_analysis(id);
+    }
+    step_until(&mut h, |st| !st.jobs.busy());
+    assert!(!h.state().w.inspector().is_open("merge-settings"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn analysis_in_a_merged_session_leaves_merge_settings_alone() {
+    let (root, s, jobs) = merged("window-settings-merged-analysis");
+    let mut h = harness(State::new(s, jobs));
+    h.run_steps(3);
+    {
+        let st = h.state_mut();
+        let id = st.jobs.start_analyze(&mut st.session);
+        st.w.track_analysis(id);
+    }
+    step_until(&mut h, |st| !st.jobs.busy());
+    assert!(!h.state().w.inspector().is_open("merge-settings"));
     let _ = std::fs::remove_dir_all(&root);
 }

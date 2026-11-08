@@ -261,6 +261,11 @@ impl SettingsPanel {
             .then_some("Feather width must be a number above 0")
     }
 
+    /// Raise `message` as a problem (the window's Problem toast).
+    pub fn set_problem(&mut self, message: String) {
+        self.problem = Some(message);
+    }
+
     /// The analysis settings from before the last applied change, once
     /// (for the window's Undo toast).
     pub fn take_analysis_undo(&mut self) -> Option<AnalyzeSettings> {

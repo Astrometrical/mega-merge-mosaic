@@ -4,13 +4,14 @@
 //! right, the main button:
 //! **Add panels…** while the session has no panels (it opens the panel
 //! list and its file dialog), **Merge** while a merge is needed
-//! ([`needs_merge`]) followed by the merge settings' summary ("Pyramid ·
+//! ([`merge_needed`]) followed by the merge settings' summary ("Pyramid ·
 //! feather 256 px", which opens Merge settings), else **Export…**.
 //!
 //! The steps act as navigation: Panels opens or closes the panel list (and
 //! reads the previews again once they stopped short), Checks opens
 //! Problems (or, while it offers **Analyse**, [`offers_analysis`], starts
-//! the analysis; never while one runs), Merge merges every group while it is to do (merging or
+//! the analysis; never while one runs), Merge merges the groups that need it
+//! ([`merge_needed`]: out of date, or their merge settings changed) while it is next (merging or
 //! merged, it shows the mosaic), Export opens the Export dialog. A step
 //! that cannot act now says why in its tooltip (Merge: the main button's
 //! reason; Export: [`MosaicView::export_block_reason`]), as a disabled
@@ -36,7 +37,7 @@ use mega_ui::widgets::{
 
 use super::steps::{
     CHECKS_STEP, EXPORT_STEP, MERGE_STEP, PANELS_STEP, is_analysis, is_previews, jobs_where,
-    needs_merge, offers_analysis, steps,
+    merge_needed, offers_analysis, steps,
 };
 use super::{CanvasMode, MERGE_SETTINGS, PROBLEMS, SessionWindow, shortcuts};
 use crate::blend_settings::{feather_text, load_draft, mode_name};
@@ -56,7 +57,7 @@ const MERGING: &str = "Merging: the Merge step shows how far it is";
 enum Main {
     /// Open the panel list and its file dialog.
     AddPanels,
-    /// Merge every group.
+    /// Merge the groups that need it.
     Merge,
     /// Open Merge settings.
     Settings,
@@ -170,7 +171,7 @@ impl SessionWindow {
     }
 
     /// Why the main button's **Merge** cannot be pressed now, if it cannot
-    /// (it shows only while [`needs_merge`]): a whole-canvas merge running,
+    /// (it shows only while [`merge_needed`]): a whole-canvas merge running,
     /// or [`MosaicView::merge_block_reason`](crate::mosaic_view::MosaicView::merge_block_reason).
     /// An ROI's merge is no reason to wait (it may be cut short).
     fn merge_block(&self, session: &OpenSession, jobs: &JobRunner) -> Option<String> {
@@ -185,7 +186,7 @@ impl SessionWindow {
     /// (what `Ctrl+Enter` presses).
     pub(super) fn can_merge(&self, session: &OpenSession, jobs: &JobRunner) -> bool {
         !session.mosaic.config.panels.is_empty()
-            && needs_merge(session)
+            && merge_needed(session)
             && self.merge_block(session, jobs).is_none()
     }
 
@@ -206,7 +207,7 @@ impl SessionWindow {
             {
                 asked = Some(Main::AddPanels);
             }
-        } else if needs_merge(session) {
+        } else if merge_needed(session) {
             let b = &load_draft(&session.mosaic.config);
             let summary = format!(
                 "{} · feather {} px",
