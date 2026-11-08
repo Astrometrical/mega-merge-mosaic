@@ -20,10 +20,12 @@
 //!   and frame). The canvas extent is the shared frame's canvas, which does
 //!   not move as previews arrive (so the user's zoom is kept).
 //! - **Camera.** [`PlanView::set_camera`] moves the canvas without
-//!   animation. The canvas fits its extent on its first frame and whenever
-//!   the extent changes; a camera set before the frame's canvas is known
-//!   (the extent is then the drawn panels') is put back after each such fit,
-//!   until the canvas draws the frame's extent.
+//!   animation, from the next frame drawn. The canvas fits its extent on its
+//!   first frame and whenever the extent changes; the camera is shown in
+//!   place of those fits ([`PlanCanvas::set_view_for`]), so they are never
+//!   painted. Set before the frame's canvas is known (the extent is then the
+//!   drawn panels'), it is kept for each new extent until the canvas draws
+//!   the frame's.
 //! - **Memory.** The textures are dropped once the view has been hidden for
 //!   [`RELEASE_AFTER`] ([`PlanView::release_if_hidden`]) and rebuilt from
 //!   the in-memory previews when it is shown again.
@@ -564,13 +566,15 @@ struct ViewSpec {
     mapping: Vec<Option<String>>,
 }
 
-/// A camera set from outside, put back after the canvas fits a provisional
-/// extent (see the module docs).
+/// A camera set from outside, kept for each extent the canvas draws until
+/// it draws the frame's (see the module docs).
 #[derive(Clone, Copy, Debug)]
 struct HeldCamera {
     camera: Camera,
-    /// Applied to the canvas's view since it was set.
-    applied: bool,
+    /// The extent it was last handed to the canvas for.
+    extent: Option<[f64; 4]>,
+    /// The canvas has drawn a frame through it since it was handed over.
+    drawn: bool,
 }
 
 /// The plan canvas of the open session: what it draws, and the work behind
@@ -580,8 +584,6 @@ pub struct PlanView {
     canvas: PlanCanvas,
     selected: Option<PathBuf>,
     held_camera: Option<HeldCamera>,
-    /// The extent the canvas last fitted (it fits again when it changes).
-    fitted: Option<[f64; 4]>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
     textures: HashMap<TexKey, egui::TextureHandle>,
@@ -635,7 +637,6 @@ impl PlanView {
             canvas: PlanCanvas::new(),
             selected: None,
             held_camera: None,
-            fitted: None,
             textures_for: None,
             textures: HashMap::new(),
             requested: HashSet::new(),
@@ -682,7 +683,7 @@ impl PlanView {
     #[allow(dead_code)] // used by the session window from Task 7 on
     pub fn camera(&self) -> Option<Camera> {
         if let Some(held) = self.held_camera
-            && !held.applied
+            && !held.drawn
         {
             return Some(held.camera);
         }
@@ -696,7 +697,8 @@ impl PlanView {
     pub fn set_camera(&mut self, camera: Camera) {
         self.held_camera = Some(HeldCamera {
             camera,
-            applied: false,
+            extent: None,
+            drawn: false,
         });
     }
 
@@ -836,7 +838,7 @@ impl PlanView {
     }
 
     /// The canvas over `extent` (`fixed`: the frame's, not the drawn
-    /// panels'), with a held camera put back after the canvas fits.
+    /// panels'), through a held camera.
     fn canvas_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -847,28 +849,23 @@ impl PlanView {
         look: &CanvasLook,
     ) {
         let now = ui.input(|i| i.time);
-        // The canvas fits the extent this frame when it is new.
-        let refit = self.fitted != Some(extent);
-        if !refit
-            && let Some(held) = &mut self.held_camera
-            && !held.applied
+        if let Some(held) = &mut self.held_camera
+            && held.extent != Some(extent)
         {
-            held.camera.apply(self.canvas.view_mut(), now);
-            held.applied = true;
+            let Camera { centre, zoom } = held.camera;
+            self.canvas.set_view_for(extent, centre, zoom);
+            held.extent = Some(extent);
+            held.drawn = false;
         }
         let r = self
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);
-        let drawn = self.canvas.last_frame().is_some_and(|(_, t)| t == now);
-        if drawn {
-            self.fitted = Some(extent);
-            if refit && let Some(held) = &mut self.held_camera {
-                // Drawn fitted this once; the camera from the next frame.
-                held.camera.apply(self.canvas.view_mut(), now);
-                held.applied = true;
-                ui.ctx().request_repaint();
+        if self.canvas.last_frame().is_some_and(|(_, t)| t == now) {
+            if let Some(held) = &mut self.held_camera {
+                held.drawn = true;
             }
             if fixed {
+                // No fit of a later extent to keep it from.
                 self.held_camera = None;
             }
         }

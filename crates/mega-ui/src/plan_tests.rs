@@ -240,3 +240,84 @@ fn drag_eases_without_reversal() {
     let moved = drawn_label(&h, "1") - p0;
     assert!((moved - d * 11.0).length() < 0.5, "{moved:?}");
 }
+
+/// Centre of item `label`'s number as drawn last frame.
+fn label_centre(h: &Harness<'_, State>, label: &str) -> Pos2 {
+    h.output()
+        .shapes
+        .iter()
+        .find_map(|cs| match &cs.shape {
+            egui::Shape::Text(t) if t.galley.text() == label => Some(t.pos + t.galley.size() / 2.0),
+            _ => None,
+        })
+        .expect("label drawn")
+}
+
+/// Where a view at `centre` and `zoom` puts canvas point `p` in the last
+/// frame's viewport.
+fn through(h: &Harness<'_, State>, centre: (f64, f64), zoom: f64, p: (f64, f64)) -> Pos2 {
+    let (rect, _) = h.state().canvas.last_frame().expect("shown");
+    rect.center()
+        + Vec2::new(
+            ((p.0 - centre.0) * zoom) as f32,
+            ((p.1 - centre.1) * zoom) as f32,
+        )
+}
+
+#[test]
+fn set_view_for_replaces_the_fit() {
+    let items = vec![item(1, [400.0, 400.0, 600.0, 600.0])];
+    let first = [0.0, 0.0, 1000.0, 1000.0];
+    let mut h = harness(first, items);
+    h.run();
+    // The extent already fitted: the next frame is painted through the view.
+    h.state_mut()
+        .canvas
+        .set_view_for(first, (300.0, 450.0), 2.0);
+    h.step();
+    let want = through(&h, (300.0, 450.0), 2.0, (500.0, 500.0));
+    assert!((label_centre(&h, "1") - want).length() < 0.5);
+    // A new extent: its first frame is painted through the view, never
+    // fitted, and the view stays.
+    let wide = [0.0, 0.0, 2000.0, 1000.0];
+    h.state_mut().extent = wide;
+    h.state_mut().canvas.set_view_for(wide, (700.0, 300.0), 1.5);
+    h.step();
+    let want = through(&h, (700.0, 300.0), 1.5, (500.0, 500.0));
+    assert!((label_centre(&h, "1") - want).length() < 0.5);
+    h.run();
+    assert!((label_centre(&h, "1") - want).length() < 0.5);
+    // The zoom limits are the new extent's fit's: half the fit zoom at least.
+    let wider = [0.0, 0.0, 4000.0, 1000.0];
+    h.state_mut().extent = wider;
+    h.state_mut()
+        .canvas
+        .set_view_for(wider, (2000.0, 500.0), 1e-3);
+    h.step();
+    let (rect, now) = h.state().canvas.last_frame().unwrap();
+    let fit = (f64::from(rect.width()) / 4000.0).min(f64::from(rect.height()) / 1000.0);
+    let zoom = h.state().canvas.view().zoom(now);
+    assert!((zoom - fit / 2.0).abs() < 1e-9, "{zoom} vs fit {fit}");
+    // Given for another extent than the one drawn: forgotten, and the drawn
+    // extent is fitted as usual.
+    let small = [0.0, 0.0, 500.0, 500.0];
+    h.state_mut().extent = small;
+    h.state_mut()
+        .canvas
+        .set_view_for([0.0, 0.0, 1.0, 1.0], (0.5, 0.5), 3.0);
+    h.step();
+    let (_, now) = h.state().canvas.last_frame().unwrap();
+    let c = h.state().canvas.view().centre(now);
+    assert!(
+        (c.0 - 250.0).abs() < 1e-9 && (c.1 - 250.0).abs() < 1e-9,
+        "{c:?}"
+    );
+    h.state_mut().extent = first;
+    h.step();
+    let (_, now) = h.state().canvas.last_frame().unwrap();
+    let c = h.state().canvas.view().centre(now);
+    assert!(
+        (c.0 - 500.0).abs() < 1e-9 && (c.1 - 500.0).abs() < 1e-9,
+        "{c:?}"
+    );
+}

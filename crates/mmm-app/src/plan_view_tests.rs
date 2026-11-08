@@ -126,6 +126,61 @@ fn shown(h: &Harness<'_, State>) -> Option<Camera> {
     Some(Camera::of(canvas.view(), now))
 }
 
+/// Asserts the last frame painted each visible panel's number where `cam`
+/// puts the panel's centre: the painted frame itself, not the view after it.
+fn assert_painted_with(h: &Harness<'_, State>, cam: Camera) {
+    let (rect, _) = h.state().view.canvas.last_frame().expect("drawn");
+    let screen = |p: (f64, f64)| {
+        rect.center()
+            + egui::vec2(
+                ((p.0 - cam.centre.0) * cam.zoom) as f32,
+                ((p.1 - cam.centre.1) * cam.zoom) as f32,
+            )
+    };
+    let mut checked = 0;
+    for it in h.state().view.items() {
+        let r = egui::Rect::from_two_pos(
+            screen((it.rect[0], it.rect[1])),
+            screen((it.rect[2], it.rect[3])),
+        );
+        if !r.intersects(rect) {
+            continue;
+        }
+        let got = h
+            .output()
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == it.label => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("panel number painted");
+        let want = r.center();
+        assert!(
+            (got - want).length() < 0.5,
+            "panel {} painted at {got:?}; the camera puts it at {want:?}",
+            it.label
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no panel painted");
+}
+
+/// Step until `done` holds, stopping at the frame that made it so.
+fn step_to(h: &mut Harness<'_, State>, done: impl Fn(&State) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done(h.state()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the plan"
+        );
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn assert_camera(got: Option<Camera>, want: Camera) {
     let got = got.expect("a camera");
     let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
@@ -182,23 +237,27 @@ fn camera_round_trips() {
     state.view.set_camera(early);
     assert_camera(state.view.camera(), early);
     let mut h = harness_of(state);
+    // The first frame the canvas draws is painted through the camera: the
+    // canvas never shows its fit of the previews' extent.
+    step_to(&mut h, |s| s.view.canvas.last_frame().is_some());
+    assert_eq!(h.state().view.frame_canvas(), None, "the previews' extent");
+    assert_painted_with(&h, early);
     step_until(&mut h, |s| textured_of(s) == 2);
-    let (w, hgt) = frame.canvas();
-    let whole = [0.0, 0.0, w as f64, hgt as f64];
-    let fitted = h.state().view.fitted.expect("drawn");
-    assert_ne!(fitted, whole, "the previews' extent");
     assert_camera(h.state().view.camera(), early);
     assert_camera(shown(&h), early);
-    // The frame arrives: the canvas fits it, and the camera is put back.
+    assert_painted_with(&h, early);
+    // The frame arrives: the frame that draws its extent is painted through
+    // the camera too.
     let dir = h.state().session.mosaic.dir.clone();
     frame
         .save(&mmm_core::preview::preview_frame_path(&dir))
         .unwrap();
     h.state_mut().generation = 2;
-    step_until(&mut h, |s| s.view.fitted == Some(whole));
+    step_to(&mut h, |s| s.view.frame_canvas().is_some());
+    assert_painted_with(&h, early);
     assert_camera(h.state().view.camera(), early);
     assert_camera(shown(&h), early);
-    // Set once drawn: drawn from the next frame on.
+    // Set once drawn: painted from the next frame on.
     let later = Camera {
         centre: (420.0, 90.0),
         zoom: 2.5,
@@ -206,6 +265,7 @@ fn camera_round_trips() {
     h.state_mut().view.set_camera(later);
     assert_camera(h.state().view.camera(), later);
     h.step();
+    assert_painted_with(&h, later);
     assert_camera(h.state().view.camera(), later);
     assert_camera(shown(&h), later);
     // And it stays.
