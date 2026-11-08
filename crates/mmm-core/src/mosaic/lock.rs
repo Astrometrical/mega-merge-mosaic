@@ -5,9 +5,12 @@
 //! session directory, released when the [`SessionLock`] drops (or the
 //! process exits, however it ends). The file is never deleted and holds no
 //! data, so it does not make a directory look like a mosaic or a group.
+//! Taking the lock waits out brief contention ([`LOCK_CONTENTION_WAIT`]) before
+//! it reports the session busy.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
@@ -29,9 +32,20 @@ impl SessionLock {
     }
 }
 
+/// How long [`lock_session`] keeps retrying a contended lock before it
+/// reports [`Error::Busy`]. It rides out the microseconds-long shared probe of
+/// [`session_busy`] (and a just-dropped holder); a real holder still yields
+/// `Busy`, at most this long after the call.
+pub const LOCK_CONTENTION_WAIT: Duration = Duration::from_millis(250);
+
+/// Pause between lock attempts while waiting out contention.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 /// Take the exclusive session lock on `dir` (which must exist), creating
-/// [`LOCK_FILE`] if missing. Fails with [`Error::Busy`] (naming `dir`) while
-/// another holder, in this process or another, has it.
+/// [`LOCK_FILE`] if missing. A contended lock is retried for up to
+/// [`LOCK_CONTENTION_WAIT`] so a brief holder (such as a [`session_busy`]
+/// probe) does not count; it then fails with [`Error::Busy`] (naming `dir`)
+/// while another holder, in this process or another, still has it.
 pub fn lock_session(dir: &Path) -> Result<SessionLock> {
     let path = dir.join(LOCK_FILE);
     let file = OpenOptions::new()
@@ -40,13 +54,23 @@ pub fn lock_session(dir: &Path) -> Result<SessionLock> {
         .write(true)
         .open(&path)
         .map_err(|e| Error::io(&path, e))?;
-    match file.try_lock() {
-        Ok(()) => Ok(SessionLock {
-            dir: dir.to_path_buf(),
-            _file: file,
-        }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(Error::busy(dir)),
-        Err(std::fs::TryLockError::Error(e)) => Err(Error::io(&path, e)),
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                return Ok(SessionLock {
+                    dir: dir.to_path_buf(),
+                    _file: file,
+                });
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if start.elapsed() >= LOCK_CONTENTION_WAIT {
+                    return Err(Error::busy(dir));
+                }
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(Error::io(&path, e)),
+        }
     }
 }
 
@@ -100,6 +124,46 @@ mod tests {
         drop(first);
         let again = lock_session(&dir).unwrap();
         assert_eq!(again.dir(), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mmm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_brief_shared_probe_does_not_make_the_lock_busy() {
+        let dir = fresh_dir("probe");
+        let path = dir.join(LOCK_FILE);
+        std::fs::write(&path, b"").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let prober = std::thread::spawn(move || {
+            let file = File::open(&path).unwrap();
+            file.lock_shared().unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            file.unlock().unwrap();
+        });
+        rx.recv().unwrap();
+        let lock = lock_session(&dir);
+        prober.join().unwrap();
+        assert!(lock.is_ok(), "{:?}", lock.err());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_lock_is_still_busy() {
+        let dir = fresh_dir("held");
+        let held = lock_session(&dir).unwrap();
+        let start = std::time::Instant::now();
+        let err = lock_session(&dir).unwrap_err();
+        assert!(err.is_busy(), "{err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

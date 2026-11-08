@@ -41,7 +41,9 @@ pub mod grouping;
 mod lock;
 mod run;
 
-pub use lock::{LOCK_FILE, SessionLock, busy_message, lock_session, session_busy};
+pub use lock::{
+    LOCK_CONTENTION_WAIT, LOCK_FILE, SessionLock, busy_message, lock_session, session_busy,
+};
 
 pub use run::{
     AnalyzeGroup, AnalyzeOutcome, AnalyzePlan, BlendPlan, Mosaic, analyze_all, blend_group,
