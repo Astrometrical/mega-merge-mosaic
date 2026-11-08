@@ -94,8 +94,8 @@ pub struct Shell {
     jobs: Option<JobRunner>,
     /// Job outcomes and failures to open windows.
     toasts: Toasts,
-    /// What each toast with an action undoes (dropped with the toast, and
-    /// with the session).
+    /// What each toast with an action undoes (dropped with the toast; the
+    /// toasts go with the session, [`Shell::drop_undos`]).
     undos: BTreeMap<ToastId, Undo>,
     /// Every toast's title pushed, in order (tests: a toast expires).
     #[cfg(test)]
@@ -210,7 +210,8 @@ impl Shell {
     /// Otherwise every other job is cancelled (all can be run again) and
     /// waited for, at most [`STOP_WAIT`]; pending saves are flushed
     /// ([`Shell::flush_pending_saves`]); the session is dropped with its
-    /// window, pipeline, checks and summary writer; the decode cache is
+    /// window, pipeline, checks and summary writer, and its Undo toasts
+    /// are taken down; the decode cache is
     /// forgotten; the start screen reads the session's facts again; the
     /// title names no session.
     ///
@@ -274,7 +275,7 @@ impl Shell {
             reap(leftover, summary, session.lock.take(), &dir, reaped, ctx);
         }
         self.jobs = None;
-        self.undos.clear();
+        self.drop_undos();
         drop(session);
         self.window = SessionWindow::new(self.files_picker.clone());
         self.pipeline = Pipeline::new();
@@ -286,6 +287,14 @@ impl Shell {
         self.update_title(ctx);
         ctx.request_repaint();
         Ok(())
+    }
+
+    /// Take down the toasts whose Undo would change the session being left
+    /// (or one no longer open), and forget what they undo.
+    fn drop_undos(&mut self) {
+        for id in std::mem::take(&mut self.undos).into_keys() {
+            self.toasts.dismiss(id);
+        }
     }
 
     /// Open or create a session on a background thread. With a session
@@ -410,7 +419,7 @@ impl Shell {
         self.summary = SummaryWriter::new(opened.summary.clone());
         self.session = Some(opened);
         self.jobs = Some(JobRunner::new(ctx.clone()));
-        self.undos.clear();
+        self.drop_undos();
         // A session without panels opens on its panel list.
         self.window = SessionWindow::new(self.files_picker.clone());
         self.pipeline = Pipeline::new();
@@ -1587,6 +1596,39 @@ mod tests {
         h.get_by_label("Undo").click();
         step_until(&mut h, |_| on_disk(&dir) == 8);
         assert_eq!(MosaicConfig::load(&dir).unwrap().panels, previous.panels);
+        assert!(h.state().undos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn leaving_takes_down_the_undo_toasts() {
+        let root = temp_dir("shell-undo-leave");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let (mut h, gate) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        gate.open();
+        step_until(&mut h, |s| !s.jobs.as_ref().unwrap().busy());
+        h.run_steps(2);
+        let panel = h.state().session().unwrap().mosaic.config.panels[7].clone();
+        let removed = vec![(7, panel)];
+        h.state_mut().window.push_toast(WindowToast {
+            toast: Toast {
+                tone: Tone::Neutral,
+                title: "Removed 1 panel".into(),
+                detail: None,
+                action: Some("Undo".into()),
+            },
+            undo: Some(Undo::Readd(removed)),
+        });
+        h.run_steps(2);
+        h.get_by_label("Removed 1 panel");
+        // Its Undo would change a session no longer open: it goes too.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, BACK)
+            .click();
+        h.step();
+        assert!(h.state().session().is_none());
+        h.run_steps(2);
+        assert!(h.query_by_label("Removed 1 panel").is_none());
+        assert!(h.query_by_label("Undo").is_none());
         assert!(h.state().undos.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
