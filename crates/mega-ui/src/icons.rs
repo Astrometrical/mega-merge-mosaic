@@ -38,6 +38,8 @@ pub const INFO: char = '\u{e0f9}';
 pub const CHEVRON_RIGHT: char = '\u{e06f}';
 /// `chevron-down`
 pub const CHEVRON_DOWN: char = '\u{e06d}';
+/// `chevron-up`
+pub const CHEVRON_UP: char = '\u{e070}';
 /// `arrow-left`
 pub const ARROW_LEFT: char = '\u{e048}';
 /// `search`

@@ -1017,3 +1017,92 @@ fn long_drag_refreshes_every_drawn_tile() {
         fine.len()
     );
 }
+
+#[test]
+fn presentation_ignores_drag() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut viewer = TiledViewer::new_synchronous(src);
+    viewer.set_presentation(true);
+    let mut h = harness(viewer);
+    h.run();
+    let before = centre_zoom(h.state());
+    let (a, b) = (Pos2::new(700.0, 500.0), Pos2::new(300.0, 200.0));
+    h.drag_at(a);
+    h.step();
+    h.hover_at(Pos2::new(500.0, 350.0));
+    h.step();
+    h.hover_at(b);
+    h.step();
+    h.drop_at(b);
+    h.run();
+    assert_eq!(centre_zoom(h.state()), before);
+}
+
+#[test]
+fn presentation_has_no_buttons() {
+    let src = TestSource::new(5000, 5000);
+    let mut viewer = TiledViewer::new_synchronous(src.clone());
+    viewer.set_presentation(true);
+    let mut h = harness(viewer);
+    h.run();
+    assert!(h.query_by_label("Home").is_none());
+    // Control: the normal viewer has the button.
+    let mut h = harness(TiledViewer::new_synchronous(src));
+    h.run();
+    assert!(h.query_by_label("Home").is_some());
+}
+
+#[test]
+fn presentation_draws_stale_at_full_brightness_without_background() {
+    let src = TestSource::new(5000, 5000);
+    *src.all.lock().unwrap() = Some(Kind::Stale);
+    let mut viewer = TiledViewer::new_synchronous(src);
+    viewer.set_presentation(true);
+    let mut h = harness(viewer);
+    h.run();
+    let mut meshes = 0;
+    for cs in &h.output().shapes {
+        match &cs.shape {
+            egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                assert!(m.vertices.iter().all(|v| v.color == Color32::WHITE));
+                meshes += 1;
+            }
+            egui::Shape::Rect(r) => assert_ne!(r.fill, crate::theme::palette::SURFACE_900),
+            _ => {}
+        }
+    }
+    assert!(meshes > 0);
+}
+
+#[test]
+fn view_mut_moves_the_camera() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = harness(TiledViewer::new_synchronous(src));
+    h.run();
+    let c0 = centre_zoom(h.state()).0;
+    let (_, now) = h.state().last_frame().unwrap();
+    h.state_mut().view_mut().pan_by(Vec2::new(40.0, 0.0), now);
+    h.run();
+    assert_ne!(centre_zoom(h.state()).0, c0);
+}
+
+#[test]
+fn opacity_scales_tile_tint() {
+    let src = TestSource::new(5000, 5000);
+    let mut viewer = TiledViewer::new_synchronous(src);
+    viewer.set_opacity(0.5);
+    let mut h = harness(viewer);
+    h.run();
+    let mut meshes = 0;
+    for cs in &h.output().shapes {
+        if let egui::Shape::Mesh(m) = &cs.shape
+            && m.texture_id != egui::TextureId::default()
+        {
+            meshes += 1;
+            for v in &m.vertices {
+                assert!((i32::from(v.color.a()) - 128).abs() <= 1, "{:?}", v.color);
+            }
+        }
+    }
+    assert!(meshes > 0);
+}

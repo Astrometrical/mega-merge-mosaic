@@ -87,7 +87,9 @@ use memmap2::{Mmap, MmapMut};
 
 use crate::error::{Error, Result};
 
+mod file_reader;
 mod sink;
+pub use file_reader::{FileTileReader, TileRead};
 pub use sink::{TileSink, blend_tiles, build_parents};
 
 /// The default tile edge, in pixels.
@@ -294,8 +296,15 @@ impl Layout {
 
     /// Parse and validate a mapped file.
     fn parse(path: &Path, bytes: &[u8]) -> Result<Self> {
+        Self::parse_header(path, &bytes[..bytes.len().min(HEADER_LEN)], bytes.len())
+    }
+
+    /// Parse and validate a store from its header bytes (the first
+    /// `HEADER_LEN` bytes, or fewer if the file is shorter) and the total
+    /// file length, without needing the whole file in memory.
+    fn parse_header(path: &Path, bytes: &[u8], file_len: usize) -> Result<Self> {
         let bad = |why: &str| Error::format(path, format!("tile store: {why}"));
-        if bytes.len() < HEADER_LEN {
+        if file_len < HEADER_LEN || bytes.len() < HEADER_LEN {
             return Err(bad("file shorter than its header"));
         }
         if &bytes[0..8] != MAGIC {
@@ -317,11 +326,10 @@ impl Layout {
         if u32_at(36) != layout.levels {
             return Err(bad("level count does not match geometry"));
         }
-        if bytes.len() != layout.file_len {
+        if file_len != layout.file_len {
             return Err(bad(&format!(
                 "file is {} bytes, geometry needs {}",
-                bytes.len(),
-                layout.file_len
+                file_len, layout.file_len
             )));
         }
         Ok(layout)
@@ -829,6 +837,20 @@ impl TileReader {
     ) -> Option<TileState> {
         self.raw
             .read_tile_any_with(self.raw.layout.index(level, tx, ty), out, || {})
+    }
+}
+
+impl TileRead for TileReader {
+    fn geometry(&self) -> TileGeometry {
+        TileReader::geometry(self)
+    }
+
+    fn state(&self, level: u32, tx: u32, ty: u32) -> TileState {
+        TileReader::state(self, level, tx, ty)
+    }
+
+    fn read_tile_any(&self, level: u32, tx: u32, ty: u32, out: &mut [f32]) -> Option<TileState> {
+        TileReader::read_tile_any(self, level, tx, ty, out)
     }
 }
 

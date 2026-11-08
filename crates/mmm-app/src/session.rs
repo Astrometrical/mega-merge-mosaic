@@ -11,6 +11,8 @@ use mmm_core::mosaic::{
     lock_session,
 };
 use mmm_core::reference::ReferenceFrame;
+use mmm_core::session_summary::{SessionSummary, read_summary};
+use serde_json::Value;
 
 /// A mosaic session open in this window.
 #[derive(Debug)]
@@ -30,6 +32,9 @@ pub struct OpenSession {
     /// `None` only for a check made to hand the session to a new process.
     #[allow(dead_code)] // held for its Drop, never read
     pub lock: Option<SessionLock>,
+    /// The session's `summary.json` as found when opening (`None` if absent
+    /// or unreadable); seeds the summary writer's blend and export stamps.
+    pub summary: Option<SessionSummary>,
 }
 
 impl OpenSession {
@@ -146,11 +151,13 @@ fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
     let frame = ReferenceFrame::load(&dir.join(FRAME_FILE)).ok();
     // Reads panel headers (Header rule): fine here, off the UI thread.
     let groups = mosaic.groups().ok();
+    let summary = read_summary(dir);
     Ok(OpenSession {
         mosaic,
         frame,
         groups,
         lock,
+        summary,
     })
 }
 
@@ -183,6 +190,7 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
         frame: None,
         groups: Some(Groups::default()),
         lock,
+        summary: None,
     })
 }
 
@@ -231,15 +239,57 @@ impl Pending {
     }
 }
 
-/// Open `dir` in a new window: a new process of this executable (one
-/// session per window, spec §3). The child is reaped on a helper thread.
-pub fn open_in_new_process(dir: &Path) -> std::io::Result<()> {
+/// Open `session` in a new window: a new process of this executable (one
+/// session per window, spec §3); with `None` it starts on the start
+/// screen. The child is reaped on a helper thread.
+pub fn open_in_new_process(session: Option<&Path>) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    let mut child = std::process::Command::new(exe).arg(dir).spawn()?;
+    let mut command = std::process::Command::new(exe);
+    command.args(session);
+    let mut child = command.spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// The key in a session's `ui` JSON holding its free-text notes.
+pub const NOTES_KEY: &str = "notes";
+
+/// The notes stored in `ui` (empty when there are none).
+pub fn notes(ui: &Value) -> String {
+    ui.get(NOTES_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Store `text` as the notes in `ui`, keeping everything else there (a `ui`
+/// that is not a JSON object becomes one).
+pub fn set_notes(ui: &mut Value, text: &str) {
+    if !ui.is_object() {
+        *ui = Value::Object(Default::default());
+    }
+    if let Some(obj) = ui.as_object_mut() {
+        obj.insert(NOTES_KEY.to_string(), Value::String(text.to_string()));
+    }
+}
+
+/// Save `text` as the notes of the session in `dir`, without opening it:
+/// takes the session lock for the write only. A session open elsewhere is
+/// refused (`Err(busy_message)`) so its configuration is never overwritten.
+/// Blocking file I/O: call from a background thread.
+pub fn save_notes_blocking(dir: &Path, text: &str) -> Result<(), String> {
+    let _lock = lock_session(dir).map_err(|e| {
+        if e.is_busy() {
+            busy_message(dir)
+        } else {
+            e.to_string()
+        }
+    })?;
+    let mut cfg = MosaicConfig::load(dir).map_err(|e| e.to_string())?;
+    set_notes(&mut cfg.ui, text);
+    cfg.save(dir).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

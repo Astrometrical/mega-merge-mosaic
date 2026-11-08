@@ -50,6 +50,31 @@ pub fn lock_session(dir: &Path) -> Result<SessionLock> {
     }
 }
 
+/// Whether another holder has the session lock on `dir`, without taking it.
+///
+/// Opens [`LOCK_FILE`] without creating it (absent: `false`) and tries a
+/// shared lock, released at once. This microseconds-long probe is the only
+/// time a start screen touches the lock; it never holds it.
+///
+/// A probe error other than contention (permissions, I/O) returns `false`: it
+/// is not evidence of another holder. Live reads go through
+/// [`crate::tiles::FileTileReader`], which is safe against a concurrent
+/// writer, and opening the session still takes the real lock and reports a
+/// real error.
+pub fn session_busy(dir: &Path) -> bool {
+    let Ok(file) = File::open(dir.join(LOCK_FILE)) else {
+        return false;
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
 /// The message for a refused [`lock_session`] on `dir`.
 pub fn busy_message(dir: &Path) -> String {
     format!(
@@ -75,6 +100,20 @@ mod tests {
         drop(first);
         let again = lock_session(&dir).unwrap();
         assert_eq!(again.dir(), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn busy_probe_sees_the_session_lock() {
+        let dir = std::env::temp_dir().join(format!("mmm-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!session_busy(&dir), "no lock file");
+        assert!(!dir.join(LOCK_FILE).exists(), "the probe creates nothing");
+        let held = lock_session(&dir).unwrap();
+        assert!(session_busy(&dir));
+        drop(held);
+        assert!(!session_busy(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

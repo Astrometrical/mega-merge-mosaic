@@ -1222,7 +1222,7 @@ stays free of `mmm-core`.
   `theme::ensure_applied` and skip drawing for one frame.
 - **Components** (`mega_ui::widgets`): `MegaButton` (primary, secondary,
   quiet, danger, ghost; large; icon buttons), `chip`, `status`, `overline`,
-  `property_grid`, `segmented`, `text_input`, `notes_field`, `progress`,
+  `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
   `Toasts` (the only notifications; never modal), plus the restyled
   `checks::checks_list` and `jobs::job_panel`, `groups` (the group palette,
   whose order is frozen because sessions store its indices) and `brand`
@@ -1231,3 +1231,136 @@ stays free of `mmm-core`.
 - **Gallery**: `cargo run -p mega-ui --example gallery` shows every token and
   component; `crates/mega-ui/tests/snapshots.rs` keeps image snapshots of it
   (ignored by default, see CLAUDE.md).
+
+## Start screen (2026-11)
+
+Spec: `docs/superpowers/specs/2026-11-07-ui-standard-and-start-screen-design.md`
+(§5). The start screen is the first thing the app shows: the most recently
+opened available session as a full-bleed hero (a drifting, crossfading
+view of its mosaic; a starfield stands in until its first image is on
+screen, and when there is none), its details and **Resume session** on
+the left, a shelf of recent sessions along the bottom and an "All sessions"
+grid with a search. It lives in `crates/mmm-app/src/start/`; the generic
+parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
+`viewer::ImageTileSource`) are in `mega-ui`.
+
+- **It never opens a session.** It takes no lock, runs no analysis and does
+  no file I/O on the UI thread. Everything it shows is read on background
+  threads that the screen polls each frame, and a session found busy (open
+  in another window or the CLI) is never read live.
+- **The summary file** (`summary.json` at the session root;
+  `mmm_core::session_summary`): panel and group counts, each group's result
+  state and blend/export stamps, check counts, canvas size and the view last
+  shown. The app keeps it current (`summary_writer::SummaryWriter`, written
+  atomically in the background whenever a fact changes: what it shows, the
+  settings the results depend on (a settings edit marks results stale with
+  no job running), or a job ending, cancelled ones included) so the start
+  screen can show a session without opening it. It is advisory: `read_summary`
+  returns `None` for a file that is absent, corrupt or from a newer mmm
+  (`SUMMARY_FORMAT`), and the card then falls back to what `mosaic.json`
+  and the cached previews say.
+- **The facts loader** (`start::facts`): per recent session, off the UI
+  thread, the availability (`Missing` for a gone folder or unplugged
+  drive, `Busy`, `Unreadable` for a corrupt or newer `mosaic.json`, else
+  `Available`), the state, group colours and notes. The states are no
+  panels, plan ready, partly merged (some groups merged, the rest without a
+  result), merged, merged and exported, and re-merge needed (any stale or
+  partial group, whatever the others). Facts load on a pool of 4 workers (`FACTS_WORKERS`), so a session on a dead network path stalls
+  one worker, never the screen or the other cards.
+- **The hero loader** (`start::hero_views`): a session with any group
+  result (merged, partly merged or needing a re-merge) gives one view per
+  group with a result, read live from its store through
+  `MosaicTileSource::open_plain`, plus each saved composition whose groups
+  all have a result, each through its saved Blend stretch (else an automatic
+  one). A planned session with no group result gives one picture per
+  group, rendered from its cached previews (`preview::load_cached_previews`,
+  `render_overview`) through the saved Plan stretch. Otherwise, no views
+  and a line saying why (a session whose state is unknown: "Nothing to
+  show yet — resume to build the preview"). Every failure degrades to fewer
+  views, never a panic. Each view fills the whole window (a cover fit, as
+  the web's `DziHeroLayer` does), whatever the mosaic's aspect: a portrait
+  mosaic in a landscape window is cropped top and bottom, never shown as a
+  narrow strip. The drift (zoom from the cover fit to `KEN_BURNS_ZOOM`
+  times it, alternating in and out per view, with a pan of up to 2 % of
+  the view that grows with the zoom and takes at most half the margin the
+  zoom opens) stays inside the image, so the image's own edges never show
+  (only a zoom past the viewer's `MAX_ZOOM`, an image far smaller than its
+  area, could). Only two feathers of page colour darken the image (no
+  other gradient or vignette; this supersedes the spec's §5.2 gradients):
+  along the left, `LEFT_FEATHER_OPACITY` (below 1, so the image shows
+  through) over the content column (the session block and the shelf's
+  heading row, whose right edge the start screen passes to
+  `HeroStage::show`), easing to clear (a smoothstep) over
+  `LEFT_FEATHER_EASE` of the width past it; and along the top,
+  `TOP_FEATHER_OPACITY` down to the bottom of the view's label and the
+  slideshow controls, which sit at the top right, easing to clear below
+  them. Both were tuned by eye on real mosaics, which are far from white:
+  over a pure white image the label and the dimmer greys in the column
+  fall below AA (revisit if that bites). Text laid over the hero all sits in the left feather's column,
+  so "All sessions" is beside the "Recent sessions" heading, and the grid's
+  Back and search are on the left. The cards are opaque; a missing
+  session's faded card keeps an opaque backing, so the image never shows
+  through it.
+- **Load order.** The first frame draws at once with no facts. The default
+  hero candidate's facts load first, then its hero views (so the first
+  image is on screen in under a second with a warm disk), then the other
+  cards' facts, and card thumbnails only once the hero has drawn. The
+  default hero is the most recently opened session that is `Available`: a
+  missing, busy or unreadable one never is. A newest session whose facts
+  haven't arrived stays the candidate for `FACTS_WAIT_S` (about 1 s); after
+  that the hero falls back to the most recent session known to be
+  available, so a folder that never answers never holds up the screen.
+  Once settled the default hero stays put, so the name, notes and
+  **Resume** target the user is reading never jump: it latches as soon as
+  the pick is a session whose facts show it available (at the latest when
+  the wait ends), or at the user's first press, key or scroll (not a mere
+  pointer move: the window may open under the cursor) even while the
+  pick's facts are still on their way. It moves again only if the latched
+  session turns out missing, busy or unreadable, is removed or is opened;
+  a newer session answering late doesn't take over. Hero dwell is 8 s and
+  the crossfade 2 s; with reduced motion (probed in the background) views
+  cut and don't drift.
+- **`FileTileReader`** (`mmm_core::tiles`): the tile reader for a store
+  another process may recreate. It follows the same per-tile seqlock
+  protocol as the memory-mapped `TileReader` but uses positioned file reads,
+  and a short read, an I/O error or an out-of-range tile reads as
+  missing; it never faults. Live reads from the start screen use it, never
+  `TileReader`, because a mapping of a truncated or replaced file raises a
+  fatal fault. **On Windows a held store reads as missing:** a
+  `TileStore`'s writer lock is mandatory there, so while any `TileStore`
+  holds the store (a blend, an invalidation or a settings edit, in another
+  process or the reader's own) every `FileTileReader` read fails (os error
+  33) and opening one fails; reads succeed again once the writer lets go.
+  So the hero shows no tiles while another process blends the session, and
+  `session_summary::result_state` reads a store being written as `None`.
+  That is why the summary writer is marked dirty on every job end,
+  cancelled ones included (the store has been released by then), and
+  re-reads the results whenever the settings change.
+- **The lock probe** (`mosaic::session_busy`): opens `.lock` without
+  creating it and tries a shared lock, released at once. It is the only time
+  the start screen touches a session's lock, and an error other than
+  contention reads as "not busy" (opening the session takes the real lock
+  and reports a real error). A busy session's notes are read-only on the
+  screen, so a save never overwrites the other window's config.
+- **Notes** (`widgets::notes_view`, `start::notes`): read as text, the
+  first `NOTES_LINES` (8) lines with **More** for the rest (**Less**
+  folds them again); **Edit** (**Add notes** when there are none) swaps in
+  a text box, focused with the cursor at the end, and **Done** or Esc
+  swaps it back, returning the focus to **Edit**. They are saved a second
+  after typing stops, or at once when editing ends or the box loses focus.
+  The session block's scroll bar takes its own room (egui's solid scroll
+  style), so long notes being edited never run under it.
+- **Recent list** (`start::recent`): up to 100 sessions, pinned first on the
+  shelf, then by last opened.
+- **Testing.** Tests build sessions in temp folders from `testutil` /
+  `synth_mosaic`, never from `test_data/`. The gallery (`mega_ui::gallery`)
+  has Starfield, Hero stage (a landscape and a portrait mosaic, the latter
+  with its panel seams showing the crop) and Session cards sections. Two ignored image
+  snapshots need a GPU: the gallery's
+  (`crates/mega-ui/tests/snapshots/`) and the real start screen's
+  (`crates/mmm-app/tests/snapshots/start_screen.png`, from
+  `start::snapshot_tests`: a merged, an empty and a missing session, the
+  stage held still). The start-screen reference shows the machine's temp
+  path in the hero's details line (the home directory is shown as `~`, so
+  no user name, but the temp location and separators are the OS's), so it
+  differs on another OS; refresh it there with `UPDATE_SNAPSHOTS=1`.

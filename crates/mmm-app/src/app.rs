@@ -2,7 +2,7 @@
 //! the session view. [`Shell`] is plain egui (testable without eframe);
 //! [`MmmApp`] wraps it for eframe with persistence and the self-test.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,8 +18,9 @@ use crate::panels_tab::{FilesPicker, PanelsTab, RfdFilesPicker};
 use crate::pipeline::{Pipeline, Step, auto_analyze, set_auto_analyze};
 use crate::plan_tab::{PlanFeed, PlanTab};
 use crate::session::{OpenSession, Pending, Request, open_in_new_process};
-use crate::start::{RecentEntry, RfdPicker, StartAction, StartScreen, unix_now};
+use crate::start::{RecentEntry, RfdDialogs, StartAction, StartScreen, unix_now};
 use crate::status::{self, SysMonitor};
+use crate::summary_writer::SummaryWriter;
 
 /// Directory, inside the session, where compressed panels are decoded.
 const DECODED_DIR: &str = "decoded";
@@ -68,13 +69,49 @@ fn default_tab(session: &OpenSession) -> Tab {
     }
 }
 
+/// Opens another application window.
+pub trait Launcher: Send + Sync {
+    /// Open a window on `session`, or on the start screen with `None`;
+    /// `Err` says why no window opened.
+    fn open_window(&self, session: Option<&Path>) -> Result<(), String>;
+}
+
+/// Opens windows as new processes of this executable.
+pub struct ProcessLauncher;
+
+impl Launcher for ProcessLauncher {
+    fn open_window(&self, session: Option<&Path>) -> Result<(), String> {
+        open_in_new_process(session).map_err(|e| format!("Cannot open a new window: {e}"))?;
+        tracing::info!("opened a new window");
+        Ok(())
+    }
+}
+
+/// Open a window through `launcher`; a failure becomes a notice. Whether
+/// a window opened.
+fn launch(launcher: &dyn Launcher, notices: &mut Vec<Notice>, session: Option<&Path>) -> bool {
+    match launcher.open_window(session) {
+        Ok(()) => true,
+        Err(text) => {
+            tracing::warn!("{text}");
+            notices.push(Notice {
+                text,
+                color: palette::HA_400,
+                until: Instant::now() + NOTICE_TIME,
+            });
+            false
+        }
+    }
+}
+
 /// The window contents: start screen or open session.
 pub struct Shell {
-    /// The start screen (also shown over an open session to open another).
+    /// The start screen (the window's content until a session is open).
     pub start: StartScreen,
     session: Option<OpenSession>,
     pending: Option<Pending>,
-    show_start: bool,
+    /// Opens the other windows ("Open another…", "New mosaic…").
+    launcher: Arc<dyn Launcher>,
     /// Background jobs of the open session (made with the session).
     jobs: Option<JobRunner>,
     sys: SysMonitor,
@@ -92,6 +129,9 @@ pub struct Shell {
     pipeline: Pipeline,
     /// The checks (made afresh with each session).
     checks: ChecksEngine,
+    /// Keeps the session's `summary.json` current (made afresh with each
+    /// session).
+    summary: SummaryWriter,
 }
 
 impl Shell {
@@ -101,7 +141,7 @@ impl Shell {
             start,
             session: None,
             pending: None,
-            show_start: false,
+            launcher: Arc::new(ProcessLauncher),
             jobs: None,
             sys: SysMonitor::start(),
             notices: Vec::new(),
@@ -113,7 +153,14 @@ impl Shell {
             files_picker: Arc::new(RfdFilesPicker),
             pipeline: Pipeline::new(),
             checks: ChecksEngine::new(),
+            summary: SummaryWriter::new(None),
         }
+    }
+
+    /// Open other windows with `launcher` (default: new processes).
+    pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Self {
+        self.launcher = launcher;
+        self
     }
 
     /// The session open in this window, if any.
@@ -196,7 +243,9 @@ impl Shell {
         self.poll(&ctx);
         self.poll_jobs(&ctx);
         if self.session.is_none() {
-            egui::CentralPanel::default().show(ui, |ui| {
+            // The start screen's hero fills the window: no panel margin.
+            let frame = egui::Frame::NONE.fill(palette::SURFACE_900);
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| {
                 if let Some(action) = self.start.ui(ui) {
                     self.request(to_request(action), &ctx);
                 }
@@ -221,9 +270,6 @@ impl Shell {
                 // Both paths are normalised (absolute, canonical) by
                 // `session::open_blocking`, so this compares like with like.
                 let dir = opened.mosaic.dir.clone();
-                if created {
-                    self.start.clear_new_form();
-                }
                 if self
                     .session
                     .as_ref()
@@ -238,16 +284,8 @@ impl Shell {
                     // A created session holds the lock; release it so the
                     // child can take it.
                     drop(opened);
-                    match open_in_new_process(&dir) {
-                        Ok(()) => {
-                            tracing::info!("opened {} in a new window", dir.display());
-                            self.start.record_opened(&dir, unix_now());
-                            self.show_start = false;
-                        }
-                        Err(e) => self.start.set_error(Some(format!(
-                            "Cannot open {} in a new window: {e}",
-                            dir.display()
-                        ))),
+                    if launch(&*self.launcher, &mut self.notices, Some(&dir)) {
+                        self.start.record_opened(&dir, unix_now());
                     }
                 } else {
                     tracing::info!("opened session {}", dir.display());
@@ -255,7 +293,13 @@ impl Shell {
                     // Compressed panels decode to disk once, shared by
                     // previews and analysis (one session per process).
                     mmm_core::decoded::set_cache_dir(dir.join(DECODED_DIR));
-                    self.tab = default_tab(&opened);
+                    // A new session starts by adding its panels.
+                    self.tab = if created {
+                        Tab::Panels
+                    } else {
+                        default_tab(&opened)
+                    };
+                    self.summary = SummaryWriter::new(opened.summary.clone());
                     self.session = Some(opened);
                     self.jobs = Some(JobRunner::new(ctx.clone()));
                     self.blend = BlendTab::new();
@@ -288,6 +332,11 @@ impl Shell {
         let editing = self.panels.has_pending() || self.blend.settings_editing(session);
         for event in &events {
             self.blend.on_event(event);
+            let target = match event {
+                JobEvent::Finished { id, .. } => jobs.target(*id),
+                _ => None,
+            };
+            self.summary.on_job_event(event, target, unix_now());
             let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
             let (text, color) = match event {
                 // Previews run by themselves and often: no notices but
@@ -315,6 +364,14 @@ impl Shell {
         }
         self.checks.poll(ctx, session, jobs, &events);
         self.plan.release_if_hidden(now);
+        // The last view: that of the active tab (Blend or Plan), else the other's.
+        let last_view = pick_view_key(
+            self.tab,
+            self.blend.view_key(&session.mosaic.config.ui),
+            self.plan.view_key().map(str::to_string),
+        );
+        let counts = self.checks.counts(&session.mosaic.config);
+        self.summary.poll(ctx, session, counts, last_view);
     }
 
     /// The open session (the Panels, Plan and Blend tabs build on this).
@@ -336,7 +393,10 @@ impl Shell {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Open another…").clicked() {
-                        self.show_start = true;
+                        launch(&*self.launcher, &mut self.notices, None);
+                    }
+                    if ui.button("New mosaic…").clicked() {
+                        launch(&*self.launcher, &mut self.notices, None);
                     }
                     let mut auto = auto_analyze(&session.mosaic.config);
                     if ui
@@ -435,17 +495,6 @@ impl Shell {
             _ => {}
         }
         self.notices_ui(&ctx);
-        let mut open = self.show_start;
-        let mut action = None;
-        egui::Window::new("Open another session")
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(680.0)
-            .show(&ctx, |ui| action = self.start.ui(ui));
-        self.show_start = open;
-        if let Some(action) = action {
-            self.request(to_request(action), &ctx);
-        }
     }
 }
 
@@ -467,6 +516,16 @@ impl Shell {
                     });
                 }
             });
+    }
+}
+
+/// The view last shown for the summary: the Blend tab's key while it is the
+/// active tab, otherwise the Plan tab's; the other tab's when the active
+/// one has none.
+fn pick_view_key(tab: Tab, blend: Option<String>, plan: Option<String>) -> Option<String> {
+    match tab {
+        Tab::Blend => blend.or(plan),
+        Tab::Plan | Tab::Panels => plan.or(blend),
     }
 }
 
@@ -492,6 +551,8 @@ pub type SelfTestOutcome = Arc<Mutex<Option<Result<(), String>>>>;
 const SELFTEST_FRAMES: u32 = 30;
 /// Frames rendered with the start screen before a given session is opened.
 const SELFTEST_START_FRAMES: u32 = 5;
+/// Most frames the start screen waits for its hero's first image.
+const SELFTEST_HERO_FRAMES: u32 = 600;
 /// Frames rendered with the session open, at least.
 const SELFTEST_SESSION_FRAMES: u32 = 10;
 /// Give up on a self-test after this long.
@@ -501,6 +562,8 @@ const SELFTEST_BACKSTOP: Duration = Duration::from_secs(10);
 
 /// `--selftest` state: render a fixed number of frames, then close.
 struct SelfTest {
+    /// When the app started.
+    started: Instant,
     frames: u32,
     session_frames: u32,
     session: Option<PathBuf>,
@@ -552,7 +615,22 @@ impl SelfTest {
             return self.finish(ctx, Err("timed out".into()));
         }
         if let Some(dir) = &self.session {
-            if !self.session_requested && self.frames >= SELFTEST_START_FRAMES {
+            // The session (the start screen's hero) opens once the hero
+            // has loaded, or after a while.
+            let loaded = shell.start.hero_loaded();
+            let waited = self.frames >= SELFTEST_HERO_FRAMES;
+            if !self.session_requested && self.frames >= SELFTEST_START_FRAMES && (loaded || waited)
+            {
+                let ms = self.started.elapsed().as_millis();
+                match shell.start.hero_image() {
+                    Some(label) => {
+                        tracing::info!(
+                            "self-test: start screen hero shows {label:?}, {ms} ms after launch"
+                        )
+                    }
+                    None if loaded => tracing::info!("self-test: start screen hero has no image"),
+                    None => tracing::warn!("self-test: start screen hero drew nothing in {ms} ms"),
+                }
                 self.session_requested = true;
                 shell.request(Request::Open(dir.clone()), ctx);
             }
@@ -781,10 +859,21 @@ impl MmmApp {
         mega_ui::theme::apply(&cc.egui_ctx);
         let recent: Vec<RecentEntry> = match (&selftest, cc.storage) {
             (None, Some(storage)) => eframe::get_value(storage, RECENT_KEY).unwrap_or_default(),
+            // The self-test's session is the start screen's hero first.
+            (Some(_), _) => initial
+                .iter()
+                .map(|path| RecentEntry {
+                    path: path.clone(),
+                    last_opened: unix_now(),
+                    pinned: false,
+                })
+                .collect(),
             _ => Vec::new(),
         };
-        let shell = Shell::new(StartScreen::new(recent, Arc::new(RfdPicker)));
+        let shell = Shell::new(StartScreen::new(recent, Arc::new(RfdDialogs)))
+            .with_launcher(Arc::new(ProcessLauncher));
         let selftest = selftest.map(|outcome| SelfTest {
+            started: Instant::now(),
             frames: 0,
             session_frames: 0,
             session: initial.clone(),
@@ -828,6 +917,8 @@ impl eframe::App for MmmApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // `save` runs first only with persistence storage available.
         self.shell.flush_pending_saves();
+        // Notes typed on the start screen less than a pause ago.
+        self.shell.start.flush_notes();
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -844,15 +935,26 @@ mod tests {
 
     use super::*;
     use crate::start::tests::{
-        StubPicker, relative_to_cwd, step_until, temp_dir, temp_dir_near_cwd,
+        RecordingLauncher, StubPicker, relative_to_cwd, step_until, temp_dir, temp_dir_near_cwd,
     };
 
     const CANVAS_W: u64 = crate::testutil::CANVAS.0;
 
     fn harness(picker: StubPicker) -> Harness<'static, Shell> {
-        let shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(picker)));
+        harness_launching(picker, Arc::new(RecordingLauncher::default()))
+    }
+
+    fn harness_launching(
+        picker: StubPicker,
+        launcher: Arc<RecordingLauncher>,
+    ) -> Harness<'static, Shell> {
+        let shell =
+            Shell::new(StartScreen::new(Vec::new(), Arc::new(picker))).with_launcher(launcher);
         Harness::builder()
             .with_size(egui::vec2(1000.0, 800.0))
+            // The start screen's background work (facts, hero, thumbnails)
+            // asks for a repaint as each piece finishes.
+            .with_max_steps(64)
             .build_ui_state(
                 |ui, s: &mut Shell| {
                     if crate::testutil::themed(ui) {
@@ -864,6 +966,14 @@ mod tests {
     }
 
     fn type_into(h: &mut Harness<'static, Shell>, field: &str, text: &str) {
+        let role = egui::accesskit::Role::TextInput;
+        // The typed path lives behind More → Type a path….
+        if field == "Session folder" && h.query_by_role_and_label(role, field).is_none() {
+            h.get_by_label("More").click();
+            h.run();
+            h.get_by_label("Type a path…").click();
+            h.run();
+        }
         h.get_by_role_and_label(egui::accesskit::Role::TextInput, field)
             .focus();
         h.step();
@@ -873,27 +983,176 @@ mod tests {
     }
 
     #[test]
-    fn new_mosaic_creates_session() {
+    fn new_mosaic_creates_from_one_dialog() {
         let parent = temp_dir("new");
-        let mut h = harness(StubPicker(Some(parent.clone())));
+        // The save dialog answers a name without the extension.
+        let mut h = harness(StubPicker(Some(parent.join("Orion"))));
         h.run();
-        h.get_by_label("New mosaic…").click();
+        h.get_by_label("New mosaic").click();
         // The (stub) dialog answers on a background thread.
-        step_until(&mut h, |s| {
-            s.start.new_parent() == Some(parent.display().to_string().as_str())
-        });
-        type_into(&mut h, "Name", "Orion");
-        h.get_by_label("Create").click();
         step_until(&mut h, |s| s.session().is_some());
         let dir = parent.join("Orion.mmm-session");
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert!(dir.join("mosaic.json").is_file());
         assert_eq!(h.state().start.recent()[0].path, dir);
-        // The form is cleared for the next New mosaic….
-        assert_eq!(h.state().start.new_parent(), None);
         // A session without panels opens on the Panels tab.
         assert_eq!(h.state().tab(), Tab::Panels);
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn cancelled_dialog_reveals_typed_path() {
+        let mut h = harness(StubPicker(None));
+        h.run();
+        let role = egui::accesskit::Role::TextInput;
+        assert!(
+            h.query_by_role_and_label(role, "No dialog? Type a path")
+                .is_none()
+        );
+        h.get_by_label("New mosaic").click();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h
+            .query_by_role_and_label(role, "No dialog? Type a path")
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "no typed-path row");
+            h.step();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(h.state().session().is_none());
+    }
+
+    #[test]
+    fn typed_path_creates_after_a_cancelled_dialog() {
+        for use_enter in [false, true] {
+            let parent = temp_dir(if use_enter {
+                "typed-enter"
+            } else {
+                "typed-button"
+            });
+            let mut h = harness(StubPicker(None));
+            h.run();
+            h.get_by_label("New mosaic").click();
+            let role = egui::accesskit::Role::TextInput;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while h
+                .query_by_role_and_label(role, "No dialog? Type a path")
+                .is_none()
+            {
+                assert!(Instant::now() < deadline, "no typed-path row");
+                h.step();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let typed = parent.join("Typed");
+            type_into(&mut h, "No dialog? Type a path", typed.to_str().unwrap());
+            if use_enter {
+                h.key_press(egui::Key::Enter);
+                h.step();
+            } else {
+                h.get_by_label("Create").click();
+            }
+            step_until(&mut h, |s| s.session().is_some());
+            let dir = parent.join("Typed.mmm-session");
+            assert!(dir.join("mosaic.json").is_file());
+            assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
+            assert_eq!(h.state().tab(), Tab::Panels);
+            let _ = std::fs::remove_dir_all(&parent);
+        }
+    }
+
+    #[test]
+    fn failed_launch_shows_a_notice_and_records_nothing() {
+        struct Failing;
+        impl Launcher for Failing {
+            fn open_window(&self, _: Option<&Path>) -> Result<(), String> {
+                Err("Cannot open a new window: no process".into())
+            }
+        }
+        let root = temp_dir("shell-launch-fail");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let other = root.join("Other.mmm-session");
+        drop(crate::session::create_blocking(&other).unwrap());
+        let shell = Shell::new(StartScreen::new(Vec::new(), Arc::new(StubPicker(None))))
+            .with_launcher(Arc::new(Failing));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 800.0))
+            .with_max_steps(64)
+            .build_ui_state(
+                |ui, s: &mut Shell| {
+                    if crate::testutil::themed(ui) {
+                        s.ui(ui);
+                    }
+                },
+                shell,
+            );
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        let recent = h.state().start.recent().to_vec();
+        h.get_by_label("Open another…").click();
+        h.step();
+        h.get_by_label_contains("Cannot open a new window");
+        // A session opened in a window that cannot launch is not recorded.
+        let ctx = h.ctx.clone();
+        h.state_mut().request(Request::Open(other), &ctx);
+        step_until(&mut h, |s| !s.is_busy());
+        assert_eq!(h.state().start.recent(), recent.as_slice());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_another_launches_a_window() {
+        let root = temp_dir("shell-another");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
+        let launcher = Arc::new(RecordingLauncher::default());
+        let mut h = harness_launching(StubPicker(None), launcher.clone());
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        h.get_by_label("Open another…").click();
+        h.step();
+        h.get_by_label("New mosaic…").click();
+        h.step();
+        assert_eq!(*launcher.0.lock().unwrap(), [None, None]);
+        // No floating start window over the session.
+        assert!(h.query_by_label("Open another session").is_none());
+        assert!(h.state().session().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shell_writes_summary_after_opening() {
+        use mmm_core::session_summary::{SUMMARY_FILE, read_summary};
+        let root = temp_dir("shell-summary");
+        let opened = crate::testutil::two_group_session(&root);
+        let dir = opened.mosaic.dir.clone();
+        let panels = opened.mosaic.config.panels.len();
+        let mut h = harness(StubPicker(None));
+        h.run();
+        type_into(&mut h, "Session folder", dir.to_str().unwrap());
+        h.key_press(egui::Key::Enter);
+        h.step();
+        step_until(&mut h, |s| s.session().is_some());
+        step_until(&mut h, |_| dir.join(SUMMARY_FILE).is_file());
+        let summary = read_summary(&dir).unwrap();
+        assert_eq!(summary.panels, panels);
+        let names: Vec<_> = summary.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Ha", "OIII"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn last_view_follows_the_active_tab() {
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(pick_view_key(Tab::Blend, s("Ha"), s("OIII")), s("Ha"));
+        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), s("OIII")), s("OIII"));
+        assert_eq!(pick_view_key(Tab::Plan, s("Ha"), None), s("Ha"));
+        assert_eq!(pick_view_key(Tab::Blend, None, s("OIII")), s("OIII"));
+        assert_eq!(pick_view_key(Tab::Panels, None, None), None);
     }
 
     #[test]
@@ -944,12 +1203,10 @@ mod tests {
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
         assert_eq!(h.state().start.recent()[0].path, dir);
 
-        // Opening it again (relative) from this window is refused, and the
-        // error shows in the session bar, not only in the start window.
-        h.get_by_label("Open another…").click();
-        h.run();
-        type_into(&mut h, "Session folder", "");
-        h.key_press(egui::Key::Enter);
+        // Opening it again (relative) in this window is refused, and the
+        // error shows in the session bar.
+        let ctx = h.ctx.clone();
+        h.state_mut().request(Request::Open(rel), &ctx);
         h.step();
         step_until(&mut h, |s| !s.is_busy());
         h.run();

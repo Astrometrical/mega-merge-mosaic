@@ -1,0 +1,499 @@
+//! Keeps the open session's `summary.json` current (see
+//! [`mmm_core::session_summary`]), so the start screen can show the
+//! session's facts without opening it.
+//!
+//! [`SummaryWriter::poll`] runs each frame. It notices changes to what the
+//! summary shows (panels, groups, checks, canvas, last view) and to the
+//! settings the results depend on (a settings edit marks them stale) by
+//! itself, and the Shell marks it dirty when a job ends, cancelled ones
+//! included ([`SummaryWriter::on_job_event`]: a result changed). The work
+//! (classifying each group's result store, writing the file) runs on a
+//! background thread; the UI thread does no file I/O.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+use mmm_core::mosaic::MosaicConfig;
+use mmm_core::mosaic::grouping::Groups;
+use mmm_core::session_summary::{
+    GroupSummary, ResultState, SUMMARY_FORMAT, SessionSummary, result_state, write_summary,
+};
+use mmm_core::settings::{AnalyzeSettings, BlendSettings, GroupOverride};
+
+use crate::checks::CheckCounts;
+use crate::jobs::{JobEvent, JobTarget};
+use crate::session::OpenSession;
+use crate::start::unix_now;
+
+/// Per-group `(blended_at, exported_at)` stamps, in unix seconds.
+type Stamps = BTreeMap<String, (Option<u64>, Option<u64>)>;
+
+/// The facts of a session as a [`SessionSummary`] (with `written_at` 0: the
+/// writer stamps it). Groups follow processing order; a group missing from
+/// `results` is [`ResultState::None`] and one missing from `stamps` has no
+/// stamps.
+pub fn summarize(
+    cfg: &MosaicConfig,
+    groups: Option<&Groups>,
+    checks: Option<CheckCounts>,
+    canvas: Option<(u64, u64)>,
+    last_view: Option<String>,
+    results: &BTreeMap<String, ResultState>,
+    stamps: &Stamps,
+) -> SessionSummary {
+    let groups = groups
+        .map(|g| {
+            g.processing_groups()
+                .into_iter()
+                .map(|(name, panels)| {
+                    let (blended_at, exported_at) = stamps.get(&name).copied().unwrap_or_default();
+                    GroupSummary {
+                        result: results.get(&name).copied().unwrap_or_default(),
+                        name,
+                        panels,
+                        blended_at,
+                        exported_at,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SessionSummary {
+        format: SUMMARY_FORMAT,
+        written_at: 0,
+        panels: cfg.panels.len(),
+        groups,
+        problems: checks.map(|c| c.problems),
+        notes: checks.map(|c| c.notes),
+        canvas,
+        last_view,
+    }
+}
+
+/// What the summary shows apart from result states, and the settings those
+/// states depend on: a change to any of it marks the writer dirty.
+#[derive(Clone, PartialEq)]
+struct Inputs {
+    panels: usize,
+    groups: Vec<(String, Vec<PathBuf>)>,
+    checks: Option<CheckCounts>,
+    canvas: Option<(u64, u64)>,
+    last_view: Option<String>,
+    settings: Settings,
+}
+
+/// The settings the group results depend on. Applying an edit
+/// ([`mmm_core::mosaic::set_settings`], a CLI override, an analysis
+/// planned) marks results stale on disk without any job ending, so a
+/// change here re-reads every group's result state.
+#[derive(Clone, PartialEq)]
+struct Settings {
+    analyze: AnalyzeSettings,
+    blend: BlendSettings,
+    overrides: BTreeMap<String, GroupOverride>,
+    needs_analyze: BTreeSet<String>,
+}
+
+impl Settings {
+    fn of(cfg: &MosaicConfig) -> Self {
+        Settings {
+            analyze: cfg.analyze.clone(),
+            blend: cfg.blend.clone(),
+            overrides: cfg.group_overrides.clone(),
+            needs_analyze: cfg.needs_analyze.clone(),
+        }
+    }
+}
+
+/// Writes the session's summary in the background when it has changed.
+pub struct SummaryWriter {
+    stamps: Stamps,
+    dirty: bool,
+    /// The last summary written (or found on opening).
+    last: Option<SessionSummary>,
+    inputs: Option<Inputs>,
+    /// The running write: the summary it wrote, or `None` if unchanged.
+    running: Option<Receiver<Option<SessionSummary>>>,
+    /// How many summaries have been written (for tests).
+    #[cfg(test)]
+    writes: usize,
+}
+
+/// Equal facts, ignoring when they were written.
+fn same_facts(a: &SessionSummary, b: &SessionSummary) -> bool {
+    SessionSummary {
+        written_at: 0,
+        ..a.clone()
+    } == SessionSummary {
+        written_at: 0,
+        ..b.clone()
+    }
+}
+
+impl SummaryWriter {
+    /// A writer for a session whose existing summary is `previous`: its
+    /// blend and export stamps carry over. Starts dirty.
+    pub fn new(previous: Option<SessionSummary>) -> Self {
+        let stamps = previous
+            .iter()
+            .flat_map(|s| &s.groups)
+            .map(|g| (g.name.clone(), (g.blended_at, g.exported_at)))
+            .collect();
+        SummaryWriter {
+            stamps,
+            dirty: true,
+            last: previous,
+            inputs: None,
+            running: None,
+            #[cfg(test)]
+            writes: 0,
+        }
+    }
+
+    /// Note that something the summary shows may have changed (a job ended).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// True while a write runs. A change that lands meanwhile is picked up
+    /// by the next poll (any later frame; no repaint is forced for it).
+    #[cfg(test)]
+    pub fn busy(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// Group `group` was blended at `at` (unix seconds).
+    pub fn record_blend(&mut self, group: &str, at: u64) {
+        self.stamps.entry(group.to_string()).or_default().0 = Some(at);
+        self.dirty = true;
+    }
+
+    /// Group `group` was exported at `at` (unix seconds).
+    pub fn record_export(&mut self, group: &str, at: u64) {
+        self.stamps.entry(group.to_string()).or_default().1 = Some(at);
+        self.dirty = true;
+    }
+
+    /// Note a job event: a finished blend or export (`target`) stamps its
+    /// group at `at` (unix seconds); a job that ended marks the writer
+    /// dirty (its result may have changed). A cancelled one too: discarding
+    /// a cancelled blend may invalidate its store (`jobs::discard_blend`),
+    /// and on Windows a store a blend holds reads as no result until the
+    /// blend lets go of it (see [`mmm_core::tiles::FileTileReader`]).
+    pub fn on_job_event(&mut self, event: &JobEvent, target: Option<(JobTarget, &str)>, at: u64) {
+        match event {
+            JobEvent::Finished { .. } => {
+                self.mark_dirty();
+                match target {
+                    Some((JobTarget::Blend, group)) => self.record_blend(group, at),
+                    Some((JobTarget::Export, group)) => self.record_export(group, at),
+                    None => {}
+                }
+            }
+            JobEvent::Failed { .. } | JobEvent::Cancelled { .. } => self.mark_dirty(),
+            JobEvent::Preview(_) => {}
+        }
+    }
+
+    /// Take a finished write's outcome, notice changed inputs, and start a
+    /// write when dirty and none is running. Cheap; call every frame. A
+    /// finished write asks `ctx` for one repaint, so a change that landed
+    /// meanwhile is flushed by the next frame's poll even when idle.
+    pub fn poll(
+        &mut self,
+        ctx: &egui::Context,
+        session: &OpenSession,
+        checks: Option<CheckCounts>,
+        last_view: Option<String>,
+    ) {
+        if let Some(rx) = &self.running {
+            match rx.try_recv() {
+                Ok(written) => {
+                    if written.is_some() {
+                        #[cfg(test)]
+                        {
+                            self.writes += 1;
+                        }
+                        self.last = written;
+                    }
+                    self.running = None;
+                }
+                Err(TryRecvError::Disconnected) => self.running = None,
+                Err(TryRecvError::Empty) => return,
+            }
+        }
+        let inputs = Inputs {
+            panels: session.mosaic.config.panels.len(),
+            groups: session
+                .groups
+                .as_ref()
+                .map(Groups::processing_groups)
+                .unwrap_or_default(),
+            checks,
+            canvas: session.canvas(),
+            last_view,
+            settings: Settings::of(&session.mosaic.config),
+        };
+        if self.inputs.as_ref() != Some(&inputs) {
+            self.inputs = Some(inputs.clone());
+            self.dirty = true;
+        }
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let mosaic = session.mosaic.clone();
+        let groups = session.groups.clone();
+        let stamps = self.stamps.clone();
+        let last = self.last.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("mmm-summary".into())
+            .spawn(move || {
+                let results: BTreeMap<String, ResultState> = groups
+                    .iter()
+                    .flat_map(Groups::processing_groups)
+                    .map(|(g, _)| {
+                        let state = result_state(&mosaic.result_path(&g));
+                        (g, state)
+                    })
+                    .collect();
+                let mut summary = summarize(
+                    &mosaic.config,
+                    groups.as_ref(),
+                    inputs.checks,
+                    inputs.canvas,
+                    inputs.last_view,
+                    &results,
+                    &stamps,
+                );
+                if last.as_ref().is_some_and(|l| same_facts(l, &summary)) {
+                    let _ = tx.send(None);
+                    ctx.request_repaint();
+                    return;
+                }
+                summary.written_at = unix_now();
+                match write_summary(&mosaic.dir, &summary) {
+                    Ok(()) => {
+                        let _ = tx.send(Some(summary));
+                        ctx.request_repaint();
+                    }
+                    Err(e) => {
+                        tracing::warn!("cannot write the session summary: {e}");
+                        let _ = tx.send(None);
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => self.running = Some(rx),
+            Err(e) => tracing::warn!("cannot start the summary thread: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mmm_core::job::JobCtl;
+    use mmm_core::mosaic::{analyze_all, blend_group, invalidate_group, set_settings};
+    use mmm_core::session_summary::read_summary;
+
+    use crate::start::tests::temp_dir;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    fn two_groups() -> (MosaicConfig, Groups) {
+        let ha = paths(&["h1.xisf", "h2.xisf", "h3.xisf"]);
+        let oiii = paths(&["o1.xisf", "o2.xisf"]);
+        let cfg = MosaicConfig::new(ha.iter().chain(&oiii).cloned().collect());
+        let groups = Groups {
+            groups: BTreeMap::from([("Ha".to_string(), ha), ("OIII".to_string(), oiii)]),
+            ungrouped: Vec::new(),
+        };
+        (cfg, groups)
+    }
+
+    #[test]
+    fn summarize_reports_groups_checks_and_results() {
+        let (cfg, groups) = two_groups();
+        let results = BTreeMap::from([
+            ("Ha".to_string(), ResultState::Complete),
+            ("OIII".to_string(), ResultState::Stale),
+        ]);
+        let checks = CheckCounts {
+            problems: 1,
+            notes: 2,
+            passed: 0,
+        };
+        let s = summarize(
+            &cfg,
+            Some(&groups),
+            Some(checks),
+            Some((600, 420)),
+            Some("Ha".into()),
+            &results,
+            &Stamps::new(),
+        );
+        assert_eq!(s.panels, 5);
+        assert_eq!(s.problems, Some(1));
+        assert_eq!(s.notes, Some(2));
+        assert_eq!(s.canvas, Some((600, 420)));
+        assert_eq!(s.last_view.as_deref(), Some("Ha"));
+        let names: Vec<_> = s.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["Ha", "OIII"]);
+        assert_eq!(s.groups[0].panels.len(), 3);
+        assert_eq!(s.groups[1].panels, paths(&["o1.xisf", "o2.xisf"]));
+        assert_eq!(s.groups[0].result, ResultState::Complete);
+        assert_eq!(s.groups[1].result, ResultState::Stale);
+
+        let unchecked = summarize(
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            &BTreeMap::new(),
+            &Stamps::new(),
+        );
+        assert_eq!((unchecked.problems, unchecked.notes), (None, None));
+        assert!(unchecked.groups.is_empty());
+    }
+
+    #[test]
+    fn exports_survive_reopening() {
+        let (cfg, groups) = two_groups();
+        let previous = SessionSummary {
+            format: SUMMARY_FORMAT,
+            groups: vec![GroupSummary {
+                name: "Ha".into(),
+                exported_at: Some(100),
+                blended_at: Some(50),
+                ..GroupSummary::default()
+            }],
+            ..SessionSummary::default()
+        };
+        let mut w = SummaryWriter::new(Some(previous));
+        let s = summarize(
+            &cfg,
+            Some(&groups),
+            None,
+            None,
+            None,
+            &BTreeMap::new(),
+            &w.stamps,
+        );
+        assert_eq!(s.groups[0].exported_at, Some(100));
+        assert_eq!(s.groups[0].blended_at, Some(50));
+        assert_eq!(s.groups[1].exported_at, None);
+        w.record_export("OIII", 200);
+        w.record_blend("Ha", 300);
+        let s = summarize(
+            &cfg,
+            Some(&groups),
+            None,
+            None,
+            None,
+            &BTreeMap::new(),
+            &w.stamps,
+        );
+        assert_eq!(s.groups[1].exported_at, Some(200));
+        assert_eq!(s.groups[0].blended_at, Some(300));
+        assert_eq!(s.groups[0].exported_at, Some(100));
+    }
+
+    /// Poll `w` until no write runs and nothing is dirty, for up to 10 s.
+    fn settle(w: &mut SummaryWriter, ctx: &egui::Context, s: &OpenSession) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for _ in 0..3 {
+            loop {
+                w.poll(ctx, s, None, None);
+                if !w.busy() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "write never landed");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn poll_writes_stamps_and_skips_unchanged() {
+        let root = temp_dir("summary-poll");
+        let s = crate::testutil::two_group_session(&root);
+        let dir = s.mosaic.dir.clone();
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        w.record_blend("Ha", 111);
+        w.record_export("Ha", 222);
+        settle(&mut w, &ctx, &s);
+        let written = read_summary(&dir).unwrap();
+        assert_eq!(written.groups[0].name, "Ha");
+        assert_eq!(written.groups[0].blended_at, Some(111));
+        assert_eq!(written.groups[0].exported_at, Some(222));
+        assert_eq!(w.writes, 1);
+        assert!(ctx.has_requested_repaint(), "a finished write repaints");
+        // Nothing changed: marking dirty and polling again writes nothing.
+        w.mark_dirty();
+        settle(&mut w, &ctx, &s);
+        assert_eq!(w.writes, 1, "unchanged facts are not rewritten");
+        // A real change is written.
+        w.record_blend("OIII", 333);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(w.writes, 2);
+        assert_eq!(read_summary(&dir).unwrap().groups[1].blended_at, Some(333));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A two-group session in `root`, analysed, with Ha blended.
+    fn ha_merged(root: &std::path::Path) -> OpenSession {
+        let mut s = crate::testutil::two_group_session(root);
+        s.groups = Some(analyze_all(&mut s.mosaic, &JobCtl::none()).unwrap());
+        blend_group(&mut s.mosaic, "Ha", None, &JobCtl::none()).unwrap();
+        s
+    }
+
+    /// The result state the written summary gives group `i`.
+    fn written_result(s: &OpenSession, i: usize) -> ResultState {
+        read_summary(&s.mosaic.dir).unwrap().groups[i].result
+    }
+
+    #[test]
+    fn settings_change_rewrites_stale_results() {
+        let root = temp_dir("summary-settings");
+        let mut s = ha_merged(&root);
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Complete);
+        // A blend-local change marks every result stale (no job ends).
+        let mut blend = s.mosaic.config.blend.clone();
+        blend.feather_px *= 2.0;
+        let analyze = s.mosaic.config.analyze.clone();
+        set_settings(&mut s.mosaic, analyze, blend).unwrap();
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Stale);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancelled_job_rewrites_the_summary() {
+        let root = temp_dir("summary-cancelled");
+        let s = ha_merged(&root);
+        let ctx = egui::Context::default();
+        let mut w = SummaryWriter::new(None);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Complete);
+        // A cancelled blend whose settings were superseded invalidates its
+        // store (`jobs::discard_blend`), then reports Cancelled.
+        invalidate_group(&s.mosaic, "Ha").unwrap();
+        w.on_job_event(&JobEvent::Cancelled { id: 1 }, None, 0);
+        settle(&mut w, &ctx, &s);
+        assert_eq!(written_result(&s, 0), ResultState::Stale);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

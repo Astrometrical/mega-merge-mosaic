@@ -16,3 +16,6 @@ tracing.workspace = true
 eframe.workspace = true
 # Image snapshots (tests/snapshots.rs, ignored by default) render with wgpu.
 egui_kittest = { workspace = true, features = ["snapshot", "wgpu"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
