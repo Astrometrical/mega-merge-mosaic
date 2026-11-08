@@ -452,7 +452,6 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                             color,
                             selected,
                             dashed,
-
                             mark,
                         },
                     );

@@ -147,7 +147,8 @@ fn choice_chip_draws_its_mark() {
                     dashed: false,
                     mark,
                 },
-            );
+            )
+            .on_hover_text("Caller's hint");
             w[i] = r.rect.width();
             last = Some(r);
         }
@@ -155,7 +156,7 @@ fn choice_chip_draws_its_mark() {
         last.unwrap()
     });
     h.run();
-    // The dot takes room, and the state is said in words.
+    // The glyph takes room, and the state is said in words.
     let [plain, stale, edited] = widths.get();
     assert!(stale > plain && edited > plain, "{plain} {stale} {edited}");
     let said: Vec<Option<String>> = h
@@ -170,5 +171,51 @@ fn choice_chip_draws_its_mark() {
             Some("settings changed".to_string())
         ]
     );
+    // Not colour alone: each mark is its tone's icon, in the icon font and
+    // the tone's colour, drawn once (the plain chip draws none).
+    let glyphs = |h: &Harness<'static, Option<egui::Rect>>, tone: Tone| {
+        let g = tone.icon().unwrap();
+        h.output()
+            .shapes
+            .iter()
+            .filter(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    t.galley.text().contains(g)
+                        && t.galley.job.sections[0].format.font_id.family
+                            == crate::theme::fonts::icon_family()
+                        && t.galley.job.sections[0].format.color == tone.color()
+                }
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(glyphs(&h, Tone::Warning), 1, "the out-of-date glyph");
+    assert_eq!(glyphs(&h, Tone::Info), 1, "the settings-changed glyph");
     assert_ne!(ChipMark::Attention.color(), ChipMark::Changed.color());
+    // Resting on a marked chip shows its state in words, with the caller's
+    // hover text; the plain chip shows only the caller's.
+    let at: Vec<egui::Pos2> = h
+        .query_all_by_label("Same")
+        .map(|n| n.rect().center())
+        .collect();
+    let rest = |h: &mut Harness<'static, Option<egui::Rect>>, p: egui::Pos2| {
+        h.hover_at(egui::pos2(590.0, 190.0));
+        h.run_steps(80);
+        h.hover_at(p);
+        h.run_steps(80);
+    };
+    for (p, state) in at
+        .iter()
+        .zip([None, Some("Out of date"), Some("Settings changed")])
+    {
+        rest(&mut h, *p);
+        h.get_by_label("Caller's hint");
+        for s in ["Out of date", "Settings changed"] {
+            assert_eq!(
+                h.query_by_label(s).is_some(),
+                state == Some(s),
+                "{s} while resting on the chip marked {state:?}"
+            );
+        }
+    }
 }

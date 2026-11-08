@@ -1314,9 +1314,14 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
 - **View bar.** Plan / Mosaic, a chip per group and per composite and **+**
   (with two or more groups), and the Outlines, ROIs, Linked and Strong
   toggles. It wraps when the window is narrow. A group chip carries a
-  `mega_ui::widgets::ChipMark` dot: `Attention` (warning tone) when the
-  group is out of date, `Changed` (info tone) when only its settings
-  changed; a composite's chip takes its members' worst. The chip's context
+  `mega_ui::widgets::ChipMark`: `Attention` (the warning tone's icon,
+  "Out of date") when the group is out of date, `Changed` (the info tone's
+  icon, "Settings changed") when only its settings changed; a composite's
+  chip takes its members' worst. The mark is the tone's glyph after the
+  label in the tone's colour, never a bare colour dot (the info tone is the
+  accent, as is a selected or hovered chip's border); the chip's hover text
+  says the state above the caller's own (the view bar's shortcut hint), and
+  its accessible description says it too. The chip's context
   menu has **Merge this group**, which commits the draft and merges that
   group only (disabled, "Merging {group}…", while that group's whole merge
   runs or is queued, and when merging is blocked). In Mosaic mode a tag over
@@ -1466,7 +1471,8 @@ stays free of `mmm-core`.
   quiet, danger, ghost; large; icon buttons), `step_strip` (pills with
   state, progress, Cancel and an optional tooltip; `step_strip_width`
   measures one row, and the strip wraps when it does not fit), `chip`,
-  `status`, `overline`,
+  `choice_chip` (a toggle; a `ChipMark` adds its tone's icon, its state as
+  hover text and its accessible description), `status`, `overline`,
   `property_grid`, `segmented`, `text_input`, `notes_view`, `progress`,
   `submenu` (a menu entry with an icon-font chevron, staying open for a
   text field inside),
