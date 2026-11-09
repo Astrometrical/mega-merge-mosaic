@@ -62,8 +62,9 @@ pub struct PanelMeta {
     pub storage: PanelStorage,
     /// Per-channel background noise: the typical in-cell RMS of the
     /// panel's background L8 cells (see [`crate::summary::panel_stats`]).
-    /// `None` for sessions analysed before the statistic existed, which
-    /// get no noise check until they are analysed again.
+    /// `None` when unmeasured: sessions analysed before the statistic
+    /// existed (no noise check until they are analysed again), or a panel
+    /// with a channel that has no usable cell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noise: Option<Vec<f64>>,
     /// Strength of the panel's background gradient: the rise of a plane
@@ -72,6 +73,17 @@ pub struct PanelMeta {
     /// measured (an older session, or no noise to compare with).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradient: Option<f64>,
+    /// Per-channel rise of that background plane across the bounding box, in
+    /// data units (0 where no plane fits): with [`PanelMeta::background`],
+    /// what the gradient check judges the gradient against. `None` when not
+    /// measured, which includes sessions analysed before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient_rise: Option<Vec<f64>>,
+    /// Per-channel background (sky) level: the median of the panel's
+    /// background cells' means (see [`crate::summary::panel_stats`]).
+    /// `None` when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Vec<f64>>,
     /// Raggedness of the panel's edges: the share of the cells one step
     /// inside its outermost covered cells that are only partly covered
     /// (see [`crate::summary::panel_stats`]). `None` when not measured.
@@ -220,6 +232,8 @@ mod tests {
             },
             noise: Some(vec![0.001, 0.002, 0.003]),
             gradient: Some(2.5),
+            gradient_rise: Some(vec![0.0025, 0.004, 0.006]),
+            background: Some(vec![0.01, 0.02, 0.03]),
             ragged: Some(0.125),
         });
         session.input = InputKind::Solved;
@@ -251,6 +265,8 @@ mod tests {
         assert_eq!(p.noise, Some(vec![0.001, 0.002, 0.003]));
         assert_eq!(p.gradient, Some(2.5));
         assert_eq!(p.ragged, Some(0.125));
+        assert_eq!(p.gradient_rise, Some(vec![0.0025, 0.004, 0.006]));
+        assert_eq!(p.background, Some(vec![0.01, 0.02, 0.03]));
         assert_eq!(reopened.input, InputKind::Solved);
         assert_eq!(reopened.frame, session.frame);
         assert_eq!(reopened.align_secs, None, "align timing must not persist");
@@ -281,6 +297,8 @@ mod tests {
             "ch_mean",
             "noise",
             "gradient",
+            "gradient_rise",
+            "background",
             "ragged",
         ] {
             assert!(
@@ -321,6 +339,8 @@ mod tests {
         assert_eq!(session.panels[0].noise, None);
         assert_eq!(session.panels[0].gradient, None);
         assert_eq!(session.panels[0].ragged, None);
+        assert_eq!(session.panels[0].gradient_rise, None);
+        assert_eq!(session.panels[0].background, None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

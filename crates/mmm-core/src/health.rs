@@ -137,7 +137,7 @@ pub fn health_with_lines(
 ) -> Result<(Health, Vec<SeamLine>)> {
     let (summaries, owner) = load_owner_map(session, graph, phot, surfaces, feather_px)?;
     let h = measure(session, phot, surfaces, &summaries, &owner);
-    let lines = seam_lines(&owner, &h);
+    let lines = seam_lines(&owner, &h, (session.canvas.0, session.canvas.1));
     Ok((h, lines))
 }
 
@@ -150,8 +150,9 @@ pub struct SeamLine {
     /// Higher panel index of the pair.
     pub b: u16,
     /// The polyline's vertices in canvas px: L8 cell corners × [`BLOCK`],
-    /// straight runs merged into one segment. An open line starts at its
-    /// lesser end; a closed one repeats its first point last.
+    /// clamped to the canvas, straight runs merged into one segment. An
+    /// open line starts at its lesser end; a closed one repeats its first
+    /// point last.
     pub points: Vec<[f64; 2]>,
     /// Whether the pair's seam step is flagged ([`SeamStep::flagged`]);
     /// `false` for a pair with no measured step.
@@ -233,9 +234,12 @@ fn chain(segments: &[(Corner, Corner)]) -> Vec<Vec<Corner>> {
 /// neighbouring L8 cells, the cell edges between them joined end to end
 /// into polylines in canvas px (a pair meeting in several places has
 /// several lines), each carrying its pair's flag from `health`. Edges
-/// against unowned cells (panel rims) are not seams. Ordered by pair, then
-/// by first point. Works on the L8 owner grid, never at full resolution.
-pub fn seam_lines(owner: &OwnerMap, health: &Health) -> Vec<SeamLine> {
+/// against unowned cells (panel rims) are not seams. Points are clamped to
+/// the `canvas` `(width, height)` in px: the last L8 column and row overhang
+/// a canvas whose size is not a multiple of [`BLOCK`]. Ordered by pair,
+/// then by first point. Works on the L8 owner grid, never at full
+/// resolution.
+pub fn seam_lines(owner: &OwnerMap, health: &Health, canvas: (u64, u64)) -> Vec<SeamLine> {
     let (w, h) = (owner.w8, owner.h8);
     let mut segments: BTreeMap<(u16, u16), Vec<(Corner, Corner)>> = BTreeMap::new();
     for y in 0..h {
@@ -257,7 +261,15 @@ pub fn seam_lines(owner: &OwnerMap, health: &Health) -> Vec<SeamLine> {
             }
         }
     }
-    let px = |c: Corner| [c.0 as f64 * BLOCK as f64, c.1 as f64 * BLOCK as f64];
+    // Only the grid's far corners (index w8 or h8) can overhang: the others
+    // lie at most (w8 − 1)·8 < width. So clamping moves a line's last point
+    // and never merges two.
+    let px = |c: Corner| {
+        [
+            (u64::from(c.0) * u64::from(BLOCK)).min(canvas.0) as f64,
+            (u64::from(c.1) * u64::from(BLOCK)).min(canvas.1) as f64,
+        ]
+    };
     let mut out = Vec::new();
     for ((a, b), segs) in segments {
         let flagged = health
@@ -406,7 +418,7 @@ mod tests {
         };
         // (0, 1) flagged; (0, 2) measured clean; (1, 2) never measured.
         let h = health_with(vec![step(0, 1, true), step(0, 2, false)]);
-        let lines = seam_lines(&owner, &h);
+        let lines = seam_lines(&owner, &h, (48, 32));
         let got: Vec<(u16, u16, bool, Vec<[f64; 2]>)> = lines
             .iter()
             .map(|l| (l.a, l.b, l.flagged, canonical(&l.points)))
@@ -426,7 +438,7 @@ mod tests {
             h8: 2,
             owner: vec![0, 1, 0, 0, 1, 0],
         };
-        let lines = seam_lines(&owner, &health_with(vec![]));
+        let lines = seam_lines(&owner, &health_with(vec![]), (24, 16));
         let got: Vec<Vec<[f64; 2]>> = lines.iter().map(|l| canonical(&l.points)).collect();
         assert_eq!(
             got,
@@ -443,11 +455,94 @@ mod tests {
             h8: 3,
             owner: vec![0, 0, 0, 0, 1, 0, 0, 0, 0],
         };
-        let lines = seam_lines(&owner, &health_with(vec![]));
+        let lines = seam_lines(&owner, &health_with(vec![]), (24, 24));
         assert_eq!(lines.len(), 1);
-        let p = &lines[0].points;
-        assert_eq!(p.len(), 5, "four corners and back: {p:?}");
-        assert_eq!(p.first(), p.last());
+        assert_eq!(
+            lines[0].points,
+            vec![
+                [8.0, 8.0],
+                [16.0, 8.0],
+                [16.0, 16.0],
+                [8.0, 16.0],
+                [8.0, 8.0]
+            ]
+        );
+    }
+
+    /// Two cells of each panel touching only at their corners: the corner
+    /// joins four boundary edges of one pair. Each line turns there (the
+    /// walk takes the edges in pairs), and between them every edge is
+    /// drawn once.
+    #[test]
+    fn a_checkerboard_corner_joins_two_lines() {
+        let owner = OwnerMap {
+            w8: 2,
+            h8: 2,
+            owner: vec![0, 1, 1, 0],
+        };
+        let lines = seam_lines(&owner, &health_with(vec![]), (16, 16));
+        let got: Vec<&Vec<[f64; 2]>> = lines.iter().map(|l| &l.points).collect();
+        assert_eq!(
+            got,
+            vec![
+                &vec![[0.0, 8.0], [8.0, 8.0], [8.0, 0.0]],
+                &vec![[8.0, 16.0], [8.0, 8.0], [16.0, 8.0]],
+            ]
+        );
+    }
+
+    /// A diagonal seam follows the L8 staircase: one vertex per step.
+    #[test]
+    fn a_diagonal_seam_is_a_staircase() {
+        // Panel 1 owns the cells above the diagonal (x > y).
+        let owner = OwnerMap {
+            w8: 4,
+            h8: 4,
+            owner: (0..16u16).map(|i| u16::from(i % 4 > i / 4)).collect(),
+        };
+        let lines = seam_lines(&owner, &health_with(vec![]), (32, 32));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].points,
+            vec![
+                [8.0, 0.0],
+                [8.0, 8.0],
+                [16.0, 8.0],
+                [16.0, 16.0],
+                [24.0, 16.0],
+                [24.0, 24.0],
+                [32.0, 24.0],
+            ]
+        );
+    }
+
+    /// The last L8 column and row overhang a canvas whose size is not a
+    /// multiple of 8: a seam reaching them stops at the canvas edge.
+    #[test]
+    fn seam_lines_stay_on_the_canvas() {
+        // Canvas 20 x 20 px: 3 x 3 cells, the last ones 4 px.
+        //   0 0 1
+        //   0 0 1
+        //   2 2 2
+        let owner = OwnerMap {
+            w8: 3,
+            h8: 3,
+            owner: vec![0, 0, 1, 0, 0, 1, 2, 2, 2],
+        };
+        let lines = seam_lines(&owner, &health_with(vec![]), (20, 20));
+        let got: Vec<(u16, u16, &Vec<[f64; 2]>)> =
+            lines.iter().map(|l| (l.a, l.b, &l.points)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 1, &vec![[16.0, 0.0], [16.0, 16.0]]),
+                (0, 2, &vec![[0.0, 16.0], [16.0, 16.0]]),
+                (1, 2, &vec![[16.0, 16.0], [20.0, 16.0]]),
+            ]
+        );
+        for l in &lines {
+            assert!(l.points.iter().all(|p| p[0] <= 20.0 && p[1] <= 20.0));
+        }
     }
 
     /// `health_with_lines` measures exactly what `health` does, from the

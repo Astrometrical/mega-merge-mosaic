@@ -585,6 +585,8 @@ fn analyze_solved(
                 noise: None,
                 gradient: None,
                 ragged: None,
+                gradient_rise: None,
+                background: None,
             };
             let reader = PanelReader::open(&meta, canvas)?;
             let scan = scan_reader(meta, reader)?;
@@ -837,6 +839,8 @@ pub fn analyze_ipc_aligned(
                 noise: None,
                 gradient: None,
                 ragged: None,
+                gradient_rise: None,
+                background: None,
             };
             let s = scan_reader(meta, reader)?;
             {
@@ -960,6 +964,8 @@ pub fn analyze_ipc_solved(
                 noise: None,
                 gradient: None,
                 ragged: None,
+                gradient_rise: None,
+                background: None,
             };
             let reader = PanelReader::open(&meta, canvas)?;
             let s = scan_reader(meta, reader)?;
@@ -1050,13 +1056,16 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
         noise: None,
         gradient: None,
         ragged: None,
+        gradient_rise: None,
+        background: None,
     };
     scan_reader(meta, panel)
 }
 
 /// Single streaming pass over one panel through a [`PanelReader`], filling in
 /// the scan-derived fields of `meta` (bbox, coverage, per-channel stats, and
-/// the quality statistics measured on the finished summary). Storage-agnostic: rows outside a cropped cache's bbox read as absent.
+/// the quality statistics measured on the finished summary).
+/// Storage-agnostic: rows outside a cropped cache's bbox read as absent.
 fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
     panel.advise_sequential();
     let (w, h, ch) = panel.canvas();
@@ -1188,6 +1197,8 @@ fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
     let stats = crate::summary::panel_stats(&summary, meta.bbox);
     meta.noise = stats.noise;
     meta.gradient = stats.gradient;
+    meta.gradient_rise = stats.gradient_rise;
+    meta.background = stats.background;
     meta.ragged = stats.ragged;
     // Surface a mid-scan producer failure (IPC transport or FITS decode) as
     // a proper `Err` instead of a silently-wrong summary; a no-op for
@@ -1897,6 +1908,13 @@ mod tests {
             let g = s.panels[i].gradient.expect("gradient measured");
             assert!(g < 1.0, "panel {i} is flat but reads {g}");
         }
+        // The rise in data units, and the sky level it is judged against:
+        // the median of the darker half, a quarter of the way up the ramp.
+        let rise = s.panels[1].gradient_rise.clone().expect("rise measured");
+        assert!(near(rise[0], RISE, 0.05), "ramp rise {rise:?}");
+        let sky = s.panels[1].background.clone().expect("level measured");
+        assert!(near(sky[0], 0.1 + RISE / 4.0, 0.02), "ramp sky {sky:?}");
+        assert!(near(s.panels[0].background.clone().unwrap()[1], 0.1, 0.02));
 
         // Raggedness: clean edges read 0; jagged ones mostly partial.
         for i in [0, 1, 3] {

@@ -433,6 +433,8 @@ mod tests {
             noise: None,
             gradient: None,
             ragged: None,
+            gradient_rise: None,
+            background: None,
         }
     }
 

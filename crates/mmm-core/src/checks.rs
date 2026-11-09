@@ -78,12 +78,23 @@ pub enum CheckCode {
 pub const NOISE_FACTOR: f64 = 2.0;
 
 /// A panel whose background gradient rises more than this many times its
-/// noise across it has a strong gradient ([`CheckCode::PanelGradient`]).
+/// noise across it (and more than [`GRADIENT_FRACTION`] of its sky level)
+/// has a strong gradient ([`CheckCode::PanelGradient`]).
 pub const GRADIENT_FACTOR: f64 = 5.0;
 
-/// A panel more than this share of whose edge cells (the inner rim of
-/// [`crate::summary::panel_stats`]) are partly covered has ragged edges
-/// ([`CheckCode::RaggedEdges`]).
+/// The share of a panel's background (sky) level its background gradient
+/// must also rise by, across the panel, to be strong
+/// ([`CheckCode::PanelGradient`]): a deep, low-noise panel's gentle
+/// gradient is many times its noise yet harmless. Dropped when the level
+/// is near zero (no larger than the noise).
+pub const GRADIENT_FRACTION: f64 = 0.1;
+
+/// A panel more than this share of whose covered region's inner rim (the
+/// cells one step inside its outermost covered cells,
+/// [`crate::summary::panel_stats`]) is only partly covered has ragged
+/// edges ([`CheckCode::RaggedEdges`]). Coverage that thins out over
+/// several cells reads high; a staircase of long straight steps (a union
+/// of dithered frames) reads as clean.
 pub const RAGGED_FRACTION: f64 = 0.3;
 
 /// The overlap's short side, in canvas pixels, below which two panels are
@@ -835,31 +846,46 @@ pub fn layout_checks(group: &str, session: &Session, graph: &OverlapGraph) -> Ve
 /// Checks over one analysed group's panel statistics, measured at analysis
 /// time ([`crate::summary::panel_stats`]), all Notes:
 /// - [`CheckCode::NoiseOutOfLine`]: the panel's noise, in any channel, is
-///   above [`NOISE_FACTOR`] times the group's median for that channel (the
-///   median over the measured panels, needing two of them);
-/// - [`CheckCode::PanelGradient`]: its gradient is above [`GRADIENT_FACTOR`];
+///   above [`NOISE_FACTOR`] times the median of the *other* measured panels
+///   of the group for that channel (at least one other, with a median
+///   above 0), so even a two-panel group can have an outlier;
+/// - [`CheckCode::PanelGradient`]: in some channel with noise above 0, its
+///   background plane rises more than [`GRADIENT_FACTOR`] times the noise
+///   *and* more than [`GRADIENT_FRACTION`] of the background level; when the
+///   level is near zero (its magnitude at or below the noise, e.g. a
+///   background-subtracted panel) the noise test alone decides;
 /// - [`CheckCode::RaggedEdges`]: its raggedness is above [`RAGGED_FRACTION`].
 ///
 /// A statistic that was never measured (a session analysed before the
 /// statistics existed) is skipped, and such a panel does not count towards
-/// the group's median: an old session raises none of these, and passes
+/// the others' median: an old session raises none of these, and passes
 /// none, until it is analysed again. Panels are reported by their
 /// user-facing file.
 pub fn stat_checks(group: &str, session: &Session) -> Vec<Check> {
     let user_file =
         |m: &crate::session::PanelMeta| m.source.clone().unwrap_or_else(|| m.path.clone());
-    let measured: Vec<&Vec<f64>> = session
-        .panels
-        .iter()
-        .filter_map(|m| m.noise.as_ref())
-        .collect();
-    let channels = measured.iter().map(|n| n.len()).max().unwrap_or(0);
-    let medians: Vec<Option<f64>> = (0..channels)
-        .map(|c| {
-            let mut v: Vec<f64> = measured.iter().filter_map(|n| n.get(c).copied()).collect();
-            (v.len() > 1).then(|| median(&mut v)).filter(|&m| m > 0.0)
+    // Channel `c` of the measured panels other than `id`: their median.
+    let others = |id: usize, c: usize| -> Option<f64> {
+        let mut v: Vec<f64> = session
+            .panels
+            .iter()
+            .filter(|o| o.id != id)
+            .filter_map(|o| o.noise.as_ref()?.get(c).copied())
+            .collect();
+        (!v.is_empty()).then(|| median(&mut v)).filter(|&m| m > 0.0)
+    };
+    // In some channel the plane rises well above the noise and the sky.
+    let strong = |m: &crate::session::PanelMeta| -> bool {
+        let (Some(noise), Some(rise), Some(sky)) = (&m.noise, &m.gradient_rise, &m.background)
+        else {
+            return false;
+        };
+        noise.iter().zip(rise).zip(sky).any(|((&n, &r), &level)| {
+            n > 0.0
+                && r > GRADIENT_FACTOR * n
+                && (level.abs() <= n || r > GRADIENT_FRACTION * level.abs())
         })
-        .collect();
+    };
 
     let mut out = Vec::new();
     for m in &session.panels {
@@ -879,8 +905,8 @@ pub fn stat_checks(group: &str, session: &Session) -> Vec<Check> {
         };
         let noisy = m.noise.as_ref().is_some_and(|n| {
             n.iter()
-                .zip(&medians)
-                .any(|(&x, med)| med.is_some_and(|med| x > NOISE_FACTOR * med))
+                .enumerate()
+                .any(|(c, &x)| others(m.id, c).is_some_and(|med| x > NOISE_FACTOR * med))
         });
         if noisy {
             note(
@@ -889,7 +915,7 @@ pub fn stat_checks(group: &str, session: &Session) -> Vec<Check> {
                 "Check it for less integration time or poor frames; its part of the mosaic will look noisier.",
             );
         }
-        if m.gradient.is_some_and(|g| g > GRADIENT_FACTOR) {
+        if strong(m) {
             note(
                 CheckCode::PanelGradient,
                 format!(
@@ -1266,6 +1292,8 @@ mod tests {
             noise: None,
             gradient: None,
             ragged: None,
+            gradient_rise: None,
+            background: None,
         }
     }
 
@@ -1969,6 +1997,8 @@ mod tests {
         for (m, n) in s.panels.iter_mut().zip([1.0e-3, 1.1e-3, 0.9e-3, 1.05e-3]) {
             m.noise = Some(vec![n, 2.0 * n]);
             m.gradient = Some(1.5);
+            m.gradient_rise = Some(vec![1.5 * n, 3.0 * n]);
+            m.background = Some(vec![0.1, 0.2]);
             m.ragged = Some(0.0);
         }
         let stats = stat_checks("Ha", &s);
@@ -1985,13 +2015,89 @@ mod tests {
     // ---- statistics and seams ----
 
     /// A panel of [`meta`] carrying the analysis statistics.
+    /// Its gradient rises `gradient` times the noise in every channel, on a
+    /// near-zero sky (so only the noise test decides).
     fn stat_meta(id: usize, noise: &[f64], gradient: f64, ragged: f64) -> PanelMeta {
         PanelMeta {
             noise: Some(noise.to_vec()),
             gradient: Some(gradient),
+            gradient_rise: Some(noise.iter().map(|n| gradient * n).collect()),
+            background: Some(vec![0.0; noise.len()]),
             ragged: Some(ragged),
             ..meta(id, 0.1)
         }
+    }
+
+    /// One panel with the given per-channel noise, background level and
+    /// gradient rise.
+    fn sky_meta(noise: &[f64], background: &[f64], rise: &[f64]) -> PanelMeta {
+        let gradient = rise
+            .iter()
+            .zip(noise)
+            .map(|(r, n)| r / n)
+            .fold(0.0, f64::max);
+        PanelMeta {
+            noise: Some(noise.to_vec()),
+            gradient: Some(gradient),
+            gradient_rise: Some(rise.to_vec()),
+            background: Some(background.to_vec()),
+            ragged: Some(0.0),
+            ..meta(0, 0.1)
+        }
+    }
+
+    fn gradient_notes(m: PanelMeta) -> usize {
+        of(
+            &stat_checks("Ha", &session(vec![m])),
+            CheckCode::PanelGradient,
+        )
+        .len()
+    }
+
+    /// A gradient needs to be strong against the noise AND against the sky
+    /// level (in the same channel), unless the sky is near zero, when the
+    /// noise test alone decides.
+    #[test]
+    fn a_gradient_must_be_strong_against_the_sky_too() {
+        // A deep, low-noise panel: 5% of a 0.05 sky is 25x its noise.
+        assert_eq!(gradient_notes(sky_meta(&[1e-4], &[0.05], &[0.0025])), 0);
+        // 20% of the sky.
+        assert_eq!(gradient_notes(sky_meta(&[1e-4], &[0.05], &[0.01])), 1);
+        // A near-zero sky (below the noise): 6x the noise is enough, 4x is not.
+        assert_eq!(gradient_notes(sky_meta(&[1e-3], &[1e-5], &[0.006])), 1);
+        assert_eq!(gradient_notes(sky_meta(&[1e-3], &[-1e-5], &[0.004])), 0);
+        // Both tests in one channel: strong against the noise in one, against
+        // the sky in the other, is not a strong gradient.
+        let split = sky_meta(&[1e-4, 1e-3], &[0.05, 0.02], &[0.0025, 0.004]);
+        assert_eq!(gradient_notes(split), 0);
+        // A noiseless channel never counts.
+        assert_eq!(gradient_notes(sky_meta(&[0.0], &[0.05], &[0.02])), 0);
+        // Measured before the sky level was recorded: no verdict.
+        let mut older = sky_meta(&[1e-4], &[0.05], &[0.01]);
+        older.background = None;
+        older.gradient_rise = None;
+        assert_eq!(gradient_notes(older), 0);
+    }
+
+    /// Each panel is compared with the median of the OTHER measured panels,
+    /// so a two-panel group can have an outlier.
+    #[test]
+    fn noise_is_judged_against_the_other_panels() {
+        let two = session(vec![
+            stat_meta(0, &[1e-3], 0.0, 0.0),
+            stat_meta(1, &[1e-2], 0.0, 0.0),
+        ]);
+        let checks = stat_checks("Ha", &two);
+        let noisy: Vec<&PathBuf> = of(&checks, CheckCode::NoiseOutOfLine)
+            .iter()
+            .map(|c| &c.panels[0])
+            .collect();
+        assert_eq!(noisy, vec![&PathBuf::from("/in/p1.xisf")]);
+        let equal = session(vec![
+            stat_meta(0, &[1e-3], 0.0, 0.0),
+            stat_meta(1, &[1e-3], 0.0, 0.0),
+        ]);
+        assert!(stat_checks("Ha", &equal).is_empty());
     }
 
     /// Health over `(a, b, delta)` steps, flagged by the `flag_steps` rule.
@@ -2120,7 +2226,7 @@ mod tests {
         // The fields stay out of session.json while unmeasured.
         old.save().unwrap();
         let json = std::fs::read_to_string(d.join("session.json")).unwrap();
-        for key in ["noise", "gradient", "ragged"] {
+        for key in ["noise", "gradient", "background", "ragged"] {
             assert!(!json.contains(key), "{key} written for an old panel");
         }
     }

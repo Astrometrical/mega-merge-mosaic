@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use crate::diag::median;
 use crate::{Error, Result};
 
 /// Canvas pixels per summary cell along each axis.
@@ -177,31 +178,24 @@ pub const PARTIAL_MAX: f32 = 0.95;
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PanelStats {
     /// Per-channel background noise: the median in-cell RMS over the
-    /// background cells. `None` without a fully covered cell.
+    /// background cells. `None` when unmeasured: no fully covered cell, or
+    /// a channel with no usable (finite) cell.
     pub noise: Option<Vec<f64>>,
     /// Background gradient strength: the largest, over the channels, of the
     /// fitted background plane's rise across the bbox over that channel's
     /// noise. `None` when no channel has positive noise and a well-posed
     /// fit.
     pub gradient: Option<f64>,
+    /// Per-channel rise of the fitted background plane across the bbox, in
+    /// data units (0 for a channel whose plane cannot be fitted). Present
+    /// exactly when `noise` is.
+    pub gradient_rise: Option<Vec<f64>>,
+    /// Per-channel background (sky) level: the median of the background
+    /// cells' means. Present exactly when `noise` is.
+    pub background: Option<Vec<f64>>,
     /// Edge raggedness: the share of the inner rim's cells only partly
     /// covered, 0 to 1. `None` when the panel has no inner rim.
     pub ragged: Option<f64>,
-}
-
-/// Median of `v` (reordered in place); `0` when empty.
-fn median(v: &mut [f64]) -> f64 {
-    let n = v.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let upper = *v.select_nth_unstable_by(n / 2, f64::total_cmp).1;
-    if n % 2 == 1 {
-        upper
-    } else {
-        let lower = v[..n / 2].iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        0.5 * (lower + upper)
-    }
 }
 
 /// Least-squares plane `z ≈ α + β·x + γ·y` over `(x, y, z)` samples;
@@ -302,8 +296,12 @@ fn rim_raggedness(s: &L8Summary, x0: usize, x1: usize, y0: usize, y1: usize) -> 
 ///   channel's noise that is the channel's gradient amplitude. The panel's
 ///   gradient is the largest amplitude over the channels with positive
 ///   noise and a well-posed fit.
-/// - Cells with a non-finite mean or RMS (NaN pixels) are left out; a
-///   channel with no usable cell reads a noise of 0.
+/// - **Background level** is the median of the background cells' means
+///   (the sky the gradient is judged against), and **gradient rise** the
+///   plane's rise in data units (0 where no plane fits).
+/// - Cells with a non-finite mean or RMS (NaN pixels) are left out. A
+///   channel left with no usable cell leaves the panel's noise, gradient,
+///   rise and level unmeasured (`None`), so it cannot drag a group median.
 ///
 /// **Raggedness** looks at the cells the panel touches (coverage above
 /// [`PARTIAL_MIN`]). The outermost layer is the touched cells with an
@@ -314,7 +312,9 @@ fn rim_raggedness(s: &L8Summary, x0: usize, x1: usize, y0: usize, y1: usize) -> 
 /// outermost layer (the neighbour diagonally outward of each lies wholly
 /// outside), so its inner rim is fully covered and reads 0; a ragged
 /// stacking edge, whose coverage thins out over several cells, leaves
-/// partial cells further in.
+/// partial cells further in. The limit of the measure: an edge made of
+/// long straight steps (a union of dithered frames) reads as clean, since
+/// each step's partial cells border empty ones.
 pub fn panel_stats(summary: &L8Summary, bbox: [u64; 4]) -> PanelStats {
     let block = BLOCK as u64;
     let (w8, h8) = (summary.w8 as usize, summary.h8 as usize);
@@ -331,60 +331,69 @@ pub fn panel_stats(summary: &L8Summary, bbox: [u64; 4]) -> PanelStats {
         .filter(|&i| summary.coverage[i] >= 1.0)
         .collect();
 
-    let (mut noise, mut gradient) = (None, None);
-    if !full.is_empty() {
-        let (bw, bh) = ((bbox[2] - bbox[0]) as f64, (bbox[3] - bbox[1]) as f64);
-        let centre = |i: usize| {
-            (
-                ((i % w8) as f64 + 0.5) * BLOCK as f64,
-                ((i / w8) as f64 + 0.5) * BLOCK as f64,
-            )
-        };
-        let mut per_channel = Vec::with_capacity(summary.channels as usize);
-        for c in 0..summary.channels as usize {
-            let mean = &summary.mean[c * cells..(c + 1) * cells];
-            let detail = &summary.detail[c * cells..(c + 1) * cells];
-            // Non-finite pixels (NaN in an input) poison a cell: skip it.
-            let usable: Vec<usize> = full
-                .iter()
-                .copied()
-                .filter(|&i| mean[i].is_finite() && detail[i].is_finite())
-                .collect();
-            let mut means: Vec<f64> = usable.iter().map(|&i| mean[i] as f64).collect();
-            let mid = median(&mut means);
-            let background: Vec<usize> = usable
-                .into_iter()
-                .filter(|&i| mean[i] as f64 <= mid)
-                .collect();
-            let mut rms: Vec<f64> = background.iter().map(|&i| detail[i] as f64).collect();
-            // No usable cell reads as no noise: never out of line.
-            let n = median(&mut rms);
-            per_channel.push(n);
-            if n <= 0.0 {
-                continue;
-            }
-            let samples: Vec<(f64, f64, f64)> = background
-                .iter()
-                .map(|&i| {
-                    let (x, y) = centre(i);
-                    (x, y, mean[i] as f64)
-                })
-                .collect();
-            if let Some((bx, by)) = plane_slopes(&samples) {
-                let amp = (bx.abs() * bw + by.abs() * bh) / n;
-                if amp.is_finite() {
-                    gradient = Some(gradient.map_or(amp, |g: f64| g.max(amp)));
-                }
-            }
-        }
-        noise = Some(per_channel);
-    }
-
-    PanelStats {
-        noise,
-        gradient,
+    let mut stats = PanelStats {
         ragged: rim_raggedness(summary, x0, x1, y0, y1),
+        ..PanelStats::default()
+    };
+    if full.is_empty() {
+        return stats;
     }
+    let (bw, bh) = ((bbox[2] - bbox[0]) as f64, (bbox[3] - bbox[1]) as f64);
+    let centre = |i: usize| {
+        (
+            ((i % w8) as f64 + 0.5) * BLOCK as f64,
+            ((i / w8) as f64 + 0.5) * BLOCK as f64,
+        )
+    };
+    let channels = summary.channels as usize;
+    let (mut noise, mut rise, mut level) = (
+        Vec::with_capacity(channels),
+        Vec::with_capacity(channels),
+        Vec::with_capacity(channels),
+    );
+    let mut gradient: Option<f64> = None;
+    for c in 0..channels {
+        let mean = &summary.mean[c * cells..(c + 1) * cells];
+        let detail = &summary.detail[c * cells..(c + 1) * cells];
+        // Non-finite pixels (NaN in an input) poison a cell: skip it.
+        let usable: Vec<usize> = full
+            .iter()
+            .copied()
+            .filter(|&i| mean[i].is_finite() && detail[i].is_finite())
+            .collect();
+        if usable.is_empty() {
+            // Unmeasurable channel: the panel's pixel statistics stay None.
+            return stats;
+        }
+        let mid = median(usable.iter().map(|&i| mean[i] as f64).collect());
+        let background: Vec<usize> = usable
+            .into_iter()
+            .filter(|&i| mean[i] as f64 <= mid)
+            .collect();
+        let n = median(background.iter().map(|&i| detail[i] as f64).collect());
+        level.push(median(background.iter().map(|&i| mean[i] as f64).collect()));
+        noise.push(n);
+        let samples: Vec<(f64, f64, f64)> = background
+            .iter()
+            .map(|&i| {
+                let (x, y) = centre(i);
+                (x, y, mean[i] as f64)
+            })
+            .collect();
+        let fitted = plane_slopes(&samples)
+            .map(|(bx, by)| bx.abs() * bw + by.abs() * bh)
+            .filter(|r| r.is_finite());
+        rise.push(fitted.unwrap_or(0.0));
+        if let (Some(r), true) = (fitted, n > 0.0) {
+            let amp = r / n;
+            gradient = Some(gradient.map_or(amp, |g| g.max(amp)));
+        }
+    }
+    stats.noise = Some(noise);
+    stats.gradient = gradient;
+    stats.gradient_rise = Some(rise);
+    stats.background = Some(level);
+    stats
 }
 
 #[cfg(test)]
@@ -539,8 +548,97 @@ mod tests {
         // Rise 1e-4 × 160 px over 0.002; channel 1's flat plane reads 0.
         let g = st.gradient.unwrap();
         assert!((g - 8.0).abs() < 1e-3, "{g}");
+        // The rise per channel, in data units.
+        let rise = st.gradient_rise.unwrap();
+        assert!(
+            (rise[0] - 0.016).abs() < 1e-6 && rise[1].abs() < 1e-9,
+            "{rise:?}"
+        );
+        // The background level: the median of the background cells' means.
+        // The background is columns 0..=10 (at or below the median, col 10),
+        // less the star and NaN cells: its median lies in column 5 (x 44).
+        let level = st.background.unwrap();
+        assert!(
+            (level[0] - 0.1044).abs() < 1e-6 && (level[1] - 0.2).abs() < 1e-6,
+            "{level:?}"
+        );
         // Fully covered to the canvas edge: the inner rim is all covered.
         assert_eq!(st.ragged, Some(0.0));
+    }
+
+    /// A channel with no usable cell (every fully covered cell NaN) leaves
+    /// the panel's pixel statistics unmeasured, rather than reading a noise
+    /// of 0 that would drag its group's median; the edge measure, from
+    /// coverage alone, still stands.
+    #[test]
+    fn an_unusable_channel_leaves_the_panel_unmeasured() {
+        let mut s = L8Summary::zeroed(10, 10, 2);
+        s.coverage.fill(1.0);
+        s.mean[..100].fill(0.1);
+        s.detail[..100].fill(0.002);
+        s.mean[100..].fill(f32::NAN);
+        let st = panel_stats(&s, [0, 0, 80, 80]);
+        assert_eq!(st.noise, None);
+        assert_eq!(st.gradient, None);
+        assert_eq!(st.gradient_rise, None);
+        assert_eq!(st.background, None);
+        assert_eq!(st.ragged, Some(0.0));
+    }
+
+    /// A panel too small for a plane or an inner rim: one covered cell, or
+    /// one row of cells. Its noise is still measured.
+    #[test]
+    fn thin_and_single_cell_panels() {
+        let mut one = L8Summary::zeroed(6, 6, 1);
+        one.coverage[14] = 1.0;
+        one.mean[14] = 0.1;
+        one.detail[14] = 0.002;
+        let st = panel_stats(&one, [16, 16, 24, 24]);
+        assert!((st.noise.unwrap()[0] - 0.002).abs() < 1e-9);
+        assert_eq!((st.gradient, st.ragged), (None, None));
+
+        let mut row = L8Summary::zeroed(12, 3, 1);
+        for x8 in 0..12usize {
+            let i = 12 + x8;
+            row.coverage[i] = 1.0;
+            row.mean[i] = 0.1 + 0.01 * x8 as f32;
+            row.detail[i] = 0.002;
+        }
+        let st = panel_stats(&row, [0, 8, 96, 16]);
+        assert!(st.noise.is_some());
+        assert_eq!(st.gradient, None, "collinear cells: no plane");
+        assert_eq!(st.ragged, None, "every cell is on the outermost layer");
+    }
+
+    /// The edge measure's limitation, pinned down: a union of dithered
+    /// frames is a staircase of long straight steps, whose partly covered
+    /// cells each border empty ones, so it reads as clean. Only coverage
+    /// that thins out over several cells reads as ragged.
+    #[test]
+    fn a_dithered_union_edge_reads_clean() {
+        // Twelve 200 x 150 px frames dithered up to ±20 px.
+        let offsets: [(f64, f64); 12] = [
+            (0.0, 0.0),
+            (13.0, -7.0),
+            (-19.0, 4.0),
+            (6.0, 18.0),
+            (-11.0, -16.0),
+            (17.0, 9.0),
+            (-4.0, -20.0),
+            (20.0, -2.0),
+            (-15.0, 13.0),
+            (9.0, -12.0),
+            (-7.0, 19.0),
+            (2.0, 6.0),
+        ];
+        let (s, bbox) = covering(48, 40, |x, y| {
+            offsets.iter().any(|&(dx, dy)| {
+                (80.0 + dx..280.0 + dx).contains(&x) && (80.0 + dy..230.0 + dy).contains(&y)
+            })
+        });
+        // Every partly covered cell borders an empty one: exactly 0, far
+        // below RAGGED_FRACTION.
+        assert_eq!(panel_stats(&s, bbox).ragged, Some(0.0));
     }
 
     /// No coverage, no statistics.
