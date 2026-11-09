@@ -534,7 +534,7 @@ fn panel_details_show_filter_and_integration() {
     // The first panel with its sub-frames in its header (its pixels do not
     // matter here).
     let (w, h) = crate::synth_mosaic::CANVAS;
-    let cards = [("FILTER", "'Ha'"), ("EXPTIME", "300"), ("NCOMBINE", "24")]
+    let cards = [("FILTER", "'Ha'"), ("EXPTIME", "299.7"), ("NCOMBINE", "24")]
         .map(|(k, v)| format!(r#"<FITSKeyword name="{k}" value="{v}" comment=""/>"#))
         .concat();
     let planes = vec![0.1f32; (w * h * 3) as usize];
@@ -554,6 +554,7 @@ fn panel_details_show_filter_and_integration() {
     };
     fact(&h, "Size", "600 × 420 (0.3 MP)");
     fact(&h, "Filter", "Ha");
+    // Rounded, as the integration is (299.7 s × 24).
     fact(&h, "Exposure", "300 s");
     fact(&h, "Frames", "24");
     fact(&h, "Integration", "2h 00m");
@@ -572,6 +573,13 @@ fn panel_details_show_filter_and_integration() {
         "exposure, frames, integration"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn exposures_are_rounded() {
+    assert_eq!(exposure_text(299.7), "300 s");
+    assert_eq!(exposure_text(1.0), "1 s");
+    assert_eq!(exposure_text(0.25), "0.25 s");
 }
 
 #[test]

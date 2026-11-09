@@ -209,13 +209,13 @@ pub fn problem_marks(
             at.entry(place.badged()).or_default().push(c.clone());
         }
     }
-    let seams = &report.seams;
+    let places = Places::new(session, layout, &report.seams);
     at.into_iter()
         .map(|(place, problems)| {
             // A pair whose overlap does not resolve: at its seam's lines.
-            let rect = place_rect(session, layout, seams, &place).or_else(|| {
+            let rect = places.rect(&place).or_else(|| {
                 problems.iter().find_map(|c| match Place::of(c)? {
-                    seam @ Place::Seam { .. } => place_rect(session, layout, seams, &seam),
+                    seam @ Place::Seam { .. } => places.rect(&seam),
                     _ => None,
                 })
             });
@@ -289,37 +289,77 @@ fn line_ids(l: &SeamLine) -> (usize, usize) {
     (usize::from(l.a.min(l.b)), usize::from(l.a.max(l.b)))
 }
 
+/// What places the checks on the canvas, gathered once for many look-ups
+/// (a list's rows, a view's marks): the session's panels and groups, the
+/// analysis's layout and the checks' seam lines.
+pub struct Places<'a> {
+    layout: &'a Layout,
+    seams: &'a Seams,
+    /// The session's panels.
+    panels: BTreeSet<&'a Path>,
+    /// The session's groups.
+    groups: Vec<String>,
+}
+
+impl<'a> Places<'a> {
+    /// The places of `session`'s checks: in `layout`, with `seams`.
+    pub fn new(session: &'a OpenSession, layout: &'a Layout, seams: &'a Seams) -> Self {
+        Places {
+            layout,
+            seams,
+            panels: session
+                .mosaic
+                .config
+                .panels
+                .iter()
+                .map(|e| e.path.as_path())
+                .collect(),
+            groups: group_names(session),
+        }
+    }
+
+    /// See [`place_rect`].
+    pub fn rect(&self, place: &Place) -> Option<[f64; 4]> {
+        let panel = |p: &Path| {
+            self.panels
+                .contains(p)
+                .then(|| self.layout.rects.get(p).copied())
+                .flatten()
+        };
+        match place {
+            Place::Panel(p) => panel(p),
+            Place::Overlap(a, b) => intersect(panel(a)?, panel(b)?),
+            Place::Seam { group, a, b } => {
+                let (ra, rb) = (panel(a)?, panel(b)?);
+                if !self.groups.contains(group) {
+                    return None;
+                }
+                seam_bbox(self.layout, self.seams, group, a, b).or_else(|| intersect(ra, rb))
+            }
+            Place::Area(r) => Some(r.map(|v| v as f64)),
+        }
+    }
+
+    /// See [`target_rect`].
+    pub fn target(&self, check: &Check) -> Option<[u64; 4]> {
+        let place = Place::of(check)?;
+        Some(covering_px(self.rect(&place)?))
+    }
+}
+
 /// The canvas rect of `place` in the analysed frame: a panel's analysed
 /// bbox (`layout`), the intersection of two panels' bboxes, the bbox of a
 /// seam's lines in `seams` (else its panels' overlap), an area's rect.
 /// None for a panel no longer in `session`, a seam of a group it no longer
 /// has, panels that do not overlap, or what the analysis does not place.
+/// (For many places, [`Places`].)
 pub fn place_rect(
     session: &OpenSession,
     layout: &Layout,
     seams: &Seams,
     place: &Place,
 ) -> Option<[f64; 4]> {
-    let cfg = &session.mosaic.config;
-    let panel = |p: &Path| {
-        cfg.panels
-            .iter()
-            .any(|e| e.path == p)
-            .then(|| layout.rects.get(p).copied())
-            .flatten()
-    };
-    match place {
-        Place::Panel(p) => panel(p),
-        Place::Overlap(a, b) => intersect(panel(a)?, panel(b)?),
-        Place::Seam { group, a, b } => {
-            let (ra, rb) = (panel(a)?, panel(b)?);
-            if !group_names(session).contains(group) {
-                return None;
-            }
-            seam_bbox(layout, seams, group, a, b).or_else(|| intersect(ra, rb))
-        }
-        Place::Area(r) => Some(r.map(|v| v as f64)),
-    }
+    Places::new(session, layout, seams).rect(place)
 }
 
 /// Where a badge for `place` sits given its rect: a panel's at the
@@ -334,15 +374,15 @@ pub fn badge_point(place: &Place, rect: [f64; 4]) -> [f64; 2] {
 /// The canvas rect (whole pixels, covering it) of `check`'s target: its
 /// panel's analysed bbox, its overlap, its seam's lines' bbox (else the
 /// overlap), or its area ([`place_rect`]). None for a check with no place
-/// on the canvas, or one whose target no longer resolves.
+/// on the canvas, or one whose target no longer resolves. (For many
+/// checks, [`Places`].)
 pub fn target_rect(
     session: &OpenSession,
     layout: &Layout,
     seams: &Seams,
     check: &Check,
 ) -> Option<[u64; 4]> {
-    let place = Place::of(check)?;
-    Some(covering_px(place_rect(session, layout, seams, &place)?))
+    Places::new(session, layout, seams).target(check)
 }
 
 /// The whole-pixel canvas rect covering `r` (none of it below zero).

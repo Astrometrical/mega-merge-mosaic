@@ -516,8 +516,9 @@ fn panel_of(shown: &PanelsEdit, id: u64) -> Option<&Path> {
         .find(|p| row_id(p) == id)
 }
 
-/// The file name of `path`, for rows.
-fn file_name(path: &Path) -> String {
+/// The file name of `path` (its whole path if it has none), as panels are
+/// named: rows, details, headings.
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())

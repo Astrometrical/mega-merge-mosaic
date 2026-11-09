@@ -7,13 +7,16 @@
 //!   Problems** back. Its badge counts the unaccepted problems.
 //! - **Checks rows** (here and in Panels) whose target resolves to a place
 //!   on the canvas lead there: a click or Enter opens the problem
-//!   ([`SessionWindow::open_problem`]: framed and selected).
+//!   ([`SessionWindow::open_problem`]: framed and selected). The inspector
+//!   keeps its place (Panels is not revealed; open, it follows the
+//!   selection); a canvas badge clicked reveals Panels instead.
 //! - **Panels**: "{n} panels · {g} groups · {canvas}", the previews'
 //!   progress (with **Resume** once paused), and what is selected
 //!   ([`Selected`]): a panel's details ([`PlanView::selection_ui`]: its
 //!   Overlaps rows select the neighbour and frame the overlap) and its
 //!   checks, every severity, with Accept, Un-accept and Open; or "Overlap
-//!   {a} – {b}" / "Seam {a} – {b}" and the checks at that place.
+//!   {a} – {b}" / "Seam {a} – {b}" and the checks of that pair of panels,
+//!   its overlap's and its seam's together.
 //! - **ROIs**: **Draw ROI** (also the `D` key, which reveals the section so
 //!   its hint shows) arms the draw tool on the canvas shown, plan or mosaic
 //!   (a crosshair over it while armed), then the ROI list
@@ -49,10 +52,11 @@ use crate::compositions::{
     Composition, ViewKind, channel_editor, composition_detail, save_compositions,
 };
 use crate::jobs::JobRunner;
-use crate::marks::{Place, target_rect};
+use crate::marks::{Place, Places};
 use crate::mosaic_view::MosaicView;
+use crate::panel_list::file_name;
 use crate::pipeline::{Pipeline, Step};
-use crate::plan_view::{Layout, PlanView, details_heading, file_name};
+use crate::plan_view::{Layout, PlanView, details_heading};
 use crate::session::{OpenSession, notes, set_notes};
 use crate::status::format_canvas;
 use crate::util::{Debounce, group_names};
@@ -205,7 +209,8 @@ impl SessionWindow {
         out.accept.append(&mut act.checks.accept);
         out.unaccept.append(&mut act.checks.unaccept);
         if let Some(check) = act.checks.open.take() {
-            self.open_problem(session, checks.report(), &check);
+            // A list's row: the inspector keeps its place.
+            self.open_problem(session, checks.report(), &check, false);
         }
         if let Some((panel, neighbour)) = act.neighbour.take() {
             self.go_to_neighbour(session, &panel, &neighbour);
@@ -274,8 +279,8 @@ pub(crate) fn counted(n: usize, noun: &str) -> String {
 /// each stands for; with `errors`, what could not be checked first (as
 /// problems that cannot be accepted, standing for no check). A row leads
 /// somewhere when its check's target resolves to a place on the canvas
-/// ([`target_rect`] in `layout`, with the report's seam lines): opening it
-/// goes there.
+/// ([`Places::target`] in `layout`, with the report's seam lines): opening
+/// it goes there.
 fn check_items<'r>(
     report: &'r ChecksReport,
     (session, layout): (&OpenSession, &Layout),
@@ -283,6 +288,7 @@ fn check_items<'r>(
     keep: impl Fn(&Check) -> bool,
 ) -> (Vec<CheckItem>, Vec<Option<&'r Check>>) {
     let cfg = &session.mosaic.config;
+    let places = Places::new(session, layout, &report.seams);
     let mut items = Vec::new();
     let mut sources = Vec::new();
     if errors {
@@ -309,7 +315,7 @@ fn check_items<'r>(
             detail: c.remedy.clone().unwrap_or_default(),
             accepted: is_accepted(cfg, c),
             acceptable: c.severity != Severity::Passed,
-            goes_somewhere: target_rect(session, layout, &report.seams, c).is_some(),
+            goes_somewhere: places.target(c).is_some(),
         });
         sources.push(Some(c));
     }
@@ -475,8 +481,9 @@ fn panels_ui(
 }
 
 /// The selected overlap's or seam's details: "Overlap {a} – {b}" or "Seam
-/// {a} – {b}" (the panels' names), then every check at that place, with
-/// Accept, Un-accept and Open.
+/// {a} – {b}" (the panels' names, naming what was selected), then every
+/// check of that pair of panels, its overlap's and its seam's (as the
+/// pair's badge counts them), with Accept, Un-accept and Open.
 fn place_ui(
     ui: &mut egui::Ui,
     session: &OpenSession,
@@ -494,9 +501,11 @@ fn place_ui(
     let Some(report) = checks.report() else {
         return;
     };
-    let place = selected.place();
+    // The pair's checks, its overlap's and its seam's together (as its
+    // badge counts them).
+    let pair = selected.place().badged();
     let (items, sources) = check_items(report, (session, layout), false, |c| {
-        Place::of(c).as_ref() == Some(&place)
+        Place::of(c).map(Place::badged).as_ref() == Some(&pair)
     });
     if items.is_empty() {
         muted(ui, "No checks here.");

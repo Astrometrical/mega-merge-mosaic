@@ -125,6 +125,18 @@ fn selection(h: &Harness<'static, State>) -> Option<Selected> {
     h.state().w.selection().cloned()
 }
 
+/// Whether the inspector's Panels section is open.
+fn panels_open(h: &Harness<'static, State>) -> bool {
+    h.state().w.inspector().is_open(PANELS)
+}
+
+/// Open the Panels section, as its heading clicked does (scrolling
+/// nowhere).
+fn open_panels(h: &mut Harness<'static, State>) {
+    h.state_mut().w.inspector_mut().open.insert(PANELS.into());
+    h.run_steps(2);
+}
+
 /// A seam line of group `geo`'s panels `a` and `b` through `points`.
 fn seam_line(
     geo: &BTreeMap<PathBuf, (usize, [f64; 4])>,
@@ -192,13 +204,15 @@ fn opening_a_problem_frames_and_selects_it() {
     step_to(&mut h, plan_ready);
     h.run_steps(2);
 
-    // A panel's problem: framed, the panel selected on the plan, its
-    // details in the Panels section.
+    // A panel's problem: framed, the panel selected on the plan. Opened
+    // from a list, the inspector keeps its place: Panels stays closed.
     open_row(&mut h, "Panel 3 alone");
     assert_plan_framed(&h, rect(3));
     assert_eq!(h.state().w.plan().selected(), Some(ha[3].as_path()));
     assert_eq!(selection(&h), Some(Selected::Panel(ha[3].clone())));
-    assert!(h.state().w.inspector().is_open("panels"));
+    assert!(!panels_open(&h), "a list's open reveals nothing");
+    // Open, Panels details it.
+    open_panels(&mut h);
     h.get_by_role_and_label(Role::Heading, &name(&ha[3]));
     assert!(
         rings(h.state().w.plan().lines()).is_empty(),
@@ -371,15 +385,27 @@ fn a_badge_click_opens_its_problem() {
     // lines, selected and ringed.
     let c = centre(o01);
     let at = h.state().w.plan().to_screen((c[0], c[1])).unwrap();
+    assert!(!panels_open(&h));
     badge_button(&h, at).click();
     h.run_steps(3);
     assert_plan_framed(&h, bbox(&line));
     assert_eq!(selection(&h), Some(the_seam.clone()));
     assert_eq!(rings(h.state().w.plan().lines()), [bbox(&line)]);
+    // A badge reveals Panels: the seam's heading, then every check of the
+    // pair (its seam's and its overlap's, as the badge counts them).
+    assert!(panels_open(&h), "a badge reveals Panels");
     h.get_by_role_and_label(
         Role::Heading,
         &format!("Seam {} – {}", name(&lo), name(&hi)),
     );
+    for title in ["A seam shows between 0 and 1", "Thin between 0 and 1"] {
+        assert_eq!(
+            h.query_all_by_role_and_label(Role::Button, title).count(),
+            2,
+            "{title} in Problems and the pair's checks"
+        );
+    }
+    assert_eq!(h.query_all_by_label("Panel 2 alone").count(), 1);
     // A panel's badge opens its panel's problem: the panel selected.
     h.state_mut().w.frame([0, 0, 600, 420]);
     h.run_steps(3);
@@ -476,7 +502,7 @@ fn a_stale_problem_target_is_harmless() {
             w.open_badge(session, checks.report(), id);
         }
         for c in checks_ {
-            w.open_problem(session, checks.report(), c);
+            w.open_problem(session, checks.report(), c, true);
         }
         h.run_steps(3);
     };
@@ -623,10 +649,16 @@ fn overlap_rows_go_to_the_neighbour() {
     click_plan(&mut h, own_point(&geo, &ha, 0));
     assert_eq!(h.state().w.plan().selected(), Some(ha[0].as_path()));
     assert!(h.state().w.plan().layout().overlaps[&ha[0]].contains(&ha[1]));
-    // Its overlaps are rows: one selects the neighbour and frames the
-    // overlap (not the neighbour's whole bbox).
-    h.get_by_role_and_label(Role::Button, &name(&ha[1]))
-        .click_accesskit();
+    // Its overlaps are rows that say what they do: one selects the
+    // neighbour and frames the overlap (not the neighbour's whole bbox).
+    let neighbour = name(&ha[1]);
+    let row = h.get_by_role_and_label(Role::Button, &neighbour);
+    let said = format!("Select {neighbour} and go to the overlap");
+    assert_eq!(
+        row.accesskit_node().description().as_deref(),
+        Some(said.as_str())
+    );
+    row.click_accesskit();
     h.run_steps(3);
     assert_eq!(h.state().w.plan().selected(), Some(ha[1].as_path()));
     assert_eq!(selection(&h), Some(Selected::Panel(ha[1].clone())));
@@ -669,5 +701,79 @@ fn keyboard_opens_a_problem() {
     assert_plan_framed(&h, geo[&ha[1]].1);
     assert_eq!(selection(&h), Some(Selected::Panel(ha[1].clone())));
     assert_eq!(h.state().w.plan().selected(), Some(ha[1].as_path()));
+    assert!(!panels_open(&h), "a list's open reveals nothing");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn opening_shows_the_problems_group() {
+    let (root, s, jobs) = analyzed("window-open-group");
+    let oiii = members(&s, "OIII");
+    let geo = analysed(&s, "OIII");
+    let o01 = meet(geo[&oiii[0]].1, geo[&oiii[1]].1);
+    let mut hole = problem_at(
+        CheckCode::CoverageHole,
+        CheckTarget::Group("OIII".into()),
+        &["OIII"],
+        "A hole in OIII",
+    );
+    hole.rect = Some([20, 30, 60, 50]);
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(ChecksReport {
+        checks: vec![
+            problem_at(
+                CheckCode::ThinOverlap,
+                CheckTarget::Overlap(oiii[0].clone(), oiii[1].clone()),
+                &["OIII"],
+                "Thin in OIII",
+            ),
+            hole,
+        ],
+        errors: Vec::new(),
+        seams: Default::default(),
+    });
+    let mut h = harness(state);
+    step_to(&mut h, plan_ready);
+    h.run_steps(2);
+    let ha = ViewKind::Group("Ha".into());
+    let shows = |h: &Harness<'static, State>| h.state().w.view().cloned();
+    assert_eq!(shows(&h), Some(ha.clone()));
+    // An OIII overlap opened while Ha shows: OIII shows, framed and ringed.
+    open_row(&mut h, "Thin in OIII");
+    step_to(&mut h, plan_ready);
+    h.run_steps(2);
+    assert_eq!(shows(&h), Some(ViewKind::Group("OIII".into())));
+    assert_plan_framed(&h, o01);
+    let (lo, hi) = pair(&oiii[0], &oiii[1]);
+    assert_eq!(selection(&h), Some(Selected::Overlap(lo, hi)));
+    assert_eq!(rings(h.state().w.plan().lines()), [o01]);
+    // Only a view showing it rings it, as its badge.
+    h.state_mut().w.select_view(ha.clone());
+    h.run_steps(3);
+    assert!(rings(h.state().w.plan().lines()).is_empty(), "not on Ha");
+    assert!(selection(&h).is_some(), "still selected");
+    h.state_mut().w.select_view(ViewKind::Group("OIII".into()));
+    h.run_steps(3);
+    assert_eq!(rings(h.state().w.plan().lines()), [o01]);
+    // Nor a plan drawn in another frame than the analysed one.
+    let analysed_frame = h.state().session.frame.clone();
+    h.state_mut().session.frame = Some(mmm_core::reference::ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.run_steps(3);
+    assert!(rings(h.state().w.plan().lines()).is_empty(), "frame behind");
+    h.state_mut().session.frame = analysed_frame;
+    h.run_steps(3);
+    assert_eq!(rings(h.state().w.plan().lines()), [o01]);
+    // A hole in OIII opened while Ha shows: OIII shows, the hole framed,
+    // nothing selected.
+    h.state_mut().w.select_view(ha);
+    h.run_steps(3);
+    open_row(&mut h, "A hole in OIII");
+    assert_eq!(shows(&h), Some(ViewKind::Group("OIII".into())));
+    assert_plan_framed(&h, [20.0, 30.0, 60.0, 50.0]);
+    assert_eq!(selection(&h), None);
     let _ = std::fs::remove_dir_all(&root);
 }

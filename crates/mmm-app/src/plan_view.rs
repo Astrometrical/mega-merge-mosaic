@@ -80,9 +80,9 @@ use egui::{Color32, ColorImage, RichText};
 use mega_ui::canvas_layers::{CanvasBadge, Overlay, Polyline, Tool};
 use mega_ui::icons;
 use mega_ui::plan::{Layer, PlacedItem, PlanCanvas};
+use mega_ui::theme::palette;
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
-use mega_ui::theme::{Tone, palette};
 use mega_ui::widgets::{
     ButtonKind, MegaButton, overline, property_grid, property_row, property_row_numeric,
 };
@@ -101,7 +101,7 @@ use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_c
 use crate::display_stretch::DisplayStretch;
 use crate::marks::{Place, ProblemMark, badge_point, outline_color};
 use crate::panel_edits::{group_colors, load_group_colors};
-use crate::panel_list::{UNKNOWN, integration_text};
+use crate::panel_list::{UNKNOWN, file_name, integration_text};
 use crate::session::OpenSession;
 use crate::status::format_canvas;
 use crate::util::{Poll, Task, group_names};
@@ -1826,18 +1826,23 @@ impl PlanView {
                 ui.label(text(Type::Small, "Shown once analysed."));
             }
             Some(o) if o.is_empty() => {
-                ui.label(text(Type::Small, "No other panel").color(Tone::Problem.color()));
+                // Muted: its problem (if a check flags it) says so, with
+                // its icon, in the panel's checks.
+                ui.label(text(Type::Small, "No other panel"));
             }
             Some(o) => {
                 for p in o {
                     let name = file_name(p);
+                    let does = format!("Select {name} and go to the overlap");
                     let row = MegaButton::new(ButtonKind::Quiet, &name)
                         .trailing_icon(icons::CHEVRON_RIGHT);
-                    if ui
-                        .add(row)
-                        .on_hover_text(format!("Select {name} and go to the overlap"))
-                        .clicked()
-                    {
+                    let r = ui.add(row);
+                    // Said to assistive technology too, as a checks row's
+                    // detail is.
+                    let said = does.clone();
+                    ui.ctx()
+                        .accesskit_node_builder(r.id, |node| node.set_description(said));
+                    if r.on_hover_text(does).clicked() {
                         clicked = Some(p.clone());
                     }
                 }
@@ -1847,17 +1852,23 @@ impl PlanView {
     }
 }
 
+/// An exposure, rounded as the integration is: "300 s"; below a second, to
+/// a hundredth ("0.25 s").
+fn exposure_text(seconds: f64) -> String {
+    if seconds >= 1.0 {
+        format!("{} s", seconds.round() as u64)
+    } else {
+        format!("{seconds:.2} s")
+    }
+}
+
 /// The header facts of a panel's details, as property rows.
 fn header_rows(ui: &mut egui::Ui, h: &PanelHeader) {
     let or_unknown = |v: Option<String>| v.unwrap_or_else(|| UNKNOWN.into());
     property_row_numeric(ui, "Size", &format_canvas(h.width, h.height));
     property_row_numeric(ui, "Channels", &h.channels.to_string());
     property_row(ui, "Filter", &or_unknown(h.filter.clone()));
-    property_row_numeric(
-        ui,
-        "Exposure",
-        &or_unknown(h.exposure_s.map(|e| format!("{e} s"))),
-    );
+    property_row_numeric(ui, "Exposure", &or_unknown(h.exposure_s.map(exposure_text)));
     property_row_numeric(ui, "Frames", &or_unknown(h.frames.map(|n| n.to_string())));
     property_row_numeric(
         ui,
@@ -1868,13 +1879,6 @@ fn header_rows(ui: &mut egui::Ui, h: &PanelHeader) {
     if let Some(s) = h.scale_arcsec {
         property_row_numeric(ui, "Scale", &format!("{s:.3}″/px"));
     }
-}
-
-/// A file's name (its whole path if it has none), as panels are named.
-pub(crate) fn file_name(p: &Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.display().to_string())
 }
 
 /// The heading of what the inspector details (a panel, an overlap, a

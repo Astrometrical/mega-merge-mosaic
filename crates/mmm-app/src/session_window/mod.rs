@@ -43,21 +43,25 @@
 //!   opens its first problem ([`SessionWindow::open_badge`]).
 //! - **Opening a problem** ([`SessionWindow::open_problem`]: a row clicked,
 //!   or activated with Enter, in Problems, See all, a panel's or a place's
-//!   checks; or a badge): the canvas shown frames its place (the view
-//!   shows its group first) and the place is selected, by
-//!   [`SessionWindow::go_to_roi`]'s rules (on a plan drawn in another
-//!   frame than the analysed one, a toast and nothing more). A problem
-//!   whose target no longer resolves (its panel or group gone, no place on
-//!   the canvas) does nothing; its row leads nowhere.
+//!   checks; or a badge): the view shows its group first if it does not
+//!   (a coverage hole's too), the canvas shown frames its place and the
+//!   place is selected, by [`SessionWindow::go_to_roi`]'s rules (on a plan
+//!   drawn in another frame than the analysed one, a toast and nothing
+//!   more). Opened from a list (an Overlaps row too), the inspector keeps
+//!   its place; a badge clicked reveals the Panels section on it. A
+//!   problem whose target no longer resolves (its panel or group gone, no
+//!   place on the canvas) does nothing; its row leads nowhere.
 //! - **Selection** ([`Selected`]): a panel (the plan's selection, its row in
-//!   the panel list), or an overlap or a seam, ringed on the canvas shown
-//!   (on the plan only while it draws in the analysed frame) in the
-//!   selection colour ([`crate::marks::selection_ring`]). One at a time:
+//!   the panel list), or an overlap or a seam, ringed on the canvas shown in
+//!   the selection colour ([`crate::marks::selection_ring`]) while the view
+//!   shows it (as its badge: a seam's group, an overlap's panels), on the
+//!   plan only while it draws in the analysed frame. One at a time:
 //!   selecting a panel (on the plan, in the list, an Overlaps row) drops an
 //!   overlap or a seam, and the reverse; a click on no panel of the plan,
 //!   Esc, or its panels or group leaving the session, selects nothing. A
 //!   coverage hole opened is framed, not selected. The Panels section
-//!   details what is selected ([`sections`]).
+//!   details what is selected ([`sections`]): an overlap or a seam lists
+//!   its pair's checks, as its badge counts them.
 //! - **Inspector** ([`sections`]): Problems, Panels, ROIs, Merge settings,
 //!   Composites and Notes, in that order.
 //! - **Every frame.** The shell drives the window's hooks whether or not the
@@ -480,7 +484,8 @@ impl SessionWindow {
     /// A badge on the canvas was clicked (or activated from the keyboard):
     /// open its first problem, in the Problems list's order
     /// ([`SessionWindow::open_problem`]; a pair's badge may open its
-    /// seam's problem or its overlap's, each by its own target). A badge
+    /// seam's problem or its overlap's, each by its own target), revealing
+    /// the Panels section on it (the user asked what is there). A badge
     /// whose mark or place has gone does nothing.
     pub(super) fn open_badge(
         &mut self,
@@ -497,13 +502,15 @@ impl SessionWindow {
         else {
             return;
         };
-        self.open_problem(session, report, &first);
+        self.open_problem(session, report, &first, true);
     }
 
     /// Open `check` (its row clicked or activated in a checks list, or its
     /// badge): frame its [`target_rect`] on the canvas shown and select its
     /// place ([`SessionWindow::go_to`]: a panel on the plan, an overlap or a
-    /// seam ringed; a coverage hole selects nothing). By
+    /// seam ringed; a coverage hole selects nothing, its group shown);
+    /// with `reveal` (a badge), the Panels section opens on it, else (a
+    /// list's row) the inspector keeps its place. By
     /// [`SessionWindow::go_to_roi`]'s rules: on a plan drawn in another
     /// frame than the analysed one, a toast and nothing more. A check whose
     /// target no longer resolves (its panel or group gone, or no place on
@@ -513,6 +520,7 @@ impl SessionWindow {
         session: &OpenSession,
         report: Option<&ChecksReport>,
         check: &Check,
+        reveal: bool,
     ) {
         let none = Seams::new();
         let seams = report.map_or(&none, |r| &r.seams);
@@ -522,13 +530,24 @@ impl SessionWindow {
         ) else {
             return;
         };
-        self.go_to(session, rect, Selected::of(place));
+        let selected = Selected::of(place);
+        let group = match &selected {
+            Some(s) => self.group_to_show(session, s),
+            // An area (a coverage hole): the group it is in.
+            None => check
+                .groups
+                .first()
+                .filter(|g| group_names(session).contains(g))
+                .filter(|g| !self.view_groups(session).contains(g))
+                .cloned(),
+        };
+        self.go_to(session, rect, selected, group, reveal);
     }
 
     /// An Overlaps row of `panel`'s details was clicked: select `neighbour`
     /// and frame their overlap (the intersection of their analysed bboxes,
-    /// not the neighbour's whole bbox), by [`SessionWindow::go_to`]'s rules;
-    /// nothing if it no longer resolves.
+    /// not the neighbour's whole bbox), by [`SessionWindow::go_to`]'s rules,
+    /// the inspector keeping its place; nothing if it no longer resolves.
     fn go_to_neighbour(&mut self, session: &OpenSession, panel: &Path, neighbour: &Path) {
         let (a, b) = (panel.min(neighbour), panel.max(neighbour));
         let overlap = Place::Overlap(a.to_path_buf(), b.to_path_buf());
@@ -536,43 +555,54 @@ impl SessionWindow {
             return;
         };
         let select = Selected::Panel(neighbour.to_path_buf());
-        self.go_to(session, covering_px(rect), Some(select));
+        let group = self.group_to_show(session, &select);
+        self.go_to(session, covering_px(rect), Some(select), group, false);
     }
 
     /// Go to canvas rect `rect` and select `selected` (`None`: nothing):
-    /// the view shows its group first if it does not, then the rect is
-    /// framed on the canvas shown and the Panels section opens on it. On a
-    /// plan drawn in another frame than the analysed one, a toast
-    /// ([`SessionWindow::frame_behind`]) and nothing more.
-    fn go_to(&mut self, session: &OpenSession, rect: [u64; 4], selected: Option<Selected>) {
+    /// the view shows `group` first (if any), then the rect is framed on
+    /// the canvas shown; with `reveal`, the Panels section opens on what is
+    /// selected. On a plan drawn in another frame than the analysed one, a
+    /// toast ([`SessionWindow::frame_behind`]) and nothing more.
+    fn go_to(
+        &mut self,
+        session: &OpenSession,
+        rect: [u64; 4],
+        selected: Option<Selected>,
+        group: Option<String>,
+        reveal: bool,
+    ) {
         if self.frame_behind(session) {
             return;
         }
-        if let Some(s) = &selected {
-            self.show_group_of(session, s);
+        if let Some(g) = group {
+            self.select_view(ViewKind::Group(g));
+        }
+        if reveal && selected.is_some() {
             self.inspector.reveal(PANELS);
         }
         self.select(selected);
         self.frame(rect);
     }
 
-    /// Show the group of `selected` if the view does not show it (a panel's
-    /// group, an overlap's first panel's, a seam's own).
-    fn show_group_of(&mut self, session: &OpenSession, selected: &Selected) {
-        let group = match selected {
-            Selected::Seam { group, .. } => {
-                (!self.view_groups(session).contains(group)).then(|| group.clone())
-            }
-            Selected::Panel(p) | Selected::Overlap(p, _) => {
-                if self.view_shows(session, p) {
-                    None
-                } else {
-                    group_of(session, p)
-                }
-            }
-        };
-        if let Some(g) = group {
-            self.select_view(ViewKind::Group(g));
+    /// The group to show for `selected`, if the view does not show it: a
+    /// panel's group, an overlap's first panel's, a seam's own.
+    fn group_to_show(&self, session: &OpenSession, selected: &Selected) -> Option<String> {
+        if self.view_has(session, selected) {
+            return None;
+        }
+        match selected {
+            Selected::Seam { group, .. } => Some(group.clone()),
+            Selected::Panel(p) | Selected::Overlap(p, _) => group_of(session, p),
+        }
+    }
+
+    /// Whether the view shows `selected`: a seam's group is among its
+    /// groups, a panel or an overlap's panels are among their panels.
+    fn view_has(&self, session: &OpenSession, selected: &Selected) -> bool {
+        match selected {
+            Selected::Seam { group, .. } => self.view_groups(session).contains(group),
+            other => other.panels().iter().all(|p| self.view_shows(session, p)),
         }
     }
 
@@ -611,10 +641,14 @@ impl SessionWindow {
     }
 
     /// The ring of the selected overlap or seam on the canvas, where the
-    /// analysis places it (`seams`: the checks' seam lines); none for a
-    /// panel (the plan outlines it) or nothing selected.
+    /// analysis places it (`seams`: the checks' seam lines), while the view
+    /// shows it ([`SessionWindow::view_has`], as its badge and seam lines);
+    /// none for a panel (the plan outlines it) or nothing selected.
     fn selection_ring(&self, session: &OpenSession, seams: &Seams) -> Option<Polyline> {
-        let s = self.selection.as_ref().filter(|s| s.panel().is_none())?;
+        let s = self
+            .selection
+            .as_ref()
+            .filter(|s| s.panel().is_none() && self.view_has(session, s))?;
         let rect = place_rect(session, self.plan.layout(), seams, &s.place())?;
         Some(selection_ring(rect))
     }
