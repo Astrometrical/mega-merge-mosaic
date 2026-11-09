@@ -627,6 +627,32 @@ fn notes_read_as_text_and_done_saves_at_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Click the notes' **Edit** once it is enabled, then wait for the text box
+/// (both bounded by [`PATIENCE`](crate::testutil::PATIENCE): background
+/// threads), saying which never came.
+fn edit_notes(h: &mut Harness<'static, Screen>) {
+    let deadline = Instant::now() + crate::testutil::PATIENCE;
+    while h
+        .get_by_role_and_label(Role::Button, "Edit")
+        .accesskit_node()
+        .is_disabled()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the notes' Edit stayed disabled (the card read the session as busy)"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.get_by_role_and_label(Role::Button, "Edit").click();
+    h.run();
+    while h.query_by_role(Role::MultilineTextInput).is_none() {
+        assert!(Instant::now() < deadline, "no notes text box after Edit");
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn edited_notes_leave_room_for_the_scroll_bar() {
     let root = temp_dir("start-notes-scroll");
@@ -642,8 +668,7 @@ fn edited_notes_leave_room_for_the_scroll_bar() {
     .unwrap();
     let mut h = harness(vec![entry(&dir)]);
     settle(&mut h);
-    h.get_by_role_and_label(Role::Button, "Edit").click();
-    h.run();
+    edit_notes(&mut h);
     // The block scrolls, its bar beside the text box, not over it.
     let column = h.state().screen.hero_column(h.state().full.expect("drawn"));
     let field = h.get_by_role(Role::MultilineTextInput).rect();
