@@ -1258,6 +1258,8 @@ fn rows_show_their_problems() {
         groups: vec!["Ha".into()],
         message: "Ha_3.xisf has no astrometric solution.".into(),
         remedy: Some("Plate-solve it, then add it again.".into()),
+        target: mmm_core::checks::CheckTarget::Session,
+        rect: None,
     };
     h.state_mut().checks.set_report(ChecksReport {
         checks: vec![check],
@@ -2372,6 +2374,7 @@ fn a_prior_choice_keeps_grouping_off() {
         s.mosaic.config.accepted_checks.push(CheckKey {
             code: CheckCode::FiltersDifferUngrouped,
             panel: None,
+            other: None,
         });
     });
     // A rule other than FILTER header chosen before grouping was turned off.

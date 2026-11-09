@@ -16,11 +16,13 @@
 //! exception to "no file I/O on the UI thread".
 
 use mmm_core::checks::{
-    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, panel_facts,
+    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, layout_checks,
+    panel_facts,
 };
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{Mosaic, MosaicConfig, PanelEntry};
 use mmm_core::overlap::OverlapGraph;
+use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, PREVIEWS_LABEL};
@@ -51,7 +53,7 @@ pub struct CheckCounts {
 /// Run every check over `mosaic` (worker thread: reads panel headers and
 /// the groups' analyses). `groups`: the resolved groups, if known;
 /// otherwise they are resolved here.
-pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>) -> ChecksReport {
+pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>, aligned: bool) -> ChecksReport {
     let cfg = &mosaic.config;
     let mut errors = Vec::new();
     let mut facts = Vec::new();
@@ -73,7 +75,7 @@ pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>) -> ChecksReport {
         }
     };
     let mut checks = match &groups {
-        Some(g) => input_checks(cfg, &facts, g),
+        Some(g) => input_checks(cfg, &facts, g, aligned),
         None => Vec::new(),
     };
     checks.extend(file_checks(cfg));
@@ -91,7 +93,10 @@ pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>) -> ChecksReport {
             OverlapGraph::load(&session.overlap_graph_path()).map(|graph| (session, graph))
         });
         match loaded {
-            Ok((session, graph)) => checks.extend(analysis_checks(&group, &session, &graph)),
+            Ok((session, graph)) => {
+                checks.extend(analysis_checks(&group, &session, &graph));
+                checks.extend(layout_checks(&group, &session, &graph));
+            }
             Err(e) => errors.push(format!(
                 "Cannot read the analysis of group {group}: {e}. Analyse again."
             )),
@@ -181,7 +186,10 @@ impl ChecksEngine {
             self.dirty = false;
             let mosaic = session.mosaic.clone();
             let groups = session.groups.clone();
-            self.task = Task::spawn("mmm-checks", ctx, move || run_checks(&mosaic, groups));
+            let aligned = matches!(session.frame, Some(ReferenceFrame::Aligned { .. }));
+            self.task = Task::spawn("mmm-checks", ctx, move || {
+                run_checks(&mosaic, groups, aligned)
+            });
         }
     }
 
@@ -274,18 +282,20 @@ mod tests {
         // The synthetic panels are registered, unsolved: one note each.
         let report = e.report().unwrap().clone();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert_eq!(report.checks.len(), 8);
+        // The synthetic canvases are tiny, so every overlap is thin: six
+        // per group (the layout checks).
+        assert_eq!(report.checks.len(), 8 + 12);
         assert!(
             report
                 .checks
                 .iter()
-                .all(|c| c.code == CheckCode::SolutionPresent)
+                .all(|c| matches!(c.code, CheckCode::SolutionPresent | CheckCode::ThinOverlap))
         );
         let counts = e.counts(&s.mosaic.config).unwrap();
         assert_eq!(
             counts,
             CheckCounts {
-                problems: 0,
+                problems: 12,
                 notes: 8,
                 passed: 0
             }
@@ -300,7 +310,8 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("group Ha"), "{errors:?}");
         assert!(errors[0].ends_with("Analyse again."), "{errors:?}");
-        assert_eq!(e.counts(&s.mosaic.config).unwrap().problems, 1);
+        // Ha's six thin overlaps are gone with its analysis; OIII keeps its six.
+        assert_eq!(e.counts(&s.mosaic.config).unwrap().problems, 1 + 6);
 
         // Accepting a note saves its keys; it is no longer counted.
         let pick = report.checks[0].clone();

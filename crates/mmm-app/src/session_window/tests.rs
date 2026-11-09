@@ -1806,6 +1806,8 @@ fn check(code: CheckCode, severity: Severity, panels: Vec<PathBuf>, message: &st
         groups: Vec::new(),
         message: message.into(),
         remedy: None,
+        target: mmm_core::checks::CheckTarget::Session,
+        rect: None,
     }
 }
 

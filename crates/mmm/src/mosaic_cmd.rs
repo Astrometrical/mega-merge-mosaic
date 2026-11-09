@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use mmm_core::checks::{
-    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, panel_facts,
+    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, layout_checks,
+    panel_facts,
 };
 use mmm_core::export::{ExportFormat, export_group};
 use mmm_core::job::{CancelToken, JobCtl};
@@ -411,7 +412,12 @@ pub(crate) fn check(a: &CheckArgs) -> anyhow::Result<()> {
             Err(_) => {}
         }
     }
-    let mut checks = input_checks(&m.config, &facts, &groups);
+    // Registered (pre-aligned) input has no distortion model by design.
+    let aligned = matches!(
+        mmm_core::reference::ReferenceFrame::load(&m.dir.join(FRAME_FILE)),
+        Ok(mmm_core::reference::ReferenceFrame::Aligned { .. })
+    );
+    let mut checks = input_checks(&m.config, &facts, &groups, aligned);
     checks.extend(file_checks(&m.config));
     let mut unreadable = Vec::new();
     for (group, _) in groups.processing_groups() {
@@ -428,7 +434,10 @@ pub(crate) fn check(a: &CheckArgs) -> anyhow::Result<()> {
             OverlapGraph::load(&session.overlap_graph_path()).map(|graph| (session, graph))
         });
         match loaded {
-            Ok((session, graph)) => checks.extend(analysis_checks(&group, &session, &graph)),
+            Ok((session, graph)) => {
+                checks.extend(analysis_checks(&group, &session, &graph));
+                checks.extend(layout_checks(&group, &session, &graph));
+            }
             Err(e) => unreadable.push(format!("cannot read analysis of group {group}: {e}")),
         }
     }

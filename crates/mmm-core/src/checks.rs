@@ -53,21 +53,83 @@ pub enum CheckCode {
     NoOverlap,
     /// Panel sky levels differ strongly.
     SkyLevelMismatch,
+    /// Two panels are the same file or cover nearly the same sky.
+    DuplicatePanels,
+    /// A gap in the coverage, enclosed by panels.
+    CoverageHole,
+    /// Two panels overlap by too little to be matched reliably.
+    ThinOverlap,
+    /// A panel's footprint is largely empty.
+    EmptyArea,
 }
 
-/// A check result's identity: the check and, when panel-specific, the panel.
-/// Used to remember which warnings the user has accepted.
+/// The overlap's short side, in canvas pixels, below which two panels are
+/// too thinly joined to match reliably ([`CheckCode::ThinOverlap`]).
+pub const THIN_OVERLAP_PX: u64 = 128;
+
+/// The intersection-over-union of two panels' footprints at or above which
+/// they are taken to cover the same sky ([`CheckCode::DuplicatePanels`]).
+pub const DUPLICATE_IOU: f64 = 0.9;
+
+/// The share of a panel's bounding box that may be empty before
+/// [`CheckCode::EmptyArea`] notes it (uncovered share, 0 to 1).
+pub const EMPTY_AREA_FRACTION: f64 = 0.25;
+
+/// The smallest enclosed gap that counts as a hole in the coverage
+/// ([`CheckCode::CoverageHole`]), as a fraction of the smallest panel's
+/// footprint area. Below 1 because a missing panel leaves a gap smaller than
+/// itself: its neighbours overlap into it.
+pub const HOLE_MIN_PANEL_FRACTION: f64 = 0.25;
+
+/// Where in the mosaic a check applies. Lets the interface put a badge in
+/// the right place and zoom to it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum CheckTarget {
+    /// The session as a whole (or several groups).
+    #[default]
+    Session,
+    /// One group.
+    Group(String),
+    /// One panel (user-facing file).
+    Panel(PathBuf),
+    /// The overlap of two panels.
+    Overlap(PathBuf, PathBuf),
+    /// The seam between two panels in a group's merge.
+    Seam {
+        /// The group the seam belongs to.
+        group: String,
+        /// One panel of the pair.
+        a: PathBuf,
+        /// The other panel of the pair.
+        b: PathBuf,
+    },
+}
+
+/// A check result's identity: the check and, when panel-specific, the panel
+/// (and, for a pair such as an overlap, the other panel). Used to remember
+/// which warnings the user has accepted.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CheckKey {
     /// Which check.
     pub code: CheckCode,
     /// The panel concerned, if any.
     pub panel: Option<PathBuf>,
+    /// The second panel of a pair target. Absent from keys saved before
+    /// pairs existed, which serialise exactly as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<PathBuf>,
 }
 
 /// One check result.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Check {
+    /// Where it applies.
+    #[serde(default)]
+    pub target: CheckTarget,
+    /// For an area target (a coverage hole), the canvas rectangle
+    /// `[x0, y0, x1, y1]` concerned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rect: Option<[u64; 4]>,
     /// Which check produced this result.
     pub code: CheckCode,
     /// How much it matters.
@@ -83,13 +145,22 @@ pub struct Check {
 }
 
 impl Check {
-    /// The identities of this result: one key per panel, or one panel-less
-    /// key when it names no panels.
+    /// The identities of this result: one key for a pair target (an overlap
+    /// or a seam), else one key per panel, or one panel-less key when it
+    /// names no panels.
     pub fn keys(&self) -> Vec<CheckKey> {
+        if let CheckTarget::Overlap(a, b) | CheckTarget::Seam { a, b, .. } = &self.target {
+            return vec![CheckKey {
+                code: self.code,
+                panel: Some(a.clone()),
+                other: Some(b.clone()),
+            }];
+        }
         if self.panels.is_empty() {
             return vec![CheckKey {
                 code: self.code,
                 panel: None,
+                other: None,
             }];
         }
         self.panels
@@ -97,6 +168,7 @@ impl Check {
             .map(|p| CheckKey {
                 code: self.code,
                 panel: Some(p.clone()),
+                other: None,
             })
             .collect()
     }
@@ -162,8 +234,15 @@ fn median(v: &mut [f64]) -> f64 {
     }
 }
 
-/// Checks over the panels' headers and their grouping.
-pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -> Vec<Check> {
+/// Checks over the panels' headers and their grouping. `aligned`: the
+/// panels are pre-aligned (registered) input, which carry no distortion
+/// model by design, so a linear solution passes the distortion check.
+pub fn input_checks(
+    cfg: &MosaicConfig,
+    facts: &[PanelFacts],
+    groups: &Groups,
+    aligned: bool,
+) -> Vec<Check> {
     let mut out = Vec::new();
     let find = |p: &Path| facts.iter().find(|f| f.path == p);
 
@@ -172,6 +251,8 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
         if f.solution == SolutionKind::None {
             out.push(Check {
                 code: CheckCode::SolutionPresent,
+                target: CheckTarget::Panel(f.path.clone()),
+                rect: None,
                 severity: Severity::Note,
                 panels: vec![f.path.clone()],
                 groups: vec![],
@@ -184,15 +265,31 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
         }
         out.push(Check {
             code: CheckCode::SolutionPresent,
+            target: CheckTarget::Panel(f.path.clone()),
+            rect: None,
             severity: Severity::Passed,
             panels: vec![f.path.clone()],
             groups: vec![],
             message: format!("{name} has an astrometric solution."),
             remedy: None,
         });
-        if f.solution == SolutionKind::Linear {
+        if f.solution == SolutionKind::Linear && aligned {
+            // Registered panels carry a plain linear solution by design.
             out.push(Check {
                 code: CheckCode::DistortionModel,
+                target: CheckTarget::Panel(f.path.clone()),
+                rect: None,
+                severity: Severity::Passed,
+                panels: vec![f.path.clone()],
+                groups: vec![],
+                message: "No distortion model: accepted for pre-aligned panels".into(),
+                remedy: None,
+            });
+        } else if f.solution == SolutionKind::Linear {
+            out.push(Check {
+                code: CheckCode::DistortionModel,
+                target: CheckTarget::Panel(f.path.clone()),
+                rect: None,
                 severity: Severity::Problem,
                 panels: vec![f.path.clone()],
                 groups: vec![],
@@ -202,6 +299,8 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
         } else {
             out.push(Check {
                 code: CheckCode::DistortionModel,
+                target: CheckTarget::Panel(f.path.clone()),
+                rect: None,
                 severity: Severity::Passed,
                 panels: vec![f.path.clone()],
                 groups: vec![],
@@ -231,6 +330,7 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
                 let off = (s - med).abs() / med > 0.01;
                 out.push(Check {
                     code: CheckCode::ScaleMismatch,
+target: CheckTarget::Panel(f.path.clone()),                    rect: None,
                     severity: if off { Severity::Problem } else { Severity::Passed },
                     panels: vec![f.path.clone()],
                     groups: vec![gname.clone()],
@@ -252,6 +352,8 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
         if chans.len() > 1 {
             out.push(Check {
                 code: CheckCode::MixedChannels,
+                target: CheckTarget::Group(gname.clone()),
+                rect: None,
                 severity: Severity::Problem,
                 panels: members.iter().map(|f| f.path.clone()).collect(),
                 groups: vec![gname.clone()],
@@ -283,6 +385,8 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
                 .join(", ");
             out.push(Check {
                 code: CheckCode::GroupCountMismatch,
+                target: CheckTarget::Session,
+                rect: None,
                 severity: Severity::Note,
                 panels: vec![],
                 groups: groups.groups.keys().cloned().collect(),
@@ -293,6 +397,8 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
         if !groups.ungrouped.is_empty() {
             out.push(Check {
                 code: CheckCode::Ungrouped,
+                target: CheckTarget::Session,
+                rect: None,
                 severity: Severity::Note,
                 panels: groups.ungrouped.clone(),
                 groups: vec![],
@@ -309,6 +415,8 @@ pub fn input_checks(cfg: &MosaicConfig, facts: &[PanelFacts], groups: &Groups) -
         if filters.len() > 1 {
             out.push(Check {
                 code: CheckCode::FiltersDifferUngrouped,
+                target: CheckTarget::Session,
+                rect: None,
                 severity: Severity::Note,
                 panels: vec![],
                 groups: vec![],
@@ -331,6 +439,8 @@ pub fn file_checks(cfg: &MosaicConfig) -> Vec<Check> {
         if !e.path.exists() {
             out.push(Check {
                 code: CheckCode::FileMissing,
+                target: CheckTarget::Panel(e.path.clone()),
+                rect: None,
                 severity: Severity::Problem,
                 panels: vec![e.path.clone()],
                 groups: vec![],
@@ -344,6 +454,8 @@ pub fn file_checks(cfg: &MosaicConfig) -> Vec<Check> {
         {
             out.push(Check {
                 code: CheckCode::FileChanged,
+                target: CheckTarget::Panel(e.path.clone()),
+                rect: None,
                 severity: Severity::Note,
                 panels: vec![e.path.clone()],
                 groups: vec![],
@@ -390,6 +502,8 @@ pub fn analysis_checks(group: &str, session: &Session, graph: &OverlapGraph) -> 
         if session.panels.len() > 1 && nb.is_empty() {
             out.push(Check {
                 code: CheckCode::NoOverlap,
+                target: CheckTarget::Panel(user_file(m)),
+                rect: None,
                 severity: Severity::Problem,
                 panels: vec![user_file(m)],
                 groups: vec![group.to_string()],
@@ -407,6 +521,7 @@ pub fn analysis_checks(group: &str, session: &Session, graph: &OverlapGraph) -> 
             if med > 0.0 && (mine > 2.0 * med || mine < 0.5 * med) {
                 out.push(Check {
                     code: CheckCode::SkyLevelMismatch,
+target: CheckTarget::Panel(user_file(m)),                    rect: None,
                     severity: Severity::Note,
                     panels: vec![user_file(m)],
                     groups: vec![group.to_string()],
@@ -418,6 +533,228 @@ pub fn analysis_checks(group: &str, session: &Session, graph: &OverlapGraph) -> 
                     ),
                 });
             }
+        }
+    }
+    out
+}
+
+/// Area of a `[x0, y0, x1, y1]` rectangle (0 when empty).
+fn rect_area(r: &[u64; 4]) -> u64 {
+    r[2].saturating_sub(r[0]) * r[3].saturating_sub(r[1])
+}
+
+/// Area of the intersection of two rectangles.
+fn intersection_area(a: &[u64; 4], b: &[u64; 4]) -> u64 {
+    let r = [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ];
+    rect_area(&r)
+}
+
+/// Uncovered regions fully enclosed by `rects`, as `(bounding rect, area)`.
+///
+/// The rectangles' edges cut the plane into a small grid (one cell per
+/// pair of neighbouring edge coordinates), so this is exact and costs
+/// nothing in canvas pixels. Cells outside every rectangle that connect to
+/// the grid's border are open sky; the rest, grouped by 4-connectivity,
+/// are enclosed.
+fn enclosed_gaps(rects: &[[u64; 4]]) -> Vec<([u64; 4], u64)> {
+    let rects: Vec<&[u64; 4]> = rects.iter().filter(|r| rect_area(r) > 0).collect();
+    let mut xs: Vec<u64> = rects.iter().flat_map(|r| [r[0], r[2]]).collect();
+    let mut ys: Vec<u64> = rects.iter().flat_map(|r| [r[1], r[3]]).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    if xs.len() < 2 || ys.len() < 2 {
+        return Vec::new();
+    }
+    let (nx, ny) = (xs.len() - 1, ys.len() - 1);
+    let at = |i: usize, j: usize| j * nx + i;
+    let mut covered = vec![false; nx * ny];
+    for r in &rects {
+        let i0 = xs.partition_point(|&x| x < r[0]);
+        let i1 = xs.partition_point(|&x| x < r[2]);
+        let j0 = ys.partition_point(|&y| y < r[1]);
+        let j1 = ys.partition_point(|&y| y < r[3]);
+        for j in j0..j1 {
+            for i in i0..i1 {
+                covered[at(i, j)] = true;
+            }
+        }
+    }
+    // Flood the open sky in from the border, then collect what is left.
+    let mut seen = covered.clone();
+    let neighbours = |i: usize, j: usize| {
+        let mut n = Vec::with_capacity(4);
+        if i > 0 {
+            n.push((i - 1, j));
+        }
+        if j > 0 {
+            n.push((i, j - 1));
+        }
+        if i + 1 < nx {
+            n.push((i + 1, j));
+        }
+        if j + 1 < ny {
+            n.push((i, j + 1));
+        }
+        n
+    };
+    let flood = |seed: Vec<(usize, usize)>, seen: &mut [bool]| {
+        let mut stack = seed;
+        let (mut lo, mut hi) = ([u64::MAX; 2], [0u64; 2]);
+        let mut area = 0u64;
+        while let Some((i, j)) = stack.pop() {
+            if seen[at(i, j)] {
+                continue;
+            }
+            seen[at(i, j)] = true;
+            let (w, h) = (xs[i + 1] - xs[i], ys[j + 1] - ys[j]);
+            area += w * h;
+            lo = [lo[0].min(xs[i]), lo[1].min(ys[j])];
+            hi = [hi[0].max(xs[i + 1]), hi[1].max(ys[j + 1])];
+            stack.extend(neighbours(i, j));
+        }
+        ([lo[0], lo[1], hi[0], hi[1]], area)
+    };
+    let border: Vec<(usize, usize)> = (0..nx)
+        .flat_map(|i| [(i, 0), (i, ny - 1)])
+        .chain((0..ny).flat_map(|j| [(0, j), (nx - 1, j)]))
+        .collect();
+    flood(border, &mut seen);
+    let mut gaps = Vec::new();
+    for j in 0..ny {
+        for i in 0..nx {
+            if !seen[at(i, j)] {
+                gaps.push(flood(vec![(i, j)], &mut seen));
+            }
+        }
+    }
+    gaps
+}
+
+/// Cheap checks over one analysed group's layout, from the session's
+/// panel footprints and overlap graph alone (no pixels): duplicate panels,
+/// gaps in the coverage, overlaps too thin to match, and mostly empty
+/// panels. Panels are reported by their user-facing file.
+pub fn layout_checks(group: &str, session: &Session, graph: &OverlapGraph) -> Vec<Check> {
+    let mut out = Vec::new();
+    let user_file =
+        |m: &crate::session::PanelMeta| m.source.clone().unwrap_or_else(|| m.path.clone());
+    let metas = &session.panels;
+
+    // Duplicates: the same file twice, or nearly the same footprint.
+    for (i, a) in metas.iter().enumerate() {
+        for b in &metas[i + 1..] {
+            let (fa, fb) = (user_file(a), user_file(b));
+            let same_file = fa == fb;
+            let union = rect_area(&a.bbox) + rect_area(&b.bbox);
+            let inter = intersection_area(&a.bbox, &b.bbox);
+            let same_sky = union > inter
+                && inter > 0
+                && inter as f64 / (union - inter) as f64 >= DUPLICATE_IOU;
+            if !(same_file || same_sky) {
+                continue;
+            }
+            let (na, nb) = (file_name(&fa), file_name(&fb));
+            out.push(Check {
+                code: CheckCode::DuplicatePanels,
+                target: CheckTarget::Overlap(fa.clone(), fb.clone()),
+                rect: None,
+                severity: Severity::Problem,
+                panels: vec![fa, fb],
+                groups: vec![group.to_string()],
+                message: if same_file {
+                    format!("{na} is added twice.")
+                } else {
+                    format!("{na} and {nb} cover nearly the same sky.")
+                },
+                remedy: Some("Remove one of the two panels.".into()),
+            });
+        }
+    }
+
+    // Gaps in the coverage: enclosed by panels, and a sizeable part of a
+    // panel (a missing panel leaves a gap smaller than itself, since its
+    // neighbours overlap it).
+    let rects: Vec<[u64; 4]> = metas.iter().map(|m| m.bbox).collect();
+    let smallest = rects.iter().map(rect_area).filter(|&a| a > 0).min();
+    if let Some(smallest) = smallest {
+        for (rect, area) in enclosed_gaps(&rects) {
+            if (area as f64) < HOLE_MIN_PANEL_FRACTION * smallest as f64 {
+                continue;
+            }
+            out.push(Check {
+                code: CheckCode::CoverageHole,
+                target: CheckTarget::Group(group.to_string()),
+                rect: Some(rect),
+                severity: Severity::Problem,
+                panels: vec![],
+                groups: vec![group.to_string()],
+                message: format!("A gap in {group}'s coverage: a panel may be missing."),
+                remedy: Some("Check that every panel of the mosaic has been added.".into()),
+            });
+        }
+    }
+
+    // Overlaps too thin to match.
+    for e in &graph.edges {
+        let (Some(a), Some(b)) = (
+            metas.iter().find(|m| m.id == e.a),
+            metas.iter().find(|m| m.id == e.b),
+        ) else {
+            continue;
+        };
+        let w = u64::from(e.bbox8[2].saturating_sub(e.bbox8[0]));
+        let h = u64::from(e.bbox8[3].saturating_sub(e.bbox8[1]));
+        let short = w.min(h) * u64::from(crate::summary::BLOCK);
+        if short >= THIN_OVERLAP_PX {
+            continue;
+        }
+        let (fa, fb) = (user_file(a), user_file(b));
+        out.push(Check {
+            code: CheckCode::ThinOverlap,
+            target: CheckTarget::Overlap(fa.clone(), fb.clone()),
+            rect: None,
+            severity: Severity::Problem,
+            message: format!(
+                "{} and {} overlap by only {short} px: too thin to match them reliably.",
+                file_name(&fa),
+                file_name(&fb)
+            ),
+            panels: vec![fa, fb],
+            groups: vec![group.to_string()],
+            remedy: Some("Add more overlap between the two panels.".into()),
+        });
+    }
+
+    // Mostly empty panels: the share of the bounding box not covered.
+    let canvas_area = session.canvas.0 as f64 * session.canvas.1 as f64;
+    for m in metas {
+        let bbox_area = rect_area(&m.bbox) as f64;
+        if bbox_area <= 0.0 || canvas_area <= 0.0 {
+            continue;
+        }
+        let empty = 1.0 - m.nonzero_frac * canvas_area / bbox_area;
+        if empty > EMPTY_AREA_FRACTION {
+            let f = user_file(m);
+            out.push(Check {
+                code: CheckCode::EmptyArea,
+                target: CheckTarget::Panel(f.clone()),
+                rect: None,
+                severity: Severity::Note,
+                message: format!("{} has large empty areas.", file_name(&f)),
+                panels: vec![f],
+                groups: vec![group.to_string()],
+                remedy: Some(
+                    "Fine for a tilted or rotated panel; otherwise check the panel for missing data."
+                        .into(),
+                ),
+            });
         }
     }
     out
@@ -487,7 +824,7 @@ mod tests {
 
     fn run(cfg: &MosaicConfig, paths: &[PathBuf]) -> Vec<Check> {
         let groups = resolve_groups(cfg, &|_| None);
-        input_checks(cfg, &facts_of(paths), &groups)
+        input_checks(cfg, &facts_of(paths), &groups, false)
     }
 
     fn of(checks: &[Check], code: CheckCode) -> Vec<&Check> {
@@ -601,7 +938,7 @@ mod tests {
             crate::mosaic::grouping::header_value(&InputPanel::open(p).unwrap(), "FILTER")
         };
         let groups = resolve_groups(&cfg, &header);
-        let checks = input_checks(&cfg, &facts_of(&paths), &groups);
+        let checks = input_checks(&cfg, &facts_of(&paths), &groups, false);
         let g = of(&checks, CheckCode::GroupCountMismatch);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].severity, Severity::Note);
@@ -678,17 +1015,21 @@ mod tests {
             groups: vec![],
             message: String::new(),
             remedy: None,
+            target: CheckTarget::Session,
+            rect: None,
         };
         let mut cfg = MosaicConfig::new(vec![]);
         assert!(!is_accepted(&cfg, &check));
         cfg.accepted_checks.push(CheckKey {
             code: CheckCode::MixedChannels,
             panel: Some(a),
+            other: None,
         });
         assert!(!is_accepted(&cfg, &check));
         cfg.accepted_checks.push(CheckKey {
             code: CheckCode::MixedChannels,
             panel: Some(b),
+            other: None,
         });
         assert!(is_accepted(&cfg, &check));
         // Panel-less checks use a single panel-less key.
@@ -810,6 +1151,7 @@ mod tests {
             &cfg,
             &facts_of(&filters),
             &resolve_groups(&cfg, &header),
+            false,
         ));
         cfg.grouping.rule = crate::mosaic::GroupRule::FilenameToken {
             keyword: "zzz".into(),
@@ -838,6 +1180,18 @@ mod tests {
             edges: vec![edge(0, 1), edge(0, 3), edge(1, 3)],
         };
         checks.extend(analysis_checks("Ha", &s, &g));
+        // Layout: a thin overlap, a duplicate, a hole, an empty area.
+        checks.extend(layout_checks("Ha", &layout_session(), &thin_graph()));
+        checks.extend(layout_checks(
+            "Ha",
+            &ring_session(),
+            &OverlapGraph::default(),
+        ));
+        // Pre-aligned: the distortion check passes by acceptance.
+        let lin = vec![solved_fits(&d, "lin2.fits", 1.0e-3, false)];
+        let cfg = MosaicConfig::new(lin.clone());
+        let groups = resolve_groups(&cfg, &|_| None);
+        checks.extend(input_checks(&cfg, &facts_of(&lin), &groups, true));
         checks
     }
 
@@ -857,6 +1211,10 @@ mod tests {
             CheckCode::FileMissing,
             CheckCode::NoOverlap,
             CheckCode::SkyLevelMismatch,
+            CheckCode::DuplicatePanels,
+            CheckCode::CoverageHole,
+            CheckCode::ThinOverlap,
+            CheckCode::EmptyArea,
         ] {
             // Exhaustive: a code added to the enum fails to compile here
             // until it is listed (and made) above.
@@ -871,7 +1229,11 @@ mod tests {
                 | CheckCode::FileChanged
                 | CheckCode::FileMissing
                 | CheckCode::NoOverlap
-                | CheckCode::SkyLevelMismatch => {}
+                | CheckCode::SkyLevelMismatch
+                | CheckCode::DuplicatePanels
+                | CheckCode::CoverageHole
+                | CheckCode::ThinOverlap
+                | CheckCode::EmptyArea => {}
             }
             assert!(!of(&checks, code).is_empty(), "no {code:?} check made");
         }
@@ -892,6 +1254,316 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Severity::Passed).unwrap(),
             "\"passed\""
+        );
+        for (code, name) in [
+            (CheckCode::DuplicatePanels, "duplicate_panels"),
+            (CheckCode::CoverageHole, "coverage_hole"),
+            (CheckCode::ThinOverlap, "thin_overlap"),
+            (CheckCode::EmptyArea, "empty_area"),
+        ] {
+            assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{name}\""));
+        }
+        // An old key (no `other`) serialises exactly as before and reads back.
+        let old = CheckKey {
+            code: CheckCode::NoOverlap,
+            panel: Some(PathBuf::from("a.xisf")),
+            other: None,
+        };
+        let json = serde_json::to_string(&old).unwrap();
+        assert_eq!(json, r#"{"code":"no_overlap","panel":"a.xisf"}"#);
+        assert_eq!(serde_json::from_str::<CheckKey>(&json).unwrap(), old);
+        let pair = CheckKey {
+            other: Some(PathBuf::from("b.xisf")),
+            ..old
+        };
+        let json = serde_json::to_string(&pair).unwrap();
+        assert!(json.contains(r#""other":"b.xisf""#));
+        assert_eq!(serde_json::from_str::<CheckKey>(&json).unwrap(), pair);
+    }
+
+    // ---- targets, aligned mode, layout checks ----
+
+    /// A session on a 1000 x 1000 canvas with the given panels.
+    fn canvas_session(panels: Vec<PanelMeta>) -> Session {
+        let mut s = session(panels);
+        s.canvas = (1000, 1000, 1);
+        s
+    }
+
+    /// A fully covered panel on the 1000 x 1000 canvas.
+    fn boxed(id: usize, bbox: [u64; 4]) -> PanelMeta {
+        let area = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) as f64;
+        PanelMeta {
+            bbox,
+            nonzero_frac: area / 1.0e6,
+            ..meta(id, 0.1)
+        }
+    }
+
+    fn edge_at(a: usize, b: usize, bbox8: [u32; 4]) -> OverlapEdge {
+        OverlapEdge {
+            a,
+            b,
+            bbox8,
+            n_cells: 100,
+        }
+    }
+
+    /// Panels 0 and 1 side by side, 2 a copy of 0, 3 half empty.
+    fn layout_session() -> Session {
+        let mut sparse = boxed(3, [500, 500, 700, 700]);
+        sparse.nonzero_frac /= 2.0;
+        canvas_session(vec![
+            boxed(0, [0, 0, 400, 400]),
+            boxed(1, [390, 0, 800, 400]),
+            boxed(2, [0, 0, 400, 400]),
+            sparse,
+        ])
+    }
+
+    /// Four panels around a gap at x 200..400, y 300..500.
+    fn ring_session() -> Session {
+        canvas_session(vec![
+            boxed(0, [0, 0, 400, 300]),
+            boxed(1, [400, 0, 800, 500]),
+            boxed(2, [200, 500, 800, 800]),
+            boxed(3, [0, 300, 200, 800]),
+        ])
+    }
+
+    /// One overlap 8 cells (64 px) wide.
+    fn thin_graph() -> OverlapGraph {
+        OverlapGraph {
+            edges: vec![edge_at(0, 1, [48, 0, 56, 50])],
+        }
+    }
+
+    /// A clean 2 x 2 tiling with generous overlaps.
+    fn clean_session() -> (Session, OverlapGraph) {
+        let s = canvas_session(vec![
+            boxed(0, [0, 0, 600, 600]),
+            boxed(1, [400, 0, 1000, 600]),
+            boxed(2, [0, 400, 600, 1000]),
+            boxed(3, [400, 400, 1000, 1000]),
+        ]);
+        let g = OverlapGraph {
+            edges: vec![
+                edge_at(0, 1, [50, 0, 75, 75]),
+                edge_at(0, 2, [0, 50, 75, 75]),
+                edge_at(1, 3, [50, 50, 125, 75]),
+                edge_at(2, 3, [50, 50, 75, 125]),
+                edge_at(0, 3, [50, 50, 75, 75]),
+                edge_at(1, 2, [50, 50, 75, 75]),
+            ],
+        };
+        (s, g)
+    }
+
+    fn no_edges() -> OverlapGraph {
+        OverlapGraph::default()
+    }
+
+    #[test]
+    fn existing_checks_name_their_place() {
+        let d = tmp("targets");
+        let a = solved_fits(&d, "a.fits", 1.0e-3, true);
+        let b = d.join("raw.xisf");
+        write_xisf(&b, 16, 12, 1, &planes(1)).unwrap();
+        let paths = vec![a, b];
+        let checks = run(&MosaicConfig::new(paths.clone()), &paths);
+        for c in of(&checks, CheckCode::SolutionPresent) {
+            assert_eq!(c.target, CheckTarget::Panel(c.panels[0].clone()));
+        }
+        let s = session(vec![meta(0, 0.1), meta(1, 0.1), meta(2, 0.1)]);
+        let g = OverlapGraph {
+            edges: vec![edge(0, 1)],
+        };
+        let checks = analysis_checks("Ha", &s, &g);
+        assert_eq!(
+            of(&checks, CheckCode::NoOverlap)[0].target,
+            CheckTarget::Panel(PathBuf::from("/in/p2.xisf"))
+        );
+        // A mixed-channel group is the group's problem.
+        let rgb = d.join("rgb.xisf");
+        write_xisf_solved(&rgb, 16, 12, 3, &planes(3), &wcs(1e-3)).unwrap();
+        let mono = d.join("mono.xisf");
+        write_xisf_solved(&mono, 16, 12, 1, &planes(1), &wcs(1e-3)).unwrap();
+        let mixed = vec![rgb, mono];
+        let checks = run(&MosaicConfig::new(mixed.clone()), &mixed);
+        assert!(matches!(
+            of(&checks, CheckCode::MixedChannels)[0].target,
+            CheckTarget::Group(_)
+        ));
+    }
+
+    #[test]
+    fn aligned_mode_passes_missing_distortion() {
+        let d = tmp("aligned");
+        let p = solved_fits(&d, "lin.fits", 1e-3, false);
+        let cfg = MosaicConfig::new(vec![p.clone()]);
+        let groups = resolve_groups(&cfg, &|_| None);
+        let facts = facts_of(std::slice::from_ref(&p));
+        let checks = input_checks(&cfg, &facts, &groups, true);
+        let c = of(&checks, CheckCode::DistortionModel);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].severity, Severity::Passed);
+        assert_eq!(
+            c[0].message,
+            "No distortion model: accepted for pre-aligned panels"
+        );
+        // Solved input still has the problem.
+        let checks = input_checks(&cfg, &facts, &groups, false);
+        assert_eq!(
+            of(&checks, CheckCode::DistortionModel)[0].severity,
+            Severity::Problem
+        );
+    }
+
+    #[test]
+    fn old_accepted_keys_still_match() {
+        let old: CheckKey =
+            serde_json::from_str(r#"{"code":"no_overlap","panel":"/in/p2.xisf"}"#).unwrap();
+        assert_eq!(old.other, None);
+        let s = session(vec![meta(0, 0.1), meta(1, 0.1), meta(2, 0.1)]);
+        let g = OverlapGraph {
+            edges: vec![edge(0, 1)],
+        };
+        let checks = analysis_checks("Ha", &s, &g);
+        let mut cfg = MosaicConfig::new(vec![]);
+        cfg.accepted_checks.push(old);
+        assert!(is_accepted(&cfg, of(&checks, CheckCode::NoOverlap)[0]));
+    }
+
+    #[test]
+    fn pair_keys_accept_one_overlap() {
+        let s = canvas_session(vec![
+            boxed(0, [0, 0, 400, 400]),
+            boxed(1, [390, 0, 800, 400]),
+            boxed(2, [0, 390, 400, 800]),
+        ]);
+        let g = OverlapGraph {
+            edges: vec![
+                edge_at(0, 1, [48, 0, 56, 50]),
+                edge_at(0, 2, [0, 48, 50, 56]),
+            ],
+        };
+        let checks = layout_checks("Ha", &s, &g);
+        let thin = of(&checks, CheckCode::ThinOverlap);
+        assert_eq!(thin.len(), 2);
+        let keys = thin[0].keys();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].panel.is_some() && keys[0].other.is_some());
+        let mut cfg = MosaicConfig::new(vec![]);
+        cfg.accepted_checks.extend(keys);
+        assert!(is_accepted(&cfg, thin[0]));
+        assert!(!is_accepted(&cfg, thin[1]));
+    }
+
+    #[test]
+    fn thin_overlap_fires_below_the_limit() {
+        let checks = layout_checks("Ha", &layout_session(), &thin_graph());
+        let t = of(&checks, CheckCode::ThinOverlap);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].severity, Severity::Problem);
+        assert_eq!(
+            t[0].target,
+            CheckTarget::Overlap(PathBuf::from("/in/p0.xisf"), PathBuf::from("/in/p1.xisf"))
+        );
+        assert_eq!(
+            t[0].message,
+            "p0.xisf and p1.xisf overlap by only 64 px: too thin to match them reliably."
+        );
+        // 16 cells x 8 = 128 px is not thin.
+        let wide = OverlapGraph {
+            edges: vec![edge_at(0, 1, [48, 0, 64, 50])],
+        };
+        let checks = layout_checks("Ha", &layout_session(), &wide);
+        assert!(of(&checks, CheckCode::ThinOverlap).is_empty());
+    }
+
+    #[test]
+    fn duplicate_panels_by_path_and_by_footprint() {
+        let checks = layout_checks("Ha", &layout_session(), &no_edges());
+        let d = of(&checks, CheckCode::DuplicatePanels);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].severity, Severity::Problem);
+        assert!(matches!(d[0].target, CheckTarget::Overlap(..)));
+        assert_eq!(
+            d[0].message,
+            "p0.xisf and p2.xisf cover nearly the same sky."
+        );
+        // The same file twice.
+        let mut twice = boxed(1, [500, 500, 600, 600]);
+        twice.source = Some(PathBuf::from("/in/p0.xisf"));
+        let s = canvas_session(vec![boxed(0, [0, 0, 100, 100]), twice]);
+        let checks = layout_checks("Ha", &s, &no_edges());
+        let d = of(&checks, CheckCode::DuplicatePanels);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].message, "p0.xisf is added twice.");
+        // Merely overlapping panels are not duplicates.
+        let (s, g) = clean_session();
+        assert!(of(&layout_checks("Ha", &s, &g), CheckCode::DuplicatePanels).is_empty());
+    }
+
+    #[test]
+    fn coverage_hole_is_found_with_its_rect() {
+        let s = ring_session();
+        let checks = layout_checks("Ha", &s, &no_edges());
+        let h = of(&checks, CheckCode::CoverageHole);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].severity, Severity::Problem);
+        assert_eq!(h[0].target, CheckTarget::Group("Ha".into()));
+        assert_eq!(h[0].rect, Some([200, 300, 400, 500]));
+        assert_eq!(
+            h[0].message,
+            "A gap in Ha's coverage: a panel may be missing."
+        );
+        // Close the gap: no hole.
+        let mut closed = s.clone();
+        closed.panels.push(boxed(4, [200, 300, 400, 500]));
+        let checks = layout_checks("Ha", &closed, &no_edges());
+        assert!(of(&checks, CheckCode::CoverageHole).is_empty());
+        // An open notch (not enclosed) is not a hole.
+        let mut notch = s.clone();
+        notch.panels.remove(3);
+        let checks = layout_checks("Ha", &notch, &no_edges());
+        assert!(of(&checks, CheckCode::CoverageHole).is_empty());
+        // A sliver smaller than any panel is ignored.
+        let mut tiny = s;
+        tiny.panels.push(boxed(4, [200, 300, 400, 490]));
+        let checks = layout_checks("Ha", &tiny, &no_edges());
+        assert!(of(&checks, CheckCode::CoverageHole).is_empty());
+    }
+
+    #[test]
+    fn empty_area_is_a_note() {
+        let checks = layout_checks("Ha", &layout_session(), &no_edges());
+        let e = of(&checks, CheckCode::EmptyArea);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].severity, Severity::Note);
+        assert_eq!(
+            e[0].target,
+            CheckTarget::Panel(PathBuf::from("/in/p3.xisf"))
+        );
+        assert_eq!(e[0].message, "p3.xisf has large empty areas.");
+        // 20% empty is under the limit, 30% over it.
+        let mut s = canvas_session(vec![boxed(0, [0, 0, 400, 400])]);
+        s.panels[0].nonzero_frac *= 0.8;
+        let n = |s: &Session| of(&layout_checks("Ha", s, &no_edges()), CheckCode::EmptyArea).len();
+        assert_eq!(n(&s), 0);
+        s.panels[0].nonzero_frac *= 0.875;
+        assert_eq!(n(&s), 1);
+    }
+
+    #[test]
+    fn a_clean_session_raises_no_new_problems() {
+        let (s, g) = clean_session();
+        let checks = layout_checks("Ha", &s, &g);
+        assert!(checks.is_empty(), "{checks:?}");
+        let all = analysis_checks("Ha", &s, &g);
+        assert!(
+            all.iter().all(|c| c.severity != Severity::Problem),
+            "{all:?}"
         );
     }
 }
