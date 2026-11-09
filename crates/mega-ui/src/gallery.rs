@@ -23,7 +23,7 @@ use crate::starfield::Starfield;
 use crate::table::{self, TableEvent, TableState, sectioned_table};
 use crate::theme::palette::*;
 use crate::theme::text::{Type, text};
-use crate::theme::tokens::{DIALOG_WIDTH, LINE_WIDTH, radius, space};
+use crate::theme::tokens::{DIALOG_WIDTH, LINE_WIDTH, LINE_WIDTH_STRONG, radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
@@ -348,19 +348,24 @@ fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
         clip: [380.0, 120.0, 620.0, 340.0],
         texture: tex("gallery-plan-patch", HA_500, SURFACE_700),
     }]);
-    // A seam in the overlap of the two panels, and badges (the tone's icon
-    // and a count) at constant size.
-    canvas.set_lines(vec![Polyline {
-        points: vec![
-            [500.0, 20.0],
-            [490.0, 160.0],
-            [510.0, 300.0],
-            [500.0, 420.0],
-        ],
-        color: Tone::Warning.color(),
-        width: LINE_WIDTH,
-        dashed: true,
-    }]);
+    // The seam between the two panels as the app draws it: neutral and thin
+    // where the merge is clean, solid warning and thicker (so the colour is
+    // not the only cue) where a problem is badged; and the badges (the
+    // tone's icon and a count) at constant size.
+    canvas.set_lines(vec![
+        Polyline {
+            points: vec![[500.0, 20.0], [490.0, 160.0], [496.0, 196.0]],
+            color: Tone::Neutral.color(),
+            width: LINE_WIDTH,
+            dashed: false,
+        },
+        Polyline {
+            points: vec![[504.0, 244.0], [510.0, 300.0], [500.0, 420.0]],
+            color: Tone::Warning.color(),
+            width: LINE_WIDTH_STRONG,
+            dashed: false,
+        },
+    ]);
     canvas.set_badges(vec![
         CanvasBadge {
             id: 1,

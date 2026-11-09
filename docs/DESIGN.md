@@ -1108,7 +1108,7 @@ views and export. No algorithm changed. Core additions are bookkeeping
 - **Checks engine** (`checks.rs`). Runs `panel_facts`, input and file checks,
   and analysis checks for every analysed, current group on a worker, on open,
   when groups or panels change and after any pipeline job ends; the Checks step and the
-  inspector's Problems section show problems, notes and passed. Accepting a check adds its keys to
+  inspector's Problems section show problems, notes and passed (plan 6 adds layout, statistic and seam checks, badges and seams: "Checks, badges and seams" below). Accepting a check adds its keys to
   `accepted_checks` in `mosaic.json`; accepted problems stop counting.
 - **Panel list** (`panel_list.rs`, edits in `panel_edits.rs`; opened from
   the Panels step, a resizable column left of the canvas). A sectioned
@@ -1336,7 +1336,7 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   beside it; switching plan/mosaic leaves it open); a session without panels
   opens on it, and files dropped on the window are added whatever shows.
 - **View bar.** Plan / Mosaic, a chip per group and per composite and **+**
-  (with two or more groups), and the Outlines, ROIs, Linked and Strong
+  (with two or more groups), and the Outlines, Seams, ROIs, Linked and Strong
   toggles. It wraps when the window is narrow. A group chip carries a
   `mega_ui::widgets::ChipMark`: `Attention` (the warning tone's icon,
   "Out of date") when the group is out of date, `Changed` (the info tone's
@@ -1476,7 +1476,7 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   the shared `Shell::flush_pending_saves` (closing, eframe's periodic save,
   back to the start screen).
 - **Shortcuts.** `I` inspector, `M` plan/mosaic, `[` and `]` previous and next
-  view, `O` outlines, `R` ROIs, `L` Linked, `S` Strong, `Ctrl/Cmd+Enter` the
+  view, `O` outlines, `Shift+S` seams, `R` ROIs, `L` Linked, `S` Strong, `Ctrl/Cmd+Enter` the
   main button, `Ctrl/Cmd+E` the Export dialog (while it can open: something
   merged, no analysis running); each is named in its tooltip. `Delete` (also `Backspace` on
   macOS) removes the panels selected in the open panel list, and `Esc`
@@ -1801,16 +1801,144 @@ store, to provenance or to `mosaic.json`.
   the shown side's settings on a second row in compare). Compare shows only
   on the selected ROI's label and the compared ROI.
 
+## Checks, badges and seams (plan 6, 2026-11)
+
+Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
+(§7); plan `docs/superpowers/plans/2026-11-10-checks-badges.md`. It closes
+project 3. Problems are shown where they are, never in a pop-up; a system
+error is still a toast.
+
+- **Targets and keys** (`mmm_core::checks`). A `Check` names its place:
+  `CheckTarget::{Session, Group, Panel, Overlap, Seam}` (panels by source
+  file, as the checks' `panels`), plus an optional `rect` (canvas px) for a
+  place that is none of those, a coverage hole. A `CheckKey` carries
+  `other` (the second panel of a pair, normalised to path order) and
+  `group` (set for the group-scoped `CoverageHole`, so accepting one hole
+  accepts no other); both are `serde(default, skip_serializing_if)`, so old
+  `accepted_checks` entries keep matching. `CheckCode` serialised names
+  never change; codes are only added.
+- **The check set.** Problems: `DuplicatePanels` (footprint IoU at or above
+  `DUPLICATE_IOU = 0.9`, or a panel added twice), `CoverageHole` (an
+  enclosed gap of at least `HOLE_MIN_PANEL_FRACTION = 0.25` of the smallest
+  panel's footprint, found on an edge-compressed grid, never a raster),
+  `ThinOverlap` (the overlap's short side below `THIN_OVERLAP_PX = 128`
+  canvas px and below `THIN_OVERLAP_FRACTION = 0.05` of the smaller panel's
+  short side, so binned or tiny panels stay quiet) and `ResidualSeam` (a
+  seam `flag_steps` still flags in the merged result). Notes: `EmptyArea`
+  (uncovered share of the panel's bounding box above
+  `EMPTY_AREA_FRACTION = 0.25`), `NoiseOutOfLine` (noise in any channel
+  above `NOISE_FACTOR = 2.0` times the median of the other panels in its
+  group, needing one other), `PanelGradient` (the background plane's rise
+  across the panel above `GRADIENT_FACTOR = 5.0` times its noise and above
+  `GRADIENT_FRACTION = 0.1` of the sky level, the second test dropping out
+  for a near-zero background), `RaggedEdges` (more than
+  `RAGGED_FRACTION = 0.3` of the inner rim only partly covered) and
+  `LevelMatching` (before a merge, "a seam is likely"). Passed: for
+  pre-aligned input, "No distortion model: accepted for pre-aligned
+  panels" (`is_aligned(frame)`; the app gives no distortion verdict while
+  the session has no frame). Every rule is strictly "above"; the
+  thresholds are named, documented constants, a starting point to refine
+  on real data.
+- **Analysis statistics** (`summary::panel_stats`, in `scan_reader`'s one
+  pass, so every input path has them; no new read). `PanelMeta` gains
+  `noise` (per channel), `gradient` and `ragged`, all optional and not
+  written when absent: noise is the median in-cell RMS over the darker half
+  of the fully covered L8 cells; gradient is the largest per-channel plane
+  rise over noise; ragged counts the inner rim (cells one step inside the
+  outermost covered cells), so a clean edge at any angle reads 0. Old
+  sessions have none and get no noise, gradient or edge check (and no false
+  Passed) until analysed again.
+- **Seam lines and seam checks** (`health::seam_lines`,
+  `health_with_lines`). The lines come from one scan of the L8 owner map:
+  each unit edge between cells of different owners, grouped per pair and
+  chained into polylines (scaled by 8 to canvas px). `SeamLine.flagged` is
+  the pair's `flag_steps` verdict. `seam_checks` raises `LevelMatching`
+  (before a merge) or `ResidualSeam` (merged) per flagged pair; they are
+  separate codes with pair keys, so accepting the Note never accepts the
+  Problem. The feather they use is that of the group's last whole merge
+  when it has one (the residual seam describes the mosaic that exists),
+  else the draft's. A group with no photometry has no seam checks. `mmm
+  check` lists the layout and statistic checks but no seam checks (they
+  need photometry and a health pass).
+- **The checks engine's runs** (`mmm-app/checks.rs`). The worker runs
+  layout, statistic and seam checks for every analysed group. It re-runs
+  when a whole-canvas merge finishes, and when the draft feather of a group
+  with no whole merge changes, debounced by `CHECKS_DEBOUNCE` (0.75 s) so
+  typing a feather runs it once (the clock is injectable for tests). A
+  group becoming merged or newly analysed is not a feather change.
+  `ChecksReport.seams` carries the lines. `unaccept` mirrors `accept`.
+- **Badges** (`marks.rs`, `mega_ui::canvas_layers::CanvasBadge`). A badge is
+  a pill with the problem tone's icon and the count, constant size at any
+  zoom, a button of its own (a press never pans; keyboard-focusable;
+  accessible description "{n} problem(s) here"). Both canvases get the same
+  marks from one builder: one badge per place, from the unaccepted
+  Problems of the shown groups (a composite's members). A panel's badge
+  sits at its top-right corner; an overlap and a seam of the same pair
+  share one badge at the overlap's centre, counting both; a hole badges
+  its rect. Session- and Group-targeted problems have no canvas badge
+  (they count on chips and in the Problems list). On the plan, panel
+  badges always show; the analysed-frame overlays (overlap, seam and area
+  badges, seam lines) follow `frame_matches`. A panel's outline turns the
+  problem colour only for a Panel-targeted problem; duplicate or thin
+  overlaps badge the overlap instead of outlining both panels. The mosaic
+  outlines each panel's analysed bbox, numbered as the plan numbers them.
+  The plan's old "!" marker is gone. A group chip shows the warning icon
+  and the count of all its unaccepted problems, placed or not (a
+  composite chip sums its members; check errors are not counted); its
+  accessible description reads "{n} problem(s)".
+- **Seams overlay.** The **Seams** toggle in the view bar (**Shift+S**;
+  plain S stays Strong) draws the seam lines on both canvases, off by
+  default and saved in `ui.session_view`. A line is neutral and
+  `LINE_WIDTH` thick, except a seam with an unaccepted Problem: warning
+  colour and `LINE_WIDTH_STRONG`, solid, so colour is never the only cue.
+  The warning seam and the badge are the same fact (accepting turns the
+  line neutral). A badged seam shows its badge even with Seams off.
+- **Going to a problem and the selection.** A problem row (Problems, See
+  all checks, a panel's list) is one accessible button with a chevron when
+  it has a place (Enter or click opens; Accept sits beside it, not inside).
+  Opening selects and frames the place (`open_problem`,
+  `Selected::{Panel, Overlap, Seam}`), switching the view to its group if
+  need be; with the plan's frame behind the analysed one it toasts and
+  moves nothing, and a stale target does nothing at all. A list open does
+  not reveal the Panels section (the reader keeps their place; it updates
+  in place if open); a badge click does. A selected overlap or seam gets
+  an accent ring (`LINE_WIDTH_STRONG`; on the plan only while the frame
+  matches) and Panels lists all of its pair's checks, overlap and seam
+  together, under "Overlap {a} – {b}" or "Seam {a} – {b}". A selection
+  goes with Esc, another selection, an empty click on the plan (the
+  mosaic has no click-selection), or its panels leaving the session.
+- **See all checks and un-accept.** The Problems section ends with **See
+  all checks ›**, which shows the whole list grouped under **Problems**,
+  **Notes** and **Passed** (passed collapsed), with **‹ Problems** back.
+  An accepted problem stays in it with "Accepted" and **Un-accept**, which
+  removes its keys from `accepted_checks`. The old "Problems only" toggle
+  is gone.
+- **Panel details.** A selected panel's details are a `property_grid`:
+  Size, Channels, Filter, Exposure, Frames, Integration, Solution (and
+  Scale when solved), "—" for what is unknown; Show in folder and Copy
+  path; its **Overlaps** as buttons that select the neighbour and go to
+  the overlap; then "Checks for this panel" with Accept, Un-accept and
+  Open.
+- **Gallery.** The gallery's plan canvas draws a neutral seam at
+  `LINE_WIDTH` and a flagged one (solid, `LINE_WIDTH_STRONG`, `Tone::Warning`)
+  beside it, with two badges; `LINE_WIDTH_STRONG` is a theme token.
+
 ## Coming in project 3
 
-Plans 2 (the panel list and grouping), 3 (draft merge settings and
-per-group staleness), 4 (ROIs, transient previews and Compare A/B) and 5
-(composites and the Export dialog: "Composites and the Export dialog (plan
-5)" above), in the session window above, are built. Plan 6 is next and
-changes it as follows; none of it is built yet.
+Project 3 (the in-session experience) is complete: plans 2 (the panel list
+and grouping), 3 (draft merge settings and per-group staleness), 4 (ROIs,
+transient previews and Compare A/B), 5 (composites and the Export dialog:
+"Composites and the Export dialog (plan 5)" above) and 6 (checks, badges and
+seams: "Checks, badges and seams (plan 6)" above) are built in the session
+window above. What is still open:
 
-- **Plan 6, checks and overlays.** New checks and badges, click-to-zoom from
-  a problem, and a seams overlay.
+- **Threshold tuning.** The check thresholds are starting values, not yet
+  tuned on real mosaics (a smoke run on `test_data/` is manual); seam checks
+  are not in `mmm check`.
+- **Mosaic click-selection.** The mosaic reports no empty clicks, so a
+  selection there goes only with Esc or another selection; clicking an
+  overlap or seam on a canvas to select it needs a `ViewerResponse` change
+  that does not fight Compare's peek.
 
 ## Mega UI standard (2026-11)
 
