@@ -1,7 +1,9 @@
 //! Transient in-memory merge previews of a canvas region.
 //!
 //! A preview blends one rect of an analysed group into memory: it opens no
-//! result store, writes no file and records nothing. At downsample 1 it is
+//! result store, writes no result, provenance or `mosaic.json`, and records
+//! nothing. (Reading panels at downsample 1 may fill the decoded-panel cache,
+//! as any panel read does: [`crate::decoded`].) At downsample 1 it is
 //! the same blend a whole-canvas merge runs over that region, so its pixels
 //! equal the stored tiles there.
 
@@ -143,7 +145,7 @@ impl RowSink for PatchSink {
 /// Run a planned preview (any thread; no [`Mosaic`] needed). Loads the
 /// group's analysis from `plan.session_dir` and blends the rect into
 /// memory, cancellably (progress stage `"preview"`). Opens no store and
-/// writes nothing.
+/// writes no result (panel reads may fill the decoded-panel cache).
 pub fn run_preview(plan: &PreviewPlan, ctl: &JobCtl) -> Result<PreviewPatch> {
     ctl.check()?;
     let session = Session::open(&plan.session_dir)?;
