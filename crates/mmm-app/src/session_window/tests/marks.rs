@@ -145,6 +145,13 @@ pub(super) fn covering(r: [f64; 4]) -> [f64; 4] {
     [r[0].floor(), r[1].floor(), r[2].ceil(), r[3].ceil()]
 }
 
+/// What opening a problem at canvas rect `r` frames: `r` as
+/// [`target_rect`](crate::marks::target_rect) rounds it, grown by the plan's
+/// zoom margin ([`mega_ui::plan::with_zoom_margin`]).
+pub(super) fn framed(r: [f64; 4]) -> [f64; 4] {
+    mega_ui::plan::with_zoom_margin(covering(r))
+}
+
 /// Whether the last frame stroked a line in `color` at `width` inside
 /// `canvas` (a polyline, or one of its dashes).
 fn stroked(h: &Harness<'_, State>, canvas: egui::Rect, color: Color32, width: f32) -> bool {
@@ -354,7 +361,7 @@ fn badges_match_on_plan_and_mosaic() {
     let lines_bbox = [line[0][0], line[0][1], line[1][0], line[1][1]];
     assert_camera(
         h.state().w.plan().camera(),
-        Camera::framing(covering(lines_bbox), plan_frame.size()),
+        Camera::framing(framed(lines_bbox), plan_frame.size()),
     );
     // The mosaic badges the same places, the same way (the whole canvas
     // in view again).
@@ -374,7 +381,7 @@ fn badges_match_on_plan_and_mosaic() {
     h.run_steps(3);
     assert_camera(
         h.state().w.mosaic().camera(),
-        Camera::framing(covering(r0), frame.size()),
+        Camera::framing(framed(r0), frame.size()),
     );
     let _ = std::fs::remove_dir_all(&root);
 }

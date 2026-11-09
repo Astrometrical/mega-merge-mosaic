@@ -1995,7 +1995,7 @@ fn a_selected_panel_shows_its_details_and_checks() {
     h.run_steps(2);
     assert_eq!(h.state().unaccepted, [changed]);
     // Its row opens it (in Problems and in the panel's checks): the panel
-    // framed.
+    // framed, with the zoom margin.
     assert_eq!(
         h.query_all_by_role_and_label(Role::Button, "First panel changed")
             .count(),
@@ -2010,7 +2010,7 @@ fn a_selected_panel_shows_its_details_and_checks() {
     let r = h.state().w.plan().layout().rects[&first];
     assert_camera(
         h.state().w.plan().camera(),
-        Camera::framing(r, frame.size()),
+        Camera::framing(mega_ui::plan::with_zoom_margin(r), frame.size()),
     );
     assert_eq!(h.state().w.plan().selected(), Some(first.as_path()));
     // Esc clears the selection.

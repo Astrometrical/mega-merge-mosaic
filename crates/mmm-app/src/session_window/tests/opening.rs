@@ -11,7 +11,7 @@ use mmm_core::checks::CheckTarget;
 use mmm_core::health::SeamLine;
 
 use super::marks::{
-    analysed, at, badge_button, centre, covering, meet, members, mosaic_ready, plan_ready,
+    analysed, at, badge_button, centre, framed, meet, members, mosaic_ready, plan_ready,
     problem_at, seam,
 };
 use super::*;
@@ -116,7 +116,7 @@ fn assert_plan_framed(h: &Harness<'static, State>, r: [f64; 4]) {
     let (frame, _) = h.state().w.plan().canvas_frame().unwrap();
     assert_camera(
         h.state().w.plan().camera(),
-        Camera::framing(covering(r), frame.size()),
+        Camera::framing(framed(r), frame.size()),
     );
 }
 
@@ -273,9 +273,52 @@ fn opening_a_problem_frames_and_selects_it() {
     let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
     assert_camera(
         h.state().w.mosaic().camera(),
-        Camera::framing(covering(o01), frame.size()),
+        Camera::framing(framed(o01), frame.size()),
     );
     assert_eq!(rings(h.state().w.mosaic().lines()), [o01]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_opened_panel_keeps_its_badge_in_view_and_is_ringed_on_the_mosaic() {
+    use mega_ui::theme::tokens::BADGE_HEIGHT;
+    let (root, s, jobs) = merged("window-open-panel-margin");
+    let ha = members(&s, "Ha");
+    let r1 = analysed(&s, "Ha")[&ha[1]].1;
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(ChecksReport {
+        checks: vec![problem_at(
+            CheckCode::NoOverlap,
+            CheckTarget::Panel(ha[1].clone()),
+            &["Ha"],
+            "Panel 1 alone",
+        )],
+        errors: Vec::new(),
+        seams: Default::default(),
+    });
+    let mut h = harness(state);
+    step_to(&mut h, mosaic_ready);
+    h.run_steps(2);
+    open_row(&mut h, "Panel 1 alone");
+    // Framed with a margin: its badge, at its top-right corner, is well
+    // inside the view, not on its edge.
+    let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    let cam = h.state().w.mosaic().camera().unwrap();
+    assert_camera(Some(cam), Camera::framing(framed(r1), frame.size()));
+    let badge = screen(frame, cam, (r1[2], r1[1]));
+    assert!(
+        frame.shrink(BADGE_HEIGHT / 2.0).contains(badge),
+        "the badge at {badge:?} in {frame:?}"
+    );
+    // The mosaic rings the panel selected at its bbox.
+    assert_eq!(selection(&h), Some(Selected::Panel(ha[1].clone())));
+    assert_eq!(rings(h.state().w.mosaic().lines()), [r1]);
+    // The plan outlines it instead (no ring).
+    h.get_by_label("Plan").click();
+    step_to(&mut h, plan_ready);
+    h.run_steps(2);
+    assert_eq!(h.state().w.plan().selected(), Some(ha[1].as_path()));
+    assert!(rings(h.state().w.plan().lines()).is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -429,7 +472,7 @@ fn a_badge_click_opens_its_problem() {
     h.run_steps(3);
     assert_camera(
         h.state().w.mosaic().camera(),
-        Camera::framing(covering(bbox(&line)), frame.size()),
+        Camera::framing(framed(bbox(&line)), frame.size()),
     );
     assert_eq!(selection(&h), Some(the_seam));
     assert_eq!(rings(h.state().w.mosaic().lines()), [bbox(&line)]);
@@ -472,7 +515,16 @@ fn a_stale_problem_target_is_harmless() {
         &["Ha"],
         "Mixed channels",
     );
-    let never = [&other_group, &other_panel, &nowhere];
+    // A coverage hole of a group the session no longer has (renamed or
+    // removed since the checks ran): its area is no place now.
+    let mut old_hole = problem_at(
+        CheckCode::CoverageHole,
+        CheckTarget::Group("SII".into()),
+        &["SII"],
+        "A hole in SII",
+    );
+    old_hole.rect = Some([20, 30, 60, 50]);
+    let never = [&other_group, &other_panel, &nowhere, &old_hole];
     let mut state = State::new(s, jobs);
     state.checks.set_report(ChecksReport {
         checks: [&alone, &thin].into_iter().chain(never).cloned().collect(),
@@ -486,7 +538,12 @@ fn a_stale_problem_target_is_harmless() {
     });
     h.run_steps(2);
     // Rows whose target does not resolve lead nowhere.
-    for title in ["A seam shows in SII", "gone.xisf alone", "Mixed channels"] {
+    for title in [
+        "A seam shows in SII",
+        "gone.xisf alone",
+        "Mixed channels",
+        "A hole in SII",
+    ] {
         h.get_by_label(title);
         assert!(!opens(&h, title), "{title} opens");
     }

@@ -27,8 +27,17 @@ const SCROLL_ZOOM_PER_NOTCH: f64 = 1.2;
 const SELECTED_STROKE: f32 = 2.5;
 /// Width of an ordinary outline, in points.
 const OUTLINE_STROKE: f32 = 1.0;
-/// Margin left around an item zoomed to, as a fraction of its size.
-const ZOOM_MARGIN: f64 = 0.05;
+/// Margin left around an item zoomed to ([`PlanCanvas::zoom_to`], **Zoom to
+/// selection**), as a fraction of its size on each side.
+pub const ZOOM_MARGIN: f64 = 0.05;
+
+/// `r` (`[x0, y0, x1, y1]`) grown by [`ZOOM_MARGIN`] of its size on each
+/// side: what zooming to it frames, so its edges (and what sits on them)
+/// stay in view.
+pub fn with_zoom_margin(r: [f64; 4]) -> [f64; 4] {
+    let (mx, my) = ((r[2] - r[0]) * ZOOM_MARGIN, (r[3] - r[1]) * ZOOM_MARGIN);
+    [r[0] - mx, r[1] - my, r[2] + mx, r[3] + my]
+}
 /// Dash and gap of the outline of an item with no layers yet, in points.
 const DASH: (f32, f32) = (6.0, 4.0);
 /// Strength of a highlighted item's outline: the selection outline
@@ -398,12 +407,8 @@ impl PlanCanvas {
     }
 
     fn zoom_to_padded(&mut self, r: [f64; 4], screen: Rect, now: f64) {
-        let (mx, my) = ((r[2] - r[0]) * ZOOM_MARGIN, (r[3] - r[1]) * ZOOM_MARGIN);
-        self.view.zoom_to_rect(
-            [r[0] - mx, r[1] - my, r[2] + mx, r[3] + my],
-            screen.size(),
-            now,
-        );
+        self.view
+            .zoom_to_rect(with_zoom_margin(r), screen.size(), now);
     }
 
     /// Follow a [`Tool::DrawRect`] drag; returns the rect once released.

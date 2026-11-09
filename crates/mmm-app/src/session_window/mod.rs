@@ -46,18 +46,22 @@
 //! - **Opening a problem** ([`SessionWindow::open_problem`]: a row clicked,
 //!   or activated with Enter, in Problems, See all, a panel's or a place's
 //!   checks; or a badge): the view shows its group first if it does not
-//!   (a coverage hole's too), the canvas shown frames its place and the
-//!   place is selected, by [`SessionWindow::go_to_roi`]'s rules (on a plan
-//!   drawn in another frame than the analysed one, a toast and nothing
-//!   more). Opened from a list (an Overlaps row too), the inspector keeps
-//!   its place; a badge clicked reveals the Panels section on it. A
-//!   problem whose target no longer resolves (its panel or group gone, no
-//!   place on the canvas) does nothing; its row leads nowhere.
+//!   (a coverage hole's too), the canvas shown frames its place with the
+//!   plan's zoom margin (so a panel's corner badge and a hole's
+//!   surrounding panels stay in view) and the place is selected, by
+//!   [`SessionWindow::go_to_roi`]'s rules (on a plan drawn in another frame
+//!   than the analysed one, a toast and nothing more; an ROI itself is
+//!   framed edge to edge). Opened from a list (an Overlaps row too), the
+//!   inspector keeps its place; a badge clicked reveals the Panels section
+//!   on it. A problem whose target no longer resolves (its panel or group
+//!   gone, a hole's group gone, no place on the canvas) does nothing; its
+//!   row leads nowhere.
 //! - **Selection** ([`Selected`]): a panel (the plan's selection, its row in
 //!   the panel list), or an overlap or a seam, ringed on the canvas shown in
 //!   the selection colour ([`crate::marks::selection_ring`]) while the view
 //!   shows it (as its badge: a seam's group, an overlap's panels), on the
-//!   plan only while it draws in the analysed frame. One at a time:
+//!   plan only while it draws in the analysed frame; a panel is ringed on
+//!   the mosaic only (the plan outlines it). One at a time:
 //!   selecting a panel (on the plan, in the list, an Overlaps row) drops an
 //!   overlap or a seam, and the reverse; a click on no panel of the plan,
 //!   Esc, or its panels or group leaving the session, selects nothing. A
@@ -138,6 +142,7 @@ use std::time::Instant;
 
 use mega_ui::canvas_layers::Polyline;
 use mega_ui::inspector::{InspectorState, inspector_width};
+use mega_ui::plan::with_zoom_margin;
 use mega_ui::theme::palette;
 use mega_ui::theme::tokens::{CANVAS_MIN_WIDTH, PANEL_LIST_MIN_WIDTH, space};
 use mega_ui::widgets::NotesMode;
@@ -563,9 +568,12 @@ impl SessionWindow {
 
     /// Go to canvas rect `rect` and select `selected` (`None`: nothing):
     /// the view shows `group` first (if any), then the rect is framed on
-    /// the canvas shown; with `reveal`, the Panels section opens on what is
-    /// selected. On a plan drawn in another frame than the analysed one, a
-    /// toast ([`SessionWindow::frame_behind`]) and nothing more.
+    /// the canvas shown with the plan's zoom margin
+    /// ([`mega_ui::plan::with_zoom_margin`], as **Zoom to selection**), so
+    /// a panel's corner badge and a hole's surrounding panels stay in view;
+    /// with `reveal`, the Panels section opens on what is selected. On a
+    /// plan drawn in another frame than the analysed one, a toast
+    /// ([`SessionWindow::frame_behind`]) and nothing more.
     fn go_to(
         &mut self,
         session: &OpenSession,
@@ -584,7 +592,7 @@ impl SessionWindow {
             self.inspector.reveal(PANELS);
         }
         self.select(selected);
-        self.frame(rect);
+        self.frame_rect(with_zoom_margin(rect.map(|v| v as f64)));
     }
 
     /// The group to show for `selected`, if the view does not show it: a
@@ -642,15 +650,18 @@ impl SessionWindow {
         }
     }
 
-    /// The ring of the selected overlap or seam on the canvas, where the
-    /// analysis places it (`seams`: the checks' seam lines), while the view
-    /// shows it ([`SessionWindow::view_has`], as its badge and seam lines);
-    /// none for a panel (the plan outlines it) or nothing selected.
+    /// The ring of the selection on the canvas shown, where the analysis
+    /// places it (`seams`: the checks' seam lines), while the view shows it
+    /// ([`SessionWindow::view_has`], as its badge and seam lines): an
+    /// overlap or a seam on either canvas, a panel (its analysed bbox) on
+    /// the mosaic only (the plan outlines its own selection); none with
+    /// nothing selected.
     fn selection_ring(&self, session: &OpenSession, seams: &Seams) -> Option<Polyline> {
+        let mosaic = self.mode() == CanvasMode::Mosaic;
         let s = self
             .selection
             .as_ref()
-            .filter(|s| s.panel().is_none() && self.view_has(session, s))?;
+            .filter(|s| (mosaic || s.panel().is_none()) && self.view_has(session, s))?;
         let rect = place_rect(session, self.plan.layout(), seams, &s.place())?;
         Some(selection_ring(rect))
     }
@@ -1487,11 +1498,17 @@ impl SessionWindow {
         }
     }
 
-    /// Frame canvas rect `rect` (an ROI picked) on the canvas shown, as
-    /// last drawn: the camera that frames it is handed to both canvases, so
-    /// it shows from this frame and a later switch moves nothing. Nothing
-    /// before either canvas has been drawn (no viewport to fit).
+    /// Frame canvas rect `rect` (an ROI picked) edge to edge on the canvas
+    /// shown ([`SessionWindow::frame_rect`]).
     pub(super) fn frame(&mut self, rect: [u64; 4]) {
+        self.frame_rect(rect.map(|v| v as f64));
+    }
+
+    /// Frame canvas rect `rect` on the canvas shown, as last drawn: the
+    /// camera that frames it is handed to both canvases, so it shows from
+    /// this frame and a later switch moves nothing. Nothing before either
+    /// canvas has been drawn (no viewport to fit).
+    fn frame_rect(&mut self, rect: [f64; 4]) {
         let (shown, other) = match self.mode() {
             CanvasMode::Plan => (self.plan.canvas_frame(), self.mosaic.viewer_frame()),
             CanvasMode::Mosaic => (self.mosaic.viewer_frame(), self.plan.canvas_frame()),
@@ -1499,7 +1516,7 @@ impl SessionWindow {
         let Some((viewport, _)) = shown.or(other) else {
             return;
         };
-        let c = Camera::framing(rect.map(|v| v as f64), viewport.size());
+        let c = Camera::framing(rect, viewport.size());
         self.plan.set_camera(c);
         self.mosaic.set_camera(c);
     }

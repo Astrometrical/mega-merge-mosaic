@@ -447,6 +447,16 @@ impl<'a> Places<'a> {
     /// See [`target_rect`].
     pub fn target(&self, check: &Check) -> Option<[u64; 4]> {
         let place = Place::of(check)?;
+        // An area (a coverage hole) is its group's: no place once the
+        // session no longer has the group (renamed or removed).
+        if matches!(place, Place::Area(_))
+            && !check
+                .groups
+                .first()
+                .is_some_and(|g| self.groups.contains(g))
+        {
+            return None;
+        }
         Some(covering_px(self.rect(&place)?))
     }
 
@@ -496,7 +506,8 @@ pub fn badge_point(place: &Place, rect: [f64; 4]) -> [f64; 2] {
 /// The canvas rect (whole pixels, covering it) of `check`'s target: its
 /// panel's analysed bbox, its overlap, its seam's lines' bbox (else the
 /// overlap), or its area ([`place_rect`]). None for a check with no place
-/// on the canvas, or one whose target no longer resolves. (For many
+/// on the canvas, or one whose target no longer resolves (an area too, once
+/// the session no longer has its group: the check's first). (For many
 /// checks, [`Places`].)
 pub fn target_rect(
     session: &OpenSession,
@@ -565,9 +576,10 @@ pub fn seam_lines(
     neutral
 }
 
-/// The ring a selected overlap or seam is highlighted with at its rect
-/// (`[x0, y0, x1, y1]`, canvas coordinates): the selection colour, as the
-/// plan outlines a selected panel, at the strong line width.
+/// The ring a selection is highlighted with at its rect (`[x0, y0, x1,
+/// y1]`, canvas coordinates): an overlap or a seam on either canvas, a
+/// panel on the mosaic (the plan outlines its own); the selection colour,
+/// as the plan's selected outline, at the strong line width.
 pub fn selection_ring(rect: [f64; 4]) -> Polyline {
     let [x0, y0, x1, y1] = rect;
     Polyline {
@@ -735,6 +747,10 @@ mod tests {
         let mut hole = problem(CheckTarget::Group("Ha".into()), &["Ha"]);
         hole.rect = Some([5, 6, 7, 8]);
         assert_eq!(target_rect(&s, &layout, &none, &hole), Some([5, 6, 7, 8]));
+        // A hole of a group the session no longer has: nothing.
+        let mut gone_hole = problem(CheckTarget::Group("SII".into()), &["SII"]);
+        gone_hole.rect = hole.rect;
+        assert_eq!(target_rect(&s, &layout, &none, &gone_hole), None);
         assert_eq!(rect(&none, CheckTarget::Group("Ha".into())), None);
         assert_eq!(rect(&none, CheckTarget::Session), None);
         // A panel the session no longer has, or never analysed: nothing.
