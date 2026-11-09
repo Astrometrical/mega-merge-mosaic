@@ -76,6 +76,7 @@ fn save_comps(dir: &Path, compositions: &[Composition]) {
 
 fn hoo() -> Composition {
     Composition {
+        id: 1,
         name: "HOO".into(),
         channels: [
             Some(("Ha".into(), 1.0)),
@@ -187,13 +188,14 @@ fn composition_view_is_added() {
     let dir = merged_session(&root, Some("comp:HOO"));
     // A composition of a group never merged is left out.
     let other = Composition {
+        id: 2,
         name: "Lum".into(),
         channels: [Some(("L".into(), 1.0)), None, None],
     };
     save_comps(&dir, &[hoo(), other]);
     let hero = build_hero(&facts_of(&dir));
     assert_eq!(labels(&hero), ["Ha · 4 panels", "OIII · 4 panels", "HOO"]);
-    assert_eq!(hero.start, 2, "last_view comp:HOO");
+    assert_eq!(hero.start, 2, "last_view comp:HOO (named, as earlier mmm)");
     // Ha in red, OIII in green and blue.
     let px = top_pixels(&hero.views[2]);
     assert!(
@@ -201,6 +203,16 @@ fn composition_view_is_added() {
             .any(|p| p.a() > 0 && p.r() > 0 && p.g() > 0 && p.g() == p.b()),
         "mixed colours"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn composition_view_is_found_by_id() {
+    let root = temp_dir("hero-comp-id");
+    let dir = merged_session(&root, Some("comp:1"));
+    save_comps(&dir, &[hoo()]);
+    let hero = build_hero(&facts_of(&dir));
+    assert_eq!(hero.start, 2, "last_view comp:1");
     let _ = std::fs::remove_dir_all(&root);
 }
 

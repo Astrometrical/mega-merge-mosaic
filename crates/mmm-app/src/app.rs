@@ -769,8 +769,8 @@ impl SelfTest {
                 if self.session_frames >= SELFTEST_SESSION_FRAMES && w.mosaic().is_settled() =>
             {
                 log_mosaic(w.mosaic());
-                if has_composition(shell) {
-                    shell.window_mut().select_view(ViewKind::Composition(0));
+                if let Some(id) = first_composition(shell) {
+                    shell.window_mut().select_view(ViewKind::Composition(id));
                     self.phase = Phase::MosaicComposition;
                 } else {
                     shell.window_mut().set_mode(CanvasMode::Plan);
@@ -819,11 +819,11 @@ impl SelfTest {
     }
 }
 
-/// Whether the open session has a composition.
-fn has_composition(shell: &Shell) -> bool {
+/// The id of the open session's first composition, if it has one.
+fn first_composition(shell: &Shell) -> Option<u64> {
     shell
         .session()
-        .is_some_and(|s| !load_compositions(&s.mosaic.config.ui).is_empty())
+        .and_then(|s| load_compositions(&s.mosaic.config.ui).first().map(|c| c.id))
 }
 
 /// Log what the self-test's mosaic shows.

@@ -111,7 +111,9 @@ use serde_json::Value;
 
 use crate::camera::Camera;
 use crate::checks::ChecksEngine;
-use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
+use crate::compositions::{
+    Composition, ViewKind, composition_stretch_key, load_compositions, migrate_composition_ids,
+};
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
 use crate::panel_edits::FilesPicker;
@@ -741,9 +743,10 @@ impl SessionWindow {
     pub fn view_key(&self, ui: &Value) -> Option<String> {
         match self.view.as_ref()? {
             ViewKind::Group(g) => Some(g.clone()),
-            ViewKind::Composition(i) => load_compositions(ui)
-                .get(*i)
-                .map(|c| composition_stretch_key(&c.name)),
+            ViewKind::Composition(id) => load_compositions(ui)
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| composition_stretch_key(c.id)),
         }
     }
 
@@ -917,8 +920,9 @@ impl SessionWindow {
     fn view_shows(&self, session: &OpenSession, path: &Path) -> bool {
         let groups: Vec<String> = match &self.view {
             Some(ViewKind::Group(g)) => vec![g.clone()],
-            Some(ViewKind::Composition(i)) => compositions_of(session)
-                .get(*i)
+            Some(ViewKind::Composition(id)) => compositions_of(session)
+                .iter()
+                .find(|c| c.id == *id)
                 .map(|c| {
                     c.channels
                         .iter()
@@ -961,8 +965,13 @@ impl SessionWindow {
     /// either way open the panel list for a session without panels (adding
     /// them comes first). Then keep the view one the session has (else its
     /// first group) in both canvases.
-    fn follow_session(&mut self, session: &OpenSession, jobs: &JobRunner) {
+    fn follow_session(&mut self, session: &mut OpenSession, jobs: &JobRunner) {
         if self.mode.is_none() {
+            // Composites an earlier mmm saved get their ids, and their saved
+            // view and stretch follow them there (saved with the next save).
+            if migrate_composition_ids(&mut session.mosaic.config.ui) {
+                self.save.touch();
+            }
             let saved = ViewState::load(&session.mosaic.config.ui);
             match &saved {
                 Some(s) => self.restore(s, session, jobs),
@@ -981,7 +990,7 @@ impl SessionWindow {
         let compositions = compositions_of(session);
         let valid = match &self.view {
             Some(ViewKind::Group(g)) => groups.contains(g),
-            Some(ViewKind::Composition(i)) => *i < compositions.len(),
+            Some(ViewKind::Composition(id)) => compositions.iter().any(|c| c.id == *id),
             None => false,
         };
         if !valid {
@@ -1134,8 +1143,8 @@ fn view_of_key(session: &OpenSession, key: &str) -> Option<ViewKind> {
     }
     compositions_of(session)
         .iter()
-        .position(|c| composition_stretch_key(&c.name) == key)
-        .map(ViewKind::Composition)
+        .find(|c| composition_stretch_key(c.id) == key)
+        .map(|c| ViewKind::Composition(c.id))
 }
 
 #[cfg(test)]

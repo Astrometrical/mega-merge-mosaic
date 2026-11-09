@@ -170,11 +170,11 @@ impl SessionWindow {
         if groups.len() < 2 {
             return;
         }
-        let composites = compositions_of(session).len();
+        let composites = compositions_of(session);
         let views: Vec<ViewKind> = groups
             .into_iter()
             .map(ViewKind::Group)
-            .chain((0..composites).map(ViewKind::Composition))
+            .chain(composites.iter().map(|c| ViewKind::Composition(c.id)))
             .collect();
         let at = self
             .view

@@ -34,6 +34,7 @@ fn main() -> ExitCode {
     let mut m = synth_mosaic::two_group_mosaic(&root);
     // An HOO composition for Plan (the app's `compositions` format).
     m.config.ui = serde_json::json!({ "compositions": [{
+        "id": 1,
         "name": "HOO",
         "channels": [["Ha", 1.0], ["OIII", 1.0], ["OIII", 1.0]],
     }]});

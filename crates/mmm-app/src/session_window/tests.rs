@@ -1147,7 +1147,7 @@ fn plus_adds_a_composite_and_opens_composites() {
     let list = load_compositions(&st.session.mosaic.config.ui);
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].name, "Composite 1");
-    let comp = Some(ViewKind::Composition(0));
+    let comp = Some(ViewKind::Composition(1));
     assert_eq!(st.w.view(), comp.as_ref());
     assert_eq!(st.w.plan().view(), comp.as_ref());
     assert_eq!(st.w.mosaic().view(), comp.as_ref());
@@ -1173,10 +1173,10 @@ fn deleting_a_composite_keeps_the_view() {
     save_compositions(&mut s.mosaic.config.ui, &[a, b]);
     let mut h = harness(State::new(s, runner()));
     step_until(&mut h, |st| st.w.view().is_some());
-    h.state_mut().w.select_view(ViewKind::Composition(1));
+    h.state_mut().w.select_view(ViewKind::Composition(2));
     h.state_mut().w.inspector_mut().reveal("composites");
     h.run_steps(2);
-    // A goes: B, shown, moves up the list and stays shown.
+    // A goes: B, shown, stays shown.
     h.get_all_by_label("Delete composite")
         .next()
         .expect("A's delete")
@@ -1188,7 +1188,7 @@ fn deleting_a_composite_keeps_the_view() {
         .map(|c| c.name)
         .collect();
     assert_eq!(names, ["B"]);
-    let b = Some(ViewKind::Composition(0));
+    let b = Some(ViewKind::Composition(2));
     assert_eq!(st.w.view(), b.as_ref());
     assert_eq!(st.w.plan().view(), b.as_ref());
     assert_eq!(st.w.mosaic().view(), b.as_ref());
@@ -1198,6 +1198,116 @@ fn deleting_a_composite_keeps_the_view() {
     let ha = Some(ViewKind::Group("Ha".into()));
     assert_eq!(h.state().w.view(), ha.as_ref());
     assert_eq!(h.state().w.plan().view(), ha.as_ref());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn old_composites_get_ids_and_keep_their_view() {
+    use crate::stretch_panel::{PLAN_STRETCH_KEY, save_stretch_at, saved_stretch_at};
+    use mmm_core::stretch::StretchParams;
+
+    let root = temp_dir("window-old-composites");
+    let mut s = two_group_session(&root);
+    // What an earlier mmm saved: composites without ids, the shown view and
+    // a plan stretch keyed by the composite's name.
+    s.mosaic.config.ui = serde_json::json!({ "compositions": [
+        { "name": "A", "channels": [["Ha", 1.0], null, null] },
+        { "name": "B", "channels": [null, ["OIII", 1.0], null] },
+    ]});
+    let stretch = [StretchParams {
+        black: 0.1,
+        white: 0.9,
+        midtones: 0.3,
+    }; 3];
+    save_stretch_at(
+        &mut s.mosaic.config.ui,
+        PLAN_STRETCH_KEY,
+        "comp:B",
+        Some(&stretch),
+    );
+    let saved = view_state::ViewState {
+        view: Some("comp:B".into()),
+        ..Default::default()
+    };
+    saved.save(&mut s.mosaic.config.ui);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(2);
+    let st = h.state();
+    let list = load_compositions(&st.session.mosaic.config.ui);
+    let ids: Vec<u64> = list.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [1, 2], "fresh ids, in order");
+    // It opens on B, with B's stretch, now under B's id.
+    let b = Some(ViewKind::Composition(2));
+    assert_eq!(st.w.view(), b.as_ref());
+    assert_eq!(st.w.plan().view(), b.as_ref());
+    let ui = &st.session.mosaic.config.ui;
+    assert_eq!(st.w.view_key(ui).as_deref(), Some("comp:2"));
+    assert_eq!(
+        saved_stretch_at(ui, PLAN_STRETCH_KEY, "comp:2").as_deref(),
+        Some(&stretch[..])
+    );
+    assert!(saved_stretch_at(ui, PLAN_STRETCH_KEY, "comp:B").is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn views_follow_a_composite_by_id_across_reorder_and_delete() {
+    let root = temp_dir("window-composite-ids");
+    let mut s = two_group_session(&root);
+    let mk = |name: &str, g: &str| {
+        let mut c = Composition::new(name);
+        c.channels[0] = Some((g.into(), 1.0));
+        c
+    };
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[mk("A", "Ha"), mk("B", "OIII"), mk("C", "Ha")],
+    );
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    let list = load_compositions(&h.state().session.mosaic.config.ui);
+    let id = |name: &str| list.iter().find(|c| c.name == name).unwrap().id;
+    let (a, b, c) = (id("A"), id("B"), id("C"));
+    assert!(a != b && b != c && a != c);
+    h.state_mut().w.select_view(ViewKind::Composition(b));
+    h.state_mut().w.inspector_mut().reveal("composites");
+    h.run_steps(2);
+    // Reordered: B is still the one shown.
+    let mut reordered = load_compositions(&h.state().session.mosaic.config.ui);
+    reordered.reverse();
+    save_compositions(&mut h.state_mut().session.mosaic.config.ui, &reordered);
+    h.run_steps(2);
+    let shown = Some(ViewKind::Composition(b));
+    assert_eq!(h.state().w.view(), shown.as_ref());
+    assert_eq!(h.state().w.plan().view(), shown.as_ref());
+    assert_eq!(h.state().w.mosaic().view(), shown.as_ref());
+    let key = h.state().w.view_key(&h.state().session.mosaic.config.ui);
+    assert_eq!(key, Some(format!("comp:{b}")));
+    // The editors now run C, B, A. C goes: B stays shown.
+    h.get_all_by_label("Delete composite")
+        .next()
+        .expect("C's delete")
+        .click();
+    h.run_steps(2);
+    let names: Vec<String> = load_compositions(&h.state().session.mosaic.config.ui)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["B", "A"]);
+    assert_eq!(h.state().w.view(), shown.as_ref());
+    // B goes: the first group shows; A keeps its id.
+    h.run_steps(2);
+    h.get_all_by_label("Delete composite")
+        .next()
+        .expect("B's delete")
+        .click();
+    h.run_steps(2);
+    let ha = Some(ViewKind::Group("Ha".into()));
+    assert_eq!(h.state().w.view(), ha.as_ref());
+    let left = load_compositions(&h.state().session.mosaic.config.ui);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, a);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2687,7 +2797,7 @@ fn a_composite_with_an_unmerged_member_keeps_the_canvas_in_place() {
     save_compositions(&mut s.mosaic.config.ui, &[comp]);
     let mut state = State::new(s, jobs);
     state.w.set_mode(CanvasMode::Plan);
-    state.w.select_view(ViewKind::Composition(0));
+    state.w.select_view(ViewKind::Composition(1));
     let mut h = harness(state);
     step_until(&mut h, |st| {
         plan_placed(st) && st.w.mosaic().source().is_some()

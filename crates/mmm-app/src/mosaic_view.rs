@@ -169,10 +169,11 @@ enum Readiness {
 pub(crate) fn view_members(view: &ViewKind, compositions: &[Composition]) -> Vec<String> {
     match view {
         ViewKind::Group(g) => vec![g.clone()],
-        ViewKind::Composition(i) => {
+        ViewKind::Composition(id) => {
             let mut out: Vec<String> = Vec::new();
             for (g, _) in compositions
-                .get(*i)
+                .iter()
+                .find(|c| c.id == *id)
                 .into_iter()
                 .flat_map(|c| c.channels.iter().flatten())
             {
@@ -525,14 +526,15 @@ impl MosaicView {
     }
 
     /// The view's key, as the plan keys it: the group's name, or
-    /// [`composition_stretch_key`] of the composition's name (read from
+    /// [`composition_stretch_key`] of the composition's id (read from
     /// `ui`, the session's UI settings). `None` before a view is chosen.
     pub fn view_key(&self, ui: &Value) -> Option<String> {
         match self.view.as_ref()? {
             ViewKind::Group(g) => Some(g.clone()),
-            ViewKind::Composition(i) => load_compositions(ui)
-                .get(*i)
-                .map(|c| composition_stretch_key(&c.name)),
+            ViewKind::Composition(id) => load_compositions(ui)
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| composition_stretch_key(c.id)),
         }
     }
 
@@ -1197,7 +1199,9 @@ impl MosaicView {
     fn resolve_view(&self, groups: &[String], compositions: &[Composition]) -> Option<ViewKind> {
         match &self.view {
             Some(ViewKind::Group(g)) if groups.contains(g) => self.view.clone(),
-            Some(ViewKind::Composition(i)) if *i < compositions.len() => self.view.clone(),
+            Some(ViewKind::Composition(id)) if compositions.iter().any(|c| c.id == *id) => {
+                self.view.clone()
+            }
             _ => groups.first().map(|g| ViewKind::Group(g.clone())),
         }
     }
@@ -1446,8 +1450,9 @@ impl MosaicView {
                 .map_or(0, |s| Arc::as_ptr(s) as usize)
         };
         let mapping: Vec<Option<(String, u32)>> = match &self.view {
-            Some(ViewKind::Composition(i)) => compositions
-                .get(*i)
+            Some(ViewKind::Composition(id)) => compositions
+                .iter()
+                .find(|c| c.id == *id)
                 .map(|c| {
                     c.channels
                         .iter()
@@ -1468,9 +1473,10 @@ impl MosaicView {
         let wanted: Option<Arc<dyn TileSource>> = match &self.view {
             _ if key.0.iter().all(|&p| p == 0) => None,
             Some(ViewKind::Group(g)) => source_of(g).map(|s| s as Arc<dyn TileSource>),
-            Some(ViewKind::Composition(i)) => {
+            Some(ViewKind::Composition(id)) => {
                 let channels: Vec<Option<(Arc<MosaicTileSource>, f32)>> = compositions
-                    .get(*i)
+                    .iter()
+                    .find(|c| c.id == *id)
                     .map(|c| {
                         c.channels
                             .iter()

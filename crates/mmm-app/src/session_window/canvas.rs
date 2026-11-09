@@ -173,9 +173,9 @@ impl SessionWindow {
             self.merge_group(session, jobs, &g);
         }
         if act.add_composite {
-            let i = add_composition(&mut session.mosaic.config.ui, &groups);
+            let id = add_composition(&mut session.mosaic.config.ui, &groups);
             self.save.touch();
-            self.select_view(ViewKind::Composition(i));
+            self.select_view(ViewKind::Composition(id));
             self.inspector.reveal(COMPOSITES);
         }
     }
@@ -259,8 +259,8 @@ impl SessionWindow {
                     }
                 });
             }
-            for (i, comp) in compositions_of(session).iter().enumerate() {
-                let view = ViewKind::Composition(i);
+            for comp in compositions_of(session).iter() {
+                let view = ViewKind::Composition(comp.id);
                 let c = ChoiceChip {
                     label: &comp.name,
                     color: None,
@@ -408,8 +408,8 @@ impl SessionWindow {
                     });
                 }
             }
-            ViewKind::Composition(i) => {
-                let Some(c) = compositions_of(session).get(*i).cloned() else {
+            ViewKind::Composition(id) => {
+                let Some(c) = compositions_of(session).into_iter().find(|c| c.id == *id) else {
                     return Vec::new();
                 };
                 if plan {

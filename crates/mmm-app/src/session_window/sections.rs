@@ -56,8 +56,8 @@ const NOTES_HINT: &str = "Notes about this session";
 #[derive(Default)]
 struct Actions {
     mode: Option<CanvasMode>,
-    /// The composite at this index was deleted.
-    deleted: Option<usize>,
+    /// The composite with this id was deleted.
+    deleted: Option<u64>,
     /// An ROI was picked: frame this canvas rect.
     go_to: Option<[u64; 4]>,
     /// **Draw ROI** was used: arm the draw tool on the canvas shown.
@@ -155,23 +155,17 @@ impl SessionWindow {
         if act.draw_roi {
             self.start_drawing_roi(session);
         }
-        if let Some(i) = act.deleted {
-            self.composite_deleted(session, i);
+        if let Some(id) = act.deleted {
+            self.composite_deleted(session, id);
         }
     }
 
-    /// Composite `index` is gone: a view of it shows the first group, a view
-    /// of a later one follows it down the list.
-    fn composite_deleted(&mut self, session: &OpenSession, index: usize) {
-        let next = match &self.view {
-            Some(ViewKind::Composition(i)) if *i == index => {
-                group_names(session).first().cloned().map(ViewKind::Group)
-            }
-            Some(ViewKind::Composition(i)) if *i > index => Some(ViewKind::Composition(i - 1)),
-            _ => None,
-        };
-        if let Some(view) = next {
-            self.select_view(view);
+    /// Composite `id` is gone: a view of it shows the first group.
+    fn composite_deleted(&mut self, session: &OpenSession, id: u64) {
+        if self.view == Some(ViewKind::Composition(id))
+            && let Some(g) = group_names(session).first().cloned()
+        {
+            self.select_view(ViewKind::Group(g));
         }
     }
 }
@@ -415,12 +409,12 @@ fn composites_ui(
                 .add(MegaButton::new(ButtonKind::Danger, "Delete composite"))
                 .clicked()
             {
-                act.deleted = Some(i);
+                act.deleted = Some(edited.id);
             }
         });
     }
-    if let Some(i) = act.deleted {
-        next.remove(i);
+    if let Some(id) = act.deleted {
+        next.retain(|c| c.id != id);
         changed = true;
     }
     if changed {

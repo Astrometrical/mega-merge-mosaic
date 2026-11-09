@@ -575,7 +575,7 @@ fn merge_blocked_until_result_checked_and_reader_released() {
     let ha = store("ha2.mmmt");
     let oiii = store("oiii.mmmt");
     view.apply_view(
-        ViewKind::Composition(0),
+        ViewKind::Composition(1),
         vec!["Ha".to_string(), "OIII".to_string()],
     );
     for (name, src) in [("Ha", &ha), ("OIII", &oiii)] {
@@ -729,7 +729,7 @@ fn a_drawn_rect_becomes_a_region() {
     ];
     save_compositions(&mut s.mosaic.config.ui, &[hoo]);
     let mut view = MosaicView::new();
-    view.set_view(&s, ViewKind::Composition(0));
+    view.set_view(&s, ViewKind::Composition(1));
     assert_eq!(view.members, ["Ha", "OIII"]);
     assert_eq!(
         view.group(),
@@ -780,7 +780,7 @@ fn composition_shows_merged_members() {
     let compositions = load_compositions(&s.mosaic.config.ui);
     let ctx = egui::Context::default();
     let mut view = MosaicView::new();
-    view.set_view(&s, ViewKind::Composition(0));
+    view.set_view(&s, ViewKind::Composition(1));
     let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !view.results.values().all(Member::idle) {
         assert!(Instant::now() < deadline, "results never opened");

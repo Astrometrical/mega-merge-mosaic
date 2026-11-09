@@ -637,7 +637,7 @@ fn is_panel(session: &OpenSession, path: &Path) -> bool {
 
 /// The view resolved for a frame.
 struct ViewSpec {
-    /// Texture identity and summary key (group name, or `comp:<name>`).
+    /// Texture identity and summary key (group name, or `comp:<id>`).
     key: String,
     /// The groups drawn, in order.
     groups: Vec<DrawnGroup>,
@@ -995,7 +995,7 @@ impl PlanView {
         };
         let valid = match &self.view {
             Some(ViewKind::Group(g)) => groups.contains(g),
-            Some(ViewKind::Composition(i)) => *i < compositions.len(),
+            Some(ViewKind::Composition(id)) => compositions.iter().any(|c| c.id == *id),
             None => false,
         };
         if !valid {
@@ -1144,8 +1144,8 @@ impl PlanView {
                     mapping: Vec::new(),
                 })
             }
-            ViewKind::Composition(i) => {
-                let c = compositions.get(*i)?;
+            ViewKind::Composition(id) => {
+                let c = compositions.iter().find(|c| c.id == *id)?;
                 let mut drawn: Vec<DrawnGroup> = Vec::new();
                 for (slot, ch) in c.channels.iter().enumerate() {
                     let Some((g, w)) = ch else { continue };
@@ -1160,7 +1160,7 @@ impl PlanView {
                     }
                 }
                 Some(ViewSpec {
-                    key: composition_stretch_key(&c.name),
+                    key: composition_stretch_key(c.id),
                     groups: drawn,
                     mapping: c
                         .channels

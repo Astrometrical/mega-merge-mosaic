@@ -463,7 +463,7 @@ fn composition_view_uses_additive_layers() {
     let mut h = harness(s);
     h.state_mut().previews = previews;
     h.state_mut().complete = true;
-    h.state_mut().view.select_view(ViewKind::Composition(0));
+    h.state_mut().view.select_view(ViewKind::Composition(1));
     step_until(&mut h, |s| s.view.is_settled());
     let items = h.state().view.items().to_vec();
     assert_eq!(items.len(), 8);
@@ -501,7 +501,7 @@ fn composition_view_uses_additive_layers() {
     assert_eq!(labels, (1..=8).collect::<Vec<_>>());
     // A three-channel stretch, keyed apart from any group's.
     assert_eq!(h.state().view.stretch_for_view().map(<[_]>::len), Some(3));
-    assert_eq!(h.state().view.view_key(), Some("comp:HOO"));
+    assert_eq!(h.state().view.view_key(), Some("comp:1"));
     let _ = std::fs::remove_dir_all(&root);
 }
 

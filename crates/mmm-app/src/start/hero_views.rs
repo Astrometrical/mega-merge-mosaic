@@ -36,7 +36,9 @@ use mmm_core::session_summary::{ResultState, SessionSummary};
 use mmm_core::stretch::{StretchParams, auto_stretch, channel_stats};
 
 use super::facts::{Availability, CardFacts, CardState};
-use crate::compositions::{Composition, composition_stretch_key, load_compositions};
+use crate::compositions::{
+    Composition, composition_stretch_key, load_compositions, migrate_composition_ids,
+};
 use crate::display_stretch::DisplayStretch;
 use crate::stretch_panel::{PLAN_STRETCH_KEY, saved_stretch, saved_stretch_at};
 use crate::tile_source::{CompositeTileSource, Mix, MosaicTileSource, channel_tints, planar_image};
@@ -83,7 +85,7 @@ impl HeroData {
 }
 
 /// A view and the key the summary's `last_view` names it by: the group
-/// name, or [`composition_stretch_key`] of a composition's name.
+/// name, or [`composition_stretch_key`] of a composition's id.
 struct Keyed {
     key: String,
     view: HeroView,
@@ -132,7 +134,12 @@ pub fn build_hero(facts: &CardFacts) -> HeroData {
     }
     let last = summary.and_then(|s| s.last_view.as_deref());
     let start = last
-        .and_then(|l| keyed.iter().position(|k| k.key == l))
+        .and_then(|l| {
+            // An earlier mmm named a composition's view by its name.
+            let legacy =
+                |k: &Keyed| k.key.starts_with("comp:") && l == format!("comp:{}", k.view.label);
+            keyed.iter().position(|k| k.key == l || legacy(k))
+        })
         .unwrap_or(0);
     HeroData {
         views: keyed.into_iter().map(|k| k.view).collect(),
@@ -165,7 +172,10 @@ fn group_label(group: &str, panels: usize) -> String {
 /// The live views of a merged session: each summary group with a result,
 /// then each composition whose groups all have one.
 fn merged_views(m: &Mosaic, summary: Option<&SessionSummary>) -> Vec<Keyed> {
-    let ui = &m.config.ui;
+    // Read as the window would, once it has moved an older session's keys.
+    let mut migrated = m.config.ui.clone();
+    migrate_composition_ids(&mut migrated);
+    let ui = &migrated;
     let mut out = Vec::new();
     let mut sources: BTreeMap<&str, Arc<MosaicTileSource>> = BTreeMap::new();
     let groups = summary.map_or(&[][..], |s| &s.groups);
@@ -206,7 +216,7 @@ fn merged_views(m: &Mosaic, summary: Option<&SessionSummary>) -> Vec<Keyed> {
             continue;
         };
         out.push(Keyed {
-            key: composition_stretch_key(&c.name),
+            key: composition_stretch_key(c.id),
             view: HeroView {
                 label: c.name.clone(),
                 source: Arc::new(composite),
@@ -253,7 +263,10 @@ fn planned_views(m: &Mosaic, summary: Option<&SessionSummary>) -> Vec<Keyed> {
             previews.iter().collect(),
         )],
     };
-    let ui = &m.config.ui;
+    // Read as the window would, once it has moved an older session's keys.
+    let mut migrated = m.config.ui.clone();
+    migrate_composition_ids(&mut migrated);
+    let ui = &migrated;
     // (key, label, picture) of each view.
     let mut pictures: Vec<(String, String, ColorImage)> = Vec::new();
     for (key, label, members) in groups {
@@ -267,7 +280,7 @@ fn planned_views(m: &Mosaic, summary: Option<&SessionSummary>) -> Vec<Keyed> {
         .iter()
         .filter_map(|c| {
             let img = mix_pictures(c, &pictures)?;
-            Some((composition_stretch_key(&c.name), c.name.clone(), img))
+            Some((composition_stretch_key(c.id), c.name.clone(), img))
         })
         .collect();
     pictures
