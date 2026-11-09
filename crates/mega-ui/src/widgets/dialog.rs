@@ -151,12 +151,12 @@ impl Dialog<'_> {
     /// by a pointer click (a button, the backdrop), the focus stays where
     /// the click put it.
     ///
-    /// The focus is given at the end of the next pass ([`ReturnFocus`]), the
-    /// first the dialog is not shown in: until then the opener is behind
-    /// the modal of the pass before, and egui takes the focus from a widget
-    /// drawn there. So the key that closed the dialog never reaches the
-    /// opener (Enter would press it again), and the focus is back a pass
-    /// later.
+    /// The focus is given (by a small egui plugin) at the end of the next
+    /// pass, the first the dialog is not shown in: until then the opener is
+    /// behind the modal of the pass before, and egui takes the focus from a
+    /// widget drawn there. So the key that closed the dialog never reaches
+    /// the opener (Enter would press it again), and the focus is back a
+    /// pass later.
     pub fn close(ctx: &Context, id: Id) {
         let opener = ctx.data_mut(|d| {
             let o = d.get_temp::<Id>(opener_key(id));
