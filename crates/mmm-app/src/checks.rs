@@ -109,7 +109,7 @@ struct SeamKey {
 
 /// One group's measured seams: its seam checks and seam lines.
 #[derive(Clone, Debug)]
-struct Seams {
+struct MeasuredSeams {
     checks: Vec<Check>,
     lines: Vec<SeamLine>,
 }
@@ -118,7 +118,7 @@ struct Seams {
 /// from. The engine keeps it between runs and hands it to each run's
 /// worker (moved, never copied or locked on the UI thread), which hands
 /// back the entries of the groups it saw.
-type SeamCache = BTreeMap<String, (SeamKey, Seams)>;
+type SeamCache = BTreeMap<String, (SeamKey, MeasuredSeams)>;
 
 /// One run's results.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -230,7 +230,7 @@ fn run_checks(
                     None => {
                         measured.push(group.clone());
                         measure_seams(&session, &graph, feather.feather_px).map(|m| {
-                            m.map(|(health, lines)| Seams {
+                            m.map(|(health, lines)| MeasuredSeams {
                                 checks: seam_checks(&group, &session, &health, feather.merged),
                                 lines,
                             })

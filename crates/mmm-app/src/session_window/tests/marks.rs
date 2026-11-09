@@ -757,25 +757,7 @@ fn a_composites_coincident_problems_share_one_badge() {
     };
     let mut state = State::new(s, jobs);
     state.checks.set_report(ChecksReport {
-        checks: vec![
-            thin(&ha, "Ha"),
-            thin(&oiii, "OIII"),
-            // A panel's problem in one group, a note on its twin in the
-            // other.
-            problem_at(
-                CheckCode::NoOverlap,
-                CheckTarget::Panel(ha[2].clone()),
-                &["Ha"],
-                "Ha 2 alone",
-            ),
-            at(
-                CheckCode::EmptyArea,
-                Severity::Note,
-                CheckTarget::Panel(oiii[2].clone()),
-                &["OIII"],
-                "OIII 2 is half empty",
-            ),
-        ],
+        checks: vec![thin(&ha, "Ha"), thin(&oiii, "OIII")],
         errors: Vec::new(),
         seams: Default::default(),
     });
@@ -789,10 +771,35 @@ fn a_composites_coincident_problems_share_one_badge() {
     // chip counts them too.
     let o01 = meet(gh[&ha[0]].1, gh[&ha[1]].1);
     let badges = h.state().w.mosaic().badges().to_vec();
-    assert_eq!(badges.len(), 2, "{badges:?}");
+    assert_eq!(badges.len(), 1, "{badges:?}");
     let b = badge_at(&badges, centre(o01)).expect("the pair's badge");
     assert_eq!(b.count, 2);
-    assert_eq!(chip_state(&h, "Both").as_deref(), Some("3 problems"));
+    assert_eq!(chip_state(&h, "Both").as_deref(), Some("2 problems"));
+    // Then a panel's problem in one group, and a note on its twin in the
+    // other.
+    let mut checks = h.state().checks.report().unwrap().checks.clone();
+    checks.extend([
+        problem_at(
+            CheckCode::NoOverlap,
+            CheckTarget::Panel(ha[2].clone()),
+            &["Ha"],
+            "Ha 2 alone",
+        ),
+        at(
+            CheckCode::EmptyArea,
+            Severity::Note,
+            CheckTarget::Panel(oiii[2].clone()),
+            &["OIII"],
+            "OIII 2 is half empty",
+        ),
+    ]);
+    h.state_mut().checks.set_report(ChecksReport {
+        checks,
+        errors: Vec::new(),
+        seams: Default::default(),
+    });
+    h.run_steps(2);
+    assert_eq!(h.state().w.mosaic().badges().len(), 2);
     // Opened, the pair lists both groups' checks there.
     h.state_mut().w.frame([0, 0, 600, 420]);
     h.run_steps(3);
