@@ -2375,6 +2375,7 @@ fn a_prior_choice_keeps_grouping_off() {
             code: CheckCode::FiltersDifferUngrouped,
             panel: None,
             other: None,
+            group: None,
         });
     });
     // A rule other than FILTER header chosen before grouping was turned off.

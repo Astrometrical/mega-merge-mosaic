@@ -16,13 +16,12 @@
 //! exception to "no file I/O on the UI thread".
 
 use mmm_core::checks::{
-    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, layout_checks,
-    panel_facts,
+    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, is_aligned,
+    layout_checks, panel_facts,
 };
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{Mosaic, MosaicConfig, PanelEntry};
 use mmm_core::overlap::OverlapGraph;
-use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, PREVIEWS_LABEL};
@@ -53,7 +52,7 @@ pub struct CheckCounts {
 /// Run every check over `mosaic` (worker thread: reads panel headers and
 /// the groups' analyses). `groups`: the resolved groups, if known;
 /// otherwise they are resolved here.
-pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>, aligned: bool) -> ChecksReport {
+pub fn run_checks(mosaic: &Mosaic, groups: Option<Groups>, aligned: Option<bool>) -> ChecksReport {
     let cfg = &mosaic.config;
     let mut errors = Vec::new();
     let mut facts = Vec::new();
@@ -186,7 +185,8 @@ impl ChecksEngine {
             self.dirty = false;
             let mosaic = session.mosaic.clone();
             let groups = session.groups.clone();
-            let aligned = matches!(session.frame, Some(ReferenceFrame::Aligned { .. }));
+            // No analysed frame yet: the input mode is unknown, so no distortion verdict.
+            let aligned = session.frame.as_ref().map(|f| is_aligned(Some(f)));
             self.task = Task::spawn("mmm-checks", ctx, move || {
                 run_checks(&mosaic, groups, aligned)
             });
@@ -282,20 +282,18 @@ mod tests {
         // The synthetic panels are registered, unsolved: one note each.
         let report = e.report().unwrap().clone();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        // The synthetic canvases are tiny, so every overlap is thin: six
-        // per group (the layout checks).
-        assert_eq!(report.checks.len(), 8 + 12);
+        assert_eq!(report.checks.len(), 8);
         assert!(
             report
                 .checks
                 .iter()
-                .all(|c| matches!(c.code, CheckCode::SolutionPresent | CheckCode::ThinOverlap))
+                .all(|c| c.code == CheckCode::SolutionPresent)
         );
         let counts = e.counts(&s.mosaic.config).unwrap();
         assert_eq!(
             counts,
             CheckCounts {
-                problems: 12,
+                problems: 0,
                 notes: 8,
                 passed: 0
             }
@@ -310,8 +308,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("group Ha"), "{errors:?}");
         assert!(errors[0].ends_with("Analyse again."), "{errors:?}");
-        // Ha's six thin overlaps are gone with its analysis; OIII keeps its six.
-        assert_eq!(e.counts(&s.mosaic.config).unwrap().problems, 1 + 6);
+        assert_eq!(e.counts(&s.mosaic.config).unwrap().problems, 1);
 
         // Accepting a note saves its keys; it is no longer counted.
         let pick = report.checks[0].clone();

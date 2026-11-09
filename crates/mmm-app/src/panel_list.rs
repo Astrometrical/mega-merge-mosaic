@@ -238,6 +238,7 @@ fn kept_ungrouped(config: &MosaicConfig) -> bool {
         code: CheckCode::FiltersDifferUngrouped,
         panel: None,
         other: None,
+        group: None,
     };
     config.accepted_checks.contains(&note)
         || (!config.grouping.enabled && config.grouping.rule != GroupRule::default())

@@ -81,6 +81,20 @@ pub const EMPTY_AREA_FRACTION: f64 = 0.25;
 /// itself: its neighbours overlap into it.
 pub const HOLE_MIN_PANEL_FRACTION: f64 = 0.25;
 
+/// The overlap's short side, as a fraction of the smaller panel's short
+/// side, below which (and below [`THIN_OVERLAP_PX`]) the overlap counts as
+/// thin ([`CheckCode::ThinOverlap`]). Keeps small or binned panels quiet.
+pub const THIN_OVERLAP_FRACTION: f64 = 0.05;
+
+/// Whether `frame` is a pre-aligned (registered) input frame. No frame yet
+/// is not aligned.
+pub fn is_aligned(frame: Option<&crate::reference::ReferenceFrame>) -> bool {
+    matches!(
+        frame,
+        Some(crate::reference::ReferenceFrame::Aligned { .. })
+    )
+}
+
 /// Where in the mosaic a check applies. Lets the interface put a badge in
 /// the right place and zoom to it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -118,6 +132,11 @@ pub struct CheckKey {
     /// pairs existed, which serialise exactly as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub other: Option<PathBuf>,
+    /// The group, for a group-scoped result that names no panel (a coverage
+    /// hole), so accepting one group's does not accept another's. Absent
+    /// from every older key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// One check result.
@@ -146,21 +165,30 @@ pub struct Check {
 
 impl Check {
     /// The identities of this result: one key for a pair target (an overlap
-    /// or a seam), else one key per panel, or one panel-less key when it
-    /// names no panels.
+    /// or a seam; the pair in path order, so the order the panels were
+    /// found in does not matter), one group key for a group-scoped result
+    /// that names no panels (a coverage hole), else one key per panel, or
+    /// one panel-less key when it names no panels.
     pub fn keys(&self) -> Vec<CheckKey> {
         if let CheckTarget::Overlap(a, b) | CheckTarget::Seam { a, b, .. } = &self.target {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             return vec![CheckKey {
                 code: self.code,
-                panel: Some(a.clone()),
-                other: Some(b.clone()),
+                panel: Some(lo.clone()),
+                other: Some(hi.clone()),
+                group: None,
             }];
         }
         if self.panels.is_empty() {
+            let group = match &self.target {
+                CheckTarget::Group(g) => Some(g.clone()),
+                _ => None,
+            };
             return vec![CheckKey {
                 code: self.code,
                 panel: None,
                 other: None,
+                group,
             }];
         }
         self.panels
@@ -169,6 +197,7 @@ impl Check {
                 code: self.code,
                 panel: Some(p.clone()),
                 other: None,
+                group: None,
             })
             .collect()
     }
@@ -234,14 +263,16 @@ fn median(v: &mut [f64]) -> f64 {
     }
 }
 
-/// Checks over the panels' headers and their grouping. `aligned`: the
-/// panels are pre-aligned (registered) input, which carry no distortion
-/// model by design, so a linear solution passes the distortion check.
+/// Checks over the panels' headers and their grouping. `aligned`: whether
+/// the panels are pre-aligned (registered) input, which carry no distortion
+/// model by design, so a linear solution passes the distortion check;
+/// `None` when that is not known yet (no analysed frame), in which case
+/// there is no distortion verdict at all.
 pub fn input_checks(
     cfg: &MosaicConfig,
     facts: &[PanelFacts],
     groups: &Groups,
-    aligned: bool,
+    aligned: Option<bool>,
 ) -> Vec<Check> {
     let mut out = Vec::new();
     let find = |p: &Path| facts.iter().find(|f| f.path == p);
@@ -273,7 +304,9 @@ pub fn input_checks(
             message: format!("{name} has an astrometric solution."),
             remedy: None,
         });
-        if f.solution == SolutionKind::Linear && aligned {
+        if aligned.is_none() {
+            // Unknown input mode: say nothing about distortion yet.
+        } else if f.solution == SolutionKind::Linear && aligned == Some(true) {
             // Registered panels carry a plain linear solution by design.
             out.push(Check {
                 code: CheckCode::DistortionModel,
@@ -538,6 +571,18 @@ target: CheckTarget::Panel(user_file(m)),                    rect: None,
     out
 }
 
+/// Whether two paths name the same file by spelling: a Windows verbatim
+/// prefix (`\\?\`) is ignored, and on Windows case is too. (No file system
+/// access: the panels may be gone.)
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy();
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    };
+    a == b || norm(a) == norm(b)
+}
+
 /// Area of a `[x0, y0, x1, y1]` rectangle (0 when empty).
 fn rect_area(r: &[u64; 4]) -> u64 {
     r[2].saturating_sub(r[0]) * r[3].saturating_sub(r[1])
@@ -651,7 +696,7 @@ pub fn layout_checks(group: &str, session: &Session, graph: &OverlapGraph) -> Ve
     for (i, a) in metas.iter().enumerate() {
         for b in &metas[i + 1..] {
             let (fa, fb) = (user_file(a), user_file(b));
-            let same_file = fa == fb;
+            let same_file = same_path(&fa, &fb);
             let union = rect_area(&a.bbox) + rect_area(&b.bbox);
             let inter = intersection_area(&a.bbox, &b.bbox);
             let same_sky = union > inter
@@ -712,7 +757,11 @@ pub fn layout_checks(group: &str, session: &Session, graph: &OverlapGraph) -> Ve
         let w = u64::from(e.bbox8[2].saturating_sub(e.bbox8[0]));
         let h = u64::from(e.bbox8[3].saturating_sub(e.bbox8[1]));
         let short = w.min(h) * u64::from(crate::summary::BLOCK);
-        if short >= THIN_OVERLAP_PX {
+        let short_side = |m: &crate::session::PanelMeta| {
+            (m.bbox[2].saturating_sub(m.bbox[0])).min(m.bbox[3].saturating_sub(m.bbox[1]))
+        };
+        let proportionate = THIN_OVERLAP_FRACTION * short_side(a).min(short_side(b)) as f64;
+        if short >= THIN_OVERLAP_PX || short as f64 >= proportionate {
             continue;
         }
         let (fa, fb) = (user_file(a), user_file(b));
@@ -824,7 +873,7 @@ mod tests {
 
     fn run(cfg: &MosaicConfig, paths: &[PathBuf]) -> Vec<Check> {
         let groups = resolve_groups(cfg, &|_| None);
-        input_checks(cfg, &facts_of(paths), &groups, false)
+        input_checks(cfg, &facts_of(paths), &groups, Some(false))
     }
 
     fn of(checks: &[Check], code: CheckCode) -> Vec<&Check> {
@@ -938,7 +987,7 @@ mod tests {
             crate::mosaic::grouping::header_value(&InputPanel::open(p).unwrap(), "FILTER")
         };
         let groups = resolve_groups(&cfg, &header);
-        let checks = input_checks(&cfg, &facts_of(&paths), &groups, false);
+        let checks = input_checks(&cfg, &facts_of(&paths), &groups, Some(false));
         let g = of(&checks, CheckCode::GroupCountMismatch);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].severity, Severity::Note);
@@ -1024,12 +1073,14 @@ mod tests {
             code: CheckCode::MixedChannels,
             panel: Some(a),
             other: None,
+            group: None,
         });
         assert!(!is_accepted(&cfg, &check));
         cfg.accepted_checks.push(CheckKey {
             code: CheckCode::MixedChannels,
             panel: Some(b),
             other: None,
+            group: None,
         });
         assert!(is_accepted(&cfg, &check));
         // Panel-less checks use a single panel-less key.
@@ -1151,7 +1202,7 @@ mod tests {
             &cfg,
             &facts_of(&filters),
             &resolve_groups(&cfg, &header),
-            false,
+            Some(false),
         ));
         cfg.grouping.rule = crate::mosaic::GroupRule::FilenameToken {
             keyword: "zzz".into(),
@@ -1191,7 +1242,7 @@ mod tests {
         let lin = vec![solved_fits(&d, "lin2.fits", 1.0e-3, false)];
         let cfg = MosaicConfig::new(lin.clone());
         let groups = resolve_groups(&cfg, &|_| None);
-        checks.extend(input_checks(&cfg, &facts_of(&lin), &groups, true));
+        checks.extend(input_checks(&cfg, &facts_of(&lin), &groups, Some(true)));
         checks
     }
 
@@ -1268,6 +1319,7 @@ mod tests {
             code: CheckCode::NoOverlap,
             panel: Some(PathBuf::from("a.xisf")),
             other: None,
+            group: None,
         };
         let json = serde_json::to_string(&old).unwrap();
         assert_eq!(json, r#"{"code":"no_overlap","panel":"a.xisf"}"#);
@@ -1334,7 +1386,7 @@ mod tests {
     /// One overlap 8 cells (64 px) wide.
     fn thin_graph() -> OverlapGraph {
         OverlapGraph {
-            edges: vec![edge_at(0, 1, [48, 0, 56, 50])],
+            edges: vec![edge_at(0, 1, [48, 0, 50, 50])],
         }
     }
 
@@ -1403,7 +1455,7 @@ mod tests {
         let cfg = MosaicConfig::new(vec![p.clone()]);
         let groups = resolve_groups(&cfg, &|_| None);
         let facts = facts_of(std::slice::from_ref(&p));
-        let checks = input_checks(&cfg, &facts, &groups, true);
+        let checks = input_checks(&cfg, &facts, &groups, Some(true));
         let c = of(&checks, CheckCode::DistortionModel);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].severity, Severity::Passed);
@@ -1412,7 +1464,7 @@ mod tests {
             "No distortion model: accepted for pre-aligned panels"
         );
         // Solved input still has the problem.
-        let checks = input_checks(&cfg, &facts, &groups, false);
+        let checks = input_checks(&cfg, &facts, &groups, Some(false));
         assert_eq!(
             of(&checks, CheckCode::DistortionModel)[0].severity,
             Severity::Problem
@@ -1443,8 +1495,8 @@ mod tests {
         ]);
         let g = OverlapGraph {
             edges: vec![
-                edge_at(0, 1, [48, 0, 56, 50]),
-                edge_at(0, 2, [0, 48, 50, 56]),
+                edge_at(0, 1, [48, 0, 50, 50]),
+                edge_at(0, 2, [0, 48, 50, 50]),
             ],
         };
         let checks = layout_checks("Ha", &s, &g);
@@ -1471,7 +1523,7 @@ mod tests {
         );
         assert_eq!(
             t[0].message,
-            "p0.xisf and p1.xisf overlap by only 64 px: too thin to match them reliably."
+            "p0.xisf and p1.xisf overlap by only 16 px: too thin to match them reliably."
         );
         // 16 cells x 8 = 128 px is not thin.
         let wide = OverlapGraph {
@@ -1553,6 +1605,168 @@ mod tests {
         assert_eq!(n(&s), 0);
         s.panels[0].nonzero_frac *= 0.875;
         assert_eq!(n(&s), 1);
+    }
+
+    #[test]
+    fn thin_overlap_is_proportionate_to_the_panels() {
+        let two = |w: u32| {
+            let s = canvas_session(vec![
+                boxed(0, [0, 0, 1000, 1000]),
+                boxed(1, [0, 0, 1000, 1000]),
+            ]);
+            let g = OverlapGraph {
+                edges: vec![edge_at(0, 1, [0, 0, w, 100])],
+            };
+            of(&layout_checks("Ha", &s, &g), CheckCode::ThinOverlap).len()
+        };
+        // 1000 px panels: 5% is 50 px. 48 px is thin, 56 px is not.
+        assert_eq!(two(6), 1);
+        assert_eq!(two(7), 0);
+        // Small panels: 64 px is under 128 but over 5% of 200 px.
+        let s = canvas_session(vec![
+            boxed(0, [0, 0, 200, 200]),
+            boxed(1, [136, 0, 336, 200]),
+        ]);
+        let g = OverlapGraph {
+            edges: vec![edge_at(0, 1, [17, 0, 25, 25])],
+        };
+        assert!(of(&layout_checks("Ha", &s, &g), CheckCode::ThinOverlap).is_empty());
+    }
+
+    #[test]
+    fn is_aligned_reads_the_frame() {
+        use crate::reference::ReferenceFrame;
+        let aligned = ReferenceFrame::Aligned {
+            width: 10,
+            height: 10,
+            wcs: None,
+        };
+        assert!(is_aligned(Some(&aligned)));
+        assert!(!is_aligned(None));
+    }
+
+    #[test]
+    fn aligned_and_unknown_modes_for_distortion() {
+        let d = tmp("modes");
+        let lin = solved_fits(&d, "lin.fits", 1e-3, false);
+        let raw = d.join("raw.xisf");
+        write_xisf(&raw, 16, 12, 1, &planes(1)).unwrap();
+        let paths = vec![lin, raw];
+        let cfg = MosaicConfig::new(paths.clone());
+        let groups = resolve_groups(&cfg, &|_| None);
+        let facts = facts_of(&paths);
+        // Aligned: an unsolved panel is still a Note, and has no distortion check.
+        let checks = input_checks(&cfg, &facts, &groups, Some(true));
+        let sol = of(&checks, CheckCode::SolutionPresent);
+        assert_eq!(
+            sol.iter().filter(|c| c.severity == Severity::Note).count(),
+            1
+        );
+        assert_eq!(of(&checks, CheckCode::DistortionModel).len(), 1);
+        // Unknown (no frame yet): no distortion verdict at all.
+        let checks = input_checks(&cfg, &facts, &groups, None);
+        assert!(of(&checks, CheckCode::DistortionModel).is_empty());
+        assert_eq!(of(&checks, CheckCode::SolutionPresent).len(), 2);
+    }
+
+    #[test]
+    fn pair_keys_ignore_order() {
+        let (a, b) = (PathBuf::from("/in/a.xisf"), PathBuf::from("/in/b.xisf"));
+        let mk = |x: &PathBuf, y: &PathBuf| Check {
+            code: CheckCode::ThinOverlap,
+            severity: Severity::Problem,
+            panels: vec![x.clone(), y.clone()],
+            groups: vec![],
+            message: String::new(),
+            remedy: None,
+            target: CheckTarget::Overlap(x.clone(), y.clone()),
+            rect: None,
+        };
+        assert_eq!(mk(&a, &b).keys(), mk(&b, &a).keys());
+        let mut cfg = MosaicConfig::new(vec![]);
+        cfg.accepted_checks.extend(mk(&a, &b).keys());
+        assert!(is_accepted(&cfg, &mk(&b, &a)));
+    }
+
+    #[test]
+    fn hole_keys_carry_their_group() {
+        let checks = layout_checks("Ha", &ring_session(), &no_edges());
+        let ha = of(&checks, CheckCode::CoverageHole)[0].clone();
+        assert_eq!(ha.keys()[0].group.as_deref(), Some("Ha"));
+        let other = Check {
+            target: CheckTarget::Group("OIII".into()),
+            groups: vec!["OIII".into()],
+            ..ha.clone()
+        };
+        let mut cfg = MosaicConfig::new(vec![]);
+        cfg.accepted_checks.extend(ha.keys());
+        assert!(is_accepted(&cfg, &ha));
+        assert!(!is_accepted(&cfg, &other));
+        // Keys of the older codes carry no group.
+        let s = session(vec![meta(0, 0.1), meta(1, 0.1), meta(2, 0.1)]);
+        let g = OverlapGraph {
+            edges: vec![edge(0, 1)],
+        };
+        let n = analysis_checks("Ha", &s, &g);
+        assert_eq!(of(&n, CheckCode::NoOverlap)[0].keys()[0].group, None);
+    }
+
+    #[test]
+    fn the_same_file_is_found_through_path_spelling() {
+        let mut twice = boxed(1, [500, 500, 600, 600]);
+        twice.source = Some(PathBuf::from(r"\\?\C:\In\P0.xisf"));
+        let mut first = boxed(0, [0, 0, 100, 100]);
+        first.source = Some(PathBuf::from(r"C:\in\p0.xisf"));
+        let s = canvas_session(vec![first, twice]);
+        let checks = layout_checks("Ha", &s, &no_edges());
+        let d = of(&checks, CheckCode::DuplicatePanels);
+        if cfg!(windows) {
+            assert_eq!(d.len(), 1);
+        } else {
+            // Case matters elsewhere, but the verbatim prefix never does.
+            assert!(d.is_empty());
+        }
+        let mut a = boxed(0, [0, 0, 100, 100]);
+        a.source = Some(PathBuf::from("/in/x.xisf"));
+        let mut b = boxed(1, [500, 500, 600, 600]);
+        b.source = Some(PathBuf::from("/in/x.xisf"));
+        let s = canvas_session(vec![a, b]);
+        assert_eq!(
+            of(
+                &layout_checks("Ha", &s, &no_edges()),
+                CheckCode::DuplicatePanels
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn coverage_holes_need_enough_panels_and_a_real_gap() {
+        assert!(layout_checks("Ha", &canvas_session(vec![]), &no_edges()).is_empty());
+        let one = canvas_session(vec![boxed(0, [0, 0, 400, 400])]);
+        assert!(
+            of(
+                &layout_checks("Ha", &one, &no_edges()),
+                CheckCode::CoverageHole
+            )
+            .is_empty()
+        );
+        // Exactly touching bboxes leave no gap.
+        let touching = canvas_session(vec![
+            boxed(0, [0, 0, 400, 300]),
+            boxed(1, [400, 0, 800, 500]),
+            boxed(2, [200, 500, 800, 800]),
+            boxed(3, [0, 300, 200, 800]),
+            boxed(4, [200, 300, 400, 500]),
+        ]);
+        assert!(
+            of(
+                &layout_checks("Ha", &touching, &no_edges()),
+                CheckCode::CoverageHole
+            )
+            .is_empty()
+        );
     }
 
     #[test]

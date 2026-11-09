@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use mmm_core::checks::{
-    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, layout_checks,
-    panel_facts,
+    Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, is_aligned,
+    layout_checks, panel_facts,
 };
 use mmm_core::export::{ExportFormat, export_group};
 use mmm_core::job::{CancelToken, JobCtl};
@@ -412,11 +412,11 @@ pub(crate) fn check(a: &CheckArgs) -> anyhow::Result<()> {
             Err(_) => {}
         }
     }
-    // Registered (pre-aligned) input has no distortion model by design.
-    let aligned = matches!(
-        mmm_core::reference::ReferenceFrame::load(&m.dir.join(FRAME_FILE)),
-        Ok(mmm_core::reference::ReferenceFrame::Aligned { .. })
-    );
+    // Registered (pre-aligned) input has no distortion model by design. The
+    // CLI always gives a verdict: with no analysed frame the input is
+    // taken as solved.
+    let frame = mmm_core::reference::ReferenceFrame::load(&m.dir.join(FRAME_FILE)).ok();
+    let aligned = Some(is_aligned(frame.as_ref()));
     let mut checks = input_checks(&m.config, &facts, &groups, aligned);
     checks.extend(file_checks(&m.config));
     let mut unreadable = Vec::new();
