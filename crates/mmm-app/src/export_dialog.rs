@@ -1173,6 +1173,10 @@ mod tests {
             ]
         );
         assert_eq!(names("{session}", "aux", &["Ha"], "fits"), ["aux_.fits"]);
+        assert_eq!(
+            names("{name}", "m", &["COM0", "conin$.x", "LPT²"], "fits"),
+            ["COM0_.fits", "conin$_.x.fits", "LPT²_.fits"]
+        );
         // Never empty.
         assert_eq!(names("", "m", &["Ha"], "fits"), ["export.fits"]);
         assert_eq!(
