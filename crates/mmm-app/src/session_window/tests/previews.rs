@@ -11,6 +11,8 @@ use super::*;
 use crate::blend_settings::draft_for;
 use crate::previews::tests::Gate;
 use crate::previews::{Logged, PreviewKey};
+use crate::tile_source::{Mix, planar_image};
+use mmm_core::stretch::StretchParams;
 
 /// "Core" (id 7) and "Halo" (id 9): both in the first 256 × 256 tile of
 /// the 600 × 420 synthetic canvas.
@@ -684,5 +686,164 @@ fn previews_run_on_the_plan_and_wait_while_its_frame_differs() {
     // The frames agree again: Core, now in view, merges.
     h.state_mut().session.frame = analysed;
     step_to(&mut h, |st| delivered(st, 7, "Ha") == 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- Drawing the patches (plan 4 task 6) ----
+
+/// What converting `group`'s cached patch of `roi` through `stretch` gives.
+fn converted(st: &State, roi: u64, group: &str, stretch: &[StretchParams]) -> egui::ColorImage {
+    let (_, p) = st.w.previews.patch(roi, group).expect("a patch");
+    let n = (p.width * p.height) as usize;
+    planar_image(
+        &p.data,
+        n,
+        p.width as usize,
+        (p.width as usize, p.height as usize),
+        p.channels as usize,
+        stretch,
+    )
+}
+
+/// ROI `roi` is drawn with its group's patch through the stretch the canvas
+/// has now (the mosaic's member stretch, or the plan's).
+fn drawn_with_canvas_stretch(st: &State, roi: u64, group: &str) -> bool {
+    let stretch = match st.w.mode() {
+        CanvasMode::Mosaic => st.w.mosaic().member_stretch(group),
+        CanvasMode::Plan => st.w.plan().stretch_for_view().map(<[_]>::to_vec),
+    };
+    let (Some(stretch), Some(image)) = (stretch, st.w.preview_image(roi)) else {
+        return false;
+    };
+    *image == converted(st, roi, group, &stretch)
+}
+
+/// The mosaic's HOO mix of Ha (red) and OIII (green, blue) patches of `roi`
+/// through their members' stretches; `None` for a member left out.
+fn hoo_mix(st: &State, roi: u64, ha: bool, oiii: bool) -> egui::ColorImage {
+    let mut mix = Mix::new([256, 256]);
+    for (on, group, tint) in [(ha, "Ha", [1.0, 0.0, 0.0]), (oiii, "OIII", [0.0, 1.0, 1.0])] {
+        if on {
+            let stretch = st.w.mosaic().member_stretch(group).expect("a stretch");
+            mix.add(&converted(st, roi, group, &stretch), tint);
+        }
+    }
+    mix.image()
+}
+
+#[test]
+fn a_preview_draws_over_the_mosaic_with_its_stretch() {
+    let (root, mut h, gate) = shown("draw-mosaic", &[CORE], |_| {});
+    // Nothing to draw before a patch exists.
+    h.run_steps(3);
+    assert!(h.state().w.preview_image(7).is_none());
+    gate.open();
+    step_to(&mut h, |st| drawn_with_canvas_stretch(st, 7, "Ha"));
+    // Over the aligned rect it was blended on, clipped to the ROI.
+    let st = h.state();
+    let patches = st.w.shown_patches().last();
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].rect, [0.0, 0.0, 256.0, 256.0]);
+    assert_eq!(patches[0].clip, CORE.2.map(|v| v as f64));
+    let image = st.w.preview_image(7).unwrap();
+    assert_eq!(image.size, [256, 256]);
+    assert!(image.pixels.iter().any(|p| p.a() > 0), "some data");
+    // The canvas stretch changes (Strong): the patch is converted again with
+    // the new one, and the stretch is the canvas's own.
+    let before = h.state().w.mosaic().member_stretch("Ha").unwrap();
+    let converted_before = h.state().w.shown_patches().conversions(7);
+    h.key_press(egui::Key::S);
+    step_to(&mut h, |st| {
+        st.w.mosaic().member_stretch("Ha").as_ref() != Some(&before)
+            && drawn_with_canvas_stretch(st, 7, "Ha")
+    });
+    assert!(h.state().w.shown_patches().conversions(7) > converted_before);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_preview_draws_over_the_plan() {
+    let (root, mut h, gate) = shown_on("draw-plan", &[CORE], CanvasMode::Plan, |st| {
+        st.run_pipeline = true
+    });
+    gate.open();
+    step_to(&mut h, |st| drawn_with_canvas_stretch(st, 7, "Ha"));
+    let patches = h.state().w.shown_patches().last();
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].rect, [0.0, 0.0, 256.0, 256.0]);
+    assert_eq!(patches[0].clip, CORE.2.map(|v| v as f64));
+    // Nothing is drawn while the plan draws in another frame.
+    let analysed = h.state().session.frame.clone();
+    h.state_mut().session.frame = Some(mmm_core::reference::ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.run_steps(3);
+    assert!(h.state().w.shown_patches().last().is_empty());
+    h.state_mut().session.frame = analysed;
+    step_to(&mut h, |st| st.w.shown_patches().last().len() == 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_composite_preview_mixes_its_members() {
+    let (root, mut h, gate) = shown("draw-composite", &[CORE], show_hoo);
+    // Ha's patch first: it alone is drawn, in red.
+    step_to(&mut h, |st| started(st).len() == 1);
+    let gate = release(&mut h, gate);
+    step_to(&mut h, |st| {
+        st.w.preview_image(7)
+            .is_some_and(|i| *i == hoo_mix(st, 7, true, false))
+    });
+    // Then OIII's joins it, in green and blue.
+    gate.open();
+    step_to(&mut h, |st| delivered(st, 7, "OIII") == 1);
+    step_to(&mut h, |st| {
+        st.w.preview_image(7)
+            .is_some_and(|i| *i == hoo_mix(st, 7, true, true))
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_rois_toggle_hides_previews() {
+    let (root, mut h, gate) = shown("draw-toggle", &[CORE], |_| {});
+    gate.open();
+    step_to(&mut h, |st| drawn_with_canvas_stretch(st, 7, "Ha"));
+    assert_eq!(h.state().w.shown_patches().last().len(), 1);
+    h.key_press(egui::Key::R);
+    h.run_steps(3);
+    assert!(h.state().w.shown_patches().last().is_empty());
+    assert!(h.state().w.preview_image(7).is_none());
+    h.key_press(egui::Key::R);
+    step_to(&mut h, |st| drawn_with_canvas_stretch(st, 7, "Ha"));
+    assert_eq!(h.state().w.shown_patches().last().len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn previews_never_change_the_stretch() {
+    let (root, mut h, gate) = shown_on("draw-stretch", &[CORE], CanvasMode::Plan, |st| {
+        st.run_pipeline = true
+    });
+    step_to(&mut h, |st| {
+        started(st).len() == 1 && st.w.plan().stretch_for_view().is_some()
+    });
+    let plan = h.state().w.plan().stretch_for_view().unwrap().to_vec();
+    gate.open();
+    step_to(&mut h, |st| drawn_with_canvas_stretch(st, 7, "Ha"));
+    h.run_steps(5);
+    assert_eq!(h.state().w.plan().stretch_for_view(), Some(plan.as_slice()));
+    // The same on the mosaic.
+    h.state_mut().w.set_mode(CanvasMode::Mosaic);
+    step_to(&mut h, |st| {
+        st.w.mosaic().member_stretch("Ha").is_some() && drawn_with_canvas_stretch(st, 7, "Ha")
+    });
+    let mosaic = h.state().w.mosaic().member_stretch("Ha").unwrap();
+    h.run_steps(5);
+    assert_eq!(h.state().w.mosaic().member_stretch("Ha"), Some(mosaic));
+    let image = h.state().w.preview_image(7).unwrap();
+    assert!(image.pixels.iter().any(|p| p.a() > 0));
     let _ = std::fs::remove_dir_all(&root);
 }

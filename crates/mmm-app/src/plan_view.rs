@@ -668,6 +668,8 @@ pub struct PlanView {
     highlight: Option<PathBuf>,
     /// What the window has drawn over the plan (the ROIs).
     overlays: Vec<Overlay>,
+    /// Image patches (ROI previews) drawn over the canvas.
+    patches: Vec<mega_ui::canvas_layers::Patch>,
     /// A rectangle just drawn, with the canvas it is on: see
     /// [`PlanView::take_drawn`].
     drawn: Option<([f64; 4], (u64, u64))>,
@@ -746,6 +748,7 @@ impl PlanView {
             hovered: None,
             highlight: None,
             overlays: Vec::new(),
+            patches: Vec::new(),
             drawn: None,
             held_camera: None,
             textures_for: None,
@@ -791,6 +794,12 @@ impl PlanView {
     /// on: the ROIs, when the look has them.
     pub fn set_overlays(&mut self, overlays: Vec<Overlay>) {
         self.overlays = overlays;
+    }
+
+    /// Draw these image patches (ROI previews) over the panels from the next
+    /// frame on, under the overlays.
+    pub fn set_patches(&mut self, patches: Vec<mega_ui::canvas_layers::Patch>) {
+        self.patches = patches;
     }
 
     /// Arm (or disarm) the draw tool: the next drag draws a rectangle
@@ -1027,6 +1036,7 @@ impl PlanView {
             held.drawn = false;
         }
         self.canvas.set_overlays(self.overlays.clone());
+        self.canvas.set_patches(self.patches.clone());
         let r = self
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);

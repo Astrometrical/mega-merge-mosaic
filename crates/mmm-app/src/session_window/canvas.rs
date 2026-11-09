@@ -35,8 +35,11 @@ use crate::mosaic_view::{CanvasTag, view_members};
 use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{PlanFeed, group_members};
+use crate::preview_draw::LayerSpec;
 use crate::session::OpenSession;
+use crate::tile_source::channel_tints;
 use crate::util::group_names;
+use mmm_core::stretch::StretchParams;
 
 /// Why **Mosaic** cannot be chosen before anything is merged.
 const NOTHING_MERGED: &str = "Nothing merged yet";
@@ -334,6 +337,113 @@ impl SessionWindow {
         one_row_width(ui, &widths) + space::S
     }
 
+    /// The layers each visible ROI's patch is drawn from on the canvas shown
+    /// (see `preview_draw`): per ROI in view, its id, canvas rect and one
+    /// layer per group of the view that has a patch, converted with the
+    /// stretch of the canvas beneath (read only). Nothing while the ROIs are
+    /// hidden, the plan draws in another frame than the analysed one, the
+    /// canvas has not been drawn, or the canvas has no stretch yet.
+    fn preview_wants(&self, session: &OpenSession) -> Vec<(u64, [f64; 4], Vec<LayerSpec>)> {
+        let plan = self.mode() == CanvasMode::Plan;
+        if !self.look.rois || (plan && !self.plan.frame_matches(session)) {
+            return Vec::new();
+        }
+        let Some((view, _)) = self.visible_canvas() else {
+            return Vec::new();
+        };
+        let Some(kind) = &self.view else {
+            return Vec::new();
+        };
+        // Per layer: the group, its tint, whether it shows as the channel
+        // mean, and the canvas's stretch for it.
+        let mut recipe: Vec<(String, [f32; 3], bool, Vec<StretchParams>)> = Vec::new();
+        match kind {
+            ViewKind::Group(g) => {
+                let stretch = if plan {
+                    let same = self.plan.view_key().map(str::to_string)
+                        == self.view_key(&session.mosaic.config.ui);
+                    self.plan
+                        .stretch_for_view()
+                        .filter(|_| same)
+                        .map(<[_]>::to_vec)
+                } else {
+                    self.mosaic.member_stretch(g)
+                };
+                if let Some(s) = stretch {
+                    recipe.push((g.clone(), [1.0; 3], false, s));
+                }
+            }
+            ViewKind::Composition(i) => {
+                let Some(c) = compositions_of(session).get(*i).cloned() else {
+                    return Vec::new();
+                };
+                if plan {
+                    // The plan stretches each composition channel (its group's
+                    // channel mean) on its own.
+                    let same = self.plan.view_key().map(str::to_string)
+                        == self.view_key(&session.mosaic.config.ui);
+                    let Some(stretch) = self.plan.stretch_for_view().filter(|_| same) else {
+                        return Vec::new();
+                    };
+                    for (slot, ch) in c.channels.iter().enumerate().take(3) {
+                        let mut only = vec![None, None, None];
+                        only[slot] = ch.clone();
+                        for (g, tint) in channel_tints(&only, |a, b| a == b) {
+                            if let Some(s) = stretch.get(slot) {
+                                recipe.push((g, tint, true, vec![*s]));
+                            }
+                        }
+                    }
+                } else {
+                    for (g, tint) in channel_tints(&c.channels, |a, b| a == b) {
+                        if let Some(s) = self.mosaic.member_stretch(&g) {
+                            recipe.push((g, tint, false, s));
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for roi in self.mosaic.rois() {
+            let r = roi.canvas.map(|v| v as f64);
+            if r[0] >= view[2] || r[2] <= view[0] || r[1] >= view[3] || r[3] <= view[1] {
+                continue;
+            }
+            let layers = recipe
+                .iter()
+                .filter_map(|(g, tint, mono, stretch)| {
+                    let (_, patch) = self.previews.patch(roi.id, g)?;
+                    Some(LayerSpec {
+                        patch,
+                        stretch: stretch.clone(),
+                        tint: *tint,
+                        mono: *mono,
+                    })
+                })
+                .collect();
+            out.push((roi.id, r, layers));
+        }
+        out
+    }
+
+    /// Hand the canvas shown the patches of its visible ROIs; the other
+    /// canvas drops its textures.
+    fn give_patches(&mut self, ctx: &egui::Context, session: &OpenSession) {
+        let wants = self.preview_wants(session);
+        match self.mode() {
+            CanvasMode::Plan => {
+                self.mosaic_patches.patches(ctx, Vec::new());
+                let patches = self.plan_patches.patches(ctx, wants);
+                self.plan.set_patches(patches);
+            }
+            CanvasMode::Mosaic => {
+                self.plan_patches.patches(ctx, Vec::new());
+                let patches = self.mosaic_patches.patches(ctx, wants);
+                self.mosaic.set_patches(patches);
+            }
+        }
+    }
+
     /// The canvas filling the rest of `ui`: the plan or the mosaic.
     pub(super) fn canvas_ui(
         &mut self,
@@ -344,6 +454,7 @@ impl SessionWindow {
         checks: &ChecksEngine,
     ) {
         self.look.stretch = DisplayStretch::load(&session.mosaic.config.ui);
+        self.give_patches(ui.ctx(), session);
         match self.mode() {
             CanvasMode::Plan => {
                 let feed = PlanFeed {

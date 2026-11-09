@@ -306,6 +306,8 @@ pub struct MosaicView {
     export: ExportDialog,
     /// The merge settings panel.
     settings: SettingsPanel,
+    /// The ROIs' preview patches the viewer draws ([`MosaicView::set_patches`]).
+    patches: Vec<mega_ui::canvas_layers::Patch>,
     /// The tag over the image (why the shown groups are out of date, or
     /// that their settings changed), set by the window each frame.
     tag: Option<CanvasTag>,
@@ -350,6 +352,7 @@ impl MosaicView {
             shown: false,
             rois: RoiPanel::default(),
             export: ExportDialog::new(Arc::new(RfdSavePicker)),
+            patches: Vec::new(),
             tag: None,
             reveal_settings: false,
             settings: SettingsPanel::new(),
@@ -858,6 +861,18 @@ impl MosaicView {
         self.rois.selected
     }
 
+    /// The stretch `group`'s result is drawn with (one entry per channel),
+    /// once it is open: what a preview patch of the group is converted with.
+    pub fn member_stretch(&self, group: &str) -> Option<Vec<StretchParams>> {
+        Some(self.results.get(group)?.source.as_ref()?.stretch())
+    }
+
+    /// The image patches (ROI previews) to draw over the viewer from the
+    /// next frame on.
+    pub fn set_patches(&mut self, patches: Vec<mega_ui::canvas_layers::Patch>) {
+        self.patches = patches;
+    }
+
     /// The ROIs as canvas overlays (the window gives them to the plan too).
     pub fn roi_overlays(&self) -> Vec<mega_ui::canvas_layers::Overlay> {
         self.rois.overlays()
@@ -1030,6 +1045,7 @@ impl MosaicView {
                     viewer.set_camera(size, c.centre, c.zoom);
                 }
                 viewer.set_overlays(overlays);
+                viewer.set_patches(self.patches.clone());
                 drawn = viewer.show(ui).drawn_rect;
                 // A composition shows its merged groups; the others are
                 // named over the image, which keeps the plan's place.

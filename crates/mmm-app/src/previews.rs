@@ -377,13 +377,6 @@ impl Previews {
     /// The patch of ROI `roi` and `group`, with what it was made from (up
     /// to date or not), for drawing: it counts as drawn now (the cache drops
     /// the least recently drawn first).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the canvases draw the patches from plan 4 task 6 on"
-        )
-    )]
     pub fn patch(&self, roi: u64, group: &str) -> Option<(&PreviewKey, Arc<PreviewPatch>)> {
         let e = self.cache.get(&(roi, group.to_string()))?;
         e.drawn.set(self.tick());

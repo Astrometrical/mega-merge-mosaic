@@ -110,6 +110,7 @@ use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView, group_members};
+use crate::preview_draw::PatchTextures;
 use crate::previews::{PreviewKey, Previews, Wanted};
 use crate::rois::Roi;
 use crate::session::OpenSession;
@@ -209,6 +210,9 @@ pub struct SessionWindow {
     settings_revealed: bool,
     /// The ROIs' transient previews.
     previews: Previews,
+    /// The textures of the ROIs' patches on the mosaic and on the plan.
+    mosaic_patches: PatchTextures,
+    plan_patches: PatchTextures,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -250,6 +254,8 @@ impl SessionWindow {
             was_typing: false,
             settings_revealed: false,
             previews: Previews::new(),
+            mosaic_patches: PatchTextures::default(),
+            plan_patches: PatchTextures::default(),
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -387,6 +393,21 @@ impl SessionWindow {
     /// The merged mosaic canvas.
     pub fn mosaic(&self) -> &MosaicView {
         &self.mosaic
+    }
+
+    /// The patch textures of the canvas shown.
+    #[cfg(test)]
+    fn shown_patches(&self) -> &PatchTextures {
+        match self.mode() {
+            CanvasMode::Plan => &self.plan_patches,
+            CanvasMode::Mosaic => &self.mosaic_patches,
+        }
+    }
+
+    /// The image ROI `roi`'s patch was converted to on the canvas shown.
+    #[cfg(test)]
+    fn preview_image(&self, roi: u64) -> Option<Arc<egui::ColorImage>> {
+        self.shown_patches().image(roi)
     }
 
     /// React to a job event (from [`JobRunner::poll`]): the mosaic follows
