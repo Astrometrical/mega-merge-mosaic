@@ -29,7 +29,10 @@
 //! three-channel file: per tile row it reads each distinct mapped group
 //! once and builds the R, G and B planes (a mono group's channel, the mean
 //! of an OSC group's channels, or zeros), so memory stays at a few tile
-//! rows of the width.
+//! rows of the width. Its pass-through cards are the first mapped group's,
+//! less those naming a single panel's band (`FILTER`, and the header key
+//! the groups are made by): an HOO file is not `FILTER = 'Ha'`. Its
+//! `HISTORY` says which group each channel holds.
 //!
 //! Output is written to `<name>.part` beside the destination and renamed
 //! over it only when complete: a failed or cancelled export removes its
@@ -56,7 +59,7 @@ use mpp_core::formats::tiff_write::{Container, TiffWriteOptions, write_tiff_nati
 use crate::error::{Error, Result};
 use crate::formats::FitsKeyword;
 use crate::job::{CancelToken, JobCtl};
-use crate::mosaic::Mosaic;
+use crate::mosaic::{GroupRule, Mosaic};
 use crate::output::fits::{FitsSink, WcsPlacement, session_keywords};
 use crate::session::Session;
 use crate::tiles::{TileGeometry, TileReader, TileState};
@@ -260,7 +263,11 @@ pub fn export_group_with(
         .collect();
     let tiles = TileRows::new(vec![&reader], planes);
     let to = Destination { out, on_existing };
-    run_export(&to, format, tiles, &group_session, &history, ctl)
+    let cards = PassThrough {
+        session: &group_session,
+        drop: Vec::new(),
+    };
+    run_export(&to, format, tiles, &cards, &history, ctl)
 }
 
 /// The three channels of a composite to export: each is the name of a
@@ -285,7 +292,9 @@ pub struct CompositeChannels<'a> {
 /// opens two results. A mono group fills its plane with its channel; a
 /// three-channel (OSC) group with the mean of its channels; an unmapped
 /// plane is zeros. The WCS and pass-through header cards come from the first
-/// mapped group. The returned counts are summed over the groups.
+/// mapped group, without `FILTER` or the grouping rule's header key (each
+/// names one panel's band, not the composite's). The returned counts are
+/// summed over the groups.
 ///
 /// Fails, writing nothing, for a composite that maps no group, a group
 /// never analysed or merged, a result no longer matching its analysed
@@ -387,7 +396,32 @@ pub fn export_composite_with(
     );
     let tiles = TileRows::new(readers.iter().collect(), planes);
     let to = Destination { out, on_existing };
-    run_export(&to, format, tiles, &sessions[0], &history, ctl)
+    let cards = PassThrough {
+        session: &sessions[0],
+        drop: band_cards(&m),
+    };
+    run_export(&to, format, tiles, &cards, &history, ctl)
+}
+
+/// The pass-through cards that name a single panel's band, which a
+/// composite's file must not claim: `FILTER`, and the header key the groups
+/// are made by when the grouping rule reads one.
+fn band_cards(m: &Mosaic) -> Vec<String> {
+    let mut names = vec!["FILTER".to_string()];
+    if let GroupRule::Header { key } = &m.config.grouping.rule
+        && !key.trim().eq_ignore_ascii_case("FILTER")
+    {
+        names.push(key.trim().to_string());
+    }
+    names
+}
+
+/// Where an export's pass-through and WCS cards come from: a group's
+/// session (its reference panel's cards, its frame's WCS), less the cards
+/// named in `drop` (any case).
+struct PassThrough<'a> {
+    session: &'a Session,
+    drop: Vec<String>,
 }
 
 /// Where an export goes, and what it does with a file already there.
@@ -432,12 +466,12 @@ impl Destination<'_> {
 
 /// Write the planes of `tiles` to `to` through `<out>.part` (see the
 /// module docs and [`OnExisting`]); the WCS and pass-through cards come
-/// from `wcs_session`.
+/// from `cards`.
 fn run_export(
     to: &Destination,
     format: ExportFormat,
     tiles: TileRows,
-    wcs_session: &Session,
+    cards: &PassThrough,
     history: &[String],
     ctl: &JobCtl,
 ) -> Result<ExportReport> {
@@ -454,7 +488,13 @@ fn run_export(
                 height: g.height,
                 flipped: false,
             };
-            let (mut keywords, _) = session_keywords(wcs_session, (0, 0), Some(place))?;
+            let (mut keywords, _) = session_keywords(cards.session, (0, 0), Some(place))?;
+            keywords.retain(|k| {
+                !cards
+                    .drop
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(k.name.trim()))
+            });
             keywords.extend(history.iter().map(|h| FitsKeyword {
                 name: "HISTORY".into(),
                 value: h.clone(),

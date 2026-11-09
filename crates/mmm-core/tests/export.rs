@@ -11,8 +11,8 @@ use mmm_core::export::{
     CompositeChannels, ExportFormat, ExportReport, OnExisting, export_check, export_composite,
     export_composite_with, export_group, export_group_with,
 };
-use mmm_core::formats::InputPanel;
 use mmm_core::formats::fits::FitsPanel;
+use mmm_core::formats::{FitsKeyword, InputPanel};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
     GroupRule, Grouping, Mosaic, MosaicConfig, SINGLE_GROUP, analyze_all, blend_group,
@@ -22,7 +22,9 @@ use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
 use mmm_core::settings::BlendSettings;
 use mmm_core::surfaces::Surfaces;
-use mmm_core::synth::{SynthSpec, SynthWcs, generate, write_xisf_solved};
+use mmm_core::synth::{
+    SynthSpec, SynthWcs, generate, solved_fits_cards, write_fits, write_xisf_solved,
+};
 use mmm_core::tiles::{TILE, TileGeometry, TileStore};
 
 const CANVAS: (u64, u64) = (600, 420);
@@ -453,6 +455,13 @@ fn export_of_unblended_group_says_so() {
 /// A grouped mosaic of 2×2 aligned, solved panels per `(name, channels,
 /// seed)` group (assigned by hand), analysed and every group merged.
 fn grouped_mosaic(root: &Path, groups: &[(&str, u64, u64)]) -> Mosaic {
+    grouped_mosaic_of(root, groups, false)
+}
+
+/// [`grouped_mosaic`]; when `banded`, its panels are FITS files whose
+/// headers name their group's band twice, `FILTER` and `BAND` (the grouping
+/// rule's key), beside a session-level `OBJECT`.
+fn grouped_mosaic_of(root: &Path, groups: &[(&str, u64, u64)], banded: bool) -> Mosaic {
     let mut paths = Vec::new();
     let mut names = Vec::new();
     for &(name, ch, seed) in groups {
@@ -487,8 +496,26 @@ fn grouped_mosaic(root: &Path, groups: &[(&str, u64, u64)]) -> Mosaic {
                 .iter()
                 .map(|b| f32::from_le_bytes(*b))
                 .collect();
-            let path = out.join(format!("{name}_{i}.xisf"));
-            write_xisf_solved(&path, CANVAS.0, CANVAS.1, ch, &planes, &canvas_wcs()).unwrap();
+            let path = if banded {
+                let card = |key: &str, value: &str| FitsKeyword {
+                    name: key.into(),
+                    value: format!("'{value}'"),
+                    comment: String::new(),
+                };
+                let mut cards = solved_fits_cards(&canvas_wcs(), CANVAS.1, None);
+                cards.extend([
+                    card("OBJECT", "M42"),
+                    card("FILTER", name),
+                    card("BAND", name),
+                ]);
+                let path = out.join(format!("{name}_{i}.fits"));
+                write_fits(&path, CANVAS.0, CANVAS.1, ch, &planes, -32, &cards).unwrap();
+                path
+            } else {
+                let path = out.join(format!("{name}_{i}.xisf"));
+                write_xisf_solved(&path, CANVAS.0, CANVAS.1, ch, &planes, &canvas_wcs()).unwrap();
+                path
+            };
             paths.push(path);
             names.push(name.to_string());
         }
@@ -496,7 +523,11 @@ fn grouped_mosaic(root: &Path, groups: &[(&str, u64, u64)]) -> Mosaic {
     let mut cfg = MosaicConfig::new(paths);
     cfg.grouping = Grouping {
         enabled: true,
-        rule: GroupRule::Manual,
+        rule: if banded {
+            GroupRule::Header { key: "BAND".into() }
+        } else {
+            GroupRule::Manual
+        },
     };
     for (p, n) in cfg.panels.iter_mut().zip(names) {
         p.manual_group = Some(n);
@@ -616,6 +647,42 @@ fn composite_export_averages_an_osc_member() {
     assert_close(plane_of(&data, plane, 0), &ha.data);
     assert_close(plane_of(&data, plane, 1), &mean);
     assert!(plane_of(&data, plane, 2).iter().all(|&v| v == 0.0));
+}
+
+/// The header cards of `path` named `name` (columns 1–8).
+fn cards_named(path: &Path, name: &str) -> Vec<String> {
+    header_cards(path)
+        .into_iter()
+        .filter(|c| c.get(..8).is_some_and(|n| n.trim_end() == name))
+        .collect()
+}
+
+#[test]
+fn a_composite_claims_no_one_filter() {
+    let tmp = TempDir::new("comp-filter");
+    let m = grouped_mosaic_of(&tmp.0, &[("Ha", 1, 3), ("OIII", 1, 4)], true);
+    // A group's export passes its panels' band through.
+    let ha = tmp.0.join("ha.fits");
+    export_group(&m.dir, "Ha", &ha, ExportFormat::Fits, &JobCtl::none()).unwrap();
+    for name in ["FILTER", "BAND"] {
+        let cards = cards_named(&ha, name);
+        assert_eq!(cards.len(), 1, "{name}: {cards:?}");
+        assert!(cards[0].contains("'Ha'"), "{}", cards[0]);
+    }
+    assert_eq!(cards_named(&ha, "OBJECT").len(), 1);
+    // A composite's names no single panel's band: neither FILTER nor the
+    // card its groups are made by. The session's cards and the WCS stay,
+    // and the HISTORY says which group each channel holds.
+    let out = tmp.0.join("hoo.fits");
+    export_composite(&m.dir, &hoo(), &out, ExportFormat::Fits, &JobCtl::none()).unwrap();
+    assert_eq!(cards_named(&out, "FILTER"), Vec::<String>::new());
+    assert_eq!(cards_named(&out, "BAND"), Vec::<String>::new());
+    assert_eq!(cards_named(&out, "OBJECT").len(), 1);
+    assert!(InputPanel::open(&out).unwrap().linear_wcs().is_some());
+    let text = header_cards(&out).concat();
+    for want in ["R: group 'Ha'", "G: group 'OIII'", "B: group 'OIII'"] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
 }
 
 #[test]

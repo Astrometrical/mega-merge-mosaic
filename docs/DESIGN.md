@@ -1571,7 +1571,11 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   read once (HOO's OIII in green and blue opens two results), a mono group
   fills its plane, an OSC group gives the mean of its channels, an unmapped
   plane is zeros. WCS and pass-through cards come from the first mapped
-  group; counts are summed. It fails, writing nothing, for no mapped group,
+  group, less the cards that name a single panel's band: `FILTER`, and the
+  header key the grouping rule reads (`GroupRule::Header`), so an HOO file
+  never says `FILTER = 'Ha'`; the session-level cards stay, and the
+  `HISTORY` lines record which group each channel holds. A group's export
+  keeps them all. Counts are summed. It fails, writing nothing, for no mapped group,
   a group never analysed or merged, a result that no longer matches the
   canvas, or groups of different canvases. `OnExisting` says what an
   existing destination means: `Replace` (the CLI's, and the default) or
