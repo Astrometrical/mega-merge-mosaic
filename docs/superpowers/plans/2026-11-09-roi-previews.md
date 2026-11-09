@@ -23,7 +23,7 @@
 - §7.3 (the ROIs toggle; previews drawn with the canvas stretch)
 - §15 (Undo for deleting ROIs; the Draw ROI shortcut)
 
-§8.3 (Compare A/B) is **not** in this plan. It is provisional, and the user decides on a mock-up first. Code map: `docs/DESIGN.md` "Standalone app" sections.
+§8.3 (Compare A/B) was added as Task 7 after the user tried the mock-up (2026-11-09; https://claude.ai/artifact/CnMUSkLywwkqW6arKfJpUs). Code map: `docs/DESIGN.md` "Standalone app" sections.
 
 ## Global Constraints
 
@@ -275,7 +275,49 @@ pub struct Wanted { pub roi: u64, pub group: String, pub key: PreviewKey, pub pr
 
 ---
 
-### Task 7: Docs, selftest, snapshots
+### Task 7: Compare A / B
+
+**Files:** `crates/mmm-app/src/previews.rs`, `rois.rs`, `mosaic_view.rs`, `plan_view.rs`, `session_window/{mod.rs, shortcuts.rs, canvas.rs}`, mega-ui (if the label controls need a reusable piece: a canvas-label row with buttons), and their tests.
+
+**Interfaces — Consumes:** Tasks 5 and 6. **Produces:**
+```rust
+pub struct Compare { pub roi: u64, pub a: BTreeMap<String /* group */, (PreviewKey, Arc<PreviewPatch>)>,
+                     pub a_settings: BlendSettings, pub selected: Side, /* momentary sources held */ }
+pub enum Side { A, B }
+// Previews: start_compare(roi), end_compare(), use_a() -> BlendSettings, shown_side() -> Side
+```
+- **Entering compare:**
+  - **Compare** sits on an ROI's canvas label (only for an ROI whose preview is up to date for the groups in view).
+  - It freezes that ROI's current patches for the groups in view as **A**, with the draft settings they were made from. A is pinned in memory: it is not evicted by the LRU, and it never re-merges.
+  - **B** is the live preview, exactly as in Tasks 5–6.
+  - One ROI in compare at a time. Compare on another ROI ends the current compare first.
+- **The A / B toggle:** it is on the label, and the selected side stays shown.
+- **Momentary switches** show the other side only while held. From A they peek at B; from B, at A.
+  - **Space** is held. It is skipped while a text field has focus or a dialog is open. Add it to shortcuts.rs's table.
+  - Pressing and holding the **selected** A / B button peeks. Clicking the other button switches to it.
+  - Pressing and holding the left mouse button on the compared ROI's preview peeks, on either canvas. A drag that moves past the drag threshold still pans and cancels the peek.
+- **Use A** puts A's settings back into the draft through the normal draft edit, so B re-merges and matches A. It then leaves compare. **Done** leaves compare and keeps the draft.
+- **Leaving compare:** compare also ends when the ROI is deleted or hidden, when the view's groups change, when an analysis starts, or when you leave the session.
+- **The label row:** name, then the controls (Compare, or A | B, Use A and Done), then the state text. The state text reads "A · feather {n} px · flatten {f}" or "B · …", and "B · merging…" while B re-merges. The buttons never move as the text changes.
+- **Accessibility:** the A and B buttons expose their pressed state, and a peek is announced through the label's description. A peek is shown by more than colour: an underline on the shown button.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `compare_freezes_a_and_b_follows_the_draft`
+  - `the_toggle_stays_and_space_peeks_the_other_side` (from A and from B)
+  - `holding_the_selected_button_peeks_and_clicking_the_other_switches`
+  - `holding_on_the_preview_peeks_and_a_drag_still_pans`
+  - `use_a_restores_a_settings_and_ends_compare`
+  - `compare_ends_when_its_roi_goes_or_an_analysis_starts`
+  - `a_is_never_evicted_while_comparing`
+  - `space_is_typing_in_a_text_field`
+- [ ] **Step 2:** They should FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** `cargo test -p mmm-app` (and `-p mega-ui` if touched) passes.
+- [ ] **Step 5:** Commit `feat(app): compare an ROI preview with frozen settings`.
+
+---
+
+### Task 8: Docs, selftest, snapshots
 
 - [ ] **Update DESIGN.md:**
   - the preview model (core entry, cap, runner, cache, keys, scheduler, priority, cancel and restart);
@@ -284,6 +326,7 @@ pub struct Wanted { pub roi: u64, pub group: String, pub key: PreviewKey, pub pr
   - Undo for ROI deletes;
   - the D shortcut;
   - the removal of "Merge ROI";
+  - Compare A/B (the toggle, the momentary switches, Use A, Done, and when compare ends);
   - "Coming in project 3".
 - [ ] **Selftest and gates:**
   - Run `make_selftest_session` then `--selftest`. Expected: exit 0.

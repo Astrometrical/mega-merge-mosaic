@@ -338,21 +338,30 @@ its sky anchoring).
   settings would give, which is the point: it's how a fix is tried before
   the whole mosaic is merged again.
 
-### 8.3 Compare A / B (provisional)
+### 8.3 Compare A / B
 
 Comparing a preview with the previous settings is useful, but "before" is
-ambiguous when previews re-merge as settings change. The shape the user would
-accept, *if it isn't clunky*:
+ambiguous when previews re-merge as settings change. The user tried a
+mock-up (2026-11-09) and decided it ships in this version:
 
-- An ROI's row (or label) has **Compare**. Entering compare freezes the
+- An ROI's canvas label has **Compare**. Entering compare freezes the
   current preview as **A** with the settings it was merged with. **B** keeps
   updating live as settings change.
-- An **A / B** switch on the ROI label, or one key held, flips the preview
-  between them.
-- **Use A** restores A's settings. **Done** leaves compare.
-
-The builder mocks this up during planning (or in the first UI task) and the
-user decides then. If it feels clunky, it moves to a later version (§17).
+- **A / B** on the label is a **toggle**: the selected side stays shown.
+- A **momentary switch** shows the *other* side only while held (from A it
+  peeks at B, from B at A). Three, all built so the user can keep the ones
+  that feel right on real panels:
+  - holding **Space**;
+  - pressing and holding the **selected** A / B button (clicking the other
+    button switches to it);
+  - pressing and holding the left mouse button on the preview (a drag still
+    pans).
+- **Use A** restores A's settings into the draft. **Done** leaves compare and
+  keeps the draft.
+- The label's controls keep a stable position: the buttons come before the
+  settings text (the user's first suggestion; the other, the settings text
+  on a second row, can be tried in the mock-up and swapped in if preferred).
+- One ROI in compare at a time.
 
 ## 9. Problems and checks
 
@@ -621,8 +630,10 @@ four hard-coded ones).
 - ROIs: session-level, saved, an ordered list without thumbnails, one
   show/hide toggle, transient previews merged with the current settings,
   auto-merge of dirty ROIs in view, priority to the group or composite in
-  view, cancel and restart on fast settings changes. Compare A/B only if it
-  isn't clunky; otherwise later.
+  view, cancel and restart on fast settings changes.
+- Compare A/B ships (mock-up tried 2026-11-09): controls on the canvas
+  label, A/B a toggle, momentary peeks at the other side (Space, holding the
+  selected button, holding on the preview), one ROI at a time (§8.3).
 - The inspector layout (option A), foldable. Problems sit alongside panels,
   ROIs and settings. "See all checks ›" ends the problems list. Settings
   findability is a focus area.
