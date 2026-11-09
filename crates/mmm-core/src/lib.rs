@@ -19,7 +19,9 @@
 //! - [`analyze`] — entry point: scan input panels into a [`session::Session`]
 //!   (L8 summaries, overlap graph, photometric solve, residual surfaces).
 //! - [`session`] — the persistent session directory: canvas geometry, panel
-//!   metadata, and the paths of every cached analysis artifact.
+//!   metadata (including the noise, gradient and edge raggedness measured on
+//!   each panel's L8 summary by [`summary::panel_stats`]), and the paths of
+//!   every cached analysis artifact.
 //! - [`blend`] — stream the merged mosaic to any [`blend::RowSink`], with
 //!   [`blend::BlendParams`] / [`blend::BlendMode`] selecting feather,
 //!   two-band, or pyramid blending.
@@ -27,7 +29,9 @@
 //!   preview, and a [`output::Tee`] to feed both in one pass.
 //! - [`diag`] — seam/ownership diagnostics for reporting UIs.
 //! - [`health`] — seam steps (with outlier flags) and photometric gain/offset
-//!   spread as data for health UIs.
+//!   spread as data for health UIs, and the seams as canvas polylines
+//!   ([`health::seam_lines`]; both from one owner-map pass with
+//!   [`health::health_with_lines`]).
 //! - [`formats`] + [`panel_reader`] — input access: the XISF and FITS readers
 //!   behind the format-agnostic [`formats::InputPanel`], and the
 //!   storage-agnostic row reader the pipeline consumes. For band-cached
@@ -81,9 +85,9 @@
 //!   ([`preview::plan_previews`] / [`preview::run_previews`]); cached ones
 //!   are read back and drawn as one plan picture with
 //!   [`preview::load_cached_previews`] / [`preview::render_overview`].
-//! - [`checks`] — structured input, file and analysis checks (severity, code,
-//!   affected groups, remedy) and the accepted-warning bookkeeping, as data
-//!   for a UI or `mmm check`.
+//! - [`checks`] — structured input, file, analysis, layout, panel-statistic
+//!   and seam checks (severity, code, target, affected groups, remedy) and
+//!   the accepted-warning bookkeeping, as data for a UI or `mmm check`.
 //! - [`panel_header`] — a panel's header facts from one open (size,
 //!   channels, filter, exposure, frames and integration time, solution kind,
 //!   pixel scale) with [`panel_header::read_panel_header`], for panel lists;

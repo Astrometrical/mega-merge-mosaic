@@ -1,5 +1,7 @@
 //! Analyze stage: one streaming pass per panel producing the L8 summary,
-//! content bbox, and per-channel statistics, persisted into a session dir,
+//! content bbox, per-channel statistics and the quality statistics measured
+//! on the summary (noise, gradient, edge raggedness:
+//! [`crate::summary::panel_stats`]), persisted into a session dir,
 //! followed by the overlap-graph build over the collected summaries and the
 //! photometric solve (per-edge fits + global per-panel corrections).
 //!
@@ -580,6 +582,9 @@ fn analyze_solved(
                 ch_max: vec![],
                 ch_mean: vec![],
                 storage: PanelStorage::CroppedCache { bbox: ap.bbox },
+                noise: None,
+                gradient: None,
+                ragged: None,
             };
             let reader = PanelReader::open(&meta, canvas)?;
             let scan = scan_reader(meta, reader)?;
@@ -829,6 +834,9 @@ pub fn analyze_ipc_aligned(
                 storage: PanelStorage::Ipc {
                     panel_id: id as u32,
                 },
+                noise: None,
+                gradient: None,
+                ragged: None,
             };
             let s = scan_reader(meta, reader)?;
             {
@@ -949,6 +957,9 @@ pub fn analyze_ipc_solved(
                 ch_max: vec![],
                 ch_mean: vec![],
                 storage: PanelStorage::CroppedCache { bbox: ap.bbox },
+                noise: None,
+                gradient: None,
+                ragged: None,
             };
             let reader = PanelReader::open(&meta, canvas)?;
             let s = scan_reader(meta, reader)?;
@@ -1036,13 +1047,16 @@ fn scan_panel(id: usize, path: &Path) -> Result<PanelScan> {
         ch_max: vec![],
         ch_mean: vec![],
         storage,
+        noise: None,
+        gradient: None,
+        ragged: None,
     };
     scan_reader(meta, panel)
 }
 
 /// Single streaming pass over one panel through a [`PanelReader`], filling in
-/// the scan-derived fields of `meta` (bbox, coverage, per-channel stats).
-/// Storage-agnostic: rows outside a cropped cache's bbox read as absent.
+/// the scan-derived fields of `meta` (bbox, coverage, per-channel stats, and
+/// the quality statistics measured on the finished summary). Storage-agnostic: rows outside a cropped cache's bbox read as absent.
 fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
     panel.advise_sequential();
     let (w, h, ch) = panel.canvas();
@@ -1169,6 +1183,12 @@ fn scan_reader(mut meta: PanelMeta, panel: PanelReader) -> Result<PanelScan> {
             }
         })
         .collect();
+    // Quality statistics from the summary just built (L8 cells of the bbox
+    // only; no second read of the panel).
+    let stats = crate::summary::panel_stats(&summary, meta.bbox);
+    meta.noise = stats.noise;
+    meta.gradient = stats.gradient;
+    meta.ragged = stats.ragged;
     // Surface a mid-scan producer failure (IPC transport or FITS decode) as
     // a proper `Err` instead of a silently-wrong summary; a no-op for
     // Xisf/Cache backings, which always report `None` here — so the file
@@ -1780,6 +1800,131 @@ mod tests {
         link.finish_ok().unwrap();
         host.join();
         assert!(err.contains("displaced up to 2.00 px"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Deterministic standard normal samples (xorshift64*, Irwin–Hall over
+    /// twelve uniforms): enough for test noise, no RNG dependency.
+    struct Gauss(u64);
+
+    impl Gauss {
+        fn uniform(&mut self) -> f64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn next(&mut self) -> f64 {
+            (0..12).map(|_| self.uniform()).sum::<f64>() - 6.0
+        }
+    }
+
+    /// Analysis measures each panel's noise, gradient and edge raggedness
+    /// from its L8 summary. Four 2-channel panels in a 2×2 grid on a flat
+    /// 0.1 sky with noise σ (2σ in channel 1): A is clean, B carries a ramp
+    /// rising `RISE` across it, C has jagged stacking edges (every row and
+    /// column ends up to 24 px short) and D is three times as noisy.
+    #[test]
+    fn analysis_records_noise_gradient_and_raggedness() {
+        const SIGMA: f64 = 0.002;
+        const RISE: f64 = 0.03;
+        let dir = tmpdir("panel-stats");
+        let (w, h, ch) = (256u64, 256u64, 2u64);
+        let mut rng = Gauss(0x5EED_1234_ABCD_0001);
+        let mut jitter = Gauss(0x0BAD_CAFE_F00D_0002);
+        let mut jag =
+            |n: u64| -> Vec<u64> { (0..n).map(|_| (jitter.uniform() * 24.0) as u64).collect() };
+        // (rect, noise factor, ramp, jagged)
+        let panels = [
+            ([0u64, 0, 144, 144], 1.0, false, false),
+            ([112, 0, 256, 144], 1.0, true, false),
+            ([0, 112, 144, 256], 1.0, false, true),
+            ([112, 112, 256, 256], 3.0, false, false),
+        ];
+        let mut paths = Vec::new();
+        for (i, (r, k, ramp, jagged)) in panels.into_iter().enumerate() {
+            let (rows, cols) = if jagged {
+                ((jag(h), jag(h)), (jag(w), jag(w)))
+            } else {
+                (
+                    (vec![0; h as usize], vec![0; h as usize]),
+                    (vec![0; w as usize], vec![0; w as usize]),
+                )
+            };
+            let mut planes = vec![0f32; (w * h * ch) as usize];
+            for y in r[1]..r[3] {
+                for x in r[0]..r[2] {
+                    let inside = x >= r[0] + rows.0[y as usize]
+                        && x + rows.1[y as usize] < r[2]
+                        && y >= r[1] + cols.0[x as usize]
+                        && y + cols.1[x as usize] < r[3];
+                    if !inside {
+                        continue;
+                    }
+                    let base = if ramp {
+                        0.1 + RISE * (x - r[0]) as f64 / (r[2] - r[0]) as f64
+                    } else {
+                        0.1
+                    };
+                    for c in 0..ch {
+                        let s = SIGMA * k * (c + 1) as f64;
+                        planes[(c * w * h + y * w + x) as usize] = (base + s * rng.next()) as f32;
+                    }
+                }
+            }
+            let p = dir.join(format!("p{i}.xisf"));
+            write_xisf(&p, w, h, ch, &planes).unwrap();
+            paths.push(p);
+        }
+        let s = analyze(&paths, &dir.join("s.mmm-session")).unwrap();
+        let noise = |i: usize| s.panels[i].noise.clone().expect("noise measured");
+        let near = |got: f64, want: f64, tol: f64| (got / want - 1.0).abs() < tol;
+
+        // Noise: per channel, the typical in-cell RMS of the background.
+        for i in 0..3 {
+            let n = noise(i);
+            assert_eq!(n.len(), 2);
+            assert!(near(n[0], SIGMA, 0.1), "panel {i} noise {n:?}");
+            assert!(near(n[1], 2.0 * SIGMA, 0.1), "panel {i} noise {n:?}");
+        }
+        assert!(near(noise(3)[0], 3.0 * SIGMA, 0.1), "{:?}", noise(3));
+
+        // Gradient: the fitted plane's rise across the panel over its noise.
+        let g = s.panels[1].gradient.expect("gradient measured");
+        assert!(near(g, RISE / SIGMA, 0.2), "ramp gradient {g}");
+        for i in [0, 2, 3] {
+            let g = s.panels[i].gradient.expect("gradient measured");
+            assert!(g < 1.0, "panel {i} is flat but reads {g}");
+        }
+
+        // Raggedness: clean edges read 0; jagged ones mostly partial.
+        for i in [0, 1, 3] {
+            assert_eq!(s.panels[i].ragged, Some(0.0), "panel {i}");
+        }
+        let r = s.panels[2].ragged.expect("raggedness measured");
+        assert!(r > 0.6, "jagged edges read {r}");
+
+        // The statistics persist, and the checks built on them name the
+        // right panels (A, clean, raises none).
+        let reopened = Session::open(&s.dir).unwrap();
+        assert_eq!(reopened.panels[1].gradient, s.panels[1].gradient);
+        assert_eq!(reopened.panels[0].noise, s.panels[0].noise);
+        assert_eq!(reopened.panels[2].ragged, s.panels[2].ragged);
+        let mut found: Vec<(crate::checks::CheckCode, PathBuf)> =
+            crate::checks::stat_checks("g", &reopened)
+                .into_iter()
+                .map(|c| (c.code, c.panels[0].clone()))
+                .collect();
+        found.sort();
+        use crate::checks::CheckCode::*;
+        let mut want = vec![
+            (NoiseOutOfLine, paths[3].clone()),
+            (PanelGradient, paths[1].clone()),
+            (RaggedEdges, paths[2].clone()),
+        ];
+        want.sort();
+        assert_eq!(found, want);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

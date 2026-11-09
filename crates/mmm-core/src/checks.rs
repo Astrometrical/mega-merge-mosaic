@@ -61,7 +61,30 @@ pub enum CheckCode {
     ThinOverlap,
     /// A panel's footprint is largely empty.
     EmptyArea,
+    /// A panel is much noisier than the rest of its group.
+    NoiseOutOfLine,
+    /// A panel carries a strong background gradient.
+    PanelGradient,
+    /// A panel's stacking edges are ragged.
+    RaggedEdges,
+    /// Two panels still disagree after level matching (before a merge).
+    LevelMatching,
+    /// A seam shows between two panels in the merged result.
+    ResidualSeam,
 }
+
+/// A panel noisier than this many times its group's median noise (in any
+/// channel) is out of line ([`CheckCode::NoiseOutOfLine`]).
+pub const NOISE_FACTOR: f64 = 2.0;
+
+/// A panel whose background gradient rises more than this many times its
+/// noise across it has a strong gradient ([`CheckCode::PanelGradient`]).
+pub const GRADIENT_FACTOR: f64 = 5.0;
+
+/// A panel more than this share of whose edge cells (the inner rim of
+/// [`crate::summary::panel_stats`]) are partly covered has ragged edges
+/// ([`CheckCode::RaggedEdges`]).
+pub const RAGGED_FRACTION: f64 = 0.3;
 
 /// The overlap's short side, in canvas pixels, below which two panels are
 /// too thinly joined to match reliably ([`CheckCode::ThinOverlap`]).
@@ -809,6 +832,143 @@ pub fn layout_checks(group: &str, session: &Session, graph: &OverlapGraph) -> Ve
     out
 }
 
+/// Checks over one analysed group's panel statistics, measured at analysis
+/// time ([`crate::summary::panel_stats`]), all Notes:
+/// - [`CheckCode::NoiseOutOfLine`]: the panel's noise, in any channel, is
+///   above [`NOISE_FACTOR`] times the group's median for that channel (the
+///   median over the measured panels, needing two of them);
+/// - [`CheckCode::PanelGradient`]: its gradient is above [`GRADIENT_FACTOR`];
+/// - [`CheckCode::RaggedEdges`]: its raggedness is above [`RAGGED_FRACTION`].
+///
+/// A statistic that was never measured (a session analysed before the
+/// statistics existed) is skipped, and such a panel does not count towards
+/// the group's median: an old session raises none of these, and passes
+/// none, until it is analysed again. Panels are reported by their
+/// user-facing file.
+pub fn stat_checks(group: &str, session: &Session) -> Vec<Check> {
+    let user_file =
+        |m: &crate::session::PanelMeta| m.source.clone().unwrap_or_else(|| m.path.clone());
+    let measured: Vec<&Vec<f64>> = session
+        .panels
+        .iter()
+        .filter_map(|m| m.noise.as_ref())
+        .collect();
+    let channels = measured.iter().map(|n| n.len()).max().unwrap_or(0);
+    let medians: Vec<Option<f64>> = (0..channels)
+        .map(|c| {
+            let mut v: Vec<f64> = measured.iter().filter_map(|n| n.get(c).copied()).collect();
+            (v.len() > 1).then(|| median(&mut v)).filter(|&m| m > 0.0)
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for m in &session.panels {
+        let f = user_file(m);
+        let name = file_name(&f);
+        let mut note = |code, message: String, remedy: &str| {
+            out.push(Check {
+                code,
+                target: CheckTarget::Panel(f.clone()),
+                rect: None,
+                severity: Severity::Note,
+                panels: vec![f.clone()],
+                groups: vec![group.to_string()],
+                message,
+                remedy: Some(remedy.into()),
+            });
+        };
+        let noisy = m.noise.as_ref().is_some_and(|n| {
+            n.iter()
+                .zip(&medians)
+                .any(|(&x, med)| med.is_some_and(|med| x > NOISE_FACTOR * med))
+        });
+        if noisy {
+            note(
+                CheckCode::NoiseOutOfLine,
+                format!("{name} is much noisier than the rest of {group}."),
+                "Check it for less integration time or poor frames; its part of the mosaic will look noisier.",
+            );
+        }
+        if m.gradient.is_some_and(|g| g > GRADIENT_FACTOR) {
+            note(
+                CheckCode::PanelGradient,
+                format!(
+                    "{name} has a strong gradient: it may need gradient removal before merging."
+                ),
+                "Remove the gradient from the panel, then analyse again.",
+            );
+        }
+        if m.ragged.is_some_and(|r| r > RAGGED_FRACTION) {
+            note(
+                CheckCode::RaggedEdges,
+                format!("{name} has ragged stacking edges."),
+                "Crop the ragged edges off the panel, then analyse again.",
+            );
+        }
+    }
+    out
+}
+
+/// Checks over one group's seams, from its [`crate::health::Health`]. Each
+/// seam flagged by the [`crate::health::flag_steps`] rule (a step between
+/// two panels left after level matching) is, before the group is merged, a
+/// Note that a seam is likely ([`CheckCode::LevelMatching`]) and, once
+/// `merged`, a Problem: the seam shows ([`CheckCode::ResidualSeam`]). The
+/// target is the [`CheckTarget::Seam`], its panels resolved from the
+/// session's panel ids to their user-facing files; a seam whose panels are
+/// not in the session is skipped.
+pub fn seam_checks(
+    group: &str,
+    session: &Session,
+    health: &crate::health::Health,
+    merged: bool,
+) -> Vec<Check> {
+    let user_file = |id: usize| {
+        session
+            .panels
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.source.clone().unwrap_or_else(|| m.path.clone()))
+    };
+    let mut out = Vec::new();
+    for s in health.seams.iter().filter(|s| s.flagged) {
+        let (Some(fa), Some(fb)) = (user_file(s.a), user_file(s.b)) else {
+            continue;
+        };
+        let (na, nb) = (file_name(&fa), file_name(&fb));
+        let (code, severity, message, remedy) = if merged {
+            (
+                CheckCode::ResidualSeam,
+                Severity::Problem,
+                format!("A seam shows between {na} and {nb}."),
+                "Merge again with a wider feather, or remove gradients from both panels and analyse again.",
+            )
+        } else {
+            (
+                CheckCode::LevelMatching,
+                Severity::Note,
+                format!("{na} and {nb} still disagree after matching: a seam is likely."),
+                "Remove gradients from both panels before merging, or merge with a wider feather.",
+            )
+        };
+        out.push(Check {
+            code,
+            target: CheckTarget::Seam {
+                group: group.to_string(),
+                a: fa.clone(),
+                b: fb.clone(),
+            },
+            rect: None,
+            severity,
+            panels: vec![fa, fb],
+            groups: vec![group.to_string()],
+            message,
+            remedy: Some(remedy.into()),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,6 +1263,9 @@ mod tests {
             ch_max: vec![1.0],
             ch_mean: vec![mean],
             storage: Default::default(),
+            noise: None,
+            gradient: None,
+            ragged: None,
         }
     }
 
@@ -1243,6 +1406,13 @@ mod tests {
         let cfg = MosaicConfig::new(lin.clone());
         let groups = resolve_groups(&cfg, &|_| None);
         checks.extend(input_checks(&cfg, &facts_of(&lin), &groups, Some(true)));
+        // Statistics: noise out of line, a strong gradient, ragged edges.
+        checks.extend(stat_checks("Ha", &stats_session()));
+        // A seam that stays after matching: before and after a merge.
+        let s = session(vec![meta(0, 0.1), meta(1, 0.1), meta(2, 0.1)]);
+        let h = health_of(&[(0, 1, 0.010), (0, 2, 0.011), (1, 2, 0.2)]);
+        checks.extend(seam_checks("Ha", &s, &h, false));
+        checks.extend(seam_checks("Ha", &s, &h, true));
         checks
     }
 
@@ -1266,6 +1436,11 @@ mod tests {
             CheckCode::CoverageHole,
             CheckCode::ThinOverlap,
             CheckCode::EmptyArea,
+            CheckCode::NoiseOutOfLine,
+            CheckCode::PanelGradient,
+            CheckCode::RaggedEdges,
+            CheckCode::LevelMatching,
+            CheckCode::ResidualSeam,
         ] {
             // Exhaustive: a code added to the enum fails to compile here
             // until it is listed (and made) above.
@@ -1284,7 +1459,12 @@ mod tests {
                 | CheckCode::DuplicatePanels
                 | CheckCode::CoverageHole
                 | CheckCode::ThinOverlap
-                | CheckCode::EmptyArea => {}
+                | CheckCode::EmptyArea
+                | CheckCode::NoiseOutOfLine
+                | CheckCode::PanelGradient
+                | CheckCode::RaggedEdges
+                | CheckCode::LevelMatching
+                | CheckCode::ResidualSeam => {}
             }
             assert!(!of(&checks, code).is_empty(), "no {code:?} check made");
         }
@@ -1311,6 +1491,11 @@ mod tests {
             (CheckCode::CoverageHole, "coverage_hole"),
             (CheckCode::ThinOverlap, "thin_overlap"),
             (CheckCode::EmptyArea, "empty_area"),
+            (CheckCode::NoiseOutOfLine, "noise_out_of_line"),
+            (CheckCode::PanelGradient, "panel_gradient"),
+            (CheckCode::RaggedEdges, "ragged_edges"),
+            (CheckCode::LevelMatching, "level_matching"),
+            (CheckCode::ResidualSeam, "residual_seam"),
         ] {
             assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{name}\""));
         }
@@ -1779,5 +1964,223 @@ mod tests {
             all.iter().all(|c| c.severity != Severity::Problem),
             "{all:?}"
         );
+        // Statistics in line with each other: no notes at all.
+        let mut s = s;
+        for (m, n) in s.panels.iter_mut().zip([1.0e-3, 1.1e-3, 0.9e-3, 1.05e-3]) {
+            m.noise = Some(vec![n, 2.0 * n]);
+            m.gradient = Some(1.5);
+            m.ragged = Some(0.0);
+        }
+        let stats = stat_checks("Ha", &s);
+        assert!(stats.is_empty(), "{stats:?}");
+        // Seams that match: nothing, merged or not.
+        let h = health_of(&[(0, 1, 0.010), (0, 2, 0.012), (1, 3, 0.011), (2, 3, 0.009)]);
+        assert!(h.seams.iter().all(|s| !s.flagged));
+        for merged in [false, true] {
+            let seams = seam_checks("Ha", &s, &h, merged);
+            assert!(seams.is_empty(), "{seams:?}");
+        }
+    }
+
+    // ---- statistics and seams ----
+
+    /// A panel of [`meta`] carrying the analysis statistics.
+    fn stat_meta(id: usize, noise: &[f64], gradient: f64, ragged: f64) -> PanelMeta {
+        PanelMeta {
+            noise: Some(noise.to_vec()),
+            gradient: Some(gradient),
+            ragged: Some(ragged),
+            ..meta(id, 0.1)
+        }
+    }
+
+    /// Health over `(a, b, delta)` steps, flagged by the `flag_steps` rule.
+    fn health_of(steps: &[(usize, usize, f64)]) -> crate::health::Health {
+        let deltas = steps
+            .iter()
+            .map(|&(a, b, delta)| ((a, b), crate::diag::SeamDelta { n: 10, delta }))
+            .collect();
+        crate::health::Health {
+            seams: crate::health::flag_steps(&deltas),
+            seam_delta_median: 0.0,
+            seam_delta_max: 0.0,
+            gain_range: vec![],
+            offset_range: vec![],
+        }
+    }
+
+    /// Four panels, one out of line on each statistic (p1 gradient, p2
+    /// ragged, p3 noisy in its second channel).
+    fn stats_session() -> Session {
+        session(vec![
+            stat_meta(0, &[1.0e-3, 2.0e-3], 2.0, 0.05),
+            stat_meta(1, &[1.1e-3, 2.1e-3], 8.0, 0.0),
+            stat_meta(2, &[0.9e-3, 1.9e-3], 1.0, 0.5),
+            stat_meta(3, &[1.2e-3, 6.0e-3], 0.5, 0.1),
+        ])
+    }
+
+    #[test]
+    fn stat_checks_fire_and_stay_quiet() {
+        let checks = stat_checks("Ha", &stats_session());
+        let found: Vec<(CheckCode, PathBuf)> = checks
+            .iter()
+            .map(|c| (c.code, c.panels[0].clone()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (CheckCode::PanelGradient, PathBuf::from("/in/p1.xisf")),
+                (CheckCode::RaggedEdges, PathBuf::from("/in/p2.xisf")),
+                (CheckCode::NoiseOutOfLine, PathBuf::from("/in/p3.xisf")),
+            ]
+        );
+        for c in &checks {
+            assert_eq!(c.severity, Severity::Note);
+            assert_eq!(c.target, CheckTarget::Panel(c.panels[0].clone()));
+            assert_eq!(c.groups, vec!["Ha".to_string()]);
+            assert!(c.remedy.is_some());
+        }
+        let msg = |code| of(&checks, code)[0].message.clone();
+        assert_eq!(
+            msg(CheckCode::NoiseOutOfLine),
+            "p3.xisf is much noisier than the rest of Ha."
+        );
+        assert_eq!(
+            msg(CheckCode::PanelGradient),
+            "p1.xisf has a strong gradient: it may need gradient removal before merging."
+        );
+        assert_eq!(
+            msg(CheckCode::RaggedEdges),
+            "p2.xisf has ragged stacking edges."
+        );
+
+        // At the limits nothing fires: each rule is "above".
+        let s = session(vec![
+            stat_meta(0, &[1.0e-3], GRADIENT_FACTOR, RAGGED_FRACTION),
+            stat_meta(1, &[1.0e-3], 0.0, 0.0),
+            stat_meta(2, &[2.0e-3], 0.0, 0.0),
+        ]);
+        // Median 1e-3: 2e-3 is exactly NOISE_FACTOR times it.
+        assert!(stat_checks("Ha", &s).is_empty());
+
+        // A panel alone has nothing to be out of line with, but its own
+        // gradient and edges still count.
+        let one = session(vec![stat_meta(0, &[9.0e-3], 9.0, 0.9)]);
+        let codes: Vec<CheckCode> = stat_checks("Ha", &one).iter().map(|c| c.code).collect();
+        assert_eq!(
+            codes,
+            vec![CheckCode::PanelGradient, CheckCode::RaggedEdges]
+        );
+
+        // Noiseless panels (a zero median) are never out of line.
+        let flat = session(vec![
+            stat_meta(0, &[0.0], 0.0, 0.0),
+            stat_meta(1, &[0.0], 0.0, 0.0),
+            stat_meta(2, &[1.0e-3], 0.0, 0.0),
+        ]);
+        assert!(stat_checks("Ha", &flat).is_empty());
+    }
+
+    #[test]
+    fn old_sessions_get_no_stat_checks() {
+        // A session.json from before the statistics existed.
+        let d = tmp("oldstats");
+        std::fs::write(
+            d.join("session.json"),
+            r#"{
+              "canvas": [1000, 1000, 1],
+              "panels": [
+                {"id": 0, "path": "/in/p0.xisf", "bbox": [0, 0, 600, 600],
+                 "nonzero_frac": 0.36, "ch_min": [0.0], "ch_max": [1.0], "ch_mean": [0.1]},
+                {"id": 1, "path": "/in/p1.xisf", "bbox": [400, 0, 1000, 600],
+                 "nonzero_frac": 0.36, "ch_min": [0.0], "ch_max": [1.0], "ch_mean": [0.1]},
+                {"id": 2, "path": "/in/p2.xisf", "bbox": [0, 400, 600, 1000],
+                 "nonzero_frac": 0.36, "ch_min": [0.0], "ch_max": [1.0], "ch_mean": [0.1]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let old = Session::open(&d).unwrap();
+        for m in &old.panels {
+            assert_eq!((&m.noise, m.gradient, m.ragged), (&None, None, None));
+        }
+        // No notes, and no false Passed either.
+        assert!(stat_checks("Ha", &old).is_empty());
+
+        // A group mixing re-analysed and old panels compares only the
+        // measured ones: one measured panel has no group to be out of line
+        // with, however noisy.
+        let mut mixed = old.clone();
+        mixed.panels[0].noise = Some(vec![9.0e-3]);
+        mixed.panels[0].gradient = Some(0.0);
+        mixed.panels[0].ragged = Some(0.0);
+        assert!(stat_checks("Ha", &mixed).is_empty());
+
+        // The fields stay out of session.json while unmeasured.
+        old.save().unwrap();
+        let json = std::fs::read_to_string(d.join("session.json")).unwrap();
+        for key in ["noise", "gradient", "ragged"] {
+            assert!(!json.contains(key), "{key} written for an old panel");
+        }
+    }
+
+    #[test]
+    fn seam_checks_switch_from_note_to_problem_after_a_merge() {
+        let s = session(vec![meta(0, 0.1), meta(1, 0.1), meta(2, 0.1), meta(3, 0.1)]);
+        // (1, 2) steps far above the others.
+        let h = health_of(&[(0, 1, 0.010), (0, 2, 0.011), (1, 2, 0.2), (2, 3, 0.012)]);
+        let flagged: Vec<(usize, usize)> = h
+            .seams
+            .iter()
+            .filter(|s| s.flagged)
+            .map(|s| (s.a, s.b))
+            .collect();
+        assert_eq!(flagged, vec![(1, 2)]);
+        let seam = CheckTarget::Seam {
+            group: "Ha".into(),
+            a: PathBuf::from("/in/p1.xisf"),
+            b: PathBuf::from("/in/p2.xisf"),
+        };
+
+        let before = seam_checks("Ha", &s, &h, false);
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(before[0].code, CheckCode::LevelMatching);
+        assert_eq!(before[0].severity, Severity::Note);
+        assert_eq!(before[0].target, seam);
+        assert_eq!(
+            before[0].message,
+            "p1.xisf and p2.xisf still disagree after matching: a seam is likely."
+        );
+
+        let after = seam_checks("Ha", &s, &h, true);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(after[0].code, CheckCode::ResidualSeam);
+        assert_eq!(after[0].severity, Severity::Problem);
+        assert_eq!(after[0].target, seam);
+        assert_eq!(
+            after[0].message,
+            "A seam shows between p1.xisf and p2.xisf."
+        );
+        for c in [&before[0], &after[0]] {
+            assert_eq!(
+                c.panels,
+                vec![PathBuf::from("/in/p1.xisf"), PathBuf::from("/in/p2.xisf")]
+            );
+            assert_eq!(c.groups, vec!["Ha".to_string()]);
+            assert!(c.remedy.as_deref().unwrap().contains("feather"));
+            // One pair key: accepting the seam accepts it alone.
+            let keys = c.keys();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].other, Some(PathBuf::from("/in/p2.xisf")));
+        }
+        // Accepting the note before a merge does not accept the problem.
+        let mut cfg = MosaicConfig::new(vec![]);
+        cfg.accepted_checks.extend(before[0].keys());
+        assert!(!is_accepted(&cfg, &after[0]));
+
+        // A seam whose panels left the session says nothing.
+        let gone = session(vec![meta(0, 0.1), meta(1, 0.1)]);
+        assert!(seam_checks("Ha", &gone, &h, true).is_empty());
     }
 }

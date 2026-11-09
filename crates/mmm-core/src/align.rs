@@ -761,6 +761,9 @@ mod tests {
             ch_max: vec![],
             ch_mean: vec![],
             storage: PanelStorage::CroppedCache { bbox: ap.bbox },
+            noise: None,
+            gradient: None,
+            ragged: None,
         };
         let r = PanelReader::open(&meta, (40, 32, nch as u64)).unwrap();
 
@@ -1138,6 +1141,9 @@ mod tests {
             ch_max: vec![],
             ch_mean: vec![],
             storage: PanelStorage::CroppedCache { bbox: ap.bbox },
+            noise: None,
+            gradient: None,
+            ragged: None,
         };
         let r = PanelReader::open(&meta, (frame.width, frame.height, 1)).unwrap();
 

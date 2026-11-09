@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use mmm_core::checks::{
     Check, Severity, analysis_checks, file_checks, input_checks, is_accepted, is_aligned,
-    layout_checks, panel_facts,
+    layout_checks, panel_facts, stat_checks,
 };
 use mmm_core::export::{ExportFormat, export_group};
 use mmm_core::job::{CancelToken, JobCtl};
@@ -437,6 +437,7 @@ pub(crate) fn check(a: &CheckArgs) -> anyhow::Result<()> {
             Ok((session, graph)) => {
                 checks.extend(analysis_checks(&group, &session, &graph));
                 checks.extend(layout_checks(&group, &session, &graph));
+                checks.extend(stat_checks(&group, &session));
             }
             Err(e) => unreadable.push(format!("cannot read analysis of group {group}: {e}")),
         }
