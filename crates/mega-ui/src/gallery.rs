@@ -541,6 +541,30 @@ fn table_section(ui: &mut Ui, state: &mut TableState, selection: &mut BTreeSet<u
     }
 }
 
+/// The real modal behind the Dialog section's button, while open.
+fn gallery_dialog(ctx: &egui::Context, state: &mut GalleryState) {
+    if !state.dialog_open {
+        return;
+    }
+    let r = Dialog {
+        title: "Export",
+        width: DIALOG_WIDTH,
+    }
+    .show(ctx, egui::Id::new("gallery_dialog"), |ui| {
+        ui.label("Choose what to export.");
+        footer(
+            ui,
+            &[
+                (ButtonKind::Quiet, "Cancel"),
+                (ButtonKind::Primary, "Export"),
+            ],
+        )
+    });
+    if r.close || r.inner.is_some() {
+        state.dialog_open = false;
+    }
+}
+
 /// Draw the whole gallery: every page, stacked in one scrolling area.
 pub fn show(ui: &mut Ui, state: &mut GalleryState) {
     let now = ui.input(|i| i.time);
@@ -548,25 +572,7 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
         ui.set_max_width(1100.0);
         sections(ui, state, None);
     });
-    if state.dialog_open {
-        let r = Dialog {
-            title: "Export",
-            width: DIALOG_WIDTH,
-        }
-        .show(ui.ctx(), egui::Id::new("gallery_dialog"), |ui| {
-            ui.label("Choose what to export.");
-            footer(
-                ui,
-                &[
-                    (ButtonKind::Quiet, "Cancel"),
-                    (ButtonKind::Primary, "Export"),
-                ],
-            )
-        });
-        if r.close || r.inner.is_some() {
-            state.dialog_open = false;
-        }
-    }
+    gallery_dialog(ui.ctx(), state);
     let _ = state.toasts.show(ui.ctx(), now);
 }
 
@@ -580,25 +586,7 @@ pub fn show_page(ui: &mut Ui, state: &mut GalleryState, page: usize) {
         ui.set_max_width(1100.0);
         sections(ui, state, Some(page));
     });
-    if state.dialog_open {
-        let r = Dialog {
-            title: "Export",
-            width: DIALOG_WIDTH,
-        }
-        .show(ui.ctx(), egui::Id::new("gallery_dialog"), |ui| {
-            ui.label("Choose what to export.");
-            footer(
-                ui,
-                &[
-                    (ButtonKind::Quiet, "Cancel"),
-                    (ButtonKind::Primary, "Export"),
-                ],
-            )
-        });
-        if r.close || r.inner.is_some() {
-            state.dialog_open = false;
-        }
-    }
+    gallery_dialog(ui.ctx(), state);
     let _ = state.toasts.show(ui.ctx(), now);
 }
 

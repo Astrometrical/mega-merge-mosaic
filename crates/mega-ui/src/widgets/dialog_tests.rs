@@ -10,6 +10,7 @@ struct State {
     closes: u32,
     behind: u32,
     one: u32,
+    open: bool,
 }
 
 fn harness() -> Harness<'static, State> {
@@ -23,6 +24,9 @@ fn harness() -> Harness<'static, State> {
                 if ui.button("Behind").clicked() {
                     s.behind += 1;
                 }
+                if !s.open {
+                    return;
+                }
                 let r = Dialog {
                     title: "Export",
                     width: DIALOG_WIDTH,
@@ -35,7 +39,10 @@ fn harness() -> Harness<'static, State> {
                 s.one += u32::from(r.inner);
                 s.closes += u32::from(r.close);
             },
-            State::default(),
+            State {
+                open: true,
+                ..State::default()
+            },
         )
 }
 
@@ -70,6 +77,13 @@ fn esc_and_backdrop_report_close() {
     assert_eq!(h.state().one, 1);
 }
 
+fn focused(h: &Harness<'_, State>) -> Vec<&'static str> {
+    ["Behind", "One", "Two"]
+        .into_iter()
+        .filter(|l| h.query_by_label(l).is_some_and(|n| n.is_focused()))
+        .collect()
+}
+
 #[test]
 fn input_behind_is_blocked() {
     let mut h = harness();
@@ -77,28 +91,129 @@ fn input_behind_is_blocked() {
     h.get_by_label("Behind").click();
     h.run();
     assert_eq!(h.state().behind, 0, "the backdrop swallows the click");
+    // The keyboard too: Tab never lands behind, Enter / Space never press it.
+    for _ in 0..4 {
+        h.key_press(Key::Tab);
+        h.run();
+        assert!(!focused(&h).contains(&"Behind"));
+    }
+    h.key_press(Key::Enter);
+    h.run();
+    h.key_press(Key::Space);
+    h.run();
+    assert_eq!(h.state().behind, 0, "Enter / Space do not reach behind");
 }
 
 #[test]
 fn tab_stays_inside() {
     let mut h = harness();
     h.run();
-    assert!(
-        h.get_by_label("One").is_focused(),
-        "first control starts focused"
-    );
-    for _ in 0..6 {
+    assert_eq!(focused(&h), ["One"], "first control starts focused");
+    let mut seen = Vec::new();
+    for _ in 0..4 {
         h.key_press(Key::Tab);
         h.run();
-        let inside = h.get_by_label("One").is_focused() || h.get_by_label("Two").is_focused();
-        assert!(inside, "Tab left the dialog");
-        assert!(!h.get_by_label("Behind").is_focused());
+        seen.push(focused(&h));
     }
-    for _ in 0..6 {
+    assert_eq!(seen, [["Two"], ["One"], ["Two"], ["One"]], "Tab wraps");
+    let mut seen = Vec::new();
+    for _ in 0..4 {
         h.key_press_modifiers(Modifiers::SHIFT, Key::Tab);
         h.run();
-        let inside = h.get_by_label("One").is_focused() || h.get_by_label("Two").is_focused();
-        assert!(inside, "Shift+Tab left the dialog");
+        seen.push(focused(&h));
+    }
+    assert_eq!(
+        seen,
+        [["Two"], ["One"], ["Two"], ["One"]],
+        "Shift+Tab wraps"
+    );
+}
+
+#[test]
+fn focus_left_on_the_opener_moves_into_the_dialog() {
+    let mut h = harness();
+    h.state_mut().open = false;
+    h.run();
+    h.get_by_label("Behind").focus();
+    h.run();
+    assert_eq!(focused(&h), ["Behind"]);
+    h.state_mut().open = true;
+    h.run();
+    assert_eq!(focused(&h), ["One"]);
+}
+
+#[test]
+fn a_body_without_controls_does_not_repaint_forever() {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(900.0, 700.0))
+        .build_ui_state(
+            |ui, _: &mut ()| {
+                if crate::testutil::themed(ui) {
+                    Dialog {
+                        title: "Export",
+                        width: DIALOG_WIDTH,
+                    }
+                    .show(ui.ctx(), Id::new("dlg"), |ui| {
+                        ui.label("Nothing to focus");
+                    });
+                }
+            },
+            (),
+        );
+    assert!(h.try_run().is_ok(), "the dialog keeps asking for repaints");
+}
+
+#[test]
+fn footer_tab_order_matches_its_layout() {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(600.0, 300.0))
+        .build_ui_state(
+            |ui, _: &mut ()| {
+                if crate::testutil::themed(ui) {
+                    footer(
+                        ui,
+                        &[
+                            (ButtonKind::Quiet, "Cancel"),
+                            (ButtonKind::Danger, "Overwrite"),
+                            (ButtonKind::Primary, "Export"),
+                        ],
+                    );
+                }
+            },
+            (),
+        );
+    h.run();
+    h.get_by_label("Cancel").focus();
+    h.run();
+    let xs: Vec<f32> = ["Cancel", "Overwrite", "Export"]
+        .iter()
+        .map(|l| h.get_by_label(l).rect().min.x)
+        .collect();
+    assert!(xs[0] < xs[1] && xs[1] < xs[2], "left to right: {xs:?}");
+    let mut order = vec!["Cancel"];
+    for _ in 0..2 {
+        h.key_press(Key::Tab);
+        h.run();
+        let now = ["Cancel", "Overwrite", "Export"]
+            .into_iter()
+            .find(|l| h.get_by_label(l).is_focused())
+            .expect("a footer button has focus");
+        order.push(now);
+    }
+    assert_eq!(order, ["Cancel", "Overwrite", "Export"]);
+}
+
+#[test]
+fn text_is_legible_on_the_card() {
+    use crate::theme::{contrast_ratio, palette::*};
+    for t in [
+        TEXT_STRONG,
+        TEXT_EMPHASIS,
+        TEXT_BODY,
+        TEXT_MUTED,
+        TEXT_SUBTLE,
+    ] {
+        assert!(contrast_ratio(t, SURFACE_700) >= 4.5, "{t:?}");
     }
 }
 

@@ -27,20 +27,28 @@ pub struct DialogResponse<R> {
     /// What the body closure returned.
     pub inner: R,
     /// Esc was pressed or the backdrop was clicked. The caller decides
-    /// whether to close.
+    /// whether to close, and normally should. Esc also reports close when
+    /// pressed in a text field (egui clears the field's focus first): a
+    /// caller that keeps the dialog open must accept that focus is then
+    /// nowhere until the user Tabs to the first control.
     pub close: bool,
 }
+
+/// Passes after opening in which the dialog asks for initial focus.
+const FOCUS_PASSES: u8 = 4;
 
 /// The card frame of a dialog: raised surface, strong border, card radius.
 pub fn dialog_frame() -> Frame {
     Frame::new()
-        .fill(SURFACE_800)
+        .fill(SURFACE_700)
         .stroke(Stroke::new(1.0, BORDER_STRONG))
         .corner_radius(CornerRadius::same(radius::CARD))
         .inner_margin(Margin::same(space::XL as i8))
 }
 
 impl Dialog<'_> {
+    #[doc(hidden)]
+    /// For inline previews (the gallery); real dialogs use [`Dialog::show`].
     /// Draw the title and `body` in the dialog's card, without a modal or
     /// backdrop (the gallery shows this inline).
     pub fn contents<R>(&self, ui: &mut Ui, body: impl FnOnce(&mut Ui) -> R) -> R {
@@ -60,18 +68,20 @@ impl Dialog<'_> {
         body: impl FnOnce(&mut Ui) -> R,
     ) -> DialogResponse<R> {
         // Initial focus. A newly opened dialog (not shown on the previous
-        // pass) asks for the first control's focus on every pass until some
-        // control has it: egui's first area pass is a hidden sizing pass.
+        // pass) asks for the first control's focus for a few passes, until
+        // it lands once: egui's first area pass is a hidden sizing pass.
+        // Never after that, so a click on blank space is left alone and a
+        // body with no control does not repaint forever.
         let pass = ctx.cumulative_pass_nr();
         let key = id.with("dialog_state");
-        let (last, had_focus): (u64, bool) = ctx.data(|d| d.get_temp(key)).unwrap_or((0, false));
+        let (last, tries): (u64, u8) = ctx.data(|d| d.get_temp(key)).unwrap_or((0, 0));
         let fresh = last == 0 || last + 1 < pass;
-        let pending = fresh || !had_focus;
+        let tries = if fresh { FOCUS_PASSES } else { tries };
         let modal = Modal::new(id)
             .backdrop_color(Color32::from_black_alpha(DIALOG_BACKDROP_ALPHA))
             .frame(dialog_frame())
             .show(ctx, |ui| {
-                if pending {
+                if tries > 0 {
                     ui.memory_mut(|m| {
                         if fresh && let Some(f) = m.focused() {
                             // Focus left on whatever opened the dialog.
@@ -83,8 +93,9 @@ impl Dialog<'_> {
                 }
                 self.contents(ui, body)
             });
-        let has_focus = ctx.memory(|m| m.focused()).is_some();
-        ctx.data_mut(|d| d.insert_temp(key, (pass, (!fresh && had_focus) || has_focus)));
+        let landed = ctx.memory(|m| m.focused()).is_some();
+        let left = if landed { 0 } else { tries.saturating_sub(1) };
+        ctx.data_mut(|d| d.insert_temp(key, (pass, left)));
         DialogResponse {
             close: modal.should_close(),
             inner: modal.inner,
@@ -93,18 +104,33 @@ impl Dialog<'_> {
 }
 
 /// A right-aligned row of buttons, given left to right (the primary action
-/// last). Returns the index of the one clicked this frame.
+/// last). Returns the index of the one clicked this frame. The buttons are
+/// laid out left to right, so Tab follows what the eye sees.
 pub fn footer(ui: &mut Ui, buttons: &[(ButtonKind, &str)]) -> Option<usize> {
     let mut clicked = None;
     ui.add_space(space::L);
-    let size = Vec2::new(ui.available_width(), CONTROL_HEIGHT);
-    ui.allocate_ui_with_layout(size, Layout::right_to_left(egui::Align::Center), |ui| {
+    // The row's width from the previous frame decides the leading space
+    // (the first frame repaints once to settle).
+    let key = ui.id().with("footer_width");
+    let known: Option<f32> = ui.data(|d| d.get_temp(key));
+    let avail = ui.available_width();
+    let width = known.unwrap_or(avail);
+    let size = Vec2::new(avail, CONTROL_HEIGHT);
+    let out = ui.allocate_ui_with_layout(size, Layout::left_to_right(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing = Vec2::splat(space::S);
-        for (i, (kind, label)) in buttons.iter().enumerate().rev() {
+        ui.add_space((avail - width).max(0.0));
+        let start = ui.cursor().min.x;
+        for (i, (kind, label)) in buttons.iter().enumerate() {
             if ui.add(MegaButton::new(*kind, *label)).clicked() {
                 clicked = Some(i);
             }
         }
+        ui.cursor().min.x - start - ui.spacing().item_spacing.x
     });
+    let measured = out.inner;
+    if known.is_none_or(|k| (k - measured).abs() > 0.5) {
+        ui.data_mut(|d| d.insert_temp(key, measured));
+        ui.ctx().request_repaint();
+    }
     clicked
 }
