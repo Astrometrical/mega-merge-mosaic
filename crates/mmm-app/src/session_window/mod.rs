@@ -847,14 +847,17 @@ impl SessionWindow {
     }
 
     /// Why the Export dialog cannot open now, if it cannot: an analysis
-    /// runs or is queued, or nothing is merged yet. Otherwise it opens,
-    /// whatever is ready: its rows say what is not.
+    /// waits for the running exports, runs or is queued, or nothing is
+    /// merged yet. Otherwise it opens, whatever is ready: its rows say what
+    /// is not.
     pub fn export_block_reason(
         &self,
         session: &OpenSession,
         jobs: &JobRunner,
     ) -> Option<&'static str> {
-        if jobs.analyzing() {
+        if jobs.analysis_waits_for_export() {
+            Some(crate::export_dialog::ANALYSIS_QUEUED)
+        } else if jobs.analyzing() {
             Some(crate::export_dialog::ANALYSING)
         } else if !session.merged {
             Some(crate::export_dialog::NOTHING_MERGED)

@@ -3404,6 +3404,12 @@ fn an_analysis_waits_behind_an_export() {
         tooltip: None,
     };
     assert_eq!(got[CHECKS_STEP], want);
+    // The Export dialog says why it waits: the analysis isn't running yet.
+    let w = SessionWindow::new(Arc::new(AskedFiles::default()));
+    assert_eq!(
+        w.export_block_reason(&s, &jobs),
+        Some(crate::export_dialog::ANALYSIS_QUEUED)
+    );
     // Cancel from the step drops the queued analysis and spares the export.
     super::top_bar::cancel_step(CHECKS_STEP, &mut jobs);
     let events = jobs.poll(&mut s);

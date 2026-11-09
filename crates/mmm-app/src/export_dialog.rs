@@ -105,6 +105,10 @@ const FALLBACK_NAME: &str = "export";
 
 /// Why Export waits for an analysis (and why the dialog cannot open).
 pub const ANALYSING: &str = "Waiting for the analysis to finish.";
+/// Why the dialog cannot open while an analysis waits for the running
+/// exports: once they end it runs, and what is ready may change.
+pub const ANALYSIS_QUEUED: &str =
+    "An analysis runs after the current exports. Export again once it has finished.";
 /// Why the dialog cannot open before anything is merged.
 pub const NOTHING_MERGED: &str = "Nothing is merged yet.";
 /// A row's reason while a merge of its group runs or is queued.
