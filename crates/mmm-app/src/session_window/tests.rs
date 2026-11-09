@@ -1282,6 +1282,115 @@ fn the_custom_form_creates_a_composite() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The label of the widget with the keyboard focus.
+fn focused_label(h: &Harness<'static, State>) -> Option<String> {
+    h.query(By::new().predicate(|n| n.is_focused()))
+        .and_then(|n| n.accesskit_node().label())
+}
+
+/// Press Tab until the focus is on `label` (bounded).
+fn tab_to(h: &mut Harness<'static, State>, label: &str) {
+    for _ in 0..30 {
+        if focused_label(h).as_deref() == Some(label) {
+            return;
+        }
+        h.key_press(egui::Key::Tab);
+        h.run_steps(2);
+    }
+    panic!(
+        "Tab never reached {label:?}; focus is on {:?}",
+        focused_label(h)
+    );
+}
+
+/// Focus the + chip and open its popover with `key`.
+fn open_plus_by_keyboard(h: &mut Harness<'static, State>, key: egui::Key) {
+    plus_chip(h).expect("a + chip").focus();
+    h.run_steps(2);
+    h.key_press(key);
+    h.run_steps(3);
+    h.get_by_label("Custom");
+}
+
+#[test]
+fn the_plus_popover_works_from_the_keyboard() {
+    let root = temp_dir("window-plus-keys");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    // Enter opens it and the focus lands on the first preset; Enter makes it.
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    assert_eq!(focused_label(&h).as_deref(), Some("HOO"));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(saved_comps(&h).len(), 1);
+    assert_eq!(saved_comps(&h)[0].1, "HOO");
+    assert!(h.query_by_label("Custom").is_none(), "the popover closed");
+    // The focus is back on the + chip; Space opens it again, Escape closes
+    // it and the focus is back again.
+    assert_eq!(focused_label(&h).as_deref(), Some("+"));
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    h.get_by_label("Custom");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.query_by_label("Custom").is_none());
+    assert_eq!(focused_label(&h).as_deref(), Some("+"));
+    assert_eq!(saved_comps(&h).len(), 1, "Escape makes nothing");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_custom_form_works_from_the_keyboard() {
+    let root = temp_dir("window-custom-keys");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    // Why Create is off shows without hovering.
+    h.get_by_label("Give it a name.");
+    // The name.
+    tab_to(&mut h, "Name");
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Keys");
+    h.run_steps(2);
+    h.get_by_label("Map at least one channel.");
+    // R from OIII, by keyboard; the pick closes its submenu.
+    tab_to(&mut h, "R: None");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    tab_to(&mut h, "OIII");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(
+        h.query(By::new().role(Role::Button).label("OIII"))
+            .is_none(),
+        "the submenu closed on the pick"
+    );
+    button(&h, "R: OIII");
+    // Create, by keyboard.
+    tab_to(&mut h, "Create");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(
+        saved_comps(&h),
+        [(1, "Keys".to_string(), vec![some("OIII"), None, None])]
+    );
+    assert!(h.query_by_label("Custom").is_none());
+    assert_eq!(focused_label(&h).as_deref(), Some("+"));
+    // A draft left open is dropped: close with Escape, reopen, it is empty.
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    tab_to(&mut h, "Name");
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Draft");
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    h.get_by_label("Give it a name.");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A composite mapping `group` to R.
 fn comp_of(id: u64, name: &str, group: &str) -> Composition {
     let mut c = Composition::new(name);

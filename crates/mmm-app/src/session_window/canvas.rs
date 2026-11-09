@@ -22,7 +22,6 @@ use std::path::Path;
 
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
-use mega_ui::widgets::menu::submenu;
 use mega_ui::widgets::{ChipMark, ChoiceChip, Segment, choice_chip, segmented_with};
 use mmm_core::mosaic::{OutOfDateReason, out_of_date_reason};
 
@@ -31,7 +30,7 @@ use super::steps::{draft_changed, out_of_date};
 use super::{COMPOSITES, CanvasMode, MERGE_SETTINGS, SessionWindow, compositions_of};
 use crate::bands::{group_bands, presets_for};
 use crate::checks::ChecksEngine;
-use crate::compositions::{Channels, Composition, ViewKind, create_composition, unique_name};
+use crate::compositions::{Channels, ViewKind, create_composition, unique_name};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
 use crate::mosaic_view::{CanvasTag, view_members};
@@ -681,6 +680,8 @@ fn one_row_width(ui: &egui::Ui, widths: &[f32]) -> f32 {
 struct CustomForm {
     name: String,
     channels: [Option<String>; 3],
+    /// The channel whose groups are listed.
+    open: Option<usize>,
 }
 
 /// The popover of the **+** chip `plus`: the presets the groups allow (one
@@ -692,14 +693,23 @@ fn plus_popover(
     groups: &[String],
     act: &mut BarActions,
 ) {
-    let list: Vec<Composition> = compositions_of(session);
-    let taken: Vec<String> = list.iter().map(|c| c.name.clone()).collect();
-    let bands = group_bands(session);
-    let presets = presets_for(&bands);
-    let key = plus.id.with("custom-form");
-    egui::Popup::menu(plus)
+    // Not the chip's id: the chip moves when a composite is added.
+    let key = egui::Id::new("mmm-plus-custom-form");
+    let open_key = egui::Id::new("mmm-plus-popover-open");
+    let shown = egui::Popup::menu(plus)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
+            // Only while open: what the popover offers.
+            let taken: Vec<String> = compositions_of(session)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            let bands = group_bands(session);
+            let presets = presets_for(&bands);
+            // Just opened: the keyboard starts on the first thing to pick.
+            let fresh = !ui.data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
+            ui.data_mut(|d| d.insert_temp(open_key, true));
+            let mut first = fresh;
             ui.label(text(Type::Small, "Presets"));
             if presets.is_empty() {
                 ui.label(text(Type::Small, "None: no group is named for a band."));
@@ -715,7 +725,11 @@ fn plus_popover(
                     })
                     .collect::<Vec<_>>()
                     .join(" · ");
-                if ui.button(p.label).on_hover_text(hint).clicked() {
+                let button = ui.button(p.label).on_hover_text(hint);
+                if std::mem::take(&mut first) {
+                    button.request_focus();
+                }
+                if button.clicked() {
                     act.create = Some((unique_name(p.label, &taken), mapping));
                     ui.close();
                 }
@@ -725,28 +739,46 @@ fn plus_popover(
             let mut form: CustomForm = ui.data(|d| d.get_temp(key)).unwrap_or_default();
             ui.horizontal(|ui| {
                 let label = ui.label("Name");
-                ui.text_edit_singleline(&mut form.name)
+                let field = ui
+                    .text_edit_singleline(&mut form.name)
                     .labelled_by(label.id);
+                if std::mem::take(&mut first) {
+                    field.request_focus();
+                }
             });
-            for (i, slot) in form.channels.iter_mut().enumerate() {
-                // A submenu, not a combo box: egui keeps one popup open at a
-                // time, so a combo's would close this one.
+            for i in 0..3 {
+                // Opened in place, not as a submenu or a combo box: egui
+                // keeps one popup open at a time, and a submenu's pick
+                // cannot close it without closing this one.
                 let label = format!(
                     "{}: {}",
                     channel_name(i, 3),
-                    slot.as_deref().unwrap_or("None")
+                    form.channels[i].as_deref().unwrap_or("None")
                 );
-                submenu(ui, &label, |ui| {
-                    if ui.selectable_label(slot.is_none(), "None").clicked() {
-                        *slot = None;
-                    }
-                    for g in groups {
-                        let picked = slot.as_deref() == Some(g.as_str());
-                        if ui.selectable_label(picked, g).clicked() {
-                            *slot = Some(g.clone());
+                let toggle = ui.button(label);
+                if toggle.clicked() {
+                    form.open = if form.open == Some(i) { None } else { Some(i) };
+                }
+                if form.open == Some(i) {
+                    let mut picked = None;
+                    ui.indent(("custom-options", i), |ui| {
+                        let current = form.channels[i].clone();
+                        if ui.selectable_label(current.is_none(), "None").clicked() {
+                            picked = Some(None);
                         }
+                        for g in groups {
+                            let on = current.as_deref() == Some(g.as_str());
+                            if ui.selectable_label(on, g).clicked() {
+                                picked = Some(Some(g.clone()));
+                            }
+                        }
+                    });
+                    if let Some(pick) = picked {
+                        form.channels[i] = pick;
+                        form.open = None;
+                        toggle.request_focus();
                     }
-                });
+                }
             }
             let name = form.name.trim().to_string();
             let why = if name.is_empty() {
@@ -758,15 +790,37 @@ fn plus_popover(
             } else {
                 None
             };
+            // Said in the form too: a keyboard user never hovers a disabled
+            // button.
+            if let Some(why) = why {
+                ui.label(text(Type::Small, why));
+            }
             let create = ui
                 .add_enabled(why.is_none(), egui::Button::new("Create"))
                 .on_disabled_hover_text(why.unwrap_or_default());
             if create.clicked() {
-                let channels = form.channels.clone().map(|g| g.map(|g| (g, 1.0)));
+                // A group that has gone since it was picked maps nothing.
+                let channels = form
+                    .channels
+                    .clone()
+                    .map(|g| g.filter(|g| groups.contains(g)).map(|g| (g, 1.0)));
                 act.create = Some((name, channels));
                 form = CustomForm::default();
                 ui.close();
             }
             ui.data_mut(|d| d.insert_temp(key, form));
         });
+    if shown.is_none() {
+        let ctx = plus.ctx.clone();
+        let was_open = ctx.data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
+        if was_open {
+            // Closed (a pick, Escape or a click outside): the draft goes and
+            // the keyboard goes back to the chip.
+            ctx.data_mut(|d| {
+                d.insert_temp(open_key, false);
+                d.remove::<CustomForm>(key);
+            });
+            plus.request_focus();
+        }
+    }
 }
