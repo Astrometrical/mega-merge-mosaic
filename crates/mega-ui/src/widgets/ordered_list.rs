@@ -7,7 +7,8 @@
 //!   "go to"); Enter on a focused row does the same.
 //! - A double-click, F2 on a focused row, or the **Rename** action edits the
 //!   name in place. Enter or leaving the field commits, Esc cancels, and a
-//!   name that is empty once trimmed is refused (the field stays open).
+//!   name that is empty once trimmed is refused on Enter (the field stays
+//!   open) and cancels the rename when focus leaves the field.
 //! - Drag a row to reorder it; a line shows where it would land. Every row
 //!   also has **Move up** and **Move down** actions for keyboards (disabled
 //!   at the ends), and **Delete**.
@@ -371,8 +372,13 @@ impl ListUi {
         if escaped || name == row.label {
             state.editing = None;
         } else if name.is_empty() {
-            // Refused: the field stays, ready to type again.
-            edit.fresh = true;
+            if ui.input(|i| i.key_pressed(Key::Enter)) {
+                // Refused: the field stays, ready to type again.
+                edit.fresh = true;
+            } else {
+                // Focus went elsewhere: nothing to commit, so cancel.
+                state.editing = None;
+            }
         } else {
             events.push(ListEvent::Rename(row.id, name));
             state.editing = None;
@@ -404,24 +410,47 @@ impl ListUi {
                 .layout(Layout::left_to_right(Align::Center)),
         );
         child.spacing_mut().item_spacing.x = space::XS;
-        let button = |ui: &mut Ui, enabled: bool, glyph, tooltip, kind| {
-            ui.add_enabled(enabled, icon_button_of(kind, glyph, tooltip))
+        // The accessible label names the row; the tooltip stays generic.
+        let button = |ui: &mut Ui, enabled: bool, glyph, verb: &str, label: String, kind| {
+            let button = icon_button_of(kind, glyph, &label).hover_text(verb);
+            ui.add_enabled(enabled, button)
         };
+        let name = row.label;
         let quiet = ButtonKind::Quiet;
-        let rename = button(&mut child, true, icons::PENCIL, "Rename", quiet);
-        let up = button(&mut child, index > 0, icons::ARROW_UP, "Move up", quiet);
+        let rename_label = format!("Rename {name}");
+        let rename = button(
+            &mut child,
+            true,
+            icons::PENCIL,
+            "Rename",
+            rename_label,
+            quiet,
+        );
+        let up_label = format!("Move {name} up");
+        let up = button(
+            &mut child,
+            index > 0,
+            icons::ARROW_UP,
+            "Move up",
+            up_label,
+            quiet,
+        );
+        let down_label = format!("Move {name} down");
         let down = button(
             &mut child,
             index + 1 < count,
             icons::ARROW_DOWN,
             "Move down",
+            down_label,
             quiet,
         );
+        let delete_label = format!("Delete {name}");
         let delete = button(
             &mut child,
             true,
             icons::TRASH_2,
             "Delete",
+            delete_label,
             ButtonKind::Danger,
         );
         ui.data_mut(|d| d.insert_temp(key, [rename.id, up.id, down.id, delete.id]));
@@ -456,10 +485,9 @@ impl ListUi {
         if !bounds.contains(pointer) {
             return None;
         }
-        let gap = rects.iter().filter(|r| r.center().y < pointer.y).count();
         let from = rows.iter().position(|r| r.id == id)?;
-        let to = if gap > from { gap - 1 } else { gap };
-        (to != from).then_some(to)
+        let centres: Vec<f32> = rects.iter().map(|r| r.center().y).collect();
+        drop_index(&centres, from, pointer.y)
     }
 
     /// While dragging row `id`: a line where it would land.
@@ -470,18 +498,34 @@ impl ListUi {
         let Some(from) = rows.iter().position(|r| r.id == id) else {
             return;
         };
-        // The gap the drop lands in, in the list before the row leaves it.
-        let gap = if to > from { to + 1 } else { to };
-        let y = if gap == 0 {
-            rects[0].top() - space::XS / 2.0
-        } else if gap == rects.len() {
-            rects[gap - 1].bottom() + space::XS / 2.0
-        } else {
-            (rects[gap - 1].bottom() + rects[gap].top()) / 2.0
-        };
+        let y = line_gap(rects, to, from);
         let x = rects[0].x_range();
         let line = Rect::from_x_y_ranges(x, (y - LINE_WIDTH / 2.0)..=(y + LINE_WIDTH / 2.0));
         ui.painter().rect_filled(line, 0.0, ACCENT_400);
+    }
+}
+
+/// Where a row currently at index `from` lands when dropped with the
+/// pointer at height `y`, given the heights of the rows' centres: before
+/// the first row whose centre is below the pointer, as an index once the
+/// row has left its old place. `None` if that is where it already is.
+pub(super) fn drop_index(centres: &[f32], from: usize, y: f32) -> Option<usize> {
+    let gap = centres.iter().filter(|&&c| c < y).count();
+    let to = if gap > from { gap - 1 } else { gap };
+    (to != from).then_some(to)
+}
+
+/// The height of the insertion line for a row moving from index `from` to
+/// `to`: in the gap between the rows around the slot it lands in (counted
+/// in the list before the row leaves it), half a spacing outside the ends.
+pub(super) fn line_gap(rects: &[Rect], to: usize, from: usize) -> f32 {
+    let gap = if to > from { to + 1 } else { to };
+    if gap == 0 {
+        rects[0].top() - space::XS / 2.0
+    } else if gap == rects.len() {
+        rects[gap - 1].bottom() + space::XS / 2.0
+    } else {
+        (rects[gap - 1].bottom() + rects[gap].top()) / 2.0
     }
 }
 

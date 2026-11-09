@@ -479,401 +479,399 @@ pub fn show_page(ui: &mut Ui, state: &mut GalleryState, page: usize) {
 fn sections(ui: &mut Ui, state: &mut GalleryState, page: Option<usize>) {
     let now = ui.input(|i| i.time);
     let on = |p: usize| page.is_none_or(|x| x == p);
-    {
-        if on(0) {
-            section(ui, "Type scale", |ui| {
-                for (t, spec, sample) in [
-                    (Type::Hero, "hero · 32 / semibold", "Carina Nebula SHO"),
-                    (Type::Title, "title · 20 / semibold", "Mosaic plan"),
-                    (Type::Heading, "heading · 15 / semibold", "Overlap analysis"),
-                    (
-                        Type::Body,
-                        "body · 13",
-                        "18 panels registered to a shared reference frame.",
-                    ),
-                    (Type::Small, "small · 12", "Opened 2 days ago"),
-                    (Type::Overline, "overline · 10.5 caps", "Recent sessions"),
-                    (
-                        Type::Numeric,
-                        "numeric · mono 12",
-                        "24 310 × 15 870 px · 1.62″/px",
-                    ),
-                ] {
-                    ui.horizontal(|ui| {
-                        let (r, _) = ui.allocate_exact_size(Vec2::new(180.0, 18.0), Sense::hover());
-                        ui.painter().text(
-                            r.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            spec,
-                            FontId::monospace(11.0),
-                            TEXT_SUBTLE,
-                        );
-                        ui.label(text(t, sample));
-                    });
+    if on(0) {
+        section(ui, "Type scale", |ui| {
+            for (t, spec, sample) in [
+                (Type::Hero, "hero · 32 / semibold", "Carina Nebula SHO"),
+                (Type::Title, "title · 20 / semibold", "Mosaic plan"),
+                (Type::Heading, "heading · 15 / semibold", "Overlap analysis"),
+                (
+                    Type::Body,
+                    "body · 13",
+                    "18 panels registered to a shared reference frame.",
+                ),
+                (Type::Small, "small · 12", "Opened 2 days ago"),
+                (Type::Overline, "overline · 10.5 caps", "Recent sessions"),
+                (
+                    Type::Numeric,
+                    "numeric · mono 12",
+                    "24 310 × 15 870 px · 1.62″/px",
+                ),
+            ] {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(180.0, 18.0), Sense::hover());
+                    ui.painter().text(
+                        r.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        spec,
+                        FontId::monospace(11.0),
+                        TEXT_SUBTLE,
+                    );
+                    ui.label(text(t, sample));
+                });
+            }
+        });
+
+        section(ui, "Text roles", |ui| {
+            for (c, role) in [
+                (TEXT_STRONG, "strong #eee: headings, primary values"),
+                (
+                    TEXT_EMPHASIS,
+                    "emphasis #d0d0d0: lead text, property values",
+                ),
+                (TEXT_BODY, "body #aaa: default"),
+                (TEXT_MUTED, "muted #999: secondary, labels"),
+                (TEXT_SUBTLE, "subtle #8a8a8a: captions, placeholders"),
+            ] {
+                ui.label(RichText::new(role).color(c));
+            }
+        });
+
+        section(ui, "Surfaces", |ui| {
+            ui.horizontal(|ui| {
+                swatch(ui, SURFACE_900, "900 window");
+                swatch(ui, SURFACE_800, "800 panel");
+                swatch(ui, SURFACE_700, "700 raised");
+                swatch(ui, BORDER, "600 border");
+                swatch(ui, BORDER_STRONG, "500 strong");
+            });
+        });
+
+        section(ui, "Semantic colours", |ui| {
+            ui.horizontal(|ui| {
+                swatch(ui, ACCENT_500, "accent OIII");
+                swatch(ui, GREEN_300, "passed");
+                swatch(ui, SII_400, "warn SII");
+                swatch(ui, HA_500, "problem Hα");
+                swatch(ui, HA_400, "Hα text");
+            });
+        });
+
+        section(ui, "Group palette", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (i, c) in GROUP_PALETTE.iter().enumerate() {
+                    swatch(ui, *c, &format!("slot {i}"));
                 }
             });
+        });
 
-            section(ui, "Text roles", |ui| {
-                for (c, role) in [
-                    (TEXT_STRONG, "strong #eee: headings, primary values"),
+        section(ui, "Buttons", |ui| {
+            ui.horizontal(|ui| {
+                ui.add(MegaButton::new(ButtonKind::Primary, "New mosaic").icon(icons::PLUS));
+                ui.add(MegaButton::new(ButtonKind::Secondary, "Secondary"));
+                ui.add(MegaButton::new(ButtonKind::Quiet, "Quiet"));
+                ui.add(MegaButton::new(ButtonKind::Danger, "Remove panel"));
+                ui.add_enabled(false, MegaButton::new(ButtonKind::Secondary, "Disabled"));
+                ui.add(icon_button(icons::PIN, "Pin session"));
+                ui.add(icon_button(icons::SEARCH, "Search"));
+            });
+            ui.add_space(space::S);
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 66.0), Sense::hover());
+            imagery(ui, rect);
+            let inner = rect.shrink(space::L);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(MegaButton::new(ButtonKind::Primary, "Resume session").large());
+                    ui.add(MegaButton::new(ButtonKind::Ghost, "Ghost, over imagery"));
+                });
+            });
+        });
+
+        section(ui, "Inputs", |ui| {
+            text_input(ui, &mut state.name, "Session name");
+            ui.add_space(space::S);
+            segmented(
+                ui,
+                &mut state.segment,
+                &[(0, "Composite"), (1, "Hα"), (2, "OIII"), (3, "SII")],
+            );
+            ui.add_space(space::S);
+            let (notes, mode) = (&mut state.notes, &mut state.notes_mode);
+            notes_view(ui, notes, mode, "Notes about this session", true);
+        });
+
+        section(ui, "Chips", |ui| {
+            ui.horizontal(|ui| {
+                chip(ui, "18 panels", None);
+                chip(ui, "Hα · 6", Some(GROUP_PALETTE[0]));
+                chip(ui, "OIII · 6", Some(GROUP_PALETTE[2]));
+                chip(ui, "SII · 6", Some(GROUP_PALETTE[3]));
+                chip(ui, "L", None);
+                chip(ui, "OSC", None);
+                chip(ui, "Ha_3nm_2026-10-12_flat-corrected_master_light", None);
+            });
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                for (label, color, selected, dashed, mark) in [
+                    ("Hα", Some(GROUP_PALETTE[0]), true, false, None),
+                    ("OIII", Some(GROUP_PALETTE[2]), false, false, None),
+                    ("Composite", None, false, true, None),
+                    ("Composite", None, true, true, None),
                     (
-                        TEXT_EMPHASIS,
-                        "emphasis #d0d0d0: lead text, property values",
+                        "SII",
+                        Some(GROUP_PALETTE[1]),
+                        false,
+                        false,
+                        Some(ChipMark::Attention),
                     ),
-                    (TEXT_BODY, "body #aaa: default"),
-                    (TEXT_MUTED, "muted #999: secondary, labels"),
-                    (TEXT_SUBTLE, "subtle #8a8a8a: captions, placeholders"),
+                    (
+                        "Hα",
+                        Some(GROUP_PALETTE[0]),
+                        false,
+                        false,
+                        Some(ChipMark::Changed),
+                    ),
                 ] {
-                    ui.label(RichText::new(role).color(c));
+                    choice_chip(
+                        ui,
+                        &ChoiceChip {
+                            label,
+                            color,
+                            selected,
+                            dashed,
+                            mark,
+                        },
+                    );
                 }
             });
+        });
 
-            section(ui, "Surfaces", |ui| {
-                ui.horizontal(|ui| {
-                    swatch(ui, SURFACE_900, "900 window");
-                    swatch(ui, SURFACE_800, "800 panel");
-                    swatch(ui, SURFACE_700, "700 raised");
-                    swatch(ui, BORDER, "600 border");
-                    swatch(ui, BORDER_STRONG, "500 strong");
-                });
-            });
-
-            section(ui, "Semantic colours", |ui| {
-                ui.horizontal(|ui| {
-                    swatch(ui, ACCENT_500, "accent OIII");
-                    swatch(ui, GREEN_300, "passed");
-                    swatch(ui, SII_400, "warn SII");
-                    swatch(ui, HA_500, "problem Hα");
-                    swatch(ui, HA_400, "Hα text");
-                });
-            });
-
-            section(ui, "Group palette", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (i, c) in GROUP_PALETTE.iter().enumerate() {
-                        swatch(ui, *c, &format!("slot {i}"));
-                    }
-                });
-            });
-
-            section(ui, "Buttons", |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(MegaButton::new(ButtonKind::Primary, "New mosaic").icon(icons::PLUS));
-                    ui.add(MegaButton::new(ButtonKind::Secondary, "Secondary"));
-                    ui.add(MegaButton::new(ButtonKind::Quiet, "Quiet"));
-                    ui.add(MegaButton::new(ButtonKind::Danger, "Remove panel"));
-                    ui.add_enabled(false, MegaButton::new(ButtonKind::Secondary, "Disabled"));
-                    ui.add(icon_button(icons::PIN, "Pin session"));
-                    ui.add(icon_button(icons::SEARCH, "Search"));
-                });
-                ui.add_space(space::S);
-                let (rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 66.0), Sense::hover());
-                imagery(ui, rect);
-                let inner = rect.shrink(space::L);
-                ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(MegaButton::new(ButtonKind::Primary, "Resume session").large());
-                        ui.add(MegaButton::new(ButtonKind::Ghost, "Ghost, over imagery"));
-                    });
-                });
-            });
-
-            section(ui, "Inputs", |ui| {
-                text_input(ui, &mut state.name, "Session name");
-                ui.add_space(space::S);
-                segmented(
-                    ui,
-                    &mut state.segment,
-                    &[(0, "Composite"), (1, "Hα"), (2, "OIII"), (3, "SII")],
-                );
-                ui.add_space(space::S);
-                let (notes, mode) = (&mut state.notes, &mut state.notes_mode);
-                notes_view(ui, notes, mode, "Notes about this session", true);
-            });
-
-            section(ui, "Chips", |ui| {
-                ui.horizontal(|ui| {
-                    chip(ui, "18 panels", None);
-                    chip(ui, "Hα · 6", Some(GROUP_PALETTE[0]));
-                    chip(ui, "OIII · 6", Some(GROUP_PALETTE[2]));
-                    chip(ui, "SII · 6", Some(GROUP_PALETTE[3]));
-                    chip(ui, "L", None);
-                    chip(ui, "OSC", None);
-                    chip(ui, "Ha_3nm_2026-10-12_flat-corrected_master_light", None);
-                });
-                ui.add_space(space::S);
-                ui.horizontal(|ui| {
-                    for (label, color, selected, dashed, mark) in [
-                        ("Hα", Some(GROUP_PALETTE[0]), true, false, None),
-                        ("OIII", Some(GROUP_PALETTE[2]), false, false, None),
-                        ("Composite", None, false, true, None),
-                        ("Composite", None, true, true, None),
-                        (
-                            "SII",
-                            Some(GROUP_PALETTE[1]),
-                            false,
-                            false,
-                            Some(ChipMark::Attention),
-                        ),
-                        (
-                            "Hα",
-                            Some(GROUP_PALETTE[0]),
-                            false,
-                            false,
-                            Some(ChipMark::Changed),
-                        ),
-                    ] {
-                        choice_chip(
-                            ui,
-                            &ChoiceChip {
-                                label,
-                                color,
-                                selected,
-                                dashed,
-                                mark,
+        section(ui, "Step strip", |ui| {
+            let step = |label: &str, state| StripStep {
+                label: label.to_owned(),
+                state,
+                cancellable: false,
+                tooltip: None,
+            };
+            step_strip(
+                ui,
+                &[
+                    step("Todo", StepState::Todo),
+                    step("Next", StepState::Next),
+                    step("Done", StepState::Done),
+                    step("Warn", StepState::Warn),
+                    StripStep {
+                        cancellable: true,
+                        ..step(
+                            "Merging",
+                            StepState::Working {
+                                fraction: Some(0.43),
                             },
-                        );
+                        )
+                    },
+                ],
+            );
+        });
+    }
+    if on(1) {
+        section(ui, "Inspector", |ui| {
+            let sections = [
+                Section {
+                    id: "display",
+                    title: "Display",
+                    badge: None,
+                },
+                Section {
+                    id: "problems",
+                    title: "Problems",
+                    badge: Some(Badge {
+                        text: "2".to_owned(),
+                        tone: Tone::Warning,
+                    }),
+                },
+                Section {
+                    id: "notes",
+                    title: "Notes",
+                    badge: None,
+                },
+            ];
+            let width = inspector_width(&state.inspector);
+            ui.allocate_ui(Vec2::new(width, 240.0), |ui| {
+                inspector(ui, &mut state.inspector, &sections, |ui, id| {
+                    ui.label(format!("{id} body"));
+                });
+            });
+        });
+
+        section(ui, "Table", |ui| {
+            ui.scope(|ui| {
+                ui.set_max_width(640.0);
+                table_section(ui, &mut state.table, &mut state.table_selection);
+            });
+        });
+
+        section(ui, "Ordered list", |ui| {
+            ui.scope(|ui| {
+                ui.set_max_width(360.0);
+                ordered_list_section(ui, &mut state.list, &mut state.list_rows);
+            });
+        });
+
+        section(ui, "Plan canvas", |ui| {
+            let ctx = ui.ctx().clone();
+            let plan = state.plan.get_or_insert_with(|| gallery_plan(&ctx));
+            ui.allocate_ui(Vec2::new(640.0, 280.0), |ui| {
+                let _ = plan.canvas.show(ui, PLAN_EXTENT, &plan.items, true, true);
+            });
+        });
+
+        section(ui, "Status", |ui| {
+            ui.horizontal(|ui| {
+                status(ui, Tone::Success, "Merged");
+                status(ui, Tone::Info, "Plan ready");
+                status(ui, Tone::Warning, "Re-merge needed");
+                status(ui, Tone::Problem, "1 problem");
+                status(ui, Tone::Neutral, "No panels");
+            });
+        });
+
+        section(ui, "Check list", |ui| {
+            ui.set_max_width(560.0);
+            let _ = checks_list(ui, "Checks", &state.checks, None);
+        });
+
+        section(ui, "Property grid", |ui| {
+            property_grid(ui, "gallery-props", |ui| {
+                property_row_numeric(ui, "Canvas", "24 310 × 15 870 px");
+                property_row_numeric(ui, "Scale", "1.62″/px");
+                property_row(ui, "Exports", "3 groups, 1 composite");
+                property_row_ui(ui, "Merged", |ui| {
+                    status(ui, Tone::Warning, "2 panels added since");
+                });
+            });
+        });
+
+        section(ui, "Progress", |ui| {
+            ui.set_max_width(560.0);
+            progress(ui, "Merging OIII", Some(0.62), "62% · 0:41 left");
+            ui.add_space(space::S);
+            progress(ui, "Reading headers", None, "12 files");
+        });
+
+        section(ui, "Toasts", |ui| {
+            if ui
+                .add(MegaButton::new(ButtonKind::Secondary, "Show a toast"))
+                .clicked()
+            {
+                state.toasts.push(
+                    Toast {
+                        tone: Tone::Success,
+                        title: "Export finished".into(),
+                        detail: Some("4 files · D:\\Astro\\Carina\\export".into()),
+                        action: Some("Show".into()),
+                    },
+                    now,
+                );
+            }
+        });
+
+        section(ui, "Icons", |ui| {
+            egui::Grid::new("gallery-icons")
+                .num_columns(6)
+                .spacing(Vec2::new(space::XL, space::S))
+                .show(ui, |ui| {
+                    for (i, (name, glyph)) in icons::ALL.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(icons::rich(*glyph, 18.0).color(TEXT_STRONG));
+                            ui.label(
+                                RichText::new(*name)
+                                    .text_style(TextStyle::Small)
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                        if i % 6 == 5 {
+                            ui.end_row();
+                        }
                     }
                 });
+        });
+    }
+    if on(2) {
+        section(ui, "Brand lockup", |ui| {
+            let images = state.brand.get_or_insert_with(|| {
+                BrandImages::load(ui.ctx(), brand::MEGA_MERGE_MOSAIC_PNG, "Mega Merge Mosaic")
             });
+            brand::lockup(ui, images, LockupSize::Compact);
+            ui.add_space(space::L);
+            brand::lockup(ui, images, LockupSize::Large);
+        });
 
-            section(ui, "Step strip", |ui| {
-                let step = |label: &str, state| StripStep {
-                    label: label.to_owned(),
-                    state,
-                    cancellable: false,
-                    tooltip: None,
+        section(ui, "Starfield", |ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(560.0, 160.0), Sense::hover());
+            ui.painter().rect_filled(rect, 0.0, SURFACE_900);
+            state
+                .starfield
+                .paint(&ui.painter().with_clip_rect(rect), rect);
+        });
+
+        section(ui, "Hero stage", |ui| {
+            let hero = state
+                .hero
+                .get_or_insert_with(|| gallery_hero([640, 480], [1, 1]));
+            hero_section(ui, hero);
+        });
+
+        // A portrait mosaic of 2 × 4 panels (the aspect of 9255 × 18310) in
+        // the landscape image area: it fills the area, cropped top and
+        // bottom, with no hard edges.
+        section(ui, "Hero stage · portrait mosaic", |ui| {
+            let hero = state
+                .portrait_hero
+                .get_or_insert_with(|| gallery_hero([243, 480], [2, 4]));
+            hero_section(ui, hero);
+        });
+
+        section(ui, "Session cards", |ui| {
+            let ctx = ui.ctx().clone();
+            let thumbs = state.card_thumbs.get_or_insert_with(|| {
+                let tex = |name: &str, a, b| {
+                    ctx.load_texture(
+                        name,
+                        gradient_image([200, 80], a, b),
+                        TextureOptions::LINEAR,
+                    )
                 };
-                step_strip(
+                [
+                    tex("gallery-card-a", ACCENT_600, HA_500),
+                    tex("gallery-card-b", SURFACE_700, ACCENT_500),
+                ]
+            });
+            ui.horizontal_wrapped(|ui| {
+                let status = Some((Tone::Success, "Merged"));
+                let base = |title, thumb| SessionCardData {
+                    title,
+                    status,
+                    pinned: false,
+                    dimmed: false,
+                    selected: false,
+                    thumbnail: Some(thumb),
+                };
+                let _ = session_card(ui, &base("Normal", &thumbs[0]));
+                let _ = session_card(
                     ui,
-                    &[
-                        step("Todo", StepState::Todo),
-                        step("Next", StepState::Next),
-                        step("Done", StepState::Done),
-                        step("Warn", StepState::Warn),
-                        StripStep {
-                            cancellable: true,
-                            ..step(
-                                "Merging",
-                                StepState::Working {
-                                    fraction: Some(0.43),
-                                },
-                            )
-                        },
-                    ],
+                    &SessionCardData {
+                        selected: true,
+                        ..base("Selected", &thumbs[1])
+                    },
+                );
+                let _ = session_card(
+                    ui,
+                    &SessionCardData {
+                        pinned: true,
+                        ..base("Pinned", &thumbs[0])
+                    },
+                );
+                let _ = session_card(
+                    ui,
+                    &SessionCardData {
+                        dimmed: true,
+                        status: Some((Tone::Warning, "Missing")),
+                        ..base("Dimmed", &thumbs[1])
+                    },
                 );
             });
-        }
-        if on(1) {
-            section(ui, "Inspector", |ui| {
-                let sections = [
-                    Section {
-                        id: "display",
-                        title: "Display",
-                        badge: None,
-                    },
-                    Section {
-                        id: "problems",
-                        title: "Problems",
-                        badge: Some(Badge {
-                            text: "2".to_owned(),
-                            tone: Tone::Warning,
-                        }),
-                    },
-                    Section {
-                        id: "notes",
-                        title: "Notes",
-                        badge: None,
-                    },
-                ];
-                let width = inspector_width(&state.inspector);
-                ui.allocate_ui(Vec2::new(width, 240.0), |ui| {
-                    inspector(ui, &mut state.inspector, &sections, |ui, id| {
-                        ui.label(format!("{id} body"));
-                    });
-                });
-            });
-
-            section(ui, "Table", |ui| {
-                ui.scope(|ui| {
-                    ui.set_max_width(640.0);
-                    table_section(ui, &mut state.table, &mut state.table_selection);
-                });
-            });
-
-            section(ui, "Ordered list", |ui| {
-                ui.scope(|ui| {
-                    ui.set_max_width(360.0);
-                    ordered_list_section(ui, &mut state.list, &mut state.list_rows);
-                });
-            });
-
-            section(ui, "Plan canvas", |ui| {
-                let ctx = ui.ctx().clone();
-                let plan = state.plan.get_or_insert_with(|| gallery_plan(&ctx));
-                ui.allocate_ui(Vec2::new(640.0, 280.0), |ui| {
-                    let _ = plan.canvas.show(ui, PLAN_EXTENT, &plan.items, true, true);
-                });
-            });
-
-            section(ui, "Status", |ui| {
-                ui.horizontal(|ui| {
-                    status(ui, Tone::Success, "Merged");
-                    status(ui, Tone::Info, "Plan ready");
-                    status(ui, Tone::Warning, "Re-merge needed");
-                    status(ui, Tone::Problem, "1 problem");
-                    status(ui, Tone::Neutral, "No panels");
-                });
-            });
-
-            section(ui, "Check list", |ui| {
-                ui.set_max_width(560.0);
-                let _ = checks_list(ui, "Checks", &state.checks, None);
-            });
-
-            section(ui, "Property grid", |ui| {
-                property_grid(ui, "gallery-props", |ui| {
-                    property_row_numeric(ui, "Canvas", "24 310 × 15 870 px");
-                    property_row_numeric(ui, "Scale", "1.62″/px");
-                    property_row(ui, "Exports", "3 groups, 1 composite");
-                    property_row_ui(ui, "Merged", |ui| {
-                        status(ui, Tone::Warning, "2 panels added since");
-                    });
-                });
-            });
-
-            section(ui, "Progress", |ui| {
-                ui.set_max_width(560.0);
-                progress(ui, "Merging OIII", Some(0.62), "62% · 0:41 left");
-                ui.add_space(space::S);
-                progress(ui, "Reading headers", None, "12 files");
-            });
-
-            section(ui, "Toasts", |ui| {
-                if ui
-                    .add(MegaButton::new(ButtonKind::Secondary, "Show a toast"))
-                    .clicked()
-                {
-                    state.toasts.push(
-                        Toast {
-                            tone: Tone::Success,
-                            title: "Export finished".into(),
-                            detail: Some("4 files · D:\\Astro\\Carina\\export".into()),
-                            action: Some("Show".into()),
-                        },
-                        now,
-                    );
-                }
-            });
-
-            section(ui, "Icons", |ui| {
-                egui::Grid::new("gallery-icons")
-                    .num_columns(6)
-                    .spacing(Vec2::new(space::XL, space::S))
-                    .show(ui, |ui| {
-                        for (i, (name, glyph)) in icons::ALL.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.label(icons::rich(*glyph, 18.0).color(TEXT_STRONG));
-                                ui.label(
-                                    RichText::new(*name)
-                                        .text_style(TextStyle::Small)
-                                        .color(TEXT_MUTED),
-                                );
-                            });
-                            if i % 6 == 5 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-            });
-        }
-        if on(2) {
-            section(ui, "Brand lockup", |ui| {
-                let images = state.brand.get_or_insert_with(|| {
-                    BrandImages::load(ui.ctx(), brand::MEGA_MERGE_MOSAIC_PNG, "Mega Merge Mosaic")
-                });
-                brand::lockup(ui, images, LockupSize::Compact);
-                ui.add_space(space::L);
-                brand::lockup(ui, images, LockupSize::Large);
-            });
-
-            section(ui, "Starfield", |ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(560.0, 160.0), Sense::hover());
-                ui.painter().rect_filled(rect, 0.0, SURFACE_900);
-                state
-                    .starfield
-                    .paint(&ui.painter().with_clip_rect(rect), rect);
-            });
-
-            section(ui, "Hero stage", |ui| {
-                let hero = state
-                    .hero
-                    .get_or_insert_with(|| gallery_hero([640, 480], [1, 1]));
-                hero_section(ui, hero);
-            });
-
-            // A portrait mosaic of 2 × 4 panels (the aspect of 9255 × 18310) in
-            // the landscape image area: it fills the area, cropped top and
-            // bottom, with no hard edges.
-            section(ui, "Hero stage · portrait mosaic", |ui| {
-                let hero = state
-                    .portrait_hero
-                    .get_or_insert_with(|| gallery_hero([243, 480], [2, 4]));
-                hero_section(ui, hero);
-            });
-
-            section(ui, "Session cards", |ui| {
-                let ctx = ui.ctx().clone();
-                let thumbs = state.card_thumbs.get_or_insert_with(|| {
-                    let tex = |name: &str, a, b| {
-                        ctx.load_texture(
-                            name,
-                            gradient_image([200, 80], a, b),
-                            TextureOptions::LINEAR,
-                        )
-                    };
-                    [
-                        tex("gallery-card-a", ACCENT_600, HA_500),
-                        tex("gallery-card-b", SURFACE_700, ACCENT_500),
-                    ]
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let status = Some((Tone::Success, "Merged"));
-                    let base = |title, thumb| SessionCardData {
-                        title,
-                        status,
-                        pinned: false,
-                        dimmed: false,
-                        selected: false,
-                        thumbnail: Some(thumb),
-                    };
-                    let _ = session_card(ui, &base("Normal", &thumbs[0]));
-                    let _ = session_card(
-                        ui,
-                        &SessionCardData {
-                            selected: true,
-                            ..base("Selected", &thumbs[1])
-                        },
-                    );
-                    let _ = session_card(
-                        ui,
-                        &SessionCardData {
-                            pinned: true,
-                            ..base("Pinned", &thumbs[0])
-                        },
-                    );
-                    let _ = session_card(
-                        ui,
-                        &SessionCardData {
-                            dimmed: true,
-                            status: Some((Tone::Warning, "Missing")),
-                            ..base("Dimmed", &thumbs[1])
-                        },
-                    );
-                });
-            });
-        }
-        ui.add_space(space::XXL);
+        });
     }
+    ui.add_space(space::XXL);
 }

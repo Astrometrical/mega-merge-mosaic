@@ -3,7 +3,7 @@ use egui::{Key, Rect, Vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 
-use super::ordered_list::{ListEvent, ListRow, ListState, ordered_list_with};
+use super::ordered_list::{ListEvent, ListRow, ListState, drop_index, line_gap, ordered_list_with};
 use crate::theme::tokens::space;
 
 struct State {
@@ -94,7 +94,7 @@ fn the_edit_action_renames_too() {
     h.run();
     h.hover_at(rect(&h, "Region 2").center());
     h.run();
-    h.get_by_label("Rename").click();
+    h.get_by_label("Rename Region 2").click();
     h.run();
     h.run();
     h.get_by_role(Role::TextInput).type_text("Lobe");
@@ -157,11 +157,11 @@ fn move_up_down_emit_moves() {
     h.run();
     h.hover_at(rect(&h, "Region 2").center());
     h.run();
-    h.get_by_label("Move up").click();
+    h.get_by_label("Move Region 2 up").click();
     h.run();
     h.hover_at(rect(&h, "Region 2").center());
     h.run();
-    h.get_by_label("Move down").click();
+    h.get_by_label("Move Region 2 down").click();
     h.run();
     let moves: Vec<_> = h
         .state()
@@ -185,29 +185,45 @@ fn the_ends_cannot_move_outwards() {
     h.run();
     h.hover_at(rect(&h, "Region 1").center());
     h.run();
-    assert!(h.get_by_label("Move up").accesskit_node().is_disabled());
-    assert!(!h.get_by_label("Move down").accesskit_node().is_disabled());
+    assert!(
+        h.get_by_label("Move Region 1 up")
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(
+        !h.get_by_label("Move Region 1 down")
+            .accesskit_node()
+            .is_disabled()
+    );
     h.hover_at(rect(&h, "Region 3").center());
     h.run();
-    assert!(h.get_by_label("Move down").accesskit_node().is_disabled());
-    assert!(!h.get_by_label("Move up").accesskit_node().is_disabled());
+    assert!(
+        h.get_by_label("Move Region 3 down")
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(
+        !h.get_by_label("Move Region 3 up")
+            .accesskit_node()
+            .is_disabled()
+    );
 }
 
 #[test]
 fn actions_show_on_hover_or_focus_only() {
     let mut h = harness();
     h.run();
-    assert!(h.query_by_label("Delete").is_none());
+    assert!(h.query_by_label("Delete Region 1").is_none());
     h.hover_at(rect(&h, "Region 1").center());
     h.run();
-    assert_eq!(h.query_all_by_label("Delete").count(), 1);
+    assert_eq!(h.query_all_by_label("Delete Region 1").count(), 1);
     h.hover_at(Vec2::new(390.0, 390.0).to_pos2());
     h.run();
-    assert!(h.query_by_label("Delete").is_none());
+    assert!(h.query_by_label("Delete Region 1").is_none());
     h.get_by_label("Region 3").focus();
     h.run();
     h.run();
-    assert_eq!(h.query_all_by_label("Delete").count(), 1);
+    assert_eq!(h.query_all_by_label("Delete Region 3").count(), 1);
 }
 
 #[test]
@@ -216,7 +232,7 @@ fn delete_emits() {
     h.run();
     h.hover_at(rect(&h, "Region 3").center());
     h.run();
-    h.get_by_label("Delete").click();
+    h.get_by_label("Delete Region 3").click();
     h.run();
     assert_eq!(h.state().events, vec![ListEvent::Delete(3)]);
 }
@@ -313,4 +329,101 @@ fn keyboard_activates_and_renames_a_focused_row() {
     h.run();
     assert_eq!(h.state().list.editing(), Some(2));
     h.get_by_role(Role::TextInput);
+}
+
+fn renames(h: &Harness<'_, State>) -> Vec<ListEvent> {
+    let renames = |e: &&ListEvent| matches!(e, ListEvent::Rename(..));
+    h.state().events.iter().filter(renames).cloned().collect()
+}
+
+#[test]
+fn blurring_an_empty_rename_cancels_it() {
+    let mut h = harness();
+    h.run();
+    double_click(&mut h, "Region 1");
+    h.run();
+    h.run();
+    h.key_press(Key::Backspace);
+    h.run();
+    // Focus goes elsewhere: the editor closes and the old name stays.
+    h.get_by_label("Region 3").click();
+    h.run();
+    h.run();
+    assert!(renames(&h).is_empty());
+    assert!(h.query_by_role(Role::TextInput).is_none());
+    assert_eq!(h.state().list.editing(), None);
+    h.get_by_label("Region 1");
+}
+
+#[test]
+fn blurring_a_rename_commits_it() {
+    let mut h = harness();
+    h.run();
+    double_click(&mut h, "Region 1");
+    h.run();
+    h.run();
+    h.get_by_role(Role::TextInput).type_text("Core");
+    h.run();
+    h.get_by_label("Region 3").click();
+    h.run();
+    h.run();
+    assert_eq!(renames(&h), vec![ListEvent::Rename(1, "Core".into())]);
+    assert!(h.query_by_role(Role::TextInput).is_none());
+}
+
+/// Rows 20 tall, 2 apart, from y = 0: centres 10, 32, 54, 76.
+fn centres() -> Vec<f32> {
+    (0..4).map(|i| 10.0 + 22.0 * i as f32).collect()
+}
+
+#[test]
+fn dragging_up_lands_before_the_row_pointed_at() {
+    // Row 3 (index 3) dragged to the top half of row 1 (index 1).
+    assert_eq!(drop_index(&centres(), 3, 25.0), Some(1));
+    // And to above everything.
+    assert_eq!(drop_index(&centres(), 3, -5.0), Some(0));
+}
+
+#[test]
+fn dragging_down_mid_list_lands_after_the_rows_passed() {
+    // Row 0 dragged below row 1's centre, above row 2's: lands at index 1.
+    assert_eq!(drop_index(&centres(), 0, 40.0), Some(1));
+}
+
+#[test]
+fn dragging_to_the_end_lands_last() {
+    assert_eq!(drop_index(&centres(), 0, 200.0), Some(3));
+    assert_eq!(drop_index(&centres(), 2, 200.0), Some(3));
+}
+
+#[test]
+fn dropping_in_its_own_slot_is_a_no_op() {
+    // Index 1: just above or just below its own row.
+    assert_eq!(drop_index(&centres(), 1, 20.0), None);
+    assert_eq!(drop_index(&centres(), 1, 40.0), None);
+    // The last row dragged to the end stays put.
+    assert_eq!(drop_index(&centres(), 3, 200.0), None);
+}
+
+#[test]
+fn the_insertion_line_sits_in_the_gap_it_lands_in() {
+    let rects: Vec<Rect> = (0..4)
+        .map(|i| {
+            let top = 22.0 * i as f32;
+            Rect::from_min_size(egui::pos2(0.0, top), Vec2::new(100.0, 20.0))
+        })
+        .collect();
+    // Upward: row 3 to index 1: the gap between rows 0 and 1.
+    assert_eq!(line_gap(&rects, 1, 3), 21.0);
+    // Mid-list downward: row 0 to index 1: the gap after row 1.
+    assert_eq!(line_gap(&rects, 1, 0), 43.0);
+    // To the end: below the last row, to the top: above the first.
+    assert_eq!(
+        line_gap(&rects, 3, 0),
+        rects[3].bottom() + crate::theme::tokens::space::XS / 2.0
+    );
+    assert_eq!(
+        line_gap(&rects, 0, 2),
+        -crate::theme::tokens::space::XS / 2.0
+    );
 }
