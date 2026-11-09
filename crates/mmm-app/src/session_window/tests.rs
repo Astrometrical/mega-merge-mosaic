@@ -570,6 +570,48 @@ fn camera_survives_the_mosaic_viewer_being_rebuilt() {
 }
 
 #[test]
+fn plan_rois_wait_while_the_frames_differ() {
+    use mmm_core::reference::ReferenceFrame;
+    let (root, mut s, jobs) = merged("window-plan-frames");
+    add_roi(&mut s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_until(&mut h, plan_placed);
+    h.run_steps(3);
+    let (rect, _) = h.state().w.plan().canvas_frame().unwrap();
+    assert!(painted(&h, rect, "ROI 1").is_some(), "frames agree");
+    assert!(!disabled(&h, "Draw ROI"));
+    // A canvas-changing edit: the analysed frame is not the one the plan
+    // draws in until the analysis ends.
+    h.state_mut().session.frame = Some(ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.run_steps(3);
+    assert!(painted(&h, rect, "ROI 1").is_none(), "no outlines offset");
+    assert!(disabled(&h, "Draw ROI"));
+    h.key_press(egui::Key::D);
+    h.run_steps(2);
+    assert!(!h.state().w.plan().drawing());
+    let at = h.get_by_label("Draw ROI").rect().center();
+    let why = "Available once the analysis catches up with the panels";
+    assert!(tooltip_shows(&mut h, at, why), "{why}");
+    // The mosaic is unaffected.
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    h.run_steps(2);
+    assert!(!disabled(&h, "Draw ROI"));
+    let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    assert!(painted(&h, frame, "ROI 1").is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn drawing_on_the_plan_adds_a_region() {
     let (root, s, jobs) = merged("window-draw-roi");
     let mut state = State::new(s, jobs);
@@ -589,17 +631,32 @@ fn drawing_on_the_plan_adds_a_region() {
     assert!(h.state().w.plan().drawing());
     assert!(!h.state().w.mosaic().drawing());
     let (rect, _) = h.state().w.plan().canvas_frame().expect("the plan drawn");
-    drag(
-        &mut h,
+    let cam = h.state().w.plan().camera().expect("a camera");
+    let (from, delta) = (
         rect.center() - egui::vec2(60.0, 30.0),
         egui::vec2(120.0, 60.0),
     );
+    // Where the camera puts the two corners of the drag on the canvas.
+    let at = |p: egui::Pos2| {
+        let d = p - rect.center();
+        (
+            cam.centre.0 + f64::from(d.x) / cam.zoom,
+            cam.centre.1 + f64::from(d.y) / cam.zoom,
+        )
+    };
+    let (a, b) = (at(from), at(from + delta));
+    drag(&mut h, from, delta);
     assert!(!h.state().w.plan().drawing(), "one rect per arming");
     let rois = h.state().w.mosaic().rois();
     assert_eq!(rois.len(), 1, "{rois:?}");
     assert_eq!(rois[0].name, "Region 1");
     let rect = rois[0].canvas;
     assert!(rect[2] > rect[0] && rect[3] > rect[1], "{rect:?}");
+    // The drag mapped through the plan camera (whole pixels, outward).
+    let want = [a.0, a.1, b.0, b.1];
+    for (got, want) in rect.iter().zip(want) {
+        assert!((*got as f64 - want).abs() < 1.5, "{rect:?} vs {want:?}");
+    }
     assert_eq!(h.state().w.mode(), CanvasMode::Plan);
     // Listed and selected; saved in the session's ui.
     let row = h.get_by_label("Region 1");
@@ -751,13 +808,14 @@ fn hover_row(h: &mut Harness<'static, State>, name: &str) {
 #[test]
 fn deleting_an_roi_offers_undo() {
     let (root, mut h) = two_rois("window-roi-delete");
-    hover_row(&mut h, "Core");
-    h.get_by_label("Delete Core").click();
+    // The highest id goes, so a reused id would show.
+    hover_row(&mut h, "Halo");
+    h.get_by_label("Delete Halo").click();
     h.run_steps(3);
-    assert_eq!(saved_rois(&h), [(9, "Halo".to_string())]);
+    assert_eq!(saved_rois(&h), [(7, "Core".to_string())]);
     let toasts = std::mem::take(&mut h.state_mut().toasts);
     assert_eq!(toasts.len(), 1, "{toasts:?}");
-    assert_eq!(toasts[0].toast.title, "Core deleted");
+    assert_eq!(toasts[0].toast.title, "Halo deleted");
     assert_eq!(toasts[0].toast.action.as_deref(), Some("Undo"));
     let Some(undo @ Undo::RoiDelete { .. }) = toasts.into_iter().next().and_then(|t| t.undo) else {
         panic!("an ROI undo");
@@ -778,10 +836,51 @@ fn deleting_an_roi_offers_undo() {
     }
     h.run_steps(3);
     let names = saved_rois(&h);
-    assert_eq!(names[0], (7, "Core".to_string()), "{names:?}");
+    assert_eq!(names[1], (9, "Halo".to_string()), "{names:?}");
     assert_eq!(names.len(), 3);
-    let row = h.get_by_label("Core");
+    let row = h.get_by_label("Halo");
     assert!(row.accesskit_node().is_selected().unwrap_or(false));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_survives_reorder_rename_and_other_deletes() {
+    let (root, mut h) = two_rois("window-roi-selection");
+    let selected = |h: &Harness<'static, State>, name: &str| {
+        h.get_by_label(name)
+            .accesskit_node()
+            .is_selected()
+            .unwrap_or(false)
+    };
+    h.get_by_label("Halo").click();
+    h.run_steps(3);
+    assert!(selected(&h, "Halo"));
+    // Reordered: still Halo.
+    hover_row(&mut h, "Halo");
+    h.get_by_label("Move Halo up").click();
+    h.run_steps(3);
+    assert!(selected(&h, "Halo") && !selected(&h, "Core"));
+    // Renamed: the same ROI stays selected.
+    hover_row(&mut h, "Halo");
+    h.get_by_label("Rename Halo").click();
+    h.run_steps(3);
+    h.get(
+        By::new()
+            .role(Role::TextInput)
+            .predicate(|n| n.label().as_deref() != Some("Note")),
+    )
+    .type_text("Outer");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(selected(&h, "Outer") && !selected(&h, "Core"));
+    // Another one deleted: the selection stays on Outer.
+    hover_row(&mut h, "Core");
+    h.get_by_label("Delete Core").click();
+    h.run_steps(3);
+    assert_eq!(saved_rois(&h), [(9, "Outer".to_string())]);
+    assert!(selected(&h, "Outer"));
+    assert_eq!(h.state().w.mosaic().selected_roi(), Some(9));
     let _ = std::fs::remove_dir_all(&root);
 }
 

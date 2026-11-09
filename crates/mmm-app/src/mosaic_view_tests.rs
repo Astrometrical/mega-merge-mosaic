@@ -730,6 +730,12 @@ fn a_drawn_rect_becomes_a_region() {
     save_compositions(&mut s.mosaic.config.ui, &[hoo]);
     let mut view = MosaicView::new();
     view.set_view(&s, ViewKind::Composition(0));
+    assert_eq!(view.members, ["Ha", "OIII"]);
+    assert_eq!(
+        view.group(),
+        Some("Ha"),
+        "the first member's health is shown"
+    );
 
     // A drawn rect becomes "Region 1" in whole canvas pixels, selected and
     // saved in the session's ui.
@@ -751,6 +757,10 @@ fn a_drawn_rect_becomes_a_region() {
     assert_eq!(rois[1].name, "Region 2");
     assert_ne!(rois[0].id, rois[1].id);
     assert_eq!(view.rois.selected, Some(rois[1].id));
+    // The regions belong to the session, not to the view shown.
+    view.set_view(&s, ViewKind::Group("OIII".into()));
+    assert_eq!(view.members, ["OIII"]);
+    assert_eq!(view.rois.rois().len(), 2);
     let _ = std::fs::remove_dir_all(&root);
 }
 #[test]

@@ -45,6 +45,11 @@
 //!   they are all in, and when the view or the look changes. The manual
 //!   stretch earlier versions saved per view (`plan_stretch` in
 //!   `MosaicConfig.ui`) is ignored.
+//! - **Over the panels.** The window hands the plan the regions of interest
+//!   as overlays (outlines and names, [`PlanView::set_overlays`]) and may arm
+//!   its draw tool ([`PlanView::set_drawing`]): a rectangle drawn is taken
+//!   once with [`PlanView::take_drawn`]. Both only while the plan draws in
+//!   the analysed frame ([`PlanView::frame_matches`]).
 //! - **Compositions** add their channels' layers: each mapped group's
 //!   previews are drawn as additive layers tinted red, green or blue times
 //!   the channel's weight. Overlapping previews of one group add up too
@@ -899,6 +904,19 @@ impl PlanView {
     /// The canvas's rect and time in the last frame drawn.
     pub fn canvas_frame(&self) -> Option<(egui::Rect, f64)> {
         self.canvas.last_frame()
+    }
+
+    /// Whether the plan draws in the frame the analysis left in the session
+    /// (the regions of interest and the patches are anchored in that one), or
+    /// there is no analysed frame yet. A canvas-changing panel edit makes the
+    /// previews' frame differ until the re-analysis ends; the window draws
+    /// no ROIs on the plan meanwhile and takes no rectangle from it.
+    pub fn frame_matches(&self, session: &OpenSession) -> bool {
+        match (&session.frame, &self.layout.frame) {
+            (None, _) => true,
+            (Some(analysed), Some(drawn)) => analysed == drawn,
+            (Some(_), None) => false,
+        }
     }
 
     /// The shared frame's canvas, once read.

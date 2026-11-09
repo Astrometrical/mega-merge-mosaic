@@ -42,6 +42,9 @@ use crate::session::{OpenSession, notes, set_notes};
 use crate::status::format_canvas;
 use crate::util::{Debounce, group_names};
 
+/// What to do with the draw tool armed.
+const DRAW_HINT: &str = "Drag on the image to draw; Esc cancels.";
+
 /// The notes text box's hint (as on the start screen).
 const NOTES_HINT: &str = "Notes about this session";
 
@@ -109,7 +112,7 @@ impl SessionWindow {
                 badge: None,
             },
         ];
-        let can_draw = self.can_draw_roi();
+        let draw_block = self.draw_roi_block(session);
         let drawing = self.drawing_roi();
         let mut act = Actions::default();
         let SessionWindow {
@@ -128,7 +131,7 @@ impl SessionWindow {
             ui.push_id(id, |ui| match id {
                 PROBLEMS => problems_ui(ui, session, checks, show_all_checks, &mut out.accept),
                 PANELS => panels_ui(ui, session, plan, pipeline, checks, &mut out.accept),
-                ROIS => rois_ui(ui, session, mosaic, (can_draw, drawing), &mut act),
+                ROIS => rois_ui(ui, session, mosaic, (draw_block, drawing), &mut act),
                 MERGE_SETTINGS => {
                     mosaic.settings_ui(ui, session, jobs);
                     ui.add_space(space::L);
@@ -146,7 +149,7 @@ impl SessionWindow {
             self.frame(rect);
         }
         if act.draw_roi {
-            self.start_drawing_roi();
+            self.start_drawing_roi(session);
         }
         if let Some(i) = act.deleted {
             self.composite_deleted(session, i);
@@ -344,26 +347,26 @@ fn rois_ui(
     ui: &mut egui::Ui,
     session: &mut OpenSession,
     mosaic: &mut MosaicView,
-    (can_draw, drawing): (bool, bool),
+    (draw_block, drawing): (Option<&str>, bool),
     act: &mut Actions,
 ) {
     if ui
         .add_enabled(
-            can_draw && !drawing,
+            draw_block.is_none() && !drawing,
             MegaButton::new(ButtonKind::Secondary, "Draw ROI"),
         )
         .on_hover_text(shortcuts::keyed("Draw ROI", shortcuts::DRAW_ROI))
         .on_disabled_hover_text(if drawing {
-            "Drag on the image to draw; Esc cancels."
+            DRAW_HINT
         } else {
-            "Shown once the canvas has been drawn."
+            draw_block.unwrap_or_default()
         })
         .clicked()
     {
         act.draw_roi = true;
     }
     if drawing {
-        muted(ui, "Drag on the image to draw; Esc cancels.");
+        muted(ui, DRAW_HINT);
     }
     ui.add_space(space::S);
     act.go_to = mosaic.rois_ui(ui, session);

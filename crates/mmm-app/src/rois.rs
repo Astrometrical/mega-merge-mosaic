@@ -364,9 +364,7 @@ impl RoiPanel {
                     for roi in &mut self.rois {
                         // By id (and only if it has not moved since).
                         let Some(j) = snapshot.iter().position(|s| {
-                            (s.id == roi.id || roi.id == 0 && s.id == 0)
-                                && s.sky == roi.sky
-                                && s.canvas == roi.canvas
+                            s.id == roi.id && s.sky == roi.sky && s.canvas == roi.canvas
                         }) else {
                             continue;
                         };

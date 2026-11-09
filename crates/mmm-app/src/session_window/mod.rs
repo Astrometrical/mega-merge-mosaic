@@ -264,13 +264,21 @@ impl SessionWindow {
         self.mode = Some(mode);
     }
 
-    /// Whether the shown canvas has been drawn, so a rectangle can be drawn
-    /// on it.
-    pub(super) fn can_draw_roi(&self) -> bool {
-        match self.mode() {
+    /// Why a rectangle cannot be drawn on the canvas shown now, if so: it
+    /// has not been drawn yet, or (the plan) it draws in another frame than
+    /// the one the regions are anchored in ([`PlanView::frame_matches`]).
+    pub(super) fn draw_roi_block(&self, session: &OpenSession) -> Option<&'static str> {
+        let drawn = match self.mode() {
             CanvasMode::Plan => self.plan.canvas_frame().is_some(),
             CanvasMode::Mosaic => self.mosaic.viewer_frame().is_some(),
+        };
+        if !drawn {
+            return Some("Available once the canvas has been drawn.");
         }
+        if self.mode() == CanvasMode::Plan && !self.plan.frame_matches(session) {
+            return Some("Available once the analysis catches up with the panels");
+        }
+        None
     }
 
     /// Whether the shown canvas has the draw tool armed.
@@ -282,9 +290,10 @@ impl SessionWindow {
     }
 
     /// Arm the draw tool on the canvas shown (plan or mosaic): the next drag
-    /// draws a new ROI. Nothing before the canvas has been drawn.
-    pub(super) fn start_drawing_roi(&mut self) {
-        if !self.can_draw_roi() {
+    /// draws a new ROI. Nothing while [`SessionWindow::draw_roi_block`]
+    /// gives a reason.
+    pub(super) fn start_drawing_roi(&mut self, session: &OpenSession) {
+        if self.draw_roi_block(session).is_some() {
             return;
         }
         match self.mode() {
@@ -487,6 +496,11 @@ impl SessionWindow {
                 undo: Some(Undo::Analyze(previous)),
             });
         }
+    }
+
+    /// Follow the ROI list: one deleted since the last frame raises its
+    /// "{name} deleted" toast, whose Undo puts it back.
+    fn follow_rois(&mut self) {
         if let Some((index, roi)) = self.mosaic.take_roi_deleted() {
             self.push_toast(WindowToast {
                 toast: mega_ui::widgets::Toast {
@@ -502,13 +516,14 @@ impl SessionWindow {
 
     /// The window's every-frame work, drawn or not: pick the mode and the
     /// view (on the first frame, as saved), the mosaic's work
-    /// ([`MosaicView::poll`]), the plan's texture release, and the
+    /// ([`MosaicView::poll`]), the ROI list's delete toast, the plan's texture release, and the
     /// rate-limited save (with the view, if it changed). Call every frame
     /// after the runner's poll and [`SessionWindow::track_analysis`],
     /// before drawing.
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
         self.follow_session(session, jobs);
         self.mosaic.poll(ctx, session, jobs);
+        self.follow_rois();
         self.plan.release_if_hidden(Instant::now());
         self.keep_view_state(session);
         self.save_if_due(ctx, session);

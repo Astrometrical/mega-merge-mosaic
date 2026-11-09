@@ -134,7 +134,7 @@ impl SessionWindow {
             self.look.rois = !self.look.rois;
         }
         if pressed(DRAW_ROI) {
-            self.start_drawing_roi();
+            self.start_drawing_roi(session);
         }
         let mut stretch = DisplayStretch::load(&session.mosaic.config.ui);
         let before = stretch;

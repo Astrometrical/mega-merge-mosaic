@@ -30,7 +30,7 @@
 //!   how many of an ROI's level-0 tiles are fresh (per group of the view)
 //!   run on workers ([`RoiPanel`]). There is no ROI merge: an ROI's
 //!   preview is transient and comes with the preview runner.
-//!   //!   [`MosaicView::merge_these`] merges the groups it is given over the whole
+//!   [`MosaicView::merge_these`] merges the groups it is given over the whole
 //!   canvas, committing the merge settings draft first.
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
 //!   merge settings (a draft kept in `ui`, edited at once) and analysis
@@ -827,6 +827,12 @@ impl MosaicView {
         self.viewer
             .as_ref()
             .is_some_and(|v| v.tool() == Tool::DrawRect)
+    }
+
+    /// The selected ROI's id.
+    #[cfg(test)]
+    pub fn selected_roi(&self) -> Option<u64> {
+        self.rois.selected
     }
 
     /// The ROIs as canvas overlays (the window gives them to the plan too).

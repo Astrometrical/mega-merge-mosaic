@@ -352,15 +352,24 @@ impl SessionWindow {
                     complete: pipeline.previews_complete(),
                     checks: checks.report(),
                 };
-                let overlays = if self.look.rois {
+                // The ROIs are anchored in the analysed frame: not while the
+                // plan draws in another (outlines would be offset, a drawn
+                // rect misplaced for good).
+                let matches = self.plan.frame_matches(session);
+                let overlays = if self.look.rois && matches {
                     self.mosaic.roi_overlays()
                 } else {
                     Vec::new()
                 };
                 self.plan.set_overlays(overlays);
                 self.plan.show(ui, session, &feed, &self.look);
-                if let Some((rect, canvas)) = self.plan.take_drawn() {
+                if let Some((rect, canvas)) = self.plan.take_drawn()
+                    && matches
+                {
                     self.mosaic.on_drawn(session, rect, canvas);
+                }
+                if !matches {
+                    self.plan.set_drawing(false);
                 }
                 // The plan's selection changed (a click, Esc): a panel just
                 // selected opens its details in the inspector; the list
