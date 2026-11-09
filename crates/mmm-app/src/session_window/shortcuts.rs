@@ -6,6 +6,7 @@
 //! | `M` | plan or mosaic (once the mosaic can be shown) | **Plan** / **Mosaic** |
 //! | `[` / `]` | previous / next group or composite, round the chips | the chips |
 //! | `O` | **Outlines** | the toggle |
+//! | `Shift+S` | **Seams** (plain `S` is Strong) | the toggle |
 //! | `R` | **ROIs** | the toggle |
 //! | `D` | **Draw ROI**: arm the draw tool on the canvas shown (a crosshair over it), revealing the ROIs section | the section's button |
 //! | `L` | **Linked** (not for a mono view) | the toggle |
@@ -16,7 +17,8 @@
 //! | `Esc` | clear the selection, in the panel list and on the plan | |
 //! | `Space`, held | comparing an ROI (spec §8.3): show the other side while held (Esc first if a control has the focus, as the toggle's tooltip says) | the **A** / **B** buttons |
 //!
-//! The letters, brackets, Delete and Space count with no modifier held. None
+//! The letters, brackets, Delete and Space count with no modifier held
+//! (`Shift+S` with Shift, the `Ctrl` ones with the command key). None
 //! acts while a text field has the keyboard (notes, names, a path) or the
 //! Export dialog is open, where Esc closes the dialog and nothing else (a
 //! Space held since before still ends its peek when let go:
@@ -48,6 +50,8 @@ pub(super) const PREVIOUS_VIEW: Key = Key::OpenBracket;
 pub(super) const NEXT_VIEW: Key = Key::CloseBracket;
 /// Toggles **Outlines**.
 pub(super) const OUTLINES: Key = Key::O;
+/// Toggles **Seams** (`S` alone is [`STRONG`]).
+pub(super) const SEAMS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::S);
 /// Toggles **ROIs**.
 pub(super) const ROIS: Key = Key::R;
 /// Arms the draw tool for a new ROI, as **Draw ROI** does.
@@ -143,6 +147,11 @@ impl SessionWindow {
         if pressed(OUTLINES) {
             self.look.outlines = !self.look.outlines;
             self.look.numbers = self.look.outlines;
+        }
+        // Before Strong: `pressed` wants no modifier, so Shift+S is never
+        // Strong, and this consumes it.
+        if ctx.input_mut(|i| i.consume_shortcut(&SEAMS)) {
+            self.look.seams = !self.look.seams;
         }
         if pressed(ROIS) {
             self.look.rois = !self.look.rois;

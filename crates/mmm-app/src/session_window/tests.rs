@@ -461,7 +461,7 @@ fn three_groups_two_composites(s: &mut OpenSession) {
 }
 
 /// The view bar's controls in a canvas `canvas_w` wide: Plan / Mosaic, a
-/// chip per group and composite and the four toggles (the only toggle
+/// chip per group and composite and the five toggles (the only toggle
 /// buttons in the window), then + (a menu button, "New composite"), each
 /// with its rect. Asserts none overlaps another, the canvas or the
 /// inspector.
@@ -504,7 +504,7 @@ fn the_view_bar_wraps_without_overlap() {
         h.run_steps(3);
         h.get_by_label("SII · 2");
         let controls = bar_controls(&h, canvas_w);
-        assert_eq!(controls.len(), 12, "{controls:?}");
+        assert_eq!(controls.len(), 13, "{controls:?}");
         // Narrow: the toggles on a row of their own, below the choices;
         // wide: one row.
         let top = |label: &str| {
@@ -1798,7 +1798,14 @@ fn inspector_sections_are_in_order() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A check of `panels`: one panel's targets it, as the core's per-panel
+/// checks do; any other targets the session.
 fn check(code: CheckCode, severity: Severity, panels: Vec<PathBuf>, message: &str) -> Check {
+    use mmm_core::checks::CheckTarget;
+    let target = match panels.as_slice() {
+        [p] => CheckTarget::Panel(p.clone()),
+        _ => CheckTarget::Session,
+    };
     Check {
         code,
         severity,
@@ -1806,7 +1813,7 @@ fn check(code: CheckCode, severity: Severity, panels: Vec<PathBuf>, message: &st
         groups: Vec::new(),
         message: message.into(),
         remedy: None,
-        target: mmm_core::checks::CheckTarget::Session,
+        target,
         rect: None,
     }
 }
@@ -2801,6 +2808,7 @@ fn restored_view_that_no_longer_exists_falls_back() {
             inspector_open: vec![NOTES.into()],
             panel_list_open: false,
             outlines: true,
+            seams: false,
             rois: true,
         };
         saved.save(&mut s.mosaic.config.ui);
@@ -4472,4 +4480,5 @@ fn a_region_entry_with_other_settings_still_makes_the_group_out_of_date() {
 
 mod compare;
 mod export;
+mod marks;
 mod previews;

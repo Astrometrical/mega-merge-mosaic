@@ -49,7 +49,17 @@
 //!   as overlays (outlines and names, [`PlanView::set_overlays`]) and may arm
 //!   its draw tool ([`PlanView::set_drawing`]): a rectangle drawn is taken
 //!   once with [`PlanView::take_drawn`]. Both only while the plan draws in
-//!   the analysed frame ([`PlanView::frame_matches`]).
+//!   the analysed frame ([`PlanView::frame_matches`]), as are the seam
+//!   lines it hands over ([`PlanView::set_lines`]).
+//! - **Problems** ([`crate::marks`]): the window hands the plan the view's
+//!   problems, one mark per place ([`PlanView::set_marks`]). A panel's badge
+//!   sits at the top-right corner of its outline as drawn here, and the
+//!   panel is outlined in the problem colour; an overlap's, a seam's or an
+//!   area's sits where the analysis places it, only in the analysed frame.
+//!   A badge clicked is taken with [`PlanView::take_badge_clicked`]. While
+//!   the plan is not drawn, the window keeps its layout current
+//!   ([`PlanView::follow_layout`]): the merged mosaic places its outlines
+//!   and badges with it.
 //! - **Compositions** add their channels' layers: each mapped group's
 //!   previews are drawn as additive layers tinted red, green or blue (at
 //!   full strength: weights are always 1, as the export writes them).
@@ -64,11 +74,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{Color32, ColorImage, RichText};
-use mega_ui::canvas_layers::{CanvasBadge, Overlay, Tool};
+use mega_ui::canvas_layers::{CanvasBadge, Overlay, Polyline, Tool};
 use mega_ui::plan::{Layer, PlacedItem, PlanCanvas};
+use mega_ui::theme::palette;
 use mega_ui::theme::tokens::space;
-use mega_ui::theme::{Tone, palette};
-use mmm_core::checks::{Severity, SolutionKind, is_accepted, panel_facts};
+use mmm_core::checks::{SolutionKind, panel_facts};
 use mmm_core::formats::InputPanel;
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{FRAME_FILE, Fingerprint, fingerprint};
@@ -79,9 +89,9 @@ use mmm_core::session::Session;
 use mmm_core::stretch::{ChannelStats, StretchParams, apply, channel_stats};
 
 use crate::camera::Camera;
-use crate::checks::ChecksReport;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
+use crate::marks::{Place, ProblemMark, badge_point, outline_color};
 use crate::panel_edits::{group_colors, load_group_colors};
 use crate::session::OpenSession;
 use crate::status::format_canvas;
@@ -102,7 +112,7 @@ const CHANNEL_COLORS: [Color32; 3] = [
     Color32::from_rgb(0, 0, 255),
 ];
 
-/// What the plan reads from the shell's pipeline and checks each frame.
+/// What the plan reads from the shell's pipeline each frame.
 pub struct PlanFeed<'a> {
     /// The previews received for the current inputs, by panel path.
     pub previews: &'a BTreeMap<PathBuf, Arc<Preview>>,
@@ -110,17 +120,18 @@ pub struct PlanFeed<'a> {
     pub generation: u64,
     /// Every preview of the current inputs has been run.
     pub complete: bool,
-    /// The last checks report, if any.
-    pub checks: Option<&'a ChecksReport>,
 }
 
 /// How the window around a canvas wants it drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CanvasLook {
-    /// Panel outlines.
+    /// Panel outlines, on the plan and on the merged mosaic alike.
     pub outlines: bool,
     /// Panel numbers.
     pub numbers: bool,
+    /// Where the merge changes from one panel to the next (the seam
+    /// lines), on the plan and on the merged mosaic alike.
+    pub seams: bool,
     /// The regions of interest, outlined and named on the plan and on the
     /// merged mosaic alike.
     pub rois: bool,
@@ -129,10 +140,12 @@ pub struct CanvasLook {
 }
 
 impl Default for CanvasLook {
+    /// Outlines (with numbers) and ROIs on, seams off.
     fn default() -> Self {
         CanvasLook {
             outlines: true,
             numbers: true,
+            seams: false,
             rois: true,
             stretch: DisplayStretch::default(),
         }
@@ -368,20 +381,23 @@ pub struct Layout {
     pub rects: BTreeMap<PathBuf, [f64; 4]>,
     /// Each analysed panel's overlapping panels (in its group).
     pub overlaps: BTreeMap<PathBuf, Vec<PathBuf>>,
+    /// Each analysed group's panels by file, with their ids in its
+    /// analysis (the ids its seam lines name).
+    pub ids: BTreeMap<String, BTreeMap<PathBuf, usize>>,
 }
 
-/// Read the frame and the analyses of `groups` (their session
-/// directories). The frame is the previews' (`frames.0`), else, before any
-/// complete previews run, the analysed one (`frames.1`). Blocking (worker
-/// thread); what cannot be read is left out and logged.
-pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
+/// Read the frame and the analyses of `groups` (each group's name and
+/// session directory). The frame is the previews' (`frames.0`), else,
+/// before any complete previews run, the analysed one (`frames.1`).
+/// Blocking (worker thread); what cannot be read is left out and logged.
+pub fn load_layout(frames: (&Path, &Path), groups: &[(String, PathBuf)]) -> Layout {
     let mut out = Layout {
         frame: ReferenceFrame::load(frames.0)
             .or_else(|_| ReferenceFrame::load(frames.1))
             .ok(),
         ..Layout::default()
     };
-    for dir in groups {
+    for (name, dir) in groups {
         let loaded = Session::open(dir)
             .and_then(|s| OverlapGraph::load(&s.overlap_graph_path()).map(|graph| (s, graph)));
         let (session, graph) = match loaded {
@@ -398,6 +414,7 @@ pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
                 .find(|p| p.id == id)
                 .map(|p| p.source.clone().unwrap_or_else(|| p.path.clone()))
         };
+        let ids = out.ids.entry(name.clone()).or_default();
         for p in &session.panels {
             let path = p.source.clone().unwrap_or_else(|| p.path.clone());
             let b = p.bbox;
@@ -405,6 +422,7 @@ pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
                 path.clone(),
                 [b[0] as f64, b[1] as f64, b[2] as f64, b[3] as f64],
             );
+            ids.insert(path.clone(), p.id);
             out.overlaps.entry(path).or_default();
         }
         for e in &graph.edges {
@@ -572,7 +590,8 @@ pub struct ItemSnapshot {
     pub rect: [f64; 4],
     /// Per layer: (tint, additive).
     pub layers: Vec<(Color32, bool)>,
-    /// Outline colour (Hα for a panel with an unaccepted problem).
+    /// Outline colour (the problem colour for a panel badged with a
+    /// problem, [`outline_color`]).
     pub outline: Color32,
     /// The panel number shown.
     pub label: String,
@@ -598,7 +617,7 @@ struct AutoKey {
 struct LayoutKey {
     generation: u64,
     complete: bool,
-    analysed: Vec<PathBuf>,
+    analysed: Vec<(String, PathBuf)>,
     provenance: usize,
 }
 
@@ -671,6 +690,14 @@ pub struct PlanView {
     overlays: Vec<Overlay>,
     /// Image patches (ROI previews) drawn over the canvas.
     patches: Vec<mega_ui::canvas_layers::Patch>,
+    /// The lines the window has drawn over the plan (the seams).
+    lines: Vec<Polyline>,
+    /// The view's problems, one per place, to badge ([`PlanView::set_marks`]).
+    marks: Vec<ProblemMark>,
+    /// The badges the last frame drew.
+    badges: Vec<CanvasBadge>,
+    /// A badge clicked, until taken ([`PlanView::take_badge_clicked`]).
+    badge_clicked: Option<u64>,
     /// A rectangle just drawn, with the canvas it is on: see
     /// [`PlanView::take_drawn`].
     drawn: Option<([f64; 4], (u64, u64))>,
@@ -754,6 +781,10 @@ impl PlanView {
             highlight: None,
             overlays: Vec::new(),
             patches: Vec::new(),
+            lines: Vec::new(),
+            marks: Vec::new(),
+            badges: Vec::new(),
+            badge_clicked: None,
             drawn: None,
             hold: None,
             quiet: None,
@@ -807,6 +838,29 @@ impl PlanView {
     /// frame on, under the overlays.
     pub fn set_patches(&mut self, patches: Vec<mega_ui::canvas_layers::Patch>) {
         self.patches = patches;
+    }
+
+    /// Draw these polylines (the seams, canvas coordinates) over the panels
+    /// from the next frame on, with the overlays.
+    pub fn set_lines(&mut self, lines: Vec<Polyline>) {
+        self.lines = lines;
+    }
+
+    /// Badge these problems (the view's, one mark per place,
+    /// [`crate::marks`]) from the next frame on: a panel's at the top-right
+    /// corner of its outline as the plan draws it, its outline in the
+    /// problem colour; any other where the analysis places it, and only
+    /// while the plan draws in the analysed frame
+    /// ([`PlanView::frame_matches`]). A click on one is taken with
+    /// [`PlanView::take_badge_clicked`].
+    pub fn set_marks(&mut self, marks: Vec<ProblemMark>) {
+        self.marks = marks;
+    }
+
+    /// The badge clicked (or activated from the keyboard) since the last
+    /// call, once: its mark's id ([`ProblemMark::id`]).
+    pub fn take_badge_clicked(&mut self) -> Option<u64> {
+        self.badge_clicked.take()
     }
 
     /// Arm (or disarm) the draw tool: the next drag draws a rectangle
@@ -906,6 +960,39 @@ impl PlanView {
     /// What the last frame drew, item by item.
     pub fn items(&self) -> &[ItemSnapshot] {
         &self.last_items
+    }
+
+    /// The badges the last frame drew (canvas coordinates).
+    #[cfg(test)]
+    pub fn badges(&self) -> &[CanvasBadge] {
+        &self.badges
+    }
+
+    /// The lines handed to the canvas (canvas coordinates).
+    #[cfg(test)]
+    pub fn lines(&self) -> &[Polyline] {
+        &self.lines
+    }
+
+    /// The frame and what the last analyses say about the panels, as last
+    /// read ([`load_layout`]).
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Keep the layout current while the plan is not drawn (the merged
+    /// mosaic places its outlines and badges with it): take a finished
+    /// read, and read again when the previews or analyses may have moved
+    /// the panels, as drawing does. Call each frame the plan is not drawn
+    /// (drawing it does this too).
+    pub fn follow_layout(
+        &mut self,
+        ctx: &egui::Context,
+        session: &OpenSession,
+        feed: &PlanFeed<'_>,
+    ) {
+        self.poll_tasks();
+        self.start_layout(ctx, session, feed);
     }
 
     /// Panels of the view with no place to draw them yet (no preview, no
@@ -1015,6 +1102,7 @@ impl PlanView {
             Some(spec) => self.build_items(session, spec, feed),
             None => {
                 self.last_items.clear();
+                self.badges.clear();
                 self.canvas.set_badges(Vec::new());
                 self.missing_layers = 0;
                 Vec::new()
@@ -1065,10 +1153,14 @@ impl PlanView {
         }
         self.canvas.set_overlays(self.overlays.clone());
         self.canvas.set_patches(self.patches.clone());
+        self.canvas.set_lines(self.lines.clone());
         let r = self
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);
         self.hold = r.held;
+        if r.badge_clicked.is_some() {
+            self.badge_clicked = r.badge_clicked;
+        }
         if let Some(rect) = r.drawn_rect {
             let size = (
                 extent[2].ceil().max(0.0) as u64,
@@ -1258,11 +1350,11 @@ impl PlanView {
     /// may have moved them.
     fn start_layout(&mut self, ctx: &egui::Context, session: &OpenSession, feed: &PlanFeed<'_>) {
         let cfg = &session.mosaic.config;
-        let analysed: Vec<PathBuf> = cfg
+        let analysed: Vec<(String, PathBuf)> = cfg
             .group_dirs
             .keys()
             .filter(|g| !cfg.needs_analyze.contains(*g))
-            .map(|g| session.mosaic.group_session_dir(g))
+            .map(|g| (g.clone(), session.mosaic.group_session_dir(g)))
             .collect();
         let key = LayoutKey {
             generation: feed.generation,
@@ -1529,7 +1621,8 @@ impl PlanView {
         }
     }
 
-    /// The items of the view, and the snapshot of what they show.
+    /// The items of the view, the snapshot of what they show, and the
+    /// badges of the view's problems ([`PlanView::set_marks`]).
     fn build_items(
         &mut self,
         session: &OpenSession,
@@ -1537,15 +1630,16 @@ impl PlanView {
         feed: &PlanFeed<'_>,
     ) -> Vec<PlacedItem> {
         let cfg = &session.mosaic.config;
-        let mut flagged: BTreeMap<&PathBuf, u32> = BTreeMap::new();
-        for c in feed.checks.map(|r| r.checks.as_slice()).unwrap_or_default() {
-            if c.severity == Severity::Problem && !is_accepted(cfg, c) {
-                for p in &c.panels {
-                    *flagged.entry(p).or_default() += 1;
-                }
-            }
-        }
-        let mut badges = Vec::new();
+        let badged: BTreeSet<PathBuf> = self
+            .marks
+            .iter()
+            .filter_map(|m| match &m.place {
+                Place::Panel(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        // Where each panel is drawn, for its badge.
+        let mut placed: BTreeMap<PathBuf, [f64; 4]> = BTreeMap::new();
         let ids: HashMap<&PathBuf, usize> = cfg
             .panels
             .iter()
@@ -1599,13 +1693,7 @@ impl PlanView {
                 let Some(&id) = ids.get(&path) else {
                     continue;
                 };
-                let problems = flagged.get(&path).copied().unwrap_or(0);
-                let flag = problems > 0;
-                let outline = if flag {
-                    palette::HA_500
-                } else {
-                    palette::ACCENT_500
-                };
+                let outline = outline_color(badged.contains(&path));
                 let highlighted = self.highlight.as_ref() == Some(&path);
                 snaps.push(ItemSnapshot {
                     path: path.clone(),
@@ -1615,19 +1703,7 @@ impl PlanView {
                     label: number.to_string(),
                     highlighted,
                 });
-                if flag {
-                    // At the panel's top-right corner, constant size on screen.
-                    badges.push(CanvasBadge {
-                        id: id as u64,
-                        at: [rect[2], rect[1]],
-                        tone: Tone::Problem,
-                        count: problems,
-                        description: format!(
-                            "{problems} problem{} here",
-                            if problems == 1 { "" } else { "s" }
-                        ),
-                    });
-                }
+                placed.insert(path.clone(), rect);
                 items.push(PlacedItem {
                     id: id as u64,
                     rect,
@@ -1640,7 +1716,23 @@ impl PlanView {
             }
         }
         self.last_items = snaps;
-        self.canvas.set_badges(badges);
+        // A panel's badge at its outline as drawn here; the others where
+        // the analysis places them, only in the analysed frame.
+        let analysed = self.frame_matches(session);
+        let badges: Vec<CanvasBadge> = self
+            .marks
+            .iter()
+            .filter_map(|m| {
+                let at = match &m.place {
+                    Place::Panel(p) => badge_point(&m.place, *placed.get(p)?),
+                    _ if analysed => badge_point(&m.place, m.rect?),
+                    _ => return None,
+                };
+                Some(m.badge(at))
+            })
+            .collect();
+        self.canvas.set_badges(badges.clone());
+        self.badges = badges;
         items
     }
 

@@ -34,8 +34,13 @@
 //!   chosen before something is merged or a merge has started.
 //!   [`SessionWindow::merge`] merges every group and shows the mosaic.
 //! - **View bar** ([`canvas`]): Plan / Mosaic, a chip per group and per
-//!   composite then **+** (with two or more groups), and the Outlines, ROIs,
-//!   Linked and Strong toggles.
+//!   composite then **+** (with two or more groups; each chip counts its
+//!   unaccepted problems), and the Outlines, Seams, ROIs, Linked and Strong
+//!   toggles.
+//! - **Problems in place** ([`crate::marks`]): both canvases badge the shown
+//!   groups' unaccepted problems where they are, one badge per place
+//!   (counting them); Outlines and Seams draw over both. A badge clicked
+//!   goes to its place ([`SessionWindow::open_badge`]).
 //! - **Inspector** ([`sections`]): Problems, Panels, ROIs, Merge settings,
 //!   Composites and Notes, in that order.
 //! - **Every frame.** The shell drives the window's hooks whether or not the
@@ -59,20 +64,21 @@
 //!   shows the other side while held.
 //! - **View state** ([`view_state`]): plan or mosaic, the view, the camera,
 //!   the inspector's fold and open sections, the panel list and the
-//!   Outlines and ROIs toggles are written into `ui` whenever they change.
-//!   The first frame restores them: the mosaic only if it can show, else
-//!   the plan; a view the session no longer has falls back to the first
+//!   Outlines, Seams and ROIs toggles are written into `ui` whenever they
+//!   change. The first frame restores them: the mosaic only if it can show,
+//!   else the plan; a view the session no longer has falls back to the first
 //!   group (and the camera saved with it is dropped); the camera is handed
 //!   to both canvases before either draws, so each paints its first frame
 //!   through it (no fit is painted first). With nothing saved: the mosaic
 //!   once something is merged, the first group, Problems open, Outlines and
-//!   ROIs on.
+//!   ROIs on, Seams off.
 //! - **Export dialog** ([`crate::export_dialog`]): the session's groups and
 //!   composites, exported into a folder; it opens from **Export…**, the
 //!   Export step and `Ctrl+E` once something is merged and while no
 //!   analysis runs ([`SessionWindow::export_block_reason`]).
-//! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `D`, `L`,
-//!   `S`, `Ctrl+Enter` and `Ctrl+E`, each named in its control's tooltip,
+//! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `Shift+S`, `R`,
+//!   `D`, `L`, `S`, `Ctrl+Enter` and `Ctrl+E`, each named in its control's
+//!   tooltip,
 //!   `Delete` (removes the panels selected in the open list), `Esc` (clears
 //!   the selection) and `Space` held (comparing, shows the other side);
 //!   none while a text field has the keyboard or the Export dialog is open
@@ -119,14 +125,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::camera::Camera;
-use crate::checks::ChecksEngine;
+use crate::checks::{ChecksEngine, ChecksReport};
 use crate::compositions::{
     Composition, ViewKind, composition_stretch_key, load_compositions, migrate_composition_ids,
     restore_composition,
 };
 use crate::export_dialog::{ExportDialog, RfdFolderPicker};
 use crate::jobs::{ANALYZE_LABEL, ExportTarget, JobEvent, JobRunner, JobTarget};
-use crate::mosaic_view::MosaicView;
+use crate::marks::{ProblemMark, Seams, target_rect};
+use crate::mosaic_view::{MosaicView, view_members};
 use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
@@ -216,8 +223,13 @@ pub struct SessionWindow {
     mode: Option<CanvasMode>,
     /// The view both canvases show.
     view: Option<ViewKind>,
-    /// Outlines and ROIs; the stretch is the session's, read each frame.
+    /// Outlines, Seams and ROIs; the stretch is the session's, read each
+    /// frame.
     look: CanvasLook,
+    /// The shown groups' problems, one per place, as last handed to the
+    /// canvases ([`crate::marks`]): a badge clicked is found here by its
+    /// id.
+    marks: Vec<ProblemMark>,
     /// Problems lists every check, notes and passed ones too.
     show_all_checks: bool,
     /// The Composites list: the rename in progress.
@@ -289,6 +301,7 @@ impl SessionWindow {
             mode: None,
             view: None,
             look: CanvasLook::default(),
+            marks: Vec::new(),
             show_all_checks: false,
             composite_list: Default::default(),
             notes_mode: NotesMode::default(),
@@ -371,6 +384,40 @@ impl SessionWindow {
             return;
         }
         self.frame(rect);
+    }
+
+    /// A badge on the canvas was clicked (or activated from the keyboard):
+    /// go to its place, the [`target_rect`] of the first problem there,
+    /// by [`SessionWindow::go_to_roi`]'s rules (on a plan drawn in another
+    /// frame than the analysed one, a toast and nothing more). A badge whose
+    /// mark or place has gone does nothing.
+    pub(super) fn open_badge(
+        &mut self,
+        session: &OpenSession,
+        report: Option<&ChecksReport>,
+        id: u64,
+    ) {
+        let Some(first) = self
+            .marks
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.problems.first())
+        else {
+            return;
+        };
+        let none = Seams::new();
+        let seams = report.map_or(&none, |r| &r.seams);
+        if let Some(rect) = target_rect(session, self.plan.layout(), seams, first) {
+            self.go_to_roi(session, rect);
+        }
+    }
+
+    /// The groups the view shows: the group, or a composite's members.
+    fn view_groups(&self, session: &OpenSession) -> Vec<String> {
+        self.view
+            .as_ref()
+            .map(|v| view_members(v, &compositions_of(session)))
+            .unwrap_or_default()
     }
 
     /// Whether the shown canvas has the draw tool armed.
@@ -982,7 +1029,7 @@ impl SessionWindow {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette::SURFACE_900))
             .show(ui, |ui| {
-                self.view_bar(ui, session, jobs, pipeline);
+                self.view_bar(ui, session, jobs, pipeline, checks);
                 self.canvas_ui(ui, session, jobs, pipeline, checks);
             });
         self.follow_settings();
@@ -1140,6 +1187,7 @@ impl SessionWindow {
         self.panel_list_open = saved.panel_list_open;
         self.look.outlines = saved.outlines;
         self.look.numbers = saved.outlines;
+        self.look.seams = saved.seams;
         self.look.rois = saved.rois;
     }
 
@@ -1153,6 +1201,7 @@ impl SessionWindow {
             inspector_open: self.inspector.open.iter().cloned().collect(),
             panel_list_open: self.panel_list_open,
             outlines: self.look.outlines,
+            seams: self.look.seams,
             rois: self.look.rois,
         }
     }

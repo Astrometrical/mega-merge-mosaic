@@ -2,9 +2,9 @@
 //! (its colour, "{group} · {panels}") and per composite (dashed) then
 //! **+** (named "New composite" to assistive technology, which hears
 //! whether its popover is open) — chips only with two or more groups —
-//! and at the right the **Outlines**, **ROIs**, **Linked** and **Strong**
-//! toggles (on a row of their own when the bar is too narrow). **Mosaic**
-//! can be chosen once
+//! and at the right the **Outlines**, **Seams**, **ROIs**, **Linked** and
+//! **Strong** toggles (on a row of their own when the bar is too narrow).
+//! **Mosaic** can be chosen once
 //! something is merged or a merge has started. **Linked** is disabled for
 //! a mono view ([`SessionWindow::is_mono`]). The stretch
 //! toggles are the session's ([`DisplayStretch`] in `MosaicConfig.ui`):
@@ -13,12 +13,22 @@
 //! **Marks and tags** (spec §11): a group chip (a composite's takes its
 //! members' worst) shows a [`ChipMark`] (its tone's icon, and the state in
 //! its hover text) when its mosaic is out of date ([`out_of_date`]) or its
-//! merge settings changed ([`draft_changed`]). Its
+//! merge settings changed ([`draft_changed`]), and its unaccepted problems'
+//! count with the warning icon ([`problem_count`]; a composite's is the sum
+//! over its members). Its
 //! context menu offers **Merge this group** (committing the draft and
 //! merging that group only; off while it merges or merging is blocked). In
 //! Mosaic mode a tag over the image's top-left says why a shown group is out
 //! of date ([`out_of_date_reason`]) or, quieter, that its settings changed;
 //! clicking it reveals Merge settings.
+//!
+//! **Problems in place** (spec §7.3–§7.4, [`crate::marks`]): both canvases
+//! badge the shown groups' unaccepted problems, one badge per place,
+//! whatever the toggles; **Outlines** draws the panels' outlines on the
+//! mosaic too (from the analysis), and **Seams** the shown groups' seam
+//! lines on both (on the plan only while it draws in the analysed frame),
+//! a seam with an unaccepted problem in the warning colour, thicker. A
+//! badge clicked goes to its place ([`SessionWindow::open_badge`]).
 
 use std::path::Path;
 
@@ -31,10 +41,11 @@ use super::shortcuts::{self, keyed, views_hint};
 use super::steps::{draft_changed, out_of_date};
 use super::{COMPOSITES, CanvasMode, MERGE_SETTINGS, SessionWindow, compositions_of};
 use crate::bands::{group_bands, presets_for};
-use crate::checks::ChecksEngine;
+use crate::checks::{ChecksEngine, ChecksReport};
 use crate::compositions::{Channels, ViewKind, create_composition, unique_name};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
+use crate::marks::{ProblemMark, panel_outlines, problem_count, problem_marks, seam_lines};
 use crate::mosaic_view::{CanvasTag, view_members};
 use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
@@ -131,12 +142,11 @@ impl SessionWindow {
         session: &mut OpenSession,
         jobs: &mut JobRunner,
         pipeline: &Pipeline,
+        checks: &ChecksEngine,
     ) {
         let groups = group_names(session);
         let mono = self.is_mono(session, pipeline);
-        // The mosaic can be shown once something is merged, or a merge
-        // has started (its result fills in as it runs).
-        let mosaic_ok = session.merged || jobs.blending();
+        let report = checks.report();
         let mut act = BarActions::default();
         let margin = egui::Margin::symmetric(space::M as i8, space::S as i8);
         egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
@@ -146,7 +156,7 @@ impl SessionWindow {
             let mut widths = (0.0, 0.0);
             if one_row {
                 ui.horizontal(|ui| {
-                    widths.0 = self.choices(ui, session, jobs, &groups, mosaic_ok, &mut act);
+                    widths.0 = self.choices(ui, session, jobs, report, &groups, &mut act);
                     // Right to left: Strong ends the row.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         widths.1 = self.toggles(ui, session, mono);
@@ -154,7 +164,7 @@ impl SessionWindow {
                 });
             } else {
                 ui.horizontal_wrapped(|ui| {
-                    widths.0 = self.choices(ui, session, jobs, &groups, mosaic_ok, &mut act);
+                    widths.0 = self.choices(ui, session, jobs, report, &groups, &mut act);
                 });
                 ui.add_space(space::XS);
                 ui.horizontal(|ui| {
@@ -187,17 +197,22 @@ impl SessionWindow {
     }
 
     /// Plan / Mosaic, then (with two or more groups) a chip per group and
-    /// per composite and **+**; what was clicked goes to `act`. Returns the
+    /// per composite, each with its unaccepted problems' count from
+    /// `report`, and **+**; what was clicked goes to `act`. Returns the
     /// width they take in one row.
     fn choices(
         &self,
         ui: &mut egui::Ui,
         session: &OpenSession,
         jobs: &JobRunner,
+        report: Option<&ChecksReport>,
         groups: &[String],
-        mosaic_ok: bool,
         act: &mut BarActions,
     ) -> f32 {
+        // The mosaic can be shown once something is merged, or a merge
+        // has started (its result fills in as it runs).
+        let mosaic_ok = session.merged || jobs.blending();
+        let count = |g: &str| report.map_or(0, |r| problem_count(session, r, g));
         let mut widths = Vec::new();
         let mut extra = 0.0;
         let mut mode = self.mode();
@@ -245,7 +260,7 @@ impl SessionWindow {
                     selected: self.view.as_ref() == Some(&view),
                     dashed: false,
                     mark: mark_of(session, std::slice::from_ref(g)),
-                    problems: None,
+                    problems: report.map(|_| count(g)),
                 };
                 let r = chip(ui, c).on_hover_text(&hint);
                 if r.clicked() {
@@ -266,15 +281,17 @@ impl SessionWindow {
                     }
                 });
             }
-            for comp in compositions_of(session).iter() {
+            let composites = compositions_of(session);
+            for comp in &composites {
                 let view = ViewKind::Composition(comp.id);
+                let members = view_members(&view, &composites);
                 let c = ChoiceChip {
                     label: &comp.name,
                     color: None,
                     selected: self.view.as_ref() == Some(&view),
                     dashed: true,
-                    mark: mark_of(session, &view_members(&view, &compositions_of(session))),
-                    problems: None,
+                    mark: mark_of(session, &members),
+                    problems: report.map(|_| members.iter().map(|g| count(g)).sum()),
                 };
                 if chip(ui, c).on_hover_text(&hint).clicked() {
                     act.view = Some(view);
@@ -302,8 +319,9 @@ impl SessionWindow {
         one_row_width(ui, &widths) + extra
     }
 
-    /// The overlay and stretch toggles, laid out right to left. Returns
-    /// the width they take.
+    /// The overlay and stretch toggles, laid out right to left (so they
+    /// read Outlines, Seams, ROIs, then Linked and Strong). Returns the
+    /// width they take.
     fn toggles(&mut self, ui: &mut egui::Ui, session: &mut OpenSession, mono: bool) -> f32 {
         let ui_value = &mut session.mosaic.config.ui;
         let mut stretch = DisplayStretch::load(ui_value);
@@ -349,6 +367,16 @@ impl SessionWindow {
             .clicked()
         {
             self.look.rois = !self.look.rois;
+        }
+        let seams_tip = format!(
+            "Show where the merge changes from one panel to the next ({})",
+            ui.ctx().format_shortcut(&shortcuts::SEAMS)
+        );
+        if toggle(ui, "Seams", self.look.seams)
+            .on_hover_text(seams_tip)
+            .clicked()
+        {
+            self.look.seams = !self.look.seams;
         }
         if toggle(ui, "Outlines", self.look.outlines)
             .on_hover_text(keyed(
@@ -554,7 +582,9 @@ impl SessionWindow {
         }
     }
 
-    /// The canvas filling the rest of `ui`: the plan or the mosaic.
+    /// The canvas filling the rest of `ui`: the plan or the mosaic, each
+    /// with the shown groups' problems badged in place, and their seams
+    /// while the look has them ([`crate::marks`]).
     pub(super) fn canvas_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -565,17 +595,27 @@ impl SessionWindow {
     ) {
         self.look.stretch = DisplayStretch::load(&session.mosaic.config.ui);
         self.give_patches(ui.ctx(), session);
-        match self.mode() {
+        let feed = PlanFeed {
+            previews: pipeline.previews(),
+            generation: pipeline.generation(),
+            complete: pipeline.previews_complete(),
+        };
+        // The analysis places the problems (and the mosaic's outlines):
+        // kept current whichever canvas shows.
+        self.plan.follow_layout(ui.ctx(), session, &feed);
+        let report = checks.report();
+        let groups = self.view_groups(session);
+        self.marks = problem_marks(session, self.plan.layout(), report, &groups);
+        let seams = if self.look.seams {
+            seam_lines(self.plan.layout(), report, &groups, &self.marks)
+        } else {
+            Vec::new()
+        };
+        let clicked = match self.mode() {
             CanvasMode::Plan => {
-                let feed = PlanFeed {
-                    previews: pipeline.previews(),
-                    generation: pipeline.generation(),
-                    complete: pipeline.previews_complete(),
-                    checks: checks.report(),
-                };
                 // The ROIs are anchored in the analysed frame: not while the
                 // plan draws in another (outlines would be offset, a drawn
-                // rect misplaced for good).
+                // rect misplaced for good). Nor are the seams.
                 let matches = self.plan.frame_matches(session);
                 let overlays = if self.look.rois && matches {
                     self.mosaic.roi_overlays()
@@ -583,6 +623,9 @@ impl SessionWindow {
                     Vec::new()
                 };
                 self.plan.set_overlays(overlays);
+                self.plan
+                    .set_lines(if matches { seams } else { Vec::new() });
+                self.plan.set_marks(self.marks.clone());
                 // A click on the compared preview is its peek, no selection;
                 // not while the plan draws in another frame (it shows no ROI
                 // or patch there).
@@ -621,12 +664,27 @@ impl SessionWindow {
                 if self.panels.set_highlight(hovered) {
                     ui.ctx().request_repaint();
                 }
+                self.plan.take_badge_clicked()
             }
             CanvasMode::Mosaic => {
                 // No plan to point at.
                 if self.panels.set_highlight(None) {
                     ui.ctx().request_repaint();
                 }
+                let outlines = if self.look.outlines {
+                    let layout = self.plan.layout();
+                    panel_outlines(session, layout, &groups, &self.marks, self.look.numbers)
+                } else {
+                    Vec::new()
+                };
+                self.mosaic.set_outlines(outlines);
+                self.mosaic.set_lines(seams);
+                let badges = self
+                    .marks
+                    .iter()
+                    .filter_map(ProblemMark::placed_badge)
+                    .collect();
+                self.mosaic.set_badges(badges);
                 // The plan's stretch holds a first merge of the view it was
                 // worked out for.
                 let same_view = self.plan.view_key().map(str::to_string)
@@ -649,7 +707,11 @@ impl SessionWindow {
                 if self.mosaic.take_reveal_settings() {
                     self.inspector.reveal(MERGE_SETTINGS);
                 }
+                self.mosaic.take_badge_clicked()
             }
+        };
+        if let Some(id) = clicked {
+            self.open_badge(session, report, id);
         }
         // Over the canvas: the ROI labels with controls (Compare A / B).
         self.roi_labels(ui, session);

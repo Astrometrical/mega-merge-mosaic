@@ -58,7 +58,6 @@ fn harness_of(state: State) -> Harness<'static, State> {
                     previews: &s.previews,
                     generation: s.generation,
                     complete: s.complete,
-                    checks: None,
                 };
                 egui::Panel::right("details").show(ui, |ui| {
                     s.view.selection_ui(ui, &s.session);

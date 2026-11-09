@@ -64,6 +64,10 @@ pub const BADGE_HEIGHT: f32 = 22.0;
 pub const BADGE_PAD: f32 = 7.0;
 /// Width of a polyline drawn over a canvas (a seam, say), in points.
 pub const LINE_WIDTH: f32 = 2.0;
+/// Width of a polyline that needs attention (a seam flagged as showing),
+/// in points: thicker than [`LINE_WIDTH`], so its colour is not the only
+/// signal.
+pub const LINE_WIDTH_STRONG: f32 = 3.5;
 /// Dash and gap lengths of a dashed polyline, in points.
 pub const LINE_DASH: (f32, f32) = (8.0, 5.0);
 

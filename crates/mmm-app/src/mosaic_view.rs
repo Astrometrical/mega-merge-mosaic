@@ -34,6 +34,12 @@
 //!   carry controls itself ([`MosaicView::set_roi_labelled`]).
 //!   [`MosaicView::merge_these`] merges the groups it is given over the whole
 //!   canvas, committing the merge settings draft first.
+//! - **Over the image** ([`crate::marks`]): the window hands the mosaic the
+//!   panels' outlines (while the look has them, [`MosaicView::set_outlines`];
+//!   under the ROIs), the seam lines ([`MosaicView::set_lines`]) and the
+//!   problems' badges ([`MosaicView::set_badges`]), all placed by the
+//!   analysis; a badge clicked is taken with
+//!   [`MosaicView::take_badge_clicked`].
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
 //!   merge settings (a draft kept in `ui`, edited at once) and analysis
 //!   settings (applied at once, with an Undo toast). While an analysis edit
@@ -100,7 +106,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
-use mega_ui::canvas_layers::Hold;
+use mega_ui::canvas_layers::{CanvasBadge, Hold, Overlay, Polyline};
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{radius, space};
 use mega_ui::theme::{palette, scrim};
@@ -306,6 +312,15 @@ pub struct MosaicView {
     settings: SettingsPanel,
     /// The ROIs' preview patches the viewer draws ([`MosaicView::set_patches`]).
     patches: Vec<mega_ui::canvas_layers::Patch>,
+    /// The panels' outlines the viewer draws, under the ROIs
+    /// ([`MosaicView::set_outlines`]).
+    outlines: Vec<Overlay>,
+    /// The lines the viewer draws (the seams, [`MosaicView::set_lines`]).
+    lines: Vec<Polyline>,
+    /// The badges the viewer draws (the problems, [`MosaicView::set_badges`]).
+    badges: Vec<CanvasBadge>,
+    /// A badge clicked, until taken ([`MosaicView::take_badge_clicked`]).
+    badge_clicked: Option<u64>,
     /// The tag over the image (why the shown groups are out of date, or
     /// that their settings changed), set by the window each frame.
     tag: Option<CanvasTag>,
@@ -352,6 +367,10 @@ impl MosaicView {
             shown: false,
             rois: RoiPanel::default(),
             patches: Vec::new(),
+            outlines: Vec::new(),
+            lines: Vec::new(),
+            badges: Vec::new(),
+            badge_clicked: None,
             tag: None,
             reveal_settings: false,
             hold: None,
@@ -476,6 +495,50 @@ impl MosaicView {
     /// navigate tool), in canvas coordinates.
     pub fn hold(&self) -> Option<Hold> {
         self.hold
+    }
+
+    /// Draw these panel outlines (canvas coordinates) over the mosaic from
+    /// the next frame on, under the ROIs: the window hands them while the
+    /// look has them ([`crate::marks::panel_outlines`]).
+    pub fn set_outlines(&mut self, outlines: Vec<Overlay>) {
+        self.outlines = outlines;
+    }
+
+    /// Draw these polylines (the seams, canvas coordinates) over the mosaic
+    /// from the next frame on.
+    pub fn set_lines(&mut self, lines: Vec<Polyline>) {
+        self.lines = lines;
+    }
+
+    /// Draw these badges (the view's problems, canvas coordinates) over the
+    /// mosaic from the next frame on. A click on one is taken with
+    /// [`MosaicView::take_badge_clicked`].
+    pub fn set_badges(&mut self, badges: Vec<CanvasBadge>) {
+        self.badges = badges;
+    }
+
+    /// The badge clicked (or activated from the keyboard) since the last
+    /// call, once: its id.
+    pub fn take_badge_clicked(&mut self) -> Option<u64> {
+        self.badge_clicked.take()
+    }
+
+    /// The badges handed to the viewer (canvas coordinates).
+    #[cfg(test)]
+    pub fn badges(&self) -> &[CanvasBadge] {
+        &self.badges
+    }
+
+    /// The lines handed to the viewer (canvas coordinates).
+    #[cfg(test)]
+    pub fn lines(&self) -> &[Polyline] {
+        &self.lines
+    }
+
+    /// The panel outlines handed to the viewer (canvas coordinates).
+    #[cfg(test)]
+    pub fn outlines(&self) -> &[Overlay] {
+        &self.outlines
     }
 
     /// Why the typed merge settings are refused, if they are
@@ -987,10 +1050,12 @@ impl MosaicView {
     }
 
     /// Draw the canvas filling `ui` and handle its input (a rectangle drawn
-    /// with the ROI tool becomes an ROI). Drawing only: the state it draws
+    /// with the ROI tool becomes an ROI; a badge clicked is kept for
+    /// [`MosaicView::take_badge_clicked`]). Drawing only: the state it draws
     /// is brought up to date by [`MosaicView::poll`]. The look's stretch
     /// toggles are the session's, which `poll` follows (see the module
-    /// docs); the ROIs are drawn when the look has them. `plan_stretch` is
+    /// docs); the ROIs are drawn when the look has them, over the panel
+    /// outlines, the seams and the badges handed over. `plan_stretch` is
     /// the plan's stretch of the same view, kept for a group's first merge.
     pub fn show(
         &mut self,
@@ -1007,11 +1072,11 @@ impl MosaicView {
             ui.ctx().request_repaint();
         }
         let canvas = self.view_canvas();
-        let overlays = if look.rois {
-            self.rois.overlays()
-        } else {
-            Vec::new()
-        };
+        // The ROIs over the panels' outlines.
+        let mut overlays = self.outlines.clone();
+        if look.rois {
+            overlays.extend(self.rois.overlays());
+        }
         let notes = self.member_notes();
         let mut drawn = None;
         match &mut self.viewer {
@@ -1027,9 +1092,14 @@ impl MosaicView {
                 }
                 viewer.set_overlays(overlays);
                 viewer.set_patches(self.patches.clone());
+                viewer.set_lines(self.lines.clone());
+                viewer.set_badges(self.badges.clone());
                 let shown = viewer.show(ui);
                 drawn = shown.drawn_rect;
                 self.hold = shown.held;
+                if shown.badge_clicked.is_some() {
+                    self.badge_clicked = shown.badge_clicked;
+                }
                 // A composition shows its merged groups; the others are
                 // named over the image, which keeps the plan's place.
                 if let Some((rect, _)) = viewer.last_frame() {
