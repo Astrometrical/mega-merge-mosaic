@@ -1291,7 +1291,7 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   same second as an earlier export reads as exported (the start screen has
   the same rule). A step that
   cannot act now says why in its tooltip (Merge: the merge guard's reason;
-  Export: `MosaicView::export_block_reason`). ROI previews are not jobs and
+  Export: `SessionWindow::export_block_reason`). ROI previews are not jobs and
   not shown in the strip.
 - **Merge states and predicates** (`steps.rs`). One set of predicates
   derives every place's Merge state. `out_of_date(session, group)`: the

@@ -238,7 +238,8 @@ fn an_id_key_beats_a_legacy_name_match() {
     );
     assert_eq!(hero.start, 3, "comp:2 is the id, not the name");
     // With no key matching, the legacy name still finds its composite.
-    let dir2 = merged_session(&temp_dir("hero-comp-legacy2"), Some("comp:2"));
+    let root2 = temp_dir("hero-comp-legacy2");
+    let dir2 = merged_session(&root2, Some("comp:2"));
     save_comps(
         &dir2,
         &[Composition {
@@ -248,6 +249,7 @@ fn an_id_key_beats_a_legacy_name_match() {
     );
     assert_eq!(build_hero(&facts_of(&dir2)).start, 2);
     let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
 }
 
 #[test]
