@@ -1,6 +1,6 @@
 use egui::{ColorImage, Pos2, Rect, Vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 use super::*;
 
@@ -764,7 +764,48 @@ fn warning_badge(id: u64, at: [f64; 2], count: u32) -> CanvasBadge {
         tone: Tone::Warning,
         count,
         description: format!("{count} problems here"),
+        hover: None,
     }
+}
+
+#[test]
+fn a_badges_hover_can_say_more_than_its_name() {
+    let mut h = themed_harness();
+    let detailed = CanvasBadge {
+        description: "2 problems between a and b".into(),
+        hover: Some("Too thin\nA seam shows".into()),
+        ..warning_badge(7, [300.0, 300.0], 2)
+    };
+    h.state_mut()
+        .canvas
+        .set_badges(vec![detailed, warning_badge(8, [700.0, 700.0], 1)]);
+    h.run();
+    // Named by its description; the hover is its accessible description.
+    let node = badge_button(&h, "2 problems between a and b");
+    assert_eq!(
+        node.accesskit_node().description().as_deref(),
+        Some("Too thin\nA seam shows")
+    );
+    let at = node.rect().center();
+    h.hover_at(at);
+    h.run_steps(80);
+    assert!(
+        h.query_by_label("Too thin\nA seam shows").is_some(),
+        "its hover text shows"
+    );
+    assert_eq!(
+        h.query_all_by_label("2 problems between a and b").count(),
+        1,
+        "the name alone, not as hover text"
+    );
+    // Without one, the description shows on hover (and describes nothing
+    // more).
+    let plain = badge_button(&h, "1 problems here");
+    assert_eq!(plain.accesskit_node().description(), None);
+    let at = plain.rect().center();
+    h.hover_at(at);
+    h.run_steps(80);
+    assert_eq!(h.query_all_by_label("1 problems here").count(), 2);
 }
 
 fn painted_text(h: &Harness<'_, State>) -> String {

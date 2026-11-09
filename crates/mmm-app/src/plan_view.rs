@@ -1646,10 +1646,8 @@ impl PlanView {
         let badged: BTreeSet<PathBuf> = self
             .marks
             .iter()
-            .filter_map(|m| match &m.place {
-                Place::Panel(p) => Some(p.clone()),
-                _ => None,
-            })
+            .flat_map(ProblemMark::panels)
+            .map(Path::to_path_buf)
             .collect();
         // Where each panel is drawn, for its badge.
         let mut placed: BTreeMap<PathBuf, [f64; 4]> = BTreeMap::new();
@@ -1729,15 +1727,19 @@ impl PlanView {
             }
         }
         self.last_items = snaps;
-        // A panel's badge at its outline as drawn here; the others where
-        // the analysis places them, only in the analysed frame.
+        // A panel's badge at its outline as drawn here (its first panel's
+        // drawn); the others where the analysis places them, only in the
+        // analysed frame.
         let analysed = self.frame_matches(session);
         let badges: Vec<CanvasBadge> = self
             .marks
             .iter()
             .filter_map(|m| {
                 let at = match &m.place {
-                    Place::Panel(p) => badge_point(&m.place, *placed.get(p)?),
+                    Place::Panel(_) => {
+                        let drawn = m.panels().find_map(|p| placed.get(p))?;
+                        badge_point(&m.place, *drawn)
+                    }
                     _ if analysed => badge_point(&m.place, m.rect?),
                     _ => return None,
                 };

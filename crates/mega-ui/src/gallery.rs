@@ -372,7 +372,8 @@ fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
             at: [500.0, 220.0],
             tone: Tone::Warning,
             count: 2,
-            description: "2 problems here".into(),
+            description: "2 problems between these panels".into(),
+            hover: Some("Overlap too thin\nA seam shows".into()),
         },
         CanvasBadge {
             id: 2,
@@ -380,6 +381,7 @@ fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
             tone: Tone::Problem,
             count: 1,
             description: "1 problem here".into(),
+            hover: None,
         },
     ]);
     PlanGallery {

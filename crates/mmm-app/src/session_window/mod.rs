@@ -39,8 +39,10 @@
 //!   toggles.
 //! - **Problems in place** ([`crate::marks`]): both canvases badge the shown
 //!   groups' unaccepted problems where they are, one badge per place
-//!   (counting them); Outlines and Seams draw over both. A badge clicked
-//!   opens its first problem ([`SessionWindow::open_badge`]).
+//!   (counting them; a composite's members' places on one spot share it),
+//!   named for what and where, its problems' titles on hover; Outlines and
+//!   Seams draw over both. A badge clicked opens its first problem
+//!   ([`SessionWindow::open_badge`]).
 //! - **Opening a problem** ([`SessionWindow::open_problem`]: a row clicked,
 //!   or activated with Enter, in Problems, See all, a panel's or a place's
 //!   checks; or a badge): the view shows its group first if it does not

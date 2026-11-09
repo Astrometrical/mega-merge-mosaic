@@ -274,22 +274,34 @@ fn a_chip_shows_its_problem_count() {
             None
         ]
     );
-    // Not colour alone: the warning icon, once on the counted chips, and
-    // the number beside it.
-    let warning = Tone::Warning.icon().unwrap();
-    let mut icons = 0;
-    let mut has_count = false;
-    for c in &h.output().shapes {
-        if let egui::Shape::Text(t) = &c.shape {
-            if t.galley.text().contains(warning)
-                && t.galley.job.sections[0].format.font_id.family
-                    == crate::theme::fonts::icon_family()
-            {
-                icons += 1;
-            }
-            has_count |= t.galley.text() == "3";
-        }
-    }
-    assert_eq!(icons, 3, "icon on the counted chips (mark's included)");
+    // Not colour alone: the problem icon in the problem colour, once on
+    // each counted chip, and the number beside it; the warning triangle
+    // only as the Out of date mark (a problem is not out of date).
+    let drawn = |tone: Tone| {
+        let icon = tone.icon().unwrap();
+        h.output()
+            .shapes
+            .iter()
+            .filter(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let format = &t.galley.job.sections[0].format;
+                    t.galley.text().contains(icon)
+                        && format.font_id.family == crate::theme::fonts::icon_family()
+                        && format.color == tone.color()
+                }
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(
+        drawn(Tone::Problem),
+        2,
+        "the problem icon on the counted chips"
+    );
+    assert_eq!(drawn(Tone::Warning), 1, "the mark's triangle only");
+    let has_count = h.output().shapes.iter().any(|c| match &c.shape {
+        egui::Shape::Text(t) => t.galley.text() == "3",
+        _ => false,
+    });
     assert!(has_count, "the count itself");
 }

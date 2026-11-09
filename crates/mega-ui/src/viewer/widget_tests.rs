@@ -1522,6 +1522,7 @@ fn a_badge_on_the_viewer_clicks_and_keeps_its_size() {
         tone: Tone::Problem,
         count: 4,
         description: "4 problems here".to_owned(),
+        hover: None,
     }]);
     h.run();
     let node = |h: &Harness<'static, Logged>| {

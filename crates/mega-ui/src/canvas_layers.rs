@@ -92,9 +92,13 @@ pub struct CanvasBadge {
     pub tone: Tone,
     /// The number shown beside the icon.
     pub count: u32,
-    /// What it says to assistive technology and on hover ("2 problems
-    /// here").
+    /// Its accessible name, which says what it counts and where ("2
+    /// problems here"); also its hover text, unless it has `hover`.
     pub description: String,
+    /// What resting the pointer on it shows, when that says more than the
+    /// description (what it counts, one per line); also its accessible
+    /// description. `None`: the description shows.
+    pub hover: Option<String>,
 }
 
 /// The primary button held down on a canvas (pressed there with the
@@ -486,9 +490,15 @@ pub(crate) fn show_badges(
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone())
         });
+        if let Some(more) = &badge.hover {
+            ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_description(more.clone());
+            });
+        }
+        let hover = badge.hover.as_ref().unwrap_or(&badge.description);
         let response = response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(&badge.description);
+            .on_hover_text(hover);
         if response.clicked() {
             clicked = Some(badge.id);
         }

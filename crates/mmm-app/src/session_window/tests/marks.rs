@@ -129,8 +129,12 @@ pub(super) fn badge_button<'h>(
 ) -> egui_kittest::Node<'h> {
     h.query_all(By::new().role(Role::Button))
         .find(|n| {
+            // "{n} problem(s) at …" or "… in a coverage gap".
             let said = n.accesskit_node().label().unwrap_or_default();
-            said.ends_with(" here") && n.rect().expand(1.0).contains(at)
+            let mut words = said.split(' ');
+            let counted = words.next().is_some_and(|w| w.parse::<u32>().is_ok())
+                && words.next().is_some_and(|w| w.starts_with("problem"));
+            counted && n.rect().expand(1.0).contains(at)
         })
         .unwrap_or_else(|| panic!("a badge at {at:?}"))
 }
@@ -285,30 +289,58 @@ fn badges_match_on_plan_and_mosaic() {
     // (its overlap's and its seam's problems) at the overlap's centre, an
     // area's at its centre.
     let r0 = rect(&ha[0]);
-    let want = [
-        ([r0[2], r0[1]], 2),
-        (centre(meet(r0, rect(&ha[1]))), 2),
-        (centre(o13), 1),
-        ([40.0, 40.0], 1),
-    ];
-    for (p, n) in want {
-        let b = badge_at(&plan, p).unwrap_or_else(|| panic!("a badge at {p:?}: {plan:?}"));
-        assert_eq!(b.count, n);
-        assert_eq!(b.tone, Tone::Problem, "the problem icon, not colour alone");
-        let said = if n == 1 {
-            "1 problem here".to_string()
-        } else {
-            format!("{n} problems here")
-        };
-        assert_eq!(b.description, said);
-    }
-    // Read to a screen reader as buttons.
-    let buttons = |h: &Harness<'static, State>, label: &str| {
-        h.query_all(By::new().role(Role::Button).label(label))
-            .count()
+    // Each says what and where: the place in its name, its problems'
+    // titles on hover (one per line) and as its accessible description.
+    let name = |p: &PathBuf| crate::panel_list::file_name(p);
+    let pair = |a: &PathBuf, b: &PathBuf| {
+        let (lo, hi) = (a.min(b), a.max(b));
+        format!("the overlap of {} and {}", name(lo), name(hi))
     };
-    assert_eq!(buttons(&h, "2 problems here"), 2);
-    assert_eq!(buttons(&h, "1 problem here"), 2);
+    let want = [
+        (
+            [r0[2], r0[1]],
+            2,
+            format!("2 problems at {}", name(&ha[0])),
+            "Panel 0 changed\nPanel 0 alone",
+        ),
+        (
+            centre(meet(r0, rect(&ha[1]))),
+            2,
+            format!("2 problems at {}", pair(&ha[0], &ha[1])),
+            "Thin\nA seam shows between 0 and 1",
+        ),
+        (
+            centre(o13),
+            1,
+            format!("1 problem at {}", pair(&ha[1], &ha[3])),
+            "A seam shows",
+        ),
+        (
+            [40.0, 40.0],
+            1,
+            "1 problem in a coverage gap".to_string(),
+            "A hole",
+        ),
+    ];
+    for (p, n, said, titles) in &want {
+        let b = badge_at(&plan, *p).unwrap_or_else(|| panic!("a badge at {p:?}: {plan:?}"));
+        assert_eq!(b.count, *n);
+        assert_eq!(b.tone, Tone::Problem, "the problem icon, not colour alone");
+        assert_eq!(&b.description, said);
+        assert_eq!(b.hover.as_deref(), Some(*titles));
+    }
+    // Read to a screen reader as buttons: named for what and where,
+    // described by their problems.
+    let read = |h: &Harness<'static, State>| {
+        for (_, _, said, titles) in &want {
+            let found: Vec<Option<String>> = h
+                .query_all(By::new().role(Role::Button).label(said.as_str()))
+                .map(|n| n.accesskit_node().description())
+                .collect();
+            assert_eq!(found, [Some(titles.to_string())], "{said}");
+        }
+    };
+    read(&h);
     // A badge clicked on the plan goes to its place: the lone seam's
     // badge frames its lines.
     let at = h
@@ -333,8 +365,7 @@ fn badges_match_on_plan_and_mosaic() {
     h.state_mut().w.frame([0, 0, 600, 420]);
     h.run_steps(3);
     assert_eq!(by_id(h.state().w.mosaic().badges()), plan);
-    assert_eq!(buttons(&h, "2 problems here"), 2);
-    assert_eq!(buttons(&h, "1 problem here"), 2);
+    read(&h);
     // A badge clicked on the mosaic goes to its place too: the panel's
     // bbox is framed.
     let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
@@ -689,6 +720,101 @@ fn a_composite_gathers_its_members_badges_and_seams() {
     let plan = h.state().w.plan();
     assert_eq!(spots(plan.badges().iter().map(|b| b.at)), want);
     assert_eq!(points(plan.lines()), seams);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_composites_coincident_problems_share_one_badge() {
+    let (root, mut s, jobs) = merged("window-composite-coincident");
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[Composition {
+            id: 1,
+            name: "Both".into(),
+            channels: [Some(("Ha".into(), 1.0)), Some(("OIII".into(), 1.0)), None],
+        }],
+    );
+    let (ha, oiii) = (members(&s, "Ha"), members(&s, "OIII"));
+    let (gh, go) = (analysed(&s, "Ha"), analysed(&s, "OIII"));
+    // The groups share their pointings.
+    for (a, b) in ha.iter().zip(&oiii) {
+        assert_eq!(gh[a].1, go[b].1, "{a:?} and {b:?}");
+    }
+    let thin = |panels: &[PathBuf], group: &str| {
+        problem_at(
+            CheckCode::ThinOverlap,
+            CheckTarget::Overlap(panels[0].clone(), panels[1].clone()),
+            &[group],
+            &format!("Thin in {group}"),
+        )
+    };
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(ChecksReport {
+        checks: vec![
+            thin(&ha, "Ha"),
+            thin(&oiii, "OIII"),
+            // A panel's problem in one group, a note on its twin in the
+            // other.
+            problem_at(
+                CheckCode::NoOverlap,
+                CheckTarget::Panel(ha[2].clone()),
+                &["Ha"],
+                "Ha 2 alone",
+            ),
+            at(
+                CheckCode::EmptyArea,
+                Severity::Note,
+                CheckTarget::Panel(oiii[2].clone()),
+                &["OIII"],
+                "OIII 2 is half empty",
+            ),
+        ],
+        errors: Vec::new(),
+        seams: Default::default(),
+    });
+    state.w.select_view(ViewKind::Composition(1));
+    let mut h = harness(state);
+    step_to(&mut h, |st| {
+        mosaic_ready(st) && !st.w.mosaic().badges().is_empty()
+    });
+    h.run_steps(2);
+    // One badge where the two thin overlaps coincide, counting both; the
+    // chip counts them too.
+    let o01 = meet(gh[&ha[0]].1, gh[&ha[1]].1);
+    let badges = h.state().w.mosaic().badges().to_vec();
+    assert_eq!(badges.len(), 2, "{badges:?}");
+    let b = badge_at(&badges, centre(o01)).expect("the pair's badge");
+    assert_eq!(b.count, 2);
+    assert_eq!(chip_state(&h, "Both").as_deref(), Some("3 problems"));
+    // Opened, the pair lists both groups' checks there.
+    h.state_mut().w.frame([0, 0, 600, 420]);
+    h.run_steps(3);
+    let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    let cam = h.state().w.mosaic().camera().unwrap();
+    let c = centre(o01);
+    badge_button(&h, screen(frame, cam, (c[0], c[1]))).click();
+    h.run_steps(3);
+    for title in ["Thin in Ha", "Thin in OIII"] {
+        assert_eq!(
+            h.query_all_by_role_and_label(Role::Button, title).count(),
+            2,
+            "{title} in Problems and the pair's checks"
+        );
+    }
+    // A panel lists its twin's checks too (the twin's note included).
+    h.state_mut().w.frame([0, 0, 600, 420]);
+    h.run_steps(3);
+    let r2 = gh[&ha[2]].1;
+    let cam = h.state().w.mosaic().camera().unwrap();
+    badge_button(&h, screen(frame, cam, (r2[2], r2[1]))).click();
+    h.run_steps(3);
+    assert_eq!(
+        h.state().w.selection(),
+        Some(&Selected::Panel(ha[2].clone()))
+    );
+    h.get_by_label("Checks for this panel");
+    assert_eq!(h.query_all_by_label("Ha 2 alone").count(), 2);
+    h.get_by_label("OIII 2 is half empty");
     let _ = std::fs::remove_dir_all(&root);
 }
 

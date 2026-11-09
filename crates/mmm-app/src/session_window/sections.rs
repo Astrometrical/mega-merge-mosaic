@@ -16,7 +16,9 @@
 //!   Overlaps rows select the neighbour and frame the overlap) and its
 //!   checks, every severity, with Accept, Un-accept and Open; or "Overlap
 //!   {a} – {b}" / "Seam {a} – {b}" and the checks of that pair of panels,
-//!   its overlap's and its seam's together.
+//!   its overlap's and its seam's together. In a composite each lists
+//!   every shown group's checks at that spot too, as its badge counts them
+//!   (a member's panel or pair on the same pointing).
 //! - **ROIs**: **Draw ROI** (also the `D` key, which reveals the section so
 //!   its hint shows) arms the draw tool on the canvas shown, plan or mosaic
 //!   (a crosshair over it while armed), then the ROI list
@@ -30,6 +32,7 @@
 //!   reorder, delete with Undo); the picked one shows its channel editor.
 //! - **Notes**: the session's notes, saved with the session (debounced).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -56,7 +59,7 @@ use crate::marks::{Place, Places};
 use crate::mosaic_view::MosaicView;
 use crate::panel_list::file_name;
 use crate::pipeline::{Pipeline, Step};
-use crate::plan_view::{Layout, PlanView, details_heading};
+use crate::plan_view::{Layout, PlanView, details_heading, group_members};
 use crate::session::{OpenSession, notes, set_notes};
 use crate::status::format_canvas;
 use crate::util::{Debounce, group_names};
@@ -153,6 +156,7 @@ impl SessionWindow {
         ];
         let draw_block = self.draw_roi_block(session);
         let drawing = self.drawing_roi();
+        let shown = self.view_groups(session);
         let mut act = Actions::default();
         let SessionWindow {
             plan,
@@ -181,7 +185,7 @@ impl SessionWindow {
                 ),
                 PANELS => panels_ui(
                     ui,
-                    session,
+                    (session, &shown),
                     (plan, selection.as_ref()),
                     pipeline,
                     checks,
@@ -402,12 +406,22 @@ fn problems_ui(
     }
 }
 
+/// The panels of `groups` (the groups the view shows).
+fn shown_panels(session: &OpenSession, groups: &[String]) -> BTreeSet<PathBuf> {
+    group_members(session, groups)
+        .into_values()
+        .flatten()
+        .collect()
+}
+
 /// The Panels section: the summary, the previews' progress, then what is
 /// selected: a panel's details and checks ([`PlanView::selection_ui`]), or
-/// an overlap's or a seam's heading and checks ([`place_ui`]).
+/// an overlap's or a seam's heading and checks ([`place_ui`]). In a view of
+/// several groups (a composite), a place lists every shown group's checks
+/// at that spot, as its badge counts them ([`Places::coincide`]).
 fn panels_ui(
     ui: &mut egui::Ui,
-    session: &OpenSession,
+    (session, groups): (&OpenSession, &[String]),
     (plan, selection): (&mut PlanView, Option<&Selected>),
     pipeline: &mut Pipeline,
     checks: &ChecksEngine,
@@ -450,17 +464,24 @@ fn panels_ui(
     }
     if let Some(s @ (Selected::Overlap(..) | Selected::Seam { .. })) = selection {
         ui.add_space(space::M);
-        place_ui(ui, session, plan.layout(), checks, s, act);
+        place_ui(ui, (session, groups), plan.layout(), checks, s, act);
         return;
     }
     let Some(path) = plan.selected().map(Path::to_path_buf) else {
         return;
     };
     // Its checks, every severity, those naming it with others (an overlap,
-    // a seam) too.
+    // a seam) too; and those of the shown panels badged with it (a
+    // composite's member on the same pointing).
     let listed = checks.report().map(|report| {
+        let places = Places::new(session, plan.layout(), &report.seams);
+        let me = Place::Panel(path.clone());
+        let twins: Vec<PathBuf> = shown_panels(session, groups)
+            .into_iter()
+            .filter(|q| places.coincide(&me, &Place::Panel(q.clone())))
+            .collect();
         check_items(report, (session, plan.layout()), false, |c| {
-            c.panels.contains(&path)
+            c.panels.iter().any(|p| *p == path || twins.contains(p))
         })
     });
     ui.add_space(space::M);
@@ -482,11 +503,12 @@ fn panels_ui(
 
 /// The selected overlap's or seam's details: "Overlap {a} – {b}" or "Seam
 /// {a} – {b}" (the panels' names, naming what was selected), then every
-/// check of that pair of panels, its overlap's and its seam's (as the
-/// pair's badge counts them), with Accept, Un-accept and Open.
+/// check of that pair of panels, its overlap's and its seam's, and of the
+/// shown groups' pairs at the same spot (as the pair's badge counts them),
+/// with Accept, Un-accept and Open.
 fn place_ui(
     ui: &mut egui::Ui,
-    session: &OpenSession,
+    (session, groups): (&OpenSession, &[String]),
     layout: &Layout,
     checks: &ChecksEngine,
     selected: &Selected,
@@ -501,11 +523,19 @@ fn place_ui(
     let Some(report) = checks.report() else {
         return;
     };
-    // The pair's checks, its overlap's and its seam's together (as its
-    // badge counts them).
+    // The pair's checks, its overlap's and its seam's together, and those
+    // of a shown pair badged with it.
     let pair = selected.place().badged();
+    let places = Places::new(session, layout, &report.seams);
+    let shown = shown_panels(session, groups);
     let (items, sources) = check_items(report, (session, layout), false, |c| {
-        Place::of(c).map(Place::badged).as_ref() == Some(&pair)
+        Place::of(c).map(Place::badged).is_some_and(|q| {
+            let in_view = match &q {
+                Place::Overlap(a, b) => shown.contains(a) && shown.contains(b),
+                _ => false,
+            };
+            q == pair || (in_view && places.coincide(&pair, &q))
+        })
     });
     if items.is_empty() {
         muted(ui, "No checks here.");

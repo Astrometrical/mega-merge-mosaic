@@ -85,9 +85,11 @@ pub struct ChoiceChip<'a> {
     pub dashed: bool,
     /// A state glyph after the label (see [`ChipMark`]).
     pub mark: Option<ChipMark>,
-    /// How many unaccepted problems the choice has: the warning icon and
-    /// the count after the label (and any mark); none (or zero) draws
-    /// nothing. The accessible description gains "{n} problem(s)".
+    /// How many unaccepted problems the choice has: the problem tone's icon
+    /// (as on a canvas badge or a problem row, never the warning triangle
+    /// of [`ChipMark::Attention`]) in its colour and the count after the
+    /// label (and any mark); none (or zero) draws nothing. The accessible
+    /// description gains "{n} problem(s)".
     pub problems: Option<u32>,
 }
 
@@ -189,9 +191,9 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
         0.0
     };
     let mark = glyph.as_ref().map_or(0.0, |g| space::XS + g.size().x);
-    // The problem count: the warning icon, then the number.
+    // The problem count: the problem icon, then the number.
     let problems = chip.problems.filter(|n| *n > 0);
-    let tone = Tone::Warning;
+    let tone = Tone::Problem;
     let count = problems.map(|n| {
         let icon = ui.painter().layout_no_wrap(
             tone.icon().unwrap_or(icons::INFO).to_string(),
