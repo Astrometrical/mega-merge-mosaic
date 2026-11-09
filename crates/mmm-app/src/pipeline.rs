@@ -644,6 +644,9 @@ mod tests {
         let gate = r.hold();
         p.poll(&egui::Context::default(), t0, s, r, &[], false);
         assert_eq!(p.step(), Some(Step::Previews));
+        // Noted while the gate holds it: once cancelled it may end before
+        // the next look.
+        seen.note(r, &[]);
         let first = r.views()[0].id;
         r.cancel(first);
         gate.open();
