@@ -337,6 +337,34 @@ fn colliding_names_block_export() {
 }
 
 #[test]
+fn a_pasted_quoted_path_is_taken() {
+    let (root, s, jobs) = merged("export-quoted");
+    let out = root.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let mut h = shown(s, jobs);
+    open_dialog(&mut h);
+    // As Explorer's "Copy as path" gives it, with a stray space or two.
+    let out_text = crate::util::plain_path(&out);
+    retype(&mut h, "Folder", &format!(" \"{out_text}\"  "));
+    settle(&mut h);
+    assert!(h.query_by_label("Give the folder's full path").is_none());
+    assert!(h.query_by_label("The folder doesn't exist").is_none());
+    assert!(!footer_disabled(&h, "Export"));
+    footer_button(&h, "Export").click();
+    h.run_steps(2);
+    step_until(&mut h, |st| !st.jobs.busy());
+    let want: BTreeSet<String> = ["m_Ha.fits", "m_OIII.fits"].map(String::from).into();
+    assert_eq!(files_in(&out), want);
+    // Remembered without the quotes.
+    assert_eq!(
+        h.state().session.mosaic.config.ui[EXPORT_KEY]["folder"],
+        json!(out_text)
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_folder_that_cannot_take_the_files_blocks_export() {
     let (root, s) = ready_session("export-folder");
     let out = root.join("out");

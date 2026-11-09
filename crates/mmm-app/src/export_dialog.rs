@@ -17,7 +17,8 @@
 //!    those the user unticked before ([`Choices::excluded`]): a group merged
 //!    or a composite made since starts ticked too.
 //! 3. **Folder**: typed, or picked with **Browse…** (a native folder dialog
-//!    on a worker, [`FolderPicker`]).
+//!    on a worker, [`FolderPicker`]). A path pasted in double quotes, as
+//!    Explorer's "Copy as path" gives it, is taken without them.
 //! 4. **Format**: FITS or TIFF, with a one-line note on what it holds.
 //! 5. **File name pattern**: the tokens `{session}` (the session's name)
 //!    and `{name}` (the group's or composite's); [`file_names`] makes the
@@ -497,6 +498,16 @@ fn path_key(path: &Path) -> PathBuf {
         .collect()
 }
 
+/// The folder the Folder field names: `text` without the spaces around it
+/// and one pair of double quotes around it all (Explorer's "Copy as path"
+/// gives `"C:\Astro"`), then without the spaces inside those.
+fn folder_of(text: &str) -> &str {
+    let text = text.trim();
+    text.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .map_or(text, str::trim)
+}
+
 /// Holds folder lookups back until its sender is dropped (tests).
 #[cfg(test)]
 type CheckHold = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>;
@@ -655,7 +666,7 @@ impl ExportDialog {
             }
             Some(Act::Browse) => {
                 let picker = self.picker.clone();
-                let start = PathBuf::from(c.folder.trim());
+                let start = PathBuf::from(folder_of(&c.folder));
                 c.picking = Task::spawn("mmm-export-folder", ctx, move || {
                     picker.pick_folder(Some(&start))
                 });
@@ -824,7 +835,7 @@ impl Choosing {
         rows: &[Row],
         shown: &Shown,
     ) -> bool {
-        let folder = PathBuf::from(self.folder.trim());
+        let folder = PathBuf::from(folder_of(&self.folder));
         // The rows unticked, of those the session still has.
         let excluded = rows
             .iter()
@@ -832,7 +843,7 @@ impl Choosing {
             .map(|r| r.pick.clone())
             .collect();
         let choices = Choices {
-            folder: self.folder.trim().to_string(),
+            folder: folder_of(&self.folder).to_string(),
             format: self.format,
             pattern: self.pattern.clone(),
             excluded,
@@ -898,7 +909,7 @@ impl Shown {
                 COLLISION_ADD_NAME
             }
         });
-        let folder = c.folder.trim();
+        let folder = folder_of(&c.folder);
         let lookup = (!folder.is_empty()).then(|| Lookup {
             folder: PathBuf::from(folder),
             names: names.clone(),
@@ -1422,6 +1433,19 @@ mod tests {
         };
         assert_eq!(found.problem, want);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pasted_path_loses_its_quotes() {
+        assert_eq!(folder_of(r#""C:\Astro""#), r"C:\Astro");
+        assert_eq!(folder_of(r#"  "C:\Astro\Out" "#), r"C:\Astro\Out");
+        assert_eq!(folder_of("  /astro/out "), "/astro/out");
+        // One pair, and only a pair around it all.
+        assert_eq!(folder_of(r#"""C:\x"""#), r#""C:\x""#);
+        assert_eq!(folder_of(r#""C:\x"#), r#""C:\x"#);
+        assert_eq!(folder_of(r#"C:\a "b""#), r#"C:\a "b""#);
+        assert_eq!(folder_of(r#""""#), "");
+        assert_eq!(folder_of(r#"""#), r#"""#);
     }
 
     #[test]

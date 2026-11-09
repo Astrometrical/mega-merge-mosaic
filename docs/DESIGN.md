@@ -1626,7 +1626,9 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   description. A group with only its settings changed is still ready. On
   opening, every ready row is ticked except those the user unticked before
   (`Choices::excluded`), so a group merged or a composite made since starts
-  ticked too (spec §14: the common case is one click). Then the folder (typed, or **Browse…** through a
+  ticked too (spec §14: the common case is one click). Then the folder
+  (typed, its surrounding spaces and one pair of surrounding double quotes
+  dropped, so Explorer's "Copy as path" `"C:\Astro"` pastes as it is; or **Browse…** through a
   native dialog on a worker), the format (FITS or TIFF) and the file name
   pattern: `{session}` and `{name}` (`file_names` makes names safe for any
   file system, including Windows reserved device names; the default is
