@@ -903,6 +903,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// End to end, from a run over a synthetic two-group session through
+    /// the canvas's marks: a seam line's panel ids (the analysis's
+    /// `PanelMeta.id`s, its owner indices) are the ids the plan's layout
+    /// reads for its panels, so each line lies in its own pair's overlap,
+    /// and a seam problem is framed at its lines, badged at its pair's
+    /// overlap and drawn in the warning colour there.
+    #[test]
+    fn seam_lines_and_badges_land_on_their_pairs_overlap() {
+        use mega_ui::theme::Tone;
+        use mmm_core::checks::CheckTarget;
+
+        use crate::marks::{covering_px, problem_marks, seam_lines, target_rect};
+        use crate::plan_view::load_layout;
+
+        let (root, s, _r) = analyzed("checks-seam-places");
+        let cfg = &s.mosaic.config;
+        let run = run_checks(
+            &s.mosaic,
+            s.groups.clone(),
+            None,
+            &group_feathers(cfg),
+            SeamCache::new(),
+        );
+        let report = run.report;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let groups = ["Ha".to_string(), "OIII".to_string()];
+        let dirs: Vec<(String, PathBuf)> = groups
+            .iter()
+            .map(|g| (g.clone(), s.mosaic.group_session_dir(g)))
+            .collect();
+        let no_frame = root.join("no-frame.json");
+        let layout = load_layout((&no_frame, &no_frame), &dirs);
+        let meet = |a: [f64; 4], b: [f64; 4]| {
+            [
+                a[0].max(b[0]),
+                a[1].max(b[1]),
+                a[2].min(b[2]),
+                a[3].min(b[3]),
+            ]
+        };
+        let bbox = |points: &mut dyn Iterator<Item = &[f64; 2]>| {
+            points.fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |r, p| {
+                [
+                    r[0].min(p[0]),
+                    r[1].min(p[1]),
+                    r[2].max(p[0]),
+                    r[3].max(p[1]),
+                ]
+            })
+        };
+        // One L8 cell of slack: the lines run along cell edges.
+        let cell = 8.0;
+        for g in &groups {
+            let lines = &report.seams[g];
+            assert!(!lines.is_empty(), "{g} has seams");
+            let file = |id: u16| {
+                layout.ids[g]
+                    .iter()
+                    .find(|(_, i)| **i == usize::from(id))
+                    .map(|(p, _)| p.clone())
+                    .unwrap_or_else(|| panic!("{g} has a panel {id}"))
+            };
+            let rect = |p: &PathBuf| layout.rects[p];
+            for l in lines {
+                let o = meet(rect(&file(l.a)), rect(&file(l.b)));
+                assert!(
+                    l.points.iter().all(|p| {
+                        p[0] >= o[0] - cell
+                            && p[0] <= o[2] + cell
+                            && p[1] >= o[1] - cell
+                            && p[1] <= o[3] + cell
+                    }),
+                    "{g}: the line of {} and {} is off their overlap {o:?}: {:?}",
+                    l.a,
+                    l.b,
+                    l.points
+                );
+            }
+            // A problem at the first line's seam.
+            let first = &lines[0];
+            let (a, b) = (file(first.a), file(first.b));
+            let pair = |l: &SeamLine| (l.a.min(l.b), l.a.max(l.b));
+            let its: Vec<&SeamLine> = lines.iter().filter(|l| pair(l) == pair(first)).collect();
+            let shows = Check {
+                code: CheckCode::ResidualSeam,
+                severity: Severity::Problem,
+                panels: vec![a.clone(), b.clone()],
+                groups: vec![g.clone()],
+                message: "A seam shows".into(),
+                remedy: None,
+                target: CheckTarget::Seam {
+                    group: g.clone(),
+                    a: a.clone(),
+                    b: b.clone(),
+                },
+                rect: None,
+            };
+            // Framed at its lines.
+            let lines_box = bbox(&mut its.iter().flat_map(|l| &l.points));
+            assert_eq!(
+                target_rect(&s, &layout, &report.seams, &shows),
+                Some(covering_px(lines_box))
+            );
+            // Badged at its pair's overlap, its lines warned.
+            let with = ChecksReport {
+                checks: vec![shows],
+                ..report.clone()
+            };
+            let shown = [g.clone()];
+            let marks = problem_marks(&s, &layout, Some(&with), &shown);
+            assert_eq!(marks.len(), 1);
+            let o = meet(rect(&a), rect(&b));
+            assert_eq!(
+                marks[0].placed_badge().map(|b| b.at),
+                Some([(o[0] + o[2]) / 2.0, (o[1] + o[3]) / 2.0])
+            );
+            let warned: Vec<Vec<[f64; 2]>> = seam_lines(&layout, Some(&with), &shown, &marks)
+                .into_iter()
+                .filter(|l| l.color == Tone::Warning.color())
+                .map(|l| l.points)
+                .collect();
+            let want: Vec<Vec<[f64; 2]>> = its.iter().map(|l| l.points.clone()).collect();
+            assert_eq!(warned, want);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn aligned_sessions_pass_the_distortion_check() {
         use mmm_core::reference::ReferenceFrame;
