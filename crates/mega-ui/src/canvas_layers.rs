@@ -1,7 +1,7 @@
 //! What the tiled viewer and the plan canvas share for drawing over their
 //! content: [`Overlay`] rectangles, image [`Patch`]es, the in-progress
 //! rectangle of [`Tool::DrawRect`], and the one function that paints them
-//! all (`paint_layers`).
+//! all (`paint_layers`); and a press held on either canvas ([`Hold`]).
 
 use egui::{
     Align2, Color32, Pos2, Rect, Shape, Stroke, StrokeKind, TextStyle, TextureHandle, Vec2,
@@ -14,8 +14,9 @@ use crate::theme::tokens::space;
 const OVERLAY_STROKE: f32 = 1.5;
 /// Dash and gap lengths of a dashed overlay, in points.
 const OVERLAY_DASH: (f32, f32) = (6.0, 4.0);
-/// Offset of an overlay's label from its top-left corner, in points.
-const LABEL_OFFSET: Vec2 = Vec2::new(space::XS, 2.0);
+/// Offset of an overlay's label from its top-left corner, in points (a
+/// [`crate::widgets::CanvasLabel`] puts its name there too).
+pub const LABEL_OFFSET: Vec2 = Vec2::new(space::XS, 2.0);
 
 /// What a primary-button drag does on a canvas.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,6 +42,50 @@ pub struct Overlay {
     pub label: String,
     /// Dashed rather than solid outline.
     pub dashed: bool,
+}
+
+/// The primary button held down on a canvas (pressed there with the
+/// navigate tool, and not released yet), as the canvas reports it each
+/// frame. A press held still stays a hold however long it lasts; once the
+/// pointer has moved further than a click may, it is a drag (it pans) for
+/// the rest of the press.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hold {
+    /// Where the button went down, in canvas coordinates (through the view
+    /// of that frame).
+    pub origin: (f64, f64),
+    /// The pointer has moved past the click distance since: a drag.
+    pub moved: bool,
+}
+
+/// Follow a press held on `response` (a canvas with the navigate tool):
+/// `held` keeps it across frames. `to_canvas` maps a screen point to canvas
+/// coordinates. The hold this frame, if any.
+pub(crate) fn follow_hold(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    held: &mut Option<Hold>,
+    to_canvas: &dyn Fn(Pos2) -> (f64, f64),
+) -> Option<Hold> {
+    let (down, origin, latest) = ui.input(|i| {
+        (
+            i.pointer.primary_down(),
+            i.pointer.press_origin(),
+            i.pointer.latest_pos(),
+        )
+    });
+    let Some(origin) = origin.filter(|_| down && response.is_pointer_button_down_on()) else {
+        *held = None;
+        return None;
+    };
+    let max = ui.ctx().options(|o| o.input_options.max_click_dist);
+    let moved = latest.is_some_and(|p| p.distance(origin) > max);
+    let h = held.get_or_insert(Hold {
+        origin: to_canvas(origin),
+        moved: false,
+    });
+    h.moved |= moved;
+    Some(*h)
 }
 
 /// An image drawn over a canvas: `texture` is stretched over `rect` and

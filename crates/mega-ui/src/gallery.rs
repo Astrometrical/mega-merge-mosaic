@@ -27,11 +27,11 @@ use crate::theme::tokens::{radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, ChipMark, ChoiceChip, ListEvent, ListRow, ListState, MegaButton, NotesMode,
-    SessionCardData, StepState, StripStep, Toast, Toasts, chip, choice_chip, icon_button,
-    notes_view, ordered_list_with, overline, progress, property_grid, property_row,
-    property_row_numeric, property_row_ui, segmented, session_card, status, step_strip, submenu,
-    text_input,
+    ButtonKind, CanvasLabel, ChipMark, ChoiceChip, LabelControl, ListEvent, ListRow, ListState,
+    MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast, Toasts, canvas_label,
+    chip, choice_chip, icon_button, notes_view, ordered_list_with, overline, progress,
+    property_grid, property_row, property_row_numeric, property_row_ui, segmented, session_card,
+    status, step_strip, submenu, text_input,
 };
 
 /// Number of gallery pages: 0 tokens, 1 components, 2 imagery. Pages exist
@@ -43,7 +43,7 @@ pub const PAGES: usize = 3;
 /// test and the snapshots render each page at this size; grow it when a
 /// section is added (a page must stay under 4096 points tall).
 pub fn page_size(page: usize) -> Vec2 {
-    Vec2::new(1200.0, [1340.0, 2160.0, 1380.0][page])
+    Vec2::new(1200.0, [1340.0, 2160.0, 1600.0][page])
 }
 
 /// The gallery's interactive state.
@@ -312,6 +312,92 @@ fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
                 tex("gallery-plan-b", SURFACE_700, ACCENT_500),
             ),
         ],
+    }
+}
+
+/// Canvas labels over imagery, each at the corner of the region it names:
+/// one row with **Compare** and the state; comparing, showing A, its
+/// settings on a second row; and a momentary switch held, B shown (and
+/// underlined) while A stays selected.
+fn canvas_label_section(ui: &mut Ui) {
+    let (strip, _) = ui.allocate_exact_size(Vec2::new(1000.0, 150.0), Sense::hover());
+    imagery(ui, strip);
+    let toggle = |name: &'static str, selected, shown| LabelControl::Toggle {
+        options: ["A", "B"],
+        accessible: match name {
+            "Bat wing" => ["Show A of Bat wing", "Show B of Bat wing"],
+            _ => ["Show A of Sword", "Show B of Sword"],
+        },
+        selected,
+        shown,
+        tooltip: None,
+    };
+    let button = |text, accessible, primary| LabelControl::Button {
+        text,
+        accessible,
+        tooltip: None,
+        primary,
+    };
+    let one_row = [button("Compare", "Compare Trapezium", false)];
+    let showing_a = [
+        toggle("Bat wing", 0, 0),
+        button("Use A", "Use A for Bat wing", false),
+        button("Done", "Done comparing Bat wing", true),
+    ];
+    let peeking = [
+        toggle("Sword", 0, 1),
+        button("Use A", "Use A for Sword", false),
+        button("Done", "Done comparing Sword", true),
+    ];
+    let labels = [
+        (
+            "Trapezium",
+            20.0,
+            &one_row[..],
+            "up to date",
+            false,
+            ACCENT_400,
+        ),
+        (
+            "Bat wing",
+            340.0,
+            &showing_a[..],
+            "A · feather 40 px · flatten 2",
+            true,
+            TEXT_BODY,
+        ),
+        (
+            "Sword",
+            670.0,
+            &peeking[..],
+            "B · feather 120 px · flatten off",
+            true,
+            TEXT_BODY,
+        ),
+    ];
+    for (name, x, controls, line, below, color) in labels {
+        let region = Rect::from_min_size(
+            strip.left_top() + Vec2::new(x, space::L),
+            Vec2::new(300.0, 120.0),
+        );
+        ui.painter()
+            .rect_stroke(region, 0.0, Stroke::new(1.5, color), StrokeKind::Inside);
+        let description = format!("{name}: {line}");
+        canvas_label(
+            ui,
+            ("gallery-canvas-label", name),
+            &CanvasLabel {
+                corner: region.left_top(),
+                clip: strip,
+                name,
+                color,
+                controls,
+                text: line,
+                text_below: below,
+                accessible: name,
+                description: &description,
+            },
+        );
     }
 }
 
@@ -872,6 +958,8 @@ fn sections(ui: &mut Ui, state: &mut GalleryState, page: Option<usize>) {
                 );
             });
         });
+
+        section(ui, "Canvas label", canvas_label_section);
     }
     ui.add_space(space::XXL);
 }

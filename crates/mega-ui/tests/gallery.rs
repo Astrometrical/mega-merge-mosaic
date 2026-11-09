@@ -39,6 +39,9 @@ fn gallery_renders_every_section() {
         "HERO STAGE · PORTRAIT MOSAIC",
         "PLAN CANVAS",
         "SESSION CARDS",
+        "CANVAS LABEL",
+        "Compare Trapezium",
+        "Show B of Sword",
         "41 checks passed",
         "62% · 0:41 left",
     ];

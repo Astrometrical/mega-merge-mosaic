@@ -620,3 +620,44 @@ fn overlay_button_labels_stay_on_one_line_in_a_narrow_canvas() {
         assert_eq!(rows, 1, "{label} wrapped");
     }
 }
+
+#[test]
+fn a_held_press_is_reported_until_released() {
+    let mut h = harness(
+        [0.0, 0.0, 1000.0, 1000.0],
+        vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+    );
+    h.run();
+    let held = |h: &Harness<'_, State>| h.state().log.last().and_then(|r| r.held);
+    assert_eq!(held(&h), None);
+    let at = to_screen(&h, (300.0, 400.0));
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    let got = held(&h).expect("held");
+    assert!((got.origin.0 - 300.0).abs() < 1e-3 && (got.origin.1 - 400.0).abs() < 1e-3);
+    assert!(!got.moved);
+    // Past a click's time, still: held, not moved.
+    h.run_steps(100);
+    assert_eq!(held(&h).map(|h| h.moved), Some(false));
+    // Past the click distance: moved (and panned), for the rest of the press.
+    h.hover_at(at + Vec2::new(0.0, 60.0));
+    h.step();
+    assert_eq!(held(&h).map(|h| h.moved), Some(true));
+    h.hover_at(at);
+    h.step();
+    assert_eq!(held(&h).map(|h| h.moved), Some(true));
+    h.drop_at(at);
+    h.step();
+    assert_eq!(held(&h), None);
+    // The draw tool's press is no hold.
+    h.state_mut().canvas.set_tool(Tool::DrawRect);
+    h.run();
+    h.hover_at(at);
+    h.drag_at(at);
+    h.step();
+    assert_eq!(held(&h), None);
+    h.drop_at(at);
+    h.run();
+}

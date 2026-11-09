@@ -1,6 +1,7 @@
 //! Mega UI components, styled only from [`crate::theme`] tokens.
 
 pub mod button;
+pub mod canvas_label;
 pub mod chip;
 pub mod menu;
 pub mod notes;
@@ -15,6 +16,7 @@ pub mod text_input;
 pub mod toast;
 
 pub use button::{ButtonKind, MegaButton, focus_ring, icon_button, icon_button_of};
+pub use canvas_label::{CanvasLabel, LabelControl, LabelResponse, canvas_label};
 pub use chip::{CHIP_MAX_WIDTH, ChipMark, ChoiceChip, chip, choice_chip};
 pub use menu::submenu;
 pub use notes::{NOTES_LINES, NotesMode, NotesResponse, notes_view};

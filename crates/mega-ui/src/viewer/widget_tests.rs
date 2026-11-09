@@ -1210,3 +1210,98 @@ fn patches_paint_after_stale_tiles_and_hatch_and_before_overlays() {
     );
     assert!(t < p && p < o, "tiles/hatch {t}, patch {p}, overlay {o}");
 }
+
+/// Viewer plus the hold it reported each frame.
+struct Holding {
+    viewer: TiledViewer,
+    held: Vec<Option<Hold>>,
+}
+
+fn holding_harness(viewer: TiledViewer) -> Harness<'static, Holding> {
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut Holding| {
+                let r = s.viewer.show(ui);
+                s.held.push(r.held);
+            },
+            Holding {
+                viewer,
+                held: Vec::new(),
+            },
+        )
+}
+
+fn last_held(h: &Harness<'static, Holding>) -> Option<Hold> {
+    *h.state().held.last().expect("a frame")
+}
+
+#[test]
+fn a_held_press_is_reported_until_released() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = holding_harness(TiledViewer::new_synchronous(src));
+    h.run();
+    assert_eq!(last_held(&h), None);
+    let (rect, now) = h.state().viewer.last_frame().unwrap();
+    let at = Pos2::new(600.0, 400.0);
+    let origin = h.state().viewer.view().screen_to_image(at, rect, now);
+    let c0 = centre_zoom(&h.state().viewer).0;
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    let still = Some(Hold {
+        origin,
+        moved: false,
+    });
+    assert_eq!(last_held(&h), still);
+    // Held still past the time of a click (egui calls it a drag by then):
+    // still held, never moved, nothing panned.
+    h.run_steps(100);
+    assert_eq!(last_held(&h), still);
+    assert_eq!(centre_zoom(&h.state().viewer).0, c0);
+    // A small wobble is no drag.
+    h.hover_at(at + Vec2::new(3.0, 0.0));
+    h.step();
+    assert_eq!(last_held(&h).map(|h| h.moved), Some(false));
+    // Past the click distance: a drag, which pans; it stays one even back
+    // at the origin.
+    h.hover_at(at + Vec2::new(60.0, 0.0));
+    h.step();
+    assert_eq!(
+        last_held(&h).map(|h| (h.origin, h.moved)),
+        Some((origin, true))
+    );
+    assert_ne!(centre_zoom(&h.state().viewer).0, c0);
+    h.hover_at(at);
+    h.step();
+    assert_eq!(last_held(&h).map(|h| h.moved), Some(true));
+    h.drop_at(at);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    // A new press starts afresh.
+    h.hover_at(at);
+    h.drag_at(at);
+    h.step();
+    assert_eq!(last_held(&h).map(|h| h.moved), Some(false));
+    h.drop_at(at);
+    h.step();
+    // Drawing a rect is no hold.
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.hover_at(at);
+    h.drag_at(at);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.drop_at(at);
+    h.step();
+    // Nor is anything in presentation mode.
+    h.state_mut().viewer.set_presentation(true);
+    h.hover_at(at);
+    h.drag_at(at);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.drop_at(at);
+    h.step();
+}

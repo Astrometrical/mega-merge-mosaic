@@ -15,7 +15,7 @@ use egui::{
 };
 
 use crate::canvas_layers::{
-    DrawStep, Overlay, Patch, Tool, drawing_rect, follow_draw, paint_layers,
+    DrawStep, Hold, Overlay, Patch, Tool, drawing_rect, follow_draw, follow_hold, paint_layers,
 };
 use crate::theme::palette;
 use crate::viewer::{OverlayButton, View, drag_delta, overlay_buttons};
@@ -117,6 +117,9 @@ pub struct PlanResponse {
     /// [`Tool::DrawRect`]: `[x0, y0, x1, y1]` in canvas coordinates,
     /// normalised (`x0 <= x1`, `y0 <= y1`) and clamped to the extent.
     pub drawn_rect: Option<[f64; 4]>,
+    /// The primary button held down on the canvas with [`Tool::Navigate`],
+    /// in canvas coordinates.
+    pub held: Option<Hold>,
 }
 
 /// Canvas command from a button or the host app, applied in `show`.
@@ -144,6 +147,8 @@ pub struct PlanCanvas {
     /// The rectangle being drawn: its fixed corner and the current one, in
     /// canvas coordinates.
     drawing: Option<((f64, f64), (f64, f64))>,
+    /// The press held on the canvas, while it is.
+    held: Option<Hold>,
 }
 
 impl Default for PlanCanvas {
@@ -165,6 +170,7 @@ impl PlanCanvas {
             patches: Vec::new(),
             tool: Tool::Navigate,
             drawing: None,
+            held: None,
         }
     }
 
@@ -278,6 +284,14 @@ impl PlanCanvas {
         let drawn_rect = self.handle_draw(ui, &response, rect, extent, now);
         self.handle_pan_zoom(ui, &response, rect, now);
         let navigating = self.tool == Tool::Navigate && drawn_rect.is_none();
+        let held = if navigating {
+            let view = &self.view;
+            let to_canvas = |p: Pos2| view.screen_to_image(p, rect, now);
+            follow_hold(ui, &response, &mut self.held, &to_canvas)
+        } else {
+            self.held = None;
+            None
+        };
         let hit = |p: Pos2| {
             let c = self.view.screen_to_image(p, rect, now);
             items.iter().rev().find(|it| it.contains(c)).map(|it| it.id)
@@ -285,6 +299,7 @@ impl PlanCanvas {
         let mut out = PlanResponse {
             hovered: response.hover_pos().and_then(hit),
             drawn_rect,
+            held,
             ..PlanResponse::default()
         };
         if navigating

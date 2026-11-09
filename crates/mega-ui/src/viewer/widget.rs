@@ -28,7 +28,7 @@ use egui::{
 use super::cache::{DEFAULT_CAPACITY, TileCache};
 use super::{Fetched, PyramidGeometry, TileKey, TileSource, View, pick_level, visible_tiles};
 use crate::canvas_layers::{
-    DrawStep, Overlay, Patch, Tool, drawing_rect, follow_draw, paint_layers,
+    DrawStep, Hold, Overlay, Patch, Tool, drawing_rect, follow_draw, follow_hold, paint_layers,
 };
 use crate::theme::palette;
 
@@ -49,6 +49,10 @@ pub struct ViewerResponse {
     /// [`Tool::DrawRect`]: `[x0, y0, x1, y1]` in image coordinates,
     /// normalised (`x0 <= x1`, `y0 <= y1`) and clamped to the image.
     pub drawn_rect: Option<[f64; 4]>,
+    /// The primary button held down on the viewer with
+    /// [`Tool::Navigate`] (none in presentation mode), in image
+    /// coordinates.
+    pub held: Option<Hold>,
 }
 
 /// Tint a tile is drawn with: white for `Valid`, ~55% grey for `Stale`,
@@ -242,6 +246,8 @@ pub struct TiledViewer {
     opacity: f32,
     /// Set once any tile has been painted.
     drawn_any: bool,
+    /// The press held on the viewer, while it is.
+    held: Option<Hold>,
 }
 
 impl TiledViewer {
@@ -278,6 +284,7 @@ impl TiledViewer {
             presentation: false,
             opacity: 1.0,
             drawn_any: false,
+            held: None,
         }
     }
 
@@ -453,6 +460,14 @@ impl TiledViewer {
         } else {
             self.handle_input(ui, &response, rect, now)
         };
+        let held = if self.presentation || self.tool != Tool::Navigate || drawn_rect.is_some() {
+            self.held = None;
+            None
+        } else {
+            let view = &self.view;
+            let to_image = |p: Pos2| view.screen_to_image(p, rect, now);
+            follow_hold(ui, &response, &mut self.held, &to_image)
+        };
 
         let generation = self.source.generation();
         let wanted = self.wanted_tiles(rect, now);
@@ -477,6 +492,7 @@ impl TiledViewer {
                 .hover_pos()
                 .map(|p| self.view.screen_to_image(p, rect, now)),
             drawn_rect,
+            held,
         }
     }
 
