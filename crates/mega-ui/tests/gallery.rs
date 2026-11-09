@@ -40,6 +40,7 @@ fn gallery_renders_every_section() {
         "PLAN CANVAS",
         "SESSION CARDS",
         "CANVAS LABEL",
+        "DIALOG",
         "Compare Trapezium",
         "Show B of Sword",
         "41 checks passed",

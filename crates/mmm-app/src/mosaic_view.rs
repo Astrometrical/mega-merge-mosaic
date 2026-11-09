@@ -1,7 +1,7 @@
 //! The merged mosaic canvas (spec §5–§7): the view's merged results drawn
 //! tile by tile in the shared frame, with its regions of interest. Only the
 //! canvas: the window around it picks the view ([`MosaicView::select_view`])
-//! and the look ([`CanvasLook`]), starts merges and exports through its
+//! and the look ([`CanvasLook`]), starts merges through its
 //! methods, and shows the ROI list ([`MosaicView::rois_ui`]), the merge
 //! settings ([`MosaicView::settings_ui`]) and the health
 //! ([`MosaicView::health_ui`]) where it likes, whether or not the canvas
@@ -39,8 +39,6 @@
 //!   settings (applied at once, with an Undo toast). While an analysis edit
 //!   waits to apply or the feather text is invalid, merging is blocked; an
 //!   applied analysis edit reloads the view's (now stale) tiles.
-//! - **Export** ([`crate::export`]) writes the view's groups' results to
-//!   FITS or TIFF as jobs, after warning about stale or missing tiles.
 //! - **Camera.** [`MosaicView::set_camera`] moves the canvas without
 //!   animation from the next frame the viewer paints. The viewer is
 //!   rebuilt when the view's results come and go (a view without any
@@ -121,7 +119,6 @@ use crate::blend_settings::{SettingsPanel, load_draft};
 use crate::camera::Camera;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
-use crate::export::{ExportAction, ExportDialog, RfdSavePicker};
 use crate::jobs::{JobEvent, JobRunner};
 use crate::plan_view::CanvasLook;
 use crate::rois::{Roi, RoiPanel};
@@ -169,10 +166,11 @@ enum Readiness {
 pub(crate) fn view_members(view: &ViewKind, compositions: &[Composition]) -> Vec<String> {
     match view {
         ViewKind::Group(g) => vec![g.clone()],
-        ViewKind::Composition(i) => {
+        ViewKind::Composition(id) => {
             let mut out: Vec<String> = Vec::new();
             for (g, _) in compositions
-                .get(*i)
+                .iter()
+                .find(|c| c.id == *id)
                 .into_iter()
                 .flat_map(|c| c.channels.iter().flatten())
             {
@@ -304,8 +302,6 @@ pub struct MosaicView {
     shown: bool,
     /// The session's ROIs and their workers.
     rois: RoiPanel,
-    /// The export dialog.
-    export: ExportDialog,
     /// The merge settings panel.
     settings: SettingsPanel,
     /// The ROIs' preview patches the viewer draws ([`MosaicView::set_patches`]).
@@ -355,7 +351,6 @@ impl MosaicView {
                 .clamp(2, 8),
             shown: false,
             rois: RoiPanel::default(),
-            export: ExportDialog::new(Arc::new(RfdSavePicker)),
             patches: Vec::new(),
             tag: None,
             reveal_settings: false,
@@ -516,7 +511,6 @@ impl MosaicView {
             && self.results.values().all(Member::idle)
             && self.health_task.is_none()
             && self.rois.idle()
-            && self.export.idle()
             && !self.settings.has_pending()
             && self
                 .viewer
@@ -525,14 +519,15 @@ impl MosaicView {
     }
 
     /// The view's key, as the plan keys it: the group's name, or
-    /// [`composition_stretch_key`] of the composition's name (read from
+    /// [`composition_stretch_key`] of the composition's id (read from
     /// `ui`, the session's UI settings). `None` before a view is chosen.
     pub fn view_key(&self, ui: &Value) -> Option<String> {
         match self.view.as_ref()? {
             ViewKind::Group(g) => Some(g.clone()),
-            ViewKind::Composition(i) => load_compositions(ui)
-                .get(*i)
-                .map(|c| composition_stretch_key(&c.name)),
+            ViewKind::Composition(id) => load_compositions(ui)
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| composition_stretch_key(c.id)),
         }
     }
 
@@ -739,9 +734,6 @@ impl MosaicView {
             }
             Readiness::Analyzed => {}
         }
-        if !self.export.idle() {
-            return Some("Waiting for the export check.".into());
-        }
         if let Some(why) = self.settings.input_error() {
             return Some(why.into());
         }
@@ -802,9 +794,8 @@ impl MosaicView {
         jobs: &mut JobRunner,
         groups: Vec<String>,
     ) -> bool {
-        // The export check maps result stores a merge may recreate; an
-        // analysis edit waiting to apply would cancel the merge anyway.
-        if !self.export.idle() || self.settings.has_pending() {
+        // An analysis edit waiting to apply would cancel the merge anyway.
+        if self.settings.has_pending() {
             return false;
         }
         let any = !groups.is_empty();
@@ -813,66 +804,6 @@ impl MosaicView {
             self.merge_jobs.insert(id, g);
         }
         any
-    }
-
-    /// Whether the export dialog may open now: the view has groups, no
-    /// tracked analysis runs and the dialog is not open already
-    /// ([`MosaicView::export_block_reason`] gives none).
-    pub fn can_open_export(&self) -> bool {
-        self.export_block_reason().is_none()
-    }
-
-    /// Why the export dialog cannot open now, if it cannot.
-    pub fn export_block_reason(&self) -> Option<&'static str> {
-        if self.export.is_open() {
-            Some("The Export dialog is open.")
-        } else if self.members.is_empty() {
-            Some("There is nothing to export in this view.")
-        } else if self.analyze_job.is_some() {
-            Some("Waiting for the analysis to finish.")
-        } else {
-            None
-        }
-    }
-
-    /// Whether the export dialog is open.
-    pub fn export_open(&self) -> bool {
-        self.export.is_open()
-    }
-
-    /// Open the export dialog for the view's groups.
-    pub fn open_export(&mut self, session: &OpenSession) {
-        self.export.open(session, self.members.clone());
-    }
-
-    /// Draw the export dialog (if open) and act on the user's decision:
-    /// merge the chosen groups first, or start one export job per group.
-    pub fn export_ui(
-        &mut self,
-        ctx: &egui::Context,
-        session: &mut OpenSession,
-        jobs: &mut JobRunner,
-    ) {
-        let can_merge = self.merge_guard(session, jobs, &self.members).is_none();
-        // Merges of the dialog's groups queued or running (whatever view is
-        // showing now): the export check maps the stores they may recreate.
-        let merging: BTreeSet<String> = self
-            .export
-            .groups()
-            .into_iter()
-            .filter(|g| jobs.blend_pending(g))
-            .collect();
-        match self.export.ui(ctx, session, can_merge, &merging) {
-            Some(ExportAction::BlendFirst(groups)) => {
-                self.merge_groups(session, jobs, groups);
-            }
-            Some(ExportAction::Export(dests, format)) => {
-                for (group, out) in dests {
-                    jobs.start_export(session, &group, out, format);
-                }
-            }
-            None => {}
-        }
     }
 
     /// Whether the viewer's ROI draw tool is on (a drag on the canvas
@@ -1197,7 +1128,9 @@ impl MosaicView {
     fn resolve_view(&self, groups: &[String], compositions: &[Composition]) -> Option<ViewKind> {
         match &self.view {
             Some(ViewKind::Group(g)) if groups.contains(g) => self.view.clone(),
-            Some(ViewKind::Composition(i)) if *i < compositions.len() => self.view.clone(),
+            Some(ViewKind::Composition(id)) if compositions.iter().any(|c| c.id == *id) => {
+                self.view.clone()
+            }
             _ => groups.first().map(|g| ViewKind::Group(g.clone())),
         }
     }
@@ -1446,8 +1379,9 @@ impl MosaicView {
                 .map_or(0, |s| Arc::as_ptr(s) as usize)
         };
         let mapping: Vec<Option<(String, u32)>> = match &self.view {
-            Some(ViewKind::Composition(i)) => compositions
-                .get(*i)
+            Some(ViewKind::Composition(id)) => compositions
+                .iter()
+                .find(|c| c.id == *id)
                 .map(|c| {
                     c.channels
                         .iter()
@@ -1468,9 +1402,10 @@ impl MosaicView {
         let wanted: Option<Arc<dyn TileSource>> = match &self.view {
             _ if key.0.iter().all(|&p| p == 0) => None,
             Some(ViewKind::Group(g)) => source_of(g).map(|s| s as Arc<dyn TileSource>),
-            Some(ViewKind::Composition(i)) => {
+            Some(ViewKind::Composition(id)) => {
                 let channels: Vec<Option<(Arc<MosaicTileSource>, f32)>> = compositions
-                    .get(*i)
+                    .iter()
+                    .find(|c| c.id == *id)
                     .map(|c| {
                         c.channels
                             .iter()

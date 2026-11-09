@@ -76,6 +76,7 @@ fn save_comps(dir: &Path, compositions: &[Composition]) {
 
 fn hoo() -> Composition {
     Composition {
+        id: 1,
         name: "HOO".into(),
         channels: [
             Some(("Ha".into(), 1.0)),
@@ -187,13 +188,14 @@ fn composition_view_is_added() {
     let dir = merged_session(&root, Some("comp:HOO"));
     // A composition of a group never merged is left out.
     let other = Composition {
+        id: 2,
         name: "Lum".into(),
         channels: [Some(("L".into(), 1.0)), None, None],
     };
     save_comps(&dir, &[hoo(), other]);
     let hero = build_hero(&facts_of(&dir));
     assert_eq!(labels(&hero), ["Ha · 4 panels", "OIII · 4 panels", "HOO"]);
-    assert_eq!(hero.start, 2, "last_view comp:HOO");
+    assert_eq!(hero.start, 2, "last_view comp:HOO (named, as earlier mmm)");
     // Ha in red, OIII in green and blue.
     let px = top_pixels(&hero.views[2]);
     assert!(
@@ -202,6 +204,52 @@ fn composition_view_is_added() {
         "mixed colours"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn composition_view_is_found_by_id() {
+    let root = temp_dir("hero-comp-id");
+    let dir = merged_session(&root, Some("comp:1"));
+    save_comps(&dir, &[hoo()]);
+    let hero = build_hero(&facts_of(&dir));
+    assert_eq!(hero.start, 2, "last_view comp:1");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_id_key_beats_a_legacy_name_match() {
+    let root = temp_dir("hero-comp-legacy");
+    let dir = merged_session(&root, Some("comp:2"));
+    // A composite named "2" has id 1; the one saved view names is id 2.
+    let named_two = Composition {
+        name: "2".into(),
+        ..hoo()
+    };
+    let by_id = Composition {
+        id: 2,
+        name: "Other".into(),
+        ..hoo()
+    };
+    save_comps(&dir, &[named_two, by_id]);
+    let hero = build_hero(&facts_of(&dir));
+    assert_eq!(
+        labels(&hero),
+        ["Ha · 4 panels", "OIII · 4 panels", "2", "Other"]
+    );
+    assert_eq!(hero.start, 3, "comp:2 is the id, not the name");
+    // With no key matching, the legacy name still finds its composite.
+    let root2 = temp_dir("hero-comp-legacy2");
+    let dir2 = merged_session(&root2, Some("comp:2"));
+    save_comps(
+        &dir2,
+        &[Composition {
+            name: "2".into(),
+            ..hoo()
+        }],
+    );
+    assert_eq!(build_hero(&facts_of(&dir2)).start, 2);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
 }
 
 #[test]

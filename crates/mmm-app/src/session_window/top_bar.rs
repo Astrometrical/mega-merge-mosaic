@@ -12,9 +12,10 @@
 //! Problems (or, while it offers **Analyse**, [`offers_analysis`], starts
 //! the analysis; never while one runs), Merge merges the groups that need it
 //! ([`merge_needed`]: out of date, or their merge settings changed) while it is next (merging or
-//! merged, it shows the mosaic), Export opens the Export dialog. A step
+//! merged, it shows the mosaic), Export opens the Export dialog
+//! ([`crate::export_dialog`]; exporting or not). A step
 //! that cannot act now says why in its tooltip (Merge: the main button's
-//! reason; Export: [`MosaicView::export_block_reason`]), as a disabled
+//! reason; Export: [`SessionWindow::export_block_reason`]), as a disabled
 //! **Export…** does. A working step's **Cancel** cancels its jobs. An
 //! ROI's merge belongs to its ROI: it neither holds **Merge** back nor
 //! stops with the Merge step's Cancel.
@@ -23,8 +24,6 @@
 //! button. Otherwise the strip takes a row of its own below (wrapping if
 //! even that is too narrow), and a name too long for what is left is cut
 //! short with "…" (its tooltip shows it whole). Nothing overlaps.
-//!
-//! [`MosaicView::export_block_reason`]: crate::mosaic_view::MosaicView::export_block_reason
 
 use egui::{Align, Layout};
 use mega_ui::icons;
@@ -85,6 +84,7 @@ impl SessionWindow {
         pipeline: &mut Pipeline,
         checks: &ChecksEngine,
     ) -> bool {
+        let dialog_was_open = self.export_open();
         let mut strip = steps(session, jobs, pipeline, checks);
         self.explain_idle_steps(&mut strip, session, jobs);
         let mut event = None;
@@ -143,13 +143,18 @@ impl SessionWindow {
             }
             Some(Main::Merge) => self.merge(session, jobs),
             Some(Main::Settings) => self.inspector_mut().reveal(MERGE_SETTINGS),
-            Some(Main::Export) => self.mosaic.open_export(session),
+            Some(Main::Export) => self.open_export(session, jobs),
             None => {}
         }
         match event {
             Some(StripEvent::Open(i)) => self.open_step(i, &strip, session, jobs, pipeline, checks),
             Some(StripEvent::Cancel(i)) => cancel_step(i, jobs),
             None => {}
+        }
+        // The dialog is drawn before the top bar: one opened here shows
+        // from the next frame.
+        if self.export_open() && !dialog_was_open {
+            ui.ctx().request_repaint();
         }
         back
     }
@@ -167,7 +172,7 @@ impl SessionWindow {
         if matches!(merge.state, StepState::Todo | StepState::Next) {
             merge.tooltip = self.mosaic.merge_block_reason(session, jobs);
         }
-        strip[EXPORT_STEP].tooltip = self.mosaic.export_block_reason().map(str::to_string);
+        strip[EXPORT_STEP].tooltip = self.export_block_reason(session, jobs).map(str::to_string);
     }
 
     /// Why the main button's **Merge** cannot be pressed now, if it cannot
@@ -232,13 +237,16 @@ impl SessionWindow {
                 asked = Some(Main::Merge);
             }
         } else {
-            let why = self.mosaic.export_block_reason();
+            let why = self.export_block_reason(session, jobs);
+            let keys = ui.ctx().format_shortcut(&shortcuts::EXPORT);
             if ui
                 .add_enabled(
                     why.is_none(),
                     MegaButton::new(ButtonKind::Primary, "Export…"),
                 )
-                .on_hover_text("Export this view's merged groups to FITS or TIFF")
+                .on_hover_text(format!(
+                    "Export the merged groups and composites to FITS or TIFF ({keys})"
+                ))
                 .on_disabled_hover_text(why.unwrap_or_default())
                 .clicked()
             {
@@ -280,7 +288,7 @@ impl SessionWindow {
                 self.set_mode(CanvasMode::Mosaic);
             }
             MERGE_STEP => self.merge(session, jobs),
-            EXPORT_STEP if self.mosaic.can_open_export() => self.mosaic.open_export(session),
+            EXPORT_STEP => self.open_export(session, jobs),
             _ => {}
         }
     }

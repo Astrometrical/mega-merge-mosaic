@@ -1,8 +1,10 @@
 //! The canvas and its view bar: **Plan** / **Mosaic**, a chip per group
 //! (its colour, "{group} · {panels}") and per composite (dashed) then
-//! **+** — chips only with two or more groups — and at the right the
-//! **Outlines**, **ROIs**, **Linked** and **Strong** toggles (on a row of
-//! their own when the bar is too narrow). **Mosaic** can be chosen once
+//! **+** (named "New composite" to assistive technology, which hears
+//! whether its popover is open) — chips only with two or more groups —
+//! and at the right the **Outlines**, **ROIs**, **Linked** and **Strong**
+//! toggles (on a row of their own when the bar is too narrow). **Mosaic**
+//! can be chosen once
 //! something is merged or a merge has started. **Linked** is disabled for
 //! a mono view ([`SessionWindow::is_mono`]). The stretch
 //! toggles are the session's ([`DisplayStretch`] in `MosaicConfig.ui`):
@@ -20,6 +22,7 @@
 
 use std::path::Path;
 
+use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
 use mega_ui::widgets::{ChipMark, ChoiceChip, Segment, choice_chip, segmented_with};
 use mmm_core::mosaic::{OutOfDateReason, out_of_date_reason};
@@ -27,8 +30,9 @@ use mmm_core::mosaic::{OutOfDateReason, out_of_date_reason};
 use super::shortcuts::{self, keyed, views_hint};
 use super::steps::{draft_changed, out_of_date};
 use super::{COMPOSITES, CanvasMode, MERGE_SETTINGS, SessionWindow, compositions_of};
+use crate::bands::{group_bands, presets_for};
 use crate::checks::ChecksEngine;
-use crate::compositions::{ViewKind, add_composition};
+use crate::compositions::{Channels, ViewKind, create_composition, unique_name};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
 use crate::mosaic_view::{CanvasTag, view_members};
@@ -38,6 +42,7 @@ use crate::plan_view::{PlanFeed, group_members};
 use crate::preview_draw::{LayerSpec, PatchWant};
 use crate::previews::Side;
 use crate::session::OpenSession;
+use crate::stretch_panel::channel_name;
 use crate::tile_source::channel_tints;
 use crate::util::group_names;
 use mmm_core::stretch::StretchParams;
@@ -52,7 +57,8 @@ const ONE_CHANNEL: &str = "One channel: nothing to link";
 struct BarActions {
     mode: Option<CanvasMode>,
     view: Option<ViewKind>,
-    add_composite: bool,
+    /// **+** made this composite: its name and channels.
+    create: Option<(String, Channels)>,
     /// **Merge this group** was chosen on this group's chip.
     merge_group: Option<String>,
 }
@@ -172,10 +178,10 @@ impl SessionWindow {
         if let Some(g) = act.merge_group {
             self.merge_group(session, jobs, &g);
         }
-        if act.add_composite {
-            let i = add_composition(&mut session.mosaic.config.ui, &groups);
+        if let Some((name, channels)) = act.create {
+            let id = create_composition(&mut session.mosaic.config.ui, &name, channels);
             self.save.touch();
-            self.select_view(ViewKind::Composition(i));
+            self.select_view(ViewKind::Composition(id));
             self.inspector.reveal(COMPOSITES);
         }
     }
@@ -259,8 +265,8 @@ impl SessionWindow {
                     }
                 });
             }
-            for (i, comp) in compositions_of(session).iter().enumerate() {
-                let view = ViewKind::Composition(i);
+            for comp in compositions_of(session).iter() {
+                let view = ViewKind::Composition(comp.id);
                 let c = ChoiceChip {
                     label: &comp.name,
                     color: None,
@@ -279,9 +285,16 @@ impl SessionWindow {
                 dashed: false,
                 mark: None,
             };
-            if chip(ui, plus).on_hover_text("New composite").clicked() {
-                act.add_composite = true;
-            }
+            let r = chip(ui, plus).on_hover_text(NEW_COMPOSITE);
+            let open = plus_popover(&r, session, groups, act);
+            // Named for what it does (it shows "+"), and a menu button, not
+            // a toggle: it says whether its popover is open, as the Custom
+            // form's R/G/B buttons do.
+            ui.ctx().accesskit_node_builder(r.id, |node| {
+                node.set_label(NEW_COMPOSITE);
+                node.clear_toggled();
+                node.set_expanded(open);
+            });
         }
         one_row_width(ui, &widths) + extra
     }
@@ -408,8 +421,8 @@ impl SessionWindow {
                     });
                 }
             }
-            ViewKind::Composition(i) => {
-                let Some(c) = compositions_of(session).get(*i).cloned() else {
+            ViewKind::Composition(id) => {
+                let Some(c) = compositions_of(session).into_iter().find(|c| c.id == *id) else {
                     return Vec::new();
                 };
                 if plan {
@@ -670,4 +683,173 @@ impl SessionWindow {
 fn one_row_width(ui: &egui::Ui, widths: &[f32]) -> f32 {
     let gaps = widths.len().saturating_sub(1) as f32;
     widths.iter().sum::<f32>() + gaps * ui.spacing().item_spacing.x
+}
+
+/// The Custom form's draft, kept in egui memory while the popover is open.
+#[derive(Clone, Default)]
+struct CustomForm {
+    name: String,
+    channels: [Option<String>; 3],
+    /// The channel whose groups are listed.
+    open: Option<usize>,
+}
+
+/// The **+** chip's accessible name and hover text.
+const NEW_COMPOSITE: &str = "New composite";
+
+/// The popover of the **+** chip `plus`: the presets the groups allow (one
+/// click makes one), then the Custom form (a name and a group, or None, per
+/// channel, and **Create**). What it makes goes to `act`. Whether it is
+/// open (shown this frame).
+fn plus_popover(
+    plus: &egui::Response,
+    session: &OpenSession,
+    groups: &[String],
+    act: &mut BarActions,
+) -> bool {
+    // Not the chip's id: the chip moves when a composite is added.
+    let key = egui::Id::new("mmm-plus-custom-form");
+    let open_key = egui::Id::new("mmm-plus-popover-open");
+    let clicked_key = egui::Id::new("mmm-plus-popover-clicked");
+    let shown = egui::Popup::menu(plus)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            // Only while open: what the popover offers.
+            let taken: Vec<String> = compositions_of(session)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            let bands = group_bands(session);
+            let presets = presets_for(&bands);
+            // Just opened: the keyboard starts on the first thing to pick.
+            let fresh = !ui.data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
+            ui.data_mut(|d| d.insert_temp(open_key, true));
+            // Whether this frame's input was a pointer click: if the popover
+            // closes with it, the focus stays where the click put it.
+            let clicked = ui.input(|i| i.pointer.any_click());
+            ui.data_mut(|d| d.insert_temp(clicked_key, clicked));
+            let mut first = fresh;
+            ui.label(text(Type::Small, "Presets"));
+            if presets.is_empty() {
+                ui.label(text(Type::Small, "None: no group is named for a band."));
+            }
+            for p in &presets {
+                let mapping = p.mapping(&bands);
+                let hint = mapping
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let g = m.as_ref().map_or("None", |(g, _)| g.as_str());
+                        format!("{} {g}", channel_name(i, 3))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let button = ui.button(p.label).on_hover_text(hint);
+                if std::mem::take(&mut first) {
+                    button.request_focus();
+                }
+                if button.clicked() {
+                    act.create = Some((unique_name(p.label, &taken), mapping));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(text(Type::Small, "Custom"));
+            let mut form: CustomForm = ui.data(|d| d.get_temp(key)).unwrap_or_default();
+            ui.horizontal(|ui| {
+                let label = ui.label("Name");
+                let field = ui
+                    .text_edit_singleline(&mut form.name)
+                    .labelled_by(label.id);
+                if std::mem::take(&mut first) {
+                    field.request_focus();
+                }
+            });
+            for i in 0..3 {
+                // Opened in place, not as a submenu or a combo box: egui
+                // keeps one popup open at a time, and a submenu's pick
+                // cannot close it without closing this one.
+                let label = format!(
+                    "{}: {}",
+                    channel_name(i, 3),
+                    form.channels[i].as_deref().unwrap_or("None")
+                );
+                let toggle = ui.button(label);
+                let expanded = form.open == Some(i);
+                ui.ctx().accesskit_node_builder(toggle.id, |b| {
+                    b.set_expanded(expanded);
+                });
+                if toggle.clicked() {
+                    form.open = if form.open == Some(i) { None } else { Some(i) };
+                }
+                if form.open == Some(i) {
+                    let mut picked = None;
+                    ui.indent(("custom-options", i), |ui| {
+                        let current = form.channels[i].clone();
+                        if ui.selectable_label(current.is_none(), "None").clicked() {
+                            picked = Some(None);
+                        }
+                        for g in groups {
+                            let on = current.as_deref() == Some(g.as_str());
+                            if ui.selectable_label(on, g).clicked() {
+                                picked = Some(Some(g.clone()));
+                            }
+                        }
+                    });
+                    if let Some(pick) = picked {
+                        form.channels[i] = pick;
+                        form.open = None;
+                        toggle.request_focus();
+                    }
+                }
+            }
+            let name = form.name.trim().to_string();
+            let why = if name.is_empty() {
+                Some("Give it a name.")
+            } else if taken.contains(&name) {
+                Some("Another composite has this name.")
+            } else if form.channels.iter().all(Option::is_none) {
+                Some("Map at least one channel.")
+            } else {
+                None
+            };
+            // Said in the form too: a keyboard user never hovers a disabled
+            // button.
+            if let Some(why) = why {
+                ui.label(text(Type::Small, why));
+            }
+            let create = ui
+                .add_enabled(why.is_none(), egui::Button::new("Create"))
+                .on_disabled_hover_text(why.unwrap_or_default());
+            if create.clicked() {
+                // A group that has gone since it was picked maps nothing.
+                let channels = form
+                    .channels
+                    .clone()
+                    .map(|g| g.filter(|g| groups.contains(g)).map(|g| (g, 1.0)));
+                act.create = Some((name, channels));
+                form = CustomForm::default();
+                ui.close();
+            }
+            ui.data_mut(|d| d.insert_temp(key, form));
+        });
+    if shown.is_none() {
+        let ctx = plus.ctx.clone();
+        let was_open = ctx.data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
+        if was_open {
+            // Closed (a pick, Escape or a click outside): the draft goes; the
+            // keyboard goes back to the chip unless a click closed it.
+            let by_pointer = ctx
+                .data(|d| d.get_temp::<bool>(clicked_key))
+                .unwrap_or(false);
+            ctx.data_mut(|d| {
+                d.insert_temp(open_key, false);
+                d.remove::<CustomForm>(key);
+            });
+            if !by_pointer {
+                plus.request_focus();
+            }
+        }
+    }
+    shown.is_some()
 }

@@ -23,15 +23,16 @@ use crate::starfield::Starfield;
 use crate::table::{self, TableEvent, TableState, sectioned_table};
 use crate::theme::palette::*;
 use crate::theme::text::{Type, text};
-use crate::theme::tokens::{radius, space};
+use crate::theme::tokens::{DIALOG_WIDTH, radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, CanvasLabel, ChipMark, ChoiceChip, LabelControl, ListEvent, ListRow, ListState,
-    MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast, Toasts, canvas_label,
-    chip, choice_chip, icon_button, notes_view, ordered_list_with, overline, progress,
-    property_grid, property_row, property_row_numeric, property_row_ui, segmented, session_card,
-    status, step_strip, submenu, text_input,
+    ButtonKind, CanvasLabel, ChipMark, ChoiceChip, Dialog, FooterButton, LabelControl, ListEvent,
+    ListRow, ListState, MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast,
+    Toasts, canvas_label, chip, choice_chip, dialog_frame, footer, footer_with, icon_button,
+    notes_view, ordered_list_with, overline, progress, property_grid, property_row,
+    property_row_numeric, property_row_ui, segmented, session_card, status, step_strip, submenu,
+    text_input,
 };
 
 /// Number of gallery pages: 0 tokens, 1 components, 2 imagery. Pages exist
@@ -43,7 +44,7 @@ pub const PAGES: usize = 3;
 /// test and the snapshots render each page at this size; grow it when a
 /// section is added (a page must stay under 4096 points tall).
 pub fn page_size(page: usize) -> Vec2 {
-    Vec2::new(1200.0, [1340.0, 2160.0, 1600.0][page])
+    Vec2::new(1200.0, [1340.0, 2400.0, 1600.0][page])
 }
 
 /// The gallery's interactive state.
@@ -65,6 +66,7 @@ pub struct GalleryState {
     plan: Option<PlanGallery>,
     list: ListState,
     list_rows: Vec<GalleryRow>,
+    dialog_open: bool,
 }
 
 /// A row of the ordered-list section: id, name, status, selected.
@@ -135,6 +137,7 @@ Panel 7: gradient in the lower left, redo DBE."
             card_thumbs: None,
             plan: None,
             list: ListState::default(),
+            dialog_open: false,
             list_rows: vec![
                 GalleryRow {
                     id: 1,
@@ -539,6 +542,30 @@ fn table_section(ui: &mut Ui, state: &mut TableState, selection: &mut BTreeSet<u
     }
 }
 
+/// The real modal behind the Dialog section's button, while open.
+fn gallery_dialog(ctx: &egui::Context, state: &mut GalleryState) {
+    if !state.dialog_open {
+        return;
+    }
+    let r = Dialog {
+        title: "Export",
+        width: DIALOG_WIDTH,
+    }
+    .show(ctx, egui::Id::new("gallery_dialog"), |ui| {
+        ui.label("Choose what to export.");
+        footer(
+            ui,
+            &[
+                (ButtonKind::Quiet, "Cancel"),
+                (ButtonKind::Primary, "Export"),
+            ],
+        )
+    });
+    if r.close || r.inner.is_some() {
+        state.dialog_open = false;
+    }
+}
+
 /// Draw the whole gallery: every page, stacked in one scrolling area.
 pub fn show(ui: &mut Ui, state: &mut GalleryState) {
     let now = ui.input(|i| i.time);
@@ -546,6 +573,7 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
         ui.set_max_width(1100.0);
         sections(ui, state, None);
     });
+    gallery_dialog(ui.ctx(), state);
     let _ = state.toasts.show(ui.ctx(), now);
 }
 
@@ -559,6 +587,7 @@ pub fn show_page(ui: &mut Ui, state: &mut GalleryState, page: usize) {
         ui.set_max_width(1100.0);
         sections(ui, state, Some(page));
     });
+    gallery_dialog(ui.ctx(), state);
     let _ = state.toasts.show(ui.ctx(), now);
 }
 
@@ -872,6 +901,49 @@ fn sections(ui: &mut Ui, state: &mut GalleryState, page: Option<usize>) {
                         }
                     }
                 });
+        });
+
+        section(ui, "Dialog", |ui| {
+            // The frame as drawn inside the modal, shown inline; the button
+            // opens the real thing (backdrop, focus trap, Esc to close).
+            let dialog = Dialog {
+                title: "Export",
+                width: DIALOG_WIDTH,
+            };
+            dialog_frame().show(ui, |ui| {
+                dialog.contents(ui, |ui| {
+                    ui.label("2 groups · 1 composite");
+                    // Every footer kind, and a button that cannot be
+                    // pressed yet (it says why on hover).
+                    footer_with(
+                        ui,
+                        &[
+                            FooterButton {
+                                kind: ButtonKind::Quiet,
+                                label: "Cancel",
+                                disabled: None,
+                            },
+                            FooterButton {
+                                kind: ButtonKind::Danger,
+                                label: "Overwrite and export",
+                                disabled: None,
+                            },
+                            FooterButton {
+                                kind: ButtonKind::Primary,
+                                label: "Export",
+                                disabled: Some("Checking the folder\u{2026}"),
+                            },
+                        ],
+                    );
+                });
+            });
+            ui.add_space(space::M);
+            if ui
+                .add(MegaButton::new(ButtonKind::Secondary, "Open dialog"))
+                .clicked()
+            {
+                state.dialog_open = true;
+            }
         });
     }
     if on(2) {

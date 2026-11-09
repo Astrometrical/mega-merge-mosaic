@@ -16,7 +16,8 @@
 //!   **Draw ROI** gives there: a toast rather than a tooltip, since the
 //!   list's rows carry none and the click must not pass unexplained).
 //! - **Merge settings** ([`MosaicView::settings_ui`]), then the health.
-//! - **Composites**: each composite's editor and **Delete composite**.
+//! - **Composites**: the composites as an ordered list (pick, rename,
+//!   reorder, delete with Undo); the picked one shows its channel editor.
 //! - **Notes**: the session's notes, saved with the session (debounced).
 
 use std::path::Path;
@@ -27,6 +28,7 @@ use mega_ui::inspector::{Badge, Section, inspector_with_shortcut};
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
 use mega_ui::theme::{Severity as UiSeverity, Tone};
+use mega_ui::widgets::ordered_list::{ListEvent, ListRow, ListState, ordered_list_with};
 use mega_ui::widgets::{ButtonKind, MegaButton, NotesMode, notes_view};
 use mmm_core::checks::{Check, Severity, is_accepted};
 use mmm_core::mosaic::MosaicConfig;
@@ -34,10 +36,12 @@ use mmm_core::mosaic::MosaicConfig;
 use super::shortcuts;
 use super::{
     COMPOSITES, CanvasMode, MERGE_SETTINGS, NOTES, PANELS, PROBLEMS, ROIS, SessionOutput,
-    SessionWindow, compositions_of,
+    SessionWindow, Undo, WindowToast, compositions_of,
 };
 use crate::checks::{ChecksEngine, ChecksReport};
-use crate::compositions::{ViewKind, composition_editor, save_compositions};
+use crate::compositions::{
+    Composition, ViewKind, channel_editor, composition_detail, save_compositions,
+};
 use crate::jobs::JobRunner;
 use crate::mosaic_view::MosaicView;
 use crate::pipeline::{Pipeline, Step};
@@ -56,8 +60,12 @@ const NOTES_HINT: &str = "Notes about this session";
 #[derive(Default)]
 struct Actions {
     mode: Option<CanvasMode>,
-    /// The composite at this index was deleted.
-    deleted: Option<usize>,
+    /// A composite was deleted: the index it had, and it.
+    deleted: Option<(usize, Composition)>,
+    /// A composite row was picked: show it.
+    view: Option<ViewKind>,
+    /// A rename was refused: another composite has this name.
+    refused: Option<String>,
     /// An ROI was picked: frame this canvas rect.
     go_to: Option<[u64; 4]>,
     /// **Draw ROI** was used: arm the draw tool on the canvas shown.
@@ -126,6 +134,8 @@ impl SessionWindow {
             show_all_checks,
             notes_mode,
             save,
+            composite_list,
+            view,
             ..
         } = self;
         let fold = shortcuts::FOLD.symbol_or_name();
@@ -141,7 +151,9 @@ impl SessionWindow {
                     ui.add_space(space::L);
                     mosaic.health_ui(ui);
                 }
-                COMPOSITES => composites_ui(ui, session, save, &mut act),
+                COMPOSITES => {
+                    composites_ui(ui, session, (composite_list, view.as_ref()), save, &mut act)
+                }
                 NOTES => notes_ui(ui, session, notes_mode, save),
                 _ => {}
             });
@@ -155,23 +167,40 @@ impl SessionWindow {
         if act.draw_roi {
             self.start_drawing_roi(session);
         }
-        if let Some(i) = act.deleted {
-            self.composite_deleted(session, i);
+        if let Some(view) = act.view {
+            self.select_view(view);
+        }
+        if let Some(name) = act.refused {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: Tone::Warning,
+                    title: format!("Another composite is called {name}"),
+                    detail: None,
+                    action: None,
+                },
+                undo: None,
+            });
+        }
+        if let Some((index, composite)) = act.deleted {
+            self.composite_deleted(session, composite.id);
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: Tone::Neutral,
+                    title: format!("{} deleted", composite.name),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::CompositeDelete { index, composite }),
+            });
         }
     }
 
-    /// Composite `index` is gone: a view of it shows the first group, a view
-    /// of a later one follows it down the list.
-    fn composite_deleted(&mut self, session: &OpenSession, index: usize) {
-        let next = match &self.view {
-            Some(ViewKind::Composition(i)) if *i == index => {
-                group_names(session).first().cloned().map(ViewKind::Group)
-            }
-            Some(ViewKind::Composition(i)) if *i > index => Some(ViewKind::Composition(i - 1)),
-            _ => None,
-        };
-        if let Some(view) = next {
-            self.select_view(view);
+    /// Composite `id` is gone: a view of it shows the first group.
+    fn composite_deleted(&mut self, session: &OpenSession, id: u64) {
+        if self.view == Some(ViewKind::Composition(id))
+            && let Some(g) = group_names(session).first().cloned()
+        {
+            self.select_view(ViewKind::Group(g));
         }
     }
 }
@@ -187,7 +216,7 @@ fn muted(ui: &mut egui::Ui, s: impl Into<String>) {
 }
 
 /// `n` and `noun`, plural unless one.
-pub(super) fn counted(n: usize, noun: &str) -> String {
+pub(crate) fn counted(n: usize, noun: &str) -> String {
     if n == 1 {
         format!("1 {noun}")
     } else {
@@ -379,6 +408,7 @@ fn rois_ui(
 fn composites_ui(
     ui: &mut egui::Ui,
     session: &mut OpenSession,
+    (state, shown): (&mut ListState, Option<&ViewKind>),
     save: &mut Debounce,
     act: &mut Actions,
 ) {
@@ -395,33 +425,54 @@ fn composites_ui(
         );
         return;
     }
+    let details: Vec<String> = list
+        .iter()
+        .map(|c| composition_detail(c, &groups))
+        .collect();
+    let rows: Vec<ListRow> = list
+        .iter()
+        .zip(&details)
+        .map(|(c, detail)| ListRow {
+            id: c.id,
+            label: &c.name,
+            detail: Some(detail),
+            selected: shown == Some(&ViewKind::Composition(c.id)),
+        })
+        .collect();
     let mut next = list.clone();
     let mut changed = false;
-    for (i, edited) in next.iter_mut().enumerate() {
-        if i > 0 {
-            ui.separator();
+    let events = ordered_list_with(ui, "composites", &rows, state, |ui, id| {
+        if let Some(c) = next.iter_mut().find(|c| c.id == id) {
+            changed |= channel_editor(ui, c, &groups);
         }
-        let others: Vec<String> = list
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, o)| o.name.clone())
-            .collect();
-        ui.push_id(("composite", i), |ui| {
-            if composition_editor(ui, edited, &groups, &others) {
-                changed = true;
+    });
+    for event in events {
+        match event {
+            ListEvent::Select(id) | ListEvent::Activate(id) => {
+                act.view = Some(ViewKind::Composition(id));
             }
-            if ui
-                .add(MegaButton::new(ButtonKind::Danger, "Delete composite"))
-                .clicked()
-            {
-                act.deleted = Some(i);
+            ListEvent::Rename(id, name) => {
+                if next.iter().any(|c| c.id != id && c.name == name) {
+                    act.refused = Some(name);
+                } else if let Some(c) = next.iter_mut().find(|c| c.id == id) {
+                    c.name = name;
+                    changed = true;
+                }
             }
-        });
-    }
-    if let Some(i) = act.deleted {
-        next.remove(i);
-        changed = true;
+            ListEvent::Move { id, to } => {
+                if let Some(from) = next.iter().position(|c| c.id == id) {
+                    let c = next.remove(from);
+                    next.insert(to.min(next.len()), c);
+                    changed = true;
+                }
+            }
+            ListEvent::Delete(id) => {
+                if let Some(at) = next.iter().position(|c| c.id == id) {
+                    act.deleted = Some((at, next.remove(at)));
+                    changed = true;
+                }
+            }
+        }
     }
     if changed {
         save_compositions(&mut session.mosaic.config.ui, &next);

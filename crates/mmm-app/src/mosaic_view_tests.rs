@@ -45,8 +45,7 @@ impl State {
 
 /// The view's canvas filling the window, driven as the shell drives it:
 /// the job runner's events, the settings and the view's every-frame work
-/// first, then (when shown) the inspector and the canvas, then the export
-/// dialog.
+/// first, then (when shown) the inspector and the canvas.
 fn harness(state: State) -> Harness<'static, State> {
     Harness::builder()
         .with_size(egui::vec2(900.0, 700.0))
@@ -76,7 +75,6 @@ fn harness(state: State) -> Harness<'static, State> {
                             .show(ui, &mut s.session, &s.look, s.plan_stretch.as_deref());
                     });
                 }
-                s.view.export_ui(&ctx, &mut s.session, &mut s.jobs);
             },
             state,
         )
@@ -575,7 +573,7 @@ fn merge_blocked_until_result_checked_and_reader_released() {
     let ha = store("ha2.mmmt");
     let oiii = store("oiii.mmmt");
     view.apply_view(
-        ViewKind::Composition(0),
+        ViewKind::Composition(1),
         vec!["Ha".to_string(), "OIII".to_string()],
     );
     for (name, src) in [("Ha", &ha), ("OIII", &oiii)] {
@@ -729,7 +727,7 @@ fn a_drawn_rect_becomes_a_region() {
     ];
     save_compositions(&mut s.mosaic.config.ui, &[hoo]);
     let mut view = MosaicView::new();
-    view.set_view(&s, ViewKind::Composition(0));
+    view.set_view(&s, ViewKind::Composition(1));
     assert_eq!(view.members, ["Ha", "OIII"]);
     assert_eq!(
         view.group(),
@@ -780,7 +778,7 @@ fn composition_shows_merged_members() {
     let compositions = load_compositions(&s.mosaic.config.ui);
     let ctx = egui::Context::default();
     let mut view = MosaicView::new();
-    view.set_view(&s, ViewKind::Composition(0));
+    view.set_view(&s, ViewKind::Composition(1));
     let deadline = Instant::now() + crate::testutil::PATIENCE;
     while !view.results.values().all(Member::idle) {
         assert!(Instant::now() < deadline, "results never opened");
@@ -794,201 +792,6 @@ fn composition_shows_merged_members() {
     assert!(view.viewer.is_some(), "the merged member is shown");
     assert_eq!(view.member_notes(), ["OIII: Not merged yet."]);
     assert_eq!(view.shown_text(), None);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Answers the save dialog with a fixed path.
-struct FixedSave(std::path::PathBuf);
-
-impl crate::export::SavePicker for FixedSave {
-    fn pick_save(
-        &self,
-        _format: crate::export::ExportFormat,
-        _name: &str,
-    ) -> Option<std::path::PathBuf> {
-        Some(self.0.clone())
-    }
-}
-
-struct ExportState {
-    view: MosaicView,
-    session: OpenSession,
-    jobs: JobRunner,
-    events: Vec<JobEvent>,
-}
-
-#[test]
-fn export_dialog_warns_then_runs() {
-    use egui_kittest::kittest::Queryable;
-    use mmm_core::formats::InputPanel;
-
-    use crate::testutil::CANVAS;
-
-    let (root, mut s, mut jobs) = analyzed("mosaic-export-dialog");
-    // Only the top-left tile of Ha is merged: 5 of its 6 tiles missing.
-    jobs.start_blend(&mut s, "Ha", Some([0, 0, 256, 256]));
-    drain(&mut jobs, &mut s);
-    let picked = root.join("picked.fits");
-    let mut view = MosaicView::new();
-    view.select("Ha".into());
-    view.export.set_picker(Arc::new(FixedSave(picked.clone())));
-    let mut h = Harness::builder()
-        .with_size(egui::vec2(900.0, 700.0))
-        .with_step_dt(0.01)
-        .build_ui_state(
-            |ui, st: &mut ExportState| {
-                // The view's background work (opening the result), then
-                // the dialog, as `MosaicView::show` and the shell do each
-                // frame.
-                update(&mut st.view, ui.ctx(), &mut st.session, &st.jobs);
-                st.view.export_ui(ui.ctx(), &mut st.session, &mut st.jobs);
-                let events = st.jobs.poll(&mut st.session);
-                for e in &events {
-                    st.view.on_event(e);
-                }
-                st.events.extend(events);
-            },
-            ExportState {
-                view,
-                session: s,
-                jobs,
-                events: Vec::new(),
-            },
-        );
-    // Wait until the result is checked (merging becomes possible).
-    step_until(&mut h, |st| can_merge(&st.view, &st.session, &st.jobs));
-    {
-        let st = h.state_mut();
-        st.view.open_export(&st.session);
-    }
-    h.run_steps(2);
-    assert!(h.state().view.export.is_open());
-
-    // Browse… fills the destination from the save dialog.
-    h.get_by_label("Browse…").click();
-    let want = picked.display().to_string();
-    step_until(&mut h, |st| st.view.export.path() == want);
-
-    // Export checks first: the result is partly missing, so it warns.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
-        .click();
-    step_until(&mut h, |st| st.view.export.warning_shown());
-    h.get_by_label_contains("Ha: 5 missing tile(s)");
-    assert!(
-        !h.state().jobs.busy(),
-        "nothing runs before the user decides"
-    );
-    assert!(!picked.exists());
-
-    // Merging first merges the chosen groups; no export.
-    h.get_by_label("Merge whole mosaic first").click();
-    h.run_steps(1);
-    assert!(!h.state().view.export.is_open());
-    assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
-    step_until(&mut h, |st| {
-        !st.jobs.busy() && can_merge(&st.view, &st.session, &st.jobs)
-    });
-    assert!(
-        h.state()
-            .events
-            .iter()
-            .any(|e| matches!(e, JobEvent::Finished { label, .. } if label == "Merge Ha"))
-    );
-
-    // Stale it all, then "Export anyway" runs the export as a job.
-    {
-        let st = h.state_mut();
-        mmm_core::mosaic::invalidate_group(&st.session.mosaic, "Ha").unwrap();
-        st.view.open_export(&st.session);
-    }
-    h.run_steps(2);
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
-        .click();
-    step_until(&mut h, |st| st.view.export.warning_shown());
-    h.get_by_label_contains("Ha: 6 stale tile(s)");
-    h.get_by_label("Export anyway").click();
-    h.run_steps(1);
-    assert!(!h.state().view.export.is_open());
-    assert_eq!(labels(&h.state().jobs), ["Export Ha"]);
-    step_until(&mut h, |st| !st.jobs.busy());
-    assert!(
-        h.state()
-            .events
-            .iter()
-            .any(|e| matches!(e, JobEvent::Finished { label, .. } if label == "Export Ha")),
-        "{:?}",
-        h.state().events
-    );
-    let p = InputPanel::open(&picked).unwrap();
-    assert_eq!(
-        (p.width(), p.height(), p.channels()),
-        (CANVAS.0, CANVAS.1, 3)
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn no_merge_while_the_export_check_runs() {
-    let (root, mut s, mut jobs) = analyzed("mosaic-during-check");
-    let mut view = MosaicView::new();
-    view.select("Ha".into());
-    let ctx = egui::Context::default();
-    for _ in 0..500 {
-        if can_merge(&view, &s, &jobs) {
-            break;
-        }
-        update(&mut view, &ctx, &mut s, &jobs);
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(can_merge(&view, &s, &jobs), "allowed when idle");
-    view.open_export(&s);
-    let (release, rx) = std::sync::mpsc::channel();
-    view.export.force_checking(&ctx, rx);
-    assert!(!view.export.idle());
-    let why = view.merge_block_reason(&s, &jobs).expect("blocked");
-    assert!(why.contains("export"), "{why}");
-    view.merge_all(&mut s, &mut jobs);
-    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()]);
-    assert!(!jobs.busy(), "no merge job started during the check");
-    assert!(view.merge_jobs.is_empty());
-    drop(release);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn export_refused_for_a_pending_merge_after_switching_view() {
-    use egui_kittest::kittest::{NodeT, Queryable};
-
-    let (root, mut s, mut jobs) = analyzed("mosaic-export-switch");
-    let gate = jobs.hold();
-    let mut view = MosaicView::new();
-    view.select("Ha".into());
-    view.open_export(&s);
-    // Switch the view away from Ha; the dialog still has Ha.
-    view.select("OIII".into());
-    jobs.start_blend(&mut s, "Ha", None);
-    let mut h = Harness::builder()
-        .with_size(egui::vec2(900.0, 700.0))
-        .with_step_dt(0.01)
-        .build_ui_state(
-            |ui, st: &mut ExportState| {
-                st.view.export_ui(ui.ctx(), &mut st.session, &mut st.jobs);
-            },
-            ExportState {
-                view,
-                session: s,
-                jobs,
-                events: Vec::new(),
-            },
-        );
-    h.run_steps(2);
-    assert!(
-        h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
-            .accesskit_node()
-            .is_disabled()
-    );
-    h.get_by_label_contains("Waiting for the merge of Ha");
-    gate.open();
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1007,162 +810,6 @@ fn absent_reason_hidden_while_reopening() {
         view.absent(),
         Some("Cannot read the group's analysis: gone")
     );
-}
-
-/// The export dialog alone, as the view drives it: the user's decisions
-/// are collected, nothing is started.
-struct DialogState {
-    dialog: crate::export::ExportDialog,
-    session: OpenSession,
-    jobs: JobRunner,
-    merging: std::collections::BTreeSet<String>,
-    actions: Vec<crate::export::ExportAction>,
-}
-
-fn dialog_harness(
-    session: OpenSession,
-    jobs: JobRunner,
-    groups: Vec<String>,
-) -> Harness<'static, DialogState> {
-    let mut dialog = crate::export::ExportDialog::new(Arc::new(FixedSave(Default::default())));
-    dialog.open(&session, groups);
-    Harness::builder()
-        .with_size(egui::vec2(900.0, 700.0))
-        .with_step_dt(0.01)
-        .build_ui_state(
-            |ui, st: &mut DialogState| {
-                st.jobs.poll(&mut st.session);
-                st.merging = st
-                    .session
-                    .mosaic
-                    .config
-                    .group_dirs
-                    .keys()
-                    .filter(|g| st.jobs.blend_pending(g))
-                    .cloned()
-                    .collect();
-                let can_merge = true;
-                if let Some(a) = st.dialog.ui(ui.ctx(), &st.session, can_merge, &st.merging) {
-                    st.actions.push(a);
-                }
-            },
-            DialogState {
-                dialog,
-                session,
-                jobs,
-                merging: Default::default(),
-                actions: Vec::new(),
-            },
-        )
-}
-
-fn export_button<'h>(h: &'h Harness<'static, DialogState>) -> egui_kittest::Node<'h> {
-    use egui_kittest::kittest::Queryable;
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Export")
-}
-
-fn export_disabled(h: &Harness<'static, DialogState>) -> bool {
-    use egui_kittest::kittest::NodeT;
-    export_button(h).accesskit_node().is_disabled()
-}
-
-#[test]
-fn export_disabled_while_a_chosen_group_merges() {
-    let (root, mut s, mut jobs) = analyzed("mosaic-export-merging");
-    let gate = jobs.hold();
-    jobs.start_blend(&mut s, "Ha", None);
-    jobs.start_blend(&mut s, "OIII", None);
-    let mut h = dialog_harness(s, jobs, vec!["Ha".into()]);
-    {
-        let st = h.state_mut();
-        st.dialog
-            .set_path(&root.join("ha.fits").display().to_string());
-    }
-    h.run_steps(2);
-    // Ha's merge runs: no check (it maps the store the merge may recreate).
-    assert!(export_disabled(&h));
-    export_button(&h).click();
-    h.run_steps(2);
-    assert!(h.state().dialog.idle(), "no check started");
-    gate.open();
-    step_until(&mut h, |st| !st.jobs.busy());
-    h.run_steps(2);
-    assert!(!export_disabled(&h));
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn export_snapshots_choices_and_confirms_overwrite() {
-    use egui_kittest::kittest::Queryable;
-
-    use crate::export::{ExportAction, ExportFormat};
-
-    let (root, mut s, mut jobs) = analyzed("mosaic-export-overwrite");
-    jobs.start_blend(&mut s, "Ha", None);
-    jobs.start_blend(&mut s, "OIII", None);
-    drain(&mut jobs, &mut s);
-
-    // One group to an existing file: confirm first, listing it.
-    let dest = root.join("ha.fits");
-    std::fs::write(&dest, b"keep").unwrap();
-    let mut h = dialog_harness(s, jobs, vec!["Ha".into()]);
-    h.state_mut().dialog.set_path(&dest.display().to_string());
-    h.run_steps(2);
-    export_button(&h).click();
-    step_until(&mut h, |st| st.dialog.overwrite_shown());
-    h.get_by_label_contains(&dest.display().to_string());
-    // Back: nothing decided, the file untouched.
-    h.get_by_label("Back").click();
-    h.run();
-    assert!(h.state().actions.is_empty());
-    assert_eq!(std::fs::read(&dest).unwrap(), b"keep");
-    // Again, then change the choices while the confirmation shows: the
-    // export uses what was checked.
-    export_button(&h).click();
-    step_until(&mut h, |st| st.dialog.overwrite_shown());
-    {
-        let st = h.state_mut();
-        st.dialog
-            .set_path(&root.join("other.tif").display().to_string());
-        st.dialog.set_format(ExportFormat::Tiff);
-    }
-    h.get_by_label("Overwrite").click();
-    h.run_steps(2);
-    assert_eq!(
-        h.state().actions,
-        [ExportAction::Export(
-            vec![("Ha".to_string(), dest.clone())],
-            ExportFormat::Fits
-        )]
-    );
-    drop(h);
-
-    // Several groups: the derived names are checked too.
-    let (root2, mut s, mut jobs) = analyzed("mosaic-export-overwrite2");
-    jobs.start_blend(&mut s, "Ha", None);
-    jobs.start_blend(&mut s, "OIII", None);
-    drain(&mut jobs, &mut s);
-    let tag = s.mosaic.config.group_dirs["OIII"].clone();
-    let existing = root2.join(format!("m-{tag}.fits"));
-    std::fs::write(&existing, b"keep").unwrap();
-    let mut h = dialog_harness(s, jobs, vec!["Ha".into(), "OIII".into()]);
-    h.state_mut()
-        .dialog
-        .set_path(&root2.join("m.fits").display().to_string());
-    h.run_steps(2);
-    export_button(&h).click();
-    step_until(&mut h, |st| st.dialog.overwrite_shown());
-    h.get_by_label_contains(&existing.display().to_string());
-    assert!(
-        h.query_by_label_contains(&root2.join("m-Ha").display().to_string())
-            .is_none(),
-        "only existing files are listed"
-    );
-    h.get_by_label("Overwrite").click();
-    h.run_steps(2);
-    assert!(matches!(&h.state().actions[..], [ExportAction::Export(d, _)] if d.len() == 2));
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(&root2);
 }
 
 #[test]
@@ -1223,6 +870,7 @@ fn previews_do_not_move_persisted_rois() {
         summary: None,
         merged: false,
         results: Default::default(),
+        stamps: Default::default(),
     };
     // The previews run in the panels' frame...
     let mut jobs = JobRunner::new(egui::Context::default());

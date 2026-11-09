@@ -25,9 +25,20 @@
 //!   memory-mapped. The provenance goes into `ImageDescription`; TIFF has
 //!   no standard place for the WCS.
 //!
+//! [`export_composite`] writes a composite of groups the same way as one
+//! three-channel file: per tile row it reads each distinct mapped group
+//! once and builds the R, G and B planes (a mono group's channel, the mean
+//! of an OSC group's channels, or zeros), so memory stays at a few tile
+//! rows of the width. Its pass-through cards are the first mapped group's,
+//! less those naming a single panel's band (`FILTER`, and the header key
+//! the groups are made by): an HOO file is not `FILTER = 'Ha'`. Its
+//! `HISTORY` says which group each channel holds.
+//!
 //! Output is written to `<name>.part` beside the destination and renamed
 //! over it only when complete: a failed or cancelled export removes its
 //! partial and scratch files and leaves an existing destination untouched.
+//! [`export_group_with`] and [`export_composite_with`] can instead refuse
+//! to replace an existing destination at all ([`OnExisting::Keep`]).
 //! Cancellation is checked once per tile row. While the TIFF writer runs it
 //! cannot be stopped; a cancel then makes the rest of the image read as
 //! zeros, so the writer finishes at disk speed and the file is discarded.
@@ -48,7 +59,7 @@ use mpp_core::formats::tiff_write::{Container, TiffWriteOptions, write_tiff_nati
 use crate::error::{Error, Result};
 use crate::formats::FitsKeyword;
 use crate::job::{CancelToken, JobCtl};
-use crate::mosaic::Mosaic;
+use crate::mosaic::{GroupRule, Mosaic};
 use crate::output::fits::{FitsSink, WcsPlacement, session_keywords};
 use crate::session::Session;
 use crate::tiles::{TileGeometry, TileReader, TileState};
@@ -85,6 +96,24 @@ impl ExportFormat {
             ExportFormat::Tiff => "TIFF",
         }
     }
+}
+
+/// What an export does when its destination exists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnExisting {
+    /// Replace it once the new file is complete (what `mmm export` does).
+    #[default]
+    Replace,
+    /// Never replace it: the export fails, leaving it as it is, if the
+    /// destination exists when the export starts or by the time the new
+    /// file is complete. For a caller that looked at the destination before
+    /// (and found none, or did not have it confirmed): one there now
+    /// appeared meanwhile. The new file is put in place with a hard link,
+    /// which never replaces; on a file system without hard links (FAT,
+    /// some network shares) the destination is looked for once more just
+    /// before an ordinary rename, so a file appearing in that instant
+    /// would still be replaced.
+    Keep,
 }
 
 /// What an export found (or, from [`export_check`], would find) in the
@@ -177,12 +206,26 @@ pub fn export_check(result: &Path) -> Result<ExportReport> {
 /// Fails, writing nothing, for a group never analysed or never blended,
 /// or whose result no longer matches its analysed canvas (blend again).
 /// [`Error::Cancelled`] when `ctl` is cancelled; progress is reported as
-/// [`EXPORT_STAGE`].
+/// [`EXPORT_STAGE`]. An existing destination is replaced
+/// ([`export_group_with`] can refuse to).
 pub fn export_group(
     session: &Path,
     group: &str,
     out: &Path,
     format: ExportFormat,
+    ctl: &JobCtl,
+) -> Result<ExportReport> {
+    export_group_with(session, group, out, format, OnExisting::Replace, ctl)
+}
+
+/// [`export_group`], doing `on_existing` with an existing destination
+/// ([`OnExisting::Keep`]: fail, leaving it as it is).
+pub fn export_group_with(
+    session: &Path,
+    group: &str,
+    out: &Path,
+    format: ExportFormat,
+    on_existing: OnExisting,
     ctl: &JobCtl,
 ) -> Result<ExportReport> {
     let m = Mosaic::open(session)?;
@@ -208,7 +251,235 @@ pub fn export_group(
             g.width, g.height, g.channels
         )));
     }
-    let history = history_lines(&m, group);
+    let history = history_lines(
+        vec![format!(
+            "Exported by Mega Merge Mosaic (mmm {}), group '{group}'",
+            env!("CARGO_PKG_VERSION")
+        )],
+        vec![blend_lines(&m, group, false)],
+    );
+    let planes = (0..g.channels as usize)
+        .map(|c| Plane::Channel(0, c))
+        .collect();
+    let tiles = TileRows::new(vec![&reader], planes);
+    let to = Destination { out, on_existing };
+    let cards = PassThrough {
+        session: &group_session,
+        drop: Vec::new(),
+    };
+    run_export(&to, format, tiles, &cards, &history, ctl)
+}
+
+/// The three channels of a composite to export: each is the name of a
+/// group (its merged result) or `None` for an empty (all-zero) plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompositeChannels<'a> {
+    /// The composite's name, recorded in the provenance.
+    pub name: &'a str,
+    /// The group in the red plane.
+    pub r: Option<&'a str>,
+    /// The group in the green plane.
+    pub g: Option<&'a str>,
+    /// The group in the blue plane.
+    pub b: Option<&'a str>,
+}
+
+/// Export a composite of merged groups in the mosaic `session` to `out` as
+/// one three-channel `format` file (see the module docs), covering the
+/// whole canvas.
+///
+/// Each distinct mapped group is read once, so HOO (OIII in green and blue)
+/// opens two results. A mono group fills its plane with its channel; a
+/// three-channel (OSC) group with the mean of its channels; an unmapped
+/// plane is zeros. The WCS and pass-through header cards come from the first
+/// mapped group, without `FILTER` or the grouping rule's header key (each
+/// names one panel's band, not the composite's). The returned counts are
+/// summed over the groups.
+///
+/// Fails, writing nothing, for a composite that maps no group, a group
+/// never analysed or merged, a result no longer matching its analysed
+/// canvas, or groups of different canvases. [`Error::Cancelled`] when `ctl`
+/// is cancelled; progress is reported as [`EXPORT_STAGE`]. An existing
+/// destination is replaced ([`export_composite_with`] can refuse to).
+pub fn export_composite(
+    session: &Path,
+    channels: &CompositeChannels,
+    out: &Path,
+    format: ExportFormat,
+    ctl: &JobCtl,
+) -> Result<ExportReport> {
+    export_composite_with(session, channels, out, format, OnExisting::Replace, ctl)
+}
+
+/// [`export_composite`], doing `on_existing` with an existing destination
+/// ([`OnExisting::Keep`]: fail, leaving it as it is).
+pub fn export_composite_with(
+    session: &Path,
+    channels: &CompositeChannels,
+    out: &Path,
+    format: ExportFormat,
+    on_existing: OnExisting,
+    ctl: &JobCtl,
+) -> Result<ExportReport> {
+    let m = Mosaic::open(session)?;
+    let mapped = [channels.r, channels.g, channels.b];
+    let mut members: Vec<&str> = Vec::new();
+    for g in mapped.into_iter().flatten() {
+        if !members.contains(&g) {
+            members.push(g);
+        }
+    }
+    if members.is_empty() {
+        return Err(Error::compute("the composite maps no groups"));
+    }
+    let mut readers = Vec::new();
+    let mut sessions = Vec::new();
+    for &group in &members {
+        if !m.config.group_dirs.contains_key(group) {
+            return Err(Error::compute(format!(
+                "group '{group}' has not been analysed or merged — nothing to export"
+            )));
+        }
+        let result = m.result_path(group);
+        if !result.exists() {
+            return Err(Error::compute(format!(
+                "group '{group}' has not been merged yet — merge it before exporting"
+            )));
+        }
+        readers.push(open_result(&result)?);
+        sessions.push(Session::open(&m.group_session_dir(group))?);
+    }
+    let first = readers[0].geometry();
+    if readers.iter().any(|r| {
+        let g = r.geometry();
+        (g.width, g.height, g.tile) != (first.width, first.height, first.tile)
+    }) {
+        return Err(Error::compute(
+            "the composite's groups have different canvases",
+        ));
+    }
+    for ((reader, session), group) in readers.iter().zip(&sessions).zip(&members) {
+        let g = reader.geometry();
+        let (cw, ch, cc) = session.canvas;
+        if (g.width, g.height, g.channels as u64) != (cw, ch, cc) {
+            return Err(Error::compute(format!(
+                "the result of group '{group}' is {}×{}×{} but its analysed canvas is \
+                 {cw}×{ch}×{cc} — merge it again before exporting",
+                g.width, g.height, g.channels
+            )));
+        }
+    }
+    let planes = mapped
+        .iter()
+        .map(
+            |&g| match g.and_then(|g| members.iter().position(|&x| x == g)) {
+                None => Plane::Zero,
+                Some(i) if readers[i].geometry().channels == 1 => Plane::Channel(i, 0),
+                Some(i) => Plane::Mean(i),
+            },
+        )
+        .collect();
+    let mut head = vec![format!(
+        "Exported by Mega Merge Mosaic (mmm {}), composite '{}'",
+        env!("CARGO_PKG_VERSION"),
+        channels.name
+    )];
+    for (label, g) in ["R", "G", "B"].into_iter().zip(mapped) {
+        head.push(match g {
+            Some(g) => format!("{label}: group '{g}'"),
+            None => format!("{label}: none"),
+        });
+    }
+    let history = history_lines(
+        head,
+        members.iter().map(|g| blend_lines(&m, g, true)).collect(),
+    );
+    let tiles = TileRows::new(readers.iter().collect(), planes);
+    let to = Destination { out, on_existing };
+    let cards = PassThrough {
+        session: &sessions[0],
+        drop: band_cards(&m),
+    };
+    run_export(&to, format, tiles, &cards, &history, ctl)
+}
+
+/// The pass-through cards that name a single panel's band, which a
+/// composite's file must not claim: `FILTER`, and the header key the groups
+/// are made by when the grouping rule reads one.
+fn band_cards(m: &Mosaic) -> Vec<String> {
+    let mut names = vec!["FILTER".to_string()];
+    if let GroupRule::Header { key } = &m.config.grouping.rule
+        && !key.trim().eq_ignore_ascii_case("FILTER")
+    {
+        names.push(key.trim().to_string());
+    }
+    names
+}
+
+/// Where an export's pass-through and WCS cards come from: a group's
+/// session (its reference panel's cards, its frame's WCS), less the cards
+/// named in `drop` (any case).
+struct PassThrough<'a> {
+    session: &'a Session,
+    drop: Vec<String>,
+}
+
+/// Where an export goes, and what it does with a file already there.
+struct Destination<'a> {
+    out: &'a Path,
+    on_existing: OnExisting,
+}
+
+impl Destination<'_> {
+    /// [`OnExisting::Keep`]'s refusal: `out` is there.
+    fn appeared(&self) -> Error {
+        let name = self.out.file_name().unwrap_or(self.out.as_os_str());
+        Error::compute(format!(
+            "{} appeared meanwhile and was not replaced",
+            name.to_string_lossy()
+        ))
+    }
+
+    /// Something (a file, a folder, a link) is at `out`.
+    fn taken(&self) -> bool {
+        self.out.symlink_metadata().is_ok()
+    }
+
+    /// Put the complete `part` in place at `out` (see [`OnExisting`]).
+    fn put(&self, part: &Path) -> Result<()> {
+        let out = self.out;
+        if self.on_existing == OnExisting::Replace {
+            return std::fs::rename(part, out).map_err(|e| Error::io(out, e));
+        }
+        match std::fs::hard_link(part, out) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(part);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(self.appeared()),
+            // No hard links here: look once more, then rename.
+            Err(_) if self.taken() => Err(self.appeared()),
+            Err(_) => std::fs::rename(part, out).map_err(|e| Error::io(out, e)),
+        }
+    }
+}
+
+/// Write the planes of `tiles` to `to` through `<out>.part` (see the
+/// module docs and [`OnExisting`]); the WCS and pass-through cards come
+/// from `cards`.
+fn run_export(
+    to: &Destination,
+    format: ExportFormat,
+    tiles: TileRows,
+    cards: &PassThrough,
+    history: &[String],
+    ctl: &JobCtl,
+) -> Result<ExportReport> {
+    let out = to.out;
+    if to.on_existing == OnExisting::Keep && to.taken() {
+        return Err(to.appeared());
+    }
+    let g = tiles.g;
     let part = sibling(out, "part");
     let written = match format {
         ExportFormat::Fits => {
@@ -217,17 +488,23 @@ pub fn export_group(
                 height: g.height,
                 flipped: false,
             };
-            let (mut keywords, _) = session_keywords(&group_session, (0, 0), Some(place))?;
+            let (mut keywords, _) = session_keywords(cards.session, (0, 0), Some(place))?;
+            keywords.retain(|k| {
+                !cards
+                    .drop
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(k.name.trim()))
+            });
             keywords.extend(history.iter().map(|h| FitsKeyword {
                 name: "HISTORY".into(),
                 value: h.clone(),
                 comment: String::new(),
             }));
-            write_fits(&reader, &part, keywords, ctl)
+            write_fits(tiles, &part, keywords, ctl)
         }
         ExportFormat::Tiff => {
             let scratch = sibling(out, "scratch");
-            let written = write_tiff(&reader, &part, &scratch, out, &history, ctl);
+            let written = write_tiff(tiles, &part, &scratch, out, history, ctl);
             let _ = std::fs::remove_file(&scratch);
             written
         }
@@ -239,9 +516,8 @@ pub fn export_group(
             return Err(e);
         }
     };
-    std::fs::rename(&part, out).map_err(|e| {
+    to.put(&part).inspect_err(|_| {
         let _ = std::fs::remove_file(&part);
-        Error::io(out, e)
     })?;
     Ok(report)
 }
@@ -254,14 +530,14 @@ fn sibling(out: &Path, suffix: &str) -> PathBuf {
     out.with_file_name(name)
 }
 
-/// The provenance lines of an export of `group`: the mmm version, then the
-/// latest blend of the group (version, time, rect and settings) from the
-/// mosaic's provenance. ASCII only, each at most [`HISTORY_WIDTH`] long.
-fn history_lines(m: &Mosaic, group: &str) -> Vec<String> {
-    let mut text = vec![format!(
-        "Exported by Mega Merge Mosaic (mmm {}), group '{group}'",
-        env!("CARGO_PKG_VERSION")
-    )];
+/// The latest blend of `group` (version, time, rect and settings) from the
+/// mosaic's provenance, as text lines; `titled` puts the group's name in
+/// front, for exports of several groups.
+fn blend_lines(m: &Mosaic, group: &str, titled: bool) -> Vec<String> {
+    let mut text = Vec::new();
+    if titled {
+        text.push(format!("Group '{group}':"));
+    }
     let blend = m
         .config
         .provenance
@@ -278,6 +554,15 @@ fn history_lines(m: &Mosaic, group: &str) -> Vec<String> {
         }
         None => text.push("No blend of this group is recorded in the provenance".into()),
     }
+    text
+}
+
+/// The provenance lines of an export: the `head` lines (the mmm version and
+/// what was exported), then each group's blend lines. ASCII only, each at
+/// most [`HISTORY_WIDTH`] long.
+fn history_lines(head: Vec<String>, groups: Vec<Vec<String>>) -> Vec<String> {
+    let mut text = head;
+    text.extend(groups.into_iter().flatten());
     let mut lines = Vec::new();
     for t in text {
         let ascii: String = t
@@ -298,22 +583,43 @@ fn history_lines(m: &Mosaic, group: &str) -> Vec<String> {
     lines
 }
 
-/// Reads the level-0 tiles of a store one tile row at a time, counting
-/// stale and missing tiles.
+/// Where one output plane of an export comes from.
+#[derive(Clone, Copy)]
+enum Plane {
+    /// Channel `c` of source `s`.
+    Channel(usize, usize),
+    /// The mean of all channels of source `s`.
+    Mean(usize),
+    /// No data: zeros.
+    Zero,
+}
+
+/// Reads the level-0 tiles of one or more stores (all of one canvas) one
+/// tile row at a time, counting stale and missing tiles, and assembles the
+/// planes of the output from them.
 struct TileRows<'a> {
-    reader: &'a TileReader,
+    readers: Vec<&'a TileReader>,
+    planes: Vec<Plane>,
     g: TileGeometry,
-    tile: Vec<f32>,
+    /// One tile buffer per reader.
+    tiles: Vec<Vec<f32>>,
     report: ExportReport,
 }
 
 impl<'a> TileRows<'a> {
-    fn new(reader: &'a TileReader) -> Self {
-        let g = reader.geometry();
+    /// `readers` share width, height and tile size; output plane `p` is
+    /// built as `planes[p]`.
+    fn new(readers: Vec<&'a TileReader>, planes: Vec<Plane>) -> Self {
+        let g = readers[0].geometry();
+        let tiles = readers
+            .iter()
+            .map(|r| vec![0.0; r.geometry().channels as usize * g.tile as usize * g.tile as usize])
+            .collect();
         TileRows {
-            reader,
+            readers,
+            planes,
             g,
-            tile: vec![0.0; g.channels as usize * g.tile as usize * g.tile as usize],
+            tiles,
             report: ExportReport {
                 stale_tiles: 0,
                 missing_tiles: 0,
@@ -321,6 +627,11 @@ impl<'a> TileRows<'a> {
                 height: g.height,
             },
         }
+    }
+
+    /// Channels of the output.
+    fn channels(&self) -> u64 {
+        self.planes.len() as u64
     }
 
     /// Tile rows in the image.
@@ -334,48 +645,60 @@ impl<'a> TileRows<'a> {
         (y0, (self.g.tile as u64).min(self.g.height - y0))
     }
 
-    /// Copy tile `(tx, ty)` into `self.tile`: a valid or stale copy as it
-    /// is, a missing tile (or one still being written after
-    /// [`TORN_RETRIES`] tries) as zeros, counted.
-    fn read_tile(&mut self, tx: u32, ty: u32) {
+    /// Copy tile `(tx, ty)` of reader `s` into `self.tiles[s]`: a valid or
+    /// stale copy as it is, a missing tile (or one still being written
+    /// after [`TORN_RETRIES`] tries) as zeros, counted.
+    fn read_tile(&mut self, s: usize, tx: u32, ty: u32) {
+        let (reader, tile) = (self.readers[s], &mut self.tiles[s]);
         for _ in 0..TORN_RETRIES {
-            match self.reader.read_tile_any(0, tx, ty, &mut self.tile) {
+            match reader.read_tile_any(0, tx, ty, tile) {
                 Some(TileState::Valid) => return,
                 Some(_) => {
                     self.report.stale_tiles += 1;
                     return;
                 }
-                None if self.reader.state(0, tx, ty) == TileState::Missing => break,
+                None if reader.state(0, tx, ty) == TileState::Missing => break,
                 // Caught mid-write: try again.
                 None => std::thread::yield_now(),
             }
         }
-        self.tile.fill(0.0);
+        tile.fill(0.0);
         self.report.missing_tiles += 1;
     }
 
     /// Tile row `ty` as a [`crate::blend::RowSink`] band: planar,
-    /// channel-major (each channel's rows, full width); returns its first
+    /// channel-major (each plane's rows, full width); returns its first
     /// row.
     fn band(&mut self, ty: u32, band: &mut Vec<f32>) -> u64 {
         let (y0, rows) = self.span(ty);
-        let (w, t, ch) = (
-            self.g.width as usize,
-            self.g.tile as usize,
-            self.g.channels as usize,
-        );
+        let (w, t) = (self.g.width as usize, self.g.tile as usize);
         let rows = rows as usize;
         band.clear();
-        band.resize(ch * rows * w, 0.0);
+        band.resize(self.planes.len() * rows * w, 0.0);
         let (nx, _) = self.g.tiles(0);
         for tx in 0..nx {
-            self.read_tile(tx, ty);
+            for s in 0..self.readers.len() {
+                self.read_tile(s, tx, ty);
+            }
             let x0 = tx as usize * t;
             let cols = t.min(w - x0);
-            for c in 0..ch {
+            for (p, plane) in self.planes.iter().enumerate() {
                 for r in 0..rows {
-                    let src = &self.tile[(c * t + r) * t..][..cols];
-                    band[(c * rows + r) * w + x0..][..cols].copy_from_slice(src);
+                    let dst = &mut band[(p * rows + r) * w + x0..][..cols];
+                    match *plane {
+                        Plane::Channel(s, c) => {
+                            dst.copy_from_slice(&self.tiles[s][(c * t + r) * t..][..cols]);
+                        }
+                        Plane::Mean(s) => {
+                            let n = self.readers[s].geometry().channels as usize;
+                            for (x, d) in dst.iter_mut().enumerate() {
+                                let sum: f32 =
+                                    (0..n).map(|c| self.tiles[s][(c * t + r) * t + x]).sum();
+                                *d = sum / n as f32;
+                            }
+                        }
+                        Plane::Zero => {}
+                    }
                 }
             }
         }
@@ -385,17 +708,16 @@ impl<'a> TileRows<'a> {
 
 /// Stream every tile row into a FITS file at `path`.
 fn write_fits(
-    reader: &TileReader,
+    mut tiles: TileRows,
     path: &Path,
     keywords: Vec<FitsKeyword>,
     ctl: &JobCtl,
 ) -> Result<ExportReport> {
     use crate::blend::RowSink;
 
-    let mut tiles = TileRows::new(reader);
     let g = tiles.g;
     let mut sink = FitsSink::create(path, keywords)?;
-    sink.begin(g.width, g.height, g.channels as u64)?;
+    sink.begin(g.width, g.height, tiles.channels())?;
     let mut band = Vec::new();
     for ty in 0..tiles.rows() {
         ctl.check()?;
@@ -450,16 +772,15 @@ impl PlanarRows<f32> for Staged<'_> {
 /// decides the container: `.btf`/`.tf8` is BigTIFF, anything else BigTIFF
 /// only when the image needs it.
 fn write_tiff(
-    reader: &TileReader,
+    mut tiles: TileRows,
     path: &Path,
     scratch: &Path,
     out: &Path,
     history: &[String],
     ctl: &JobCtl,
 ) -> Result<ExportReport> {
-    let mut tiles = TileRows::new(reader);
     let g = tiles.g;
-    let (w, h, ch) = (g.width, g.height, g.channels as u64);
+    let (w, h, ch) = (g.width, g.height, tiles.channels());
     // Reading the tiles is the first half of the progress, writing the
     // TIFF the second.
     let total = 2 * h;

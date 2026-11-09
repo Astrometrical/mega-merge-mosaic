@@ -14,14 +14,14 @@ use mega_ui::widgets::{StepState, StripStep};
 use mmm_core::checks::{Check, CheckCode, Severity};
 use mmm_core::mosaic::{MosaicConfig, SINGLE_GROUP};
 
-use super::steps::{MERGE_STEP, draft_changed, out_of_date, steps};
+use super::steps::{CHECKS_STEP, EXPORT_STEP, MERGE_STEP, draft_changed, out_of_date, steps};
 use super::*;
 use crate::camera::Camera;
 use crate::checks::{ChecksEngine, ChecksReport};
 use crate::compositions::{Composition, ViewKind, load_compositions, save_compositions};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::tests::{analyzed, drain};
-use crate::jobs::{JobRunner, JobTarget};
+use crate::jobs::{ExportTarget, JobRunner, JobTarget};
 use crate::panel_edits::FilesPicker;
 use crate::pipeline::{Pipeline, Step};
 use crate::rois::{Roi, save_rois};
@@ -195,10 +195,21 @@ fn labels(jobs: &JobRunner) -> Vec<String> {
     jobs.views().into_iter().map(|v| v.label).collect()
 }
 
-/// The **+** chip (the canvas's zoom-in button is a "+" too, but no
-/// toggle).
+/// The **+** chip's accessible name (it shows "+").
+const NEW_COMPOSITE: &str = "New composite";
+
+/// The **+** chip.
 fn plus_chip<'h>(h: &'h Harness<'static, State>) -> Option<egui_kittest::Node<'h>> {
-    h.query(By::new().label("+").predicate(|n| n.toggled().is_some()))
+    h.query(By::new().role(Role::Button).label(NEW_COMPOSITE))
+}
+
+/// Whether the **+** chip says its popover is open.
+fn plus_expanded(h: &Harness<'static, State>) -> Option<bool> {
+    plus_chip(h)
+        .expect("a + chip")
+        .accesskit_node()
+        .data()
+        .is_expanded()
 }
 
 fn disabled(h: &Harness<'static, State>, label: &str) -> bool {
@@ -450,12 +461,14 @@ fn three_groups_two_composites(s: &mut OpenSession) {
 }
 
 /// The view bar's controls in a canvas `canvas_w` wide: Plan / Mosaic, a
-/// chip per group and composite, +, and the four toggles (the only toggle
-/// buttons in the window), each with its rect. Asserts none overlaps
-/// another, the canvas or the inspector.
+/// chip per group and composite and the four toggles (the only toggle
+/// buttons in the window), then + (a menu button, "New composite"), each
+/// with its rect. Asserts none overlaps another, the canvas or the
+/// inspector.
 fn bar_controls(h: &Harness<'_, State>, canvas_w: f32) -> Vec<(String, egui::Rect)> {
     let controls: Vec<(String, egui::Rect)> = h
         .query_all(By::new().predicate(|n| n.toggled().is_some()))
+        .chain(h.query_all(By::new().role(Role::Button).label(NEW_COMPOSITE)))
         .map(|n| (n.accesskit_node().label().unwrap_or_default(), n.rect()))
         .collect();
     let (canvas, _) = h.state().w.plan().canvas_frame().expect("the plan drawn");
@@ -1133,8 +1146,50 @@ fn no_chips_for_a_single_group() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The Composites list's row called `name` (the chips are called the same,
+/// but are no list items).
+fn comp_row<'h>(h: &'h Harness<'static, State>, name: &'h str) -> egui_kittest::Node<'h> {
+    h.get(By::new().role(Role::ListItem).label(name))
+}
+
+/// Hover the Composites row `name` so its actions show.
+fn hover_comp_row(h: &mut Harness<'static, State>, name: &str) {
+    let at = comp_row(h, name).rect().center();
+    h.hover_at(at);
+    h.run_steps(2);
+}
+
+/// The saved composites as (id, name, channel groups).
+fn saved_comps(h: &Harness<'static, State>) -> Vec<(u64, String, Vec<Option<String>>)> {
+    load_compositions(&h.state().session.mosaic.config.ui)
+        .into_iter()
+        .map(|c| {
+            let groups = c
+                .channels
+                .iter()
+                .map(|s| s.as_ref().map(|(g, _)| g.clone()));
+            (c.id, c.name, groups.collect())
+        })
+        .collect()
+}
+
+fn some(g: &str) -> Option<String> {
+    Some(g.to_string())
+}
+
+/// A button called `label` that is no toggle (the chips are called the
+/// same).
+fn button<'h>(h: &'h Harness<'static, State>, label: &'h str) -> egui_kittest::Node<'h> {
+    h.get(
+        By::new()
+            .role(Role::Button)
+            .label(label)
+            .predicate(|n| n.toggled().is_none()),
+    )
+}
+
 #[test]
-fn plus_adds_a_composite_and_opens_composites() {
+fn the_plus_popover_creates_a_preset() {
     let root = temp_dir("window-plus");
     let s = two_group_session(&root);
     let dir = s.mosaic.dir.clone();
@@ -1142,23 +1197,422 @@ fn plus_adds_a_composite_and_opens_composites() {
     step_until(&mut h, |st| st.w.view().is_some());
     assert!(!h.state().w.inspector().is_open("composites"));
     plus_chip(&h).expect("a + chip").click();
-    h.run_steps(2);
+    h.run_steps(3);
+    // Only what Ha and OIII allow, then Custom.
+    button(&h, "HOO");
+    for absent in ["RGB", "SHO", "HSO"] {
+        assert!(
+            h.query(By::new().role(Role::Button).label(absent))
+                .is_none(),
+            "{absent}"
+        );
+    }
+    h.get_by_label("Custom");
+    assert!(saved_comps(&h).is_empty(), "opening the popover makes none");
+    button(&h, "HOO").click();
+    h.run_steps(3);
+    let hoo = vec![some("Ha"), some("OIII"), some("OIII")];
+    assert_eq!(saved_comps(&h), [(1, "HOO".to_string(), hoo)]);
     let st = h.state();
-    let list = load_compositions(&st.session.mosaic.config.ui);
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0].name, "Composite 1");
-    let comp = Some(ViewKind::Composition(0));
+    let comp = Some(ViewKind::Composition(1));
     assert_eq!(st.w.view(), comp.as_ref());
     assert_eq!(st.w.plan().view(), comp.as_ref());
     assert_eq!(st.w.mosaic().view(), comp.as_ref());
     assert!(st.w.inspector().is_open("composites"));
-    // Its chip, and its editor in the Composites section.
-    h.get_by_label("Composite 1");
-    h.get_by_label("Delete composite");
+    // The popover closed; the chip and the selected row are there.
+    assert!(h.query_by_label("Custom").is_none());
+    assert!(
+        comp_row(&h, "HOO")
+            .accesskit_node()
+            .is_selected()
+            .unwrap_or(false)
+    );
+    // Again: a unique name.
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    button(&h, "HOO").click();
+    h.run_steps(3);
+    let names: Vec<(u64, String)> = saved_comps(&h).into_iter().map(|c| (c.0, c.1)).collect();
+    assert_eq!(names, [(1, "HOO".into()), (2, "HOO 2".into())]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
     // Saved.
     step_until(&mut h, |_| {
-        MosaicConfig::load(&dir).is_ok_and(|c| load_compositions(&c.ui).len() == 1)
+        MosaicConfig::load(&dir).is_ok_and(|c| load_compositions(&c.ui).len() == 2)
     });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_custom_form_creates_a_composite() {
+    let root = temp_dir("window-custom");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    // Nothing named, nothing mapped: Create is off.
+    assert!(button(&h, "Create").accesskit_node().is_disabled());
+    h.get_by_role_and_label(Role::TextInput, "Name").focus();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Mine");
+    h.run_steps(2);
+    assert!(
+        button(&h, "Create").accesskit_node().is_disabled(),
+        "named, but nothing mapped"
+    );
+    // R from OIII.
+    button(&h, "R: None").click();
+    h.run_steps(3);
+    h.get_by_label("OIII").click();
+    h.run_steps(3);
+    assert!(!button(&h, "Create").accesskit_node().is_disabled());
+    button(&h, "Create").click();
+    h.run_steps(3);
+    assert_eq!(
+        saved_comps(&h),
+        [(1, "Mine".to_string(), vec![some("OIII"), None, None])]
+    );
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(1)));
+    assert!(h.state().w.inspector().is_open("composites"));
+    assert!(h.query_by_label("Custom").is_none(), "the popover closed");
+    // A taken name cannot be created again.
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "Name").focus();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Mine");
+    h.run_steps(2);
+    button(&h, "R: None").click();
+    h.run_steps(3);
+    h.get_by_label("Ha").click();
+    h.run_steps(3);
+    assert!(
+        button(&h, "Create").accesskit_node().is_disabled(),
+        "the name is taken"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The label of the widget with the keyboard focus.
+fn focused_label(h: &Harness<'static, State>) -> Option<String> {
+    h.query(By::new().predicate(|n| n.is_focused()))
+        .and_then(|n| n.accesskit_node().label())
+}
+
+/// Press Tab until the focus is on `label` (bounded).
+fn tab_to(h: &mut Harness<'static, State>, label: &str) {
+    for _ in 0..30 {
+        if focused_label(h).as_deref() == Some(label) {
+            return;
+        }
+        h.key_press(egui::Key::Tab);
+        h.run_steps(2);
+    }
+    panic!(
+        "Tab never reached {label:?}; focus is on {:?}",
+        focused_label(h)
+    );
+}
+
+/// Focus the + chip and open its popover with `key`.
+fn open_plus_by_keyboard(h: &mut Harness<'static, State>, key: egui::Key) {
+    plus_chip(h).expect("a + chip").focus();
+    h.run_steps(2);
+    h.key_press(key);
+    h.run_steps(3);
+    h.get_by_label("Custom");
+}
+
+#[test]
+fn the_plus_popover_works_from_the_keyboard() {
+    let root = temp_dir("window-plus-keys");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    // The chip shows "+" and is named for what it does, its popover shut.
+    assert_eq!(plus_expanded(&h), Some(false));
+    // Enter opens it and the focus lands on the first preset; Enter makes it.
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    assert_eq!(plus_expanded(&h), Some(true), "it says it is open");
+    assert_eq!(focused_label(&h).as_deref(), Some("HOO"));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(saved_comps(&h).len(), 1);
+    assert_eq!(saved_comps(&h)[0].1, "HOO");
+    assert!(h.query_by_label("Custom").is_none(), "the popover closed");
+    assert_eq!(plus_expanded(&h), Some(false));
+    // The focus is back on the + chip; Space opens it again, Escape closes
+    // it and the focus is back again.
+    assert_eq!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    h.get_by_label("Custom");
+    assert_eq!(plus_expanded(&h), Some(true));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.query_by_label("Custom").is_none());
+    assert_eq!(plus_expanded(&h), Some(false));
+    assert_eq!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
+    assert_eq!(saved_comps(&h).len(), 1, "Escape makes nothing");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_click_elsewhere_keeps_the_focus_it_gave() {
+    let root = temp_dir("window-plus-click");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.state_mut().w.inspector_mut().reveal(MERGE_SETTINGS);
+    h.run_steps(3);
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    h.get_by_label("Custom");
+    // Clicking into the feather field closes the popover (a click outside)
+    // and leaves the focus where the click put it.
+    h.get_by_role_and_label(Role::TextInput, "Feather (px)")
+        .click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Custom").is_none(), "the popover closed");
+    let field = h.get_by_role_and_label(Role::TextInput, "Feather (px)");
+    assert!(field.is_focused(), "focus on the feather field");
+    assert_ne!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_custom_form_works_from_the_keyboard() {
+    let root = temp_dir("window-custom-keys");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    // Why Create is off shows without hovering.
+    h.get_by_label("Give it a name.");
+    // The name.
+    tab_to(&mut h, "Name");
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Keys");
+    h.run_steps(2);
+    h.get_by_label("Map at least one channel.");
+    // R from OIII, by keyboard; the toggle says it is open, and the pick
+    // collapses the in-place list.
+    tab_to(&mut h, "R: None");
+    assert_eq!(
+        button(&h, "R: None").accesskit_node().data().is_expanded(),
+        Some(false)
+    );
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(
+        button(&h, "R: None").accesskit_node().data().is_expanded(),
+        Some(true)
+    );
+    tab_to(&mut h, "OIII");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(
+        h.query(By::new().role(Role::Button).label("OIII"))
+            .is_none(),
+        "the submenu closed on the pick"
+    );
+    assert_eq!(
+        button(&h, "R: OIII").accesskit_node().data().is_expanded(),
+        Some(false)
+    );
+    // Create, by keyboard.
+    tab_to(&mut h, "Create");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(
+        saved_comps(&h),
+        [(1, "Keys".to_string(), vec![some("OIII"), None, None])]
+    );
+    assert!(h.query_by_label("Custom").is_none());
+    assert_eq!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
+    // A draft left open is dropped: close with Escape, reopen, it is empty.
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    tab_to(&mut h, "Name");
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Draft");
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    h.get_by_label("Give it a name.");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A composite mapping `group` to R.
+fn comp_of(id: u64, name: &str, group: &str) -> Composition {
+    let mut c = Composition::new(name);
+    c.id = id;
+    c.channels[0] = Some((group.into(), 1.0));
+    c
+}
+
+#[test]
+fn composites_rename_reorder_and_delete_with_undo() {
+    let root = temp_dir("window-comp-list");
+    let mut s = two_group_session(&root);
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[
+            comp_of(1, "A", "Ha"),
+            comp_of(2, "B", "OIII"),
+            comp_of(3, "C", "Ha"),
+        ],
+    );
+    let mut state = State::new(s, runner());
+    state.w.inspector_mut().reveal(COMPOSITES);
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(3);
+    let selected = |h: &Harness<'static, State>, name: &str| {
+        comp_row(h, name)
+            .accesskit_node()
+            .is_selected()
+            .unwrap_or(false)
+    };
+    // Clicking a row shows that composite, and opens its channel editor.
+    comp_row(&h, "B").click();
+    h.run_steps(3);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    assert!(selected(&h, "B"));
+    assert_eq!(h.get_all_by_role(Role::ComboBox).count(), 3, "R, G and B");
+    assert!(h.query_by_label("Weight").is_none());
+    // Reorder: B up. The order is saved, the view stays on B (its id).
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Move B up").click();
+    h.run_steps(3);
+    let order = |h: &Harness<'static, State>| -> Vec<String> {
+        saved_comps(h).into_iter().map(|c| c.1).collect()
+    };
+    assert_eq!(order(&h), ["B", "A", "C"]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    // Rename: the id, and so the view, stay.
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Rename B").click();
+    h.run_steps(3);
+    h.get_by_role(Role::TextInput).type_text("Blue");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(order(&h), ["Blue", "A", "C"]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    let key = h.state().w.view_key(&h.state().session.mosaic.config.ui);
+    assert_eq!(key.as_deref(), Some("comp:2"));
+    // A name another composite has is refused, with a toast.
+    hover_comp_row(&mut h, "A");
+    h.get_by_label("Rename A").click();
+    h.run_steps(3);
+    h.get_by_role(Role::TextInput).type_text("C");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(order(&h), ["Blue", "A", "C"]);
+    assert!(
+        !std::mem::take(&mut h.state_mut().toasts).is_empty(),
+        "the refusal is a toast"
+    );
+    // Channel editor (Blue is selected): G from Ha.
+    h.get_all_by_role(Role::ComboBox).nth(1).unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Ha").click();
+    h.run_steps(3);
+    assert_eq!(
+        saved_comps(&h).remove(0).2,
+        vec![some("OIII"), some("Ha"), None]
+    );
+    // Delete the highest id (C): a toast with Undo, and a new composite
+    // does not take C's id.
+    hover_comp_row(&mut h, "C");
+    h.get_by_label("Delete C").click();
+    h.run_steps(3);
+    assert_eq!(order(&h), ["Blue", "A"]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    let toasts = std::mem::take(&mut h.state_mut().toasts);
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert_eq!(toasts[0].toast.title, "C deleted");
+    assert_eq!(toasts[0].toast.action.as_deref(), Some("Undo"));
+    let Some(undo @ Undo::CompositeDelete { .. }) = toasts.into_iter().next().and_then(|t| t.undo)
+    else {
+        panic!("a composite undo");
+    };
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    button(&h, "HOO").click();
+    h.run_steps(3);
+    let fresh = saved_comps(&h).pop().unwrap();
+    assert_eq!((fresh.0, fresh.1.as_str()), (4, "HOO"));
+    // Undo puts C back at its place with its id.
+    {
+        let st = h.state_mut();
+        st.w.undo(undo, &mut st.session, &mut st.jobs);
+    }
+    h.run_steps(3);
+    let all: Vec<(u64, String)> = saved_comps(&h).into_iter().map(|c| (c.0, c.1)).collect();
+    assert_eq!(
+        all,
+        [
+            (2, "Blue".into()),
+            (1, "A".into()),
+            (3, "C".into()),
+            (4, "HOO".into())
+        ]
+    );
+    // Delete the shown one: the first group shows.
+    h.state_mut().w.select_view(ViewKind::Composition(2));
+    h.run_steps(3);
+    hover_comp_row(&mut h, "Blue");
+    h.get_by_label("Delete Blue").click();
+    h.run_steps(3);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Group("Ha".into())));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_composite_with_a_missing_group_says_so() {
+    let root = temp_dir("window-comp-missing");
+    let mut s = two_group_session(&root);
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[comp_of(1, "Gone", "SII"), comp_of(2, "Fine", "Ha")],
+    );
+    let mut state = State::new(s, runner());
+    state.w.inspector_mut().reveal(COMPOSITES);
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(3);
+    let detail = |h: &Harness<'static, State>, name: &str| {
+        comp_row(h, name)
+            .accesskit_node()
+            .description()
+            .unwrap_or_default()
+    };
+    assert_eq!(detail(&h, "Gone"), "missing group SII");
+    assert_eq!(detail(&h, "Fine"), "R Ha · G None · B None");
+    // The mapping is kept, and the editor shows the group as missing.
+    comp_row(&h, "Gone").click();
+    h.run_steps(3);
+    let r = h
+        .get_all_by_role(Role::ComboBox)
+        .next()
+        .expect("R's editor");
+    assert_eq!(r.accesskit_node().value().as_deref(), Some("SII (missing)"));
+    assert_eq!(saved_comps(&h)[0].2, vec![some("SII"), None, None]);
+    // The group comes back (named SII by hand): nothing is missing.
+    {
+        let st = h.state_mut();
+        for p in &mut st.session.mosaic.config.panels[6..] {
+            p.manual_group = Some("SII".into());
+        }
+        st.session.groups = st.session.mosaic.groups().ok();
+    }
+    h.run_steps(3);
+    assert_eq!(detail(&h, "Gone"), "R SII · G None · B None");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1173,14 +1627,12 @@ fn deleting_a_composite_keeps_the_view() {
     save_compositions(&mut s.mosaic.config.ui, &[a, b]);
     let mut h = harness(State::new(s, runner()));
     step_until(&mut h, |st| st.w.view().is_some());
-    h.state_mut().w.select_view(ViewKind::Composition(1));
+    h.state_mut().w.select_view(ViewKind::Composition(2));
     h.state_mut().w.inspector_mut().reveal("composites");
     h.run_steps(2);
-    // A goes: B, shown, moves up the list and stays shown.
-    h.get_all_by_label("Delete composite")
-        .next()
-        .expect("A's delete")
-        .click();
+    // A goes: B, shown, stays shown.
+    hover_comp_row(&mut h, "A");
+    h.get_by_label("Delete A").click();
     h.run_steps(2);
     let st = h.state();
     let names: Vec<String> = load_compositions(&st.session.mosaic.config.ui)
@@ -1188,16 +1640,123 @@ fn deleting_a_composite_keeps_the_view() {
         .map(|c| c.name)
         .collect();
     assert_eq!(names, ["B"]);
-    let b = Some(ViewKind::Composition(0));
+    let b = Some(ViewKind::Composition(2));
     assert_eq!(st.w.view(), b.as_ref());
     assert_eq!(st.w.plan().view(), b.as_ref());
     assert_eq!(st.w.mosaic().view(), b.as_ref());
     // B goes too: the first group shows.
-    h.get_by_label("Delete composite").click();
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Delete B").click();
     h.run_steps(2);
     let ha = Some(ViewKind::Group("Ha".into()));
     assert_eq!(h.state().w.view(), ha.as_ref());
     assert_eq!(h.state().w.plan().view(), ha.as_ref());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn old_composites_get_ids_and_keep_their_view() {
+    use crate::stretch_panel::{PLAN_STRETCH_KEY, save_stretch_at, saved_stretch_at};
+    use mmm_core::stretch::StretchParams;
+
+    let root = temp_dir("window-old-composites");
+    let mut s = two_group_session(&root);
+    // What an earlier mmm saved: composites without ids, the shown view and
+    // a plan stretch keyed by the composite's name.
+    s.mosaic.config.ui = serde_json::json!({ "compositions": [
+        { "name": "A", "channels": [["Ha", 1.0], null, null] },
+        { "name": "B", "channels": [null, ["OIII", 1.0], null] },
+    ]});
+    let stretch = [StretchParams {
+        black: 0.1,
+        white: 0.9,
+        midtones: 0.3,
+    }; 3];
+    save_stretch_at(
+        &mut s.mosaic.config.ui,
+        PLAN_STRETCH_KEY,
+        "comp:B",
+        Some(&stretch),
+    );
+    let saved = view_state::ViewState {
+        view: Some("comp:B".into()),
+        ..Default::default()
+    };
+    saved.save(&mut s.mosaic.config.ui);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(2);
+    let st = h.state();
+    let list = load_compositions(&st.session.mosaic.config.ui);
+    let ids: Vec<u64> = list.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [1, 2], "fresh ids, in order");
+    // It opens on B, with B's stretch, now under B's id.
+    let b = Some(ViewKind::Composition(2));
+    assert_eq!(st.w.view(), b.as_ref());
+    assert_eq!(st.w.plan().view(), b.as_ref());
+    let ui = &st.session.mosaic.config.ui;
+    assert_eq!(st.w.view_key(ui).as_deref(), Some("comp:2"));
+    assert_eq!(
+        saved_stretch_at(ui, PLAN_STRETCH_KEY, "comp:2").as_deref(),
+        Some(&stretch[..])
+    );
+    assert!(saved_stretch_at(ui, PLAN_STRETCH_KEY, "comp:B").is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn views_follow_a_composite_by_id_across_reorder_and_delete() {
+    let root = temp_dir("window-composite-ids");
+    let mut s = two_group_session(&root);
+    let mk = |name: &str, g: &str| {
+        let mut c = Composition::new(name);
+        c.channels[0] = Some((g.into(), 1.0));
+        c
+    };
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[mk("A", "Ha"), mk("B", "OIII"), mk("C", "Ha")],
+    );
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    let list = load_compositions(&h.state().session.mosaic.config.ui);
+    let id = |name: &str| list.iter().find(|c| c.name == name).unwrap().id;
+    let (a, b, c) = (id("A"), id("B"), id("C"));
+    assert!(a != b && b != c && a != c);
+    h.state_mut().w.select_view(ViewKind::Composition(b));
+    h.state_mut().w.inspector_mut().reveal("composites");
+    h.run_steps(2);
+    // Reordered: B is still the one shown.
+    let mut reordered = load_compositions(&h.state().session.mosaic.config.ui);
+    reordered.reverse();
+    save_compositions(&mut h.state_mut().session.mosaic.config.ui, &reordered);
+    h.run_steps(2);
+    let shown = Some(ViewKind::Composition(b));
+    assert_eq!(h.state().w.view(), shown.as_ref());
+    assert_eq!(h.state().w.plan().view(), shown.as_ref());
+    assert_eq!(h.state().w.mosaic().view(), shown.as_ref());
+    let key = h.state().w.view_key(&h.state().session.mosaic.config.ui);
+    assert_eq!(key, Some(format!("comp:{b}")));
+    // The editors now run C, B, A. C goes: B stays shown.
+    hover_comp_row(&mut h, "C");
+    h.get_by_label("Delete C").click();
+    h.run_steps(2);
+    let names: Vec<String> = load_compositions(&h.state().session.mosaic.config.ui)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["B", "A"]);
+    assert_eq!(h.state().w.view(), shown.as_ref());
+    // B goes: the first group shows; A keeps its id.
+    h.run_steps(2);
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Delete B").click();
+    h.run_steps(2);
+    let ha = Some(ViewKind::Group("Ha".into()));
+    assert_eq!(h.state().w.view(), ha.as_ref());
+    let left = load_compositions(&h.state().session.mosaic.config.ui);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, a);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1990,18 +2549,21 @@ fn analyse_step_restarts_a_stalled_analysis() {
     step_until(&mut h, |st| !st.jobs.busy());
     h.run_steps(2);
     assert_eq!(shown_steps(h.state())[1], strip("Analyse", StepState::Next));
-    assert!(
-        h.state().w.mosaic().can_open_export(),
-        "no analysis tracked"
+    let export_block = |st: &State| st.w.export_block_reason(&st.session, &st.jobs);
+    assert_eq!(
+        export_block(h.state()),
+        Some("Nothing is merged yet."),
+        "no analysis running"
     );
     // Pressed: it starts, and the mosaic tracks it.
     let again = h.state_mut().jobs.hold();
     h.get_by_label("Analyse").click();
     h.run_steps(2);
     assert!(h.state().jobs.analyzing());
-    assert!(
-        !h.state().w.mosaic().can_open_export(),
-        "the analysis is tracked"
+    assert_eq!(
+        export_block(h.state()),
+        Some("Waiting for the analysis to finish."),
+        "the analysis runs"
     );
     again.open();
     step_until(&mut h, |st| {
@@ -2102,13 +2664,12 @@ fn no_user_visible_blend_wording() {
     );
 
     // The export dialog.
-    let State { w, session, .. } = h.state_mut();
-    w.mosaic.open_export(session);
+    let State {
+        w, session, jobs, ..
+    } = h.state_mut();
+    w.open_export(session, jobs);
     h.run_steps(4);
-    assert!(
-        !h.state().w.mosaic().can_open_export(),
-        "the dialog is open"
-    );
+    assert!(h.state().w.export_open(), "the dialog is open");
     assert_no_blend(&h, "export dialog");
 
     // The plan.
@@ -2382,10 +2943,13 @@ fn shortcuts_ignored_in_the_export_dialog() {
     use egui::Key;
     let (root, s, jobs) = merged("window-export-keys");
     let mut h = harness(State::new(s, jobs));
-    step_until(&mut h, |st| st.w.mosaic().can_open_export());
-    let State { w, session, .. } = h.state_mut();
-    w.mosaic.open_export(session);
+    step_until(&mut h, |st| st.w.view().is_some());
+    let State {
+        w, session, jobs, ..
+    } = h.state_mut();
+    w.open_export(session, jobs);
     h.run_steps(2);
+    assert!(h.state().w.export_open());
     h.key_press(Key::O);
     h.key_press(Key::M);
     h.run_steps(2);
@@ -2643,7 +3207,8 @@ fn steps_that_cannot_act_say_why() {
     let (root, s, jobs) = merged("window-why-not");
     let mut h = harness(State::new(s, jobs));
     step_until(&mut h, |st| {
-        st.w.mosaic().can_open_export() && st.w.mosaic().viewer_frame().is_some()
+        st.w.export_block_reason(&st.session, &st.jobs).is_none()
+            && st.w.mosaic().viewer_frame().is_some()
     });
     // An analysis running (held): nothing merges or exports until it ends.
     let gate = h.state_mut().jobs.hold();
@@ -2667,7 +3232,7 @@ fn steps_that_cannot_act_say_why() {
     h.get_by_label("Export").click();
     h.run_steps(2);
     assert_eq!(labels(&h.state().jobs).len(), 1, "the analysis only");
-    assert!(!h.state().w.mosaic().export_open());
+    assert!(!h.state().w.export_open());
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
     drop(h);
@@ -2687,7 +3252,7 @@ fn a_composite_with_an_unmerged_member_keeps_the_canvas_in_place() {
     save_compositions(&mut s.mosaic.config.ui, &[comp]);
     let mut state = State::new(s, jobs);
     state.w.set_mode(CanvasMode::Plan);
-    state.w.select_view(ViewKind::Composition(0));
+    state.w.select_view(ViewKind::Composition(1));
     let mut h = harness(state);
     step_until(&mut h, |st| {
         plan_placed(st) && st.w.mosaic().source().is_some()
@@ -2753,7 +3318,8 @@ fn a_one_group_merge_names_no_group() {
     // One export: "Exporting", no "1 of 1"; the job is "Export".
     let gate = jobs.hold();
     let out = root.join("one.fits");
-    let id = jobs.start_export(&s, SINGLE_GROUP, out, crate::export::ExportFormat::Fits);
+    let target = ExportTarget::Group(SINGLE_GROUP.into());
+    let id = jobs.start_export(&s, target, out, mmm_core::export::ExportFormat::Fits, false);
     assert_eq!(jobs.label(id), Some("Export"));
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     assert_eq!(got[3].label, "Exporting");
@@ -2775,11 +3341,12 @@ fn a_merge_waits_behind_an_export() {
     let (root, mut s, mut jobs) = analyzed("steps-merge-after-export");
     jobs.start_blend(&mut s, "Ha", None);
     let _ = drain(&mut jobs, &mut s);
-    // An export runs (held); a merge is pressed meanwhile.
-    let gate = jobs.hold();
+    // An export of Ha runs (held); a merge of Ha is pressed meanwhile.
+    let gate = jobs.hold_exports();
     let out = root.join("ha.fits");
-    let export = jobs.start_export(&s, "Ha", out, crate::export::ExportFormat::Fits);
-    let merge = jobs.start_blend(&mut s, "OIII", None);
+    let ha = ExportTarget::Group("Ha".into());
+    let export = jobs.start_export(&s, ha, out, mmm_core::export::ExportFormat::Fits, false);
+    let merge = jobs.start_blend(&mut s, "Ha", None);
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     let want = StripStep {
         label: "Merge queued after export".into(),
@@ -2794,16 +3361,140 @@ fn a_merge_waits_behind_an_export() {
     assert!(events.contains(&JobEvent::Cancelled { id: merge }));
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     assert_ne!(got[MERGE_STEP].label, "Merge queued after export");
-    // Queued again, it runs once the export has ended.
-    let merge = jobs.start_blend(&mut s, "OIII", None);
+    // A merge of another group runs beside the export, and the step shows
+    // it (with Ha's merge queued again behind the export).
+    let held = jobs.hold();
+    let oiii = jobs.start_blend(&mut s, "OIII", None);
+    let merge = jobs.start_blend(&mut s, "Ha", None);
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    assert_eq!(got[MERGE_STEP].label, "Merging OIII · 1 of 2 · 0 %");
+    // Ha's merge runs once the export has ended.
+    held.open();
     gate.open();
     let events = drain(&mut jobs, &mut s);
     let finished = |id: u64| {
         events
             .iter()
-            .any(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id))
+            .position(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id))
     };
-    assert!(finished(export) && finished(merge), "{events:?}");
+    let (export, merge) = (finished(export), finished(merge));
+    assert!(finished(oiii).is_some(), "{events:?}");
+    assert!(export.is_some() && merge > export, "{events:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_analysis_waits_behind_an_export() {
+    use crate::jobs::JobEvent;
+    let (root, mut s, mut jobs) = analyzed("steps-analysis-after-export");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    // An export of Ha runs (held); an analysis is asked for meanwhile.
+    let gate = jobs.hold_exports();
+    let out = root.join("ha.fits");
+    let ha = ExportTarget::Group("Ha".into());
+    let fits = mmm_core::export::ExportFormat::Fits;
+    let export = jobs.start_export(&s, ha, out.clone(), fits, false);
+    let analysis = jobs.start_analyze(&mut s);
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    let want = StripStep {
+        label: "Analysis queued after export".into(),
+        state: StepState::Working { fraction: None },
+        cancellable: true,
+        tooltip: None,
+    };
+    assert_eq!(got[CHECKS_STEP], want);
+    // The Export dialog says why it waits: the analysis isn't running yet.
+    let w = SessionWindow::new(Arc::new(AskedFiles::default()));
+    assert_eq!(
+        w.export_block_reason(&s, &jobs),
+        Some(crate::export_dialog::ANALYSIS_QUEUED)
+    );
+    // Cancel from the step drops the queued analysis and spares the export.
+    super::top_bar::cancel_step(CHECKS_STEP, &mut jobs);
+    let events = jobs.poll(&mut s);
+    assert!(events.contains(&JobEvent::Cancelled { id: analysis }));
+    assert!(!events.contains(&JobEvent::Cancelled { id: export }));
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    assert_ne!(got[CHECKS_STEP].label, "Analysis queued after export");
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    assert!(
+        events.contains(&JobEvent::Finished {
+            id: export,
+            label: "Export Ha".into()
+        }),
+        "{events:?}"
+    );
+    assert!(out.is_file());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_export_step_says_exported() {
+    use crate::session::Stamps;
+    let (root, mut s, mut jobs) = analyzed("steps-exported");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.results = classify_results(&s);
+    let export = |s: &OpenSession, jobs: &JobRunner| {
+        steps(s, jobs, &Pipeline::new(), &ChecksEngine::new())[EXPORT_STEP].clone()
+    };
+    let stamp = |blended_at, exported_at| Stamps {
+        blended_at,
+        exported_at,
+    };
+    let todo = strip("Export", StepState::Todo);
+    let exported = strip("Exported", StepState::Done);
+    // Ha is merged and never exported (OIII, not merged, is not ready).
+    s.stamps.insert("Ha".into(), stamp(Some(100), None));
+    assert_eq!(export(&s, &jobs), todo);
+    // Exported since its merge.
+    s.stamps.insert("Ha".into(), stamp(Some(100), Some(100)));
+    assert_eq!(export(&s, &jobs), exported);
+    // Merged again since.
+    s.stamps.insert("Ha".into(), stamp(Some(200), Some(100)));
+    assert_eq!(export(&s, &jobs), todo);
+    s.stamps.insert("Ha".into(), stamp(Some(200), Some(300)));
+    assert_eq!(export(&s, &jobs), exported);
+    // Every group ready must have been exported: OIII merged, not yet.
+    jobs.start_blend(&mut s, "OIII", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.results = classify_results(&s);
+    s.stamps.insert("OIII".into(), stamp(Some(400), None));
+    assert_eq!(export(&s, &jobs), todo);
+    s.stamps.insert("OIII".into(), stamp(Some(400), Some(500)));
+    assert_eq!(export(&s, &jobs), exported);
+    // While exports run, the step says so, and its Cancel cancels them all
+    // (a composite's too).
+    let gate = jobs.hold();
+    let fits = mmm_core::export::ExportFormat::Fits;
+    let ha = ExportTarget::Group("Ha".into());
+    let first = jobs.start_export(&s, ha, root.join("ha.fits"), fits, false);
+    let hoo = ExportTarget::Composite {
+        id: 1,
+        name: "HOO".into(),
+        channels: [Some("Ha".into()), Some("OIII".into()), Some("OIII".into())],
+    };
+    let second = jobs.start_export(&s, hoo, root.join("hoo.fits"), fits, false);
+    let got = export(&s, &jobs);
+    assert_eq!(
+        (got.label.as_str(), got.cancellable),
+        ("Exporting 1 of 2", true)
+    );
+    super::top_bar::cancel_step(EXPORT_STEP, &mut jobs);
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    for id in [first, second] {
+        assert!(events.contains(&JobEvent::Cancelled { id }), "{events:?}");
+    }
+    assert_eq!(export(&s, &jobs), exported);
+    // An out-of-date group is not ready, so it does not count; with none
+    // ready, nothing reads as exported.
+    mmm_core::mosaic::mark_needs_analyze(&mut s.mosaic, &["OIII".to_string()]).unwrap();
+    assert_eq!(export(&s, &jobs), exported, "Ha still is");
+    mmm_core::mosaic::mark_needs_analyze(&mut s.mosaic, &["Ha".to_string()]).unwrap();
+    assert_eq!(export(&s, &jobs), todo);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3133,7 +3824,7 @@ fn settings_changed_is_not_out_of_date() {
     assert!(draft_changed(&st.session, "Ha") && !out_of_date(&st.session, "Ha"));
     // The main button merges; export stays allowed.
     assert!(!rightmost_disabled(&h, "Merge"));
-    assert!(st.w.mosaic().export_block_reason().is_none());
+    assert!(st.w.export_block_reason(&st.session, &st.jobs).is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3775,4 +4466,5 @@ fn a_region_entry_with_other_settings_still_makes_the_group_out_of_date() {
 }
 
 mod compare;
+mod export;
 mod previews;

@@ -13,7 +13,7 @@ use mmm_core::session_summary::{ResultState, SessionSummary, read_summary};
 
 use super::RecentEntry;
 use crate::panel_edits::load_group_colors;
-use crate::session::{notes, session_name};
+use crate::session::{Stamps, notes, session_name};
 
 /// Whether a recent session can be used right now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,10 +80,7 @@ pub fn card_state(
             if groups.iter().any(|g| g.settings_changed) {
                 return CardState::SettingsChanged;
             }
-            let exported = groups.iter().all(|g| match (g.blended_at, g.exported_at) {
-                (Some(b), Some(e)) => e >= b,
-                _ => false,
-            });
+            let exported = groups.iter().all(|g| Stamps::of(g).exported());
             return if exported {
                 CardState::MergedExported
             } else {

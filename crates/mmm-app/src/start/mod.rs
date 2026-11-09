@@ -787,14 +787,7 @@ fn display_path(path: &Path) -> String {
 /// [`display_path`] with the home directory given: a `path` under `home`
 /// shows as `~` followed by the rest (in the platform's separator).
 fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
-    let s = path.display().to_string();
-    let plain = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{unc}")
-    } else if let Some(local) = s.strip_prefix(r"\\?\") {
-        local.to_string()
-    } else {
-        s
-    };
+    let plain = crate::util::plain_path(path);
     // A bare root as "home" would turn every path into `~...`.
     let Some(home) = home.filter(|h| h.components().count() > 1) else {
         return plain;

@@ -444,6 +444,8 @@ fn a_highlight_lights_its_panel_and_the_pointer_names_one() {
 #[test]
 fn composition_view_uses_additive_layers() {
     let (root, mut s, _r) = analyzed("plan-composition");
+    // B's weight, as an earlier build may have saved it, is not applied:
+    // every channel shows at full strength, as the export writes it.
     let mut hoo = Composition::new("HOO");
     hoo.channels = [
         Some(("Ha".into(), 1.0)),
@@ -463,7 +465,7 @@ fn composition_view_uses_additive_layers() {
     let mut h = harness(s);
     h.state_mut().previews = previews;
     h.state_mut().complete = true;
-    h.state_mut().view.select_view(ViewKind::Composition(0));
+    h.state_mut().view.select_view(ViewKind::Composition(1));
     step_until(&mut h, |s| s.view.is_settled());
     let items = h.state().view.items().to_vec();
     assert_eq!(items.len(), 8);
@@ -476,7 +478,7 @@ fn composition_view_uses_additive_layers() {
                 it.layers,
                 vec![
                     (Color32::from_rgb(0, 255, 0), true),
-                    (Color32::from_rgb(0, 0, 128), true),
+                    (Color32::from_rgb(0, 0, 255), true),
                 ]
             );
         }
@@ -501,7 +503,7 @@ fn composition_view_uses_additive_layers() {
     assert_eq!(labels, (1..=8).collect::<Vec<_>>());
     // A three-channel stretch, keyed apart from any group's.
     assert_eq!(h.state().view.stretch_for_view().map(<[_]>::len), Some(3));
-    assert_eq!(h.state().view.view_key(), Some("comp:HOO"));
+    assert_eq!(h.state().view.view_key(), Some("comp:1"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -529,9 +531,16 @@ fn copy_path_puts_path_on_clipboard() {
     let s = two_group_session(&root);
     let path = s.mosaic.config.panels[0].path.clone();
     let mut h = harness(s);
-    h.run();
+    // Background workers (previews) may keep asking for repaints, so step
+    // until what's needed is there rather than `run()` to idle.
+    h.run_steps(2);
     h.state_mut().view.select(Some(path.clone()));
-    h.run();
+    let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
+    while h.query_by_label("Copy path").is_none() {
+        assert!(std::time::Instant::now() < deadline, "no Copy path");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert_eq!(h.state().view.selected(), Some(path.as_path()));
     h.get_by_label("Copy path").click();
     let mut copied = Vec::new();
@@ -629,6 +638,7 @@ fn plan_places_solved_panels_before_previews() {
         summary: None,
         merged: false,
         results: Default::default(),
+        stamps: Default::default(),
     };
     let mut h = harness(s);
     // No previews, no analysis: dashed outlines at the WCS footprints.

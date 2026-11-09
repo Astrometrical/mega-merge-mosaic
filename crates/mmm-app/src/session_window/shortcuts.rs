@@ -11,14 +11,16 @@
 //! | `L` | **Linked** (not for a mono view) | the toggle |
 //! | `S` | **Strong** | the toggle |
 //! | `Ctrl+Enter` (`Cmd+Enter` on macOS) | **Merge**, while the main button offers it | the main button |
+//! | `Ctrl+E` (`Cmd+E` on macOS) | open the Export dialog, while it can open (something merged, no analysis running) | **Export…** |
 //! | `Delete` (and `Backspace` on macOS) | remove the selected panels (a toast offers Undo), while the panel list is open | the row menu's **Remove** |
 //! | `Esc` | clear the selection, in the panel list and on the plan | |
 //! | `Space`, held | comparing an ROI (spec §8.3): show the other side while held (Esc first if a control has the focus, as the toggle's tooltip says) | the **A** / **B** buttons |
 //!
 //! The letters, brackets, Delete and Space count with no modifier held. None
 //! acts while a text field has the keyboard (notes, names, a path) or the
-//! Export dialog is open (a Space held since before still ends its peek when
-//! let go: [`SessionWindow::follow_peek_key`]); a focused button or chip
+//! Export dialog is open, where Esc closes the dialog and nothing else (a
+//! Space held since before still ends its peek when let go:
+//! [`SessionWindow::follow_peek_key`]); a focused button or chip
 //! (keyboard navigation) does not stop them, except Space, which presses
 //! the focused control. The canvas always shows (the panel list sits beside
 //! it), so the canvas's own (`M`, the brackets and the toggles) act with
@@ -56,6 +58,8 @@ pub(super) const LINKED: Key = Key::L;
 pub(super) const STRONG: Key = Key::S;
 /// Merges, as the main button does.
 pub(super) const MERGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
+/// Opens the Export dialog, as **Export…** does.
+pub(super) const EXPORT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
 /// Removes the panels selected in the panel list.
 pub(super) const REMOVE: Key = Key::Delete;
 /// Removes them too on macOS, whose keyboards label Backspace "delete".
@@ -89,7 +93,7 @@ impl SessionWindow {
         jobs: &mut JobRunner,
         pipeline: &Pipeline,
     ) {
-        let typing = ctx.text_edit_focused() || self.mosaic.export_open();
+        let typing = ctx.text_edit_focused() || self.export.is_open();
         self.follow_peek_key(ctx, typing);
         if typing {
             return;
@@ -118,6 +122,9 @@ impl SessionWindow {
         }
         if ctx.input_mut(|i| i.consume_shortcut(&MERGE)) && self.can_merge(session, jobs) {
             self.merge(session, jobs);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&EXPORT)) {
+            self.open_export(session, jobs);
         }
         // As the segment: the plan always, the mosaic once it can show.
         if pressed(PLAN_MOSAIC) {
@@ -170,11 +177,11 @@ impl SessionWindow {
         if groups.len() < 2 {
             return;
         }
-        let composites = compositions_of(session).len();
+        let composites = compositions_of(session);
         let views: Vec<ViewKind> = groups
             .into_iter()
             .map(ViewKind::Group)
-            .chain((0..composites).map(ViewKind::Composition))
+            .chain(composites.iter().map(|c| ViewKind::Composition(c.id)))
             .collect();
         let at = self
             .view

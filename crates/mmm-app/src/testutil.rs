@@ -42,6 +42,7 @@ pub(crate) fn open(mosaic: mmm_core::mosaic::Mosaic) -> OpenSession {
         summary: None,
         merged: false,
         results: Default::default(),
+        stamps: Default::default(),
     }
 }
 

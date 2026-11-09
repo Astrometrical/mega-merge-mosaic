@@ -51,3 +51,8 @@ pub const HERO_CROSSFADE_S: f64 = 2.0;
 /// Hero slideshow: zoom factor the drift reaches over a view's time on
 /// screen.
 pub const KEN_BURNS_ZOOM: f64 = 1.08;
+
+/// Width of a modal dialog's body (the Export dialog).
+pub const DIALOG_WIDTH: f32 = 520.0;
+/// Alpha of the black backdrop behind a modal dialog.
+pub const DIALOG_BACKDROP_ALPHA: u8 = 150;

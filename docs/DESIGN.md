@@ -966,7 +966,9 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   win: a settings edit cancels and joins a running job before applying; an
   analysis cancels everything; a blend cancels (or replaces) only a running
   or queued blend of the same group, and blends of other groups queue and
-  run in order.
+  run in order. It has two lanes, one job running in each: analyses,
+  previews and merges share the main lane, and exports run on their own
+  (see "Exports have their own lane" below).
   Group resolution (reads panel headers) runs on a worker via
   `plan_analyze_with`. The `apply_*` saves of `mosaic.json` stay on the UI
   thread (small atomic write; the core requires apply on the owner thread).
@@ -1225,18 +1227,17 @@ views and export. No algorithm changed. Core additions are bookkeeping
   (`ImageDescription` carries the same provenance). It reads the tile store
   tile row by tile row without a writer lock; stale tiles are exported as
   they are, missing tiles as zeros. `export_check` counts stale and missing
-  level-0 tiles first and both frontends warn (the app offers *Merge whole
-  mosaic first* or *Export anyway*). The app's Export is disabled while a
-  blend of a chosen group is queued or running (the check maps the store the
-  blend may recreate); it takes the groups, destinations and format when
-  pressed (later edits in the dialog do not change that export) and lists
-  destinations that exist already, exporting over them only after an
-  explicit *Overwrite*. Output goes to `<out>.part` and is
+  level-0 tiles first; the CLI warns about them. The app does not: its
+  Export dialog offers only groups whose result is complete and up to date
+  ("Composites and the Export dialog (plan 5)" below). Output goes to
+  `<out>.part` and is
   renamed on success; failure or cancel leaves an existing destination
-  untouched. FITS uses the top-down WCS convention only. The TIFF writer
-  needs random access, so TIFF export stages a scratch file the size of the
-  image next to the output (about twice the disk, briefly); a cancelled TIFF
-  export finishes at disk speed before cleaning up. CLI: `mmm export`.
+  untouched (`OnExisting`, below, for what the app asks of a destination it
+  did not confirm). FITS uses the top-down WCS convention only. The TIFF
+  writer needs random access, so TIFF export stages a scratch file the size
+  of the image next to the output (about twice the disk, briefly); a
+  cancelled TIFF export finishes at disk speed before cleaning up. CLI:
+  `mmm export`.
   **XISF export is deferred**: formats live in mpp-core, which has no XISF
   writer yet; the spec's XISF export is missing in v1 until it gains one
   (and a streaming TIFF writer would remove the scratch file).
@@ -1270,7 +1271,9 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   Panels opens or closes the panel list, Checks opens the Problems section,
   Merge merges every group while that is to do (merging or merged, it shows
   the mosaic), Export opens the Export dialog. Checks reads "Checks" until
-  there is something to say, "Analysing…" while analysis runs (cancellable),
+  there is something to say, "Analysis queued after export" while an
+  analysis waits for the exports asked for before it (cancellable, no
+  fraction), "Analysing…" while analysis runs (cancellable),
   "Checking…", "{n} problem(s)" or "Checks passed", and **Analyse** only when
   the analysis stalled after a cancel or failure
   (`Pipeline::analysis_stalled`; clicking it analyses, whichever step is
@@ -1278,9 +1281,17 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   never restarts it); otherwise analysis starts by itself. Merging reads "Merging
   {group} · {i} of {n} · {pct} %", without "{i} of {n}" for a single merge and
   without the group in a session of one group (an OSC mosaic: "Merging · 43
-  %"; its jobs and toasts are "Merge" and "Merge finished"). A step that
+  %"; its jobs and toasts are "Merge" and "Merge finished"). Export reads
+  "Exporting {i} of {n}" while exports run or wait (cancellable: Cancel
+  cancels them all), **Exported** (done) when some group is ready to export
+  (complete and not `out_of_date`) and every ready group was exported, alone
+  or in a composite, since its last merge (`steps::exported`: the summary's
+  `exported_at >= blended_at`, the start screen's rule, `Stamps::exported`),
+  else "Export". Stamps are whole seconds, so a merge finishing in the
+  same second as an earlier export reads as exported (the start screen has
+  the same rule). A step that
   cannot act now says why in its tooltip (Merge: the merge guard's reason;
-  Export: `MosaicView::export_block_reason`). ROI previews are not jobs and
+  Export: `SessionWindow::export_block_reason`). ROI previews are not jobs and
   not shown in the strip.
 - **Merge states and predicates** (`steps.rs`). One set of predicates
   derives every place's Merge state. `out_of_date(session, group)`: the
@@ -1291,8 +1302,9 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   not out of date, but its last whole-canvas merge used different effective
   merge settings from the draft (`mmm_core::mosaic::settings_changed`, the
   draft with the group's override applied). The Merge step reads, in order:
-  "Merge queued after export" (a whole-canvas merge waiting behind a running
-  export; cancellable, no fraction), "Merging …" (above), "Merge" (no
+  "Merge queued after export" (a whole-canvas merge waiting for an export of
+  its group while no whole-canvas merge runs; cancellable, no fraction),
+  "Merging …" (above), "Merge" (no
   groups, analysis needed or running; or nothing ever merged, as the next
   step), "Out of date" (some group `out_of_date`; next), "Settings changed"
   (some group `draft_changed`; next) or "Merged" (done). The step strip, the
@@ -1423,10 +1435,31 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   cancels every non-export job (`JobRunner::cancel_for_panel_edit`,
   unaffected groups' merges included); a whole merge it stopped raises
   "Merge stopped: panels changed" once per edit.
-- **Merges behind exports.** The runner has a single slot, so every merge
-  waits behind a running export (not only a merge of the group being
-  exported); the strip says "Merge queued after export"
-  (`JobRunner::merge_waits_for_export`).
+- **Exports have their own lane** (`jobs.rs`). Exports run one at a time,
+  in order, on a lane of their own, beside the main lane's work. Only a
+  merge (whole canvas or a region) of a group being exported waits
+  (`JobRunner::exporting_groups`: the groups of the exports running or
+  queued, a composite's export counting each of its groups): it stays
+  queued while the jobs after it start, and the strip says "Merge queued
+  after export" (`JobRunner::merge_waits_for_export`). Merges of other
+  groups run during the export. The rule is a hard one: a merge rewrites
+  the store an export reads (torn tiles would be exported as zeros) and may
+  recreate it, which faults a live reader. For the same reason an export
+  waits for a running merge of a group it reads (a queued one never holds
+  it back). **An analysis never cancels an export** (final-review ruling):
+  analyses and exports take turns in the order they were asked for. An
+  analysis, the user's (the Checks step's **Analyse**) or the pipeline's,
+  waits until every export asked for before it has ended, and the Checks
+  step says "Analysis queued after export" (Working, no fraction,
+  cancellable; `JobRunner::analysis_waits_for_export`); an export waits for
+  a running analysis or one asked for before it, never for one asked for
+  after it. Every wait between the two points to an older job (job ids
+  only grow) and running jobs never wait, so nothing waits forever: the
+  argument is in `jobs.rs`'s module docs. The pipeline still starts its
+  automatic analysis only while neither lane runs anything. A panel edit spares exports. Leaving the session stops both lanes (or hands
+  both lanes' workers to the reaper, which keeps the lock until they end).
+  A composite's export is one job ("Export {composite name}"); when it
+  finishes it stamps `exported_at` for each of its groups.
 - **Display stretch** (`display_stretch.rs`). Always automatic, never set by
   hand, one rule for the plan and the mosaic: an automatic stretch per
   channel, with **Linked** (one stretch for all channels) and **Strong** (a
@@ -1444,13 +1477,15 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   back to the start screen).
 - **Shortcuts.** `I` inspector, `M` plan/mosaic, `[` and `]` previous and next
   view, `O` outlines, `R` ROIs, `L` Linked, `S` Strong, `Ctrl/Cmd+Enter` the
-  main button; each is named in its tooltip. `Delete` (also `Backspace` on
+  main button, `Ctrl/Cmd+E` the Export dialog (while it can open: something
+  merged, no analysis running); each is named in its tooltip. `Delete` (also `Backspace` on
   macOS) removes the panels selected in the open panel list, and `Esc`
   clears the selection (unless it closes a menu or leaves a text field: egui
   lets go of the field before the shortcuts run, so the window remembers
   whether one had the keyboard last frame). None acts while a text field
   has the keyboard (`Context::text_edit_focused`; a button or chip focused
-  by keyboard navigation does not stop them) or the Export dialog is open.
+  by keyboard navigation does not stop them) or the Export dialog is open
+  (then none acts, Ctrl+E included, and Esc closes only the dialog).
   `Space`, held while comparing an ROI, shows the other side (below), but
   only while no widget has the keyboard focus (a focused control keeps
   Space to press it; the A | B toggle's tooltip ends "Esc, then hold Space
@@ -1498,6 +1533,161 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   export that ended, a failure. Never modal. A toast whose Undo would
   change the session is taken down when the session closes or another
   opens (`Toasts::dismiss`).
+
+## Composites and the Export dialog (plan 5, 2026-11)
+
+Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
+(§12–§14); plan `docs/superpowers/plans/2026-11-09-composites-export.md`.
+
+- **Composite ids** (`compositions.rs`). A composite (`Composition`: `id`,
+  `name`, `channels`: a group and weight, or nothing, for each of R, G, B)
+  has a stable `id`, so renaming or reordering never orphans what is keyed
+  by it. Its keys are `comp:{id}` (`composition_stretch_key`: the plan
+  display stretch in `ui.plan_stretch`, the saved view in
+  `ui.session_view.view`, the plan's texture identity); `ViewKind::
+  Composition(id)` is the view. Ids are never reused: `ui.composition_next_id`
+  (`NEXT_ID_KEY`) is a counter that only moves up, so a new composite never
+  inherits a deleted one's saved stretch or view, and an Undo of a delete
+  whose id is taken gets a fresh id. Sessions saved with `comp:{name}` keys
+  are migrated once on opening (`migrate_composition_ids`: it runs only
+  while some saved composite lacks an id, `load_compositions` giving it the
+  next free one, and then moves the stretch and view keys; a key naming no
+  composite stays).
+- **Weights are always 1.** A channel stores a weight (`f32`), but earlier
+  builds' 0–2 slider is gone and the export ignores weights, so
+  `load_compositions` reads every weight as 1, the migration saves a list
+  holding another weight once (`migrate_composition_ids`, without moving any
+  key), `create_composition` and the channel editor write 1, and the view's
+  mix (`channel_tints`, the plan's composition layers) never applies a
+  weight: the view shows what is exported.
+- **Recognition and presets** (`bands.rs`). `recognise` names a group's
+  band (`Band`: R, G, B, Ha, SII, OIII) from its name alone (case, spaces,
+  hyphens, underscores and a bandwidth such as "7nm" do not matter: "Ha",
+  "H-alpha", "O3", "S-II", "Red"); the default FILTER grouping names groups
+  by their filter values, and the session has no header facts without I/O,
+  so a group named by hand is recognised by its name only. A band claimed by
+  two groups is ambiguous and offers nothing (no guessing). `presets_for`
+  offers `PRESETS` (RGB, SHO, HOO, HSO) whose every band is a distinct
+  group; a preset makes a composite named for it, each channel at weight 1.
+- **The + popover** (`session_window/canvas.rs`, `plus_popover`). The **+**
+  chip (with two or more groups) opens a popover: the presets the groups
+  allow, one click making one, then **Custom**: a name and a group, or
+  None, for each channel, and **Create**. It works from the keyboard (Enter
+  opens it, the focus lands on the first preset), and a click outside, such
+  as into a text field, closes it. The chip shows "+" and its hover text
+  says "New composite"; that is also its accessible name, and it reports
+  its popover's expanded state (a menu button, not a toggle), as the Custom
+  form's R/G/B buttons do.
+- **The composites list** (the inspector's Composites section,
+  `sections.rs`): the composites as an ordered list (pick, rename, reorder,
+  delete with Undo); the picked one shows its channel editor. An OSC member
+  contributes the **mean of its channels**, in the view and in the export
+  alike.
+- **Composite export** (`mmm_core::export::export_composite`,
+  `export_composite_with`, `CompositeChannels`). One three-channel file
+  (FITS or TIFF) covering the whole canvas: each distinct mapped group is
+  read once (HOO's OIII in green and blue opens two results), a mono group
+  fills its plane, an OSC group gives the mean of its channels, an unmapped
+  plane is zeros. WCS and pass-through cards come from the first mapped
+  group, less the cards that name a single panel's band: `FILTER`, and the
+  header key the grouping rule reads (`GroupRule::Header`), so an HOO file
+  never says `FILTER = 'Ha'`; the session-level cards stay, and the
+  `HISTORY` lines record which group each channel holds. A group's export
+  keeps them all. Counts are summed. It fails, writing nothing, for no mapped group,
+  a group never analysed or merged, a result that no longer matches the
+  canvas, or groups of different canvases. `OnExisting` says what an
+  existing destination means: `Replace` (the CLI's, and the default) or
+  `Keep`, which never replaces: the export fails if the destination exists
+  when it starts or by the time the file is complete, putting the new file
+  in place with a hard link; where hard links do not exist (FAT, some
+  network shares) the destination is looked for once more just before an
+  ordinary rename, so a file appearing in that instant could still be
+  replaced (documented, accepted). The app asks for `Replace` only for a
+  file the Export dialog showed as there and the user confirmed (**Overwrite
+  and export**); every other export is `Keep` ("{file} appeared meanwhile and
+  was not replaced"). Exports never replace a file the user did not confirm.
+- **The export lane** ("Exports have their own lane" above) holds one
+  export at a time; an export of a group, or of a composite (one job,
+  "Export {composite name}", counting each of its groups), is an
+  `ExportTarget`, started with `JobRunner::start_export`. What waits for
+  what: a merge of a group being exported waits ("Merge queued after
+  export"); merges of other groups run; an export waits for a running merge
+  of a group it reads and for an analysis running or asked for before it.
+  Every analysis, automatic or the user's, waits for the exports asked for
+  before it rather than cancelling them ("Analysis queued after export"),
+  so what is being written never changes. A finished export, group or
+  composite, stamps `exported_at` for each group it read (the summary is per
+  group).
+- **The Export dialog** (`export_dialog.rs`, the session's one modal, opened
+  by **Export…**, the Export step and `Ctrl/Cmd+E`; the module docs hold the
+  detail). It cannot open before anything is merged ("Nothing is merged
+  yet.") or while an analysis runs. Rows: every group, then every
+  composite, each ticked only while `readiness_of` says `Ready` and no merge
+  of its group runs or waits; otherwise it is greyed with its reason
+  (`Readiness::reason`: "not merged", "out of date", "maps no groups",
+  "missing group {g}", "merging…"), which is also its accessible
+  description. A group with only its settings changed is still ready. On
+  opening, every ready row is ticked except those the user unticked before
+  (`Choices::excluded`), so a group merged or a composite made since starts
+  ticked too (spec §14: the common case is one click). Then the folder
+  (typed, its surrounding spaces and one pair of surrounding double quotes
+  dropped, so Explorer's "Copy as path" `"C:\Astro"` pastes as it is; or **Browse…** through a
+  native dialog on a worker), the format (FITS or TIFF) and the file name
+  pattern: `{session}` and `{name}` (`file_names` makes names safe for any
+  file system, including Windows reserved device names; the default is
+  `{session}_{name}`). The preview lists the exact file names. Which exist
+  is looked up on a worker (it creates nothing in the folder: there is no
+  writability probe) and a file is marked "exists" when it is there or an
+  export running or queued (`JobRunner::export_destinations`) will write
+  it; the folder must be a full path and exist, and on Unix not be
+  read-only (Windows marks folders such as Documents read-only
+  meaninglessly, so there an unwritable folder is a failed job's toast).
+  Until the lookup answers, Export waits ("Checking the folder…") and the
+  previous marks stay, so nothing jumps. Two rows with the same name (ignoring
+  case) are marked "same name"; the message says to add `{name}` or, when
+  the pattern has it, to rename one. When files exist, a line says "{n} files
+  already exist and will be replaced" and Export becomes **Overwrite and
+  export**. The disabled Export's reason is its tooltip and shows in the
+  body. **Export** saves the choices under `ui.export` (`EXPORT_KEY`:
+  folder, format, pattern, and `excluded`, the rows unticked by hand as
+  `{group: name}` or `{composite: id}` entries, of those the session still
+  has; ticking a row again takes it out), starts one job per ticked row and
+  closes. A `selection` saved by earlier builds (the rows exported) is
+  ignored and goes with the next save: read as "everything else excluded"
+  it would leave out what was made since. **Cancel**, Esc and a click on
+  the backdrop close it, keeping nothing; closed from the keyboard, the
+  focus goes back to what opened it (`Dialog::close`). A failed export is a
+  toast, never a dialog message.
+- **The dialog frame** (`mega_ui::widgets::Dialog`, `dialog.rs`). A modal on
+  `egui::Modal`: a backdrop, a titled card (`DIALOG_WIDTH`), a body closure
+  and `DialogResponse { inner, close }` (Esc or a backdrop click). Keyboard
+  focus starts on the body's first control and Tab stays inside the dialog.
+  The widget that had the focus when it opened is remembered; the caller
+  calls `Dialog::close` in the pass it stops showing it, and when the dialog
+  closed from the keyboard (Esc, or a button pressed with Enter or Space)
+  the focus goes back to that widget, if it is still there. egui takes the
+  focus from a widget drawn behind the modal of the pass before, so a small
+  plugin (`ReturnFocus`) gives it at the end of the first pass without the
+  modal; the closing key therefore never presses the opener again. A pointer
+  click that closed it (a button, the backdrop) leaves the focus where the
+  click put it, as the **+** popover does. The modal's root (its area's
+  `Ui`, whose id is the dialog's) is a modal `Role::Dialog` node labelled by
+  the title, so a screen reader hears "Export, dialog".
+  `footer` and `footer_with` are the right-aligned button row (primary last);
+  `footer_with` takes `FooterButton { kind, label, disabled }`, a disabled
+  button saying why on hover. Modals are only for choosing, never for
+  reporting. The gallery shows one.
+- **Exported** (`OpenSession.stamps`, `session::Stamps`). Each group's
+  `blended_at` and `exported_at`, read from the summary when the session
+  opens and stamped as merges and exports finish, are what the Export step's
+  **Exported** and the start screen read (`Stamps::exported`: both stamped
+  and `exported_at >= blended_at`). Stamps are whole seconds, so a merge
+  finishing in the same second as an earlier export reads as exported.
+
+- **Selftest.** After visiting the views, `--selftest` starts an export of
+  the first group and of the first composition into a temporary folder
+  (`Shell::selftest_exports`, the dialog's `start_export` path without the
+  dialog) and waits for both files to appear, then removes the folder.
 
 ## Transient ROI previews (plan 4, 2026-11)
 
@@ -1614,12 +1804,11 @@ store, to provenance or to `mosaic.json`.
 ## Coming in project 3
 
 Plans 2 (the panel list and grouping), 3 (draft merge settings and
-per-group staleness) and 4 (ROIs, transient previews and Compare A/B), in the
-session window above, are built. Plans 5 and 6 of project 3 change it as
-follows; none of it is built yet.
+per-group staleness), 4 (ROIs, transient previews and Compare A/B) and 5
+(composites and the Export dialog: "Composites and the Export dialog (plan
+5)" above), in the session window above, are built. Plan 6 is next and
+changes it as follows; none of it is built yet.
 
-- **Plan 5, composites and export.** A composites popover and the new Export
-  dialog.
 - **Plan 6, checks and overlays.** New checks and badges, click-to-zoom from
   a problem, and a seams overlay.
 

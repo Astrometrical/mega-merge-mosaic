@@ -81,7 +81,7 @@ pub(super) fn show_hoo(st: &mut State) {
         Some(("OIII".into(), 1.0)),
     ];
     save_compositions(&mut st.session.mosaic.config.ui, &[hoo]);
-    st.w.select_view(ViewKind::Composition(0));
+    st.w.select_view(ViewKind::Composition(1));
 }
 
 pub(super) fn log(st: &State) -> Vec<Logged> {
@@ -483,7 +483,7 @@ fn an_empty_view_is_out_of_date_and_offers_no_compare() {
             &mut st.session.mosaic.config.ui,
             &[Composition::new("Empty")],
         );
-        st.w.select_view(ViewKind::Composition(0));
+        st.w.select_view(ViewKind::Composition(1));
     }
     h.run_steps(5);
     let st = h.state();

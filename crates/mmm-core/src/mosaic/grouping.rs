@@ -174,13 +174,26 @@ pub fn resolve_groups(cfg: &MosaicConfig, header: &dyn Fn(&Path) -> Option<Strin
     out
 }
 
-/// Windows reserved device names (with or without an extension).
-fn is_reserved_device_name(s: &str) -> bool {
+/// Whether file name `s` is a Windows reserved device name (`CON`, `PRN`,
+/// `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0`–`COM9`, `LPT0`–`LPT9`, and
+/// `COM`/`LPT` with a superscript `¹`, `²` or `³`), whatever its case and
+/// with or without an extension: its stem, before the first `.`, is one.
+/// Windows refuses to create such a file anywhere.
+pub fn is_reserved_device_name(s: &str) -> bool {
     let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let port = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
+    let mut number = port.unwrap_or_default().chars();
+    port.is_some()
+        && matches!(number.next(), Some('0'..='9' | '¹' | '²' | '³'))
+        && number.next().is_none()
 }
 
 /// The safe directory-name base for a group name. Characters outside
@@ -439,6 +452,25 @@ mod tests {
         let pg = g.processing_groups();
         assert_eq!(pg.len(), 1);
         assert_eq!(pg[0].1.len(), 2);
+    }
+
+    #[test]
+    fn every_windows_device_name_is_reserved() {
+        for name in [
+            "CON", "prn", "Aux", "NUL", "COM0", "com1", "COM9", "LPT0", "lpt9", "COM¹", "com²",
+            "LPT³", "CONIN$", "conout$",
+        ] {
+            assert!(is_reserved_device_name(name), "{name}");
+            assert!(
+                is_reserved_device_name(&format!("{name}.fits")),
+                "{name}.fits"
+            );
+        }
+        for name in [
+            "CONSOLE", "COM", "COM10", "LPT⁴", "COMA", "CONIN", "m_CON", "", "nul_", "a.CON",
+        ] {
+            assert!(!is_reserved_device_name(name), "{name}");
+        }
     }
 
     #[test]

@@ -176,6 +176,43 @@ impl Shell {
         &mut self.window
     }
 
+    /// Self-test: start an export of the first group and one of the first
+    /// composition (if any) into `dir`, as FITS, the way the Export dialog
+    /// does. Returns the files they will write.
+    fn selftest_exports(&mut self, dir: &Path) -> Vec<PathBuf> {
+        let Some((session, jobs)) = self.session.as_ref().zip(self.jobs.as_mut()) else {
+            return Vec::new();
+        };
+        let fmt = mmm_core::export::ExportFormat::Fits;
+        let mut files = Vec::new();
+        if let Some(group) = group_names(session).into_iter().next() {
+            let out = dir.join(format!("group.{}", fmt.extension()));
+            jobs.start_export(
+                session,
+                crate::jobs::ExportTarget::Group(group),
+                out.clone(),
+                fmt,
+                false,
+            );
+            files.push(out);
+        }
+        if let Some(c) = load_compositions(&session.mosaic.config.ui)
+            .into_iter()
+            .next()
+        {
+            let out = dir.join(format!("composite.{}", fmt.extension()));
+            let [r, g, b] = c.channels;
+            let target = crate::jobs::ExportTarget::Composite {
+                id: c.id,
+                name: c.name,
+                channels: [r.map(|c| c.0), g.map(|c| c.0), b.map(|c| c.0)],
+            };
+            jobs.start_export(session, target, out.clone(), fmt, false);
+            files.push(out);
+        }
+        files
+    }
+
     /// The automatic pipeline (its previews feed the plan).
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
@@ -221,7 +258,8 @@ impl Shell {
     /// Leave the open session for the start screen, in this window (‹,
     /// spec §15). Refused while an export runs or waits (`Err` says why).
     /// Otherwise every other job is cancelled (all can be run again) and
-    /// waited for, at most [`STOP_WAIT`]; pending saves are flushed
+    /// waited for, on both of the runner's lanes ([`JobRunner::stop_all`]),
+    /// at most [`STOP_WAIT`]; pending saves are flushed
     /// ([`Shell::flush_pending_saves`]); the session is dropped with its
     /// window, pipeline, checks and summary writer, and its Undo toasts
     /// are taken down; the decode cache is
@@ -236,7 +274,9 @@ impl Shell {
     /// written on this thread and the lock released at once. A job or a
     /// preview that ignores the wait (a decode cannot be interrupted) is let
     /// go of without hanging the window: a reaper thread keeps the session's
-    /// lock until its thread has ended, then writes the summary and releases
+    /// lock until its thread, and every job worker of either lane
+    /// ([`JobRunner::detach_workers`]), has ended, then writes the summary
+    /// and releases
     /// the lock (the start screen shows the session open in another window
     /// meanwhile, and reads it again after). An edit that was waiting for
     /// the jobs is then dropped (logged) if a job did not stop. Either way
@@ -264,7 +304,8 @@ impl Shell {
                     JobEvent::Finished { id, .. } => jobs.target(*id),
                     _ => None,
                 };
-                self.summary.on_job_event(event, target, unix_now());
+                self.summary
+                    .on_job_event(session, event, target, unix_now());
             }
         }
         // The preview thread gets what is left of the same wait.
@@ -483,7 +524,8 @@ impl Shell {
                 JobEvent::Finished { id, .. } => jobs.target(*id),
                 _ => None,
             };
-            self.summary.on_job_event(event, target, unix_now());
+            self.summary
+                .on_job_event(session, event, target, unix_now());
             let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
             let (tone, text) = match event {
                 // Previews run by themselves and often: no toasts but
@@ -665,6 +707,9 @@ struct SelfTest {
     done: bool,
     /// Where the session part of the test is.
     phase: Phase,
+    /// The temporary folder the export phase writes into, and the files it
+    /// waits for.
+    exports: Option<(PathBuf, Vec<PathBuf>)>,
 }
 
 /// The self-test's walk through the session window's canvas.
@@ -680,7 +725,11 @@ enum Phase {
     /// Waiting for the plan of the first group to settle (after a
     /// composite's).
     PlanGroup,
-    /// Every view visited.
+    /// Every view visited: export a group and a composite.
+    StartExports,
+    /// Waiting for the exported files to appear.
+    Exporting,
+    /// Everything done.
     Done,
 }
 
@@ -763,14 +812,44 @@ impl SelfTest {
             // mosaic, which closes the list.
             shell.window_mut().set_mode(CanvasMode::Mosaic);
         }
+        match self.phase {
+            Phase::StartExports => {
+                let dir = std::env::temp_dir().join(format!("mmm-selftest-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                let files = match std::fs::create_dir_all(&dir) {
+                    Ok(()) => shell.selftest_exports(&dir),
+                    Err(e) => {
+                        tracing::error!("self-test: cannot create {}: {e}", dir.display());
+                        Vec::new()
+                    }
+                };
+                self.exports = Some((dir, files));
+                self.phase = Phase::Exporting;
+                return;
+            }
+            Phase::Exporting => {
+                if let Some((dir, files)) = &self.exports {
+                    // A file appears only when its export is complete (the
+                    // export writes `.part` and renames). The watchdog ends
+                    // a test whose export never finishes.
+                    if files.iter().all(|f| f.is_file()) {
+                        tracing::info!("self-test: exported {} files", files.len());
+                        let _ = std::fs::remove_dir_all(dir);
+                        self.phase = Phase::Done;
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
         let w = shell.window();
         match self.phase {
             Phase::Mosaic
                 if self.session_frames >= SELFTEST_SESSION_FRAMES && w.mosaic().is_settled() =>
             {
                 log_mosaic(w.mosaic());
-                if has_composition(shell) {
-                    shell.window_mut().select_view(ViewKind::Composition(0));
+                if let Some(id) = first_composition(shell) {
+                    shell.window_mut().select_view(ViewKind::Composition(id));
                     self.phase = Phase::MosaicComposition;
                 } else {
                     shell.window_mut().set_mode(CanvasMode::Plan);
@@ -795,14 +874,14 @@ impl SelfTest {
                         shell.window_mut().select_view(ViewKind::Group(g));
                         Phase::PlanGroup
                     }
-                    _ => Phase::Done,
+                    _ => Phase::StartExports,
                 };
             }
             Phase::PlanGroup
                 if matches!(w.plan().view(), Some(ViewKind::Group(_))) && w.plan().is_settled() =>
             {
                 log_plan(shell);
-                self.phase = Phase::Done;
+                self.phase = Phase::StartExports;
             }
             _ => {}
         }
@@ -819,11 +898,11 @@ impl SelfTest {
     }
 }
 
-/// Whether the open session has a composition.
-fn has_composition(shell: &Shell) -> bool {
+/// The id of the open session's first composition, if it has one.
+fn first_composition(shell: &Shell) -> Option<u64> {
     shell
         .session()
-        .is_some_and(|s| !load_compositions(&s.mosaic.config.ui).is_empty())
+        .and_then(|s| load_compositions(&s.mosaic.config.ui).first().map(|c| c.id))
 }
 
 /// Log what the self-test's mosaic shows.
@@ -981,6 +1060,7 @@ impl MmmApp {
             outcome,
             done: false,
             phase: Phase::Mosaic,
+            exports: None,
         });
         MmmApp {
             shell,
@@ -1944,7 +2024,8 @@ mod tests {
         {
             let shell = h.state_mut();
             let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
-            jobs.start_export(session, "Ha", root.join("Ha.fits"), ExportFormat::Fits);
+            let ha = crate::jobs::ExportTarget::Group("Ha".into());
+            jobs.start_export(session, ha, root.join("Ha.fits"), ExportFormat::Fits, false);
         }
         h.run_steps(3);
         let back = |h: &Harness<'static, Shell>| {
