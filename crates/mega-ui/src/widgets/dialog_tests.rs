@@ -245,3 +245,81 @@ fn footer_reports_the_clicked_button() {
     h.run();
     assert_eq!(*h.state(), Some(1));
 }
+
+#[test]
+fn a_disabled_footer_button_says_why_and_does_nothing() {
+    use egui_kittest::kittest::NodeT;
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(600.0, 300.0))
+        .build_ui_state(
+            |ui, s: &mut Option<usize>| {
+                if crate::testutil::themed(ui) {
+                    let c = footer_with(
+                        ui,
+                        &[
+                            FooterButton {
+                                kind: ButtonKind::Quiet,
+                                label: "Cancel",
+                                disabled: None,
+                            },
+                            FooterButton {
+                                kind: ButtonKind::Primary,
+                                label: "Export",
+                                disabled: Some("Nothing is ticked."),
+                            },
+                        ],
+                    );
+                    *s = s.or(c);
+                }
+            },
+            None,
+        );
+    h.run();
+    assert!(h.get_by_label("Export").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("Cancel").accesskit_node().is_disabled());
+    h.get_by_label("Export").click();
+    h.run();
+    assert_eq!(*h.state(), None, "a disabled button does nothing");
+    // Its reason shows on hover.
+    let at = h.get_by_label("Export").rect().center();
+    h.hover_at(at);
+    for _ in 0..60 {
+        h.run();
+    }
+    h.get_by_label("Nothing is ticked.");
+    // The enabled one still reports its click.
+    h.get_by_label("Cancel").click();
+    h.run();
+    assert_eq!(*h.state(), Some(0));
+}
+
+#[test]
+fn initial_focus_never_goes_to_what_is_drawn_after_it() {
+    // The dialog shown first in the frame, the rest of the screen after it
+    // (as a window that lets its dialog take Esc first draws them).
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(900.0, 700.0))
+        .build_ui_state(
+            |ui, open: &mut bool| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                if *open {
+                    Dialog {
+                        title: "Export",
+                        width: DIALOG_WIDTH,
+                    }
+                    .show(ui.ctx(), Id::new("dlg"), |ui| {
+                        let _ = ui.button("One");
+                    });
+                }
+                let _ = ui.button("After");
+            },
+            false,
+        );
+    h.run();
+    *h.state_mut() = true;
+    h.run();
+    assert!(h.get_by_label("One").is_focused(), "focus starts inside");
+    assert!(!h.get_by_label("After").is_focused());
+}

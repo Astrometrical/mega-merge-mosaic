@@ -91,7 +91,14 @@ impl Dialog<'_> {
                     });
                     ui.ctx().request_repaint();
                 }
-                self.contents(ui, body)
+                let inner = self.contents(ui, body);
+                if tries > 0 {
+                    // Nothing in the body took the focus (the area's hidden
+                    // sizing pass has no live controls): no widget drawn
+                    // after the dialog in this pass may take it instead.
+                    ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+                }
+                inner
             });
         let landed = ctx.memory(|m| m.focused()).is_some();
         let left = if landed { 0 } else { tries.saturating_sub(1) };
@@ -103,10 +110,37 @@ impl Dialog<'_> {
     }
 }
 
+/// One button of [`footer_with`].
+#[derive(Clone, Copy, Debug)]
+pub struct FooterButton<'a> {
+    /// What the button is for (its colours).
+    pub kind: ButtonKind,
+    /// Its text, also its accessible label.
+    pub label: &'a str,
+    /// Why it cannot be pressed now, shown on hover; `None` when it can.
+    /// A disabled button takes no keyboard focus, so say why in the body
+    /// too.
+    pub disabled: Option<&'a str>,
+}
+
 /// A right-aligned row of buttons, given left to right (the primary action
 /// last). Returns the index of the one clicked this frame. The buttons are
 /// laid out left to right, so Tab follows what the eye sees.
 pub fn footer(ui: &mut Ui, buttons: &[(ButtonKind, &str)]) -> Option<usize> {
+    let buttons: Vec<FooterButton<'_>> = buttons
+        .iter()
+        .map(|&(kind, label)| FooterButton {
+            kind,
+            label,
+            disabled: None,
+        })
+        .collect();
+    footer_with(ui, &buttons)
+}
+
+/// [`footer`] with buttons that may be disabled: a disabled one cannot be
+/// pressed and says why on hover.
+pub fn footer_with(ui: &mut Ui, buttons: &[FooterButton<'_>]) -> Option<usize> {
     let mut clicked = None;
     ui.add_space(space::L);
     // The row's width from the previous frame decides the leading space
@@ -120,8 +154,13 @@ pub fn footer(ui: &mut Ui, buttons: &[(ButtonKind, &str)]) -> Option<usize> {
         ui.spacing_mut().item_spacing = Vec2::splat(space::S);
         ui.add_space((avail - width).max(0.0));
         let start = ui.cursor().min.x;
-        for (i, (kind, label)) in buttons.iter().enumerate() {
-            if ui.add(MegaButton::new(*kind, *label)).clicked() {
+        for (i, b) in buttons.iter().enumerate() {
+            let r = ui.add_enabled(b.disabled.is_none(), MegaButton::new(b.kind, b.label));
+            let r = match b.disabled {
+                Some(why) => r.on_disabled_hover_text(why),
+                None => r,
+            };
+            if r.clicked() {
                 clicked = Some(i);
             }
         }
