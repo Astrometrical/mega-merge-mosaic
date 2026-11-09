@@ -313,6 +313,16 @@ impl SettingsPanel {
         self.draft_changed = true;
     }
 
+    /// Put `draft` back as the merge settings draft (compare's **Use A**):
+    /// feather text being typed, valid or not, gives way to it, so the field
+    /// shows its width and nothing typed blocks merging; then as
+    /// [`SettingsPanel::edit_draft`].
+    pub fn restore_draft(&mut self, cfg: &mut MosaicConfig, draft: BlendSettings) {
+        self.feather_text = None;
+        self.feather_error = None;
+        self.edit_draft(cfg, draft);
+    }
+
     /// Cancel the jobs in the way of `new`: every job but exports when it
     /// reruns the analysis. True if any had to be (the edit then waits for
     /// them to stop).

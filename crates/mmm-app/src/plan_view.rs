@@ -675,6 +675,8 @@ pub struct PlanView {
     drawn: Option<([f64; 4], (u64, u64))>,
     /// The press held on the canvas in the last frame drawn.
     hold: Option<mega_ui::canvas_layers::Hold>,
+    /// A canvas rect where a click selects nothing ([`PlanView::set_quiet`]).
+    quiet: Option<[u64; 4]>,
     held_camera: Option<HeldCamera>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
@@ -753,6 +755,7 @@ impl PlanView {
             patches: Vec::new(),
             drawn: None,
             hold: None,
+            quiet: None,
             held_camera: None,
             textures_for: None,
             textures: HashMap::new(),
@@ -823,6 +826,19 @@ impl PlanView {
     /// canvas it was drawn on.
     pub fn take_drawn(&mut self) -> Option<([f64; 4], (u64, u64))> {
         self.drawn.take()
+    }
+
+    /// From the next frame drawn, a click inside canvas rect `rect` (if any)
+    /// selects no panel and clears no selection: a press there is the
+    /// window's (compare's peek on the ROI compared).
+    pub fn set_quiet(&mut self, rect: Option<[u64; 4]>) {
+        self.quiet = rect;
+    }
+
+    /// The screen rect the canvas's own buttons took in its last frame
+    /// ([`PlanCanvas::controls_rect`]).
+    pub fn controls_rect(&self) -> Option<egui::Rect> {
+        self.canvas.controls_rect()
     }
 
     /// The primary button held on the canvas in the last frame drawn (the
@@ -1075,10 +1091,20 @@ impl PlanView {
                 .get(id as usize)
                 .map(|p| p.path.clone())
         };
-        if let Some(id) = r.clicked {
-            self.selected = path_of(id);
-        } else if r.clicked_empty {
-            self.selected = None;
+        // A click in the quiet rect selects nothing.
+        let quiet = self.quiet.is_some_and(|q| {
+            let at = ui.input(|i| i.pointer.interact_pos());
+            let frame = self.canvas.last_frame();
+            at.zip(frame).is_some_and(|(p, (rect, t))| {
+                let (x, y) = self.canvas.view().screen_to_image(p, rect, t);
+                x >= q[0] as f64 && x < q[2] as f64 && y >= q[1] as f64 && y < q[3] as f64
+            })
+        });
+        match r.clicked {
+            _ if quiet => {}
+            Some(id) => self.selected = path_of(id),
+            None if r.clicked_empty => self.selected = None,
+            None => {}
         }
         self.hovered = r.hovered.and_then(path_of);
     }

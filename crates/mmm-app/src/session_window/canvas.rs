@@ -553,6 +553,9 @@ impl SessionWindow {
                     Vec::new()
                 };
                 self.plan.set_overlays(overlays);
+                // A click on the compared preview is its peek, no selection.
+                let quiet = self.previews.compare().and_then(|c| c.rect());
+                self.plan.set_quiet(quiet);
                 self.plan.show(ui, session, &feed, &self.look);
                 if let Some((rect, canvas)) = self.plan.take_drawn()
                     && matches

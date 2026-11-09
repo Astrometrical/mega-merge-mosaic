@@ -7,8 +7,8 @@ use mmm_core::settings::BlendSettings;
 use mmm_core::stretch::StretchParams;
 
 use super::previews::{
-    CORE, delivered, draft_feather, drawn_with_canvas_stretch, last_started_key, release, show_hoo,
-    shown, started,
+    CORE, HALO, delivered, draft_feather, drawn_with_canvas_stretch, last_started_key, release,
+    show_hoo, shown, started,
 };
 use super::*;
 use crate::blend_settings::load_draft;
@@ -96,11 +96,23 @@ fn up_to_date_with(
     tag: &str,
     prepare: impl FnOnce(&mut State),
 ) -> (PathBuf, Harness<'static, State>, Arc<Gate>) {
-    let (root, mut h, gate) = shown(tag, &[CORE], prepare);
+    up_to_date_roi(tag, CORE, prepare)
+}
+
+/// ROI `roi` alone, its preview merged and up to date on the mosaic, and
+/// selected (its label offers Compare); previews started from now on wait
+/// for the gate returned.
+fn up_to_date_roi(
+    tag: &str,
+    roi: (u64, &str, [u64; 4]),
+    prepare: impl FnOnce(&mut State),
+) -> (PathBuf, Harness<'static, State>, Arc<Gate>) {
+    let (root, mut h, gate) = shown(tag, &[roi], prepare);
     step_to(&mut h, |st| started(st).len() == 1);
     let gate = release(&mut h, gate);
-    step_to(&mut h, |st| delivered(st, 7, "Ha") == 1);
-    step_until_row(&mut h, "Core", "up to date");
+    step_to(&mut h, |st| delivered(st, roi.0, "Ha") == 1);
+    step_until_row(&mut h, roi.1, "up to date");
+    h.state_mut().w.mosaic.select_roi(roi.0);
     h.run_steps(2);
     (root, h, gate)
 }
@@ -405,17 +417,20 @@ fn use_a_restores_a_settings_and_ends_compare() {
     step_until_row(&mut h, "Core", "up to date");
     h.run_steps(10);
     assert_eq!(started(h.state()).len(), merges);
-    // The label is back to one row.
+    // The label is back to one row, and A's texture is let go of.
     assert!(h.query_by_label("Compare Core").is_some());
     assert!(h.query_by_label("Use A for Core").is_none());
+    assert!(!h.state().w.shown_patches().has(7, Side::A));
     // Done leaves compare keeping the draft.
     let (_, gate) = comparing_two_sides(&mut h, gate);
     let b = load_draft(&h.state().session.mosaic.config);
     assert_ne!(b, a);
+    assert!(h.state().w.shown_patches().has(7, Side::A));
     h.get_by_label("Done comparing Core").click();
-    h.step();
+    h.run_steps(2);
     assert!(compare(h.state()).is_none());
     assert_eq!(load_draft(&h.state().session.mosaic.config), b);
+    assert!(!h.state().w.shown_patches().has(7, Side::A));
     gate.open();
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -563,6 +578,325 @@ fn the_label_is_one_row_outside_compare_and_two_in_it() {
     assert_eq!(rects(&h), first);
     h.key_up(egui::Key::Space);
     h.run_steps(2);
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn space_presses_a_focused_control() {
+    let (root, mut h, gate) = up_to_date("compare-space-focus");
+    let (_, gate) = comparing_two_sides(&mut h, gate);
+    // A option focused (keyboard navigation): Space chooses it, no peek.
+    h.get_by_label("Show A of Core").focus();
+    h.run_steps(2);
+    h.key_down(egui::Key::Space);
+    h.run_steps(2);
+    let c = compare(h.state()).unwrap();
+    assert_eq!((c.selected, c.shown()), (Side::A, Side::A));
+    assert!(c.peeks.is_empty(), "{:?}", c.peeks);
+    h.key_up(egui::Key::Space);
+    h.run_steps(2);
+    // Done focused: Space presses it, and compare ends.
+    h.get_by_label("Done comparing Core").focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    assert!(compare(h.state()).is_none());
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compare_is_offered_on_the_selected_roi_only() {
+    let (root, mut h, gate) = shown("compare-selected", &[CORE, HALO], |_| {});
+    gate.open();
+    step_until_row(&mut h, "Core", "up to date");
+    step_until_row(&mut h, "Halo", "up to date");
+    h.run_steps(2);
+    let rect = frame(&h);
+    // None selected: plain painted labels, no Compare.
+    assert!(h.query_by_label("Compare Core").is_none());
+    assert!(h.query_by_label("Compare Halo").is_none());
+    assert!(painted(&h, rect, "Core").is_some() && painted(&h, rect, "Halo").is_some());
+    // Core picked in the list: its label offers Compare; Halo's stays
+    // painted.
+    h.get_by_label("Core").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Compare Core").is_some());
+    assert!(h.query_by_label("Compare Halo").is_none());
+    // Both in view again; Core compared, then Halo selected: Core keeps its
+    // compare controls and Halo offers Compare.
+    h.state_mut().w.frame([0, 0, 220, 180]);
+    h.run_steps(3);
+    h.get_by_label("Compare Core").click();
+    h.run_steps(2);
+    assert_eq!(compare(h.state()).map(|c| c.roi), Some(7));
+    h.state_mut().w.mosaic.select_roi(9);
+    h.run_steps(2);
+    assert!(h.query_by_label("Done comparing Core").is_some());
+    assert!(h.query_by_label("Compare Halo").is_some());
+    assert!(h.state().w.shown_patches().has(7, Side::A));
+    // Compare on Halo ends Core's: one at a time.
+    h.get_by_label("Compare Halo").click();
+    h.run_steps(2);
+    assert_eq!(compare(h.state()).map(|c| c.roi), Some(9));
+    assert!(h.query_by_label("Done comparing Core").is_none());
+    assert!(h.query_by_label("Done comparing Halo").is_some());
+    assert!(!h.state().w.shown_patches().has(7, Side::A));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_click_in_the_compared_preview_selects_no_panel_on_the_plan() {
+    let (root, mut h, gate) = up_to_date("compare-plan-click");
+    gate.open();
+    h.key_press(egui::Key::M);
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Plan && plan_placed(st)
+    });
+    h.run_steps(3);
+    let rect = frame(&h);
+    let cam = h.state().w.plan().camera().unwrap();
+    let click = |h: &mut Harness<'static, State>, p: (f64, f64)| {
+        let at = screen(rect, cam, p);
+        h.hover_at(at);
+        h.drag_at(at);
+        let_go(h, at);
+        h.run_steps(2);
+    };
+    // Low in Core, clear of its label, on a panel.
+    let inside = (150.0, 155.0);
+    // Not comparing: a click there selects the panel under it.
+    click(&mut h, inside);
+    assert!(h.state().w.plan().selected().is_some());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().w.plan().selected().is_none());
+    // Comparing: it selects nothing (a press there is a peek)...
+    h.get_by_label("Compare Core").click();
+    h.run_steps(2);
+    assert!(compare(h.state()).is_some());
+    click(&mut h, inside);
+    assert!(h.state().w.plan().selected().is_none());
+    // ...while a click on a panel outside Core still does.
+    let core = CORE.2.map(|v| v as f64);
+    let outside = h
+        .state()
+        .w
+        .plan()
+        .items()
+        .iter()
+        .map(|it| {
+            (
+                (it.rect[0] + it.rect[2]) / 2.0,
+                (it.rect[1] + it.rect[3]) / 2.0,
+            )
+        })
+        .find(|c| !(c.0 >= core[0] && c.0 < core[2] && c.1 >= core[1] && c.1 < core[3]))
+        .expect("a panel centre outside Core");
+    click(&mut h, outside);
+    assert!(h.state().w.plan().selected().is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// "Big": most of the 600 × 420 canvas.
+const BIG: (u64, &str, [u64; 4]) = (11, "Big", [50, 50, 550, 400]);
+
+#[test]
+fn zoomed_into_a_big_roi_its_label_stays_reachable_and_the_canvas_buttons_never_peek() {
+    let (root, mut h, gate) = up_to_date_roi("compare-big", BIG, |_| {});
+    gate.open();
+    h.get_by_label("Compare Big").click();
+    h.run_steps(2);
+    assert!(compare(h.state()).is_some());
+    // Zoomed in: Big covers the whole view, its corner far off screen.
+    let c = Camera {
+        centre: (300.0, 225.0),
+        zoom: 4.0,
+    };
+    h.state_mut().w.mosaic.set_camera(c);
+    h.run_steps(3);
+    let rect = frame(&h);
+    assert!(
+        screen(rect, c, (50.0, 50.0)).x < rect.left(),
+        "the corner is off screen"
+    );
+    // The label sits at the top-left of what shows, clear of the canvas's
+    // buttons, all of it inside the view.
+    let buttons = h.state().w.mosaic().controls_rect().expect("the buttons");
+    for name in [
+        "Show A of Big",
+        "Show B of Big",
+        "Use A for Big",
+        "Done comparing Big",
+    ] {
+        let r = h.get_by_label(name).rect();
+        assert!(rect.contains_rect(r), "{name} {r:?} in {rect:?}");
+        assert!(
+            !r.intersects(buttons),
+            "{name} {r:?} on the buttons {buttons:?}"
+        );
+    }
+    // The canvas's own buttons over the preview: held, no peek.
+    let plus = h
+        .query(By::new().label("+").predicate(|n| n.toggled().is_none()))
+        .expect("the zoom in button")
+        .rect()
+        .center();
+    press(&mut h, plus);
+    h.run_steps(100);
+    assert_eq!(shown_side(h.state()), Side::B);
+    let_go(&mut h, plus);
+    h.run_steps(2);
+    // The preview itself still peeks.
+    let inside = rect.center() + egui::vec2(0.0, 100.0);
+    press(&mut h, inside);
+    h.run_steps(2);
+    assert_eq!(shown_side(h.state()), Side::A);
+    let_go(&mut h, inside);
+    h.run_steps(2);
+    // Done, reachable: compare ends.
+    h.get_by_label("Done comparing Big").click();
+    h.run_steps(2);
+    assert!(compare(h.state()).is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn b_out_of_date_and_not_merging_says_so() {
+    let (root, mut h, gate) = up_to_date("compare-b-stale");
+    h.get_by_label("Compare Core").click();
+    h.run_steps(2);
+    // Invalid typed settings hold previews back: B is out of date and not
+    // merging.
+    h.state_mut().w.mosaic.force_feather_error();
+    let feather = draft_feather(h.state());
+    set_draft_feather(&mut h.state_mut().session, feather + 60.0);
+    h.run_steps(3);
+    assert_eq!(started(h.state()).len(), 1);
+    assert!(says(&h, "B · out of date"), "{:?}", described(&h));
+    // Valid again: B merges.
+    h.state_mut().w.mosaic.clear_feather_error();
+    step_to(&mut h, |st| started(st).len() == 2);
+    h.step();
+    assert!(says(&h, "B · merging…"));
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The window loses (`false`) or regains the keyboard focus.
+fn window_focus(h: &mut Harness<'static, State>, focused: bool) {
+    h.input_mut().focused = focused;
+    h.event(egui::Event::WindowFocused(focused));
+    h.run_steps(2);
+}
+
+#[test]
+fn losing_the_window_focus_ends_the_peeks() {
+    let (root, mut h, gate) = up_to_date("compare-focus-lost");
+    let (_, gate) = comparing_two_sides(&mut h, gate);
+    // The selected button held.
+    let b = h.get_by_label("Show B of Core").rect().center();
+    press(&mut h, b);
+    h.run_steps(2);
+    assert_eq!(shown_side(h.state()), Side::A);
+    window_focus(&mut h, false);
+    assert_eq!(shown_side(h.state()), Side::B, "button");
+    window_focus(&mut h, true);
+    let_go(&mut h, b);
+    h.run_steps(2);
+    // The preview held.
+    h.state_mut().w.frame(CORE.2);
+    h.run_steps(3);
+    let cam = h.state().w.mosaic().camera().unwrap();
+    let inside = screen(frame(&h), cam, (150.0, 155.0));
+    press(&mut h, inside);
+    h.run_steps(2);
+    assert_eq!(shown_side(h.state()), Side::A);
+    window_focus(&mut h, false);
+    assert_eq!(shown_side(h.state()), Side::B, "preview");
+    window_focus(&mut h, true);
+    let_go(&mut h, inside);
+    h.run_steps(2);
+    // Space held.
+    h.key_down(egui::Key::Space);
+    h.run_steps(2);
+    assert_eq!(shown_side(h.state()), Side::A);
+    window_focus(&mut h, false);
+    assert_eq!(shown_side(h.state()), Side::B, "space");
+    window_focus(&mut h, true);
+    h.key_up(egui::Key::Space);
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_settings_text_gives_the_groups_override() {
+    use mmm_core::settings::{BlendOverride, GroupOverride};
+    let (root, mut h, gate) = up_to_date_with("compare-override", |st| {
+        st.session.mosaic.config.group_overrides.insert(
+            "Ha".into(),
+            GroupOverride {
+                blend: BlendOverride {
+                    feather_px: Some(77.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+    });
+    gate.open();
+    let draft = load_draft(&h.state().session.mosaic.config);
+    assert_ne!(draft.feather_px, 77.0);
+    let flatten = draft.flatten.map_or("off".to_string(), |f| f.to_string());
+    h.get_by_label("Compare Core").click();
+    h.run_steps(2);
+    // What Ha merges with: the override's feather, not the draft's.
+    assert!(says(&h, &format!("B · feather 77 px · flatten {flatten}")));
+    h.key_down(egui::Key::Space);
+    h.run_steps(2);
+    assert!(says(&h, &format!("A · feather 77 px · flatten {flatten}")));
+    h.key_up(egui::Key::Space);
+    h.run_steps(2);
+    // The draft's feather changes: Ha's does not (nothing merges).
+    set_draft_feather(&mut h.state_mut().session, draft.feather_px + 60.0);
+    h.run_steps(5);
+    assert!(says(&h, &format!("B · feather 77 px · flatten {flatten}")));
+    assert_eq!(started(h.state()).len(), 1);
+    // Use A puts the draft back (the override stays on top of it).
+    let a_key = compare(h.state()).unwrap().a["Ha"].0.clone();
+    h.get_by_label("Use A for Core").click();
+    h.run_steps(2);
+    assert_eq!(load_draft(&h.state().session.mosaic.config), draft);
+    assert_eq!(h.state().w.previews().cached_key(7, "Ha"), Some(&a_key));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn use_a_clears_an_invalid_feather() {
+    let (root, mut h, gate) = up_to_date_with("compare-use-a-invalid", |st| {
+        st.w.inspector_mut().reveal(MERGE_SETTINGS);
+    });
+    let (a, gate) = comparing_two_sides(&mut h, gate);
+    // Typed into the feather field: not a width, so merging is blocked.
+    h.get_by_role_and_label(Role::TextInput, "Feather (px)")
+        .focus();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Feather (px)")
+        .type_text("x");
+    h.run_steps(2);
+    assert!(h.state().w.mosaic().input_error().is_some());
+    // Use A: A's settings, the field showing A's feather, nothing blocked.
+    h.get_by_label("Use A for Core").click();
+    h.run_steps(3);
+    assert!(compare(h.state()).is_none());
+    assert_eq!(load_draft(&h.state().session.mosaic.config), a);
+    assert!(h.state().w.mosaic().input_error().is_none());
+    let field = h.get_by_role_and_label(Role::TextInput, "Feather (px)");
+    assert_eq!(
+        field.accesskit_node().value().as_deref(),
+        Some(crate::blend_settings::feather_text(a.feather_px).as_str())
+    );
     gate.open();
     let _ = std::fs::remove_dir_all(&root);
 }

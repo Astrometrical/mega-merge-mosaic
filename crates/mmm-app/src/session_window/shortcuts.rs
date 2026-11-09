@@ -19,9 +19,10 @@
 //! acts while a text field has the keyboard (notes, names, a path) or the
 //! Export dialog is open (a Space held since before still ends its peek when
 //! let go: [`SessionWindow::follow_peek_key`]); a focused button or chip
-//! (keyboard navigation) does not stop them. The canvas always shows (the panel list sits beside it), so
-//! the canvas's own (`M`, the brackets and the toggles) act with the list
-//! open too. A key that is a shortcut is consumed, so no widget sees it
+//! (keyboard navigation) does not stop them, except Space, which presses
+//! the focused control. The canvas always shows (the panel list sits beside
+//! it), so the canvas's own (`M`, the brackets and the toggles) act with
+//! the list open too. A key that is a shortcut is consumed, so no widget sees it
 //! too, except Esc: an Esc that closes a menu or leaves a text field does
 //! only that, keeping the selection.
 

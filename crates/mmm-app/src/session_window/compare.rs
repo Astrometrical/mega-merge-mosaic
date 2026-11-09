@@ -1,28 +1,37 @@
 //! Compare A / B on an ROI preview (spec §8.3), on the ROIs' canvas labels.
 //!
-//! - **The labels.** An ROI up to date for the groups in view (while no
-//!   analysis runs) has its label drawn here, with **Compare**, on one row:
-//!   name, **Compare**, "up to date". The compared ROI's label holds, on its
-//!   first row, the name, the **A | B** toggle, **Use A** and **Done**; the
-//!   shown side's settings ("A · feather 40 px · flatten 2", "B · …", or
-//!   "B · merging…" while B merges) go on a second row, so the buttons never
-//!   move. Other ROIs keep the label the canvas paints. A label is drawn
-//!   once: the canvas paints none for an ROI labelled here.
+//! - **The labels.** The selected ROI, when up to date for the groups in
+//!   view (while no analysis runs), has its label drawn here, with
+//!   **Compare**, on one row: name, **Compare**, "up to date". The compared
+//!   ROI's label holds, on its first row, the name, the **A | B** toggle,
+//!   **Use A** and **Done**; the shown side's settings ("A · feather 40 px ·
+//!   flatten 2", "B · …", "B · merging…" while B merges, or "B · out of
+//!   date" while it waits) go on a second row, so the buttons never move.
+//!   Other ROIs keep the label the canvas paints. A label is drawn once: the
+//!   canvas paints none for an ROI labelled here. A label sits at the
+//!   top-left of the part of its ROI in view (its corner, when that shows),
+//!   inside the view and clear of the canvas's own buttons, so its controls
+//!   stay reachable however far the canvas is zoomed in.
 //! - **Compare** freezes the ROI's preview as A ([`Previews::start_compare`],
 //!   with the draft it was made from); B, the live preview, is selected.
 //!   One ROI at a time: Compare on another ends the current one first.
 //! - **A | B** is a toggle: the selected side stays shown. Three momentary
-//!   switches show the other side while held ([`Peek`]): Space (not while
-//!   typing or in a dialog; letting go ends it wherever the keyboard focus
-//!   has gone), pressing and holding the selected button (clicking the
-//!   other switches to it), and pressing and holding the left mouse button
-//!   on the compared ROI's preview on either canvas (a drag past the click
-//!   distance still pans, and ends the peek). The label's accessible
-//!   description says what shows, and "Peeking…" while a switch is held.
+//!   switches show the other side while held ([`Peek`]): Space (only while
+//!   no widget has the keyboard focus, so a focused control keeps Space to
+//!   press it, and not while typing or in a dialog; letting go ends it
+//!   wherever the focus has gone), pressing and holding the selected button
+//!   (clicking the other switches to it), and pressing and holding the left
+//!   mouse button on the compared ROI's preview on either canvas (a drag
+//!   past the click distance still pans, and ends the peek; a press on the
+//!   canvas's own buttons is none; on the plan a click there selects no
+//!   panel). None lasts while the window has no focus. The label's
+//!   accessible description says what shows, and "Peeking…" while a switch
+//!   is held.
 //! - **Use A** puts A's settings back in the draft through the Merge
-//!   settings' own draft edit (saved with the window, as any draft edit),
-//!   and leaves compare; A's preview is then the ROI's preview. **Done**
-//!   leaves compare, keeping the draft.
+//!   settings' own draft edit (saved with the window, as any draft edit;
+//!   feather text being typed, valid or not, gives way to A's), and leaves
+//!   compare; A's preview is then the ROI's preview. **Done** leaves
+//!   compare, keeping the draft.
 //! - **Leaving.** Compare ends when its ROI is deleted or moved
 //!   ([`Previews`]), hidden (the ROIs toggle), when the view's groups
 //!   change, when an analysis starts and when the session is left.
@@ -38,13 +47,14 @@ use mmm_core::settings::BlendSettings;
 
 use super::shortcuts::{PEEK, keyed};
 use super::{CanvasMode, SessionWindow};
-use crate::blend_settings::{feather_text, load_draft};
+use crate::blend_settings::{draft_for, feather_text, load_draft};
 use crate::jobs::JobRunner;
 use crate::previews::{Peek, PreviewState, Side};
 use crate::session::OpenSession;
 
 /// **Compare**'s tooltip.
-const COMPARE_TIP: &str = "Freeze this preview as A, then change the Merge settings to compare                            B, the live preview, with it";
+const COMPARE_TIP: &str =
+    "Freeze this preview as A, then change the Merge settings and compare B with it";
 /// **Use A**'s tooltip.
 const USE_A_TIP: &str = "Put A's settings back in the Merge settings and leave compare";
 /// **Done**'s tooltip.
@@ -82,9 +92,10 @@ fn index(side: Side) -> usize {
 }
 
 impl SessionWindow {
-    /// The ROIs whose canvas label is drawn here, with controls: each up to
-    /// date for the groups in view (`states`) while no analysis runs or is
-    /// queued, and the one compared. None while the ROIs are hidden.
+    /// The ROIs whose canvas label is drawn here, with controls: the
+    /// selected one if up to date for the groups in view (`states`) while no
+    /// analysis runs or is queued, and the one compared. None while the ROIs
+    /// are hidden.
     pub(super) fn labelled_rois(
         &self,
         states: &BTreeMap<u64, PreviewState>,
@@ -93,15 +104,11 @@ impl SessionWindow {
         if !self.look.rois {
             return BTreeSet::new();
         }
-        let mut out: BTreeSet<u64> = if jobs.analyzing() {
-            BTreeSet::new()
-        } else {
-            states
-                .iter()
-                .filter(|(_, s)| **s == PreviewState::UpToDate)
-                .map(|(id, _)| *id)
-                .collect()
-        };
+        let selected = self
+            .mosaic
+            .selected_roi()
+            .filter(|id| !jobs.analyzing() && states.get(id) == Some(&PreviewState::UpToDate));
+        let mut out: BTreeSet<u64> = selected.into_iter().collect();
         out.extend(self.previews.compare().map(|c| c.roi));
         out
     }
@@ -121,13 +128,16 @@ impl SessionWindow {
     }
 
     /// Space, the momentary switch of the keyboard: while comparing, a press
-    /// (not while `typing`: a text field has the keyboard, or a dialog is
-    /// open) starts a peek and is consumed; the peek lasts while the key is
-    /// down, so letting go ends it wherever the keyboard focus has gone.
+    /// starts a peek and is consumed, unless a widget has the keyboard focus
+    /// (a focused button keeps Space to press it) or `typing` (a text field
+    /// has the keyboard, or a dialog is open); the peek lasts while the key
+    /// is down, so letting go ends it wherever the focus has gone (egui lets
+    /// go of every key when the window loses the focus).
     pub(super) fn follow_peek_key(&mut self, ctx: &egui::Context, typing: bool) {
         let comparing = self.previews.compare().is_some();
+        let free = !typing && ctx.memory(|m| m.focused()).is_none();
         let pressed = comparing
-            && !typing
+            && free
             && ctx.input_mut(|i| i.modifiers.is_none() && i.consume_key(Modifiers::NONE, PEEK));
         let down = ctx.input(|i| i.key_down(PEEK));
         self.peek_key = comparing && down && (self.peek_key || pressed);
@@ -157,6 +167,12 @@ impl SessionWindow {
         let mut actions = Vec::new();
         let mut button_held = false;
         let mut preview_held = false;
+        // The canvas's own buttons, which a label keeps clear of.
+        let avoid = if plan {
+            self.plan.controls_rect()
+        } else {
+            self.mosaic.controls_rect()
+        };
         if let Some((rect, cam)) = canvas {
             let to_screen = |p: (f64, f64)| {
                 rect.center()
@@ -179,7 +195,9 @@ impl SessionWindow {
                 if !on_screen.intersects(rect) {
                     continue;
                 }
-                let (resp, compared) = self.roi_label(ui, session, &roi, on_screen.min, rect);
+                // The top-left of the part in view (the corner, if it shows).
+                let corner = on_screen.intersect(rect).min;
+                let (resp, compared) = self.roi_label(ui, session, &roi, corner, rect, avoid);
                 match compared {
                     Some(selected) => {
                         button_held = resp.held == Some((0, index(selected)));
@@ -226,7 +244,7 @@ impl SessionWindow {
                 Action::Select(side) => self.previews.select_side(side),
                 Action::UseA => {
                     if let Some(a) = self.previews.use_a() {
-                        self.mosaic.edit_draft(session, a);
+                        self.mosaic.restore_draft(session, a);
                     }
                 }
                 Action::Done => self.previews.end_compare(),
@@ -241,8 +259,9 @@ impl SessionWindow {
     }
 
     /// Draw ROI `roi`'s label at screen point `corner` over the canvas in
-    /// `viewport`: the compare controls if it is compared (with the side
-    /// selected), else **Compare**.
+    /// `viewport`, clear of `avoid` (the canvas's buttons): the compare
+    /// controls if it is compared (with the side selected), else
+    /// **Compare**.
     fn roi_label(
         &self,
         ui: &mut egui::Ui,
@@ -250,6 +269,7 @@ impl SessionWindow {
         roi: &crate::rois::Roi,
         corner: egui::Pos2,
         viewport: egui::Rect,
+        avoid: Option<egui::Rect>,
     ) -> (mega_ui::widgets::LabelResponse, Option<Side>) {
         let name = roi.name.as_str();
         let accessible = format!("{name} on the canvas");
@@ -267,7 +287,7 @@ impl SessionWindow {
             let label = CanvasLabel {
                 corner,
                 clip: viewport,
-                avoid: None,
+                avoid,
                 name,
                 color,
                 controls: &controls,
@@ -280,16 +300,12 @@ impl SessionWindow {
         };
         let shown = c.shown();
         let text = match shown {
-            Side::A => settings_text(Side::A, &c.a_settings),
-            Side::B => {
-                let merging = self.previews.state(roi.id, self.mosaic.members(), session)
-                    == PreviewState::Merging;
-                if merging {
-                    "B · merging…".to_string()
-                } else {
-                    settings_text(Side::B, &load_draft(&session.mosaic.config))
-                }
-            }
+            Side::A => settings_text(Side::A, &self.a_settings(c)),
+            Side::B => match self.previews.state(roi.id, self.mosaic.members(), session) {
+                PreviewState::Merging => "B · merging…".to_string(),
+                PreviewState::OutOfDate => "B · out of date".to_string(),
+                PreviewState::UpToDate => settings_text(Side::B, &self.b_settings(session)),
+            },
         };
         let description = if c.peeking() {
             format!("Peeking while held: {text}")
@@ -330,7 +346,7 @@ impl SessionWindow {
         let label = CanvasLabel {
             corner,
             clip: viewport,
-            avoid: None,
+            avoid,
             name,
             color,
             controls: &controls,
@@ -344,5 +360,28 @@ impl SessionWindow {
             canvas_label(ui, ("roi-label", roi.id), &label),
             Some(selected),
         )
+    }
+
+    /// The settings side A of compare `c` was merged with, as its label
+    /// gives them: in a group view the group's own (the draft as it was,
+    /// with the group's override); in a composite, whose groups may each
+    /// override it, the draft as it was.
+    fn a_settings(&self, c: &crate::previews::Compare) -> BlendSettings {
+        match self.mosaic.members() {
+            [group] => c.a.get(group).map(|(key, _)| key.settings.clone()),
+            _ => None,
+        }
+        .unwrap_or_else(|| c.a_settings.clone())
+    }
+
+    /// The settings side B merges with now, as its label gives them: in a
+    /// group view the group's own ([`draft_for`]: the draft with the
+    /// group's override); in a composite, the draft.
+    fn b_settings(&self, session: &OpenSession) -> BlendSettings {
+        let cfg = &session.mosaic.config;
+        match self.mosaic.members() {
+            [group] => draft_for(cfg, group),
+            _ => load_draft(cfg),
+        }
     }
 }

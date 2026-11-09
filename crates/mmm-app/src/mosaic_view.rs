@@ -878,9 +878,21 @@ impl MosaicView {
     }
 
     /// The selected ROI's id.
-    #[cfg(test)]
     pub fn selected_roi(&self) -> Option<u64> {
         self.rois.selected
+    }
+
+    /// Select ROI `id`, as picking it in the list does, without going to
+    /// it (tests).
+    #[cfg(test)]
+    pub(crate) fn select_roi(&mut self, id: u64) {
+        self.rois.selected = Some(id);
+    }
+
+    /// The screen rect the viewer's own buttons took in its last frame
+    /// ([`TiledViewer::controls_rect`]).
+    pub fn controls_rect(&self) -> Option<egui::Rect> {
+        self.viewer.as_ref()?.controls_rect()
     }
 
     /// The stretch `group`'s result is drawn with (one entry per channel),
@@ -982,11 +994,13 @@ impl MosaicView {
         self.rois.want_sync = true;
     }
 
-    /// Make `draft` the merge settings draft, as an edit of the Merge
-    /// settings does ([`SettingsPanel::edit_draft`]): the window saves it
-    /// (debounced) once it takes the change.
-    pub fn edit_draft(&mut self, session: &mut OpenSession, draft: BlendSettings) {
-        self.settings.edit_draft(&mut session.mosaic.config, draft);
+    /// Put `draft` back as the merge settings draft, as an edit of the
+    /// Merge settings does, dropping feather text being typed
+    /// ([`SettingsPanel::restore_draft`]): the window saves it (debounced)
+    /// once it takes the change.
+    pub fn restore_draft(&mut self, session: &mut OpenSession, draft: BlendSettings) {
+        self.settings
+            .restore_draft(&mut session.mosaic.config, draft);
     }
 
     /// Whether the merge settings draft changed since the last call

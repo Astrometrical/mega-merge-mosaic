@@ -181,6 +181,12 @@ impl PatchTextures {
         self.entries.get(&(roi, side))?.image.clone()
     }
 
+    /// Whether ROI `roi` has a texture (drawn or kept) for `side` (tests).
+    #[cfg(test)]
+    pub fn has(&self, roi: u64, side: Side) -> bool {
+        self.entries.contains_key(&(roi, side))
+    }
+
     /// The side of ROI `roi` drawn last frame (tests).
     #[cfg(test)]
     pub fn drawn_side(&self, roi: u64) -> Option<Side> {
