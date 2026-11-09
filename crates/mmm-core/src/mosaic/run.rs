@@ -837,6 +837,16 @@ pub fn last_analyze_settings(cfg: &MosaicConfig, group: &str) -> Option<AnalyzeS
         .find_map(|e| serde_json::from_value(e.detail.get("groups")?.get(group)?.clone()).ok())
 }
 
+/// The index in `cfg.provenance` of the newest `"analyze"` entry that lists
+/// `group` (`None` if never analyzed). Provenance only grows, so the stamp
+/// moves exactly when the group is analyzed again: a cheap way to tell what
+/// analysis something made from the group (a transient preview) used.
+pub fn analysis_stamp(cfg: &MosaicConfig, group: &str) -> Option<usize> {
+    cfg.provenance.iter().rposition(|e| {
+        e.action == "analyze" && e.detail.get("groups").and_then(|g| g.get(group)).is_some()
+    })
+}
+
 /// Why a group's mosaic is out of date, as far as the provenance trail
 /// can tell (see [`out_of_date_reason`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

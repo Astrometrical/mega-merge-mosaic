@@ -12,12 +12,12 @@ use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::{Groups, affected_groups};
 use mmm_core::mosaic::{
     AnalyzeScope, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig,
-    PREVIEW_MAX_PIXELS, RESULT_FILE, SINGLE_GROUP, analyze_all, blend_group, commit_blend_settings,
-    invalidate_group, last_analyze_settings, last_merge_settings, mark_needs_analyze, plan_analyze,
-    plan_analyze_scoped, plan_analyze_with, plan_blend, plan_blend_with, plan_preview,
-    preview_downsample, run_analyze, run_blend, run_preview, set_analyze_settings,
-    set_blend_settings, set_group_override, set_inputs, set_inputs_affecting, set_settings,
-    settings_changed,
+    PREVIEW_MAX_PIXELS, RESULT_FILE, SINGLE_GROUP, analysis_stamp, analyze_all, blend_group,
+    commit_blend_settings, invalidate_group, last_analyze_settings, last_merge_settings,
+    mark_needs_analyze, plan_analyze, plan_analyze_scoped, plan_analyze_with, plan_blend,
+    plan_blend_with, plan_preview, preview_downsample, run_analyze, run_blend, run_preview,
+    set_analyze_settings, set_blend_settings, set_group_override, set_inputs, set_inputs_affecting,
+    set_settings, settings_changed,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -1295,6 +1295,40 @@ fn last_analyze_settings_is_per_group() {
         Some(m.config.settings_for("OIII").0)
     );
     assert_eq!(last_analyze_settings(&m.config, "Nope"), None);
+}
+
+#[test]
+fn the_analysis_stamp_moves_with_each_analysis_of_the_group() {
+    use serde_json::json;
+    let mut cfg = MosaicConfig::new(Vec::new());
+    assert_eq!(analysis_stamp(&cfg, "Ha"), None, "never analysed");
+    let both = json!({ "groups": { "Ha": {}, "OIII": {} } });
+    cfg.push_provenance("analyze", None, both);
+    cfg.push_provenance("blend", Some("Ha"), json!({ "whole": true }));
+    assert_eq!(analysis_stamp(&cfg, "Ha"), Some(0));
+    assert_eq!(analysis_stamp(&cfg, "OIII"), Some(0));
+    // A merge, or an analysis entry without the groups it analysed, moves
+    // nothing.
+    cfg.push_provenance("analyze", None, json!({ "n": 1 }));
+    assert_eq!(analysis_stamp(&cfg, "Ha"), Some(0));
+    // Ha alone analysed again: only its stamp moves.
+    cfg.push_provenance("analyze", None, json!({ "groups": { "Ha": {} } }));
+    assert_eq!(analysis_stamp(&cfg, "Ha"), Some(3));
+    assert_eq!(analysis_stamp(&cfg, "OIII"), Some(0));
+    assert_eq!(analysis_stamp(&cfg, "Nope"), None);
+}
+
+#[test]
+fn a_real_analysis_stamps_its_groups() {
+    let tmp = TempDir::new("analysis-stamp");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let first = analysis_stamp(&m.config, "Ha").expect("analysed");
+    assert_eq!(analysis_stamp(&m.config, "OIII"), Some(first));
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_eq!(analysis_stamp(&m.config, "Ha"), Some(first), "a merge");
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    assert!(analysis_stamp(&m.config, "Ha").unwrap() > first);
 }
 
 #[test]
