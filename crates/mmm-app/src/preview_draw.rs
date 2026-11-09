@@ -361,6 +361,7 @@ mod tests {
             height: h,
             channels,
             downsample,
+            coarse: downsample == 8,
             data: (0..n * channels as usize)
                 .map(|i| 0.1 + (i % 7) as f32 / 10.0)
                 .collect(),

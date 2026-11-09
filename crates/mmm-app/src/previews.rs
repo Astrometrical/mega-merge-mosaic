@@ -911,6 +911,7 @@ pub(crate) mod tests {
             height: 1,
             channels: 1,
             downsample: 1,
+            coarse: false,
             data: vec![0.5; n],
         }
     }

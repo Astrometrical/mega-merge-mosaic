@@ -48,7 +48,8 @@ pub use lock::{
 };
 
 pub use preview::{
-    PREVIEW_MAX_PIXELS, PreviewPatch, PreviewPlan, plan_preview, preview_downsample, run_preview,
+    PREVIEW_FULL_RES_MAX_PIXELS, PREVIEW_MAX_PIXELS, PreviewPatch, PreviewPlan, PreviewScale,
+    plan_preview, preview_scale, run_preview,
 };
 
 pub use run::{
