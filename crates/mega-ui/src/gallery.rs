@@ -27,11 +27,12 @@ use crate::theme::tokens::{DIALOG_WIDTH, radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, CanvasLabel, ChipMark, ChoiceChip, Dialog, LabelControl, ListEvent, ListRow,
-    ListState, MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast, Toasts,
-    canvas_label, chip, choice_chip, dialog_frame, footer, icon_button, notes_view,
-    ordered_list_with, overline, progress, property_grid, property_row, property_row_numeric,
-    property_row_ui, segmented, session_card, status, step_strip, submenu, text_input,
+    ButtonKind, CanvasLabel, ChipMark, ChoiceChip, Dialog, FooterButton, LabelControl, ListEvent,
+    ListRow, ListState, MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast,
+    Toasts, canvas_label, chip, choice_chip, dialog_frame, footer, footer_with, icon_button,
+    notes_view, ordered_list_with, overline, progress, property_grid, property_row,
+    property_row_numeric, property_row_ui, segmented, session_card, status, step_strip, submenu,
+    text_input,
 };
 
 /// Number of gallery pages: 0 tokens, 1 components, 2 imagery. Pages exist
@@ -912,12 +913,26 @@ fn sections(ui: &mut Ui, state: &mut GalleryState, page: Option<usize>) {
             dialog_frame().show(ui, |ui| {
                 dialog.contents(ui, |ui| {
                     ui.label("2 groups · 1 composite");
-                    footer(
+                    // Every footer kind, and a button that cannot be
+                    // pressed yet (it says why on hover).
+                    footer_with(
                         ui,
                         &[
-                            (ButtonKind::Quiet, "Cancel"),
-                            (ButtonKind::Danger, "Overwrite and export"),
-                            (ButtonKind::Primary, "Export"),
+                            FooterButton {
+                                kind: ButtonKind::Quiet,
+                                label: "Cancel",
+                                disabled: None,
+                            },
+                            FooterButton {
+                                kind: ButtonKind::Danger,
+                                label: "Overwrite and export",
+                                disabled: None,
+                            },
+                            FooterButton {
+                                kind: ButtonKind::Primary,
+                                label: "Export",
+                                disabled: Some("Checking the folder\u{2026}"),
+                            },
                         ],
                     );
                 });
