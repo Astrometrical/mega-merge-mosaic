@@ -531,9 +531,16 @@ fn copy_path_puts_path_on_clipboard() {
     let s = two_group_session(&root);
     let path = s.mosaic.config.panels[0].path.clone();
     let mut h = harness(s);
-    h.run();
+    // Background workers (previews) may keep asking for repaints, so step
+    // until what's needed is there rather than `run()` to idle.
+    h.run_steps(2);
     h.state_mut().view.select(Some(path.clone()));
-    h.run();
+    let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
+    while h.query_by_label("Copy path").is_none() {
+        assert!(std::time::Instant::now() < deadline, "no Copy path");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert_eq!(h.state().view.selected(), Some(path.as_path()));
     h.get_by_label("Copy path").click();
     let mut copied = Vec::new();
