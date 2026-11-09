@@ -64,10 +64,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{Color32, ColorImage, RichText};
-use mega_ui::canvas_layers::{Overlay, Tool};
+use mega_ui::canvas_layers::{CanvasBadge, Overlay, Tool};
 use mega_ui::plan::{Layer, PlacedItem, PlanCanvas};
-use mega_ui::theme::palette;
 use mega_ui::theme::tokens::space;
+use mega_ui::theme::{Tone, palette};
 use mmm_core::checks::{Severity, SolutionKind, is_accepted, panel_facts};
 use mmm_core::formats::InputPanel;
 use mmm_core::job::{CancelToken, JobCtl};
@@ -1015,6 +1015,7 @@ impl PlanView {
             Some(spec) => self.build_items(session, spec, feed),
             None => {
                 self.last_items.clear();
+                self.canvas.set_badges(Vec::new());
                 self.missing_layers = 0;
                 Vec::new()
             }
@@ -1536,16 +1537,15 @@ impl PlanView {
         feed: &PlanFeed<'_>,
     ) -> Vec<PlacedItem> {
         let cfg = &session.mosaic.config;
-        let flagged: BTreeSet<&PathBuf> = feed
-            .checks
-            .map(|r| {
-                r.checks
-                    .iter()
-                    .filter(|c| c.severity == Severity::Problem && !is_accepted(cfg, c))
-                    .flat_map(|c| c.panels.iter())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut flagged: BTreeMap<&PathBuf, u32> = BTreeMap::new();
+        for c in feed.checks.map(|r| r.checks.as_slice()).unwrap_or_default() {
+            if c.severity == Severity::Problem && !is_accepted(cfg, c) {
+                for p in &c.panels {
+                    *flagged.entry(p).or_default() += 1;
+                }
+            }
+        }
+        let mut badges = Vec::new();
         let ids: HashMap<&PathBuf, usize> = cfg
             .panels
             .iter()
@@ -1599,7 +1599,8 @@ impl PlanView {
                 let Some(&id) = ids.get(&path) else {
                     continue;
                 };
-                let flag = flagged.contains(&path);
+                let problems = flagged.get(&path).copied().unwrap_or(0);
+                let flag = problems > 0;
                 let outline = if flag {
                     palette::HA_500
                 } else {
@@ -1614,19 +1615,32 @@ impl PlanView {
                     label: number.to_string(),
                     highlighted,
                 });
+                if flag {
+                    // At the panel's top-right corner, constant size on screen.
+                    badges.push(CanvasBadge {
+                        id: id as u64,
+                        at: [rect[2], rect[1]],
+                        tone: Tone::Problem,
+                        count: problems,
+                        description: format!(
+                            "{problems} problem{} here",
+                            if problems == 1 { "" } else { "s" }
+                        ),
+                    });
+                }
                 items.push(PlacedItem {
                     id: id as u64,
                     rect,
                     layers: drawn,
                     outline,
                     label: number.to_string(),
-                    marker: flag.then_some(palette::HA_500),
                     selected: self.selected.as_ref() == Some(&path),
                     highlighted,
                 });
             }
         }
         self.last_items = snaps;
+        self.canvas.set_badges(badges);
         items
     }
 

@@ -245,6 +245,7 @@ impl SessionWindow {
                     selected: self.view.as_ref() == Some(&view),
                     dashed: false,
                     mark: mark_of(session, std::slice::from_ref(g)),
+                    problems: None,
                 };
                 let r = chip(ui, c).on_hover_text(&hint);
                 if r.clicked() {
@@ -273,6 +274,7 @@ impl SessionWindow {
                     selected: self.view.as_ref() == Some(&view),
                     dashed: true,
                     mark: mark_of(session, &view_members(&view, &compositions_of(session))),
+                    problems: None,
                 };
                 if chip(ui, c).on_hover_text(&hint).clicked() {
                     act.view = Some(view);
@@ -284,6 +286,7 @@ impl SessionWindow {
                 selected: false,
                 dashed: false,
                 mark: None,
+                problems: None,
             };
             let r = chip(ui, plus).on_hover_text(NEW_COMPOSITE);
             let open = plus_popover(&r, session, groups, act);
@@ -313,6 +316,7 @@ impl SessionWindow {
                 selected: on,
                 dashed: false,
                 mark: None,
+                problems: None,
             };
             let r = choice_chip(ui, &chip);
             widths.push(r.rect.width());

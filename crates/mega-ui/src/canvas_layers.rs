@@ -1,6 +1,7 @@
 //! What the tiled viewer and the plan canvas share for drawing over their
 //! content: [`Overlay`] rectangles, image [`Patch`]es, the in-progress
-//! rectangle of [`Tool::DrawRect`] (with its pointer, [`DRAW_CURSOR`]), and
+//! rectangle of [`Tool::DrawRect`] (with its pointer, [`DRAW_CURSOR`]),
+//! [`Polyline`]s and [`CanvasBadge`]s (counts that click), and
 //! the one function that paints them all (`paint_layers`); and a press held
 //! on either canvas ([`Hold`]).
 
@@ -8,8 +9,9 @@ use egui::{
     Align2, Color32, Pos2, Rect, Shape, Stroke, StrokeKind, TextStyle, TextureHandle, Vec2,
 };
 
-use crate::theme::palette;
-use crate::theme::tokens::space;
+use crate::icons;
+use crate::theme::tokens::{BADGE_HEIGHT, BADGE_PAD, LINE_DASH, space};
+use crate::theme::{Tone, palette};
 
 /// Stroke width of an overlay rectangle, in points.
 const OVERLAY_STROKE: f32 = 1.5;
@@ -59,6 +61,40 @@ pub struct Overlay {
     pub label: String,
     /// Dashed rather than solid outline.
     pub dashed: bool,
+}
+
+/// A polyline drawn over a canvas (a seam, say), in canvas coordinates,
+/// painted with the [`Overlay`]s and clipped to the viewport.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Polyline {
+    /// The vertices, `[x, y]` in canvas coordinates.
+    pub points: Vec<[f64; 2]>,
+    /// Stroke colour.
+    pub color: Color32,
+    /// Stroke width in points (a [`crate::theme::tokens::LINE_WIDTH`]).
+    pub width: f32,
+    /// Dashed rather than solid.
+    pub dashed: bool,
+}
+
+/// A count of something at a canvas point: a pill with the tone's icon and
+/// the count, drawn after the overlays at a constant size on screen
+/// (however far the canvas is zoomed), centred on `at`. Each badge is a
+/// button, reachable by keyboard and clickable; the canvas's response
+/// reports it as `badge_clicked`. The icon always comes with the colour.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasBadge {
+    /// Caller's identifier, reported back as `badge_clicked`.
+    pub id: u64,
+    /// Where the badge sits, `[x, y]` in canvas coordinates.
+    pub at: [f64; 2],
+    /// Its tone: the icon, and the colour of the icon and the outline.
+    pub tone: Tone,
+    /// The number shown beside the icon.
+    pub count: u32,
+    /// What it says to assistive technology and on hover ("2 problems
+    /// here").
+    pub description: String,
 }
 
 /// The primary button held down on a canvas (pressed there with the
@@ -156,7 +192,8 @@ pub struct Patch {
     pub texture: TextureHandle,
 }
 
-/// Paint `patches`, then `overlays`, then the rectangle being drawn, onto
+/// Paint `patches`, then `overlays`, then `lines`, then the rectangle being
+/// drawn, onto
 /// `painter` (which clips to the viewport `viewport`). `to_screen` maps a
 /// canvas rect to the screen.
 pub(crate) fn paint_layers(
@@ -165,6 +202,7 @@ pub(crate) fn paint_layers(
     to_screen: &dyn Fn([f64; 4]) -> Rect,
     patches: &[Patch],
     overlays: &[Overlay],
+    lines: &[Polyline],
     drawing: Option<[f64; 4]>,
 ) {
     for p in patches {
@@ -220,6 +258,7 @@ pub(crate) fn paint_layers(
             );
         }
     }
+    paint_lines(painter, viewport, to_screen, lines);
     if let Some(r) = drawing {
         painter.rect_stroke(
             to_screen(r),
@@ -282,4 +321,177 @@ pub(crate) fn follow_draw(
 /// The corners of a rect in progress as `[x0, y0, x1, y1]`.
 pub(crate) fn drawing_rect(d: Option<Corners>) -> Option<[f64; 4]> {
     d.map(|(a, b)| [a.0, a.1, b.0, b.1])
+}
+
+/// Paint `lines` (clipped to `viewport`; a dashed line keeps its dash phase
+/// from its own start however it is panned).
+fn paint_lines(
+    painter: &egui::Painter,
+    viewport: Rect,
+    to_screen: &dyn Fn([f64; 4]) -> Rect,
+    lines: &[Polyline],
+) {
+    for line in lines {
+        let pts: Vec<Pos2> = line
+            .points
+            .iter()
+            .map(|p| to_screen([p[0], p[1], p[0], p[1]]).min)
+            .collect();
+        if pts.len() < 2 {
+            continue;
+        }
+        let stroke = Stroke::new(line.width, line.color);
+        let clip = viewport.expand(line.width);
+        if !Rect::from_points(&pts).intersects(clip) {
+            continue;
+        }
+        if line.dashed {
+            let mut walked = 0.0;
+            for pair in pts.windows(2) {
+                let len = (pair[1] - pair[0]).length();
+                dash_segment(painter, pair[0], pair[1], walked, clip, stroke);
+                walked += len;
+            }
+        } else {
+            painter.add(Shape::line(pts, stroke));
+        }
+    }
+}
+
+/// The dashes of the segment `a`-`b`, which starts `walked` points into its
+/// polyline, that fall inside `clip`.
+fn dash_segment(
+    painter: &egui::Painter,
+    a: Pos2,
+    b: Pos2,
+    walked: f32,
+    clip: Rect,
+    stroke: Stroke,
+) {
+    let len = (b - a).length();
+    let Some((t0, t1)) = clip_params(a, b, clip) else {
+        return;
+    };
+    if len <= 0.0 {
+        return;
+    }
+    let (dash, gap) = LINE_DASH;
+    let period = dash + gap;
+    let (s0, s1) = (t0 * len, t1 * len);
+    let mut start = ((walked + s0) / period).floor() * period - walked;
+    while start < s1 {
+        let (from, to) = (start.max(s0), (start + dash).min(s1));
+        if to > from {
+            painter.add(Shape::line_segment(
+                [a.lerp(b, from / len), a.lerp(b, to / len)],
+                stroke,
+            ));
+        }
+        start += period;
+    }
+}
+
+/// The part of the segment `a`-`b`, as parameters in `0..=1`, inside
+/// `clip` (Liang-Barsky), if any.
+fn clip_params(a: Pos2, b: Pos2, clip: Rect) -> Option<(f32, f32)> {
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0_f32, 1.0_f32);
+    for (p, q) in [
+        (-d.x, a.x - clip.min.x),
+        (d.x, clip.max.x - a.x),
+        (-d.y, a.y - clip.min.y),
+        (d.y, clip.max.y - a.y),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    (t0 < t1).then_some((t0, t1))
+}
+
+/// Show `badges` over the canvas filling `viewport`: each is a pill at its
+/// canvas point, centred, at its constant size, and a button of its own
+/// (above the canvas's own press, so a press on one never starts a pan),
+/// with focus ring and accessible description. `to_screen` maps a canvas
+/// rect to the screen. Returns the id of the badge clicked (or activated
+/// with Enter or Space) this frame. Call after the canvas has painted and
+/// before the controls drawn over it.
+pub(crate) fn show_badges(
+    ui: &mut egui::Ui,
+    viewport: Rect,
+    to_screen: &dyn Fn([f64; 4]) -> Rect,
+    badges: &[CanvasBadge],
+) -> Option<u64> {
+    let painter = ui.painter_at(viewport);
+    let font = TextStyle::Small.resolve(ui.style());
+    let mut clicked = None;
+    for badge in badges {
+        let at = to_screen([badge.at[0], badge.at[1], badge.at[0], badge.at[1]]).min;
+        let icon = painter.layout_no_wrap(
+            badge.tone.icon().unwrap_or(icons::INFO).to_string(),
+            icons::font(font.size),
+            badge.tone.color(),
+        );
+        let count =
+            painter.layout_no_wrap(badge.count.to_string(), font.clone(), palette::TEXT_STRONG);
+        let width =
+            (icon.size().x + space::XS + count.size().x + 2.0 * BADGE_PAD).max(BADGE_HEIGHT);
+        let pill = Rect::from_center_size(at, Vec2::new(width, BADGE_HEIGHT));
+        let visible = pill.intersect(viewport);
+        if visible.width() <= 0.0 || visible.height() <= 0.0 {
+            continue;
+        }
+        let id = ui.id().with(("mega-ui-canvas-badge", badge.id));
+        // Click and drag, so a drag that starts on a badge is the badge's
+        // and does not pan the canvas under it.
+        let response = ui.interact(visible, id, egui::Sense::click_and_drag());
+        let corner = (BADGE_HEIGHT / 2.0) as u8;
+        let outline = if response.hovered() || response.has_focus() {
+            palette::TEXT_STRONG
+        } else {
+            badge.tone.color()
+        };
+        painter.rect(
+            pill,
+            egui::CornerRadius::same(corner),
+            palette::SURFACE_900,
+            Stroke::new(1.5, outline),
+            StrokeKind::Inside,
+        );
+        let left = pill.left() + BADGE_PAD;
+        painter.galley(
+            Pos2::new(left, pill.center().y - icon.size().y / 2.0),
+            icon.clone(),
+            badge.tone.color(),
+        );
+        painter.galley(
+            Pos2::new(
+                left + icon.size().x + space::XS,
+                pill.center().y - count.size().y / 2.0,
+            ),
+            count,
+            palette::TEXT_STRONG,
+        );
+        crate::widgets::button::focus_ring(ui, &response, corner);
+        let label = badge.description.clone();
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone())
+        });
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(&badge.description);
+        if response.clicked() {
+            clicked = Some(badge.id);
+        }
+    }
+    clicked
 }

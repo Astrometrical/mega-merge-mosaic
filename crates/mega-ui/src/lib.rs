@@ -42,4 +42,27 @@ pub(crate) mod testutil {
         }
         ready
     }
+
+    /// Whether any shape strokes a line with `color` at `width`.
+    pub fn has_stroke(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+        width: f32,
+    ) -> bool {
+        use egui::epaint::ColorMode;
+        fn hit(s: &egui::Shape, color: egui::Color32, width: f32) -> bool {
+            match s {
+                egui::Shape::Path(p) => {
+                    matches!(&p.stroke.color, ColorMode::Solid(c) if *c == color)
+                        && (p.stroke.width - width).abs() < 1e-3
+                }
+                egui::Shape::LineSegment { stroke, .. } => {
+                    stroke.color == color && (stroke.width - width).abs() < 1e-3
+                }
+                egui::Shape::Vec(v) => v.iter().any(|s| hit(s, color, width)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|c| hit(&c.shape, color, width))
+    }
 }

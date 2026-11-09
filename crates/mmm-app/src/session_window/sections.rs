@@ -23,7 +23,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use mega_ui::checks::{CheckAction, CheckItem, checks_list};
+use mega_ui::checks::{CheckAction, CheckItem, ListMode, checks_list};
 use mega_ui::inspector::{Badge, Section, inspector_with_shortcut};
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
@@ -243,6 +243,7 @@ fn check_items<'r>(
                 detail: String::new(),
                 accepted: false,
                 acceptable: false,
+                goes_somewhere: false,
             });
             sources.push(None);
         }
@@ -258,6 +259,7 @@ fn check_items<'r>(
             detail: c.remedy.clone().unwrap_or_default(),
             accepted: is_accepted(cfg, c),
             acceptable: c.severity != Severity::Passed,
+            goes_somewhere: false,
         });
         sources.push(Some(c));
     }
@@ -273,8 +275,13 @@ fn list(
     sources: &[Option<&Check>],
     accept: &mut Vec<Check>,
 ) {
-    for CheckAction::Accept(i) in checks_list(ui, heading, items, None) {
-        if let Some(Some(c)) = sources.get(i) {
+    // The flat list for now (the old "See all checks" toggle filters it).
+    // Un-accept and Open have no handler yet: no row sets `goes_somewhere`
+    // and the grouped `ListMode::All` (which offers Un-accept) is not used.
+    for action in checks_list(ui, heading, items, ListMode::Problems) {
+        if let CheckAction::Accept(i) = action
+            && let Some(Some(c)) = sources.get(i)
+        {
             accept.push((*c).clone());
         }
     }

@@ -28,8 +28,8 @@ use egui::{
 use super::cache::{DEFAULT_CAPACITY, TileCache};
 use super::{Fetched, PyramidGeometry, TileKey, TileSource, View, pick_level, visible_tiles};
 use crate::canvas_layers::{
-    DrawStep, Hold, Overlay, Patch, Pressed, Tool, drawing_rect, follow_draw, follow_hold,
-    paint_layers, pointer_over, show_tool_cursor,
+    CanvasBadge, DrawStep, Hold, Overlay, Patch, Polyline, Pressed, Tool, drawing_rect,
+    follow_draw, follow_hold, paint_layers, pointer_over, show_badges, show_tool_cursor,
 };
 use crate::theme::palette;
 
@@ -54,6 +54,9 @@ pub struct ViewerResponse {
     /// [`Tool::Navigate`] (none in presentation mode), in image
     /// coordinates.
     pub held: Option<Hold>,
+    /// A badge clicked (or activated from the keyboard) this frame: its
+    /// [`CanvasBadge::id`].
+    pub badge_clicked: Option<u64>,
 }
 
 /// Tint a tile is drawn with: white for `Valid`, ~55% grey for `Stale`,
@@ -242,6 +245,8 @@ pub struct TiledViewer {
     drawing: Option<((f64, f64), (f64, f64))>,
     overlays: Vec<Overlay>,
     patches: Vec<Patch>,
+    lines: Vec<Polyline>,
+    badges: Vec<CanvasBadge>,
     /// See [`TiledViewer::set_presentation`].
     presentation: bool,
     /// See [`TiledViewer::set_opacity`].
@@ -285,6 +290,8 @@ impl TiledViewer {
             drawing: None,
             overlays: Vec::new(),
             patches: Vec::new(),
+            lines: Vec::new(),
+            badges: Vec::new(),
             presentation: false,
             opacity: 1.0,
             drawn_any: false,
@@ -410,6 +417,19 @@ impl TiledViewer {
         self.patches = patches;
     }
 
+    /// Replace the polylines drawn over the items, with the overlays
+    /// (canvas coordinates).
+    pub fn set_lines(&mut self, lines: Vec<Polyline>) {
+        self.lines = lines;
+    }
+
+    /// Replace the badges drawn over everything else (canvas coordinates;
+    /// constant size on screen). A click or Enter on one is reported as
+    /// `badge_clicked`.
+    pub fn set_badges(&mut self, badges: Vec<CanvasBadge>) {
+        self.badges = badges;
+    }
+
     /// Viewport rect and `ui.input().time` of the last frame shown, for
     /// mapping between screen and image with [`TiledViewer::view`].
     pub fn last_frame(&self) -> Option<(Rect, f64)> {
@@ -492,6 +512,18 @@ impl TiledViewer {
         let backlog = self.receive(ui.ctx(), generation);
         self.paint(&ui.painter_at(rect), rect, now, generation);
         self.paint_overlays(&ui.painter_at(rect), rect, now);
+        let badge_clicked = if self.presentation {
+            None
+        } else {
+            let view = &self.view;
+            let screen = |r: [f64; 4]| {
+                Rect::from_two_pos(
+                    view.image_to_screen((r[0], r[1]), rect, now),
+                    view.image_to_screen((r[2], r[3]), rect, now),
+                )
+            };
+            show_badges(ui, rect, &screen, &self.badges)
+        };
         self.controls = None;
         if !self.presentation {
             self.overlay_buttons(ui, rect);
@@ -507,6 +539,7 @@ impl TiledViewer {
                 .map(|p| self.view.screen_to_image(p, rect, now)),
             drawn_rect,
             held,
+            badge_clicked,
         }
     }
 
@@ -599,6 +632,7 @@ impl TiledViewer {
             &screen,
             &self.patches,
             &self.overlays,
+            &self.lines,
             drawing_rect(self.drawing),
         );
     }

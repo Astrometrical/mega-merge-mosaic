@@ -45,7 +45,6 @@ fn item(id: u64, rect: [f64; 4]) -> PlacedItem {
         layers: Vec::new(),
         outline: palette::ACCENT_500,
         label: format!("{id}"),
-        marker: None,
         selected: false,
         highlighted: false,
     }
@@ -726,4 +725,189 @@ fn a_press_on_the_plans_buttons_is_no_hold() {
     assert!(held(&h).is_some());
     h.drop_at(at);
     h.run();
+}
+
+// ---- badges and lines ----
+
+use crate::canvas_layers::{CanvasBadge, Polyline};
+use crate::theme::Tone;
+
+/// A themed harness (badges draw icons) over a 1000 x 1000 extent.
+fn themed_harness() -> Harness<'static, State> {
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if crate::testutil::themed(ui) {
+                    let r = s
+                        .canvas
+                        .show(ui, s.extent, &s.items, s.outlines, s.outlines);
+                    s.log.push(r);
+                }
+            },
+            State {
+                canvas: PlanCanvas::new(),
+                extent: [0.0, 0.0, 1000.0, 1000.0],
+                items: vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+                log: Vec::new(),
+                outlines: true,
+            },
+        )
+}
+
+fn warning_badge(id: u64, at: [f64; 2], count: u32) -> CanvasBadge {
+    CanvasBadge {
+        id,
+        at,
+        tone: Tone::Warning,
+        count,
+        description: format!("{count} problems here"),
+    }
+}
+
+fn painted_text(h: &Harness<'_, State>) -> String {
+    fn walk(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => out.push_str(t.galley.text()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    for c in &h.output().shapes {
+        walk(&c.shape, &mut out);
+    }
+    out
+}
+
+fn badge_button<'a>(h: &'a Harness<'static, State>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.get_by_role_and_label(egui::accesskit::Role::Button, label)
+}
+
+#[test]
+fn a_badge_shows_icon_and_count_and_clicks() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [500.0, 500.0], 2)]);
+    h.run();
+    let text = painted_text(&h);
+    assert!(
+        text.contains(crate::icons::TRIANGLE_ALERT),
+        "the tone's icon"
+    );
+    assert!(text.contains('2'), "the count");
+    h.state_mut().log.clear();
+    badge_button(&h, "2 problems here").click();
+    h.run();
+    let log = &h.state().log;
+    assert!(
+        log.iter().any(|r| r.badge_clicked == Some(7)),
+        "{:?}",
+        log.iter().map(|r| r.badge_clicked).collect::<Vec<_>>()
+    );
+    assert!(
+        log.iter().all(|r| r.clicked.is_none() && !r.clicked_empty),
+        "the canvas saw no click"
+    );
+}
+
+#[test]
+fn a_focused_badge_activates_with_enter() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(9, [300.0, 300.0], 1)]);
+    h.run();
+    badge_button(&h, "1 problems here").focus();
+    h.run();
+    h.state_mut().log.clear();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert!(
+        h.state().log.iter().any(|r| r.badge_clicked == Some(9)),
+        "Enter on the focused badge clicks it"
+    );
+}
+
+#[test]
+fn a_press_on_a_badge_does_not_pan() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [500.0, 500.0], 2)]);
+    h.run();
+    let centre = |h: &Harness<'_, State>| {
+        let (_, now) = h.state().canvas.last_frame().unwrap();
+        h.state().canvas.view().centre(now)
+    };
+    let before = centre(&h);
+    let p = badge_button(&h, "2 problems here").rect().center();
+    h.hover_at(p);
+    h.drag_at(p);
+    h.hover_at(p + Vec2::new(80.0, 40.0));
+    h.run();
+    h.event(egui::Event::PointerButton {
+        pos: p + Vec2::new(80.0, 40.0),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run();
+    assert_eq!(centre(&h), before, "the view stayed put");
+}
+
+#[test]
+fn badges_keep_their_screen_size_when_zooming() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [500.0, 500.0], 2)]);
+    h.run();
+    let before = badge_button(&h, "2 problems here").rect();
+    h.state_mut().canvas.zoom_to([400.0, 400.0, 600.0, 600.0]);
+    h.run();
+    let after = badge_button(&h, "2 problems here").rect();
+    assert!(before.width() > 8.0 && before.height() > 8.0, "{before:?}");
+    assert!((before.width() - after.width()).abs() < 0.01);
+    assert!((before.height() - after.height()).abs() < 0.01);
+}
+
+#[test]
+fn polylines_paint_on_both_canvases() {
+    let solid = egui::Color32::from_rgb(11, 22, 33);
+    let dashed = egui::Color32::from_rgb(44, 55, 66);
+    let lines = vec![
+        Polyline {
+            points: vec![[100.0, 100.0], [500.0, 300.0], [900.0, 100.0]],
+            color: solid,
+            width: 3.0,
+            dashed: false,
+        },
+        Polyline {
+            points: vec![[100.0, 900.0], [900.0, 900.0]],
+            color: dashed,
+            width: 2.5,
+            dashed: true,
+        },
+    ];
+    let mut h = themed_harness();
+    h.state_mut().canvas.set_lines(lines.clone());
+    h.run();
+    assert!(
+        crate::testutil::has_stroke(&h.output().shapes, solid, 3.0),
+        "solid, plan"
+    );
+    assert!(
+        crate::testutil::has_stroke(&h.output().shapes, dashed, 2.5),
+        "dashed, plan"
+    );
+    h.state_mut().canvas.set_lines(Vec::new());
+    h.run();
+    assert!(
+        !crate::testutil::has_stroke(&h.output().shapes, solid, 3.0),
+        "cleared"
+    );
 }

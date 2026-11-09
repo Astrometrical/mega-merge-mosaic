@@ -1453,3 +1453,92 @@ fn the_wheel_and_the_readout_work_over_a_label() {
     assert_eq!(centre_zoom(&h.state().viewer).0, c0);
     assert!(h.state().log.iter().all(|r| r.held.is_none()));
 }
+
+/// A themed viewer harness that logs every response.
+struct Logged {
+    viewer: TiledViewer,
+    log: Vec<ViewerResponse>,
+}
+
+fn logged_harness(viewer: TiledViewer) -> Harness<'static, Logged> {
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut Logged| {
+                if crate::testutil::themed(ui) {
+                    let r = s.viewer.show(ui);
+                    s.log.push(r);
+                }
+            },
+            Logged {
+                viewer,
+                log: Vec::new(),
+            },
+        )
+}
+
+#[test]
+fn polylines_paint_on_both_canvases() {
+    use crate::canvas_layers::Polyline;
+    let solid = Color32::from_rgb(11, 22, 33);
+    let dashed = Color32::from_rgb(44, 55, 66);
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = logged_harness(TiledViewer::new_synchronous(src));
+    h.state_mut().viewer.set_lines(vec![
+        Polyline {
+            points: vec![[1000.0, 1000.0], [5000.0, 3000.0], [9000.0, 1000.0]],
+            color: solid,
+            width: 3.0,
+            dashed: false,
+        },
+        Polyline {
+            points: vec![[1000.0, 9000.0], [9000.0, 9000.0]],
+            color: dashed,
+            width: 2.5,
+            dashed: true,
+        },
+    ]);
+    h.run();
+    assert!(
+        crate::testutil::has_stroke(&h.output().shapes, solid, 3.0),
+        "solid, viewer"
+    );
+    assert!(
+        crate::testutil::has_stroke(&h.output().shapes, dashed, 2.5),
+        "dashed, viewer"
+    );
+}
+
+#[test]
+fn a_badge_on_the_viewer_clicks_and_keeps_its_size() {
+    use crate::canvas_layers::CanvasBadge;
+    use crate::theme::Tone;
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = logged_harness(TiledViewer::new_synchronous(src));
+    h.state_mut().viewer.set_badges(vec![CanvasBadge {
+        id: 3,
+        at: [10_000.0, 5_000.0],
+        tone: Tone::Problem,
+        count: 4,
+        description: "4 problems here".to_owned(),
+    }]);
+    h.run();
+    let node = |h: &Harness<'static, Logged>| {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "4 problems here")
+            .rect()
+    };
+    let before = node(&h);
+    h.state_mut().log.clear();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "4 problems here")
+        .click();
+    h.run();
+    assert!(h.state().log.iter().any(|r| r.badge_clicked == Some(3)));
+    h.state_mut()
+        .viewer
+        .zoom_to_rect([9000.0, 4000.0, 11000.0, 6000.0]);
+    h.run();
+    let after = node(&h);
+    assert!((before.width() - after.width()).abs() < 0.01);
+    assert!((before.height() - after.height()).abs() < 0.01);
+}

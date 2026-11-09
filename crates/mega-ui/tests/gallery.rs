@@ -29,6 +29,7 @@ fn gallery_renders_every_section() {
         "Notes for the selected region show here.",
         "STATUS",
         "CHECK LIST",
+        "CHECK LIST · ALL",
         "PROPERTY GRID",
         "PROGRESS",
         "TOASTS",

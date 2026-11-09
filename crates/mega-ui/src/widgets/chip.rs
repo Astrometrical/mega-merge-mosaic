@@ -85,6 +85,10 @@ pub struct ChoiceChip<'a> {
     pub dashed: bool,
     /// A state glyph after the label (see [`ChipMark`]).
     pub mark: Option<ChipMark>,
+    /// How many unaccepted problems the choice has: the warning icon and
+    /// the count after the label (and any mark); none (or zero) draws
+    /// nothing. The accessible description gains "{n} problem(s)".
+    pub problems: Option<u32>,
 }
 
 /// A chip's state: what needs the user's attention. Drawn as its tone's
@@ -178,14 +182,31 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
     });
     let galley = ui
         .painter()
-        .layout_no_wrap(chip.label.to_owned(), font, text_color);
+        .layout_no_wrap(chip.label.to_owned(), font.clone(), text_color);
     let dot = if chip.color.is_some() {
         DOT + space::XS
     } else {
         0.0
     };
     let mark = glyph.as_ref().map_or(0.0, |g| space::XS + g.size().x);
-    let size = Vec2::new(galley.size().x + 2.0 * PAD + dot + mark, HEIGHT);
+    // The problem count: the warning icon, then the number.
+    let problems = chip.problems.filter(|n| *n > 0);
+    let tone = Tone::Warning;
+    let count = problems.map(|n| {
+        let icon = ui.painter().layout_no_wrap(
+            tone.icon().unwrap_or(icons::INFO).to_string(),
+            icons::font(font.size),
+            tone.color(),
+        );
+        let n = ui
+            .painter()
+            .layout_no_wrap(n.to_string(), font.clone(), text_color);
+        (icon, n)
+    });
+    let counted = count
+        .as_ref()
+        .map_or(0.0, |(i, n)| space::S + i.size().x + space::XS + n.size().x);
+    let size = Vec2::new(galley.size().x + 2.0 * PAD + dot + mark + counted, HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if chip.selected { BORDER } else { SURFACE_700 };
@@ -221,25 +242,45 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
         let pos = egui::pos2(x, rect.center().y - galley.size().y / 2.0);
         let text_width = galley.size().x;
         p.galley(pos, galley, text_color);
+        let mut end = x + text_width;
         if let (Some(m), Some(g)) = (chip.mark, glyph) {
-            let pos = egui::pos2(
-                x + text_width + space::XS,
-                rect.center().y - g.size().y / 2.0,
-            );
+            let pos = egui::pos2(end + space::XS, rect.center().y - g.size().y / 2.0);
+            end = pos.x + g.size().x;
             p.galley(pos, g, m.color());
+        }
+        if let Some((icon, n)) = count {
+            let at = end + space::S;
+            let icon_pos = egui::pos2(at, rect.center().y - icon.size().y / 2.0);
+            let n_pos = egui::pos2(
+                at + icon.size().x + space::XS,
+                rect.center().y - n.size().y / 2.0,
+            );
+            p.galley(icon_pos, icon, tone.color());
+            p.galley(n_pos, n, text_color);
         }
     }
     super::button::focus_ring(ui, &response, (HEIGHT / 2.0) as u8);
     let (selected, label) = (chip.selected, chip.label);
     response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, label));
-    match chip.mark {
-        Some(m) => {
-            ui.ctx().accesskit_node_builder(response.id, |node| {
-                node.set_description(m.description());
-            });
-            // The state in words; hover text the caller adds stacks below.
-            response.on_hover_text(m.label())
-        }
-        None => response,
-    }
+    let problems_said = problems.map(|n| format!("{n} problem{}", if n == 1 { "" } else { "s" }));
+    let description = match (chip.mark, &problems_said) {
+        (Some(m), Some(p)) => Some(format!("{}, {p}", m.description())),
+        (Some(m), None) => Some(m.description().to_owned()),
+        (None, Some(p)) => Some(p.clone()),
+        (None, None) => None,
+    };
+    let Some(description) = description else {
+        return response;
+    };
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_description(description);
+    });
+    // The state in words; hover text the caller adds stacks below.
+    let hover = match (chip.mark, problems_said) {
+        (Some(m), Some(p)) => format!("{}, {p}", m.label()),
+        (Some(m), None) => m.label().to_owned(),
+        (None, Some(p)) => p,
+        (None, None) => unreachable!("a description implies a state"),
+    };
+    response.on_hover_text(hover)
 }

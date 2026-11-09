@@ -12,8 +12,8 @@ use egui::{
 };
 
 use crate::brand::{self, BrandImages, LockupSize};
-use crate::canvas_layers::{Overlay, Patch};
-use crate::checks::{CheckItem, checks_list};
+use crate::canvas_layers::{CanvasBadge, Overlay, Patch, Polyline};
+use crate::checks::{CheckAction, CheckItem, ListMode, checks_list};
 use crate::groups::GROUP_PALETTE;
 use crate::hero::{HeroStage, HeroView};
 use crate::icons;
@@ -23,7 +23,7 @@ use crate::starfield::Starfield;
 use crate::table::{self, TableEvent, TableState, sectioned_table};
 use crate::theme::palette::*;
 use crate::theme::text::{Type, text};
-use crate::theme::tokens::{DIALOG_WIDTH, radius, space};
+use crate::theme::tokens::{DIALOG_WIDTH, LINE_WIDTH, radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
@@ -44,7 +44,7 @@ pub const PAGES: usize = 3;
 /// test and the snapshots render each page at this size; grow it when a
 /// section is added (a page must stay under 4096 points tall).
 pub fn page_size(page: usize) -> Vec2 {
-    Vec2::new(1200.0, [1340.0, 2400.0, 1600.0][page])
+    Vec2::new(1200.0, [1400.0, 2800.0, 1600.0][page])
 }
 
 /// The gallery's interactive state.
@@ -57,6 +57,7 @@ pub struct GalleryState {
     table: TableState,
     table_selection: BTreeSet<u64>,
     checks: Vec<CheckItem>,
+    all_checks: Vec<CheckItem>,
     toasts: Toasts,
     brand: Option<BrandImages>,
     starfield: Starfield,
@@ -93,6 +94,7 @@ impl Default for GalleryState {
                     .into(),
                 accepted: false,
                 acceptable: true,
+                goes_somewhere: false,
             },
             CheckItem {
                 severity: Severity::Note,
@@ -100,6 +102,7 @@ impl Default for GalleryState {
                 detail: "May show as seams. Consider gradient removal before merging.".into(),
                 accepted: false,
                 acceptable: false,
+                goes_somewhere: false,
             },
         ];
         checks.extend((1..=41).map(|i| CheckItem {
@@ -108,6 +111,7 @@ impl Default for GalleryState {
             detail: String::new(),
             accepted: false,
             acceptable: false,
+            goes_somewhere: false,
         }));
         GalleryState {
             segment: 0,
@@ -129,6 +133,7 @@ Panel 7: gradient in the lower left, redo DBE."
             },
             table_selection: BTreeSet::from([8]),
             checks,
+            all_checks: all_checks(),
             toasts: Toasts::default(),
             brand: None,
             starfield: Starfield::new(7),
@@ -262,6 +267,49 @@ fn gallery_hero(size: [usize; 2], grid: [usize; 2]) -> HeroStage {
     stage
 }
 
+/// The items of the "all checks" list: every group, rows that lead to
+/// their place, and an accepted problem to take back.
+fn all_checks() -> Vec<CheckItem> {
+    let item = |severity, title: &str, detail: &str, accepted, acceptable| CheckItem {
+        severity,
+        title: title.into(),
+        detail: detail.into(),
+        accepted,
+        acceptable,
+        goes_somewhere: severity != Severity::Passed,
+    };
+    vec![
+        item(
+            Severity::Problem,
+            "Hole in the coverage near panels 4 and 7",
+            "Add a panel there or accept the gap.",
+            false,
+            true,
+        ),
+        item(
+            Severity::Problem,
+            "Panels 2 and 3 overlap by only 90 px",
+            "Too thin to match their levels.",
+            true,
+            true,
+        ),
+        item(
+            Severity::Note,
+            "OIII 13–15: strong background gradient",
+            "May show as seams.",
+            false,
+            false,
+        ),
+        item(
+            Severity::Passed,
+            "No distortion model: accepted for pre-aligned panels",
+            "",
+            false,
+            false,
+        ),
+    ]
+}
+
 /// Canvas extent of the gallery's plan.
 const PLAN_EXTENT: [f64; 4] = [0.0, 0.0, 1000.0, 440.0];
 
@@ -285,7 +333,6 @@ fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
         }],
         outline: ACCENT_500,
         label: format!("Panel {id}"),
-        marker: None,
         selected: false,
         highlighted: false,
     };
@@ -301,6 +348,35 @@ fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
         clip: [380.0, 120.0, 620.0, 340.0],
         texture: tex("gallery-plan-patch", HA_500, SURFACE_700),
     }]);
+    // A seam in the overlap of the two panels, and badges (the tone's icon
+    // and a count) at constant size.
+    canvas.set_lines(vec![Polyline {
+        points: vec![
+            [500.0, 20.0],
+            [490.0, 160.0],
+            [510.0, 300.0],
+            [500.0, 420.0],
+        ],
+        color: Tone::Warning.color(),
+        width: LINE_WIDTH,
+        dashed: true,
+    }]);
+    canvas.set_badges(vec![
+        CanvasBadge {
+            id: 1,
+            at: [500.0, 220.0],
+            tone: Tone::Warning,
+            count: 2,
+            description: "2 problems here".into(),
+        },
+        CanvasBadge {
+            id: 2,
+            at: [940.0, 60.0],
+            tone: Tone::Problem,
+            count: 1,
+            description: "1 problem here".into(),
+        },
+    ]);
     PlanGallery {
         canvas,
         items: vec![
@@ -747,6 +823,26 @@ fn sections(ui: &mut Ui, state: &mut GalleryState, page: Option<usize>) {
                             selected,
                             dashed,
                             mark,
+                            problems: None,
+                        },
+                    );
+                }
+            });
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                for (label, mark, problems) in [
+                    ("Hα", None, Some(2)),
+                    ("OIII", Some(ChipMark::Attention), Some(12)),
+                ] {
+                    choice_chip(
+                        ui,
+                        &ChoiceChip {
+                            label,
+                            color: Some(GROUP_PALETTE[0]),
+                            selected: false,
+                            dashed: false,
+                            mark,
+                            problems,
                         },
                     );
                 }
@@ -844,7 +940,18 @@ fn sections(ui: &mut Ui, state: &mut GalleryState, page: Option<usize>) {
 
         section(ui, "Check list", |ui| {
             ui.set_max_width(560.0);
-            let _ = checks_list(ui, "Checks", &state.checks, None);
+            let _ = checks_list(ui, "Checks", &state.checks, ListMode::Problems);
+        });
+
+        section(ui, "Check list · all", |ui| {
+            ui.set_max_width(560.0);
+            for action in checks_list(ui, "All checks", &state.all_checks, ListMode::All) {
+                if let CheckAction::Unaccept(i) | CheckAction::Accept(i) = action
+                    && let Some(c) = state.all_checks.get_mut(i)
+                {
+                    c.accepted = !c.accepted;
+                }
+            }
         });
 
         section(ui, "Property grid", |ui| {
