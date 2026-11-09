@@ -892,7 +892,14 @@ below is UI-agnostic and the CLI is its first consumer.
   invalidates its store; `apply_analyze` clears the mark of each group the
   run completed: a re-analysis stales the old tiles, and an interrupted one
   leaves every unfinished group refused by `plan_blend` rather than
-  half-replaced. `BlendSettings::validate`
+  half-replaced. In the same save `apply_analyze` appends an `"analyze"`
+  provenance entry (`{groups: {name: settings}}`) listing exactly the
+  groups the run completed, also when it stopped part-way (cancelled or
+  failed after some finished; nothing when none did), so
+  `last_analyze_settings`, `analysis_stamp` and `out_of_date_reason` see
+  every group whose analysis is current as analysed (fixed 2026-11; before,
+  only a run that finished every group recorded one).
+  `BlendSettings::validate`
   (finite feather > 0) guards every settings edit and `MosaicConfig::save`,
   so `mosaic.json` never holds a value JSON cannot represent; settings
   structs default missing fields so older files keep loading.
@@ -1446,25 +1453,32 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   by keyboard navigation does not stop them) or the Export dialog is open.
   `Space`, held while comparing an ROI, shows the other side (below), but
   only while no widget has the keyboard focus (a focused control keeps
-  Space to press it); a Space held from before still ends its peek when
-  let go, wherever the keyboard focus has gone.
+  Space to press it; the A | B toggle's tooltip ends "Esc, then hold Space
+  to peek", Esc letting go of the focus); a Space held from before still
+  ends its peek when let go, wherever the keyboard focus has gone. `D`
+  arms the draw tool (as **Draw ROI**) and reveals the ROIs section, so its
+  hint and Esc show however the section was left; while armed the pointer
+  over either canvas is a crosshair (`canvas_layers::DRAW_CURSOR`).
 - **Compare A / B** (spec §8.3; `session_window/compare.rs`,
   `previews::Compare`). The selected ROI, up to date for the groups in view
-  (no analysis running), has its canvas label drawn by the window with
-  **Compare** (mega-ui `CanvasLabel`, at the corner where the canvas would
-  paint the label, which it then does not; zoomed in, at the top-left of
-  the ROI's part in view, inside the view and clear of the canvas's own
-  buttons, `controls_rect`). Compare freezes the ROI's
-  patches as A with the draft they were made from; A is held outside the
-  preview cache (never evicted, counted towards its cap once) and never
-  merged again; B is the live preview. The A | B toggle stays; Space, the
-  selected button held, or the left button held on the compared preview
-  (the canvases report a `canvas_layers::Hold`; past the click distance it
-  is a drag, which pans and ends the peek; a press on a control over the
-  canvas is none; on the plan a click there selects no panel) show the
-  other side while held, none of them while the window has no focus. The
-  second row reads the shown side's settings (in a group view with the
-  group's override), "B · merging…" or "B · out of date".
+  (no analysis running; a view mapping no group, such as an empty
+  composite, has nothing up to date and offers no Compare), has its canvas
+  label drawn by the window with **Compare** (mega-ui `CanvasLabel`, at
+  the corner where the canvas would paint the label, which it then does
+  not; zoomed in, at the top-left of the ROI's part in view, inside the
+  view and clear of the canvas's own buttons, `controls_rect`). Compare
+  freezes the ROI's patches as A with the draft they were made from; A is
+  held outside the preview cache (never evicted, counted towards its cap
+  once) and never merged again; B is the live preview. The A | B toggle
+  stays; Space, the selected button held, or the left button held on the
+  compared preview (the canvases report a `canvas_layers::Hold`; past the
+  click distance it is a drag, which pans and ends the peek; a press on a
+  control over the canvas is none; on the plan a click there selects no
+  panel, unless the plan draws in another frame and so shows no ROI) show
+  the other side while held, none of them while the window has no focus.
+  The toggle's tooltip ends "Esc, then hold Space to peek". The second row
+  reads the shown side's settings (in a group view with the group's
+  override), "B · merging…" or "B · out of date".
   Both sides' textures stay converted with the canvas's stretch, so a
   switch shows at once. **Use A** puts A's settings back through the draft
   edit (`SettingsPanel::restore_draft`, which also drops feather text being
@@ -1495,13 +1509,26 @@ store, to provenance or to `mosaic.json`.
   rect, settings)` reads no file (it refuses a group never analysed or with
   `needs_analyze`); `run_preview(&PreviewPlan, &JobCtl)` opens the group's
   `Session`, aligns the rect outward to tiles and blends it into a
-  `PreviewPatch` (planar `f32`, tile-aligned `rect`, `downsample`) on any
-  thread, cancellably (stage `"preview"`). At downsample 1 the patch equals
-  the stored tiles of a whole merge there. `PREVIEW_MAX_PIXELS` (2048²)
-  caps the patch: a rect over it is blended at downsample 8 (the blend
-  supports only 1 and 8, `preview_downsample`); a rect over the cap even
-  then is refused. Reading panels may fill the derived decoded-panel cache,
-  as any panel read does.
+  `PreviewPatch` (planar `f32`, tile-aligned `rect`, `downsample`,
+  `coarse`) on any thread, cancellably (stage `"preview"`). At downsample 1
+  the patch equals the stored tiles of a whole merge there.
+  `PREVIEW_MAX_PIXELS` (2048²) caps the patch (`preview_scale`,
+  `PreviewScale`): an aligned rect over it, up to
+  `PREVIEW_FULL_RES_MAX_PIXELS` (32 MP), is still blended at full
+  resolution in the chosen merge mode, into a decimating sink that
+  box-averages d × d blocks as the bands stream in, d the smallest integer
+  bringing `ceil(w/d) · ceil(h/d)` under the cap; only pixels with data
+  (some channel non-zero) are averaged and a block with none stays zero,
+  so the no-data rule holds. Above 32 MP the rect is blended from the L8
+  summaries (downsample 8) for speed, which feathers the summary means in
+  every mode, so the patch is `coarse` (its ROI row says "coarse preview:
+  merge mode not shown"; the canvas label does not); a rect whose 1/8 grid
+  is over the cap even then is refused. (The first plan-4 build blended
+  every rect over the cap at L8, so an ROI over 4 MP showed the same image
+  for every mode while reading "up to date"; at fit zoom on a real canvas
+  that was most ROIs.) `PreviewPlan` carries both caps (`max_pixels`,
+  `full_res_max_pixels`), which tests lower. Reading panels may fill the
+  derived decoded-panel cache, as any panel read does.
 - **Runner, cache and scheduler** (`previews.rs`, `Previews`). One worker
   thread ("mmm-preview"), not the `JobRunner`: no job event, no toast, no
   strip entry. Patches are cached by `(ROI id, group)` with the
@@ -1509,8 +1536,15 @@ store, to provenance or to `mosaic.json`.
   group merges with it (`draft_for`, the override applied) and the group's
   analysis stamp (`mmm_core::mosaic::analysis_stamp`: the index of the
   newest `"analyze"` provenance entry listing the group, which moves on
-  every re-analysis). A cached key unlike `PreviewKey::wanted` makes the
-  ROI out of date (`PreviewState`: Merging, UpToDate, OutOfDate). Each frame
+  every re-analysis, also one that stopped part-way once it had finished
+  the group, since `apply_analyze` records those groups). An analysed group
+  no entry lists (it has a `group_dirs` entry and no `needs_analyze` mark:
+  a session whose analysis stopped part-way before that fix) previews with
+  the sentinel stamp `previews::UNSTAMPED` (`usize::MAX`), which its next
+  analysis replaces with a real index. A cached key unlike
+  `PreviewKey::wanted` makes the ROI out of date (`PreviewState`: Merging,
+  UpToDate, OutOfDate; a view with no group in it, an empty composite, is
+  out of date, never up to date). Each frame
   `poll` delivers a finished patch (dropped if cancelled or its key is no
   longer wanted; a failure is logged, no toast, and not retried with the
   same key) and `schedule` cancels a running preview that is no longer
@@ -1529,19 +1563,34 @@ store, to provenance or to `mosaic.json`.
   composite one layer per member, tinted and added like the canvas's
   composite; on the plan a patch takes its group's colour. A texture is
   re-converted only when a layer's patch, stretch, tint or mode changes; the
-  old one shows meanwhile. The plan shows no ROIs or patches, and cannot arm
-  a draw, while its frame differs from the analysed one
-  (`PlanView::frame_matches`).
+  old one shows meanwhile. No patch is drawn while the ROIs are not synced
+  with the frame (between an analysis applying and their reprojection
+  landing, when an old patch would draw at its old rect); the textures are
+  kept meanwhile (`PatchTextures::withhold`), so nothing converts again.
+  While the plan's frame differs from the analysed one
+  (`PlanView::frame_matches`) the plan shows no ROIs or patches, cannot arm
+  a draw, keeps no quiet rect for a compare (a click where the compared ROI
+  was selects a panel as anywhere), and going to an ROI from the list there
+  moves nothing: a toast says why, with **Draw ROI**'s reason "Available
+  once the analysis catches up with the panels" (a toast, not a tooltip:
+  the list's rows carry none, and the click must not pass unexplained;
+  `SessionWindow::go_to_roi`). The mosaic is unaffected.
 - **ROIs on both canvases** (`rois.rs`, `session_window/sections.rs`). Each
   `Roi` has an `id` (unique, never reused while the session is open;
   entries saved without one get fresh ids on load) and new ones are named
   "Region n" (`unique_roi_name`; older "ROI n" names stay). **Draw ROI** or
   `D` arms the draw tool (`canvas_layers::Tool::DrawRect`) on the canvas
-  shown, mosaic or plan; the rect is stored sky-anchored as before. The ROI
+  shown, mosaic or plan; the rect is stored sky-anchored as before. While
+  it is armed the pointer over either canvas is a crosshair
+  (`canvas_layers::DRAW_CURSOR`, set by mega-ui's plan canvas and tiled
+  viewer), and `D` also reveals the ROIs section, so its hint ("Drag on the
+  image to draw; Esc cancels.") shows even when the section was folded:
+  the next drag never silently draws instead of panning. The ROI
   list is a mega-ui `ordered_list`: a click selects and frames the ROI on the
   canvas shown, double-click or F2 renames, drag or Move up / Move down
   reorders, and Delete removes it with a toast whose **Undo** puts it back.
-  The row shows the preview state. `R` toggles the overlays.
+  The row shows the preview state, plus "coarse preview: merge mode not
+  shown" while the patch in view is coarse. `R` toggles the overlays.
 - **mega-ui pieces.** `canvas_layers` is what both canvases share for
   drawing over their content: `Overlay` rectangles, image `Patch`es, the
   `Tool` in progress, and `Hold` (a primary press held on the canvas; past
