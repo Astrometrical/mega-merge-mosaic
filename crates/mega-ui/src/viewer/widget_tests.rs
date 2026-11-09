@@ -1163,3 +1163,50 @@ fn viewer_patches_are_clipped() {
     assert!((uv.min - Pos2::new(0.5, 0.0)).length() < 1e-4);
     assert!((uv.max - Pos2::new(1.0, 0.5)).length() < 1e-4);
 }
+
+#[test]
+fn patches_paint_after_stale_tiles_and_hatch_and_before_overlays() {
+    let src = TestSource::new(5000, 5000);
+    *src.all.lock().unwrap() = Some(Kind::Stale);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    let tex = h.ctx.load_texture(
+        "patch",
+        ColorImage::new([2, 2], vec![Color32::WHITE; 4]),
+        egui::TextureOptions::LINEAR,
+    );
+    let id = tex.id();
+    h.state_mut().viewer.set_patches(vec![Patch {
+        rect: [500.0, 500.0, 3000.0, 3000.0],
+        clip: [500.0, 500.0, 3000.0, 3000.0],
+        texture: tex,
+    }]);
+    h.state_mut().viewer.set_overlays(vec![Overlay {
+        rect: [600.0, 600.0, 2000.0, 2000.0],
+        color: Color32::RED,
+        label: String::new(),
+        dashed: false,
+    }]);
+    h.run();
+    let (mut last_tile_or_hatch, mut patch, mut overlay) = (None, None, None);
+    for (i, cs) in h.output().shapes.iter().enumerate() {
+        match &cs.shape {
+            egui::Shape::Mesh(m) if m.texture_id == id => patch = Some(i),
+            egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                last_tile_or_hatch = Some(i);
+            }
+            egui::Shape::LineSegment { stroke, .. }
+                if stroke.color == crate::theme::palette::BORDER =>
+            {
+                last_tile_or_hatch = Some(i);
+            }
+            egui::Shape::Rect(r) if r.stroke.color == Color32::RED => overlay = Some(i),
+            _ => {}
+        }
+    }
+    let (t, p, o) = (
+        last_tile_or_hatch.expect("tiles"),
+        patch.expect("patch"),
+        overlay.expect("overlay"),
+    );
+    assert!(t < p && p < o, "tiles/hatch {t}, patch {p}, overlay {o}");
+}

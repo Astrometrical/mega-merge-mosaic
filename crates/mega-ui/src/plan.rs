@@ -318,7 +318,7 @@ impl PlanCanvas {
         let buttons = [
             OverlayButton::new("+", 28.0, "Zoom in"),
             OverlayButton::new("\u{2212}", 28.0, "Zoom out"),
-            OverlayButton::new("Home", 52.0, "Fit everything"),
+            OverlayButton::new("Home", 60.0, "Fit everything"),
             OverlayButton {
                 enabled: items.iter().any(|it| it.selected),
                 ..OverlayButton::new("Zoom to selection", 128.0, "Zoom to the selection")

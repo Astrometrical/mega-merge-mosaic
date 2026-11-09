@@ -740,7 +740,7 @@ impl TiledViewer {
         let buttons = [
             OverlayButton::new("+", 28.0, "Zoom in"),
             OverlayButton::new("\u{2212}", 28.0, "Zoom out"),
-            OverlayButton::new("Home", 52.0, "Fit the whole image"),
+            OverlayButton::new("Home", 60.0, "Fit the whole image"),
         ];
         let cmds = [Command::Zoom(2.0), Command::Zoom(0.5), Command::Home];
         if let Some(i) = overlay_buttons(ui, rect, &buttons) {
@@ -795,7 +795,12 @@ pub(crate) fn overlay_buttons(ui: &mut Ui, rect: Rect, buttons: &[OverlayButton]
                     .layout(egui::Layout::centered_and_justified(
                         egui::Direction::TopDown,
                     )),
-                |ui| ui.add_enabled(b.enabled, egui::Button::new(b.label)),
+                |ui| {
+                    ui.add_enabled(
+                        b.enabled,
+                        egui::Button::new(b.label).wrap_mode(egui::TextWrapMode::Extend),
+                    )
+                },
             )
             .inner;
         if resp.on_hover_text(b.tip).clicked() {

@@ -11,7 +11,7 @@ use mega_ui::gallery::{self, GalleryState};
 fn gallery_harness(pixels_per_point: f32) -> Harness<'static, GalleryState> {
     Harness::builder()
         .wgpu()
-        .with_size(egui::vec2(1200.0, 4000.0))
+        .with_size(gallery::FULL_SIZE)
         .with_pixels_per_point(pixels_per_point)
         .build_ui_state(
             |ui, s: &mut GalleryState| {

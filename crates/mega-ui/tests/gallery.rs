@@ -7,7 +7,7 @@ use mega_ui::gallery::{self, GalleryState};
 #[test]
 fn gallery_renders_every_section() {
     let mut h = Harness::builder()
-        .with_size(egui::vec2(1200.0, 4000.0))
+        .with_size(gallery::FULL_SIZE)
         .build_ui_state(
             |ui, s: &mut GalleryState| {
                 if mega_ui::theme::ensure_applied(ui.ctx()) {
@@ -28,6 +28,9 @@ fn gallery_renders_every_section() {
         "BUTTONS",
         "INPUTS",
         "CHIPS",
+        "STEP STRIP",
+        "INSPECTOR",
+        "TABLE",
         "STATUS",
         "CHECK LIST",
         "PROPERTY GRID",
@@ -37,6 +40,7 @@ fn gallery_renders_every_section() {
         "BRAND LOCKUP",
         "STARFIELD",
         "HERO STAGE",
+        "HERO STAGE · PORTRAIT MOSAIC",
         "PLAN CANVAS",
         "SESSION CARDS",
         "41 checks passed",

@@ -563,6 +563,13 @@ fn the_plan_draw_tool_returns_a_rect() {
     // Esc cancels the tool and the rest of the drag.
     h.state_mut().canvas.set_tool(Tool::DrawRect);
     h.run();
+    let before = {
+        let (_, now) = h.state().canvas.last_frame().unwrap();
+        (
+            h.state().canvas.view().centre(now),
+            h.state().canvas.view().zoom(now),
+        )
+    };
     h.drag_at(to_screen(&h, a));
     h.step();
     h.hover_at(to_screen(&h, (400.0, 400.0)));
@@ -574,5 +581,42 @@ fn the_plan_draw_tool_returns_a_rect() {
     h.drop_at(to_screen(&h, b));
     h.run();
     assert_eq!(drawn_rects(&h).len(), 2, "cancelled drag reported");
+    let (_, now) = h.state().canvas.last_frame().unwrap();
+    assert_eq!(
+        (
+            h.state().canvas.view().centre(now),
+            h.state().canvas.view().zoom(now)
+        ),
+        before,
+        "cancelled drag panned"
+    );
     assert_eq!(h.state().canvas.tool(), Tool::Navigate);
+}
+
+#[test]
+fn overlay_button_labels_stay_on_one_line_in_a_narrow_canvas() {
+    let mut h = Harness::builder()
+        .with_size(Vec2::new(640.0, 280.0))
+        .build_ui_state(
+            |ui, canvas: &mut PlanCanvas| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                canvas.show(ui, [0.0, 0.0, 1000.0, 440.0], &[], true, true);
+            },
+            PlanCanvas::new(),
+        );
+    h.run();
+    for label in ["Home", "Zoom to selection"] {
+        let rows = h
+            .output()
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                Shape::Text(t) if t.galley.text() == label => Some(t.galley.rows.len()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{label} not drawn"));
+        assert_eq!(rows, 1, "{label} wrapped");
+    }
 }

@@ -33,6 +33,11 @@ use crate::widgets::{
     step_strip, submenu, text_input,
 };
 
+/// Window size (points) at which the gallery shows every section in full.
+/// The gallery test and the snapshots both render at this size; grow it
+/// when a section is added.
+pub const FULL_SIZE: Vec2 = Vec2::new(1200.0, 4096.0);
+
 /// The gallery's interactive state.
 pub struct GalleryState {
     segment: u8,
@@ -265,10 +270,10 @@ fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
     }
 }
 
-/// Draw `hero` as the start screen does, full bleed in a 1000 × 320 strip
+/// Draw `hero` as the start screen does, full bleed in a 1000 × 160 strip
 /// whose left third is the content column.
 fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(1000.0, 320.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1000.0, 160.0), Sense::hover());
     // Constant time keeps the stage on its first view, mid-drift.
     ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(rect);
@@ -591,7 +596,7 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
         section(ui, "Plan canvas", |ui| {
             let ctx = ui.ctx().clone();
             let plan = state.plan.get_or_insert_with(|| gallery_plan(&ctx));
-            ui.allocate_ui(Vec2::new(640.0, 280.0), |ui| {
+            ui.allocate_ui(Vec2::new(640.0, 200.0), |ui| {
                 let _ = plan.canvas.show(ui, PLAN_EXTENT, &plan.items, true, true);
             });
         });
@@ -677,7 +682,7 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
         });
 
         section(ui, "Starfield", |ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(560.0, 160.0), Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(560.0, 100.0), Sense::hover());
             ui.painter().rect_filled(rect, 0.0, SURFACE_900);
             state
                 .starfield
