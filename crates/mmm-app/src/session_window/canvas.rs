@@ -696,6 +696,7 @@ fn plus_popover(
     // Not the chip's id: the chip moves when a composite is added.
     let key = egui::Id::new("mmm-plus-custom-form");
     let open_key = egui::Id::new("mmm-plus-popover-open");
+    let clicked_key = egui::Id::new("mmm-plus-popover-clicked");
     let shown = egui::Popup::menu(plus)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
@@ -709,6 +710,10 @@ fn plus_popover(
             // Just opened: the keyboard starts on the first thing to pick.
             let fresh = !ui.data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
             ui.data_mut(|d| d.insert_temp(open_key, true));
+            // Whether this frame's input was a pointer click: if the popover
+            // closes with it, the focus stays where the click put it.
+            let clicked = ui.input(|i| i.pointer.any_click());
+            ui.data_mut(|d| d.insert_temp(clicked_key, clicked));
             let mut first = fresh;
             ui.label(text(Type::Small, "Presets"));
             if presets.is_empty() {
@@ -756,6 +761,10 @@ fn plus_popover(
                     form.channels[i].as_deref().unwrap_or("None")
                 );
                 let toggle = ui.button(label);
+                let expanded = form.open == Some(i);
+                ui.ctx().accesskit_node_builder(toggle.id, |b| {
+                    b.set_expanded(expanded);
+                });
                 if toggle.clicked() {
                     form.open = if form.open == Some(i) { None } else { Some(i) };
                 }
@@ -814,13 +823,18 @@ fn plus_popover(
         let ctx = plus.ctx.clone();
         let was_open = ctx.data(|d| d.get_temp::<bool>(open_key)).unwrap_or(false);
         if was_open {
-            // Closed (a pick, Escape or a click outside): the draft goes and
-            // the keyboard goes back to the chip.
+            // Closed (a pick, Escape or a click outside): the draft goes; the
+            // keyboard goes back to the chip unless a click closed it.
+            let by_pointer = ctx
+                .data(|d| d.get_temp::<bool>(clicked_key))
+                .unwrap_or(false);
             ctx.data_mut(|d| {
                 d.insert_temp(open_key, false);
                 d.remove::<CustomForm>(key);
             });
-            plus.request_focus();
+            if !by_pointer {
+                plus.request_focus();
+            }
         }
     }
 }

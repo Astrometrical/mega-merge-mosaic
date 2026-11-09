@@ -1341,6 +1341,29 @@ fn the_plus_popover_works_from_the_keyboard() {
 }
 
 #[test]
+fn a_click_elsewhere_keeps_the_focus_it_gave() {
+    let root = temp_dir("window-plus-click");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.state_mut().w.inspector_mut().reveal(MERGE_SETTINGS);
+    h.run_steps(3);
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    h.get_by_label("Custom");
+    // Clicking into the feather field closes the popover (a click outside)
+    // and leaves the focus where the click put it.
+    h.get_by_role_and_label(Role::TextInput, "Feather (px)")
+        .click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Custom").is_none(), "the popover closed");
+    let field = h.get_by_role_and_label(Role::TextInput, "Feather (px)");
+    assert!(field.is_focused(), "focus on the feather field");
+    assert_ne!(focused_label(&h).as_deref(), Some("+"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn the_custom_form_works_from_the_keyboard() {
     let root = temp_dir("window-custom-keys");
     let s = two_group_session(&root);
@@ -1355,10 +1378,19 @@ fn the_custom_form_works_from_the_keyboard() {
         .type_text("Keys");
     h.run_steps(2);
     h.get_by_label("Map at least one channel.");
-    // R from OIII, by keyboard; the pick closes its submenu.
+    // R from OIII, by keyboard; the toggle says it is open, and the pick
+    // collapses the in-place list.
     tab_to(&mut h, "R: None");
+    assert_eq!(
+        button(&h, "R: None").accesskit_node().data().is_expanded(),
+        Some(false)
+    );
     h.key_press(egui::Key::Enter);
     h.run_steps(3);
+    assert_eq!(
+        button(&h, "R: None").accesskit_node().data().is_expanded(),
+        Some(true)
+    );
     tab_to(&mut h, "OIII");
     h.key_press(egui::Key::Enter);
     h.run_steps(3);
@@ -1367,7 +1399,10 @@ fn the_custom_form_works_from_the_keyboard() {
             .is_none(),
         "the submenu closed on the pick"
     );
-    button(&h, "R: OIII");
+    assert_eq!(
+        button(&h, "R: OIII").accesskit_node().data().is_expanded(),
+        Some(false)
+    );
     // Create, by keyboard.
     tab_to(&mut h, "Create");
     h.key_press(egui::Key::Enter);
