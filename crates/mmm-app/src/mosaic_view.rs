@@ -21,16 +21,17 @@
 //!   named over the image's bottom-left corner (an overlay: the image keeps
 //!   the plan's place); groups on different canvases cannot be mixed: the
 //!   view says why instead.
-//! - **ROIs** ([`crate::rois`]): drawn on the canvas with the viewer's draw
-//!   tool, named, noted, selected (the window then frames it,
-//!   [`MosaicView::rois_ui`]) and deleted;
-//!   kept in `MosaicConfig.ui`. Reading the frame and reprojecting them
-//!   (sky ↔ canvas) and counting how many of an ROI's level-0 tiles are
-//!   fresh (per group of the view) run on workers ([`RoiPanel`]).
-//!   [`MosaicView::merge_roi`] starts one merge of the selected ROI per
-//!   group of the view with the merge settings draft, uncommitted (the job
-//!   runner queues them; newer work wins per group), once the ROIs follow
-//!   the current frame;
+//! - **ROIs** ([`crate::rois`]): drawn on either canvas with its draw tool
+//!   (the window arms it; the mosaic takes the rect through
+//!   [`MosaicView::on_drawn`]), named, noted, reordered, selected (the
+//!   window then frames it, [`MosaicView::rois_ui`]) and deleted (with an
+//!   undo, [`MosaicView::take_roi_deleted`]); kept in `MosaicConfig.ui`.
+//!   Reading the frame and reprojecting them (sky ↔ canvas) runs on a
+//!   worker ([`RoiPanel`]). There is no ROI merge: an ROI's preview is
+//!   transient, made by the window's preview runner ([`crate::previews`]),
+//!   and the list and the canvas labels show its state
+//!   ([`MosaicView::set_roi_states`]); the window draws the labels that
+//!   carry controls itself ([`MosaicView::set_roi_labelled`]).
 //!   [`MosaicView::merge_these`] merges the groups it is given over the whole
 //!   canvas, committing the merge settings draft first.
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
@@ -60,7 +61,7 @@
 //!
 //! Everything slow runs on background threads ([`Task`]): opening each
 //! result ([`open_result`]), the automatic stretch statistics, the health
-//! metrics, the ROI sync and freshness counts. The one write on the UI
+//! metrics and the ROI sync. The one write on the UI
 //! thread is the debounced `mosaic.json` save of the ROI list (at most once
 //! per [`SAVE_INTERVAL`](crate::util::SAVE_INTERVAL)), the same documented
 //! exception as the job runner's plan/apply saves.
@@ -82,8 +83,8 @@
 //!   merge queued behind an analysis would start the moment it is applied,
 //!   before the check);
 //! - a source given up (out of date, view switched, replaced) is tracked by
-//!   a `Weak` until the viewer's loader threads and any statistics or
-//!   freshness task have dropped it; merging stays blocked until then. A
+//!   a `Weak` until the viewer's loader threads and any statistics task
+//!   have dropped it; merging stays blocked until then. A
 //!   composite holds every member's reader, so a member given up stays
 //!   tracked until the composite itself is dropped: all member readers are
 //!   released before any member's store may be recreated;
@@ -101,6 +102,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
+use mega_ui::canvas_layers::Hold;
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{radius, space};
 use mega_ui::theme::{palette, scrim};
@@ -110,12 +112,12 @@ use mmm_core::mosaic::{FRAME_FILE, commit_blend_settings};
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
-use mmm_core::settings::{AnalyzeSettings, ChangeImpact};
+use mmm_core::settings::{AnalyzeSettings, BlendSettings, ChangeImpact};
 use mmm_core::stretch::StretchParams;
 use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
 
-use crate::blend_settings::{SettingsPanel, draft_for, load_draft};
+use crate::blend_settings::{SettingsPanel, load_draft};
 use crate::camera::Camera;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
@@ -273,8 +275,8 @@ pub struct MosaicView {
     /// Why the view cannot be drawn though its results are open (e.g. a
     /// composition of groups on different canvases).
     view_problem: Option<String>,
-    /// Sources given up but maybe still mapped by loader, statistics or
-    /// freshness threads (directly or inside a composite).
+    /// Sources given up but maybe still mapped by loader or statistics
+    /// threads (directly or inside a composite).
     retired: Vec<Weak<MosaicTileSource>>,
     /// A camera the viewer paints its next frame through: one set from
     /// outside, or the last one shown when the viewer was rebuilt.
@@ -306,11 +308,15 @@ pub struct MosaicView {
     export: ExportDialog,
     /// The merge settings panel.
     settings: SettingsPanel,
+    /// The ROIs' preview patches the viewer draws ([`MosaicView::set_patches`]).
+    patches: Vec<mega_ui::canvas_layers::Patch>,
     /// The tag over the image (why the shown groups are out of date, or
     /// that their settings changed), set by the window each frame.
     tag: Option<CanvasTag>,
     /// The tag was clicked: the window reveals Merge settings.
     reveal_settings: bool,
+    /// The press held on the viewer in the last frame drawn.
+    hold: Option<Hold>,
 }
 
 impl Default for MosaicView {
@@ -350,8 +356,10 @@ impl MosaicView {
             shown: false,
             rois: RoiPanel::default(),
             export: ExportDialog::new(Arc::new(RfdSavePicker)),
+            patches: Vec::new(),
             tag: None,
             reveal_settings: false,
+            hold: None,
             settings: SettingsPanel::new(),
         }
     }
@@ -359,10 +367,7 @@ impl MosaicView {
     /// Show `view` from the next frame on (its groups are resolved then; one
     /// that no longer exists falls back to the first group).
     pub fn select_view(&mut self, view: ViewKind) {
-        if self.view.as_ref() != Some(&view) {
-            self.rois.view_changed();
-            self.view = Some(view);
-        }
+        self.view = Some(view);
     }
 
     /// The groups of the view, in order.
@@ -443,6 +448,56 @@ impl MosaicView {
         self.rois.rois()
     }
 
+    /// The ROIs' canvas rects follow the current frame: no reprojection is
+    /// running or wanted ([`RoiPanel::synced`]).
+    pub fn rois_synced(&self) -> bool {
+        self.rois.synced()
+    }
+
+    /// Each ROI's preview state, by id ([`RoiPanel::set_states`]): the ROI
+    /// list says it, and the canvas labels while a preview merges.
+    pub fn set_roi_states(&mut self, states: BTreeMap<u64, crate::previews::PreviewState>) {
+        self.rois.set_states(states);
+    }
+
+    /// The ROIs whose preview in view is coarse, which their rows say
+    /// ([`RoiPanel::set_coarse`]).
+    pub fn set_roi_coarse(&mut self, ids: BTreeSet<u64>) {
+        self.rois.set_coarse(ids);
+    }
+
+    /// The ROIs whose canvas label the window draws, with its controls
+    /// ([`RoiPanel::set_labelled`]).
+    pub fn set_roi_labelled(&mut self, ids: BTreeSet<u64>) {
+        self.rois.set_labelled(ids);
+    }
+
+    /// The colour ROI `id` is drawn in ([`RoiPanel::color`]).
+    pub fn roi_color(&self, id: u64) -> Color32 {
+        self.rois.color(id)
+    }
+
+    /// The primary button held on the viewer in the last frame drawn (the
+    /// navigate tool), in canvas coordinates.
+    pub fn hold(&self) -> Option<Hold> {
+        self.hold
+    }
+
+    /// Why the typed merge settings are refused, if they are
+    /// ([`SettingsPanel::input_error`]): no merge, and no preview, meanwhile.
+    pub fn input_error(&self) -> Option<&'static str> {
+        self.settings.input_error()
+    }
+
+    /// Move ROI `id` to canvas rect `canvas`, as a reprojection does
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn move_roi(&mut self, id: u64, canvas: [u64; 4]) {
+        if let Some(r) = self.rois.rois.iter_mut().find(|r| r.id == id) {
+            r.canvas = canvas;
+        }
+    }
+
     fn member(&self) -> Option<&Member> {
         self.results.get(self.group.as_ref()?)
     }
@@ -453,8 +508,8 @@ impl MosaicView {
         self.viewer.is_none().then(|| self.placeholder())
     }
 
-    /// True once drawn with nothing pending: no open, statistics, health,
-    /// ROI or freshness task, and the viewer (if any) has drawn and loaded
+    /// True once drawn with nothing pending: no open, statistics, health
+    /// or ROI sync task, and the viewer (if any) has drawn and loaded
     /// its tiles. A session without groups settles at once.
     pub fn is_settled(&self) -> bool {
         self.shown
@@ -534,7 +589,6 @@ impl MosaicView {
             if self.group.as_ref() == Some(&group) {
                 self.want_health = true;
             }
-            self.rois.want_fresh = true;
         }
     }
 
@@ -579,7 +633,7 @@ impl MosaicView {
 
     /// The view's every-frame work, whether or not the canvas is drawn:
     /// resolve the view's groups, poll and start the background work
-    /// (opening results, stretches, health, ROI sync and freshness), follow
+    /// (opening results, stretches, health, ROI sync), follow
     /// merges and analyses, release given-up sources, and save. Call every
     /// frame after the runner's poll (and [`MosaicView::track_analysis`]),
     /// before anything is drawn. The stretch toggles followed are the
@@ -618,8 +672,8 @@ impl MosaicView {
     }
 
     /// Settings were applied: the view's results went stale (their tiles
-    /// load again to show it), and ROI freshness and health are computed
-    /// again (health depends on the feather).
+    /// load again to show it), and health is computed again (it depends on
+    /// the feather).
     fn on_settings_applied(&mut self, impact: ChangeImpact) {
         if impact == ChangeImpact::None {
             return;
@@ -629,7 +683,6 @@ impl MosaicView {
                 src.bump();
             }
         }
-        self.rois.want_fresh = true;
         self.want_health = true;
     }
 
@@ -653,30 +706,6 @@ impl MosaicView {
             return Some(format!("Merging {group}…"));
         }
         self.merge_guard(session, jobs, &[group.to_string()])
-    }
-
-    /// Why no merge of the selected ROI may start now, if any (`None`:
-    /// [`MosaicView::merge_roi`] is allowed).
-    pub fn merge_roi_block_reason(
-        &self,
-        session: &OpenSession,
-        jobs: &JobRunner,
-    ) -> Option<String> {
-        if self.members.is_empty() {
-            return Some("There is nothing to merge in this view.".into());
-        }
-        if let Some(why) = self.merge_guard(session, jobs, &self.members) {
-            return Some(why);
-        }
-        if self.rois.selected_rect().is_none() {
-            return Some("Select or draw a region of interest first.".into());
-        }
-        if !self.rois.synced() {
-            return Some(
-                "Waiting for the regions of interest to follow the latest analysis.".into(),
-            );
-        }
-        None
     }
 
     /// Why no merge of `groups` may start now, if any: the store
@@ -762,38 +791,16 @@ impl MosaicView {
                 .set_problem(format!("Merge settings not saved: {e}"));
             return false;
         }
-        self.merge_groups(session, jobs, groups, None)
+        self.merge_groups(session, jobs, groups)
     }
 
-    /// Merge the selected ROI for each group of the view (newer work wins
-    /// per group in the job runner) with the merge settings draft, through
-    /// each group's override, without committing it (spec §11: change a
-    /// setting, merge an ROI, look); nothing while
-    /// [`MosaicView::merge_roi_block_reason`] gives a reason (e.g. while the
-    /// ROIs are being reprojected: the rect may still be from an older
-    /// frame, or while the feather text is invalid). A region merged with
-    /// settings other than its group's last whole merge makes the group out
-    /// of date ([`mmm_core::mosaic::region_differs`]) until Merge re-merges
-    /// it.
-    pub fn merge_roi(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
-        if self.merge_roi_block_reason(session, jobs).is_some() {
-            return;
-        }
-        let Some(rect) = self.rois.selected_rect() else {
-            return;
-        };
-        self.merge_groups(session, jobs, self.members.clone(), Some(rect));
-    }
-
-    /// Merge `rect` of each of `groups`: `None` (the whole canvas) with the
-    /// committed settings (a whole merge commits the draft first), an ROI
-    /// with the draft ([`draft_for`]).
+    /// Merge each of `groups` over the whole canvas with the committed
+    /// settings (a whole merge commits the draft first).
     fn merge_groups(
         &mut self,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
         groups: Vec<String>,
-        rect: Option<[u64; 4]>,
     ) -> bool {
         // The export check maps result stores a merge may recreate; an
         // analysis edit waiting to apply would cancel the merge anyway.
@@ -802,13 +809,7 @@ impl MosaicView {
         }
         let any = !groups.is_empty();
         for g in groups {
-            let id = match rect {
-                None => jobs.start_blend(session, &g, None),
-                Some(_) => {
-                    let draft = draft_for(&session.mosaic.config, &g);
-                    jobs.start_blend_with(session, &g, rect, draft)
-                }
-            };
+            let id = jobs.start_blend(session, &g, None);
             self.merge_jobs.insert(id, g);
         }
         any
@@ -863,7 +864,7 @@ impl MosaicView {
             .collect();
         match self.export.ui(ctx, session, can_merge, &merging) {
             Some(ExportAction::BlendFirst(groups)) => {
-                self.merge_groups(session, jobs, groups, None);
+                self.merge_groups(session, jobs, groups);
             }
             Some(ExportAction::Export(dests, format)) => {
                 for (group, out) in dests {
@@ -882,15 +883,56 @@ impl MosaicView {
             .is_some_and(|v| v.tool() == Tool::DrawRect)
     }
 
-    /// The ROI list: "+ new ROI" (the viewer's draw tool), and each ROI's
-    /// name, note and freshness; changes are saved (debounced). The canvas
-    /// rect of an ROI just picked, to go to: the caller frames it on the
-    /// canvas it shows (both canvases share the camera, so nothing here
-    /// moves the viewer).
+    /// The selected ROI's id.
+    pub fn selected_roi(&self) -> Option<u64> {
+        self.rois.selected
+    }
+
+    /// Select ROI `id`, as picking it in the list does, without going to
+    /// it (tests).
+    #[cfg(test)]
+    pub(crate) fn select_roi(&mut self, id: u64) {
+        self.rois.selected = Some(id);
+    }
+
+    /// The screen rect the viewer's own buttons took in its last frame
+    /// ([`TiledViewer::controls_rect`]).
+    pub fn controls_rect(&self) -> Option<egui::Rect> {
+        self.viewer.as_ref()?.controls_rect()
+    }
+
+    /// The stretch `group`'s result is drawn with (one entry per channel),
+    /// once it is open: what a preview patch of the group is converted with.
+    pub fn member_stretch(&self, group: &str) -> Option<Vec<StretchParams>> {
+        Some(self.results.get(group)?.source.as_ref()?.stretch())
+    }
+
+    /// The image patches (ROI previews) to draw over the viewer from the
+    /// next frame on.
+    pub fn set_patches(&mut self, patches: Vec<mega_ui::canvas_layers::Patch>) {
+        self.patches = patches;
+    }
+
+    /// The ROIs as canvas overlays (the window gives them to the plan too).
+    pub fn roi_overlays(&self) -> Vec<mega_ui::canvas_layers::Overlay> {
+        self.rois.overlays()
+    }
+
+    /// Arm (or disarm) the viewer's ROI draw tool: the next drag draws a
+    /// rectangle. Nothing without a viewer.
+    pub fn set_drawing(&mut self, on: bool) {
+        if let Some(v) = &mut self.viewer {
+            v.set_tool(if on { Tool::DrawRect } else { Tool::Navigate });
+        }
+    }
+
+    /// The ROI list: each ROI's name, size and state, and the note of the
+    /// selected one; changes are saved (debounced). The canvas rect of an
+    /// ROI just picked, to go to: the caller frames it on the canvas it
+    /// shows (both canvases share the camera, so nothing here moves the
+    /// viewer).
     pub fn rois_ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession) -> Option<[u64; 4]> {
-        let out = self
-            .rois
-            .ui(ui, &mut session.mosaic.config.ui, self.viewer.as_mut());
+        let out = self.rois.ui(ui, &mut session.mosaic.config.ui);
         if out.changed {
             self.save.touch();
         }
@@ -943,6 +985,28 @@ impl MosaicView {
     #[cfg(test)]
     pub fn force_feather_error(&mut self) {
         self.settings.force_feather_error();
+    }
+
+    /// Take back [`MosaicView::force_feather_error`] (tests).
+    #[cfg(test)]
+    pub fn clear_feather_error(&mut self) {
+        self.settings.clear_feather_error();
+    }
+
+    /// Ask for the ROIs to be reprojected, as an analysis ending does
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn want_roi_sync(&mut self) {
+        self.rois.want_sync = true;
+    }
+
+    /// Put `draft` back as the merge settings draft, as an edit of the
+    /// Merge settings does, dropping feather text being typed
+    /// ([`SettingsPanel::restore_draft`]): the window saves it (debounced)
+    /// once it takes the change.
+    pub fn restore_draft(&mut self, session: &mut OpenSession, draft: BlendSettings) {
+        self.settings
+            .restore_draft(&mut session.mosaic.config, draft);
     }
 
     /// Whether the merge settings draft changed since the last call
@@ -1005,6 +1069,7 @@ impl MosaicView {
         plan_stretch: Option<&[StretchParams]>,
     ) {
         self.shown = true;
+        self.hold = None;
         self.plan_stretch = plan_stretch.map(<[StretchParams]>::to_vec);
         if self.resolved.as_ref() != self.view.as_ref() {
             // A view selected since the last poll: drawn from the next frame.
@@ -1030,7 +1095,10 @@ impl MosaicView {
                     viewer.set_camera(size, c.centre, c.zoom);
                 }
                 viewer.set_overlays(overlays);
-                drawn = viewer.show(ui).drawn_rect;
+                viewer.set_patches(self.patches.clone());
+                let shown = viewer.show(ui);
+                drawn = shown.drawn_rect;
+                self.hold = shown.held;
                 // A composition shows its merged groups; the others are
                 // named over the image, which keeps the plan's place.
                 if let Some((rect, _)) = viewer.last_frame() {
@@ -1102,9 +1170,6 @@ impl MosaicView {
             self.group = members.first().cloned();
             self.health = None;
             self.want_health = true;
-        }
-        if self.view.as_ref() != Some(&view) {
-            self.rois.view_changed();
         }
         self.view = Some(view);
         self.members = members;
@@ -1289,18 +1354,8 @@ impl MosaicView {
                 });
             }
         }
-        let members = self
-            .members
-            .iter()
-            .map(|g| {
-                (
-                    g.clone(),
-                    self.results.get(g).and_then(|m| m.source.clone()),
-                )
-            })
-            .collect();
         self.rois
-            .start_tasks(ctx, session.mosaic.dir.join(FRAME_FILE), members);
+            .start_sync(ctx, session.mosaic.dir.join(FRAME_FILE));
         let now = Instant::now();
         if self.save.due(now) {
             self.save.saved(now);
@@ -1450,7 +1505,6 @@ impl MosaicView {
                 }
             }
         }
-        self.rois.want_fresh = true;
     }
 
     /// Follow the running merge of a group of the view: bump its source's
@@ -1475,7 +1529,6 @@ impl MosaicView {
             None if m.opening.is_none() => m.reopen = true,
             None => {}
         }
-        self.rois.want_fresh = true;
     }
 
     /// Apply finished automatic stretches worked out for the current look.
@@ -1503,9 +1556,24 @@ impl MosaicView {
         }
     }
 
-    /// A rectangle drawn on the canvas becomes a new ROI, selected and
-    /// saved (debounced).
-    fn on_drawn(&mut self, session: &mut OpenSession, r: [f64; 4], canvas: (u64, u64)) {
+    /// The ROI the list deleted since the last call, with its index, once:
+    /// the window offers to undo it.
+    pub fn take_roi_deleted(&mut self) -> Option<(usize, Roi)> {
+        self.rois.take_deleted()
+    }
+
+    /// Put back a deleted ROI at its index, selected (saved, debounced).
+    pub fn restore_roi(&mut self, session: &mut OpenSession, index: usize, roi: Roi) {
+        self.rois.load_once(&session.mosaic.config.ui);
+        if self.rois.restore(&mut session.mosaic.config.ui, index, roi) {
+            self.save.touch();
+        }
+    }
+
+    /// A rectangle drawn on a canvas (`r` in its image pixels, which is
+    /// `canvas` pixels wide and high) becomes a new ROI, selected and saved
+    /// (debounced).
+    pub fn on_drawn(&mut self, session: &mut OpenSession, r: [f64; 4], canvas: (u64, u64)) {
         if self.rois.on_drawn(&mut session.mosaic.config.ui, r, canvas) {
             self.save.touch();
         }

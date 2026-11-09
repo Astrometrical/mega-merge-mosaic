@@ -1,5 +1,5 @@
-//! Image snapshots of the gallery. They need a GPU, so they are ignored by
-//! default (CI has none); run them with
+//! Image snapshots of the gallery, one per page and scale. They need a GPU,
+//! so they are ignored by default (CI has none); run them with
 //! `cargo test -p mega-ui --test snapshots -- --ignored`, and refresh the
 //! references with `UPDATE_SNAPSHOTS=1` after an intended visual change.
 //! If wgpu can't create a device (DX12 fails on some Windows machines), set
@@ -8,33 +8,61 @@
 use egui_kittest::Harness;
 use mega_ui::gallery::{self, GalleryState};
 
-fn gallery_harness(pixels_per_point: f32) -> Harness<'static, GalleryState> {
-    Harness::builder()
+/// Snapshot gallery `page` (0-based) at `pixels_per_point` as
+/// `gallery_p{page + 1}_{scale}x`.
+fn snapshot_page(page: usize, pixels_per_point: f32) {
+    let mut h = Harness::builder()
         .wgpu()
-        .with_size(egui::vec2(1200.0, 4000.0))
+        .with_size(gallery::page_size(page))
         .with_pixels_per_point(pixels_per_point)
         .build_ui_state(
-            |ui, s: &mut GalleryState| {
+            move |ui, s: &mut GalleryState| {
                 if mega_ui::theme::ensure_applied(ui.ctx()) {
-                    gallery::show(ui, s);
+                    gallery::show_page(ui, s, page);
                 }
             },
             GalleryState::default(),
-        )
+        );
+    h.run_steps(4);
+    h.snapshot(format!(
+        "gallery_p{}_{}x",
+        page + 1,
+        pixels_per_point as u32
+    ));
 }
 
 #[test]
 #[ignore = "image snapshot: needs a GPU; run with --ignored"]
-fn gallery_snapshot_1x() {
-    let mut h = gallery_harness(1.0);
-    h.run_steps(4);
-    h.snapshot("gallery_1x");
+fn gallery_snapshot_p1_1x() {
+    snapshot_page(0, 1.0);
 }
 
 #[test]
 #[ignore = "image snapshot: needs a GPU; run with --ignored"]
-fn gallery_snapshot_2x() {
-    let mut h = gallery_harness(2.0);
-    h.run_steps(4);
-    h.snapshot("gallery_2x");
+fn gallery_snapshot_p2_1x() {
+    snapshot_page(1, 1.0);
+}
+
+#[test]
+#[ignore = "image snapshot: needs a GPU; run with --ignored"]
+fn gallery_snapshot_p3_1x() {
+    snapshot_page(2, 1.0);
+}
+
+#[test]
+#[ignore = "image snapshot: needs a GPU; run with --ignored"]
+fn gallery_snapshot_p1_2x() {
+    snapshot_page(0, 2.0);
+}
+
+#[test]
+#[ignore = "image snapshot: needs a GPU; run with --ignored"]
+fn gallery_snapshot_p2_2x() {
+    snapshot_page(1, 2.0);
+}
+
+#[test]
+#[ignore = "image snapshot: needs a GPU; run with --ignored"]
+fn gallery_snapshot_p3_2x() {
+    snapshot_page(2, 2.0);
 }

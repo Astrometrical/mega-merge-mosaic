@@ -65,6 +65,8 @@ struct State {
     files: Arc<AskedFiles>,
     /// The toasts the window raised, in order.
     toasts: Vec<WindowToast>,
+    /// The job runner's events, in order.
+    events: Vec<JobEvent>,
 }
 
 impl State {
@@ -80,6 +82,7 @@ impl State {
             accepted: Vec::new(),
             files,
             toasts: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -125,6 +128,7 @@ fn harness_sized(state: State, size: egui::Vec2) -> Harness<'static, State> {
                     s.w.ui(ui, &mut s.session, &mut s.jobs, &mut s.pipeline, &s.checks);
                 s.accepted.extend(out.accept);
                 s.toasts.extend(out.toasts);
+                s.events.extend(events);
             },
             state,
         )
@@ -155,6 +159,7 @@ fn empty(root: &std::path::Path) -> OpenSession {
 /// One ROI, "ROI 1", whose label the mosaic paints at its top-left corner.
 fn add_roi(s: &mut OpenSession) {
     let roi = Roi {
+        id: 1,
         name: "ROI 1".into(),
         note: String::new(),
         sky: None,
@@ -235,6 +240,25 @@ fn painted(
     })
 }
 
+/// The first label of ROI `name` painted inside `rect` in the last frame
+/// (its name, followed by " · merging…" while its preview merges): its
+/// position and size.
+fn painted_roi(
+    h: &Harness<'_, State>,
+    rect: egui::Rect,
+    name: &str,
+) -> Option<(egui::Pos2, egui::Vec2)> {
+    let merging = format!("{name} · merging…");
+    h.output().shapes.iter().find_map(|cs| match &cs.shape {
+        egui::Shape::Text(t)
+            if (t.galley.text() == name || t.galley.text() == merging) && rect.contains(t.pos) =>
+        {
+            Some((t.pos, t.galley.size()))
+        }
+        _ => None,
+    })
+}
+
 /// Asserts the last frame the mosaic painted put each ROI's label where
 /// `cam` puts the ROI's top-left corner: the painted frame itself.
 fn assert_mosaic_painted_with(h: &Harness<'_, State>, cam: Camera) {
@@ -244,7 +268,7 @@ fn assert_mosaic_painted_with(h: &Harness<'_, State>, cam: Camera) {
         // The viewer writes an overlay's label just inside its corner.
         let corner = (r.canvas[0] as f64, r.canvas[1] as f64);
         let want = screen(rect, cam, corner) + egui::vec2(4.0, 2.0);
-        let (got, _) = painted(h, rect, &r.name).expect("ROI label painted");
+        let (got, _) = painted_roi(h, rect, &r.name).expect("ROI label painted");
         assert!(
             (got - want).length() < 1.0,
             "{} painted at {got:?}; the camera puts it at {want:?}",
@@ -569,19 +593,494 @@ fn camera_survives_the_mosaic_viewer_being_rebuilt() {
 }
 
 #[test]
-fn drawing_an_roi_shows_the_mosaic() {
+fn plan_rois_wait_while_the_frames_differ() {
+    use mmm_core::reference::ReferenceFrame;
+    let (root, mut s, jobs) = merged("window-plan-frames");
+    add_roi(&mut s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_until(&mut h, plan_placed);
+    h.run_steps(3);
+    let (rect, _) = h.state().w.plan().canvas_frame().unwrap();
+    assert!(painted_roi(&h, rect, "ROI 1").is_some(), "frames agree");
+    assert!(!disabled(&h, "Draw ROI"));
+    // A canvas-changing edit: the analysed frame is not the one the plan
+    // draws in until the analysis ends.
+    h.state_mut().session.frame = Some(ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.run_steps(3);
+    assert!(
+        painted_roi(&h, rect, "ROI 1").is_none(),
+        "no outlines offset"
+    );
+    assert!(disabled(&h, "Draw ROI"));
+    h.key_press(egui::Key::D);
+    h.run_steps(2);
+    assert!(!h.state().w.plan().drawing());
+    let at = h.get_by_label("Draw ROI").rect().center();
+    let why = "Available once the analysis catches up with the panels";
+    assert!(tooltip_shows(&mut h, at, why), "{why}");
+    // The mosaic is unaffected.
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    h.run_steps(2);
+    assert!(!disabled(&h, "Draw ROI"));
+    let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    assert!(painted_roi(&h, frame, "ROI 1").is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn going_to_an_roi_waits_while_the_plan_frame_differs() {
+    use mmm_core::reference::ReferenceFrame;
+    let (root, mut s, jobs) = merged("window-plan-goto");
+    add_roi(&mut s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_until(&mut h, plan_placed);
+    h.run_steps(3);
+    let fit = h.state().w.plan().camera().unwrap();
+    // The plan draws in another frame than the analysed one, which the
+    // ROI is anchored in: picking it goes nowhere, and a toast says why.
+    h.state_mut().session.frame = Some(ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.run_steps(3);
+    h.get_by_label("ROI 1").click();
+    h.run_steps(3);
+    assert_eq!(h.state().w.mosaic().selected_roi(), Some(1), "selected");
+    assert_camera(h.state().w.plan().camera(), fit);
+    let titles: Vec<String> = h
+        .state()
+        .toasts
+        .iter()
+        .map(|t| t.toast.title.clone())
+        .collect();
+    assert_eq!(
+        titles,
+        ["Available once the analysis catches up with the panels"]
+    );
+    // The mosaic is unaffected: picking it there frames it.
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    h.run_steps(2);
+    let before = h.state().w.mosaic().camera().unwrap();
+    h.get_by_label("ROI 1").click();
+    h.run_steps(3);
+    let after = h.state().w.mosaic().camera().unwrap();
+    assert!(after.zoom > before.zoom * 1.5, "{before:?} → {after:?}");
+    assert_eq!(h.state().toasts.len(), 1, "no second toast");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn drawing_on_the_plan_adds_a_region() {
     let (root, s, jobs) = merged("window-draw-roi");
     let mut state = State::new(s, jobs);
     state.w.set_mode(CanvasMode::Plan);
-    state.w.inspector_mut().reveal("rois");
+    state.w.inspector_mut().reveal(ROIS);
     let mut h = harness(state);
-    step_until(&mut h, |st| st.w.mosaic().source().is_some());
+    step_until(&mut h, |st| {
+        plan_placed(st) && st.w.mosaic().source().is_some()
+    });
     h.run_steps(2);
     assert_eq!(h.state().w.mode(), CanvasMode::Plan);
-    h.get_by_label("+ new ROI").click();
+    assert!(h.query_by_label("None yet.").is_some());
+    // Nothing forces the mosaic any more: the plan's own tool is armed.
+    h.get_by_label("Draw ROI").click();
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    assert!(h.state().w.plan().drawing());
+    assert!(!h.state().w.mosaic().drawing());
+    let (rect, _) = h.state().w.plan().canvas_frame().expect("the plan drawn");
+    let cam = h.state().w.plan().camera().expect("a camera");
+    let (from, delta) = (
+        rect.center() - egui::vec2(60.0, 30.0),
+        egui::vec2(120.0, 60.0),
+    );
+    // Where the camera puts the two corners of the drag on the canvas.
+    let at = |p: egui::Pos2| {
+        let d = p - rect.center();
+        (
+            cam.centre.0 + f64::from(d.x) / cam.zoom,
+            cam.centre.1 + f64::from(d.y) / cam.zoom,
+        )
+    };
+    let (a, b) = (at(from), at(from + delta));
+    drag(&mut h, from, delta);
+    assert!(!h.state().w.plan().drawing(), "one rect per arming");
+    let rois = h.state().w.mosaic().rois();
+    assert_eq!(rois.len(), 1, "{rois:?}");
+    assert_eq!(rois[0].name, "Region 1");
+    let rect = rois[0].canvas;
+    assert!(rect[2] > rect[0] && rect[3] > rect[1], "{rect:?}");
+    // The drag mapped through the plan camera (whole pixels, outward).
+    let want = [a.0, a.1, b.0, b.1];
+    for (got, want) in rect.iter().zip(want) {
+        assert!((*got as f64 - want).abs() < 1.5, "{rect:?} vs {want:?}");
+    }
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    // Listed and selected; saved in the session's ui.
+    let row = h.get_by_label("Region 1");
+    assert!(row.accesskit_node().is_selected().unwrap_or(false));
+    let saved = crate::rois::load_rois(&h.state().session.mosaic.config.ui);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].canvas, rect);
+    // The mosaic draws what was drawn on the plan.
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    h.run_steps(2);
+    let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
+    assert!(painted_roi(&h, frame, "Region 1").is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_plan_draws_roi_outlines() {
+    let (root, mut s, jobs) = merged("window-plan-rois");
+    add_roi(&mut s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    let mut h = harness(state);
+    step_until(&mut h, plan_placed);
+    h.run_steps(3);
+    let (rect, _) = h.state().w.plan().canvas_frame().unwrap();
+    let cam = h.state().w.plan().camera().expect("a camera");
+    // The label sits just inside the ROI's top-left corner, as on the mosaic.
+    let want = screen(rect, cam, (100.0, 100.0)) + egui::vec2(4.0, 2.0);
+    let (got, _) = painted_roi(&h, rect, "ROI 1").expect("ROI label painted on the plan");
+    assert!((got - want).length() < 1.0, "{got:?} != {want:?}");
+    // R hides them on the plan too.
+    h.key_press(egui::Key::R);
+    h.run_steps(3);
+    assert!(painted_roi(&h, rect, "ROI 1").is_none());
+    h.key_press(egui::Key::R);
+    h.run_steps(3);
+    assert!(painted_roi(&h, rect, "ROI 1").is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_d_key_arms_the_draw_tool() {
+    use egui::Key;
+    let (root, s, jobs) = merged("window-d-key");
+    let mut state = State::new(s, jobs);
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    h.run_steps(2);
+    // On the mosaic: its tool.
+    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    h.key_press(Key::D);
     h.run_steps(2);
     assert!(h.state().w.mosaic().drawing());
-    assert_eq!(h.state().w.mode(), CanvasMode::Mosaic);
+    assert!(!h.state().w.plan().drawing());
+    // Esc cancels (and the tool goes), then on the plan: the plan's.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().w.mosaic().drawing());
+    h.key_press(Key::M);
+    step_until(&mut h, plan_placed);
+    h.run_steps(2);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    h.key_press(Key::D);
+    h.run_steps(2);
+    assert!(h.state().w.plan().drawing());
+    assert!(!h.state().w.mosaic().drawing());
+    // The button says so: disabled while armed, with the key in its tooltip
+    // when not.
+    assert!(disabled(&h, "Draw ROI"));
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().w.plan().drawing());
+    assert!(!disabled(&h, "Draw ROI"));
+    let at = h.get_by_label("Draw ROI").rect().center();
+    assert!(tooltip_shows(&mut h, at, "Draw ROI (D)"));
+    // Switching canvas disarms the one left behind.
+    h.get_by_label("Draw ROI").click();
+    h.run_steps(2);
+    assert!(h.state().w.plan().drawing());
+    h.get_by_label("Mosaic").click();
+    h.run_steps(3);
+    assert!(!h.state().w.plan().drawing() && !h.state().w.mosaic().drawing());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_d_key_reveals_the_rois_section_and_the_armed_tool_shows() {
+    use egui::Key;
+    let (root, s, jobs) = merged("window-d-reveals");
+    let mut h = harness(State::new(s, jobs));
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    h.run_steps(2);
+    // ROIs folded (Problems open), the inspector folded too.
+    assert!(!h.state().w.inspector().open.contains(ROIS));
+    h.key_press(Key::I);
+    h.run_steps(2);
+    assert!(h.state().w.inspector().folded);
+    let centre = h.state().w.mosaic().viewer_frame().unwrap().0.center();
+    let cursor = |h: &Harness<'static, State>| h.output().platform_output.cursor_icon;
+    h.hover_at(centre);
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Default);
+    // D arms the tool and opens the section, so its hint (and Esc) show;
+    // the pointer over the canvas is a crosshair.
+    h.key_press(Key::D);
+    h.run_steps(3);
+    assert!(h.state().w.mosaic().drawing());
+    assert!(!h.state().w.inspector().folded);
+    assert!(h.state().w.inspector().open.contains(ROIS));
+    h.get_by_label("Drag on the image to draw; Esc cancels.");
+    let centre = h.state().w.mosaic().viewer_frame().unwrap().0.center();
+    h.hover_at(centre);
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair);
+    // Esc disarms it: the plain pointer again.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().w.mosaic().drawing());
+    assert_eq!(cursor(&h), egui::CursorIcon::Default);
+    // On the plan too.
+    h.key_press(Key::M);
+    step_until(&mut h, plan_placed);
+    h.run_steps(2);
+    h.key_press(Key::D);
+    h.run_steps(2);
+    assert!(h.state().w.plan().drawing());
+    let centre = h.state().w.plan().canvas_frame().unwrap().0.center();
+    h.hover_at(centre);
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_d_key_is_typing_in_a_text_field() {
+    use egui::Key;
+    let (root, s, jobs) = merged("window-d-typing");
+    let mut state = State::new(s, jobs);
+    state.w.inspector_mut().reveal(NOTES);
+    let mut h = harness(state);
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    h.run_steps(2);
+    h.get_by_label("Add notes").click();
+    h.run_steps(2);
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.run_steps(2);
+    h.key_press(Key::D);
+    h.run_steps(2);
+    assert!(!h.state().w.mosaic().drawing(), "typed, not a shortcut");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two ROIs, "Core" (id 7) then "Halo" (id 9), in a merged session.
+fn two_rois(tag: &str) -> (PathBuf, Harness<'static, State>) {
+    let (root, mut s, jobs) = merged(tag);
+    let roi = |id, name: &str, canvas| Roi {
+        id,
+        name: name.into(),
+        note: String::new(),
+        sky: None,
+        canvas,
+    };
+    save_rois(
+        &mut s.mosaic.config.ui,
+        &[
+            roi(7, "Core", [100, 100, 200, 160]),
+            roi(9, "Halo", [0, 0, 64, 64]),
+        ],
+    );
+    let mut state = State::new(s, jobs);
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    h.run_steps(3);
+    (root, h)
+}
+
+/// The ids and names of the ROIs saved in the session's `ui`.
+fn saved_rois(h: &Harness<'static, State>) -> Vec<(u64, String)> {
+    crate::rois::load_rois(&h.state().session.mosaic.config.ui)
+        .into_iter()
+        .map(|r| (r.id, r.name))
+        .collect()
+}
+
+/// The detail line ROI row `name` reads (size, then state).
+fn row_detail(h: &Harness<'static, State>, name: &str) -> String {
+    h.get_by_label(name)
+        .accesskit_node()
+        .description()
+        .unwrap_or_default()
+}
+
+/// Step until ROI row `name` reads `state` (bounded by [`PATIENCE`]).
+fn step_until_row(h: &mut Harness<'static, State>, name: &str, state: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while !row_detail(h, name).ends_with(state) {
+        assert!(
+            Instant::now() < deadline,
+            "{name} reads {:?}, never {state:?}",
+            row_detail(h, name)
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Hover the row of `name` so its actions show.
+fn hover_row(h: &mut Harness<'static, State>, name: &str) {
+    let at = h.get_by_label(name).rect().center();
+    h.hover_at(at);
+    h.run_steps(2);
+}
+
+#[test]
+fn deleting_an_roi_offers_undo() {
+    let (root, mut h) = two_rois("window-roi-delete");
+    // The highest id goes, so a reused id would show.
+    hover_row(&mut h, "Halo");
+    h.get_by_label("Delete Halo").click();
+    h.run_steps(3);
+    assert_eq!(saved_rois(&h), [(7, "Core".to_string())]);
+    let toasts = std::mem::take(&mut h.state_mut().toasts);
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert_eq!(toasts[0].toast.title, "Halo deleted");
+    assert_eq!(toasts[0].toast.action.as_deref(), Some("Undo"));
+    let Some(undo @ Undo::RoiDelete { .. }) = toasts.into_iter().next().and_then(|t| t.undo) else {
+        panic!("an ROI undo");
+    };
+    // A region drawn meanwhile does not take the deleted one's id...
+    {
+        let st = h.state_mut();
+        st.w.mosaic
+            .on_drawn(&mut st.session, [0.0, 0.0, 40.0, 40.0], (9255, 18310));
+    }
+    let drawn = saved_rois(&h)[1].clone();
+    assert!(drawn.0 > 9, "{drawn:?}");
+    assert_eq!(drawn.1, "Region 1");
+    // ...and Undo puts the deleted one back at its place, selected.
+    {
+        let st = h.state_mut();
+        st.w.undo(undo, &mut st.session, &mut st.jobs);
+    }
+    h.run_steps(3);
+    let names = saved_rois(&h);
+    assert_eq!(names[1], (9, "Halo".to_string()), "{names:?}");
+    assert_eq!(names.len(), 3);
+    let row = h.get_by_label("Halo");
+    assert!(row.accesskit_node().is_selected().unwrap_or(false));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn selection_survives_reorder_rename_and_other_deletes() {
+    let (root, mut h) = two_rois("window-roi-selection");
+    let selected = |h: &Harness<'static, State>, name: &str| {
+        h.get_by_label(name)
+            .accesskit_node()
+            .is_selected()
+            .unwrap_or(false)
+    };
+    h.get_by_label("Halo").click();
+    h.run_steps(3);
+    assert!(selected(&h, "Halo"));
+    // Reordered: still Halo.
+    hover_row(&mut h, "Halo");
+    h.get_by_label("Move Halo up").click();
+    h.run_steps(3);
+    assert!(selected(&h, "Halo") && !selected(&h, "Core"));
+    // Renamed: the same ROI stays selected.
+    hover_row(&mut h, "Halo");
+    h.get_by_label("Rename Halo").click();
+    h.run_steps(3);
+    h.get(
+        By::new()
+            .role(Role::TextInput)
+            .predicate(|n| n.label().as_deref() != Some("Note")),
+    )
+    .type_text("Outer");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(selected(&h, "Outer") && !selected(&h, "Core"));
+    // Another one deleted: the selection stays on Outer.
+    hover_row(&mut h, "Core");
+    h.get_by_label("Delete Core").click();
+    h.run_steps(3);
+    assert_eq!(saved_rois(&h), [(9, "Outer".to_string())]);
+    assert!(selected(&h, "Outer"));
+    assert_eq!(h.state().w.mosaic().selected_roi(), Some(9));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reordering_and_renaming_persist() {
+    let (root, mut h) = two_rois("window-roi-order");
+    // Move Halo up: the order is saved, ids stay with their ROIs.
+    hover_row(&mut h, "Halo");
+    h.get_by_label("Move Halo up").click();
+    h.run_steps(3);
+    assert_eq!(
+        saved_rois(&h),
+        [(9, "Halo".to_string()), (7, "Core".to_string())]
+    );
+    // Rename Core.
+    hover_row(&mut h, "Core");
+    h.get_by_label("Rename Core").click();
+    h.run_steps(3);
+    h.get_by_role(Role::TextInput).type_text("Nebula core");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(
+        saved_rois(&h),
+        [(9, "Halo".to_string()), (7, "Nebula core".to_string())]
+    );
+    // Written to the session's file with the window's save, ids included.
+    {
+        let st = h.state_mut();
+        st.w.flush_save(&mut st.session);
+    }
+    let dir = h.state().session.mosaic.dir.clone();
+    let back = MosaicConfig::load(&dir).unwrap();
+    let rois = crate::rois::load_rois(&back.ui);
+    let got: Vec<_> = rois.iter().map(|r| (r.id, r.name.as_str())).collect();
+    assert_eq!(got, [(9, "Halo"), (7, "Nebula core")]);
+    assert_eq!(rois[0].canvas, [0, 0, 64, 64]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_roi_is_gone() {
+    let (root, mut h) = two_rois("window-no-merge-roi");
+    assert!(h.query_by_label("Merge ROI").is_none());
+    assert!(h.query_by_label("+ new ROI").is_none());
+    h.get_by_label("Draw ROI");
+    // Selecting a region merges nothing.
+    h.get_by_label("Core").click();
+    h.run_steps(3);
+    assert!(!h.state().jobs.busy());
+    assert!(labels(&h.state().jobs).is_empty());
+    // Every row reads its state in text: "up to date" once its preview has
+    // merged by itself, through no job.
+    step_until_row(&mut h, "Core", "up to date");
+    assert!(labels(&h.state().jobs).is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2214,7 +2713,7 @@ fn a_composite_with_an_unmerged_member_keeps_the_canvas_in_place() {
         "the mosaic in {mosaic:?}, the plan in {plan:?}"
     );
     assert_camera(h.state().w.mosaic().camera(), cam);
-    let (got, _) = painted(&h, mosaic, "ROI 1").expect("ROI label painted");
+    let (got, _) = painted_roi(&h, mosaic, "ROI 1").expect("ROI label painted");
     let want = screen(plan, cam, (100.0, 100.0)) + egui::vec2(4.0, 2.0);
     assert!((got - want).length() < 1.0, "{got:?} != {want:?}");
     let _ = std::fs::remove_dir_all(&root);
@@ -3213,103 +3712,67 @@ fn the_merge_step_merges_from_out_of_date_and_settings_changed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A merged two-group session showing Ha on the mosaic, its draft feather
-/// 100 px above the committed one, whose "ROI 1" was merged through
-/// **Merge ROI** (so for Ha only). Returns the committed feather too.
-fn roi_merged_with_the_draft(tag: &str) -> (PathBuf, Harness<'static, State>, f32) {
+/// A merged two-group session showing Ha on the mosaic whose provenance
+/// carries a region merge of Ha with a feather 100 px above its whole
+/// merge's: what a session touched by an older build that merged ROIs
+/// into the store holds. Returns the committed feather too.
+fn with_a_region_entry(tag: &str) -> (PathBuf, Harness<'static, State>, f32) {
     let (root, mut s, jobs) = merged(tag);
-    add_roi(&mut s);
     let old = s.mosaic.config.blend.feather_px;
-    set_draft_feather(&mut s, old + 100.0);
+    let mut entry = s
+        .mosaic
+        .config
+        .provenance
+        .iter()
+        .rev()
+        .find(|e| e.action == "blend" && e.group.as_deref() == Some("Ha"))
+        .cloned()
+        .expect("Ha's whole merge");
+    entry.detail["whole"] = false.into();
+    entry.detail["rect"] = serde_json::json!(ROI);
+    entry.detail["settings"]["feather_px"] = f64::from(old + 100.0).into();
+    s.mosaic.config.provenance.push(entry);
     let mut state = State::new(s, jobs);
     state.w.set_mode(CanvasMode::Mosaic);
     state.w.select_view(ViewKind::Group("Ha".into()));
-    state.w.inspector_mut().reveal(ROIS);
     let mut h = harness(state);
     step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
-    h.get_by_label("ROI 1").click();
-    step_until(&mut h, |st| {
-        st.w.mosaic()
-            .merge_roi_block_reason(&st.session, &st.jobs)
-            .is_none()
-    });
-    let gate = h.state_mut().jobs.hold();
-    h.get_by_label("Merge ROI").click();
-    h.run_steps(2);
-    assert_eq!(labels(&h.state().jobs), ["Merge Ha"]);
-    gate.open();
-    step_until(&mut h, |st| !st.jobs.busy());
     h.run_steps(3);
     (root, h, old)
 }
 
 #[test]
-fn an_roi_merge_uses_the_draft() {
-    let (root, h, old) = roi_merged_with_the_draft("window-roi-draft");
-    let cfg = &h.state().session.mosaic.config;
-    let last = cfg
-        .provenance
-        .iter()
-        .rev()
-        .find(|e| e.action == "blend")
-        .expect("the ROI merge's entry");
-    assert_eq!(last.group.as_deref(), Some("Ha"));
-    assert_eq!(last.detail["whole"], false);
-    let feather = last.detail["settings"]["feather_px"].as_f64();
-    assert_eq!(feather, Some(f64::from(old + 100.0)), "the draft's feather");
-    // Nothing committed: the draft stays a draft.
-    assert_eq!(cfg.blend.feather_px, old);
-    assert_eq!(
-        crate::blend_settings::load_draft(cfg).feather_px,
-        old + 100.0
-    );
-    assert_eq!(merged_feather(&h.state().session, "Ha"), Some(old));
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn a_region_with_other_settings_makes_the_group_out_of_date() {
-    let (root, mut h, old) = roi_merged_with_the_draft("window-roi-differs");
+fn a_region_entry_with_other_settings_still_makes_the_group_out_of_date() {
+    let (root, mut h, old) = with_a_region_entry("window-roi-differs");
     let st = h.state();
-    // Its store is complete: the region's settings are what make it out of
-    // date, not the store.
+    // Its store is complete: the region entry's settings are what make it
+    // out of date, not the store.
     assert_eq!(st.session.results.get("Ha"), Some(&ResultState::Complete));
-    assert!(out_of_date(&st.session, "Ha") && !draft_changed(&st.session, "Ha"));
-    assert!(draft_changed(&st.session, "OIII"));
+    assert!(out_of_date(&st.session, "Ha"));
     assert_eq!(
         shown_steps(st)[MERGE_STEP],
         strip("Out of date", StepState::Next)
     );
     h.get_by_label("Out of date — region merged with other settings");
-    assert!(
-        h.query_by_label("Settings changed since this merge")
-            .is_none()
-    );
     assert_eq!(chip_state(&h, "Ha · 4"), Some("out of date".to_string()));
-    // The main button offers Merge, which commits the draft and merges both
-    // (Ha out of date, OIII's settings changed).
+    // Merge re-merges the whole canvas, which clears it.
     until_mergeable(&mut h);
-    assert!(!rightmost_disabled(&h, "Merge"));
     let gate = h.state_mut().jobs.hold();
     click_rightmost(&h, "Merge");
     h.run_steps(2);
-    assert_eq!(labels(&h.state().jobs), ["Merge Ha", "Merge OIII"]);
+    assert!(labels(&h.state().jobs).contains(&"Merge Ha".to_string()));
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
     h.run_steps(3);
     let st = h.state();
-    assert_eq!(st.session.mosaic.config.blend.feather_px, old + 100.0);
-    for g in ["Ha", "OIII"] {
-        assert_eq!(merged_feather(&st.session, g), Some(old + 100.0), "{g}");
-        assert!(!out_of_date(&st.session, g) && !draft_changed(&st.session, g));
-    }
-    assert_eq!(
-        shown_steps(st)[MERGE_STEP],
-        strip("Merged", StepState::Done)
-    );
+    assert_eq!(merged_feather(&st.session, "Ha"), Some(old));
+    assert!(!out_of_date(&st.session, "Ha"));
     assert!(
         h.query_by_label("Out of date — region merged with other settings")
             .is_none()
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+mod compare;
+mod previews;

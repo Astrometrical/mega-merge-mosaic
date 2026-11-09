@@ -75,6 +75,13 @@ pub const MAXIMIZE_2: char = '\u{e113}';
 /// `ellipsis`: more actions (a table row's actions menu).
 pub const ELLIPSIS: char = '\u{e0b6}';
 
+/// `arrow-up`: move up.
+pub const ARROW_UP: char = '\u{e04a}';
+/// `arrow-down`: move down.
+pub const ARROW_DOWN: char = '\u{e042}';
+/// `trash-2`: delete.
+pub const TRASH_2: char = '\u{e18e}';
+
 /// Every glyph above with its Lucide name, for tests and the gallery.
 pub const ALL: &[(&str, char)] = &[
     ("plus", PLUS),
@@ -103,6 +110,9 @@ pub const ALL: &[(&str, char)] = &[
     ("house", HOUSE),
     ("maximize-2", MAXIMIZE_2),
     ("ellipsis", ELLIPSIS),
+    ("arrow-up", ARROW_UP),
+    ("arrow-down", ARROW_DOWN),
+    ("trash-2", TRASH_2),
 ];
 
 #[cfg(test)]

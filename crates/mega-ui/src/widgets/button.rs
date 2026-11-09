@@ -31,14 +31,14 @@ pub enum ButtonKind {
 
 /// Fill, border and text colour of one interaction state.
 #[derive(Clone, Copy)]
-struct StateLook {
-    fill: Color32,
-    stroke: Color32,
-    text: Color32,
+pub(crate) struct StateLook {
+    pub(crate) fill: Color32,
+    pub(crate) stroke: Color32,
+    pub(crate) text: Color32,
 }
 
 /// The idle, hovered and pressed looks of a kind.
-fn looks(kind: ButtonKind) -> [StateLook; 3] {
+pub(crate) fn looks(kind: ButtonKind) -> [StateLook; 3] {
     let s = |fill, stroke, text| StateLook { fill, stroke, text };
     let none = Color32::TRANSPARENT;
     match kind {

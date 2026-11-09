@@ -163,17 +163,6 @@ impl MosaicTileSource {
         self.coarse_stats().map(|s| stretch.params(&s))
     }
 
-    /// Level-0 tiles meeting canvas rect `r`: `(valid, total)`. Reads tile
-    /// states only (cheap); call off the UI thread all the same.
-    pub fn fresh_counts(&self, r: [u64; 4]) -> (usize, usize) {
-        let tiles = self.tiles.tiles_in_rect(0, r);
-        let valid = tiles
-            .iter()
-            .filter(|&&(tx, ty)| self.reader.state(0, tx, ty) == TileState::Valid)
-            .count();
-        (valid, tiles.len())
-    }
-
     /// Visible size of tile `(tx, ty)` at `level` (edge tiles are cropped).
     fn visible(&self, level: u32, tx: u32, ty: u32) -> (usize, usize) {
         let t = u64::from(self.tiles.tile);
@@ -275,12 +264,6 @@ pub fn planar_image(
         }
     }
     ColorImage::new([w, h], pixels)
-}
-
-/// The fraction of tiles that are valid, from `(valid, total)` counts;
-/// `None` when there are no tiles.
-pub fn fresh_fraction((valid, total): (usize, usize)) -> Option<f64> {
-    (total > 0).then(|| valid as f64 / total as f64)
 }
 
 /// Colour of each composition channel (R, G, B) at weight 1.
@@ -599,10 +582,14 @@ mod tests {
         ] {
             assert_eq!(image(plain.fetch(k)), image(mapped.fetch(k)), "{k:?}");
         }
-        assert_eq!(
-            plain.fresh_counts([0, 0, 600, 300]),
-            mapped.fresh_counts([0, 0, 600, 300])
-        );
+        // The same tile states, every one.
+        for (tx, ty) in mapped.tiles.tiles_in_rect(0, [0, 0, 600, 300]) {
+            assert_eq!(
+                plain.reader.state(0, tx, ty),
+                mapped.reader.state(0, tx, ty),
+                "({tx}, {ty})"
+            );
+        }
     }
 
     #[test]
@@ -699,28 +686,6 @@ mod tests {
                 .coarse_stats()
                 .is_none()
         );
-        drop(store);
-    }
-    #[test]
-    fn roi_fresh_fraction() {
-        let path = temp_dir("tsrc-fresh").join("result.mmmt");
-        let mut store = TileStore::create(&path, geom(1)).unwrap();
-        let data = vec![0.5f32; T * T];
-        // Level 0 is 3 × 2 tiles: (0,0) valid, (1,0) stale, the rest missing.
-        store.write_tile(0, 0, 0, &data).unwrap();
-        store.write_tile(0, 1, 0, &data).unwrap();
-        store.invalidate_rect([256, 0, 512, 256]);
-        let src = MosaicTileSource::open(&path, None).unwrap();
-        // An ROI inside tile (0,0) only: all fresh.
-        assert_eq!(src.fresh_counts([10, 10, 100, 100]), (1, 1));
-        // Across (0,0) and (1,0): half.
-        assert_eq!(src.fresh_counts([200, 10, 300, 100]), (1, 2));
-        // The whole canvas: one of six.
-        assert_eq!(src.fresh_counts([0, 0, 600, 300]), (1, 6));
-        // Empty or off-canvas rects have no tiles.
-        assert_eq!(src.fresh_counts([700, 0, 800, 10]), (0, 0));
-        assert_eq!(fresh_fraction((1, 2)), Some(0.5));
-        assert_eq!(fresh_fraction((0, 0)), None);
         drop(store);
     }
 

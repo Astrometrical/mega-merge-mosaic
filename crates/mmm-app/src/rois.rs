@@ -9,32 +9,48 @@
 //! list itself is UI state, saved like the display stretch.
 //!
 //! [`RoiPanel`] is the ROI list (the session window's ROIs section) and its
-//! workers: the list (new, select, rename, note, delete), the
-//! reprojection, and how fresh each group of the view is inside each ROI.
-//! Selecting an ROI asks to go to it ([`RoiOutcome::go_to`]): the window
-//! frames it on whichever canvas shows, through the camera both share.
+//! worker: the list (new, select, rename, note, delete) and the
+//! reprojection. Each ROI's row and canvas label show its transient
+//! preview's state, as the window reports it ([`RoiPanel::set_states`],
+//! from [`crate::previews`]), and a row adds [`COARSE_NOTE`] while the
+//! preview in view is coarse ([`RoiPanel::set_coarse`]); an ROI whose label
+//! carries controls (Compare A / B, spec §8.3) has it drawn by the window,
+//! so its overlay carries no label ([`RoiPanel::set_labelled`]): the label
+//! is drawn once. Selecting an ROI asks to go to it ([`RoiOutcome::go_to`]):
+//! the window frames it on whichever canvas shows, through the camera both
+//! share (not on a plan drawn in another frame than the analysed one).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use egui::RichText;
+use egui::{Color32, RichText};
+use mega_ui::canvas_layers::Overlay;
 use mega_ui::theme::palette;
-use mega_ui::viewer::{Overlay, TiledViewer, Tool};
+use mega_ui::widgets::ordered_list::{ListEvent, ListRow, ListState, ordered_list_with};
 use mmm_core::astrometry::LinearWcs;
 use mmm_core::reference::ReferenceFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::tile_source::{MosaicTileSource, fresh_fraction};
+use crate::previews::PreviewState;
 use crate::util::{Poll, Task};
 
 /// Key in `MosaicConfig.ui` of the ROI list.
 pub const ROIS_KEY: &str = "rois";
 
+/// What an ROI's row adds while its preview in view is coarse (blended
+/// from the 1/8 summaries: [`mmm_core::mosaic::PreviewPatch::coarse`]).
+pub const COARSE_NOTE: &str = "coarse preview: merge mode not shown";
+
 /// A region of interest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Roi {
+    /// Identifies the ROI in the list (selection, rename, reorder, undo)
+    /// whatever its place; unique in the list and never reused while the
+    /// session is open. 0 in entries saved before ids existed:
+    /// [`load_rois`] gives those fresh ones.
+    #[serde(default)]
+    pub id: u64,
     /// Shown name.
     pub name: String,
     /// The user's note (may be empty).
@@ -49,12 +65,15 @@ pub struct Roi {
 }
 
 /// The ROIs saved in `ui` (none when absent or not a list); a malformed
-/// entry is skipped and the rest kept.
+/// entry is skipped and the rest kept. An entry with no id (0, or one
+/// already taken) gets a fresh one above all those in the list; the next
+/// save keeps it.
 pub fn load_rois(ui: &Value) -> Vec<Roi> {
     let Some(list) = ui.get(ROIS_KEY).and_then(Value::as_array) else {
         return Vec::new();
     };
-    list.iter()
+    let mut rois: Vec<Roi> = list
+        .iter()
         .filter_map(|v| match serde_json::from_value::<Roi>(v.clone()) {
             Ok(r) => Some(r),
             Err(e) => {
@@ -62,7 +81,17 @@ pub fn load_rois(ui: &Value) -> Vec<Roi> {
                 None
             }
         })
-        .collect()
+        .collect();
+    let mut next = rois.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+    let mut seen = std::collections::BTreeSet::new();
+    for r in &mut rois {
+        if r.id == 0 || !seen.insert(r.id) {
+            r.id = next;
+            next += 1;
+            seen.insert(r.id);
+        }
+    }
+    rois
 }
 
 /// Store `rois` in `ui`, keeping everything else there (a `ui` that is not
@@ -85,10 +114,11 @@ pub struct RoiOutcome {
     pub go_to: Option<[u64; 4]>,
 }
 
-/// A name for a new ROI that none of `taken` has: "ROI 1", "ROI 2", ….
+/// A name for a new ROI that none of `taken` has: "Region 1", "Region 2",
+/// ….
 pub fn unique_roi_name(taken: &[String]) -> String {
     (1..)
-        .map(|i| format!("ROI {i}"))
+        .map(|i| format!("Region {i}"))
         .find(|n| !taken.contains(n))
         .unwrap_or_default()
 }
@@ -185,32 +215,34 @@ pub fn roi_size_text(r: [u64; 4]) -> String {
     format!("{w} × {h} ({:.1} MP)", (w * h) as f64 / 1e6)
 }
 
-/// Per member group of the view: `(valid, total)` level-0 tiles inside an
-/// ROI, or `None` when the group has no result open.
-pub type MemberCounts = Vec<(String, Option<(usize, usize)>)>;
-/// [`MemberCounts`] of each ROI rect.
-type FreshCounts = Vec<([u64; 4], MemberCounts)>;
-
 /// The session's ROIs: the list (kept in `MosaicConfig.ui`), the
-/// selection, and the sync and freshness workers. Methods that change the
-/// list write it into the session's `ui` and return true; the view then
-/// saves (debounced).
+/// selection, the sync worker and each ROI's preview state (the window
+/// reports it). Methods that change the list write it into the session's
+/// `ui` and return true; the view then saves (debounced).
 #[derive(Default)]
 pub struct RoiPanel {
     /// The ROIs, as in `ui.rois`.
     pub(crate) rois: Vec<Roi>,
     loaded: bool,
     /// The selected ROI.
-    pub(crate) selected: Option<usize>,
+    pub(crate) selected: Option<u64>,
     /// A pending reprojection: the list it started from and the result.
     sync: Option<Task<(Vec<Roi>, Vec<Roi>)>>,
     /// Reproject (read the frame) once possible.
     pub(crate) want_sync: bool,
-    /// [`MemberCounts`] by ROI rect.
-    fresh: BTreeMap<[u64; 4], MemberCounts>,
-    fresh_task: Option<Task<FreshCounts>>,
-    /// Count fresh tiles once possible.
-    pub(crate) want_fresh: bool,
+    /// Each ROI's preview state, by id, as the window last reported it.
+    states: BTreeMap<u64, PreviewState>,
+    /// The ROIs whose preview in view is coarse, as the window last
+    /// reported them.
+    coarse: BTreeSet<u64>,
+    /// The ROIs whose canvas label the window draws (with its controls).
+    labelled: BTreeSet<u64>,
+    /// The list widget's own state (a rename in progress).
+    list: ListState,
+    /// One above every id given so far this session: ids are never reused.
+    next_id: u64,
+    /// The ROI the list just deleted, and its index ([`RoiPanel::take_deleted`]).
+    deleted: Option<(usize, Roi)>,
 }
 
 impl RoiPanel {
@@ -219,6 +251,7 @@ impl RoiPanel {
         if !self.loaded {
             self.loaded = true;
             self.rois = load_rois(ui);
+            self.next_id = self.rois.iter().map(|r| r.id).max().unwrap_or(0) + 1;
             self.want_sync = true;
         }
     }
@@ -226,11 +259,6 @@ impl RoiPanel {
     /// The ROIs.
     pub fn rois(&self) -> &[Roi] {
         &self.rois
-    }
-
-    /// The selected ROI's canvas rect.
-    pub fn selected_rect(&self) -> Option<[u64; 4]> {
-        self.rois.get(self.selected?).map(|r| r.canvas)
     }
 
     /// No reprojection running or wanted: the canvas rects follow the
@@ -241,52 +269,79 @@ impl RoiPanel {
 
     /// No worker running.
     pub fn idle(&self) -> bool {
-        self.sync.is_none() && self.fresh_task.is_none()
+        self.sync.is_none()
     }
 
-    /// The view (its groups) changed: freshness is counted again.
-    pub fn view_changed(&mut self) {
-        self.fresh.clear();
-        self.want_fresh = true;
+    /// Each ROI's preview state, by id (an ROI missing is out of date): its
+    /// row says it, and its canvas label while it merges.
+    pub fn set_states(&mut self, states: BTreeMap<u64, PreviewState>) {
+        self.states = states;
+    }
+
+    /// The ROIs whose preview in view is coarse: their rows add
+    /// [`COARSE_NOTE`] (the canvas label does not).
+    pub fn set_coarse(&mut self, ids: BTreeSet<u64>) {
+        self.coarse = ids;
+    }
+
+    /// The ROIs whose canvas label the window draws, with its controls:
+    /// their overlays carry no label.
+    pub fn set_labelled(&mut self, ids: BTreeSet<u64>) {
+        self.labelled = ids;
+    }
+
+    /// The colour ROI `id` is drawn in (outline and label): the accent
+    /// when selected.
+    pub fn color(&self, id: u64) -> Color32 {
+        if self.selected == Some(id) {
+            palette::ACCENT_400
+        } else {
+            palette::TEXT_BODY
+        }
+    }
+
+    /// ROI `id`'s preview state.
+    fn state(&self, id: u64) -> PreviewState {
+        self.states
+            .get(&id)
+            .copied()
+            .unwrap_or(PreviewState::OutOfDate)
     }
 
     /// A rectangle drawn on the canvas (image coordinates of a
-    /// `canvas`-sized result) becomes a new ROI "ROI n", selected; its sky
+    /// `canvas`-sized result) becomes a new ROI "Region n", selected; its sky
     /// corners follow from the sync. True if the list changed.
     pub fn on_drawn(&mut self, ui: &mut Value, r: [f64; 4], canvas: (u64, u64)) -> bool {
         let Some(rect) = canvas_rect(r, canvas) else {
             return false;
         };
         let taken: Vec<String> = self.rois.iter().map(|r| r.name.clone()).collect();
+        let id = self
+            .next_id
+            .max(self.rois.iter().map(|r| r.id).max().unwrap_or(0) + 1);
+        self.next_id = id + 1;
         self.rois.push(Roi {
+            id,
             name: unique_roi_name(&taken),
             note: String::new(),
             sky: None,
             canvas: rect,
         });
-        self.selected = Some(self.rois.len() - 1);
+        self.selected = Some(id);
         self.want_sync = true;
         self.geometry_changed(ui);
         true
     }
 
     /// The rects changed (draw, delete, reprojection): keep the list in
-    /// `ui` and count freshness again.
+    /// `ui`.
     fn geometry_changed(&mut self, ui: &mut Value) {
         save_rois(ui, &self.rois);
-        self.want_fresh = true;
     }
 
-    /// Start the sync (reading the frame at `frame`) and freshness counts
-    /// over `members` (each group of the view and its open result) on
-    /// workers when asked for. A freshness task holds the sources: the
-    /// caller tracks any it gives up meanwhile (`mosaic_view`).
-    pub fn start_tasks(
-        &mut self,
-        ctx: &egui::Context,
-        frame: PathBuf,
-        members: Vec<(String, Option<Arc<MosaicTileSource>>)>,
-    ) {
+    /// Start the sync (reading the frame at `frame`) on a worker when asked
+    /// for.
+    pub fn start_sync(&mut self, ctx: &egui::Context, frame: PathBuf) {
         if self.want_sync && self.sync.is_none() {
             self.want_sync = false;
             if !self.rois.is_empty() {
@@ -298,29 +353,9 @@ impl RoiPanel {
                 });
             }
         }
-        if self.want_fresh && self.fresh_task.is_none() {
-            self.want_fresh = false;
-            let rects: Vec<[u64; 4]> = self.rois.iter().map(|r| r.canvas).collect();
-            if rects.is_empty() || members.is_empty() {
-                self.fresh.clear();
-                return;
-            }
-            self.fresh_task = Task::spawn("mmm-roi-fresh", ctx, move || {
-                rects
-                    .into_iter()
-                    .map(|r| {
-                        let per = members
-                            .iter()
-                            .map(|(g, s)| (g.clone(), s.as_ref().map(|s| s.fresh_counts(r))))
-                            .collect();
-                        (r, per)
-                    })
-                    .collect()
-            });
-        }
     }
 
-    /// Apply finished workers; true if the list changed (written to `ui`).
+    /// Apply a finished sync; true if the list changed (written to `ui`).
     pub fn poll(&mut self, ui: &mut Value) -> bool {
         let mut changed = false;
         if let Some(task) = &self.sync {
@@ -333,10 +368,10 @@ impl RoiPanel {
                     // have drawn or deleted meanwhile); names and notes
                     // are the user's and stay.
                     for roi in &mut self.rois {
-                        let Some(j) = snapshot
-                            .iter()
-                            .position(|s| s.sky == roi.sky && s.canvas == roi.canvas)
-                        else {
+                        // By id (and only if it has not moved since).
+                        let Some(j) = snapshot.iter().position(|s| {
+                            s.id == roi.id && s.sky == roi.sky && s.canvas == roi.canvas
+                        }) else {
                             continue;
                         };
                         if (out[j].sky, out[j].canvas) != (roi.sky, roi.canvas) {
@@ -351,153 +386,149 @@ impl RoiPanel {
                 }
             }
         }
-        if let Some(task) = &self.fresh_task {
-            match task.poll() {
-                Poll::Pending => {}
-                Poll::Lost => self.fresh_task = None,
-                Poll::Done(counts) => {
-                    self.fresh_task = None;
-                    self.fresh = counts.into_iter().collect();
-                }
-            }
-        }
         changed
     }
 
-    /// The ROIs as viewer overlays: the selected one solid in the accent
-    /// colour, the others dashed.
+    /// The ROIs as canvas overlays (drawn on both canvases): the selected
+    /// one solid in the accent colour, the others dashed; each labelled
+    /// with its name, followed by " · merging…" while its preview merges,
+    /// except those whose label the window draws ([`RoiPanel::set_labelled`]).
     pub fn overlays(&self) -> Vec<Overlay> {
         self.rois
             .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let selected = self.selected == Some(i);
+            .map(|r| {
+                let selected = self.selected == Some(r.id);
                 Overlay {
                     rect: r.canvas.map(|v| v as f64),
-                    color: if selected {
-                        palette::ACCENT_400
-                    } else {
-                        palette::TEXT_BODY
+                    color: self.color(r.id),
+                    label: match self.state(r.id) {
+                        _ if self.labelled.contains(&r.id) => String::new(),
+                        PreviewState::Merging => format!("{} · merging…", r.name),
+                        _ => r.name.clone(),
                     },
-                    label: r.name.clone(),
                     dashed: !selected,
                 }
             })
             .collect()
     }
 
-    /// The panel: "+ new ROI" (`viewer`'s draw tool), and each ROI with
-    /// its size and freshness; the selected one with Name, Note and
-    /// Delete. Selecting one asks to go to it ([`RoiOutcome::go_to`]; the
-    /// caller moves the camera). A change of the list is written to `ui`
-    /// ([`RoiOutcome::changed`]); a rename or note edit does not count
-    /// freshness again.
-    pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        cfg_ui: &mut Value,
-        viewer: Option<&mut TiledViewer>,
-    ) -> RoiOutcome {
-        ui.label(RichText::new("Regions of interest").color(palette::TEXT_STRONG));
-        let drawing = viewer.as_ref().is_some_and(|v| v.tool() == Tool::DrawRect);
-        if ui
-            .add_enabled(viewer.is_some() && !drawing, egui::Button::new("+ new ROI"))
-            .on_hover_text("Drag a rectangle on the image")
-            .on_disabled_hover_text("Shown once there is a result to draw on")
-            .clicked()
-            && let Some(v) = viewer
-        {
-            v.set_tool(Tool::DrawRect);
+    /// Take the ROI the list just deleted, with the index it had: the
+    /// window offers to undo it.
+    pub fn take_deleted(&mut self) -> Option<(usize, Roi)> {
+        self.deleted.take()
+    }
+
+    /// Put `roi` (deleted from `index`) back there (the end, if the list
+    /// is shorter by now) and select it, keeping its id; one with its id in
+    /// the list already is left alone. True if the list changed.
+    pub fn restore(&mut self, ui: &mut Value, index: usize, roi: Roi) -> bool {
+        if self.rois.iter().any(|r| r.id == roi.id) {
+            return false;
         }
-        let muted = |ui: &mut egui::Ui, t: &str| {
-            ui.label(RichText::new(t).small().color(palette::TEXT_MUTED));
-        };
-        if drawing {
-            muted(ui, "Drag on the image to draw; Esc cancels.");
-        }
+        self.next_id = self.next_id.max(roi.id + 1);
+        self.selected = Some(roi.id);
+        self.rois.insert(index.min(self.rois.len()), roi);
+        self.want_sync = true;
+        self.geometry_changed(ui);
+        true
+    }
+
+    /// The ROI list: each ROI's name, size and state, with the note of the
+    /// selected one under it. Picking one asks to go to it
+    /// ([`RoiOutcome::go_to`]; the caller moves the camera); rename,
+    /// reorder and delete are the list's ([`ordered_list_with`]), a delete
+    /// is kept for [`RoiPanel::take_deleted`]. A change of the list is
+    /// written to `ui` ([`RoiOutcome::changed`]).
+    pub fn ui(&mut self, ui: &mut egui::Ui, cfg_ui: &mut Value) -> RoiOutcome {
         if self.rois.is_empty() {
-            muted(ui, "None yet.");
+            ui.label(
+                RichText::new("None yet.")
+                    .small()
+                    .color(palette::TEXT_MUTED),
+            );
             return RoiOutcome::default();
         }
-        let mut select = None;
-        let mut delete = None;
-        let mut edited = false;
-        for i in 0..self.rois.len() {
-            let selected = self.selected == Some(i);
-            ui.push_id(("roi", i), |ui| {
-                let roi = &mut self.rois[i];
-                if ui.selectable_label(selected, &roi.name).clicked() {
-                    select = Some(i);
-                }
-                let fresh = self
-                    .fresh
-                    .get(&roi.canvas)
-                    .map_or_else(|| "…".to_string(), fresh_text);
-                muted(ui, &format!("{} · {fresh}", roi_size_text(roi.canvas)));
-                if selected {
-                    ui.horizontal(|ui| {
-                        let l = ui.label(RichText::new("Name").color(palette::TEXT_BODY));
-                        edited |= ui
-                            .text_edit_singleline(&mut roi.name)
-                            .labelled_by(l.id)
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        let l = ui.label(RichText::new("Note").color(palette::TEXT_BODY));
-                        edited |= ui
-                            .text_edit_singleline(&mut roi.note)
-                            .labelled_by(l.id)
-                            .changed();
-                    });
-                    if ui.button("Delete").clicked() {
-                        delete = Some(i);
-                    }
-                } else if !roi.note.is_empty() {
-                    muted(ui, &roi.note);
-                }
-            });
-        }
-        let go_to = select.map(|i| {
-            self.selected = Some(i);
-            self.rois[i].canvas
-        });
-        if let Some(i) = delete {
-            self.rois.remove(i);
-            self.selected = None;
-            self.geometry_changed(cfg_ui);
-            return RoiOutcome {
-                changed: true,
-                go_to: None,
-            };
-        }
-        if edited {
-            // Names and notes only: saved, but nothing to recount.
-            save_rois(cfg_ui, &self.rois);
-        }
-        RoiOutcome {
-            changed: edited,
-            go_to,
-        }
-    }
-}
-
-/// How fresh an ROI is for the view's groups: "fresh", "stale (NN%
-/// fresh)", "not merged" or "no tiles"; with several groups, each
-/// prefixed by its name.
-pub fn fresh_text(counts: &MemberCounts) -> String {
-    let one = |c: &Option<(usize, usize)>| match c.map(fresh_fraction) {
-        None => "not merged".to_string(),
-        Some(None) => "no tiles".to_string(),
-        Some(Some(f)) if f >= 1.0 => "fresh".to_string(),
-        Some(Some(f)) => format!("stale ({:.0}% fresh)", (f * 100.0).floor()),
-    };
-    match counts.as_slice() {
-        [(_, c)] => one(c),
-        _ => counts
+        // Owned, so the note editor below may borrow the list.
+        let shown: Vec<(u64, String, String, bool)> = self
+            .rois
             .iter()
-            .map(|(g, c)| format!("{g} {}", one(c)))
-            .collect::<Vec<_>>()
-            .join(", "),
+            .map(|r| {
+                let state = self.state(r.id).text();
+                let mut detail = format!("{} · {state}", roi_size_text(r.canvas));
+                if self.coarse.contains(&r.id) {
+                    detail.push_str(" · ");
+                    detail.push_str(COARSE_NOTE);
+                }
+                (r.id, r.name.clone(), detail, self.selected == Some(r.id))
+            })
+            .collect();
+        let rows: Vec<ListRow> = shown
+            .iter()
+            .map(|(id, name, detail, selected)| ListRow {
+                id: *id,
+                label: name,
+                detail: Some(detail),
+                selected: *selected,
+            })
+            .collect();
+        let mut note_edited = false;
+        let rois = &mut self.rois;
+        let events = ordered_list_with(ui, "rois", &rows, &mut self.list, |ui, id| {
+            if let Some(roi) = rois.iter_mut().find(|r| r.id == id) {
+                ui.horizontal(|ui| {
+                    let l = ui.label(RichText::new("Note").color(palette::TEXT_BODY));
+                    note_edited |= ui
+                        .text_edit_singleline(&mut roi.note)
+                        .labelled_by(l.id)
+                        .changed();
+                });
+            }
+        });
+        let mut out = RoiOutcome::default();
+        let mut rewrite = note_edited;
+        let mut deleted = false;
+        for event in events {
+            match event {
+                ListEvent::Select(id) => self.selected = Some(id),
+                ListEvent::Activate(id) => {
+                    self.selected = Some(id);
+                    out.go_to = self.rois.iter().find(|r| r.id == id).map(|r| r.canvas);
+                }
+                ListEvent::Rename(id, name) => {
+                    if let Some(r) = self.rois.iter_mut().find(|r| r.id == id) {
+                        r.name = name;
+                        rewrite = true;
+                    }
+                }
+                ListEvent::Move { id, to } => {
+                    if let Some(from) = self.rois.iter().position(|r| r.id == id) {
+                        let roi = self.rois.remove(from);
+                        self.rois.insert(to.min(self.rois.len()), roi);
+                        rewrite = true;
+                    }
+                }
+                ListEvent::Delete(id) => {
+                    if let Some(at) = self.rois.iter().position(|r| r.id == id) {
+                        let roi = self.rois.remove(at);
+                        if self.selected == Some(id) {
+                            self.selected = None;
+                        }
+                        self.deleted = Some((at, roi));
+                        deleted = true;
+                    }
+                }
+            }
+        }
+        if deleted {
+            self.geometry_changed(cfg_ui);
+            out.go_to = None;
+            out.changed = true;
+        } else if rewrite {
+            // Names, order and notes only.
+            save_rois(cfg_ui, &self.rois);
+            out.changed = true;
+        }
+        out
     }
 }
 
@@ -526,6 +557,7 @@ mod tests {
     fn roi_sky_roundtrip() {
         let frame = solved();
         let roi = Roi {
+            id: 1,
             name: "ROI 1".into(),
             note: "faint kink in the trapezium spike".into(),
             sky: None,
@@ -608,8 +640,8 @@ mod tests {
             "empty"
         );
         assert_eq!(roi_size_text([0, 0, 2000, 1500]), "2000 × 1500 (3.0 MP)");
-        let taken = ["ROI 1".to_string(), "ROI 3".to_string()];
-        assert_eq!(unique_roi_name(&taken), "ROI 2");
+        let taken = ["Region 1".to_string(), "Region 3".to_string()];
+        assert_eq!(unique_roi_name(&taken), "Region 2");
 
         // Lenient load: malformed entries are skipped.
         let ui = serde_json::json!({ ROIS_KEY: [
@@ -624,13 +656,63 @@ mod tests {
     }
 
     #[test]
-    fn fresh_text_per_member() {
-        let one = |c| vec![("Ha".to_string(), c)];
-        assert_eq!(fresh_text(&one(Some((2, 2)))), "fresh");
-        assert_eq!(fresh_text(&one(Some((1, 3)))), "stale (33% fresh)");
-        assert_eq!(fresh_text(&one(Some((0, 0)))), "no tiles");
-        assert_eq!(fresh_text(&one(None)), "not merged");
-        let two = vec![("Ha".to_string(), Some((4, 4))), ("OIII".to_string(), None)];
-        assert_eq!(fresh_text(&two), "Ha fresh, OIII not merged");
+    fn new_rois_are_named_region_n() {
+        assert_eq!(unique_roi_name(&[]), "Region 1");
+        // The first unused number; names the user chose are no obstacle.
+        let taken = ["ROI 1", "Core", "Region 2"].map(String::from);
+        assert_eq!(unique_roi_name(&taken), "Region 1");
+        let taken = ["Region 1", "Region 2"].map(String::from);
+        assert_eq!(unique_roi_name(&taken), "Region 3");
+
+        // A drawn rect takes it, with an id, at the end of the list.
+        let mut panel = RoiPanel::default();
+        let mut ui = serde_json::json!({});
+        assert!(panel.on_drawn(&mut ui, [0.0, 0.0, 50.0, 40.0], (1000, 1000)));
+        assert!(panel.on_drawn(&mut ui, [10.0, 10.0, 60.0, 60.0], (1000, 1000)));
+        let names: Vec<_> = panel.rois().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Region 1", "Region 2"]);
+        let (a, b) = (panel.rois()[0].id, panel.rois()[1].id);
+        assert!(a != 0 && b != 0 && a != b);
+        assert_eq!(panel.selected, Some(b));
+        // Deleting the last does not free its id for the next one.
+        let gone = panel.rois.pop().unwrap();
+        assert!(panel.on_drawn(&mut ui, [0.0, 0.0, 9.0, 9.0], (1000, 1000)));
+        assert_ne!(panel.rois()[1].id, gone.id);
+        assert_eq!(load_rois(&ui), panel.rois());
+    }
+
+    #[test]
+    fn old_rois_get_ids_and_keep_names() {
+        // Entries saved before ids existed (and a clash): fresh unique ids
+        // above those taken; names, notes and rects as they were.
+        let ui = serde_json::json!({ ROIS_KEY: [
+            { "name": "ROI 1", "note": "kept", "canvas": [0, 0, 10, 10] },
+            { "id": 5, "name": "Core", "canvas": [0, 0, 20, 20] },
+            { "name": "ROI 2", "canvas": [5, 5, 30, 30] },
+            { "id": 5, "name": "Clash", "canvas": [1, 1, 2, 2] }
+        ]});
+        let loaded = load_rois(&ui);
+        let ids: Vec<u64> = loaded.iter().map(|r| r.id).collect();
+        assert_eq!(ids[1], 5, "an id already there is kept");
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 4, "{ids:?}");
+        assert!(ids.iter().all(|&i| i != 0));
+        assert!(ids[0] > 5 && ids[2] > 5 && ids[3] > 5);
+        let names: Vec<_> = loaded.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["ROI 1", "Core", "ROI 2", "Clash"]);
+        assert_eq!(loaded[0].note, "kept");
+        assert_eq!(loaded[2].canvas, [5, 5, 30, 30]);
+        // Saved back, they stay.
+        let mut ui = ui;
+        save_rois(&mut ui, &loaded);
+        assert_eq!(load_rois(&ui), loaded);
+        // A panel that loaded them goes on from the highest.
+        let mut panel = RoiPanel::default();
+        panel.load_once(&ui);
+        let top = panel.rois().iter().map(|r| r.id).max().unwrap();
+        assert!(panel.on_drawn(&mut ui, [0.0, 0.0, 9.0, 9.0], (1000, 1000)));
+        assert!(panel.rois().last().unwrap().id > top);
     }
 }

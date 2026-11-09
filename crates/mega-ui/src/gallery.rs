@@ -12,11 +12,13 @@ use egui::{
 };
 
 use crate::brand::{self, BrandImages, LockupSize};
+use crate::canvas_layers::{Overlay, Patch};
 use crate::checks::{CheckItem, checks_list};
 use crate::groups::GROUP_PALETTE;
 use crate::hero::{HeroStage, HeroView};
 use crate::icons;
 use crate::inspector::{Badge, InspectorState, Section, inspector, inspector_width};
+use crate::plan::{Layer, PlacedItem, PlanCanvas};
 use crate::starfield::Starfield;
 use crate::table::{self, TableEvent, TableState, sectioned_table};
 use crate::theme::palette::*;
@@ -25,11 +27,24 @@ use crate::theme::tokens::{radius, space};
 use crate::theme::{Severity, Tone};
 use crate::viewer::ImageTileSource;
 use crate::widgets::{
-    ButtonKind, ChipMark, ChoiceChip, MegaButton, NotesMode, SessionCardData, StepState, StripStep,
-    Toast, Toasts, chip, choice_chip, icon_button, notes_view, overline, progress, property_grid,
-    property_row, property_row_numeric, property_row_ui, segmented, session_card, status,
-    step_strip, submenu, text_input,
+    ButtonKind, CanvasLabel, ChipMark, ChoiceChip, LabelControl, ListEvent, ListRow, ListState,
+    MegaButton, NotesMode, SessionCardData, StepState, StripStep, Toast, Toasts, canvas_label,
+    chip, choice_chip, icon_button, notes_view, ordered_list_with, overline, progress,
+    property_grid, property_row, property_row_numeric, property_row_ui, segmented, session_card,
+    status, step_strip, submenu, text_input,
 };
+
+/// Number of gallery pages: 0 tokens, 1 components, 2 imagery. Pages exist
+/// because a snapshot cannot exceed 4096 points at 2x (wgpu's 8192 px
+/// texture cap); add one rather than overflow a page.
+pub const PAGES: usize = 3;
+
+/// Window size (points) at which page `page` shows in full. The gallery
+/// test and the snapshots render each page at this size; grow it when a
+/// section is added (a page must stay under 4096 points tall).
+pub fn page_size(page: usize) -> Vec2 {
+    Vec2::new(1200.0, [1340.0, 2160.0, 1600.0][page])
+}
 
 /// The gallery's interactive state.
 pub struct GalleryState {
@@ -47,6 +62,23 @@ pub struct GalleryState {
     hero: Option<HeroStage>,
     portrait_hero: Option<HeroStage>,
     card_thumbs: Option<[TextureHandle; 2]>,
+    plan: Option<PlanGallery>,
+    list: ListState,
+    list_rows: Vec<GalleryRow>,
+}
+
+/// A row of the ordered-list section: id, name, status, selected.
+struct GalleryRow {
+    id: u64,
+    label: String,
+    detail: Option<&'static str>,
+    selected: bool,
+}
+
+/// The plan canvas section: two panels, a region overlay and a patch.
+struct PlanGallery {
+    canvas: PlanCanvas,
+    items: Vec<PlacedItem>,
 }
 
 impl Default for GalleryState {
@@ -101,6 +133,34 @@ Panel 7: gradient in the lower left, redo DBE."
             hero: None,
             portrait_hero: None,
             card_thumbs: None,
+            plan: None,
+            list: ListState::default(),
+            list_rows: vec![
+                GalleryRow {
+                    id: 1,
+                    label: "Region 1".into(),
+                    detail: Some("up to date"),
+                    selected: false,
+                },
+                GalleryRow {
+                    id: 2,
+                    label: "Region 2".into(),
+                    detail: Some("merging"),
+                    selected: true,
+                },
+                GalleryRow {
+                    id: 3,
+                    label: "Orion core, the long name of a region that must be cut short".into(),
+                    detail: Some("out of date"),
+                    selected: false,
+                },
+                GalleryRow {
+                    id: 4,
+                    label: "Region 4".into(),
+                    detail: None,
+                    selected: false,
+                },
+            ],
         }
     }
 }
@@ -199,6 +259,149 @@ fn gallery_hero(size: [usize; 2], grid: [usize; 2]) -> HeroStage {
     stage
 }
 
+/// Canvas extent of the gallery's plan.
+const PLAN_EXTENT: [f64; 4] = [0.0, 0.0, 1000.0, 440.0];
+
+/// Two panels, a region drawn over both as a dashed overlay (as "Region 1"
+/// is on the plan), and a preview patch inside it, clipped to the region.
+fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
+    let tex = |name: &str, a, b| {
+        ctx.load_texture(
+            name,
+            gradient_image([200, 160], a, b),
+            TextureOptions::LINEAR,
+        )
+    };
+    let item = |id: u64, rect: [f64; 4], texture: TextureHandle| PlacedItem {
+        id,
+        rect,
+        layers: vec![Layer {
+            texture,
+            tint: Color32::WHITE,
+            additive: false,
+        }],
+        outline: ACCENT_500,
+        label: format!("Panel {id}"),
+        marker: None,
+        selected: false,
+        highlighted: false,
+    };
+    let mut canvas = PlanCanvas::new();
+    canvas.set_overlays(vec![Overlay {
+        rect: [380.0, 120.0, 700.0, 340.0],
+        color: ACCENT_400,
+        label: "Region 1".into(),
+        dashed: true,
+    }]);
+    canvas.set_patches(vec![Patch {
+        rect: [380.0, 120.0, 700.0, 340.0],
+        clip: [380.0, 120.0, 620.0, 340.0],
+        texture: tex("gallery-plan-patch", HA_500, SURFACE_700),
+    }]);
+    PlanGallery {
+        canvas,
+        items: vec![
+            item(
+                1,
+                [20.0, 20.0, 520.0, 420.0],
+                tex("gallery-plan-a", ACCENT_600, HA_500),
+            ),
+            item(
+                2,
+                [480.0, 20.0, 980.0, 420.0],
+                tex("gallery-plan-b", SURFACE_700, ACCENT_500),
+            ),
+        ],
+    }
+}
+
+/// Canvas labels over imagery, each at the corner of the region it names:
+/// one row with **Compare** and the state; comparing, showing A, its
+/// settings on a second row; and a momentary switch held, B shown (and
+/// underlined) while A stays selected.
+fn canvas_label_section(ui: &mut Ui) {
+    let (strip, _) = ui.allocate_exact_size(Vec2::new(1000.0, 150.0), Sense::hover());
+    imagery(ui, strip);
+    let toggle = |name: &'static str, selected, shown| LabelControl::Toggle {
+        options: ["A", "B"],
+        accessible: match name {
+            "Bat wing" => ["Show A of Bat wing", "Show B of Bat wing"],
+            _ => ["Show A of Sword", "Show B of Sword"],
+        },
+        selected,
+        shown,
+        tooltip: None,
+    };
+    let button = |text, accessible, primary| LabelControl::Button {
+        text,
+        accessible,
+        tooltip: None,
+        primary,
+    };
+    let one_row = [button("Compare", "Compare Trapezium", false)];
+    let showing_a = [
+        toggle("Bat wing", 0, 0),
+        button("Use A", "Use A for Bat wing", false),
+        button("Done", "Done comparing Bat wing", true),
+    ];
+    let peeking = [
+        toggle("Sword", 0, 1),
+        button("Use A", "Use A for Sword", false),
+        button("Done", "Done comparing Sword", true),
+    ];
+    let labels = [
+        (
+            "Trapezium",
+            20.0,
+            &one_row[..],
+            "up to date",
+            false,
+            ACCENT_400,
+        ),
+        (
+            "Bat wing",
+            340.0,
+            &showing_a[..],
+            "A · feather 40 px · flatten 2",
+            true,
+            TEXT_BODY,
+        ),
+        (
+            "Sword",
+            670.0,
+            &peeking[..],
+            "B · feather 120 px · flatten off",
+            true,
+            TEXT_BODY,
+        ),
+    ];
+    for (name, x, controls, line, below, color) in labels {
+        let region = Rect::from_min_size(
+            strip.left_top() + Vec2::new(x, space::L),
+            Vec2::new(300.0, 120.0),
+        );
+        ui.painter()
+            .rect_stroke(region, 0.0, Stroke::new(1.5, color), StrokeKind::Inside);
+        let description = format!("{name}: {line}");
+        canvas_label(
+            ui,
+            ("gallery-canvas-label", name),
+            &CanvasLabel {
+                corner: region.left_top(),
+                clip: strip,
+                avoid: None,
+                name,
+                color,
+                controls,
+                text: line,
+                text_below: below,
+                accessible: name,
+                description: &description,
+            },
+        );
+    }
+}
+
 /// Draw `hero` as the start screen does, full bleed in a 1000 × 320 strip
 /// whose left third is the content column.
 fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
@@ -208,6 +411,46 @@ fn hero_section(ui: &mut Ui, hero: &mut HeroStage) {
         ui.set_clip_rect(rect);
         hero.show(ui, rect.left() + rect.width() / 3.0, 0.0);
     });
+}
+
+/// The ordered-list section: regions with a status, one selected with
+/// details under it. Events are applied, so it can be tried: click, rename,
+/// drag, move and delete.
+fn ordered_list_section(ui: &mut Ui, state: &mut ListState, rows: &mut Vec<GalleryRow>) {
+    let shown: Vec<ListRow> = rows
+        .iter()
+        .map(|r| ListRow {
+            id: r.id,
+            label: &r.label,
+            detail: r.detail,
+            selected: r.selected,
+        })
+        .collect();
+    let events = ordered_list_with(ui, "gallery-list", &shown, state, |ui, _| {
+        ui.label(
+            RichText::new("Notes for the selected region show here.")
+                .text_style(TextStyle::Small)
+                .color(TEXT_MUTED),
+        );
+    });
+    for event in events {
+        match event {
+            ListEvent::Select(id) => rows.iter_mut().for_each(|r| r.selected = r.id == id),
+            ListEvent::Activate(_) => {}
+            ListEvent::Rename(id, name) => {
+                if let Some(r) = rows.iter_mut().find(|r| r.id == id) {
+                    r.label = name;
+                }
+            }
+            ListEvent::Move { id, to } => {
+                if let Some(from) = rows.iter().position(|r| r.id == id) {
+                    let row = rows.remove(from);
+                    rows.insert(to, row);
+                }
+            }
+            ListEvent::Delete(id) => rows.retain(|r| r.id != id),
+        }
+    }
 }
 
 /// The table section, sorted by integration at first: a rolled-up group
@@ -296,12 +539,34 @@ fn table_section(ui: &mut Ui, state: &mut TableState, selection: &mut BTreeSet<u
     }
 }
 
-/// Draw the gallery.
+/// Draw the whole gallery: every page, stacked in one scrolling area.
 pub fn show(ui: &mut Ui, state: &mut GalleryState) {
     let now = ui.input(|i| i.time);
     ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.set_max_width(1100.0);
+        sections(ui, state, None);
+    });
+    let _ = state.toasts.show(ui.ctx(), now);
+}
 
+/// Draw one page of the gallery (`0..PAGES`) without a scroll area, in
+/// [`page_size`] of room.
+pub fn show_page(ui: &mut Ui, state: &mut GalleryState, page: usize) {
+    let now = ui.input(|i| i.time);
+    let fill = ui.visuals().panel_fill;
+    ui.painter().rect_filled(ui.max_rect(), 0.0, fill);
+    ui.scope(|ui| {
+        ui.set_max_width(1100.0);
+        sections(ui, state, Some(page));
+    });
+    let _ = state.toasts.show(ui.ctx(), now);
+}
+
+/// The sections of `page`, or of every page if `None`.
+fn sections(ui: &mut Ui, state: &mut GalleryState, page: Option<usize>) {
+    let now = ui.input(|i| i.time);
+    let on = |p: usize| page.is_none_or(|x| x == p);
+    if on(0) {
         section(ui, "Type scale", |ui| {
             for (t, spec, sample) in [
                 (Type::Hero, "hero · 32 / semibold", "Carina Nebula SHO"),
@@ -485,7 +750,8 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                 ],
             );
         });
-
+    }
+    if on(1) {
         section(ui, "Inspector", |ui| {
             let sections = [
                 Section {
@@ -519,6 +785,21 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
             ui.scope(|ui| {
                 ui.set_max_width(640.0);
                 table_section(ui, &mut state.table, &mut state.table_selection);
+            });
+        });
+
+        section(ui, "Ordered list", |ui| {
+            ui.scope(|ui| {
+                ui.set_max_width(360.0);
+                ordered_list_section(ui, &mut state.list, &mut state.list_rows);
+            });
+        });
+
+        section(ui, "Plan canvas", |ui| {
+            let ctx = ui.ctx().clone();
+            let plan = state.plan.get_or_insert_with(|| gallery_plan(&ctx));
+            ui.allocate_ui(Vec2::new(640.0, 280.0), |ui| {
+                let _ = plan.canvas.show(ui, PLAN_EXTENT, &plan.items, true, true);
             });
         });
 
@@ -592,7 +873,8 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                     }
                 });
         });
-
+    }
+    if on(2) {
         section(ui, "Brand lockup", |ui| {
             let images = state.brand.get_or_insert_with(|| {
                 BrandImages::load(ui.ctx(), brand::MEGA_MERGE_MOSAIC_PNG, "Mega Merge Mosaic")
@@ -677,7 +959,8 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
                 );
             });
         });
-        ui.add_space(space::XXL);
-    });
-    let _ = state.toasts.show(ui.ctx(), now);
+
+        section(ui, "Canvas label", canvas_label_section);
+    }
+    ui.add_space(space::XXL);
 }

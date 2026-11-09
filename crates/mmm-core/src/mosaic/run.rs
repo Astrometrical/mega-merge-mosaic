@@ -123,9 +123,17 @@ impl Mosaic {
 
     /// Record a finished (or partly finished) [`run_analyze`]: remove the
     /// completed groups from [`MosaicConfig::needs_analyze`], record the
-    /// fingerprints of their panels, append the outcome's provenance, and
-    /// save. Groups that did not complete stay in `needs_analyze`, so
-    /// [`plan_blend`] keeps refusing them until the next analysis.
+    /// fingerprints of their panels, append an `"analyze"` provenance entry
+    /// listing each completed group with the settings it was analysed with
+    /// (`{"groups": {name: settings}}`), and save, all in one write. Groups
+    /// that did not complete stay in `needs_analyze`, so [`plan_blend`]
+    /// keeps refusing them until the next analysis, and are not listed.
+    ///
+    /// The entry is recorded whenever at least one group completed, also for
+    /// a run that stopped part-way (cancelled or failed): the groups it
+    /// finished were analysed again, so their [`analysis_stamp`] moves and
+    /// [`last_analyze_settings`] gives what they were analysed with. A run
+    /// that completed no group records nothing.
     ///
     /// A completed group whose effective analyze settings changed since it
     /// was planned (a `set_*` landed during the run) also stays marked: it
@@ -143,7 +151,14 @@ impl Mosaic {
                 p.fingerprint = Some(fp.clone());
             }
         }
-        next.provenance.extend(o.provenance.iter().cloned());
+        let detail: serde_json::Map<String, serde_json::Value> = o
+            .completed
+            .iter()
+            .filter_map(|g| Some((g.clone(), json!(o.analyzed.get(g)?))))
+            .collect();
+        if !detail.is_empty() {
+            next.push_provenance("analyze", None, json!({ "groups": detail }));
+        }
         next.save(&self.dir)?;
         self.config = next;
         Ok(())
@@ -250,9 +265,6 @@ pub struct AnalyzeOutcome {
     pub analyzed: BTreeMap<String, AnalyzeSettings>,
     /// Fingerprints of the completed groups' panels, taken after analysis.
     pub fingerprints: Vec<(PathBuf, Fingerprint)>,
-    /// Provenance to append: one `"analyze"` entry recording each group's
-    /// resolved settings when every group finished; empty otherwise.
-    pub provenance: Vec<ProvenanceEntry>,
 }
 
 /// Plan an analysis of every processing group (owner thread).
@@ -357,8 +369,8 @@ pub fn plan_analyze_scoped(
 /// Progress stages are prefixed with the group name (`"Ha: analyze"`).
 ///
 /// Returns the outcome alongside the result: on cancellation or error the
-/// outcome lists the groups that finished before it (and no provenance), so
-/// [`Mosaic::apply_analyze`] keeps them.
+/// outcome lists the groups that finished before it, so
+/// [`Mosaic::apply_analyze`] keeps them (and records their analysis).
 pub fn run_analyze(plan: &AnalyzePlan, ctl: &JobCtl) -> (AnalyzeOutcome, Result<()>) {
     let mut out = AnalyzeOutcome::default();
     let res = run_analyze_into(plan, ctl, &mut out);
@@ -375,7 +387,6 @@ fn run_analyze_into(plan: &AnalyzePlan, ctl: &JobCtl, out: &mut AnalyzeOutcome) 
         return Err(Error::FrameMoved);
     }
     frame.save(&plan.frame_path)?;
-    let mut detail = serde_json::Map::new();
     for g in &plan.groups {
         ctl.check()?;
         let prefixed = |stage: &str, done: u64, total: u64| {
@@ -398,13 +409,7 @@ fn run_analyze_into(plan: &AnalyzePlan, ctl: &JobCtl, out: &mut AnalyzeOutcome) 
         out.fingerprints.extend(fps);
         out.completed.push(g.name.clone());
         out.analyzed.insert(g.name.clone(), g.settings.clone());
-        detail.insert(g.name.clone(), json!(g.settings));
     }
-    out.provenance.push(ProvenanceEntry::new(
-        "analyze",
-        None,
-        json!({ "groups": detail }),
-    ));
     Ok(())
 }
 
@@ -412,9 +417,10 @@ fn run_analyze_into(plan: &AnalyzePlan, ctl: &JobCtl, out: &mut AnalyzeOutcome) 
 /// [`plan_analyze`], [`run_analyze`] and [`Mosaic::apply_analyze`] in turn,
 /// on the calling thread. Returns the resolved groups.
 ///
-/// A cancelled or failed run keeps the groups it finished, leaves every
-/// other group refused by [`blend_group`] until the next `analyze_all`, and
-/// returns the error without adding provenance.
+/// A cancelled or failed run keeps the groups it finished (recording their
+/// analysis, see [`Mosaic::apply_analyze`]), leaves every other group
+/// refused by [`blend_group`] until the next `analyze_all`, and returns the
+/// error.
 pub fn analyze_all(m: &mut Mosaic, ctl: &JobCtl) -> Result<Groups> {
     ctl.check()?;
     let plan = plan_analyze(m)?;
@@ -835,6 +841,16 @@ pub fn last_analyze_settings(cfg: &MosaicConfig, group: &str) -> Option<AnalyzeS
         .rev()
         .filter(|e| e.action == "analyze")
         .find_map(|e| serde_json::from_value(e.detail.get("groups")?.get(group)?.clone()).ok())
+}
+
+/// The index in `cfg.provenance` of the newest `"analyze"` entry that lists
+/// `group` (`None` if never analyzed). Provenance only grows, so the stamp
+/// moves exactly when the group is analyzed again: a cheap way to tell what
+/// analysis something made from the group (a transient preview) used.
+pub fn analysis_stamp(cfg: &MosaicConfig, group: &str) -> Option<usize> {
+    cfg.provenance.iter().rposition(|e| {
+        e.action == "analyze" && e.detail.get("groups").and_then(|g| g.get(group)).is_some()
+    })
 }
 
 /// Why a group's mosaic is out of date, as far as the provenance trail

@@ -11,12 +11,13 @@ use mmm_core::blend::{BlendMode, BlendParams, Extent, RowSink, blend};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::{Groups, affected_groups};
 use mmm_core::mosaic::{
-    AnalyzeScope, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig, RESULT_FILE,
-    SINGLE_GROUP, analyze_all, blend_group, commit_blend_settings, invalidate_group,
+    AnalyzeScope, FRAME_FILE, GROUPS_DIR, GroupRule, Grouping, Mosaic, MosaicConfig,
+    PREVIEW_FULL_RES_MAX_PIXELS, PREVIEW_MAX_PIXELS, PreviewScale, RESULT_FILE, SINGLE_GROUP,
+    analysis_stamp, analyze_all, blend_group, commit_blend_settings, invalidate_group,
     last_analyze_settings, last_merge_settings, mark_needs_analyze, plan_analyze,
-    plan_analyze_scoped, plan_analyze_with, plan_blend, plan_blend_with, run_analyze, run_blend,
-    set_analyze_settings, set_blend_settings, set_group_override, set_inputs, set_inputs_affecting,
-    set_settings, settings_changed,
+    plan_analyze_scoped, plan_analyze_with, plan_blend, plan_blend_with, plan_preview,
+    preview_scale, run_analyze, run_blend, run_preview, set_analyze_settings, set_blend_settings,
+    set_group_override, set_inputs, set_inputs_affecting, set_settings, settings_changed,
 };
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
@@ -377,7 +378,11 @@ fn cancel_analyze_all_is_cancelled() {
     );
     assert!(m.dir.join(GROUPS_DIR).join("Ha/session.json").is_file());
     assert!(!m.dir.join(GROUPS_DIR).join("OIII/session.json").exists());
-    assert!(MosaicConfig::load(&m.dir).unwrap().provenance.is_empty());
+    // Ha finished: its analysis is recorded, OIII's is not.
+    let saved = MosaicConfig::load(&m.dir).unwrap();
+    assert_eq!(saved.provenance.len(), 1);
+    let groups = saved.provenance[0].detail["groups"].as_object().unwrap();
+    assert_eq!(groups.keys().collect::<Vec<_>>(), ["Ha"]);
 }
 
 /// Every level-0 tile of the store at `path` is valid and the geometry is
@@ -679,12 +684,22 @@ fn cancelled_run_marks_all_unfinished_groups() {
         let (outcome, res) = run_analyze(&plan, &ctl);
         assert!(res.unwrap_err().is_cancelled());
         assert_eq!(outcome.completed, done);
-        assert!(outcome.provenance.is_empty());
         m.apply_analyze(&outcome).unwrap();
 
         let saved = MosaicConfig::load(&m.dir).unwrap();
         assert_eq!(saved, m.config);
-        assert!(saved.provenance.is_empty());
+        // Only a run that finished a group records an analysis (of it).
+        let recorded: Vec<Vec<&String>> = saved
+            .provenance
+            .iter()
+            .map(|e| e.detail["groups"].as_object().unwrap().keys().collect())
+            .collect();
+        let want: Vec<Vec<&str>> = if done.is_empty() {
+            vec![]
+        } else {
+            vec![done.to_vec()]
+        };
+        assert_eq!(recorded, want);
         for g in ["Ha", "OIII"] {
             let finished = done.contains(&g);
             assert_eq!(!finished, saved.needs_analyze.contains(g), "{g}");
@@ -708,6 +723,89 @@ fn cancelled_run_marks_all_unfinished_groups() {
             assert_eq!(p.fingerprint.is_some(), ha && done.contains(&"Ha"));
         }
     }
+}
+
+/// Plan, run and apply an analysis of every group of `m`, cancelled as the
+/// second group (OIII) starts: Ha finishes, OIII does not.
+fn analyse_stopping_after_ha(m: &mut Mosaic) {
+    let plan = plan_analyze(m).unwrap();
+    let token = CancelToken::new();
+    let obs = |s: &str, _: u64, _: u64| {
+        if s.starts_with("OIII: ") {
+            token.cancel();
+        }
+    };
+    let (outcome, res) = run_analyze(&plan, &JobCtl::new(token.clone(), Some(&obs)));
+    assert!(res.unwrap_err().is_cancelled());
+    assert_eq!(outcome.completed, ["Ha"]);
+    m.apply_analyze(&outcome).unwrap();
+}
+
+#[test]
+fn a_stopped_analysis_records_its_finished_groups() {
+    let tmp = TempDir::new("stopped-analysis");
+    let mut m = two_group_mosaic(&tmp.0);
+    // A first analysis stopped part-way: the group it finished is analysed,
+    // so it has a stamp (the one it did not finish has none).
+    analyse_stopping_after_ha(&mut m);
+    let analyses = |c: &MosaicConfig| {
+        c.provenance
+            .iter()
+            .filter(|e| e.action == "analyze")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let entries = analyses(&m.config);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let listed = |e: &mmm_core::mosaic::ProvenanceEntry| -> Vec<String> {
+        e.detail["groups"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(listed(&entries[0]), ["Ha"]);
+    let settings = m.config.settings_for("Ha").0;
+    assert_eq!(
+        entries[0].detail["groups"]["Ha"],
+        serde_json::to_value(&settings).unwrap(),
+        "the shape of a whole analysis's entry"
+    );
+    assert_eq!(analysis_stamp(&m.config, "Ha"), Some(0));
+    assert_eq!(analysis_stamp(&m.config, "OIII"), None);
+    assert_eq!(last_analyze_settings(&m.config, "Ha"), Some(settings));
+    assert!(!m.config.needs_analyze.contains("Ha"));
+    assert!(m.config.needs_analyze.contains("OIII"));
+    // Saved with the cleared marks.
+    assert_eq!(MosaicConfig::load(&m.dir).unwrap(), m.config);
+
+    // Both analysed, then re-analysed and stopped again after Ha: Ha's stamp
+    // moves to the new entry, which lists only Ha; OIII's stays.
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let (ha, oiii) = (
+        analysis_stamp(&m.config, "Ha").unwrap(),
+        analysis_stamp(&m.config, "OIII").unwrap(),
+    );
+    analyse_stopping_after_ha(&mut m);
+    let last = analyses(&m.config).pop().unwrap();
+    assert_eq!(listed(&last), ["Ha"]);
+    let moved = analysis_stamp(&m.config, "Ha").unwrap();
+    assert!(moved > ha, "{moved} after {ha}");
+    assert_eq!(moved, m.config.provenance.len() - 1);
+    assert_eq!(analysis_stamp(&m.config, "OIII"), Some(oiii));
+    assert!(!m.config.needs_analyze.contains("Ha"));
+    assert!(m.config.needs_analyze.contains("OIII"));
+    assert_eq!(MosaicConfig::load(&m.dir).unwrap(), m.config);
+    // A run that stopped before finishing any group records nothing.
+    let n = m.config.provenance.len();
+    let plan = plan_analyze(&mut m).unwrap();
+    let token = CancelToken::new();
+    token.cancel();
+    let (outcome, res) = run_analyze(&plan, &JobCtl::new(token, None));
+    assert!(res.unwrap_err().is_cancelled());
+    m.apply_analyze(&outcome).unwrap();
+    assert_eq!(m.config.provenance.len(), n);
 }
 
 #[test]
@@ -1297,6 +1395,40 @@ fn last_analyze_settings_is_per_group() {
 }
 
 #[test]
+fn the_analysis_stamp_moves_with_each_analysis_of_the_group() {
+    use serde_json::json;
+    let mut cfg = MosaicConfig::new(Vec::new());
+    assert_eq!(analysis_stamp(&cfg, "Ha"), None, "never analysed");
+    let both = json!({ "groups": { "Ha": {}, "OIII": {} } });
+    cfg.push_provenance("analyze", None, both);
+    cfg.push_provenance("blend", Some("Ha"), json!({ "whole": true }));
+    assert_eq!(analysis_stamp(&cfg, "Ha"), Some(0));
+    assert_eq!(analysis_stamp(&cfg, "OIII"), Some(0));
+    // A merge, or an analysis entry without the groups it analysed, moves
+    // nothing.
+    cfg.push_provenance("analyze", None, json!({ "n": 1 }));
+    assert_eq!(analysis_stamp(&cfg, "Ha"), Some(0));
+    // Ha alone analysed again: only its stamp moves.
+    cfg.push_provenance("analyze", None, json!({ "groups": { "Ha": {} } }));
+    assert_eq!(analysis_stamp(&cfg, "Ha"), Some(3));
+    assert_eq!(analysis_stamp(&cfg, "OIII"), Some(0));
+    assert_eq!(analysis_stamp(&cfg, "Nope"), None);
+}
+
+#[test]
+fn a_real_analysis_stamps_its_groups() {
+    let tmp = TempDir::new("analysis-stamp");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let first = analysis_stamp(&m.config, "Ha").expect("analysed");
+    assert_eq!(analysis_stamp(&m.config, "OIII"), Some(first));
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    assert_eq!(analysis_stamp(&m.config, "Ha"), Some(first), "a merge");
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    assert!(analysis_stamp(&m.config, "Ha").unwrap() > first);
+}
+
+#[test]
 fn settings_changed_respects_overrides() {
     let tmp = TempDir::new("changed");
     let mut m = two_group_mosaic(&tmp.0);
@@ -1520,7 +1652,7 @@ fn a_moved_frame_fails_the_scoped_run() {
     let (outcome, res) = run_analyze(&plan, &JobCtl::none());
     let err = res.unwrap_err();
     assert!(err.is_frame_moved(), "{err}");
-    assert!(outcome.completed.is_empty() && outcome.provenance.is_empty());
+    assert!(outcome.completed.is_empty());
     assert_eq!(std::fs::read(&frame_path).unwrap(), before);
 }
 
@@ -1590,4 +1722,257 @@ fn out_of_date_reason_follows_the_trail() {
     assert_eq!(out_of_date_reason(&c4, "Ha"), R::RegionDiffers);
     c4.needs_analyze.insert("Ha".into());
     assert_eq!(out_of_date_reason(&c4, "Ha"), R::Panels);
+}
+
+// ---- transient previews -------------------------------------------------
+
+/// Every file under `dir` with its length and mtime.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let md = e.metadata().unwrap();
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                out.push((e.path(), md.len(), md.modified().unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn a_preview_matches_the_whole_merge_there() {
+    let tmp = TempDir::new("preview-match");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    blend_group(&mut m, "Ha", None, &JobCtl::none()).unwrap();
+    let plan = plan_preview(&m, "Ha", [100, 50, 400, 300], BlendSettings::default()).unwrap();
+    assert_eq!(plan.rect, [100, 50, 400, 300]);
+    let patch = run_preview(&plan, &JobCtl::none()).unwrap();
+    assert_eq!(patch.rect, [0, 0, 512, 420]);
+    assert_eq!(patch.downsample, 1);
+    assert_eq!((patch.width, patch.height), (512, 420));
+    assert_eq!(patch.channels as u64, CH);
+    assert_eq!(patch.data.len(), 512 * 420 * CH as usize);
+
+    let store = TileStore::open(&m.result_path("Ha")).unwrap();
+    let g = store.geometry();
+    let t = g.tile as usize;
+    let (nx, ny) = g.tiles(0);
+    let mut buf = vec![0.0f32; CH as usize * t * t];
+    for ty in 0..ny {
+        for tx in 0..nx {
+            assert!(store.read_tile(0, tx, ty, &mut buf));
+            for c in 0..CH as usize {
+                for y in 0..t {
+                    for x in 0..t {
+                        let (cx, cy) = (tx as usize * t + x, ty as usize * t + y);
+                        if cx >= 512 || cy >= 420 {
+                            continue;
+                        }
+                        let a = buf[(c * t + y) * t + x];
+                        let b = patch.data[(c * 420 + cy) * 512 + cx];
+                        assert_eq!(a, b, "({cx},{cy}) ch {c}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_preview_writes_nothing() {
+    let tmp = TempDir::new("preview-nowrite");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let before = snapshot(&m.dir);
+    let plan = plan_preview(&m, "Ha", [0, 0, 300, 300], BlendSettings::default()).unwrap();
+    run_preview(&plan, &JobCtl::none()).unwrap();
+    assert_eq!(snapshot(&m.dir), before);
+    assert!(!m.result_path("Ha").exists());
+}
+
+#[test]
+fn a_large_roi_is_downsampled_under_the_cap() {
+    assert_eq!(PREVIEW_FULL_RES_MAX_PIXELS, 33_554_432);
+    let scale = |w, h| preview_scale(w, h, PREVIEW_MAX_PIXELS, PREVIEW_FULL_RES_MAX_PIXELS);
+    let full = |downsample| {
+        Some(PreviewScale {
+            downsample,
+            coarse: false,
+        })
+    };
+    // Under the cap: full resolution.
+    assert_eq!(scale(2048, 2048), full(1));
+    // Over it, up to 32 MP: the smallest box-average factor that fits.
+    assert_eq!(scale(2304, 2304), full(2));
+    assert_eq!(scale(5000, 5000), full(3), "2500² is over the cap");
+    assert_eq!(scale(4096, 8192), full(3));
+    // Over 32 MP: the coarse 1/8 path.
+    let coarse = scale(9255, 18310).unwrap();
+    assert_eq!(
+        coarse,
+        PreviewScale {
+            downsample: 8,
+            coarse: true
+        }
+    );
+    assert!(9255u64.div_ceil(8) * 18310u64.div_ceil(8) <= PREVIEW_MAX_PIXELS);
+    // Beyond what the L8 blend can reach under the cap: refused.
+    assert_eq!(scale(40_000, 40_000), None);
+    for (w, h) in [(2304u64, 2304u64), (5000, 5000), (4096, 8192), (5793, 5792)] {
+        let d = u64::from(scale(w, h).unwrap().downsample);
+        assert!(w.div_ceil(d) * h.div_ceil(d) <= PREVIEW_MAX_PIXELS);
+        assert!(w.div_ceil(d - 1) * h.div_ceil(d - 1) > PREVIEW_MAX_PIXELS);
+    }
+
+    // A downsampled run delivers the box-averaged grid of the rect.
+    let tmp = TempDir::new("preview-ds");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let mut plan = plan_preview(
+        &m,
+        "Ha",
+        [0, 0, CANVAS.0, CANVAS.1],
+        BlendSettings::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.full_res_max_pixels, PREVIEW_FULL_RES_MAX_PIXELS);
+    plan.max_pixels = 100_000; // 600x420 no longer fits at full resolution
+    let patch = run_preview(&plan, &JobCtl::none()).unwrap();
+    assert_eq!((patch.downsample, patch.coarse), (2, false));
+    assert_eq!((patch.width, patch.height), (300, 210));
+    assert_eq!(patch.data.len(), 300 * 210 * CH as usize);
+    assert!(patch.data.iter().any(|v| *v > 0.0));
+}
+
+/// A preview of the whole synthetic canvas of `m`'s Ha in `mode`, under
+/// caps `max_pixels` and `full_res_max_pixels`.
+fn whole_preview(
+    m: &Mosaic,
+    mode: BlendMode,
+    max_pixels: u64,
+    full_res_max_pixels: u64,
+) -> mmm_core::mosaic::PreviewPatch {
+    let settings = BlendSettings {
+        mode,
+        ..BlendSettings::default()
+    };
+    let mut plan = plan_preview(m, "Ha", [0, 0, CANVAS.0, CANVAS.1], settings).unwrap();
+    plan.max_pixels = max_pixels;
+    plan.full_res_max_pixels = full_res_max_pixels;
+    run_preview(&plan, &JobCtl::none()).unwrap()
+}
+
+#[test]
+fn a_mid_size_preview_honours_the_merge_mode() {
+    let tmp = TempDir::new("preview-mode");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    // 600 × 420 over a 100 000-pixel cap: blended at full resolution in
+    // each mode and box-averaged 2 × 2, not feathered from the summaries.
+    let cap = 100_000;
+    let full = PREVIEW_FULL_RES_MAX_PIXELS;
+    let feather = whole_preview(&m, BlendMode::Feather, cap, full);
+    let pyramid = whole_preview(&m, BlendMode::Pyramid, cap, full);
+    for p in [&feather, &pyramid] {
+        assert_eq!((p.downsample, p.coarse), (2, false));
+        assert_eq!((p.width, p.height), (300, 210));
+        assert!(u64::from(p.width) * u64::from(p.height) <= cap);
+    }
+    assert_ne!(feather.data, pyramid.data, "the merge mode shows");
+    // Each patch pixel is the mean of its 2 × 2 block of the full-resolution
+    // preview (the pixels with data in it).
+    for (mode, small) in [
+        (BlendMode::Feather, &feather),
+        (BlendMode::Pyramid, &pyramid),
+    ] {
+        let big = whole_preview(&m, mode, PREVIEW_MAX_PIXELS, full);
+        assert_eq!((big.downsample, big.coarse, big.width), (1, false, 600));
+        let (bw, bh, ch) = (600usize, 420usize, CH as usize);
+        let at = |c: usize, x: usize, y: usize| big.data[(c * bh + y) * bw + x];
+        for oy in 0..210 {
+            for ox in 0..300 {
+                let px: Vec<(usize, usize)> = (0..2)
+                    .flat_map(|dy| (0..2).map(move |dx| (2 * ox + dx, 2 * oy + dy)))
+                    .filter(|&(x, y)| (0..ch).any(|c| at(c, x, y) != 0.0))
+                    .collect();
+                for c in 0..ch {
+                    let want = if px.is_empty() {
+                        0.0
+                    } else {
+                        px.iter().map(|&(x, y)| at(c, x, y)).sum::<f32>() / px.len() as f32
+                    };
+                    let got = small.data[(c * 210 + oy) * 300 + ox];
+                    assert!(
+                        (got - want).abs() <= TOL * want.abs().max(1.0),
+                        "{mode:?} ({ox},{oy}) ch {c}: {got} != {want}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_huge_roi_uses_the_coarse_path() {
+    let tmp = TempDir::new("preview-coarse");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    // 252 000 aligned pixels, over a 200 000-pixel full-resolution limit:
+    // blended from the 1/8 summaries, which feather in every mode.
+    let (cap, limit) = (100_000, 200_000);
+    let feather = whole_preview(&m, BlendMode::Feather, cap, limit);
+    let pyramid = whole_preview(&m, BlendMode::Pyramid, cap, limit);
+    for p in [&feather, &pyramid] {
+        assert_eq!((p.downsample, p.coarse), (8, true));
+        assert_eq!((p.width, p.height), (75, 53));
+        assert_eq!(p.data.len(), 75 * 53 * CH as usize);
+        assert!(p.data.iter().any(|v| *v > 0.0));
+    }
+    assert_eq!(feather.data, pyramid.data, "the coarse path shows no mode");
+    // Under the limit the same rect is not coarse.
+    assert!(!whole_preview(&m, BlendMode::Feather, cap, 252_000).coarse);
+}
+
+#[test]
+fn preview_refuses_unanalysed_groups() {
+    let tmp = TempDir::new("preview-refuse");
+    let mut m = two_group_mosaic(&tmp.0);
+    let err = plan_preview(&m, "Ha", [0, 0, 100, 100], BlendSettings::default()).unwrap_err();
+    assert!(err.to_string().contains("analy"), "{err}");
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    plan_preview(&m, "Ha", [0, 0, 100, 100], BlendSettings::default()).unwrap();
+    m.config.needs_analyze.insert("Ha".into());
+    assert!(plan_preview(&m, "Ha", [0, 0, 100, 100], BlendSettings::default()).is_err());
+}
+
+#[test]
+fn a_cancelled_preview_errs_cancelled() {
+    let tmp = TempDir::new("preview-cancel");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let plan = plan_preview(&m, "Ha", [0, 0, 300, 300], BlendSettings::default()).unwrap();
+    let token = CancelToken::new();
+    token.cancel();
+    let err = run_preview(&plan, &JobCtl::new(token, None)).unwrap_err();
+    assert!(err.is_cancelled(), "{err}");
+}
+
+#[test]
+fn plan_preview_reads_no_files() {
+    let tmp = TempDir::new("preview-noread");
+    let mut m = two_group_mosaic(&tmp.0);
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    let dir = m.group_session_dir("Ha");
+    let moved = tmp.0.join("moved-session");
+    std::fs::rename(&dir, &moved).unwrap();
+    let plan = plan_preview(&m, "Ha", [0, 0, 300, 300], BlendSettings::default()).unwrap();
+    assert_eq!(plan.rect, [0, 0, 300, 300]);
+    assert!(run_preview(&plan, &JobCtl::none()).is_err());
 }

@@ -136,10 +136,8 @@ enum Kind {
     Blend {
         group: String,
         rect: Option<[u64; 4]>,
-        /// The settings it was queued with (the committed ones, or the
-        /// draft for an ROI merge: [`JobRunner::start_blend_with`]): the
-        /// merge runs with these, whatever is committed by the time it
-        /// starts.
+        /// The group's committed settings when it was queued: the merge runs
+        /// with these, whatever is committed by the time it starts.
         settings: BlendSettings,
     },
     Export(ExportJob),
@@ -416,23 +414,6 @@ impl JobRunner {
         rect: Option<[u64; 4]>,
     ) -> u64 {
         let settings = session.mosaic.config.settings_for(group).1;
-        self.start_blend_with(session, group, rect, settings)
-    }
-
-    /// [`JobRunner::start_blend`] with explicit `settings` (validated by
-    /// the caller) instead of the group's committed ones: an ROI merge of
-    /// the merge settings draft. A whole-canvas merge with them is fresh
-    /// when they differ from the group's last whole merge; an ROI merge
-    /// never is ([`mmm_core::mosaic::plan_blend_with`]), and one whose
-    /// settings differ makes the group out of date
-    /// ([`mmm_core::mosaic::region_differs`]).
-    pub fn start_blend_with(
-        &mut self,
-        session: &mut OpenSession,
-        group: &str,
-        rect: Option<[u64; 4]>,
-        settings: BlendSettings,
-    ) -> u64 {
         let id = self.new_id(job_label("Merge", group, session));
         self.begin(JobTarget::Blend, id, group);
         if rect.is_none() {
@@ -1237,30 +1218,45 @@ pub(crate) mod tests {
     /// Holds a worker after each progress update it sends, until stepped
     /// past it or opened.
     pub(crate) struct Stepper {
-        /// Steps granted and not taken yet, and whether it is open.
-        state: std::sync::Mutex<(u64, bool)>,
+        /// Steps granted and not taken yet, whether it is open, and how
+        /// many workers wait in [`Stepper::wait`] with no step granted.
+        state: std::sync::Mutex<(u64, bool, usize)>,
         cv: std::sync::Condvar,
     }
 
     impl Stepper {
+        /// Whether a worker is held now, after sending a progress update,
+        /// with no step granted yet (so a step granted now lets it go on to
+        /// exactly its next update).
+        pub(crate) fn held(&self) -> bool {
+            self.state.lock().unwrap().2 > 0
+        }
+
         /// Let the held worker go on to its next progress update.
         pub(crate) fn step(&self) {
-            self.state.lock().unwrap().0 += 1;
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            state.2 = state.2.saturating_sub(1);
             self.cv.notify_all();
         }
 
         /// Hold nothing any more.
         pub(crate) fn open(&self) {
-            self.state.lock().unwrap().1 = true;
+            let mut state = self.state.lock().unwrap();
+            state.1 = true;
+            state.2 = 0;
             self.cv.notify_all();
         }
 
         /// Block until stepped or opened (bounded: never hang a test).
         pub(crate) fn wait(&self) {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            if state.0 == 0 && !state.1 {
+                state.2 += 1;
+            }
             let (mut state, timeout) = self
                 .cv
-                .wait_timeout_while(state, crate::testutil::PATIENCE, |(steps, open)| {
+                .wait_timeout_while(state, crate::testutil::PATIENCE, |(steps, open, _)| {
                     *steps == 0 && !*open
                 })
                 .unwrap();
@@ -1286,7 +1282,7 @@ pub(crate) mod tests {
         /// update it sends (see [`Stepper`]).
         pub(crate) fn hold_progress(&mut self) -> std::sync::Arc<Stepper> {
             let stepper = std::sync::Arc::new(Stepper {
-                state: std::sync::Mutex::new((0, false)),
+                state: std::sync::Mutex::new((0, false, 0)),
                 cv: std::sync::Condvar::new(),
             });
             self.stepper = Some(stepper.clone());

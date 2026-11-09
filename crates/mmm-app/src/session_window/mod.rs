@@ -26,7 +26,9 @@
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
 //!   canvas's [`Camera`] to both first, so nothing moves. Going to an ROI
-//!   ([`SessionWindow::frame`]) hands both the camera that frames it.
+//!   ([`SessionWindow::go_to_roi`]) hands both the camera that frames it
+//!   (not from a plan drawn in another frame than the analysed one, which
+//!   says why in a toast instead).
 //! - **Mode.** The window opens on the mosaic once something is merged
 //!   ([`OpenSession::merged`]), else on the plan; **Mosaic** cannot be
 //!   chosen before something is merged or a merge has started.
@@ -40,8 +42,21 @@
 //!   window is drawn: [`SessionWindow::on_event`] for each job event,
 //!   [`SessionWindow::poll_panels`], [`SessionWindow::poll_settings`],
 //!   [`SessionWindow::track_analysis`] and [`SessionWindow::poll`] (the
-//!   merged mosaic's work, the plan's texture release and the window's
-//!   saves).
+//!   merged mosaic's work, the ROI previews, the plan's texture release and
+//!   the window's saves).
+//! - **ROI previews** ([`crate::previews`]): each frame the window asks for
+//!   a preview of every ROI in view on the shown canvas, for each group in
+//!   view (a composite's members in R, G, B order), the group first, then
+//!   the ROI nearest the centre of the view
+//!   ([`SessionWindow::wanted_previews`]); none while the ROIs are hidden
+//!   or being reprojected, an analysis runs or is queued, an edit waits, or
+//!   the typed merge settings are invalid. Previews run on their own
+//!   thread, never as jobs: no job event, no toast, nothing written. Each
+//!   ROI's row and canvas label say how its preview stands.
+//! - **Compare A / B** ([`compare`]): an ROI up to date offers **Compare**
+//!   on its canvas label; comparing, its label holds A | B, **Use A** and
+//!   **Done**, and Space, the selected button or a press on its preview
+//!   shows the other side while held.
 //! - **View state** ([`view_state`]): plan or mosaic, the view, the camera,
 //!   the inspector's fold and open sections, the panel list and the
 //!   Outlines and ROIs toggles are written into `ui` whenever they change.
@@ -52,11 +67,11 @@
 //!   through it (no fit is painted first). With nothing saved: the mosaic
 //!   once something is merged, the first group, Problems open, Outlines and
 //!   ROIs on.
-//! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `L`, `S`
-//!   and `Ctrl+Enter`, each named in its control's tooltip, `Delete`
-//!   (removes the panels selected in the open list) and `Esc` (clears the
-//!   selection); none while a text field has the keyboard or the Export
-//!   dialog is open.
+//! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `D`, `L`,
+//!   `S` and `Ctrl+Enter`, each named in its control's tooltip, `Delete`
+//!   (removes the panels selected in the open list), `Esc` (clears the
+//!   selection) and `Space` held (comparing, shows the other side); none
+//!   while a text field has the keyboard or the Export dialog is open.
 //! - **Saves.** The view state, the display stretch toggles, the composites,
 //!   the notes and the user's grouping choice (noted by the panel list,
 //!   [`PanelList::take_ui_changed`]) live in the session's
@@ -71,12 +86,14 @@
 //!   screen reads them there).
 
 mod canvas;
+mod compare;
 mod sections;
 mod shortcuts;
 mod steps;
 mod top_bar;
 pub mod view_state;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -101,6 +118,9 @@ use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView, group_members};
+use crate::preview_draw::PatchTextures;
+use crate::previews::{PreviewKey, PreviewState, Previews, Wanted};
+use crate::rois::Roi;
 use crate::session::OpenSession;
 use crate::util::{Debounce, group_names};
 use view_state::ViewState;
@@ -143,6 +163,14 @@ pub enum Undo {
     /// Put back the analysis settings from before the change, as an
     /// ordinary analysis edit (queued behind running jobs like any).
     Analyze(AnalyzeSettings),
+    /// Put a deleted ROI back at its index in the list (the end, if it is
+    /// shorter by now), selected, with the id it had.
+    RoiDelete {
+        /// Where it was.
+        index: usize,
+        /// The ROI as it was.
+        roi: Roi,
+    },
 }
 
 /// A toast the window asks the shell to show.
@@ -188,6 +216,16 @@ pub struct SessionWindow {
     was_typing: bool,
     /// Merge settings was opened by itself after the first analysis.
     settings_revealed: bool,
+    /// The ROIs' transient previews.
+    previews: Previews,
+    /// The textures of the ROIs' patches on the mosaic and on the plan.
+    mosaic_patches: PatchTextures,
+    plan_patches: PatchTextures,
+    /// The ROIs whose canvas label the window draws, with controls
+    /// ([`compare`]).
+    labelled: BTreeSet<u64>,
+    /// Space has been held since a press while comparing ([`compare`]).
+    peek_key: bool,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -195,6 +233,12 @@ pub struct SessionWindow {
     #[cfg(test)]
     pub(crate) list_rect: Option<egui::Rect>,
 }
+
+/// Why the plan cannot draw a region or go to one while it draws in
+/// another frame than the analysed one the regions are anchored in
+/// ([`PlanView::frame_matches`]): **Draw ROI**'s disabled tooltip, and the
+/// toast of a region picked meanwhile.
+const FRAME_BEHIND: &str = "Available once the analysis catches up with the panels";
 
 /// Inspector section ids, in their fixed order.
 const PROBLEMS: &str = "problems";
@@ -228,6 +272,11 @@ impl SessionWindow {
             panel_list_open: false,
             was_typing: false,
             settings_revealed: false,
+            previews: Previews::new(),
+            mosaic_patches: PatchTextures::default(),
+            plan_patches: PatchTextures::default(),
+            labelled: BTreeSet::new(),
+            peek_key: false,
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -248,7 +297,71 @@ impl SessionWindow {
             return;
         }
         self.carry_camera();
+        // A rectangle half-armed on the canvas going away would draw on
+        // it unseen.
+        self.plan.set_drawing(false);
+        self.mosaic.set_drawing(false);
         self.mode = Some(mode);
+    }
+
+    /// Why a rectangle cannot be drawn on the canvas shown now, if so: it
+    /// has not been drawn yet, or (the plan) it draws in another frame than
+    /// the one the regions are anchored in ([`PlanView::frame_matches`]).
+    pub(super) fn draw_roi_block(&self, session: &OpenSession) -> Option<&'static str> {
+        let drawn = match self.mode() {
+            CanvasMode::Plan => self.plan.canvas_frame().is_some(),
+            CanvasMode::Mosaic => self.mosaic.viewer_frame().is_some(),
+        };
+        if !drawn {
+            return Some("Available once the canvas has been drawn.");
+        }
+        if self.mode() == CanvasMode::Plan && !self.plan.frame_matches(session) {
+            return Some(FRAME_BEHIND);
+        }
+        None
+    }
+
+    /// Go to ROI rect `rect` (one picked in the list): frame it on the
+    /// canvas shown ([`SessionWindow::frame`]). Not on a plan drawn in
+    /// another frame than the analysed one the ROIs are anchored in
+    /// ([`PlanView::frame_matches`]), where it would frame the wrong place:
+    /// nothing moves, and a toast gives the reason **Draw ROI** gives there
+    /// ([`FRAME_BEHIND`]). The mosaic always frames it.
+    pub(super) fn go_to_roi(&mut self, session: &OpenSession, rect: [u64; 4]) {
+        if self.mode() == CanvasMode::Plan && !self.plan.frame_matches(session) {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Info,
+                    title: FRAME_BEHIND.into(),
+                    detail: None,
+                    action: None,
+                },
+                undo: None,
+            });
+            return;
+        }
+        self.frame(rect);
+    }
+
+    /// Whether the shown canvas has the draw tool armed.
+    pub(super) fn drawing_roi(&self) -> bool {
+        match self.mode() {
+            CanvasMode::Plan => self.plan.drawing(),
+            CanvasMode::Mosaic => self.mosaic.drawing(),
+        }
+    }
+
+    /// Arm the draw tool on the canvas shown (plan or mosaic): the next drag
+    /// draws a new ROI. Nothing while [`SessionWindow::draw_roi_block`]
+    /// gives a reason.
+    pub(super) fn start_drawing_roi(&mut self, session: &OpenSession) {
+        if self.draw_roi_block(session).is_some() {
+            return;
+        }
+        match self.mode() {
+            CanvasMode::Plan => self.plan.set_drawing(true),
+            CanvasMode::Mosaic => self.mosaic.set_drawing(true),
+        }
     }
 
     /// The group or composite shown (once the first frame has picked one).
@@ -325,6 +438,27 @@ impl SessionWindow {
         &self.mosaic
     }
 
+    /// The patch textures of the canvas shown.
+    #[cfg(test)]
+    fn shown_patches(&self) -> &PatchTextures {
+        match self.mode() {
+            CanvasMode::Plan => &self.plan_patches,
+            CanvasMode::Mosaic => &self.mosaic_patches,
+        }
+    }
+
+    /// The side of ROI `roi` drawn on the canvas shown last frame.
+    #[cfg(test)]
+    fn preview_drawn_side(&self, roi: u64) -> Option<crate::previews::Side> {
+        self.shown_patches().drawn_side(roi)
+    }
+
+    /// The image ROI `roi`'s patch was converted to on the canvas shown.
+    #[cfg(test)]
+    fn preview_image(&self, roi: u64) -> Option<Arc<egui::ColorImage>> {
+        self.shown_patches().image(roi)
+    }
+
     /// React to a job event (from [`JobRunner::poll`]): the mosaic follows
     /// it, and a finished merge marks the session merged; one of the whole
     /// canvas leaves its group's result complete (until the summary writer
@@ -356,6 +490,25 @@ impl SessionWindow {
     /// See [`MosaicView::track_analysis`].
     pub fn track_analysis(&mut self, id: u64) {
         self.mosaic.track_analysis(id);
+    }
+
+    /// End the ROIs' previews, leaving the session ([`Previews::stop`]):
+    /// the thread of the one cancelled, if any, for the caller to wait for
+    /// before the session's lock is released.
+    pub fn stop_previews(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.previews.stop()
+    }
+
+    /// The ROIs' previews (tests).
+    #[cfg(test)]
+    pub(crate) fn previews(&self) -> &Previews {
+        &self.previews
+    }
+
+    /// The ROIs' previews, to hold them (tests).
+    #[cfg(test)]
+    pub(crate) fn previews_mut(&mut self) -> &mut Previews {
+        &mut self.previews
     }
 
     /// The panel list (tests).
@@ -447,18 +600,139 @@ impl SessionWindow {
         }
     }
 
+    /// Follow the ROI list: one deleted since the last frame drops its
+    /// previews and raises its "{name} deleted" toast, whose Undo puts it
+    /// back.
+    fn follow_rois(&mut self) {
+        if let Some((index, roi)) = self.mosaic.take_roi_deleted() {
+            self.previews.forget_roi(roi.id);
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Neutral,
+                    title: format!("{} deleted", roi.name),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::RoiDelete { index, roi }),
+            });
+        }
+    }
+
     /// The window's every-frame work, drawn or not: pick the mode and the
     /// view (on the first frame, as saved), the mosaic's work
-    /// ([`MosaicView::poll`]), the plan's texture release, and the
-    /// rate-limited save (with the view, if it changed). Call every frame
-    /// after the runner's poll and [`SessionWindow::track_analysis`],
+    /// ([`MosaicView::poll`]), the ROI list's delete toast, the ROI previews
+    /// ([`SessionWindow::follow_previews`]), the plan's texture release, and
+    /// the rate-limited save (with the view, if it changed). Call every
+    /// frame after the runner's poll and [`SessionWindow::track_analysis`],
     /// before drawing.
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
         self.follow_session(session, jobs);
         self.mosaic.poll(ctx, session, jobs);
+        self.follow_rois();
+        self.follow_previews(ctx, session, jobs);
         self.plan.release_if_hidden(Instant::now());
         self.keep_view_state(session);
         self.save_if_due(ctx, session);
+    }
+
+    /// The ROIs' transient previews, every frame: follow the ROIs (one
+    /// moved or deleted drops its previews and its compare), end a compare
+    /// whose view no longer holds ([`SessionWindow::follow_compare`]), work
+    /// out what is wanted now ([`SessionWindow::wanted_previews`]), take a
+    /// finished preview only if it is still wanted, schedule, and hand each
+    /// ROI's state, for the groups in view, to the list and the canvas
+    /// labels, noting which labels the window draws with controls.
+    fn follow_previews(&mut self, ctx: &egui::Context, session: &OpenSession, jobs: &JobRunner) {
+        self.previews.keep_rois(self.mosaic.rois());
+        self.follow_compare(jobs);
+        let wanted = self.wanted_previews(session, jobs);
+        self.previews.poll(&wanted);
+        self.previews.schedule(ctx, session, &wanted);
+        let groups = self.mosaic.members();
+        let states: BTreeMap<u64, PreviewState> = self
+            .mosaic
+            .rois()
+            .iter()
+            .map(|r| (r.id, self.previews.state(r.id, groups, session)))
+            .collect();
+        let coarse: BTreeSet<u64> = self
+            .mosaic
+            .rois()
+            .iter()
+            .map(|r| r.id)
+            .filter(|&id| self.previews.coarse(id, groups))
+            .collect();
+        self.labelled = self.labelled_rois(&states, jobs);
+        self.mosaic.set_roi_states(states);
+        self.mosaic.set_roi_coarse(coarse);
+        self.mosaic.set_roi_labelled(self.labelled.clone());
+    }
+
+    /// The previews wanted this frame: each ROI in view on the shown canvas
+    /// for each group in view (a composite's members in R, G, B order), with
+    /// what it would be made from now ([`PreviewKey::wanted`]: a group never
+    /// analysed, or needing a new analysis, is skipped) and its priority:
+    /// the group's place in the view, then the squared distance from the
+    /// ROI's centre to the centre of the view. None while the ROIs are
+    /// hidden or not yet reprojected for the current frame, an analysis
+    /// runs or is queued, an edit (panels, analysis settings) waits, or the
+    /// typed merge settings are invalid; none before the shown canvas has
+    /// been drawn, or on a plan drawn in another frame than the analysed
+    /// one (it shows no ROIs then).
+    pub(super) fn wanted_previews(&self, session: &OpenSession, jobs: &JobRunner) -> Vec<Wanted> {
+        let waiting = jobs.analyzing() || self.has_waiting_edits();
+        if !self.look.rois
+            || !self.mosaic.rois_synced()
+            || waiting
+            || self.mosaic.input_error().is_some()
+            || (self.mode() == CanvasMode::Plan && !self.plan.frame_matches(session))
+        {
+            return Vec::new();
+        }
+        let Some((view, centre)) = self.visible_canvas() else {
+            return Vec::new();
+        };
+        let cfg = &session.mosaic.config;
+        let mut out = Vec::new();
+        for (order, group) in self.mosaic.members().iter().enumerate() {
+            let order = u8::try_from(order).unwrap_or(u8::MAX);
+            for roi in self.mosaic.rois() {
+                let r = roi.canvas.map(|v| v as f64);
+                if r[0] >= view[2] || r[2] <= view[0] || r[1] >= view[3] || r[3] <= view[1] {
+                    continue;
+                }
+                let Some(key) = PreviewKey::wanted(cfg, group, roi.canvas) else {
+                    break;
+                };
+                let dx = (r[0] + r[2]) / 2.0 - centre.0;
+                let dy = (r[1] + r[3]) / 2.0 - centre.1;
+                out.push(Wanted {
+                    roi: roi.id,
+                    group: group.clone(),
+                    key,
+                    priority: (order, (dx * dx + dy * dy) as u64),
+                });
+            }
+        }
+        out
+    }
+
+    /// The canvas rect the shown canvas shows (`[x0, y0, x1, y1]`) and its
+    /// centre: its camera over its last frame's size. `None` before it has
+    /// been drawn.
+    fn visible_canvas(&self) -> Option<([f64; 4], (f64, f64))> {
+        let (rect, _) = match self.mode() {
+            CanvasMode::Plan => self.plan.canvas_frame(),
+            CanvasMode::Mosaic => self.mosaic.viewer_frame(),
+        }?;
+        let cam = self.shown_camera()?;
+        if cam.zoom <= 0.0 {
+            return None;
+        }
+        let hw = f64::from(rect.width()) / 2.0 / cam.zoom;
+        let hh = f64::from(rect.height()) / 2.0 / cam.zoom;
+        let (cx, cy) = cam.centre;
+        Some(([cx - hw, cy - hh, cx + hw, cy + hh], cam.centre))
     }
 
     /// The shown view's key, for the summary and the saved view: a group
@@ -512,6 +786,7 @@ impl SessionWindow {
             Undo::Analyze(previous) => {
                 self.mosaic.edit_analysis(previous, session, jobs);
             }
+            Undo::RoiDelete { index, roi } => self.mosaic.restore_roi(session, index, roi),
         }
         self.save_panel_choices();
     }

@@ -60,7 +60,9 @@
 //!   ([`mosaic::set_settings`]) and input edits ([`mosaic::set_inputs`]) that
 //!   stale exactly the affected result stores, non-invalidating draft commits
 //!   ([`mosaic::commit_blend_settings`]) with per-group provenance lookups
-//!   ([`mosaic::settings_changed`], [`mosaic::region_differs`]), and a
+//!   ([`mosaic::settings_changed`], [`mosaic::region_differs`]), transient
+//!   in-memory region previews that touch no store ([`mosaic::plan_preview`],
+//!   [`mosaic::run_preview`]), and a
 //!   cross-process session
 //!   lock ([`mosaic::lock_session`]).
 //!   One writer per store is enforced (`Error::Busy`); the plan / run / apply

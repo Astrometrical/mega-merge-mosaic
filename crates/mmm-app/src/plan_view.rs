@@ -45,6 +45,11 @@
 //!   they are all in, and when the view or the look changes. The manual
 //!   stretch earlier versions saved per view (`plan_stretch` in
 //!   `MosaicConfig.ui`) is ignored.
+//! - **Over the panels.** The window hands the plan the regions of interest
+//!   as overlays (outlines and names, [`PlanView::set_overlays`]) and may arm
+//!   its draw tool ([`PlanView::set_drawing`]): a rectangle drawn is taken
+//!   once with [`PlanView::take_drawn`]. Both only while the plan draws in
+//!   the analysed frame ([`PlanView::frame_matches`]).
 //! - **Compositions** add their channels' layers: each mapped group's
 //!   previews are drawn as additive layers tinted red, green or blue times
 //!   the channel's weight. Overlapping previews of one group add up too
@@ -58,6 +63,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{Color32, ColorImage, RichText};
+use mega_ui::canvas_layers::{Overlay, Tool};
 use mega_ui::plan::{Layer, PlacedItem, PlanCanvas};
 use mega_ui::theme::palette;
 use mega_ui::theme::tokens::space;
@@ -114,8 +120,8 @@ pub struct CanvasLook {
     pub outlines: bool,
     /// Panel numbers.
     pub numbers: bool,
-    /// The regions of interest (the merged mosaic draws them; the plan
-    /// does not yet).
+    /// The regions of interest, outlined and named on the plan and on the
+    /// merged mosaic alike.
     pub rois: bool,
     /// The automatic display stretch's toggles.
     pub stretch: DisplayStretch,
@@ -660,6 +666,17 @@ pub struct PlanView {
     hovered: Option<PathBuf>,
     /// The panel to highlight (pointed at elsewhere).
     highlight: Option<PathBuf>,
+    /// What the window has drawn over the plan (the ROIs).
+    overlays: Vec<Overlay>,
+    /// Image patches (ROI previews) drawn over the canvas.
+    patches: Vec<mega_ui::canvas_layers::Patch>,
+    /// A rectangle just drawn, with the canvas it is on: see
+    /// [`PlanView::take_drawn`].
+    drawn: Option<([f64; 4], (u64, u64))>,
+    /// The press held on the canvas in the last frame drawn.
+    hold: Option<mega_ui::canvas_layers::Hold>,
+    /// A canvas rect where a click selects nothing ([`PlanView::set_quiet`]).
+    quiet: Option<[u64; 4]>,
     held_camera: Option<HeldCamera>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
@@ -734,6 +751,11 @@ impl PlanView {
             selected: None,
             hovered: None,
             highlight: None,
+            overlays: Vec::new(),
+            patches: Vec::new(),
+            drawn: None,
+            hold: None,
+            quiet: None,
             held_camera: None,
             textures_for: None,
             textures: HashMap::new(),
@@ -772,6 +794,57 @@ impl PlanView {
     /// when drawn).
     pub fn select_view(&mut self, view: ViewKind) {
         self.view = Some(view);
+    }
+
+    /// Draw these over the panels (canvas coordinates) from the next frame
+    /// on: the ROIs, when the look has them.
+    pub fn set_overlays(&mut self, overlays: Vec<Overlay>) {
+        self.overlays = overlays;
+    }
+
+    /// Draw these image patches (ROI previews) over the panels from the next
+    /// frame on, under the overlays.
+    pub fn set_patches(&mut self, patches: Vec<mega_ui::canvas_layers::Patch>) {
+        self.patches = patches;
+    }
+
+    /// Arm (or disarm) the draw tool: the next drag draws a rectangle
+    /// ([`PlanView::take_drawn`]) instead of panning, and clicks select
+    /// nothing.
+    pub fn set_drawing(&mut self, on: bool) {
+        self.canvas
+            .set_tool(if on { Tool::DrawRect } else { Tool::Navigate });
+    }
+
+    /// Whether the draw tool is armed.
+    pub fn drawing(&self) -> bool {
+        self.canvas.tool() == Tool::DrawRect
+    }
+
+    /// The rectangle the user finished drawing since the last call, once,
+    /// as `[x0, y0, x1, y1]` in canvas coordinates with the size of the
+    /// canvas it was drawn on.
+    pub fn take_drawn(&mut self) -> Option<([f64; 4], (u64, u64))> {
+        self.drawn.take()
+    }
+
+    /// From the next frame drawn, a click inside canvas rect `rect` (if any)
+    /// selects no panel and clears no selection: a press there is the
+    /// window's (compare's peek on the ROI compared).
+    pub fn set_quiet(&mut self, rect: Option<[u64; 4]>) {
+        self.quiet = rect;
+    }
+
+    /// The screen rect the canvas's own buttons took in its last frame
+    /// ([`PlanCanvas::controls_rect`]).
+    pub fn controls_rect(&self) -> Option<egui::Rect> {
+        self.canvas.controls_rect()
+    }
+
+    /// The primary button held on the canvas in the last frame drawn (the
+    /// navigate tool), in canvas coordinates.
+    pub fn hold(&self) -> Option<mega_ui::canvas_layers::Hold> {
+        self.hold
     }
 
     /// The view shown (once drawn).
@@ -867,6 +940,19 @@ impl PlanView {
         self.canvas.last_frame()
     }
 
+    /// Whether the plan draws in the frame the analysis left in the session
+    /// (the regions of interest and the patches are anchored in that one), or
+    /// there is no analysed frame yet. A canvas-changing panel edit makes the
+    /// previews' frame differ until the re-analysis ends; the window draws
+    /// no ROIs on the plan meanwhile and takes no rectangle from it.
+    pub fn frame_matches(&self, session: &OpenSession) -> bool {
+        match (&session.frame, &self.layout.frame) {
+            (None, _) => true,
+            (Some(analysed), Some(drawn)) => analysed == drawn,
+            (Some(_), None) => false,
+        }
+    }
+
     /// The shared frame's canvas, once read.
     pub fn frame_canvas(&self) -> Option<(u64, u64)> {
         self.layout.frame.as_ref().map(ReferenceFrame::canvas)
@@ -893,6 +979,7 @@ impl PlanView {
         self.last_shown = Some(Instant::now());
         // Set again if the canvas is drawn and the pointer is on a panel.
         self.hovered = None;
+        self.hold = None;
         if self.info_generation != feed.generation {
             // The panel files may have changed: read their headers again.
             self.info_generation = feed.generation;
@@ -974,9 +1061,19 @@ impl PlanView {
             held.extent = Some(extent);
             held.drawn = false;
         }
+        self.canvas.set_overlays(self.overlays.clone());
+        self.canvas.set_patches(self.patches.clone());
         let r = self
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);
+        self.hold = r.held;
+        if let Some(rect) = r.drawn_rect {
+            let size = (
+                extent[2].ceil().max(0.0) as u64,
+                extent[3].ceil().max(0.0) as u64,
+            );
+            self.drawn = Some((rect, size));
+        }
         if self.canvas.last_frame().is_some_and(|(_, t)| t == now) {
             if let Some(held) = &mut self.held_camera {
                 held.drawn = true;
@@ -994,10 +1091,20 @@ impl PlanView {
                 .get(id as usize)
                 .map(|p| p.path.clone())
         };
-        if let Some(id) = r.clicked {
-            self.selected = path_of(id);
-        } else if r.clicked_empty {
-            self.selected = None;
+        // A click in the quiet rect selects nothing.
+        let quiet = self.quiet.is_some_and(|q| {
+            let at = ui.input(|i| i.pointer.interact_pos());
+            let frame = self.canvas.last_frame();
+            at.zip(frame).is_some_and(|(p, (rect, t))| {
+                let (x, y) = self.canvas.view().screen_to_image(p, rect, t);
+                x >= q[0] as f64 && x < q[2] as f64 && y >= q[1] as f64 && y < q[3] as f64
+            })
+        });
+        match r.clicked {
+            _ if quiet => {}
+            Some(id) => self.selected = path_of(id),
+            None if r.clicked_empty => self.selected = None,
+            None => {}
         }
         self.hovered = r.hovered.and_then(path_of);
     }

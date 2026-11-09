@@ -14,6 +14,10 @@ use egui::{
     Ui,
 };
 
+use crate::canvas_layers::{
+    DrawStep, Hold, Overlay, Patch, Pressed, Tool, drawing_rect, follow_draw, follow_hold,
+    paint_layers, pointer_over, show_tool_cursor,
+};
 use crate::theme::palette;
 use crate::viewer::{OverlayButton, View, drag_delta, overlay_buttons};
 
@@ -110,6 +114,13 @@ pub struct PlanResponse {
     pub hovered: Option<u64>,
     /// A click landed on no item (callers usually deselect).
     pub clicked_empty: bool,
+    /// A rectangle the user finished drawing this frame with
+    /// [`Tool::DrawRect`]: `[x0, y0, x1, y1]` in canvas coordinates,
+    /// normalised (`x0 <= x1`, `y0 <= y1`) and clamped to the extent.
+    pub drawn_rect: Option<[f64; 4]>,
+    /// The primary button held down on the canvas with [`Tool::Navigate`],
+    /// in canvas coordinates.
+    pub held: Option<Hold>,
 }
 
 /// Canvas command from a button or the host app, applied in `show`.
@@ -131,6 +142,16 @@ pub struct PlanCanvas {
     view_for: Option<([f64; 4], (f64, f64), f64)>,
     commands: Vec<Command>,
     last_frame: Option<(Rect, f64)>,
+    overlays: Vec<Overlay>,
+    patches: Vec<Patch>,
+    tool: Tool,
+    /// The rectangle being drawn: its fixed corner and the current one, in
+    /// canvas coordinates.
+    drawing: Option<((f64, f64), (f64, f64))>,
+    /// The press on the canvas, while it lasts ([`follow_hold`]).
+    held: Pressed,
+    /// The screen rect of the canvas's buttons, as last drawn.
+    controls: Option<Rect>,
 }
 
 impl Default for PlanCanvas {
@@ -148,7 +169,44 @@ impl PlanCanvas {
             view_for: None,
             commands: Vec::new(),
             last_frame: None,
+            overlays: Vec::new(),
+            patches: Vec::new(),
+            tool: Tool::Navigate,
+            drawing: None,
+            held: None,
+            controls: None,
         }
+    }
+
+    /// Replace the rectangles drawn over the items (canvas coordinates).
+    pub fn set_overlays(&mut self, overlays: Vec<Overlay>) {
+        self.overlays = overlays;
+    }
+
+    /// Replace the images drawn over the items (under the overlays).
+    pub fn set_patches(&mut self, patches: Vec<Patch>) {
+        self.patches = patches;
+    }
+
+    /// What a drag does from now on (a rectangle being drawn is dropped).
+    /// With [`Tool::DrawRect`] a drag draws instead of panning, clicks are
+    /// not reported, and the pointer over the canvas is a crosshair
+    /// ([`crate::canvas_layers::DRAW_CURSOR`]).
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        self.drawing = None;
+    }
+
+    /// The current tool.
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    /// The screen rect the canvas's own buttons (zoom, home, zoom to
+    /// selection) took in the last frame drawn. Something drawn over the
+    /// canvas can keep clear of it.
+    pub fn controls_rect(&self) -> Option<Rect> {
+        self.controls
     }
 
     /// The current view (canvas coordinates are the view's image pixels).
@@ -235,22 +293,37 @@ impl PlanCanvas {
         }
 
         // Input before hit-testing and painting, so both use this frame's view.
+        let drawn_rect = self.handle_draw(ui, &response, rect, extent, now);
+        show_tool_cursor(ui, &response, self.tool);
         self.handle_pan_zoom(ui, &response, rect, now);
+        let navigating = self.tool == Tool::Navigate && drawn_rect.is_none();
+        let held = if navigating {
+            let view = &self.view;
+            let to_canvas = |p: Pos2| view.screen_to_image(p, rect, now);
+            follow_hold(ui, &response, &mut self.held, &to_canvas)
+        } else {
+            self.held = None;
+            None
+        };
         let hit = |p: Pos2| {
             let c = self.view.screen_to_image(p, rect, now);
             items.iter().rev().find(|it| it.contains(c)).map(|it| it.id)
         };
         let mut out = PlanResponse {
             hovered: response.hover_pos().and_then(hit),
+            drawn_rect,
+            held,
             ..PlanResponse::default()
         };
-        if response.clicked()
+        if navigating
+            && response.clicked()
             && let Some(p) = response.interact_pointer_pos()
         {
             out.clicked = hit(p);
             out.clicked_empty = out.clicked.is_none();
         }
-        if response.double_clicked()
+        if navigating
+            && response.double_clicked()
             && let Some(p) = response.interact_pointer_pos()
         {
             out.double_clicked = hit(p);
@@ -273,7 +346,7 @@ impl PlanCanvas {
         let buttons = [
             OverlayButton::new("+", 28.0, "Zoom in"),
             OverlayButton::new("\u{2212}", 28.0, "Zoom out"),
-            OverlayButton::new("Home", 52.0, "Fit everything"),
+            OverlayButton::new("Home", 60.0, "Fit everything"),
             OverlayButton {
                 enabled: items.iter().any(|it| it.selected),
                 ..OverlayButton::new("Zoom to selection", 128.0, "Zoom to the selection")
@@ -285,7 +358,9 @@ impl PlanCanvas {
             Command::Home,
             Command::ZoomToSelection,
         ];
-        if let Some(i) = overlay_buttons(ui, rect, &buttons) {
+        let (clicked, controls) = overlay_buttons(ui, rect, &buttons);
+        self.controls = Some(controls);
+        if let Some(i) = clicked {
             self.commands.push(cmds[i]);
         }
 
@@ -304,11 +379,41 @@ impl PlanCanvas {
         );
     }
 
+    /// Follow a [`Tool::DrawRect`] drag; returns the rect once released.
+    fn handle_draw(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        rect: Rect,
+        extent: [f64; 4],
+        now: f64,
+    ) -> Option<[f64; 4]> {
+        if self.tool != Tool::DrawRect {
+            return None;
+        }
+        let view = &self.view;
+        let clamp = |p: Pos2| {
+            let (x, y) = view.screen_to_image(p, rect, now);
+            (x.clamp(extent[0], extent[2]), y.clamp(extent[1], extent[3]))
+        };
+        match follow_draw(ui, response, &mut self.drawing, &clamp) {
+            DrawStep::Idle => None,
+            DrawStep::Cancelled => {
+                self.set_tool(Tool::Navigate);
+                None
+            }
+            DrawStep::Done(r) => {
+                self.tool = Tool::Navigate;
+                Some(r)
+            }
+        }
+    }
+
     fn handle_pan_zoom(&mut self, ui: &Ui, response: &egui::Response, rect: Rect, now: f64) {
-        if response.dragged() {
+        if response.dragged() && self.tool == Tool::Navigate {
             self.view.pan_by(drag_delta(response), now);
         }
-        let Some(p) = response.hover_pos() else {
+        let Some(p) = pointer_over(ui, response) else {
             return;
         };
         let line = ui.ctx().options(|o| o.input_options.line_scroll_speed);
@@ -331,7 +436,8 @@ impl PlanCanvas {
         }
     }
 
-    /// Images in slice order, then outlines, labels and markers over them,
+    /// Images in slice order, then patches, overlays and the rectangle being
+    /// drawn, then outlines, labels and markers over them,
     /// then highlighted outlines and selected outlines last (so they are
     /// never hidden; the selection over the highlight).
     fn paint(
@@ -360,6 +466,14 @@ impl PlanCanvas {
                 painter.image(layer.texture.id(), r, full_uv, layer.vertex_color());
             }
         }
+        paint_layers(
+            painter,
+            rect,
+            &screen,
+            &self.patches,
+            &self.overlays,
+            drawing_rect(self.drawing),
+        );
         for it in items {
             let r = screen(it.rect);
             if !r.intersects(rect) {

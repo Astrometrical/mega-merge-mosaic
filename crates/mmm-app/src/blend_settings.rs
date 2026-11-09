@@ -67,7 +67,8 @@ pub fn load_draft(cfg: &MosaicConfig) -> BlendSettings {
 }
 
 /// The draft as `group` would merge with it: [`load_draft`] with the
-/// group's override applied (what an ROI merge of the group runs with).
+/// group's override applied (what a transient preview of the group is made
+/// with, [`crate::previews`]).
 pub fn draft_for(cfg: &MosaicConfig, group: &str) -> BlendSettings {
     let over = cfg
         .group_overrides
@@ -264,6 +265,12 @@ impl SettingsPanel {
         self.feather_error = Some("Feather must be a number of pixels greater than 0.".into());
     }
 
+    /// Take back [`SettingsPanel::force_feather_error`] (tests).
+    #[cfg(test)]
+    pub fn clear_feather_error(&mut self) {
+        self.feather_error = None;
+    }
+
     /// Why merging is blocked by what is typed, if it is (an invalid
     /// feather width).
     pub fn input_error(&self) -> Option<&'static str> {
@@ -304,6 +311,16 @@ impl SettingsPanel {
         }
         save_draft(&mut cfg.ui, &draft);
         self.draft_changed = true;
+    }
+
+    /// Put `draft` back as the merge settings draft (compare's **Use A**):
+    /// feather text being typed, valid or not, gives way to it, so the field
+    /// shows its width and nothing typed blocks merging; then as
+    /// [`SettingsPanel::edit_draft`].
+    pub fn restore_draft(&mut self, cfg: &mut MosaicConfig, draft: BlendSettings) {
+        self.feather_text = None;
+        self.feather_error = None;
+        self.edit_draft(cfg, draft);
     }
 
     /// Cancel the jobs in the way of `new`: every job but exports when it

@@ -631,6 +631,39 @@ fn drawn_rect_reported_in_image_coords() {
 }
 
 #[test]
+fn the_cursor_is_a_crosshair_while_the_draw_tool_is_armed() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    let over = Pos2::new(500.0, 400.0);
+    let cursor = |h: &Harness<'static, Drawing>| h.output().platform_output.cursor_icon;
+    h.hover_at(over);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "navigating");
+    // Armed: a crosshair over the canvas, and while drawing.
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair);
+    h.drag_at(over);
+    h.step();
+    h.hover_at(Pos2::new(600.0, 450.0));
+    h.step();
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair, "drawing");
+    // Off the canvas: none.
+    h.drop_at(Pos2::new(600.0, 450.0));
+    h.run();
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.hover_at(Pos2::new(-10.0, -10.0));
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "off the canvas");
+    // A rect drawn disarms the tool: the cursor goes back.
+    drag(&mut h, over, Pos2::new(600.0, 450.0));
+    assert_eq!(h.state().viewer.tool(), Tool::Navigate);
+    h.hover_at(over);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "disarmed");
+}
+
+#[test]
 fn overlays_drawn_and_zoom_to_rect() {
     let src = TestSource::new(20_000, 10_000);
     let mut h = drawing_harness(TiledViewer::new_synchronous(src));
@@ -1126,4 +1159,297 @@ fn opacity_scales_tile_tint() {
         }
     }
     assert!(meshes > 0);
+}
+
+#[test]
+fn viewer_patches_are_clipped() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    let tex = h.ctx.load_texture(
+        "patch",
+        ColorImage::new([4, 4], vec![Color32::WHITE; 16]),
+        egui::TextureOptions::LINEAR,
+    );
+    let id = tex.id();
+    h.state_mut().viewer.set_patches(vec![Patch {
+        rect: [2000.0, 2000.0, 6000.0, 6000.0],
+        clip: [4000.0, 1000.0, 9000.0, 4000.0],
+        texture: tex,
+    }]);
+    h.run();
+    let (rect, now) = h.state().viewer.last_frame().unwrap();
+    let to_screen = |p: (f64, f64)| h.state().viewer.view().image_to_screen(p, rect, now);
+    let mut bounds = Vec::new();
+    for cs in &h.output().shapes {
+        if let egui::Shape::Mesh(m) = &cs.shape
+            && m.texture_id == id
+        {
+            let pts: Vec<Pos2> = m.vertices.iter().map(|v| v.pos).collect();
+            let uvs: Vec<Pos2> = m.vertices.iter().map(|v| v.uv).collect();
+            bounds.push((egui::Rect::from_points(&pts), egui::Rect::from_points(&uvs)));
+        }
+    }
+    assert_eq!(bounds.len(), 1);
+    let want = egui::Rect::from_min_max(to_screen((4000.0, 2000.0)), to_screen((6000.0, 4000.0)));
+    let (pos, uv) = bounds[0];
+    assert!((pos.min - want.min).length() < 0.5 && (pos.max - want.max).length() < 0.5);
+    assert!((uv.min - Pos2::new(0.5, 0.0)).length() < 1e-4);
+    assert!((uv.max - Pos2::new(1.0, 0.5)).length() < 1e-4);
+}
+
+#[test]
+fn patches_paint_after_stale_tiles_and_hatch_and_before_overlays() {
+    let src = TestSource::new(5000, 5000);
+    *src.all.lock().unwrap() = Some(Kind::Stale);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    let tex = h.ctx.load_texture(
+        "patch",
+        ColorImage::new([2, 2], vec![Color32::WHITE; 4]),
+        egui::TextureOptions::LINEAR,
+    );
+    let id = tex.id();
+    h.state_mut().viewer.set_patches(vec![Patch {
+        rect: [500.0, 500.0, 3000.0, 3000.0],
+        clip: [500.0, 500.0, 3000.0, 3000.0],
+        texture: tex,
+    }]);
+    h.state_mut().viewer.set_overlays(vec![Overlay {
+        rect: [600.0, 600.0, 2000.0, 2000.0],
+        color: Color32::RED,
+        label: String::new(),
+        dashed: false,
+    }]);
+    h.run();
+    let (mut last_tile_or_hatch, mut patch, mut overlay) = (None, None, None);
+    for (i, cs) in h.output().shapes.iter().enumerate() {
+        match &cs.shape {
+            egui::Shape::Mesh(m) if m.texture_id == id => patch = Some(i),
+            egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                last_tile_or_hatch = Some(i);
+            }
+            egui::Shape::LineSegment { stroke, .. }
+                if stroke.color == crate::theme::palette::BORDER =>
+            {
+                last_tile_or_hatch = Some(i);
+            }
+            egui::Shape::Rect(r) if r.stroke.color == Color32::RED => overlay = Some(i),
+            _ => {}
+        }
+    }
+    let (t, p, o) = (
+        last_tile_or_hatch.expect("tiles"),
+        patch.expect("patch"),
+        overlay.expect("overlay"),
+    );
+    assert!(t < p && p < o, "tiles/hatch {t}, patch {p}, overlay {o}");
+}
+
+/// Viewer plus the hold it reported each frame.
+struct Holding {
+    viewer: TiledViewer,
+    held: Vec<Option<Hold>>,
+}
+
+fn holding_harness(viewer: TiledViewer) -> Harness<'static, Holding> {
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut Holding| {
+                let r = s.viewer.show(ui);
+                s.held.push(r.held);
+            },
+            Holding {
+                viewer,
+                held: Vec::new(),
+            },
+        )
+}
+
+fn last_held(h: &Harness<'static, Holding>) -> Option<Hold> {
+    *h.state().held.last().expect("a frame")
+}
+
+#[test]
+fn a_held_press_is_reported_until_released() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = holding_harness(TiledViewer::new_synchronous(src));
+    h.run();
+    assert_eq!(last_held(&h), None);
+    let (rect, now) = h.state().viewer.last_frame().unwrap();
+    let at = Pos2::new(600.0, 400.0);
+    let origin = h.state().viewer.view().screen_to_image(at, rect, now);
+    let c0 = centre_zoom(&h.state().viewer).0;
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    let still = Some(Hold {
+        origin,
+        moved: false,
+    });
+    assert_eq!(last_held(&h), still);
+    // Held still past the time of a click (egui calls it a drag by then):
+    // still held, never moved, nothing panned.
+    h.run_steps(100);
+    assert_eq!(last_held(&h), still);
+    assert_eq!(centre_zoom(&h.state().viewer).0, c0);
+    // A small wobble is no drag.
+    h.hover_at(at + Vec2::new(3.0, 0.0));
+    h.step();
+    assert_eq!(last_held(&h).map(|h| h.moved), Some(false));
+    // Past the click distance: a drag, which pans; it stays one even back
+    // at the origin.
+    h.hover_at(at + Vec2::new(60.0, 0.0));
+    h.step();
+    assert_eq!(
+        last_held(&h).map(|h| (h.origin, h.moved)),
+        Some((origin, true))
+    );
+    assert_ne!(centre_zoom(&h.state().viewer).0, c0);
+    h.hover_at(at);
+    h.step();
+    assert_eq!(last_held(&h).map(|h| h.moved), Some(true));
+    h.drop_at(at);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    // A new press starts afresh.
+    h.hover_at(at);
+    h.drag_at(at);
+    h.step();
+    assert_eq!(last_held(&h).map(|h| h.moved), Some(false));
+    h.drop_at(at);
+    h.step();
+    // Drawing a rect is no hold.
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.hover_at(at);
+    h.drag_at(at);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.drop_at(at);
+    h.step();
+    // Nor is anything in presentation mode.
+    h.state_mut().viewer.set_presentation(true);
+    h.hover_at(at);
+    h.drag_at(at);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.drop_at(at);
+    h.step();
+}
+
+#[test]
+fn a_press_on_the_viewers_buttons_is_no_hold() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = holding_harness(TiledViewer::new_synchronous(src));
+    h.run();
+    let controls = h.state().viewer.controls_rect().expect("buttons drawn");
+    // On "+" (the zoom button over the image): no hold, however long.
+    let plus = h.get_by_label("+").rect().center();
+    assert!(controls.contains(plus));
+    h.hover_at(plus);
+    h.step();
+    h.drag_at(plus);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.run_steps(100);
+    assert_eq!(last_held(&h), None);
+    h.drop_at(plus);
+    h.step();
+    // On the image: a hold.
+    let at = Pos2::new(600.0, 400.0);
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    assert!(last_held(&h).is_some());
+    // The window losing the focus ends it, for the rest of the press.
+    h.input_mut().focused = false;
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.input_mut().focused = true;
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.drop_at(at);
+    h.step();
+}
+
+/// A viewer with a canvas label over it, and what the viewer reported.
+struct Labelled {
+    viewer: TiledViewer,
+    log: Vec<ViewerResponse>,
+}
+
+#[test]
+fn the_wheel_and_the_readout_work_over_a_label() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut Labelled| {
+                let r = s.viewer.show(ui);
+                s.log.push(r);
+                let (rect, _) = s.viewer.last_frame().unwrap();
+                let controls = [crate::widgets::LabelControl::Button {
+                    text: "Compare",
+                    accessible: "Compare Region 1",
+                    tooltip: None,
+                    primary: false,
+                }];
+                crate::widgets::canvas_label(
+                    ui,
+                    "label",
+                    &crate::widgets::CanvasLabel {
+                        corner: Pos2::new(400.0, 300.0),
+                        clip: rect,
+                        avoid: None,
+                        name: "Region 1",
+                        color: palette::TEXT_BODY,
+                        controls: &controls,
+                        text: "up to date",
+                        text_below: false,
+                        accessible: "Region 1 on the canvas",
+                        description: "",
+                    },
+                );
+            },
+            Labelled {
+                viewer: TiledViewer::new_synchronous(src),
+                log: Vec::new(),
+            },
+        );
+    h.run();
+    // Over the label's panel, beside its button.
+    let over = h
+        .get_by_label("Region 1 on the canvas")
+        .rect()
+        .left_center()
+        + Vec2::new(6.0, 0.0);
+    h.hover_at(over);
+    h.step();
+    let readout = h.state().log.last().unwrap().hovered_image_pos;
+    assert!(readout.is_some(), "the pixel readout");
+    let (_, z0) = centre_zoom(&h.state().viewer);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: Vec2::new(0.0, 1.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run();
+    let (_, z1) = centre_zoom(&h.state().viewer);
+    assert!(z1 > z0 * 1.1, "the wheel zooms: {z0} -> {z1}");
+    // A press there is still the label's: no pan, no hold.
+    let c0 = centre_zoom(&h.state().viewer).0;
+    h.drag_at(over);
+    h.step();
+    h.hover_at(over + Vec2::new(80.0, 0.0));
+    h.step();
+    h.drop_at(over + Vec2::new(80.0, 0.0));
+    h.run();
+    assert_eq!(centre_zoom(&h.state().viewer).0, c0);
+    assert!(h.state().log.iter().all(|r| r.held.is_none()));
 }
