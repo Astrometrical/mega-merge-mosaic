@@ -1,12 +1,19 @@
 //! The inspector's sections, in their fixed order:
 //!
 //! - **Problems**: the checks' problems (and what could not be checked),
-//!   each with **Accept** where it can be accepted, then **See all checks ›**
-//!   for the notes and passed checks too. Its badge counts the unaccepted
-//!   problems.
+//!   each with **Accept** where it can be accepted (an accepted one says
+//!   so), then **See all checks ›**: every check, grouped under Problems,
+//!   Notes and Passed, an accepted problem with **Un-accept**, and **‹
+//!   Problems** back. Its badge counts the unaccepted problems.
+//! - **Checks rows** (here and in Panels) whose target resolves to a place
+//!   on the canvas lead there: a click or Enter opens the problem
+//!   ([`SessionWindow::open_problem`]: framed and selected).
 //! - **Panels**: "{n} panels · {g} groups · {canvas}", the previews'
-//!   progress (with **Resume** once paused), and the selected panel's
-//!   details and checks.
+//!   progress (with **Resume** once paused), and what is selected
+//!   ([`Selected`]): a panel's details ([`PlanView::selection_ui`]: its
+//!   Overlaps rows select the neighbour and frame the overlap) and its
+//!   checks, every severity, with Accept, Un-accept and Open; or "Overlap
+//!   {a} – {b}" / "Seam {a} – {b}" and the checks at that place.
 //! - **ROIs**: **Draw ROI** (also the `D` key, which reveals the section so
 //!   its hint shows) arms the draw tool on the canvas shown, plan or mosaic
 //!   (a crosshair over it while armed), then the ROI list
@@ -20,7 +27,7 @@
 //!   reorder, delete with Undo); the picked one shows its channel editor.
 //! - **Notes**: the session's notes, saved with the session (debounced).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mega_ui::checks::{CheckAction, CheckItem, ListMode, checks_list};
@@ -31,11 +38,10 @@ use mega_ui::theme::{Severity as UiSeverity, Tone};
 use mega_ui::widgets::ordered_list::{ListEvent, ListRow, ListState, ordered_list_with};
 use mega_ui::widgets::{ButtonKind, MegaButton, NotesMode, notes_view};
 use mmm_core::checks::{Check, Severity, is_accepted};
-use mmm_core::mosaic::MosaicConfig;
 
 use super::shortcuts;
 use super::{
-    COMPOSITES, CanvasMode, MERGE_SETTINGS, NOTES, PANELS, PROBLEMS, ROIS, SessionOutput,
+    COMPOSITES, CanvasMode, MERGE_SETTINGS, NOTES, PANELS, PROBLEMS, ROIS, Selected, SessionOutput,
     SessionWindow, Undo, WindowToast, compositions_of,
 };
 use crate::checks::{ChecksEngine, ChecksReport};
@@ -43,9 +49,10 @@ use crate::compositions::{
     Composition, ViewKind, channel_editor, composition_detail, save_compositions,
 };
 use crate::jobs::JobRunner;
+use crate::marks::{Place, target_rect};
 use crate::mosaic_view::MosaicView;
 use crate::pipeline::{Pipeline, Step};
-use crate::plan_view::PlanView;
+use crate::plan_view::{Layout, PlanView, details_heading, file_name};
 use crate::session::{OpenSession, notes, set_notes};
 use crate::status::format_canvas;
 use crate::util::{Debounce, group_names};
@@ -70,6 +77,22 @@ struct Actions {
     go_to: Option<[u64; 4]>,
     /// **Draw ROI** was used: arm the draw tool on the canvas shown.
     draw_roi: bool,
+    /// What the checks lists asked for.
+    checks: CheckActs,
+    /// An Overlaps row of the selected panel's details was clicked: the
+    /// panel, and the neighbour to select.
+    neighbour: Option<(PathBuf, PathBuf)>,
+}
+
+/// What the checks lists asked for this frame.
+#[derive(Default)]
+struct CheckActs {
+    /// Accept these ([`SessionOutput::accept`]).
+    accept: Vec<Check>,
+    /// Un-accept these ([`SessionOutput::unaccept`]).
+    unaccept: Vec<Check>,
+    /// Open this one ([`SessionWindow::open_problem`]).
+    open: Option<Check>,
 }
 
 impl SessionWindow {
@@ -136,6 +159,7 @@ impl SessionWindow {
             save,
             composite_list,
             view,
+            selection,
             ..
         } = self;
         let fold = shortcuts::FOLD.symbol_or_name();
@@ -143,8 +167,22 @@ impl SessionWindow {
             // Each body under its own id: the inspector draws them all in
             // like-identified scopes.
             ui.push_id(id, |ui| match id {
-                PROBLEMS => problems_ui(ui, session, checks, show_all_checks, &mut out.accept),
-                PANELS => panels_ui(ui, session, plan, pipeline, checks, &mut out.accept),
+                PROBLEMS => problems_ui(
+                    ui,
+                    session,
+                    plan.layout(),
+                    checks,
+                    show_all_checks,
+                    &mut act,
+                ),
+                PANELS => panels_ui(
+                    ui,
+                    session,
+                    (plan, selection.as_ref()),
+                    pipeline,
+                    checks,
+                    &mut act,
+                ),
                 ROIS => rois_ui(ui, session, mosaic, (draw_block, drawing), &mut act),
                 MERGE_SETTINGS => {
                     mosaic.settings_ui(ui, session, jobs);
@@ -163,6 +201,14 @@ impl SessionWindow {
         }
         if let Some(rect) = act.go_to {
             self.go_to_roi(session, rect);
+        }
+        out.accept.append(&mut act.checks.accept);
+        out.unaccept.append(&mut act.checks.unaccept);
+        if let Some(check) = act.checks.open.take() {
+            self.open_problem(session, checks.report(), &check);
+        }
+        if let Some((panel, neighbour)) = act.neighbour.take() {
+            self.go_to_neighbour(session, &panel, &neighbour);
         }
         if act.draw_roi {
             self.start_drawing_roi(session);
@@ -226,13 +272,17 @@ pub(crate) fn counted(n: usize, noun: &str) -> String {
 
 /// The checks of `report` that `keep` passes as list items, with the check
 /// each stands for; with `errors`, what could not be checked first (as
-/// problems that cannot be accepted, standing for no check).
+/// problems that cannot be accepted, standing for no check). A row leads
+/// somewhere when its check's target resolves to a place on the canvas
+/// ([`target_rect`] in `layout`, with the report's seam lines): opening it
+/// goes there.
 fn check_items<'r>(
     report: &'r ChecksReport,
-    cfg: &MosaicConfig,
+    (session, layout): (&OpenSession, &Layout),
     errors: bool,
     keep: impl Fn(&Check) -> bool,
 ) -> (Vec<CheckItem>, Vec<Option<&'r Check>>) {
+    let cfg = &session.mosaic.config;
     let mut items = Vec::new();
     let mut sources = Vec::new();
     if errors {
@@ -259,47 +309,62 @@ fn check_items<'r>(
             detail: c.remedy.clone().unwrap_or_default(),
             accepted: is_accepted(cfg, c),
             acceptable: c.severity != Severity::Passed,
-            goes_somewhere: false,
+            goes_somewhere: target_rect(session, layout, &report.seams, c).is_some(),
         });
         sources.push(Some(c));
     }
     (items, sources)
 }
 
-/// `items` under `heading` (none: an empty string); an accepted one's check
-/// goes to `accept`.
+/// `items` under `heading` (none: an empty string) as `mode` lists them;
+/// what is asked of a row's check goes to `acts` (Accept, Un-accept, Open).
 fn list(
     ui: &mut egui::Ui,
     heading: &str,
-    items: &[CheckItem],
-    sources: &[Option<&Check>],
-    accept: &mut Vec<Check>,
+    (items, sources): (&[CheckItem], &[Option<&Check>]),
+    mode: ListMode,
+    acts: &mut CheckActs,
 ) {
-    // The flat list for now (the old "See all checks" toggle filters it).
-    // Un-accept and Open have no handler yet: no row sets `goes_somewhere`
-    // and the grouped `ListMode::All` (which offers Un-accept) is not used.
-    for action in checks_list(ui, heading, items, ListMode::Problems) {
-        if let CheckAction::Accept(i) = action
-            && let Some(Some(c)) = sources.get(i)
-        {
-            accept.push((*c).clone());
+    for action in checks_list(ui, heading, items, mode) {
+        let (CheckAction::Accept(i) | CheckAction::Unaccept(i) | CheckAction::Open(i)) = action;
+        let Some(Some(c)) = sources.get(i) else {
+            continue;
+        };
+        let c = (*c).clone();
+        match action {
+            CheckAction::Accept(_) => acts.accept.push(c),
+            CheckAction::Unaccept(_) => acts.unaccept.push(c),
+            CheckAction::Open(_) => acts.open = Some(c),
         }
     }
 }
 
+/// The Problems section: what could not be checked and the problems (the
+/// accepted ones say so), then **See all checks ›**; or, seeing all, **‹
+/// Problems** and every check grouped by severity, an accepted problem
+/// with **Un-accept**.
 fn problems_ui(
     ui: &mut egui::Ui,
     session: &OpenSession,
+    layout: &Layout,
     checks: &ChecksEngine,
     show_all: &mut bool,
-    accept: &mut Vec<Check>,
+    act: &mut Actions,
 ) {
+    if *show_all
+        && ui
+            .add(MegaButton::new(ButtonKind::Quiet, "‹ Problems"))
+            .on_hover_text("Back to the problems")
+            .clicked()
+    {
+        *show_all = false;
+    }
+    let all = *show_all;
     match checks.report() {
         None if checks.running() => muted(ui, "Checking…"),
         None => muted(ui, "Not checked yet."),
         Some(report) => {
-            let all = *show_all;
-            let (items, sources) = check_items(report, &session.mosaic.config, true, |c| {
+            let (items, sources) = check_items(report, (session, layout), true, |c| {
                 all || c.severity == Severity::Problem
             });
             if items.is_empty() {
@@ -312,27 +377,35 @@ fn problems_ui(
                     },
                 );
             } else {
-                list(ui, "", &items, &sources, accept);
+                let mode = if all {
+                    ListMode::All
+                } else {
+                    ListMode::Problems
+                };
+                list(ui, "", (&items, &sources), mode, &mut act.checks);
             }
         }
     }
-    let label = if *show_all {
-        "Problems only"
-    } else {
-        "See all checks ›"
-    };
-    if ui.add(MegaButton::new(ButtonKind::Quiet, label)).clicked() {
-        *show_all = !*show_all;
+    if !all
+        && ui
+            .add(MegaButton::new(ButtonKind::Quiet, "See all checks ›"))
+            .on_hover_text("Every check, notes and passed ones too")
+            .clicked()
+    {
+        *show_all = true;
     }
 }
 
+/// The Panels section: the summary, the previews' progress, then what is
+/// selected: a panel's details and checks ([`PlanView::selection_ui`]), or
+/// an overlap's or a seam's heading and checks ([`place_ui`]).
 fn panels_ui(
     ui: &mut egui::Ui,
     session: &OpenSession,
-    plan: &mut PlanView,
+    (plan, selection): (&mut PlanView, Option<&Selected>),
     pipeline: &mut Pipeline,
     checks: &ChecksEngine,
-    accept: &mut Vec<Check>,
+    act: &mut Actions,
 ) {
     let cfg = &session.mosaic.config;
     let n = cfg.panels.len();
@@ -369,17 +442,67 @@ fn panels_ui(
     if unplaced > 0 {
         muted(ui, format!("{unplaced} not placed yet"));
     }
+    if let Some(s @ (Selected::Overlap(..) | Selected::Seam { .. })) = selection {
+        ui.add_space(space::M);
+        place_ui(ui, session, plan.layout(), checks, s, act);
+        return;
+    }
     let Some(path) = plan.selected().map(Path::to_path_buf) else {
         return;
     };
+    // Its checks, every severity, those naming it with others (an overlap,
+    // a seam) too.
+    let listed = checks.report().map(|report| {
+        check_items(report, (session, plan.layout()), false, |c| {
+            c.panels.contains(&path)
+        })
+    });
     ui.add_space(space::M);
-    plan.selection_ui(ui, session);
-    if let Some(report) = checks.report() {
-        let (items, sources) = check_items(report, cfg, false, |c| c.panels.contains(&path));
-        if !items.is_empty() {
-            ui.add_space(space::M);
-            list(ui, "Checks for this panel", &items, &sources, accept);
-        }
+    if let Some(neighbour) = plan.selection_ui(ui, session) {
+        act.neighbour = Some((path.clone(), neighbour));
+    }
+    if let Some((items, sources)) = listed.filter(|(items, _)| !items.is_empty()) {
+        ui.add_space(space::M);
+        let heading = "Checks for this panel";
+        list(
+            ui,
+            heading,
+            (&items, &sources),
+            ListMode::All,
+            &mut act.checks,
+        );
+    }
+}
+
+/// The selected overlap's or seam's details: "Overlap {a} – {b}" or "Seam
+/// {a} – {b}" (the panels' names), then every check at that place, with
+/// Accept, Un-accept and Open.
+fn place_ui(
+    ui: &mut egui::Ui,
+    session: &OpenSession,
+    layout: &Layout,
+    checks: &ChecksEngine,
+    selected: &Selected,
+    act: &mut Actions,
+) {
+    let (kind, a, b) = match selected {
+        Selected::Overlap(a, b) => ("Overlap", a, b),
+        Selected::Seam { a, b, .. } => ("Seam", a, b),
+        Selected::Panel(_) => return,
+    };
+    details_heading(ui, &format!("{kind} {} – {}", file_name(a), file_name(b)));
+    let Some(report) = checks.report() else {
+        return;
+    };
+    let place = selected.place();
+    let (items, sources) = check_items(report, (session, layout), false, |c| {
+        Place::of(c).as_ref() == Some(&place)
+    });
+    if items.is_empty() {
+        muted(ui, "No checks here.");
+    } else {
+        ui.add_space(space::S);
+        list(ui, "", (&items, &sources), ListMode::All, &mut act.checks);
     }
 }
 

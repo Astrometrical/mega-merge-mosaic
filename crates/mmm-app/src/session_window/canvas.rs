@@ -28,7 +28,10 @@
 //! mosaic too (from the analysis), and **Seams** the shown groups' seam
 //! lines on both (on the plan only while it draws in the analysed frame),
 //! a seam with an unaccepted problem in the warning colour, thicker. A
-//! badge clicked goes to its place ([`SessionWindow::open_badge`]).
+//! badge clicked opens its first problem ([`SessionWindow::open_badge`]).
+//! The selected overlap or seam is ringed over them, on both canvases (on
+//! the plan only in the analysed frame); a click on no panel of the plan
+//! selects nothing ([`crate::session_window::Selected`]).
 
 use std::path::Path;
 
@@ -39,13 +42,13 @@ use mmm_core::mosaic::{OutOfDateReason, out_of_date_reason};
 
 use super::shortcuts::{self, keyed, views_hint};
 use super::steps::{draft_changed, out_of_date};
-use super::{COMPOSITES, CanvasMode, MERGE_SETTINGS, SessionWindow, compositions_of};
+use super::{COMPOSITES, CanvasMode, MERGE_SETTINGS, Selected, SessionWindow, compositions_of};
 use crate::bands::{group_bands, presets_for};
 use crate::checks::{ChecksEngine, ChecksReport};
 use crate::compositions::{Channels, ViewKind, create_composition, unique_name};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
-use crate::marks::{ProblemMark, panel_outlines, problem_count, problem_marks, seam_lines};
+use crate::marks::{ProblemMark, Seams, panel_outlines, problem_count, problem_marks, seam_lines};
 use crate::mosaic_view::{CanvasTag, view_members};
 use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
@@ -606,11 +609,14 @@ impl SessionWindow {
         let report = checks.report();
         let groups = self.view_groups(session);
         self.marks = problem_marks(session, self.plan.layout(), report, &groups);
-        let seams = if self.look.seams {
+        let mut seams = if self.look.seams {
             seam_lines(self.plan.layout(), report, &groups, &self.marks)
         } else {
             Vec::new()
         };
+        // The selected overlap or seam, ringed over them.
+        let none = Seams::new();
+        seams.extend(self.selection_ring(session, report.map_or(&none, |r| &r.seams)));
         let clicked = match self.mode() {
             CanvasMode::Plan => {
                 // The ROIs are anchored in the analysed frame: not while the
@@ -644,21 +650,28 @@ impl SessionWindow {
                 if !matches {
                     self.plan.set_drawing(false);
                 }
-                // The plan's selection changed (a click, Esc): a panel just
-                // selected opens its details in the inspector; the list
-                // follows (drawn already: from the next frame).
+                // The plan's selection changed (a click, a panel gone): a
+                // panel just selected is the selection, its details open in
+                // the inspector; the list follows (drawn already: from the
+                // next frame). A click on no panel selects nothing, an
+                // overlap or a seam included.
                 let selected = self.plan.selected().map(Path::to_path_buf);
-                if selected != self.selected {
-                    match &selected {
+                let before = self.selection.as_ref().and_then(Selected::panel);
+                if selected.as_deref() != before {
+                    match selected {
                         Some(p) => {
                             self.inspector.reveal(super::PANELS);
-                            self.panels.select_only(p, self.panel_list_open);
+                            self.panels.select_only(&p, self.panel_list_open);
+                            self.selection = Some(Selected::Panel(p));
                         }
-                        None => self.panels.clear_selection(),
+                        None => self.select(None),
                     }
                     ui.ctx().request_repaint();
                 }
-                self.selected = selected;
+                if self.plan.take_clicked_empty() && self.selection.is_some() {
+                    self.select(None);
+                    ui.ctx().request_repaint();
+                }
                 // The panel pointed at lights its row, from the next frame.
                 let hovered = self.plan.hovered().map(Path::to_path_buf);
                 if self.panels.set_highlight(hovered) {

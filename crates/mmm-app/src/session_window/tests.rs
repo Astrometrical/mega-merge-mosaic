@@ -61,6 +61,8 @@ struct State {
     run_pipeline: bool,
     /// The checks the window asked the shell to accept, in order.
     accepted: Vec<Check>,
+    /// The checks the window asked the shell to un-accept, in order.
+    unaccepted: Vec<Check>,
     /// The panel list's file dialog.
     files: Arc<AskedFiles>,
     /// The toasts the window raised, in order.
@@ -80,6 +82,7 @@ impl State {
             checks: ChecksEngine::new(),
             run_pipeline: false,
             accepted: Vec::new(),
+            unaccepted: Vec::new(),
             files,
             toasts: Vec::new(),
             events: Vec::new(),
@@ -127,6 +130,7 @@ fn harness_sized(state: State, size: egui::Vec2) -> Harness<'static, State> {
                 let out =
                     s.w.ui(ui, &mut s.session, &mut s.jobs, &mut s.pipeline, &s.checks);
                 s.accepted.extend(out.accept);
+                s.unaccepted.extend(out.unaccept);
                 s.toasts.extend(out.toasts);
                 s.events.extend(events);
             },
@@ -1978,6 +1982,37 @@ fn a_selected_panel_shows_its_details_and_checks() {
         .map(|c| c.message.as_str())
         .collect();
     assert_eq!(accepted, ["First panel changed"]);
+    // Accepted (as the shell would), it can be un-accepted there.
+    let changed = h.state().checks.report().unwrap().checks[0].clone();
+    h.state_mut()
+        .session
+        .mosaic
+        .config
+        .accepted_checks
+        .extend(changed.keys());
+    h.run_steps(2);
+    h.get_by_label("Un-accept").click_accesskit();
+    h.run_steps(2);
+    assert_eq!(h.state().unaccepted, [changed]);
+    // Its row opens it (in Problems and in the panel's checks): the panel
+    // framed.
+    assert_eq!(
+        h.query_all_by_role_and_label(Role::Button, "First panel changed")
+            .count(),
+        2
+    );
+    h.get_all_by_role_and_label(Role::Button, "First panel changed")
+        .last()
+        .expect("the panel's row")
+        .click_accesskit();
+    h.run_steps(3);
+    let (frame, _) = h.state().w.plan().canvas_frame().unwrap();
+    let r = h.state().w.plan().layout().rects[&first];
+    assert_camera(
+        h.state().w.plan().camera(),
+        Camera::framing(r, frame.size()),
+    );
+    assert_eq!(h.state().w.plan().selected(), Some(first.as_path()));
     // Esc clears the selection.
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
@@ -4481,4 +4516,5 @@ fn a_region_entry_with_other_settings_still_makes_the_group_out_of_date() {
 mod compare;
 mod export;
 mod marks;
+mod opening;
 mod previews;

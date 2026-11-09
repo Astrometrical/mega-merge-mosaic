@@ -342,14 +342,18 @@ pub fn target_rect(
     check: &Check,
 ) -> Option<[u64; 4]> {
     let place = Place::of(check)?;
-    let r = place_rect(session, layout, seams, &place)?;
+    Some(covering_px(place_rect(session, layout, seams, &place)?))
+}
+
+/// The whole-pixel canvas rect covering `r` (none of it below zero).
+pub fn covering_px(r: [f64; 4]) -> [u64; 4] {
     let px = |v: f64| v.max(0.0) as u64;
-    Some([
+    [
         px(r[0].floor()),
         px(r[1].floor()),
         px(r[2].ceil()),
         px(r[3].ceil()),
-    ])
+    ]
 }
 
 /// The seam lines of `groups` in `report` (canvas coordinates): neutral,
@@ -397,6 +401,19 @@ pub fn seam_lines(
     }
     neutral.extend(warned);
     neutral
+}
+
+/// The ring a selected overlap or seam is highlighted with at its rect
+/// (`[x0, y0, x1, y1]`, canvas coordinates): the selection colour, as the
+/// plan outlines a selected panel, at the strong line width.
+pub fn selection_ring(rect: [f64; 4]) -> Polyline {
+    let [x0, y0, x1, y1] = rect;
+    Polyline {
+        points: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]],
+        color: palette::ACCENT_400,
+        width: LINE_WIDTH_STRONG,
+        dashed: false,
+    }
 }
 
 /// A panel's outline colour: the problem colour when it is badged, else

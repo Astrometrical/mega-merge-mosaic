@@ -122,7 +122,7 @@ const DEFAULT_HEADER_KEY: &str = "FILTER";
 /// The first keyword of **Path keyword…** (`…/FILTER_Ha/…` → `Ha`).
 const DEFAULT_PATH_KEYWORD: &str = "FILTER";
 /// A cell whose fact is unknown.
-const UNKNOWN: &str = "—";
+pub(crate) const UNKNOWN: &str = "—";
 /// The FILTER cell of a panel whose header is not read yet.
 const READING: &str = "Reading…";
 /// The FILTER cell of a panel that can't be opened.
@@ -524,7 +524,7 @@ fn file_name(path: &Path) -> String {
 }
 
 /// An integration time: "3h 05m", or "45s" below a minute.
-fn integration_text(seconds: f64) -> String {
+pub(crate) fn integration_text(seconds: f64) -> String {
     let whole = seconds.max(0.0).round() as u64;
     if whole < 60 {
         return format!("{whole}s");

@@ -15,7 +15,7 @@ use mmm_core::session::Session;
 use super::*;
 
 /// The panels of `group` in `s`, in configuration order.
-fn members(s: &OpenSession, group: &str) -> Vec<PathBuf> {
+pub(super) fn members(s: &OpenSession, group: &str) -> Vec<PathBuf> {
     group_members(s, &[group.to_string()])
         .remove(group)
         .expect("the group")
@@ -23,7 +23,7 @@ fn members(s: &OpenSession, group: &str) -> Vec<PathBuf> {
 
 /// Each panel of `group`'s id and content bbox in the group's analysis
 /// (read from its `session.json`, not through the window).
-fn analysed(s: &OpenSession, group: &str) -> BTreeMap<PathBuf, (usize, [f64; 4])> {
+pub(super) fn analysed(s: &OpenSession, group: &str) -> BTreeMap<PathBuf, (usize, [f64; 4])> {
     let session = Session::open(&s.mosaic.group_session_dir(group)).unwrap();
     session
         .panels
@@ -39,7 +39,7 @@ fn analysed(s: &OpenSession, group: &str) -> BTreeMap<PathBuf, (usize, [f64; 4])
 }
 
 /// The intersection of two rects.
-fn meet(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+pub(super) fn meet(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
     [
         a[0].max(b[0]),
         a[1].max(b[1]),
@@ -49,12 +49,12 @@ fn meet(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
 }
 
 /// A rect's centre.
-fn centre(r: [f64; 4]) -> [f64; 2] {
+pub(super) fn centre(r: [f64; 4]) -> [f64; 2] {
     [(r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0]
 }
 
 /// A check of `severity` at `target`.
-fn at(
+pub(super) fn at(
     code: CheckCode,
     severity: Severity,
     target: CheckTarget,
@@ -79,12 +79,17 @@ fn at(
 }
 
 /// A problem at `target`.
-fn problem_at(code: CheckCode, target: CheckTarget, groups: &[&str], message: &str) -> Check {
+pub(super) fn problem_at(
+    code: CheckCode,
+    target: CheckTarget,
+    groups: &[&str],
+    message: &str,
+) -> Check {
     at(code, Severity::Problem, target, groups, message)
 }
 
 /// The seam of group `group` between `a` and `b`.
-fn seam(group: &str, a: &std::path::Path, b: &std::path::Path) -> CheckTarget {
+pub(super) fn seam(group: &str, a: &std::path::Path, b: &std::path::Path) -> CheckTarget {
     CheckTarget::Seam {
         group: group.into(),
         a: a.to_path_buf(),
@@ -118,7 +123,10 @@ fn spots(points: impl IntoIterator<Item = [f64; 2]>) -> Vec<[i64; 2]> {
 }
 
 /// The badge button drawn at screen point `at` (its pill's centre).
-fn badge_button<'h>(h: &'h Harness<'static, State>, at: egui::Pos2) -> egui_kittest::Node<'h> {
+pub(super) fn badge_button<'h>(
+    h: &'h Harness<'static, State>,
+    at: egui::Pos2,
+) -> egui_kittest::Node<'h> {
     h.query_all(By::new().role(Role::Button))
         .find(|n| {
             let said = n.accesskit_node().label().unwrap_or_default();
@@ -129,7 +137,7 @@ fn badge_button<'h>(h: &'h Harness<'static, State>, at: egui::Pos2) -> egui_kitt
 
 /// A canvas rect framed as [`target_rect`](crate::marks::target_rect)
 /// rounds it: whole pixels, covering it.
-fn covering(r: [f64; 4]) -> [f64; 4] {
+pub(super) fn covering(r: [f64; 4]) -> [f64; 4] {
     [r[0].floor(), r[1].floor(), r[2].ceil(), r[3].ceil()]
 }
 
@@ -156,12 +164,12 @@ fn stroked(h: &Harness<'_, State>, canvas: egui::Rect, color: Color32, width: f3
 }
 
 /// The plan has drawn every panel of its view, its layout in.
-fn plan_ready(st: &State) -> bool {
+pub(super) fn plan_ready(st: &State) -> bool {
     plan_placed(st) && !st.w.plan().layout().rects.is_empty()
 }
 
 /// The mosaic is drawn, with the layout in.
-fn mosaic_ready(st: &State) -> bool {
+pub(super) fn mosaic_ready(st: &State) -> bool {
     st.w.mode() == CanvasMode::Mosaic
         && st.w.mosaic().viewer_frame().is_some()
         && !st.w.plan().layout().rects.is_empty()

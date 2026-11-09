@@ -14,7 +14,7 @@
 //! | `Ctrl+Enter` (`Cmd+Enter` on macOS) | **Merge**, while the main button offers it | the main button |
 //! | `Ctrl+E` (`Cmd+E` on macOS) | open the Export dialog, while it can open (something merged, no analysis running) | **Export…** |
 //! | `Delete` (and `Backspace` on macOS) | remove the selected panels (a toast offers Undo), while the panel list is open | the row menu's **Remove** |
-//! | `Esc` | clear the selection, in the panel list and on the plan | |
+//! | `Esc` | clear the selection: a panel (in the panel list and on the plan), an overlap or a seam | |
 //! | `Space`, held | comparing an ROI (spec §8.3): show the other side while held (Esc first if a control has the focus, as the toggle's tooltip says) | the **A** / **B** buttons |
 //!
 //! The letters, brackets, Delete and Space count with no modifier held

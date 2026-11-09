@@ -525,6 +525,56 @@ fn header_facts_are_read_again_for_new_inputs() {
 }
 
 #[test]
+fn panel_details_show_filter_and_integration() {
+    use egui::accesskit::Role;
+    let root = temp_dir("plan-details");
+    let s = two_group_session(&root);
+    let path = s.mosaic.config.panels[0].path.clone();
+    let plain = s.mosaic.config.panels[1].path.clone();
+    // The first panel with its sub-frames in its header (its pixels do not
+    // matter here).
+    let (w, h) = crate::synth_mosaic::CANVAS;
+    let cards = [("FILTER", "'Ha'"), ("EXPTIME", "300"), ("NCOMBINE", "24")]
+        .map(|(k, v)| format!(r#"<FITSKeyword name="{k}" value="{v}" comment=""/>"#))
+        .concat();
+    let planes = vec![0.1f32; (w * h * 3) as usize];
+    mmm_core::synth::write_xisf_with_header_xml(&path, w, h, 3, &planes, &cards).unwrap();
+    let mut h = harness(s);
+    h.run_steps(2);
+    h.state_mut().view.select(Some(path.clone()));
+    step_until(&mut h, |s| s.view.has_info(&path));
+    h.run_steps(2);
+    let fact = |h: &Harness<'static, State>, k: &str, v: &str| {
+        let key = h.get_by_label(k).rect();
+        let value = h.get_by_label(v).rect();
+        assert!(
+            (key.center().y - value.center().y).abs() < 2.0 && key.max.x < value.min.x,
+            "{k} {key:?} beside {v} {value:?}"
+        );
+    };
+    fact(&h, "Size", "600 × 420 (0.3 MP)");
+    fact(&h, "Filter", "Ha");
+    fact(&h, "Exposure", "300 s");
+    fact(&h, "Frames", "24");
+    fact(&h, "Integration", "2h 00m");
+    fact(&h, "Solution", "None (registered)");
+    // In the standard's buttons.
+    h.get_by_role_and_label(Role::Button, "Show in folder");
+    h.get_by_role_and_label(Role::Button, "Copy path");
+    // What a header does not say reads "—".
+    h.state_mut().view.select(Some(plain.clone()));
+    step_until(&mut h, |s| s.view.has_info(&plain));
+    h.run_steps(2);
+    fact(&h, "Filter", "Ha");
+    assert_eq!(
+        h.query_all_by_label("—").count(),
+        3,
+        "exposure, frames, integration"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn copy_path_puts_path_on_clipboard() {
     let root = temp_dir("plan-copy");
     let s = two_group_session(&root);
