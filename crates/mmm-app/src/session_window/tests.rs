@@ -461,12 +461,14 @@ fn three_groups_two_composites(s: &mut OpenSession) {
 }
 
 /// The view bar's controls in a canvas `canvas_w` wide: Plan / Mosaic, a
-/// chip per group and composite, +, and the four toggles (the only toggle
-/// buttons in the window), each with its rect. Asserts none overlaps
-/// another, the canvas or the inspector.
+/// chip per group and composite and the four toggles (the only toggle
+/// buttons in the window), then + (a menu button, "New composite"), each
+/// with its rect. Asserts none overlaps another, the canvas or the
+/// inspector.
 fn bar_controls(h: &Harness<'_, State>, canvas_w: f32) -> Vec<(String, egui::Rect)> {
     let controls: Vec<(String, egui::Rect)> = h
         .query_all(By::new().predicate(|n| n.toggled().is_some()))
+        .chain(h.query_all(By::new().role(Role::Button).label(NEW_COMPOSITE)))
         .map(|n| (n.accesskit_node().label().unwrap_or_default(), n.rect()))
         .collect();
     let (canvas, _) = h.state().w.plan().canvas_frame().expect("the plan drawn");
