@@ -697,6 +697,69 @@ fn the_dialog_works_from_the_keyboard() {
 }
 
 #[test]
+fn closing_from_the_keyboard_gives_the_focus_back() {
+    let (root, s) = ready_session("export-focus-back");
+    let mut h = shown(s, runner());
+    // Ctrl+E from a control, then Esc: the focus is back on that control.
+    h.get_by_label("Outlines").focus();
+    h.run_steps(2);
+    assert_eq!(focused_label(&h).as_deref(), Some("Outlines"));
+    h.key_press_modifiers(Modifiers::COMMAND, Key::E);
+    h.run_steps(3);
+    assert!(h.state().w.export_open());
+    settle(&mut h);
+    assert_eq!(focused_label(&h).as_deref(), Some("Ha"), "in the dialog");
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    assert!(!h.state().w.export_open());
+    assert_eq!(focused_label(&h).as_deref(), Some("Outlines"), "Esc");
+    // Export… pressed with Enter, then Cancel with Enter: back on Export…,
+    // and the Enter that cancelled does not open the dialog again.
+    h.get_by_label("Export\u{2026}").focus();
+    h.run_steps(2);
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().w.export_open());
+    settle(&mut h);
+    tab_to(&mut h, "Cancel");
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    assert!(!h.state().w.export_open(), "Cancel closed it");
+    assert_eq!(focused_label(&h).as_deref(), Some("Export\u{2026}"));
+    h.run_steps(3);
+    assert!(!h.state().w.export_open(), "and it stays closed");
+    assert_eq!(focused_label(&h).as_deref(), Some("Export\u{2026}"));
+    // Closed with a click (Cancel): the focus is left where the click put it.
+    h.get_by_label("Export\u{2026}").focus();
+    h.run_steps(2);
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    settle(&mut h);
+    footer_button(&h, "Cancel").click();
+    h.run_steps(3);
+    assert!(!h.state().w.export_open());
+    assert_ne!(focused_label(&h).as_deref(), Some("Export\u{2026}"));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_dialog_is_a_dialog_named_export() {
+    let (root, s) = ready_session("export-a11y");
+    let mut h = shown(s, runner());
+    open_dialog(&mut h);
+    let dialog = h.get_by_role(Role::Dialog);
+    assert_eq!(dialog.accesskit_node().label().as_deref(), Some("Export"));
+    assert!(dialog.accesskit_node().data().is_modal());
+    assert!(
+        dialog.query_by_label("Cancel").is_some(),
+        "the footer is in it"
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn the_dialog_opens_once_something_is_merged() {
     let root = temp_dir("export-nothing-merged");
     let s = two_group_session(&root);

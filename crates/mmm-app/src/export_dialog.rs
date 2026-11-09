@@ -54,9 +54,13 @@
 //! only when the dialog showed it as there; any other file there by the
 //! time the export is written is left alone, and the job fails saying it
 //! "appeared meanwhile and was not replaced". **Cancel**, Esc and a click
-//! on the backdrop close the dialog, keeping nothing of what changed. A
-//! folder dialog that cannot be shown is reported in a toast
-//! ([`ExportDialog::take_problem`]).
+//! on the backdrop close the dialog, keeping nothing of what changed.
+//! Closed from the keyboard (Esc, or **Cancel** or **Export** pressed with
+//! Enter or Space), the focus goes back to what had it when the dialog
+//! opened (**Export…**, the Export step, or whatever had it at `Ctrl+E`),
+//! if it is still there ([`Dialog::close`]); closed with a click, the focus
+//! stays where the click put it. A folder dialog that cannot be shown is
+//! reported in a toast ([`ExportDialog::take_problem`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -358,6 +362,11 @@ impl FolderPicker for RfdFolderPicker {
     }
 }
 
+/// The Export dialog's id (its modal's).
+fn dialog_id() -> egui::Id {
+    egui::Id::new("export-dialog")
+}
+
 /// One row: a group or a composite, how it stands, and what it exports.
 struct Row {
     pick: Pick,
@@ -627,9 +636,7 @@ impl ExportDialog {
             title: "Export",
             width: DIALOG_WIDTH,
         }
-        .show(ctx, egui::Id::new("export-dialog"), |ui| {
-            body(ui, c, &rows, &shown, analysing)
-        });
+        .show(ctx, dialog_id(), |ui| body(ui, c, &rows, &shown, analysing));
         let act = if response.close {
             Some(Act::Cancel)
         } else {
@@ -638,6 +645,7 @@ impl ExportDialog {
         match act {
             Some(Act::Cancel) => {
                 self.open = None;
+                Dialog::close(ctx, dialog_id());
                 return false;
             }
             Some(Act::Browse) => {
@@ -653,6 +661,7 @@ impl ExportDialog {
             Some(Act::Export) => {
                 let changed = c.export(session, jobs, &rows, &shown);
                 self.open = None;
+                Dialog::close(ctx, dialog_id());
                 return changed;
             }
             None => {}
