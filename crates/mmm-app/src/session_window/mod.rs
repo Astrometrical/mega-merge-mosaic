@@ -1069,8 +1069,9 @@ impl SessionWindow {
     /// first group) in both canvases.
     fn follow_session(&mut self, session: &mut OpenSession, jobs: &JobRunner) {
         if self.mode.is_none() {
-            // Composites an earlier mmm saved get their ids, and their saved
-            // view and stretch follow them there (saved with the next save).
+            // Composites an earlier mmm saved get their ids (their saved
+            // view and stretch follow them) and weight 1, saved with the
+            // next save.
             if migrate_composition_ids(&mut session.mosaic.config.ui) {
                 self.save.touch();
             }

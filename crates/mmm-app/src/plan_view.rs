@@ -51,8 +51,9 @@
 //!   once with [`PlanView::take_drawn`]. Both only while the plan draws in
 //!   the analysed frame ([`PlanView::frame_matches`]).
 //! - **Compositions** add their channels' layers: each mapped group's
-//!   previews are drawn as additive layers tinted red, green or blue times
-//!   the channel's weight. Overlapping previews of one group add up too
+//!   previews are drawn as additive layers tinted red, green or blue (at
+//!   full strength: weights are always 1, as the export writes them).
+//!   Overlapping previews of one group add up too
 //!   (brighter overlaps in a composition view).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -1148,8 +1149,10 @@ impl PlanView {
                 let c = compositions.iter().find(|c| c.id == *id)?;
                 let mut drawn: Vec<DrawnGroup> = Vec::new();
                 for (slot, ch) in c.channels.iter().enumerate() {
-                    let Some((g, w)) = ch else { continue };
-                    let tint = scale_color(CHANNEL_COLORS[slot], *w);
+                    // The weight is not applied (always 1; the export
+                    // ignores it).
+                    let Some((g, _)) = ch else { continue };
+                    let tint = CHANNEL_COLORS[slot];
                     match drawn.iter_mut().find(|d| &d.name == g) {
                         Some(d) => d.layers.push((Some(slot), tint)),
                         None => drawn.push(DrawnGroup {
@@ -1748,12 +1751,6 @@ impl PlanView {
     pub(crate) fn has_info(&self, path: &Path) -> bool {
         self.info.contains_key(path)
     }
-}
-
-/// `c` with its RGB scaled by `w` (clamped to `[0, 255]`).
-fn scale_color(c: Color32, w: f32) -> Color32 {
-    let s = |v: u8| (f32::from(v) * w).round().clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(s(c.r()), s(c.g()), s(c.b()))
 }
 
 /// Plain text of a solution kind.

@@ -1,7 +1,10 @@
 //! Compositions (composites, as the UI calls them): named colour mixes of
 //! groups, shown on the canvas like a group (plan or mosaic). Each of the
-//! three output channels (R, G, B) takes a group with a weight, or nothing.
-//! Stored in `MosaicConfig.ui` under [`COMPOSITIONS_KEY`].
+//! three output channels (R, G, B) takes a group, or nothing. Each mapped
+//! channel stores a weight too, always 1: earlier builds had a 0–2 slider,
+//! but the export ignores weights, so the view does, and loading reads
+//! every weight as 1. Stored in `MosaicConfig.ui` under
+//! [`COMPOSITIONS_KEY`].
 
 use egui::RichText;
 use mega_ui::theme::palette;
@@ -13,7 +16,8 @@ use crate::stretch_panel::channel_name;
 /// Key in `MosaicConfig.ui` of the compositions list.
 pub const COMPOSITIONS_KEY: &str = "compositions";
 
-/// What the R, G and B channels show: a group and its weight, or nothing.
+/// What the R, G and B channels show: a group and its weight (always 1), or
+/// nothing.
 pub type Channels = [Option<(String, f32)>; 3];
 
 /// A named mix of groups into the R, G and B channels.
@@ -27,7 +31,7 @@ pub struct Composition {
     pub id: u64,
     /// Shown name.
     pub name: String,
-    /// Per output channel (R, G, B): the group shown and its weight.
+    /// Per output channel (R, G, B): the group shown and its weight (1).
     pub channels: Channels,
 }
 
@@ -56,7 +60,9 @@ pub enum ViewKind {
 /// entry is read by itself: a malformed one, one without a name, or a
 /// repeat of an earlier name is skipped, and the rest are kept. An entry
 /// without an id (saved by an earlier mmm), or with a repeated one, gets
-/// the next free id (the highest plus one); the next save writes them.
+/// the next free id (the highest plus one); every channel's weight is 1
+/// (earlier builds had a 0–2 slider; the export ignores weights, so the
+/// view must too). The next save writes them.
 pub fn load_compositions(ui: &Value) -> Vec<Composition> {
     let Some(list) = ui.get(COMPOSITIONS_KEY).and_then(Value::as_array) else {
         return Vec::new();
@@ -64,7 +70,10 @@ pub fn load_compositions(ui: &Value) -> Vec<Composition> {
     let mut out: Vec<Composition> = Vec::new();
     for v in list {
         match serde_json::from_value::<Composition>(v.clone()) {
-            Ok(c) if !c.name.trim().is_empty() && !out.iter().any(|o| o.name == c.name) => {
+            Ok(mut c) if !c.name.trim().is_empty() && !out.iter().any(|o| o.name == c.name) => {
+                for (_, w) in c.channels.iter_mut().flatten() {
+                    *w = 1.0;
+                }
                 out.push(c)
             }
             Ok(c) => tracing::warn!("composition {:?} skipped: no or a repeated name", c.name),
@@ -83,13 +92,15 @@ pub fn load_compositions(ui: &Value) -> Vec<Composition> {
     out
 }
 
-/// Bring what an earlier mmm saved in `ui` up to the ids: if any saved
+/// Bring what an earlier mmm saved in `ui` up to date: if any saved
 /// composition lacks an id (or repeats one), save the list with ids
 /// ([`load_compositions`] assigns them) and move the plan display stretch
 /// ([`crate::stretch_panel::PLAN_STRETCH_KEY`]) and the saved view
 /// (`session_view.view`) keyed `comp:{name}` to `comp:{id}`. A key naming
-/// no composite stays. Does nothing once every entry has an id, so a name
-/// that looks like an id is never mistaken for one. True if `ui` changed.
+/// no composite stays. Once every entry has an id, the keys never move
+/// again, so a name that looks like an id is never mistaken for one; a
+/// channel weight other than 1 is still saved as 1 then. True if `ui`
+/// changed.
 pub fn migrate_composition_ids(ui: &mut Value) -> bool {
     let Some(raw) = ui.get(COMPOSITIONS_KEY).and_then(Value::as_array) else {
         return false;
@@ -99,8 +110,22 @@ pub fn migrate_composition_ids(ui: &mut Value) -> bool {
         let id = v.get("id").and_then(Value::as_u64).unwrap_or(0);
         id != 0 && seen.insert(id)
     });
+    // A channel saved as `[group, weight]` with a weight other than 1.
+    let weighted = raw.iter().any(|v| {
+        v.get("channels")
+            .and_then(Value::as_array)
+            .is_some_and(|chs| {
+                chs.iter()
+                    .filter_map(|ch| ch.get(1).and_then(Value::as_f64))
+                    .any(|w| w != 1.0)
+            })
+    });
     if current {
-        return false;
+        if weighted {
+            let list = load_compositions(ui);
+            save_compositions(ui, &list);
+        }
+        return weighted;
     }
     let list = load_compositions(ui);
     let moves: Vec<(String, String)> = list
@@ -169,7 +194,7 @@ pub fn unique_name(base: &str, taken: &[String]) -> String {
         .unwrap_or_default()
 }
 
-/// Add a composition called `name` mapping `channels` (weights as given)
+/// Add a composition called `name` mapping `channels` (each at weight 1)
 /// to the compositions in `ui`, with a new id; returns that id. The caller
 /// has made `name` unique ([`unique_name`]). Not saved to disk (the caller
 /// rate-limits that).
@@ -179,7 +204,7 @@ pub fn create_composition(ui: &mut Value, name: &str, channels: [Option<(String,
     list.push(Composition {
         id,
         name: name.to_string(),
-        channels,
+        channels: channels.map(|ch| ch.map(|(g, _)| (g, 1.0))),
     });
     save_compositions(ui, &list);
     id
@@ -238,8 +263,8 @@ pub fn composition_detail(c: &Composition, groups: &[String]) -> String {
 
 /// Editor of one composition's channels (a group, or "None", for each of
 /// R, G and B); true if changed. `groups` are the groups to choose from. A
-/// mapped group that is not among them is kept and shown as missing. The
-/// weights stay as they are (1) and are not shown.
+/// mapped group that is not among them is kept and shown as missing. A
+/// group picked gets weight 1; weights are not shown.
 pub fn channel_editor(ui: &mut egui::Ui, c: &mut Composition, groups: &[String]) -> bool {
     let mut changed = false;
     for (i, slot) in c.channels.iter_mut().enumerate() {
@@ -262,8 +287,7 @@ pub fn channel_editor(ui: &mut egui::Ui, c: &mut Composition, groups: &[String])
                         for g in groups {
                             let picked = slot.as_ref().is_some_and(|(s, _)| s == g);
                             if ui.selectable_label(picked, g).clicked() && !picked {
-                                let w = slot.as_ref().map_or(1.0, |(_, w)| *w);
-                                *slot = Some((g.clone(), w));
+                                *slot = Some((g.clone(), 1.0));
                                 changed = true;
                             }
                         }
@@ -291,8 +315,8 @@ mod tests {
         a.id = 1;
         a.channels = [
             Some(("SII".into(), 1.0)),
-            Some(("Ha".into(), 0.5)),
-            Some(("OIII".into(), 1.25)),
+            Some(("Ha".into(), 1.0)),
+            Some(("OIII".into(), 1.0)),
         ];
         let mut b = Composition::new("Ha only");
         b.id = 2;
@@ -360,6 +384,36 @@ mod tests {
         let before = ui.clone();
         assert!(!migrate_composition_ids(&mut ui));
         assert_eq!(ui, before);
+    }
+
+    /// Composites saved by earlier builds, whose slider set weights from 0
+    /// to 2, load at weight 1 (the export ignores weights, so the view must
+    /// too), and opening the session writes them so.
+    #[test]
+    fn legacy_weights_load_as_one() {
+        let mut ui = serde_json::json!({ "compositions": [
+            { "id": 1, "name": "HOO",
+              "channels": [["Ha", 0.5], ["OIII", 2.0], ["OIII", 1.0]] },
+        ]});
+        let c = &load_compositions(&ui)[0];
+        let one = |g: &str| Some((g.to_string(), 1.0));
+        assert_eq!(c.channels, [one("Ha"), one("OIII"), one("OIII")]);
+        // The view mixes each channel at full strength, as the export does.
+        let tints = crate::tile_source::channel_tints(&c.channels, |a, b| a == b);
+        assert_eq!(
+            tints,
+            [
+                ("Ha".to_string(), [1.0, 0.0, 0.0]),
+                ("OIII".to_string(), [0.0, 1.0, 1.0]),
+            ]
+        );
+        // Opened, the session saves them at weight 1 (once).
+        assert!(migrate_composition_ids(&mut ui));
+        assert_eq!(
+            ui["compositions"][0]["channels"],
+            serde_json::json!([["Ha", 1.0], ["OIII", 1.0], ["OIII", 1.0]])
+        );
+        assert!(!migrate_composition_ids(&mut ui));
     }
 
     fn channels_of(groups: [Option<&str>; 3]) -> [Option<(String, f32)>; 3] {
@@ -466,9 +520,19 @@ mod tests {
         h.get_by_label("OIII").click();
         h.run();
         assert_eq!(h.state().c.channels[0], Some(("OIII".to_string(), 1.0)));
-        // G's weight is kept, not edited; and no weight control exists.
+        // G's weight is not edited; and no weight control exists.
         assert_eq!(h.state().c.channels[1], Some(("Ha".to_string(), 0.5)));
         assert!(h.query_all_by_label("Weight").next().is_none());
         assert_eq!(h.state().changes, 1);
+        // Another group picked for G gets weight 1, whatever G had.
+        h.get_all_by_role(egui::accesskit::Role::ComboBox)
+            .nth(1)
+            .unwrap()
+            .click();
+        h.run();
+        h.get_by_label("OIII").click();
+        h.run();
+        assert_eq!(h.state().c.channels[1], Some(("OIII".to_string(), 1.0)));
+        assert_eq!(h.state().changes, 2);
     }
 }

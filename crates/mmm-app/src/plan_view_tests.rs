@@ -444,6 +444,8 @@ fn a_highlight_lights_its_panel_and_the_pointer_names_one() {
 #[test]
 fn composition_view_uses_additive_layers() {
     let (root, mut s, _r) = analyzed("plan-composition");
+    // B's weight, as an earlier build may have saved it, is not applied:
+    // every channel shows at full strength, as the export writes it.
     let mut hoo = Composition::new("HOO");
     hoo.channels = [
         Some(("Ha".into(), 1.0)),
@@ -476,7 +478,7 @@ fn composition_view_uses_additive_layers() {
                 it.layers,
                 vec![
                     (Color32::from_rgb(0, 255, 0), true),
-                    (Color32::from_rgb(0, 0, 128), true),
+                    (Color32::from_rgb(0, 0, 255), true),
                 ]
             );
         }

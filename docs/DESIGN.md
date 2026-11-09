@@ -1553,6 +1553,13 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   while some saved composite lacks an id, `load_compositions` giving it the
   next free one, and then moves the stretch and view keys; a key naming no
   composite stays).
+- **Weights are always 1.** A channel stores a weight (`f32`), but earlier
+  builds' 0–2 slider is gone and the export ignores weights, so
+  `load_compositions` reads every weight as 1, the migration saves a list
+  holding another weight once (`migrate_composition_ids`, without moving any
+  key), `create_composition` and the channel editor write 1, and the view's
+  mix (`channel_tints`, the plan's composition layers) never applies a
+  weight: the view shows what is exported.
 - **Recognition and presets** (`bands.rs`). `recognise` names a group's
   band (`Band`: R, G, B, Ha, SII, OIII) from its name alone (case, spaces,
   hyphens, underscores and a bandwidth such as "7nm" do not matter: "Ha",

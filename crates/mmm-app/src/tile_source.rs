@@ -266,21 +266,23 @@ pub fn planar_image(
     ColorImage::new([w, h], pixels)
 }
 
-/// Colour of each composition channel (R, G, B) at weight 1.
+/// Colour of each composition channel (R, G, B).
 const CHANNEL_TINTS: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 /// The distinct members of a composition's `channels` (R, G, B: a member
 /// and its weight, or nothing), in first-mapped order, each with its RGB
-/// tint: its channel's colour times the weight, summed over every channel
-/// it is mapped to. `same` tells whether two members are one.
+/// tint: its channels' colours, summed over every channel it is mapped to.
+/// The weight is not applied (weights are always 1, and the export ignores
+/// them: the view shows what is exported). `same` tells whether two
+/// members are one.
 pub fn channel_tints<T: Clone>(
     channels: &[Option<(T, f32)>],
     same: impl Fn(&T, &T) -> bool,
 ) -> Vec<(T, [f32; 3])> {
     let mut members: Vec<(T, [f32; 3])> = Vec::new();
     for (slot, ch) in channels.iter().enumerate().take(CHANNEL_TINTS.len()) {
-        let Some((member, w)) = ch else { continue };
-        let tint = CHANNEL_TINTS[slot].map(|c| c * w);
+        let Some((member, _)) = ch else { continue };
+        let tint = CHANNEL_TINTS[slot];
         match members.iter_mut().find(|(m, _)| same(m, member)) {
             Some((_, t)) => {
                 for (a, b) in t.iter_mut().zip(tint) {
@@ -296,9 +298,9 @@ pub fn channel_tints<T: Clone>(
 /// A composition view (spec §5.3) as a [`TileSource`]: each mapped group's
 /// [`MosaicTileSource`] tile is fetched (through that group's own display
 /// stretch) on the loader thread and mixed additively, tinted by
-/// its channel's colour times the weight, as the Plan composition layers
-/// are. A group mapped to several channels is fetched once with the summed
-/// tint.
+/// its channel's colour ([`channel_tints`]: weights are not applied), as
+/// the Plan composition layers are. A group mapped to several channels is
+/// fetched once with the summed tint.
 ///
 /// **Store recreation.** The composite holds every member's reader: all of
 /// them must be released (the composite dropped by the viewer's loaders)
@@ -713,7 +715,8 @@ mod tests {
         let ha = Arc::new(MosaicTileSource::open(&ha_path, None).unwrap());
         let oiii = Arc::new(MosaicTileSource::open(&oiii_path, None).unwrap());
 
-        // HOO-like: R ← Ha × 1, G ← OIII × 1, B ← OIII × 0.5.
+        // HOO: R ← Ha, G ← OIII, B ← OIII (a weight an earlier build
+        // saved, 0.5 here, is not applied: weights are always 1).
         let channels = [
             Some((ha.clone(), 1.0)),
             Some((oiii.clone(), 1.0)),
@@ -728,12 +731,12 @@ mod tests {
             Fetched::Missing => panic!("missing"),
         };
         // 0.5 → 128, 0.25 → 64 (linear stretch), mixed per channel.
-        assert_eq!(px(comp.fetch(key(0, 0, 0))), Color32::from_rgb(128, 64, 32));
+        assert_eq!(px(comp.fetch(key(0, 0, 0))), Color32::from_rgb(128, 64, 64));
         assert!(matches!(comp.fetch(key(0, 0, 0)), Fetched::Valid(_)));
         // Any stale member makes the tile stale.
         assert!(matches!(comp.fetch(key(0, 1, 0)), Fetched::Stale(_)));
         // A member without the tile adds nothing; the rest still show.
-        assert_eq!(px(comp.fetch(key(0, 2, 0))), Color32::from_rgb(0, 64, 32));
+        assert_eq!(px(comp.fetch(key(0, 2, 0))), Color32::from_rgb(0, 64, 64));
         // No member has it: missing.
         assert!(matches!(comp.fetch(key(0, 0, 1)), Fetched::Missing));
 
@@ -747,11 +750,11 @@ mod tests {
             midtones: 0.5,
         }]);
         assert!(comp.generation() > g0);
-        assert_eq!(px(comp.fetch(key(0, 0, 0))), Color32::from_rgb(255, 64, 32));
-        // Weights above 1 saturate.
+        assert_eq!(px(comp.fetch(key(0, 0, 0))), Color32::from_rgb(255, 64, 64));
+        // A weight above 1 brightens nothing either.
         let bright = [Some((oiii.clone(), 2.0)), None, None];
         let comp2 = CompositeTileSource::new(&bright).unwrap();
-        assert_eq!(px(comp2.fetch(key(0, 0, 0))).r(), 128);
+        assert_eq!(px(comp2.fetch(key(0, 0, 0))).r(), 64);
 
         // Different geometries cannot be mixed: an explanation instead.
         let mut other = geom(1);

@@ -302,7 +302,7 @@ fn planned_views(m: &Mosaic, summary: Option<&SessionSummary>) -> Vec<Keyed> {
 }
 
 /// Composition `c` mixed from the group `pictures` (key, label, image),
-/// each tinted by its channels' colours times the weights; `None` when it
+/// each tinted by its channels' colours ([`channel_tints`]); `None` when it
 /// maps no group or a group without a picture.
 fn mix_pictures(c: &Composition, pictures: &[(String, String, ColorImage)]) -> Option<ColorImage> {
     let picture = |g: &str| pictures.iter().find(|p| p.0 == g).map(|p| &p.2);
