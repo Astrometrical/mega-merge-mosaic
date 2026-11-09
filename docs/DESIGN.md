@@ -1636,6 +1636,17 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   `egui::Modal`: a backdrop, a titled card (`DIALOG_WIDTH`), a body closure
   and `DialogResponse { inner, close }` (Esc or a backdrop click). Keyboard
   focus starts on the body's first control and Tab stays inside the dialog.
+  The widget that had the focus when it opened is remembered; the caller
+  calls `Dialog::close` in the pass it stops showing it, and when the dialog
+  closed from the keyboard (Esc, or a button pressed with Enter or Space)
+  the focus goes back to that widget, if it is still there. egui takes the
+  focus from a widget drawn behind the modal of the pass before, so a small
+  plugin (`ReturnFocus`) gives it at the end of the first pass without the
+  modal; the closing key therefore never presses the opener again. A pointer
+  click that closed it (a button, the backdrop) leaves the focus where the
+  click put it, as the **+** popover does. The modal's root (its area's
+  `Ui`, whose id is the dialog's) is a modal `Role::Dialog` node labelled by
+  the title, so a screen reader hears "Export, dialog".
   `footer` and `footer_with` are the right-aligned button row (primary last);
   `footer_with` takes `FooterButton { kind, label, disabled }`, a disabled
   button saying why on hover. Modals are only for choosing, never for

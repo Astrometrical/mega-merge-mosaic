@@ -5,7 +5,11 @@
 //! Built on [`egui::Modal`], which blocks input behind the dialog and reports
 //! Esc and backdrop clicks. On top of that the dialog starts with keyboard
 //! focus on the first control of its body, and Tab / Shift+Tab stay inside it.
+//! Closed from the keyboard ([`Dialog::close`]), it gives the focus back to
+//! the widget that had it when it opened. To assistive technology its root
+//! is a modal [`Role::Dialog`] labelled by its title ("Export, dialog").
 
+use egui::accesskit::Role;
 use egui::{Color32, Context, CornerRadius, Frame, Id, Layout, Margin, Modal, Stroke, Ui, Vec2};
 
 use crate::theme::palette::*;
@@ -52,15 +56,23 @@ impl Dialog<'_> {
     /// Draw the title and `body` in the dialog's card, without a modal or
     /// backdrop (the gallery shows this inline).
     pub fn contents<R>(&self, ui: &mut Ui, body: impl FnOnce(&mut Ui) -> R) -> R {
+        self.titled(ui, body).0
+    }
+
+    /// [`Dialog::contents`], and the title's id (what names the dialog).
+    fn titled<R>(&self, ui: &mut Ui, body: impl FnOnce(&mut Ui) -> R) -> (R, Id) {
         ui.set_width(self.width);
-        ui.label(text(Type::Title, self.title));
+        let title = ui.label(text(Type::Title, self.title)).id;
         ui.add_space(space::L);
-        body(ui)
+        (body(ui), title)
     }
 
     /// Show the dialog over everything, in the modal layer. Call it every
-    /// frame while the dialog is open. Focus starts on the first control of
-    /// the body when the dialog opens.
+    /// frame while the dialog is open, and [`Dialog::close`] once when it
+    /// closes. Focus starts on the first control of the body when the dialog
+    /// opens; the widget that had it is remembered, for `close` to give it
+    /// back. The modal's root is a modal [`Role::Dialog`] node labelled by
+    /// the title.
     pub fn show<R>(
         self,
         ctx: &Context,
@@ -77,6 +89,19 @@ impl Dialog<'_> {
         let (last, tries): (u64, u8) = ctx.data(|d| d.get_temp(key)).unwrap_or((0, 0));
         let fresh = last == 0 || last + 1 < pass;
         let tries = if fresh { FOCUS_PASSES } else { tries };
+        if fresh {
+            // Whatever opened the dialog (if anything had the focus), for
+            // `close` to give the focus back to.
+            ctx.add_plugin(ReturnFocus);
+            let opener = ctx.memory(|m| m.focused());
+            ctx.data_mut(|d| {
+                d.remove::<Id>(opener_key(id));
+                if let Some(o) = opener {
+                    d.insert_temp(opener_key(id), o);
+                }
+            });
+        }
+        let mut title = None;
         let modal = Modal::new(id)
             .backdrop_color(Color32::from_black_alpha(DIALOG_BACKDROP_ALPHA))
             .frame(dialog_frame())
@@ -91,7 +116,8 @@ impl Dialog<'_> {
                     });
                     ui.ctx().request_repaint();
                 }
-                let inner = self.contents(ui, body);
+                let (inner, t) = self.titled(ui, body);
+                title = Some(t);
                 if tries > 0 {
                     // Nothing in the body took the focus (the area's hidden
                     // sizing pass has no live controls): no widget drawn
@@ -100,12 +126,88 @@ impl Dialog<'_> {
                 }
                 inner
             });
+        // The modal's root (its area's `Ui`, whose id is the modal's): the
+        // dialog, named by its title.
+        if let Some(title) = title {
+            ctx.accesskit_node_builder(id, |node| {
+                node.set_role(Role::Dialog);
+                node.set_modal();
+                node.push_labelled_by(title.accesskit_id());
+            });
+        }
         let landed = ctx.memory(|m| m.focused()).is_some();
         let left = if landed { 0 } else { tries.saturating_sub(1) };
         ctx.data_mut(|d| d.insert_temp(key, (pass, left)));
         DialogResponse {
             close: modal.should_close(),
             inner: modal.inner,
+        }
+    }
+
+    /// The dialog shown as `id` has closed: call it once, in the pass the
+    /// caller stops showing it. Closed from the keyboard (Esc, or a button
+    /// pressed with Enter or Space), the focus goes back to the widget that
+    /// had it when the dialog opened, if that widget is still there. Closed
+    /// by a pointer click (a button, the backdrop), the focus stays where
+    /// the click put it.
+    ///
+    /// The focus is given at the end of the next pass ([`ReturnFocus`]), the
+    /// first the dialog is not shown in: until then the opener is behind
+    /// the modal of the pass before, and egui takes the focus from a widget
+    /// drawn there. So the key that closed the dialog never reaches the
+    /// opener (Enter would press it again), and the focus is back a pass
+    /// later.
+    pub fn close(ctx: &Context, id: Id) {
+        let opener = ctx.data_mut(|d| {
+            let o = d.get_temp::<Id>(opener_key(id));
+            d.remove::<Id>(opener_key(id));
+            o
+        });
+        let clicked = ctx.input(|i| i.pointer.any_click());
+        if let Some(opener) = opener.filter(|_| !clicked) {
+            ctx.add_plugin(ReturnFocus);
+            let pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|d| d.insert_temp(return_key(), (opener, pass)));
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// Where a dialog remembers the widget that had the focus when it opened.
+fn opener_key(id: Id) -> Id {
+    id.with("dialog_opener")
+}
+
+/// Where [`Dialog::close`] leaves the widget to give the focus back to, and
+/// the pass the dialog closed in.
+fn return_key() -> Id {
+    Id::new("mega_ui::dialog::return_focus")
+}
+
+/// Gives a closed dialog's opener the focus back at the end of the pass
+/// after the one it closed in ([`Dialog::close`]): that pass shows no
+/// modal, so from the next one on the opener may keep the focus. Added by
+/// every dialog that opens (egui keeps one), so it runs from the pass after.
+struct ReturnFocus;
+
+impl egui::Plugin for ReturnFocus {
+    fn debug_name(&self) -> &'static str {
+        "mega_ui::dialog::ReturnFocus"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx();
+        let Some((opener, closed)) = ctx.data(|d| d.get_temp::<(Id, u64)>(return_key())) else {
+            return;
+        };
+        if ctx.cumulative_pass_nr() <= closed {
+            // The pass the dialog closed in: it was still shown.
+            return;
+        }
+        ctx.data_mut(|d| d.remove::<(Id, u64)>(return_key()));
+        // Still there: drawn in this pass or the one before.
+        if ctx.read_response(opener).is_some() {
+            ctx.memory_mut(|m| m.request_focus(opener));
         }
     }
 }

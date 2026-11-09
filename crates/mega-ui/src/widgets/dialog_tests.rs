@@ -142,6 +142,132 @@ fn focus_left_on_the_opener_moves_into_the_dialog() {
     assert_eq!(focused(&h), ["One"]);
 }
 
+/// A closed dialog drawn before the rest of the screen (as the session
+/// window draws it), opened by setting `open`; Esc, the backdrop and either
+/// of its buttons close it, as a caller does: [`Dialog::close`].
+fn closing_harness() -> Harness<'static, State> {
+    Harness::builder()
+        .with_size(Vec2::new(900.0, 700.0))
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if !crate::testutil::themed(ui) {
+                    return;
+                }
+                if s.open {
+                    let r = Dialog {
+                        title: "Export",
+                        width: DIALOG_WIDTH,
+                    }
+                    .show(ui.ctx(), Id::new("dlg"), |ui| {
+                        let one = ui.button("One").clicked();
+                        let two = ui.button("Two").clicked();
+                        one || two
+                    });
+                    if r.close || r.inner {
+                        s.closes += 1;
+                        s.open = false;
+                        Dialog::close(ui.ctx(), Id::new("dlg"));
+                    }
+                }
+                if ui.button("Behind").clicked() {
+                    s.behind += 1;
+                }
+            },
+            State::default(),
+        )
+}
+
+/// Focus "Behind", then open the dialog from it.
+fn open_from_behind(h: &mut Harness<'_, State>) {
+    h.get_by_label("Behind").focus();
+    h.run();
+    assert_eq!(focused(h), ["Behind"]);
+    h.state_mut().open = true;
+    h.run();
+    assert_eq!(focused(h), ["One"], "the dialog takes the focus");
+}
+
+#[test]
+fn closing_from_the_keyboard_gives_the_opener_its_focus_back() {
+    let mut h = closing_harness();
+    h.run();
+    open_from_behind(&mut h);
+    h.key_press(Key::Escape);
+    h.run();
+    assert!(!h.state().open);
+    assert_eq!(focused(&h), ["Behind"], "Esc");
+    // A button of the dialog pressed from the keyboard: the key that closed
+    // the dialog does not press the opener too.
+    for key in [Key::Enter, Key::Space] {
+        open_from_behind(&mut h);
+        h.key_press(key);
+        h.run();
+        assert!(!h.state().open, "{key:?} closes it");
+        assert_eq!(focused(&h), ["Behind"], "{key:?}");
+        assert_eq!(
+            h.state().behind,
+            0,
+            "{key:?} pressed only the dialog's button"
+        );
+    }
+    // And it stays there.
+    for _ in 0..3 {
+        h.step();
+    }
+    assert_eq!(focused(&h), ["Behind"]);
+}
+
+#[test]
+fn closing_with_a_click_leaves_the_focus_to_the_click() {
+    let mut h = closing_harness();
+    h.run();
+    // A click on a button of the dialog.
+    open_from_behind(&mut h);
+    h.get_by_label("One").click();
+    h.run();
+    assert!(!h.state().open);
+    assert_eq!(focused(&h), Vec::<&str>::new(), "not given back");
+    // A click on the backdrop.
+    open_from_behind(&mut h);
+    click_at(&h, Pos2::new(850.0, 650.0));
+    h.run();
+    assert!(!h.state().open);
+    assert_eq!(focused(&h), Vec::<&str>::new(), "not given back");
+    assert_eq!(h.state().closes, 2);
+}
+
+#[test]
+fn closing_gives_nothing_back_when_nothing_had_the_focus() {
+    let mut h = closing_harness();
+    h.run();
+    h.state_mut().open = true;
+    h.run();
+    h.key_press(Key::Escape);
+    h.run();
+    assert!(!h.state().open);
+    assert_eq!(focused(&h), Vec::<&str>::new());
+}
+
+#[test]
+fn the_dialog_is_a_modal_dialog_named_by_its_title() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::NodeT;
+    let mut h = harness();
+    h.run();
+    let dialog = h.get_by_role(Role::Dialog);
+    let node = dialog.accesskit_node();
+    assert_eq!(node.label().as_deref(), Some("Export"));
+    assert!(node.data().is_modal());
+    assert!(
+        dialog.query_by_label("One").is_some(),
+        "its controls are in it"
+    );
+    assert!(
+        dialog.query_by_label("Behind").is_none(),
+        "what is behind it is not"
+    );
+}
+
 #[test]
 fn a_body_without_controls_does_not_repaint_forever() {
     let mut h = Harness::builder()
