@@ -286,6 +286,9 @@ impl Pipeline {
             });
             return;
         }
+        // Only with nothing running, exports included: starting an analysis
+        // cancels them (it may recreate the stores they read), so the
+        // automatic one waits for them to end.
         if !jobs.busy() && wants_analysis(session) && !self.analysis_stalled(session) {
             let id = jobs.start_analyze_scoped(session, analysis_scope(session));
             self.job = Some(Job {
@@ -698,6 +701,68 @@ mod tests {
         run_until(&mut p, &mut s, &mut r, t0, false, &mut seen, idle);
         assert_eq!(p.previews().len(), 8);
         assert!(p.previews_complete());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_automatic_analysis_waits_for_the_exports() {
+        use crate::jobs::{ExportTarget, JobTarget};
+        use mmm_core::export::ExportFormat;
+        let root = temp_dir("pipe-export-waits");
+        let mut s = two_group_session(&root);
+        let (mut p, mut r) = (Pipeline::new(), runner());
+        let ctx = egui::Context::default();
+        let t = Instant::now();
+        let mut seen = Seen::default();
+        run_until(&mut p, &mut s, &mut r, t, false, &mut seen, idle);
+        assert!(p.take_started_analysis().is_some(), "on opening");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        // An export of Ha runs, held on its lane.
+        let gate = r.hold_exports();
+        let out = root.join("ha.fits");
+        let ha = ExportTarget::Group("Ha".into());
+        let export = r.start_export(&s, ha, out.clone(), ExportFormat::Fits);
+        // A panel edit (it spares exports, so it applies at once) leaves a
+        // group needing analysis.
+        assert!(matches!(drop_last(&s).apply(&mut s, &mut r), Applied::Done));
+        assert!(wants_analysis(&s));
+        // After the debounce the previews are read again beside the
+        // export, but no analysis starts: it would cancel the export.
+        p.poll(&ctx, t, &mut s, &mut r, &[], false);
+        let t = t + DEBOUNCE + Duration::from_millis(100);
+        let mut seen = Seen::default();
+        let no_analysis = |r: &JobRunner| {
+            assert!(!r.analyzing(), "an analysis started during the export");
+        };
+        run_until(&mut p, &mut s, &mut r, t, false, &mut seen, |p, r| {
+            no_analysis(r);
+            p.previews_complete() && !r.busy_except_exports()
+        });
+        for _ in 0..20 {
+            let events = r.poll(&mut s);
+            p.poll(&ctx, t, &mut s, &mut r, &events, false);
+            seen.note(&r, &events);
+            no_analysis(&r);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(p.take_started_analysis(), None);
+        assert_eq!(r.run_of(JobTarget::Export).map(|x| x.id), Some(export));
+        assert!(wants_analysis(&s), "still wanted");
+        assert!(!seen.events.contains(&JobEvent::Cancelled { id: export }));
+        // Once the export has ended, the analysis starts.
+        gate.open();
+        run_until(&mut p, &mut s, &mut r, t, false, &mut seen, idle);
+        let analysis = p.take_started_analysis().expect("an analysis");
+        let ended = |id: u64| {
+            seen.events
+                .iter()
+                .position(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id))
+        };
+        assert!(ended(export).is_some(), "{:?}", seen.events);
+        assert!(ended(analysis) > ended(export), "{:?}", seen.events);
+        assert!(out.is_file());
+        assert!(!wants_analysis(&s));
         let _ = std::fs::remove_dir_all(&root);
     }
 

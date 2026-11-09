@@ -45,10 +45,12 @@
 //! (never a store's writer lock) and writes a file of its own. It waits
 //! for an analysis (running or queued) and for a running blend of a group
 //! it reads; a queued blend never holds it back (that blend waits for the
-//! export instead). A new analysis cancels the running export and drops
-//! queued ones, since it may recreate the stores they read, and starts
-//! once the cancelled export has ended. Input edits spare exports
-//! ([`JobRunner::cancel_all_but_exports`]).
+//! export instead). An analysis the user starts cancels the running export
+//! and drops queued ones, since it may recreate the stores they read, and
+//! starts once the cancelled export has ended. The automatic analysis
+//! never does: the pipeline ([`crate::pipeline::Pipeline`]) starts one only
+//! while no job runs on either lane, so it waits for the exports to end.
+//! Input edits spare exports ([`JobRunner::cancel_all_but_exports`]).
 //!
 //! A queued job starts once `poll` has applied (or discarded) its lane's
 //! predecessor's outcome; its worker joins that predecessor's thread
@@ -320,6 +322,7 @@ struct Lane {
     previous: Option<JoinHandle<()>>,
     #[cfg(test)]
     gate: Option<Arc<tests::Gate>>,
+    /// Set on the main lane only (`JobRunner::hold_progress`).
     #[cfg(test)]
     stepper: Option<Arc<tests::Stepper>>,
 }
@@ -439,7 +442,10 @@ impl JobRunner {
     /// replaces anything queued (newer work wins), except previews: the
     /// analysis waits for them. Exports too are cancelled (a running one;
     /// queued ones are dropped), and the analysis starts once the running
-    /// export has ended: it may recreate the stores exports read.
+    /// export has ended: it may recreate the stores exports read. That is
+    /// for an analysis the user asks for; the pipeline's automatic one
+    /// ([`crate::pipeline::Pipeline::poll`]) is started only while no job
+    /// runs, exports included, so it waits for them instead.
     ///
     /// The groups are resolved on a worker first ("Resolving groups…").
     /// Planning then happens on the UI thread: it marks and saves
@@ -1528,15 +1534,16 @@ pub(crate) mod tests {
             gate
         }
 
-        /// Hold every worker started from now on, on either lane, after
-        /// each progress update it sends (see [`Stepper`]).
+        /// Hold every main-lane worker (analysis, previews, merge) started
+        /// from now on after each progress update it sends (see
+        /// [`Stepper`]). Exports are not held: an export running beside a
+        /// stepped merge never takes the merge's steps.
         pub(crate) fn hold_progress(&mut self) -> std::sync::Arc<Stepper> {
             let stepper = std::sync::Arc::new(Stepper {
                 state: std::sync::Mutex::new((0, false, 0)),
                 cv: std::sync::Condvar::new(),
             });
             self.main.stepper = Some(stepper.clone());
-            self.exports.stepper = Some(stepper.clone());
             stepper
         }
 
@@ -1819,6 +1826,109 @@ pub(crate) mod tests {
         );
         assert_eq!(InputPanel::open(&hoo_out).unwrap().channels(), 3);
         assert!(r.exporting_groups().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_region_merge_waits_for_an_export_of_its_group() {
+        let (root, mut s, mut r) = analyzed("job-region-after-export");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        let gate = r.hold_exports();
+        let export = r.start_export(&s, group("Ha"), root.join("ha.fits"), ExportFormat::Fits);
+        let region = r.start_blend(&mut s, "Ha", Some([0, 0, 64, 64]));
+        poll_idle(&mut r, &mut s);
+        assert!(
+            waiting(&r, region),
+            "it would write the store the export reads"
+        );
+        assert!(
+            !r.merge_waits_for_export(),
+            "a region's merge is not the step's"
+        );
+        gate.open();
+        assert_eq!(
+            drain(&mut r, &mut s),
+            vec![
+                JobEvent::Finished {
+                    id: export,
+                    label: "Export Ha".into()
+                },
+                JobEvent::Finished {
+                    id: region,
+                    label: "Merge Ha".into()
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_export_waits_for_a_running_merge_of_its_groups() {
+        let (root, mut s, mut r) = analyzed("job-export-after-merge");
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        // A merge of Ha runs (held). Exports of Ha, and of a composite
+        // with Ha, wait for it: it rewrites (maybe recreates) Ha's store.
+        let gate = r.hold();
+        let old = r.start_blend(&mut s, "Ha", None);
+        let fits = ExportFormat::Fits;
+        let ha = r.start_export(&s, group("Ha"), root.join("ha.fits"), fits);
+        let composite = r.start_export(&s, hoo(), root.join("hoo.fits"), fits);
+        assert!(waiting(&r, ha) && waiting(&r, composite));
+        // A new merge of Ha cancels the running one and waits behind the
+        // exports, which do not wait for it in turn.
+        let new = r.start_blend(&mut s, "Ha", None);
+        let stages: Vec<(u64, String)> = r.views().into_iter().map(|v| (v.id, v.stage)).collect();
+        assert_eq!(
+            stages,
+            [
+                (old, CANCELLING.into()),
+                (new, WAITING.into()),
+                (ha, WAITING.into()),
+                (composite, WAITING.into()),
+            ]
+        );
+        gate.open();
+        assert_eq!(
+            drain(&mut r, &mut s),
+            vec![
+                JobEvent::Cancelled { id: old },
+                JobEvent::Finished {
+                    id: ha,
+                    label: "Export Ha".into()
+                },
+                JobEvent::Finished {
+                    id: composite,
+                    label: "Export HOO".into()
+                },
+                JobEvent::Finished {
+                    id: new,
+                    label: "Merge Ha".into()
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stepping_a_merge_leaves_exports_alone() {
+        let (root, mut s, mut r) = analyzed("job-step-merge-not-export");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        // The merge is held after each progress update; the export beside
+        // it is not, so it can never take the merge's steps.
+        let stepper = r.hold_progress();
+        let merge = r.start_blend(&mut s, "OIII", None);
+        let out = root.join("ha.fits");
+        let export = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits);
+        let events = poll_until(&mut r, &mut s, |_, e| finished(e, export) && stepper.held());
+        assert!(!finished(&events, merge));
+        assert!(out.is_file());
+        stepper.open();
+        let events = drain(&mut r, &mut s);
+        assert!(finished(&events, merge), "{events:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

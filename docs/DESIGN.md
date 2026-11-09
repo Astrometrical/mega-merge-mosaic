@@ -1443,9 +1443,11 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   the store an export reads (torn tiles would be exported as zeros) and may
   recreate it, which faults a live reader. For the same reason an export
   waits for a running merge of a group it reads (a queued one never holds
-  it back) and for an analysis; an analysis cancels the running export,
-  drops queued ones and starts once the cancelled export has ended. A
-  panel edit spares exports. Leaving the session stops both lanes (or hands
+  it back) and for an analysis. An analysis the user starts cancels the
+  running export, drops queued ones and starts once the cancelled export
+  has ended; the automatic analysis never cancels an export (the pipeline
+  starts one only while neither lane runs anything, so it waits for the
+  exports to end). A panel edit spares exports. Leaving the session stops both lanes (or hands
   both lanes' workers to the reaper, which keeps the lock until they end).
   A composite's export is one job ("Export {composite name}"); when it
   finishes it stamps `exported_at` for each of its groups.
