@@ -176,6 +176,43 @@ impl Shell {
         &mut self.window
     }
 
+    /// Self-test: start an export of the first group and one of the first
+    /// composition (if any) into `dir`, as FITS, the way the Export dialog
+    /// does. Returns the files they will write.
+    fn selftest_exports(&mut self, dir: &Path) -> Vec<PathBuf> {
+        let Some((session, jobs)) = self.session.as_ref().zip(self.jobs.as_mut()) else {
+            return Vec::new();
+        };
+        let fmt = mmm_core::export::ExportFormat::Fits;
+        let mut files = Vec::new();
+        if let Some(group) = group_names(session).into_iter().next() {
+            let out = dir.join(format!("group.{}", fmt.extension()));
+            jobs.start_export(
+                session,
+                crate::jobs::ExportTarget::Group(group),
+                out.clone(),
+                fmt,
+                false,
+            );
+            files.push(out);
+        }
+        if let Some(c) = load_compositions(&session.mosaic.config.ui)
+            .into_iter()
+            .next()
+        {
+            let out = dir.join(format!("composite.{}", fmt.extension()));
+            let [r, g, b] = c.channels;
+            let target = crate::jobs::ExportTarget::Composite {
+                id: c.id,
+                name: c.name,
+                channels: [r.map(|c| c.0), g.map(|c| c.0), b.map(|c| c.0)],
+            };
+            jobs.start_export(session, target, out.clone(), fmt, false);
+            files.push(out);
+        }
+        files
+    }
+
     /// The automatic pipeline (its previews feed the plan).
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
@@ -670,6 +707,9 @@ struct SelfTest {
     done: bool,
     /// Where the session part of the test is.
     phase: Phase,
+    /// The temporary folder the export phase writes into, and the files it
+    /// waits for.
+    exports: Option<(PathBuf, Vec<PathBuf>)>,
 }
 
 /// The self-test's walk through the session window's canvas.
@@ -685,7 +725,11 @@ enum Phase {
     /// Waiting for the plan of the first group to settle (after a
     /// composite's).
     PlanGroup,
-    /// Every view visited.
+    /// Every view visited: export a group and a composite.
+    StartExports,
+    /// Waiting for the exported files to appear.
+    Exporting,
+    /// Everything done.
     Done,
 }
 
@@ -768,6 +812,36 @@ impl SelfTest {
             // mosaic, which closes the list.
             shell.window_mut().set_mode(CanvasMode::Mosaic);
         }
+        match self.phase {
+            Phase::StartExports => {
+                let dir = std::env::temp_dir().join(format!("mmm-selftest-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                let files = match std::fs::create_dir_all(&dir) {
+                    Ok(()) => shell.selftest_exports(&dir),
+                    Err(e) => {
+                        tracing::error!("self-test: cannot create {}: {e}", dir.display());
+                        Vec::new()
+                    }
+                };
+                self.exports = Some((dir, files));
+                self.phase = Phase::Exporting;
+                return;
+            }
+            Phase::Exporting => {
+                if let Some((dir, files)) = &self.exports {
+                    // A file appears only when its export is complete (the
+                    // export writes `.part` and renames). The watchdog ends
+                    // a test whose export never finishes.
+                    if files.iter().all(|f| f.is_file()) {
+                        tracing::info!("self-test: exported {} files", files.len());
+                        let _ = std::fs::remove_dir_all(dir);
+                        self.phase = Phase::Done;
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
         let w = shell.window();
         match self.phase {
             Phase::Mosaic
@@ -800,14 +874,14 @@ impl SelfTest {
                         shell.window_mut().select_view(ViewKind::Group(g));
                         Phase::PlanGroup
                     }
-                    _ => Phase::Done,
+                    _ => Phase::StartExports,
                 };
             }
             Phase::PlanGroup
                 if matches!(w.plan().view(), Some(ViewKind::Group(_))) && w.plan().is_settled() =>
             {
                 log_plan(shell);
-                self.phase = Phase::Done;
+                self.phase = Phase::StartExports;
             }
             _ => {}
         }
@@ -986,6 +1060,7 @@ impl MmmApp {
             outcome,
             done: false,
             phase: Phase::Mosaic,
+            exports: None,
         });
         MmmApp {
             shell,
