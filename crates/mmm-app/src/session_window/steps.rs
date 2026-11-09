@@ -5,7 +5,7 @@
 //! | Step | State |
 //! |---|---|
 //! | Panels | none: "Add panels"; previews running: "Reading previews {done} / {n}" (cancellable); previews stopped short: "Read previews" (next); else "{n} panels" (done) |
-//! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
+//! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; an analysis queued behind an export asked for before it ([`JobRunner::analysis_waits_for_export`]): "Analysis queued after export" (cancellable, no fraction); analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
 //! | Merge | no whole-canvas merge running, and one queued waiting for an export of its group ([`JobRunner::merge_waits_for_export`]): "Merge queued after export" (cancellable, no fraction); whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, it needs analysis, or a region of it was merged with other settings): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
 //! | Export | exports running or queued: "Exporting {i} of {n}" ("Exporting" for one) (cancellable: Cancel cancels them all); some group ready to export and every such group exported since its last merge ([`exported`]): "Exported" (done); else "Export" |
 //!
@@ -188,6 +188,9 @@ fn checks_step(
     let cfg = &session.mosaic.config;
     if cfg.panels.is_empty() {
         return step("Checks", StepState::Todo);
+    }
+    if jobs.analysis_waits_for_export() {
+        return working("Analysis queued after export".into(), None);
     }
     if jobs.analyzing() {
         let analysis = jobs_where(views, is_analysis);

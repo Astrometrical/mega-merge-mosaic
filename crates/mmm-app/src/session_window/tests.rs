@@ -14,7 +14,7 @@ use mega_ui::widgets::{StepState, StripStep};
 use mmm_core::checks::{Check, CheckCode, Severity};
 use mmm_core::mosaic::{MosaicConfig, SINGLE_GROUP};
 
-use super::steps::{EXPORT_STEP, MERGE_STEP, draft_changed, out_of_date, steps};
+use super::steps::{CHECKS_STEP, EXPORT_STEP, MERGE_STEP, draft_changed, out_of_date, steps};
 use super::*;
 use crate::camera::Camera;
 use crate::checks::{ChecksEngine, ChecksReport};
@@ -3361,6 +3361,47 @@ fn a_merge_waits_behind_an_export() {
     let (export, merge) = (finished(export), finished(merge));
     assert!(finished(oiii).is_some(), "{events:?}");
     assert!(export.is_some() && merge > export, "{events:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_analysis_waits_behind_an_export() {
+    use crate::jobs::JobEvent;
+    let (root, mut s, mut jobs) = analyzed("steps-analysis-after-export");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    // An export of Ha runs (held); an analysis is asked for meanwhile.
+    let gate = jobs.hold_exports();
+    let out = root.join("ha.fits");
+    let ha = ExportTarget::Group("Ha".into());
+    let fits = mmm_core::export::ExportFormat::Fits;
+    let export = jobs.start_export(&s, ha, out.clone(), fits, false);
+    let analysis = jobs.start_analyze(&mut s);
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    let want = StripStep {
+        label: "Analysis queued after export".into(),
+        state: StepState::Working { fraction: None },
+        cancellable: true,
+        tooltip: None,
+    };
+    assert_eq!(got[CHECKS_STEP], want);
+    // Cancel from the step drops the queued analysis and spares the export.
+    super::top_bar::cancel_step(CHECKS_STEP, &mut jobs);
+    let events = jobs.poll(&mut s);
+    assert!(events.contains(&JobEvent::Cancelled { id: analysis }));
+    assert!(!events.contains(&JobEvent::Cancelled { id: export }));
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    assert_ne!(got[CHECKS_STEP].label, "Analysis queued after export");
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    assert!(
+        events.contains(&JobEvent::Finished {
+            id: export,
+            label: "Export Ha".into()
+        }),
+        "{events:?}"
+    );
+    assert!(out.is_file());
     let _ = std::fs::remove_dir_all(&root);
 }
 

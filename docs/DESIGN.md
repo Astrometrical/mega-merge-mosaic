@@ -1271,7 +1271,9 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   Panels opens or closes the panel list, Checks opens the Problems section,
   Merge merges every group while that is to do (merging or merged, it shows
   the mosaic), Export opens the Export dialog. Checks reads "Checks" until
-  there is something to say, "Analysing…" while analysis runs (cancellable),
+  there is something to say, "Analysis queued after export" while an
+  analysis waits for the exports asked for before it (cancellable, no
+  fraction), "Analysing…" while analysis runs (cancellable),
   "Checking…", "{n} problem(s)" or "Checks passed", and **Analyse** only when
   the analysis stalled after a cancel or failure
   (`Pipeline::analysis_stalled`; clicking it analyses, whichever step is
@@ -1444,11 +1446,17 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   the store an export reads (torn tiles would be exported as zeros) and may
   recreate it, which faults a live reader. For the same reason an export
   waits for a running merge of a group it reads (a queued one never holds
-  it back) and for an analysis. An analysis the user starts cancels the
-  running export, drops queued ones and starts once the cancelled export
-  has ended; the automatic analysis never cancels an export (the pipeline
-  starts one only while neither lane runs anything, so it waits for the
-  exports to end). A panel edit spares exports. Leaving the session stops both lanes (or hands
+  it back). **An analysis never cancels an export** (final-review ruling):
+  analyses and exports take turns in the order they were asked for. An
+  analysis, the user's (the Checks step's **Analyse**) or the pipeline's,
+  waits until every export asked for before it has ended, and the Checks
+  step says "Analysis queued after export" (Working, no fraction,
+  cancellable; `JobRunner::analysis_waits_for_export`); an export waits for
+  a running analysis or one asked for before it, never for one asked for
+  after it. Every wait between the two points to an older job (job ids
+  only grow) and running jobs never wait, so nothing waits forever: the
+  argument is in `jobs.rs`'s module docs. The pipeline still starts its
+  automatic analysis only while neither lane runs anything. A panel edit spares exports. Leaving the session stops both lanes (or hands
   both lanes' workers to the reaper, which keeps the lock until they end).
   A composite's export is one job ("Export {composite name}"); when it
   finishes it stamps `exported_at` for each of its groups.
@@ -1594,10 +1602,10 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   `ExportTarget`, started with `JobRunner::start_export`. What waits for
   what: a merge of a group being exported waits ("Merge queued after
   export"); merges of other groups run; an export waits for a running merge
-  of a group it reads and for an analysis. An **automatic** analysis (the
-  pipeline's, after a panel or settings edit) waits for the exports to end
-  rather than cancelling them, so what is being written never changes; only
-  an analysis the user starts cancels them. A finished export, group or
+  of a group it reads and for an analysis running or asked for before it.
+  Every analysis, automatic or the user's, waits for the exports asked for
+  before it rather than cancelling them ("Analysis queued after export"),
+  so what is being written never changes. A finished export, group or
   composite, stamps `exported_at` for each group it read (the summary is per
   group).
 - **The Export dialog** (`export_dialog.rs`, the session's one modal, opened

@@ -21,10 +21,11 @@
 //!
 //! **The main lane** runs analyses, previews and merges:
 //!
-//! - A new analysis cancels the running job and replaces everything
-//!   queued: it re-stales every group anyway. Panel previews are the
+//! - A new analysis cancels the lane's running job and replaces everything
+//!   queued on it: it re-stales every group anyway. Panel previews are the
 //!   exception: they hold no result store and feed the analysis's decode
-//!   cache, so the analysis queues behind them instead.
+//!   cache, so the analysis queues behind them instead. It never cancels an
+//!   export (below).
 //! - New previews cancel running previews and replace queued ones; they
 //!   queue behind any other job. Each preview is delivered as it finishes
 //!   ([`JobEvent::Preview`]).
@@ -43,14 +44,37 @@
 //! **The export lane** runs exports one at a time, in order. An export
 //! reads its groups' results through [`mmm_core::tiles::TileReader`]s
 //! (never a store's writer lock) and writes a file of its own. It waits
-//! for an analysis (running or queued) and for a running blend of a group
-//! it reads; a queued blend never holds it back (that blend waits for the
-//! export instead). An analysis the user starts cancels the running export
-//! and drops queued ones, since it may recreate the stores they read, and
-//! starts once the cancelled export has ended. The automatic analysis
-//! never does: the pipeline ([`crate::pipeline::Pipeline`]) starts one only
-//! while no job runs on either lane, so it waits for the exports to end.
-//! Input edits spare exports ([`JobRunner::cancel_all_but_exports`]).
+//! for a running blend of a group it reads; a queued blend never holds it
+//! back (that blend waits for the export instead).
+//!
+//! **Analyses and exports take turns in the order they were asked for**
+//! (job ids only grow). An analysis may recreate the stores exports read,
+//! so the two never overlap, and an analysis never cancels or drops an
+//! export, whoever started it: it waits on the main lane until every export
+//! asked for before it has ended ([`JobRunner::analysis_waits_for_export`]:
+//! the Checks step says "Analysis queued after export"), holding back what
+//! is queued behind it there. An export waits for a running analysis and for
+//! one asked for before it; one asked for after it never holds it back. The
+//! pipeline ([`crate::pipeline::Pipeline`]) starts its automatic analysis
+//! only while no job runs on either lane, so it never waits. Input edits
+//! spare exports ([`JobRunner::cancel_all_but_exports`]).
+//!
+//! **No job waits forever.** Every wait is for a job that is running, or for
+//! one asked for earlier:
+//!
+//! - a running job never waits, and ends (or is cancelled);
+//! - a blend of a group being exported waits for those exports, which never
+//!   wait for a queued blend; the jobs behind it on the main lane start
+//!   meanwhile, so it holds nothing back;
+//! - an export waits for a running blend, a running analysis, or an
+//!   analysis with a smaller id; an analysis waits for the exports with a
+//!   smaller id and for the main lane's running job; the jobs behind an
+//!   analysis wait for it.
+//!
+//! So between analyses and exports every wait points to a smaller id, and
+//! the oldest of the jobs waiting has only running jobs to wait for: it
+//! starts when they end. In particular an analysis queued behind exports
+//! never holds back an export asked for before it.
 //!
 //! A queued job starts once `poll` has applied (or discarded) its lane's
 //! predecessor's outcome; its worker joins that predecessor's thread
@@ -443,13 +467,15 @@ impl JobRunner {
     }
 
     /// Analyze every group; returns the job id. Cancels the running job and
-    /// replaces anything queued (newer work wins), except previews: the
-    /// analysis waits for them. Exports too are cancelled (a running one;
-    /// queued ones are dropped), and the analysis starts once the running
-    /// export has ended: it may recreate the stores exports read. That is
-    /// for an analysis the user asks for; the pipeline's automatic one
-    /// ([`crate::pipeline::Pipeline::poll`]) is started only while no job
-    /// runs, exports included, so it waits for them instead.
+    /// replaces anything queued on the main lane (newer work wins), except
+    /// previews: the analysis waits for them. Exports are never cancelled
+    /// nor dropped: the analysis may recreate the stores they read, so it
+    /// waits until every export asked for before it has ended (the Checks
+    /// step says "Analysis queued after export",
+    /// [`JobRunner::analysis_waits_for_export`]); an export asked for after
+    /// it waits for it in turn. The user's analysis and the pipeline's
+    /// automatic one ([`crate::pipeline::Pipeline::poll`], which starts one
+    /// only while no job runs) follow the same rule.
     ///
     /// The groups are resolved on a worker first ("Resolving groups…").
     /// Planning then happens on the UI thread: it marks and saves
@@ -470,11 +496,7 @@ impl JobRunner {
         if let Some(r) = self.main.running.as_ref().filter(|r| !r.previews) {
             r.token.cancel();
         }
-        if let Some(r) = &self.exports.running {
-            r.token.cancel();
-        }
-        let mut dropped = self.main.drop_queued(|k| matches!(k, Kind::Previews));
-        dropped.extend(self.exports.drop_queued(|_| false));
+        let dropped = self.main.drop_queued(|k| matches!(k, Kind::Previews));
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
         self.main.queue.push_back(Queued {
@@ -558,8 +580,9 @@ impl JobRunner {
 
     /// Export `target` (a group's blended result, or a composite's) to `out`
     /// as `format`; returns the job id. Runs on the export lane, after the
-    /// exports before it, and cancels nothing; it waits for an analysis and
-    /// for a running blend of a group it reads (see the module docs). Stale
+    /// exports before it, and cancels nothing; it waits for a running
+    /// analysis or one asked for before it, and for a running blend of a
+    /// group it reads (see the module docs). Stale
     /// tiles are exported as they are and missing ones as zeros: the Export
     /// dialog offers only targets ready to export
     /// ([`crate::export_dialog::readiness_of`]). Planning does no I/O.
@@ -709,6 +732,36 @@ impl JobRunner {
                 matches!(&q.kind, Kind::Blend { group, .. } if exporting.contains(group))
                     && self.whole_canvas(q.id)
             })
+    }
+
+    /// Whether an analysis is queued behind an export asked for before it
+    /// (running or queued): the Checks step then says "Analysis queued after
+    /// export" (cancellable, no fraction).
+    pub fn analysis_waits_for_export(&self) -> bool {
+        self.main
+            .queue
+            .iter()
+            .any(|q| matches!(q.kind, Kind::Analyze { .. }) && self.export_before(q.id))
+    }
+
+    /// Whether an export asked for before job `id` runs or is queued.
+    fn export_before(&self, id: u64) -> bool {
+        self.exports.ids().any(|e| e < id)
+    }
+
+    /// Whether an analysis runs, or one asked for before job `id` is queued.
+    fn analysis_before(&self, id: u64) -> bool {
+        let running = self
+            .main
+            .running
+            .as_ref()
+            .is_some_and(|r| r.blend.is_none() && !r.previews);
+        running
+            || self
+                .main
+                .queue
+                .iter()
+                .any(|q| matches!(q.kind, Kind::Analyze { .. }) && q.id < id)
     }
 
     /// Cancel every job, exports included, and wait up to `wait` for the
@@ -1060,9 +1113,8 @@ impl JobRunner {
     /// Start the main lane's queued jobs until one runs (or none can start
     /// yet); a job that cannot be planned fails at once. A blend of a group
     /// being exported is passed over: it stays queued while the jobs after
-    /// it start. An analysis waits for a running export (cancelled when the
-    /// analysis was asked for) to end, and holds back what is queued after
-    /// it.
+    /// it start. An analysis waits for the exports asked for before it
+    /// (running or queued) to end, and holds back what is queued after it.
     fn start_main(&mut self, session: &OpenSession) {
         while self.main.running.is_none() {
             let exporting = self.exporting_groups();
@@ -1070,7 +1122,7 @@ impl JobRunner {
             for (i, q) in self.main.queue.iter().enumerate() {
                 match &q.kind {
                     Kind::Blend { group, .. } if exporting.contains(group) => {}
-                    Kind::Analyze { .. } if self.exports.running.is_some() => break,
+                    Kind::Analyze { .. } if self.export_before(q.id) => break,
                     _ => {
                         next = Some(i);
                         break;
@@ -1085,9 +1137,10 @@ impl JobRunner {
     }
 
     /// Start the export lane's next export, in order, unless it must wait:
-    /// for an analysis, running or queued (it may recreate the stores), or
-    /// for a running blend of a group it reads (it rewrites that store, and
-    /// may recreate it).
+    /// for a running analysis or one queued before it (it may recreate the
+    /// stores; one queued after it waits for it instead), or for a running
+    /// blend of a group it reads (it rewrites that store, and may recreate
+    /// it).
     fn start_exports(&mut self, session: &OpenSession) {
         while self.exports.running.is_none() {
             let Some(q) = self.exports.queue.front() else {
@@ -1097,7 +1150,7 @@ impl JobRunner {
                 .target(q.id)
                 .map(|(_, t)| t.groups())
                 .unwrap_or_default();
-            if self.analyzing() || reads.iter().any(|g| self.merging(g)) {
+            if self.analysis_before(q.id) || reads.iter().any(|g| self.merging(g)) {
                 return;
             }
             let q = self.exports.queue.pop_front().expect("a queued export");
@@ -1982,55 +2035,90 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn analysis_cancels_exports_on_their_lane() {
+    fn a_user_analysis_waits_for_exports() {
         let (root, mut s, mut r) = analyzed("job-analysis-exports");
         r.start_blend(&mut s, "Ha", None);
         r.start_blend(&mut s, "OIII", None);
         drain(&mut r, &mut s);
         // One export runs (held on its lane), another waits behind it.
         let gate = r.hold_exports();
-        let ha_out = root.join("ha.fits");
-        let running = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits, false);
-        let queued = r.start_export(
-            &s,
-            group("OIII"),
-            root.join("o.fits"),
-            ExportFormat::Fits,
-            false,
-        );
+        let fits = ExportFormat::Fits;
+        let (ha_out, oiii_out) = (root.join("ha.fits"), root.join("o.fits"));
+        let running = r.start_export(&s, group("Ha"), ha_out.clone(), fits, false);
+        let queued = r.start_export(&s, group("OIII"), oiii_out.clone(), fits, false);
         assert!(waiting(&r, queued), "one export at a time");
-        // An analysis drops the queued export at once and cancels the
-        // running one, then waits for it to end: it may recreate the store
-        // the export reads.
+        assert!(!r.analysis_waits_for_export());
+        // An analysis asked for by the user cancels neither: it waits for
+        // both (it may recreate the stores they read).
         let analyze = r.start_analyze(&mut s);
         let stages: Vec<(u64, String)> = r.views().into_iter().map(|v| (v.id, v.stage)).collect();
         assert_eq!(
             stages,
-            [(running, CANCELLING.into()), (analyze, WAITING.into())]
+            [
+                (running, "Starting…".into()),
+                (analyze, WAITING.into()),
+                (queued, WAITING.into()),
+            ]
         );
-        let mut events = r.poll(&mut s);
-        assert_eq!(events, vec![JobEvent::Cancelled { id: queued }]);
+        assert!(r.analysis_waits_for_export());
+        assert!(r.analyzing(), "it is queued");
         poll_idle(&mut r, &mut s);
-        assert!(waiting(&r, analyze), "not before the export has ended");
+        assert!(waiting(&r, analyze), "not before the exports have ended");
+        // The export queued before the analysis is not held back by it.
         gate.open();
-        events.extend(drain(&mut r, &mut s));
+        let events = drain(&mut r, &mut s);
         assert_eq!(
             events,
             vec![
-                JobEvent::Cancelled { id: queued },
-                JobEvent::Cancelled { id: running },
+                JobEvent::Finished {
+                    id: running,
+                    label: "Export Ha".into()
+                },
+                JobEvent::Finished {
+                    id: queued,
+                    label: "Export OIII".into()
+                },
                 JobEvent::Finished {
                     id: analyze,
                     label: ANALYZE_LABEL.into()
                 },
             ]
         );
-        assert!(!ha_out.exists());
+        assert!(ha_out.is_file() && oiii_out.is_file());
+        assert!(!r.analysis_waits_for_export());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exports_and_analyses_take_turns_in_the_order_asked() {
+        let (root, mut s, mut r) = analyzed("job-analysis-turns");
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        let fits = ExportFormat::Fits;
+        // An export runs (held); an analysis waits for it, and an export
+        // asked for after the analysis waits for the analysis.
+        let gate = r.hold_exports();
+        let first = r.start_export(&s, group("Ha"), root.join("1.fits"), fits, false);
+        let analyze = r.start_analyze(&mut s);
+        let after = r.start_export(&s, group("OIII"), root.join("2.fits"), fits, false);
+        assert!(waiting(&r, analyze) && waiting(&r, after));
+        gate.open();
+        let events = drain(&mut r, &mut s);
+        let ended: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::Finished { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, [first, analyze, after], "{events:?}");
         // An export started while an analysis runs waits for it.
         let gate = r.hold();
         let analyze = r.start_analyze(&mut s);
-        let export = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits, false);
+        let export = r.start_export(&s, group("Ha"), root.join("3.fits"), fits, false);
         assert!(!waiting(&r, analyze) && waiting(&r, export));
+        assert!(!r.analysis_waits_for_export(), "the analysis runs");
         gate.open();
         let events = drain(&mut r, &mut s);
         assert_eq!(

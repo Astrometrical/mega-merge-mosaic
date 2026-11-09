@@ -286,9 +286,9 @@ impl Pipeline {
             });
             return;
         }
-        // Only with nothing running, exports included: starting an analysis
-        // cancels them (it may recreate the stores they read), so the
-        // automatic one waits for them to end.
+        // Only with nothing running, exports included: an analysis waits for
+        // the exports asked for before it (it may recreate the stores they
+        // read), and the automatic one is not even queued until they end.
         if !jobs.busy() && wants_analysis(session) && !self.analysis_stalled(session) {
             let id = jobs.start_analyze_scoped(session, analysis_scope(session));
             self.job = Some(Job {
@@ -728,7 +728,7 @@ mod tests {
         assert!(matches!(drop_last(&s).apply(&mut s, &mut r), Applied::Done));
         assert!(wants_analysis(&s));
         // After the debounce the previews are read again beside the
-        // export, but no analysis starts: it would cancel the export.
+        // export, but no analysis starts (nor queues) until the export ends.
         p.poll(&ctx, t, &mut s, &mut r, &[], false);
         let t = t + DEBOUNCE + Duration::from_millis(100);
         let mut seen = Seen::default();
