@@ -3300,7 +3300,7 @@ fn a_one_group_merge_names_no_group() {
     let gate = jobs.hold();
     let out = root.join("one.fits");
     let target = ExportTarget::Group(SINGLE_GROUP.into());
-    let id = jobs.start_export(&s, target, out, mmm_core::export::ExportFormat::Fits);
+    let id = jobs.start_export(&s, target, out, mmm_core::export::ExportFormat::Fits, false);
     assert_eq!(jobs.label(id), Some("Export"));
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     assert_eq!(got[3].label, "Exporting");
@@ -3326,7 +3326,7 @@ fn a_merge_waits_behind_an_export() {
     let gate = jobs.hold_exports();
     let out = root.join("ha.fits");
     let ha = ExportTarget::Group("Ha".into());
-    let export = jobs.start_export(&s, ha, out, mmm_core::export::ExportFormat::Fits);
+    let export = jobs.start_export(&s, ha, out, mmm_core::export::ExportFormat::Fits, false);
     let merge = jobs.start_blend(&mut s, "Ha", None);
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     let want = StripStep {
@@ -3404,13 +3404,13 @@ fn the_export_step_says_exported() {
     let gate = jobs.hold();
     let fits = mmm_core::export::ExportFormat::Fits;
     let ha = ExportTarget::Group("Ha".into());
-    let first = jobs.start_export(&s, ha, root.join("ha.fits"), fits);
+    let first = jobs.start_export(&s, ha, root.join("ha.fits"), fits, false);
     let hoo = ExportTarget::Composite {
         id: 1,
         name: "HOO".into(),
         channels: [Some("Ha".into()), Some("OIII".into()), Some("OIII".into())],
     };
-    let second = jobs.start_export(&s, hoo, root.join("hoo.fits"), fits);
+    let second = jobs.start_export(&s, hoo, root.join("hoo.fits"), fits, false);
     let got = export(&s, &jobs);
     assert_eq!(
         (got.label.as_str(), got.cancellable),

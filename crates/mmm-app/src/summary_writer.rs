@@ -807,7 +807,7 @@ mod tests {
         assert_eq!(s.stamps.get("Ha"), Some(&stamp(Some(100), None)));
         // A group's export stamps its group.
         let ha = ExportTarget::Group("Ha".into());
-        jobs.start_export(&s, ha, root.join("ha.fits"), ExportFormat::Fits);
+        jobs.start_export(&s, ha, root.join("ha.fits"), ExportFormat::Fits, false);
         let events = drain(&mut jobs, &mut s);
         note(&mut w, &mut s, &jobs, &events, 150);
         assert_eq!(s.stamps.get("Ha"), Some(&stamp(Some(100), Some(150))));
@@ -818,7 +818,7 @@ mod tests {
             name: "HOO".into(),
             channels: [Some("Ha".into()), Some("OIII".into()), Some("OIII".into())],
         };
-        jobs.start_export(&s, hoo, root.join("hoo.fits"), ExportFormat::Fits);
+        jobs.start_export(&s, hoo, root.join("hoo.fits"), ExportFormat::Fits, false);
         let events = drain(&mut jobs, &mut s);
         assert!(
             events

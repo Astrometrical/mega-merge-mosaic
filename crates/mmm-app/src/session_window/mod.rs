@@ -921,6 +921,17 @@ impl SessionWindow {
         if self.export.ui(&ctx, session, jobs) {
             self.save.touch();
         }
+        if let Some(why) = self.export.take_problem() {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Problem,
+                    title: why,
+                    detail: None,
+                    action: None,
+                },
+                undo: None,
+            });
+        }
         let mut out = SessionOutput::default();
         let margin = egui::Margin::symmetric(space::M as i8, space::S as i8);
         let _top = egui::Panel::top("session-top-bar")

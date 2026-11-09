@@ -65,7 +65,8 @@ use std::time::{Duration, Instant};
 
 use mega_ui::jobs::JobView;
 use mmm_core::export::{
-    CompositeChannels, ExportFormat, ExportReport, export_composite, export_group,
+    CompositeChannels, ExportFormat, ExportReport, OnExisting, export_composite_with,
+    export_group_with,
 };
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
@@ -217,6 +218,8 @@ struct ExportJob {
     target: ExportTarget,
     out: std::path::PathBuf,
     format: ExportFormat,
+    /// An existing `out` may be replaced (else the export refuses to).
+    replace: bool,
 }
 
 /// A job waiting for its lane's running one to end.
@@ -391,6 +394,9 @@ pub struct JobRunner {
     /// Blend and export jobs' kind and what they work on, by id (see
     /// [`JobRunner::target`]).
     targets: BTreeMap<u64, (JobTarget, ExportTarget)>,
+    /// Export jobs' destinations, by id, while they run or wait (pruned by
+    /// [`JobRunner::poll`]).
+    outs: BTreeMap<u64, std::path::PathBuf>,
     /// The blends of the whole canvas (not of an ROI), by id.
     whole: BTreeSet<u64>,
     /// Whole-canvas blends and exports that ended (ran to an end, whatever
@@ -423,6 +429,7 @@ impl JobRunner {
             exports: Lane::default(),
             labels: BTreeMap::new(),
             targets: BTreeMap::new(),
+            outs: BTreeMap::new(),
             whole: BTreeSet::new(),
             blends_ended: 0,
             exports_ended: 0,
@@ -558,12 +565,19 @@ impl JobRunner {
     /// ([`crate::export_dialog::readiness_of`]). Planning does no I/O.
     /// Labelled "Export {group}" ("Export" alone in a session of one
     /// group), or "Export {composite name}".
+    ///
+    /// `replace`: an existing `out` is replaced (the user confirmed it);
+    /// otherwise the export fails, leaving it as it is, if `out` exists when
+    /// it starts or by the time the new file is complete
+    /// ([`OnExisting::Keep`]: "{file} appeared meanwhile and was not
+    /// replaced").
     pub fn start_export(
         &mut self,
         session: &OpenSession,
         target: ExportTarget,
         out: std::path::PathBuf,
         format: ExportFormat,
+        replace: bool,
     ) -> u64 {
         let label = match &target {
             ExportTarget::Group(group) => job_label("Export", group, session),
@@ -571,16 +585,28 @@ impl JobRunner {
         };
         let id = self.new_id(label);
         self.begin(JobTarget::Export, id, target.clone());
+        self.outs.insert(id, out.clone());
         self.exports.queue.push_back(Queued {
             id,
             kind: Kind::Export(ExportJob {
                 target,
                 out,
                 format,
+                replace,
             }),
         });
         self.start_next(session);
         id
+    }
+
+    /// Where the exports running or queued write, in order (the running
+    /// one first). Another export there would replace a file that is not
+    /// there yet.
+    pub fn export_destinations(&self) -> Vec<std::path::PathBuf> {
+        self.exports
+            .ids()
+            .filter_map(|id| self.outs.get(&id).cloned())
+            .collect()
     }
 
     /// The groups the exports running or queued read: each group exported,
@@ -786,6 +812,8 @@ impl JobRunner {
             self.take_from(lane, session, &mut events);
         }
         self.start_next(session);
+        let live: BTreeSet<u64> = self.exports.ids().collect();
+        self.outs.retain(|id, _| live.contains(id));
         events.append(&mut self.pending);
         for e in &events {
             match e {
@@ -1193,16 +1221,26 @@ impl JobRunner {
                             };
                             Done::Previews(run_previews(plan, &ctl, &on_ready))
                         }
-                        Planned::Export { dir, job } => Done::Export(match &job.target {
-                            ExportTarget::Group(group) => {
-                                export_group(dir, group, &job.out, job.format, &ctl)
-                            }
-                            ExportTarget::Composite { name, channels, .. } => {
-                                let [r, g, b] = channels.each_ref().map(Option::as_deref);
-                                let channels = CompositeChannels { name, r, g, b };
-                                export_composite(dir, &channels, &job.out, job.format, &ctl)
-                            }
-                        }),
+                        Planned::Export { dir, job } => {
+                            let existing = if job.replace {
+                                OnExisting::Replace
+                            } else {
+                                OnExisting::Keep
+                            };
+                            let (out, format) = (&job.out, job.format);
+                            Done::Export(match &job.target {
+                                ExportTarget::Group(group) => {
+                                    export_group_with(dir, group, out, format, existing, &ctl)
+                                }
+                                ExportTarget::Composite { name, channels, .. } => {
+                                    let [r, g, b] = channels.each_ref().map(Option::as_deref);
+                                    let channels = CompositeChannels { name, r, g, b };
+                                    export_composite_with(
+                                        dir, &channels, out, format, existing, &ctl,
+                                    )
+                                }
+                            })
+                        }
                     }
                 };
                 // Everything the job held (store locks included) is
@@ -1684,7 +1722,13 @@ pub(crate) mod tests {
         drain(&mut r, &mut s);
         let gate = r.hold();
         let oiii = r.start_blend(&mut s, "OIII", None);
-        let export = r.start_export(&s, group("Ha"), root.join("h.fits"), ExportFormat::Fits);
+        let export = r.start_export(
+            &s,
+            group("Ha"),
+            root.join("h.fits"),
+            ExportFormat::Fits,
+            false,
+        );
         // The running jobs get going while `stop_all` waits for them.
         let opener = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
@@ -1718,8 +1762,8 @@ pub(crate) mod tests {
         let (root, mut s, mut r) = analyzed("job-target");
         let blend = r.start_blend(&mut s, "Ha", None);
         let out = root.join("o.fits");
-        let export = r.start_export(&s, group("OIII"), out, ExportFormat::Fits);
-        let composite = r.start_export(&s, hoo(), root.join("c.fits"), ExportFormat::Fits);
+        let export = r.start_export(&s, group("OIII"), out, ExportFormat::Fits, false);
+        let composite = r.start_export(&s, hoo(), root.join("c.fits"), ExportFormat::Fits, false);
         // A composite named like a group is told apart from it.
         let named_oiii = ExportTarget::Composite {
             id: 8,
@@ -1731,6 +1775,7 @@ pub(crate) mod tests {
             named_oiii.clone(),
             root.join("l.fits"),
             ExportFormat::Fits,
+            false,
         );
         assert_eq!(r.target(blend), Some((JobTarget::Blend, &group("Ha"))));
         assert_eq!(r.target(export), Some((JobTarget::Export, &group("OIII"))));
@@ -1756,7 +1801,7 @@ pub(crate) mod tests {
         // An export of Ha runs, held on its lane.
         let gate = r.hold_exports();
         let ha_out = root.join("ha.fits");
-        let export = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits);
+        let export = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits, false);
         assert!(!waiting(&r, export), "running");
         assert_eq!(r.exporting_groups(), groups(&["Ha"]));
         // A merge of OIII runs beside it, to its end.
@@ -1797,7 +1842,7 @@ pub(crate) mod tests {
         // A composite's export holds back a merge of any of its members.
         let gate = r.hold_exports();
         let hoo_out = root.join("hoo.fits");
-        let export = r.start_export(&s, hoo(), hoo_out.clone(), ExportFormat::Fits);
+        let export = r.start_export(&s, hoo(), hoo_out.clone(), ExportFormat::Fits, false);
         assert_eq!(r.exporting_groups(), groups(&["Ha", "OIII"]));
         let ha = r.start_blend(&mut s, "Ha", None);
         let oiii = r.start_blend(&mut s, "OIII", None);
@@ -1833,7 +1878,13 @@ pub(crate) mod tests {
         r.start_blend(&mut s, "Ha", None);
         drain(&mut r, &mut s);
         let gate = r.hold_exports();
-        let export = r.start_export(&s, group("Ha"), root.join("ha.fits"), ExportFormat::Fits);
+        let export = r.start_export(
+            &s,
+            group("Ha"),
+            root.join("ha.fits"),
+            ExportFormat::Fits,
+            false,
+        );
         let region = r.start_blend(&mut s, "Ha", Some([0, 0, 64, 64]));
         poll_idle(&mut r, &mut s);
         assert!(
@@ -1872,8 +1923,8 @@ pub(crate) mod tests {
         let gate = r.hold();
         let old = r.start_blend(&mut s, "Ha", None);
         let fits = ExportFormat::Fits;
-        let ha = r.start_export(&s, group("Ha"), root.join("ha.fits"), fits);
-        let composite = r.start_export(&s, hoo(), root.join("hoo.fits"), fits);
+        let ha = r.start_export(&s, group("Ha"), root.join("ha.fits"), fits, false);
+        let composite = r.start_export(&s, hoo(), root.join("hoo.fits"), fits, false);
         assert!(waiting(&r, ha) && waiting(&r, composite));
         // A new merge of Ha cancels the running one and waits behind the
         // exports, which do not wait for it in turn.
@@ -1920,7 +1971,7 @@ pub(crate) mod tests {
         let stepper = r.hold_progress();
         let merge = r.start_blend(&mut s, "OIII", None);
         let out = root.join("ha.fits");
-        let export = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits);
+        let export = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits, false);
         let events = poll_until(&mut r, &mut s, |_, e| finished(e, export) && stepper.held());
         assert!(!finished(&events, merge));
         assert!(out.is_file());
@@ -1939,8 +1990,14 @@ pub(crate) mod tests {
         // One export runs (held on its lane), another waits behind it.
         let gate = r.hold_exports();
         let ha_out = root.join("ha.fits");
-        let running = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits);
-        let queued = r.start_export(&s, group("OIII"), root.join("o.fits"), ExportFormat::Fits);
+        let running = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits, false);
+        let queued = r.start_export(
+            &s,
+            group("OIII"),
+            root.join("o.fits"),
+            ExportFormat::Fits,
+            false,
+        );
         assert!(waiting(&r, queued), "one export at a time");
         // An analysis drops the queued export at once and cancels the
         // running one, then waits for it to end: it may recreate the store
@@ -1972,7 +2029,7 @@ pub(crate) mod tests {
         // An export started while an analysis runs waits for it.
         let gate = r.hold();
         let analyze = r.start_analyze(&mut s);
-        let export = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits);
+        let export = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits, false);
         assert!(!waiting(&r, analyze) && waiting(&r, export));
         gate.open();
         let events = drain(&mut r, &mut s);
@@ -2001,7 +2058,7 @@ pub(crate) mod tests {
         // A merge and an export run side by side, both held.
         let gate = r.hold();
         let merge = r.start_blend(&mut s, "OIII", None);
-        let export = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits);
+        let export = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits, false);
         assert!(!waiting(&r, merge) && !waiting(&r, export), "both run");
         // Leaving cancels both and waits for both.
         let opener = gate.clone();
@@ -2016,7 +2073,7 @@ pub(crate) mod tests {
         // handed over, to be joined before the session's lock goes.
         let gate = r.hold();
         r.start_blend(&mut s, "OIII", None);
-        r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits);
+        r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits, false);
         let (_, stopped) = r.stop_all(&mut s, Duration::from_millis(20));
         assert!(!stopped);
         let workers = r.detach_workers();
@@ -2591,5 +2648,40 @@ pub(crate) mod tests {
             analysis_event(4, "Analyse".into(), moved(), Ok(()), false),
             JobEvent::Failed { id: 4, .. }
         ));
+    }
+
+    #[test]
+    fn an_export_replaces_only_what_it_was_told_to() {
+        let (root, mut s, mut r) = analyzed("job-export-keep");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        let out = root.join("ha.fits");
+        std::fs::write(&out, b"keep").unwrap();
+        // Not told to replace: it fails, saying so, and the file stays.
+        let id = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits, false);
+        let events = drain(&mut r, &mut s);
+        assert_eq!(
+            events,
+            [JobEvent::Failed {
+                id,
+                message: "Export Ha: ha.fits appeared meanwhile and was not replaced".into(),
+            }]
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep");
+        // Told to: replaced.
+        let id = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits, true);
+        assert!(finished(&drain(&mut r, &mut s), id));
+        assert_ne!(std::fs::read(&out).unwrap(), b"keep");
+        // The destinations of the exports running or queued.
+        let gate = r.hold_exports();
+        let a = root.join("a.fits");
+        let b = root.join("b.fits");
+        r.start_export(&s, group("Ha"), a.clone(), ExportFormat::Fits, false);
+        r.start_export(&s, hoo(), b.clone(), ExportFormat::Fits, false);
+        assert_eq!(r.export_destinations(), [a, b]);
+        gate.open();
+        let _ = drain(&mut r, &mut s);
+        assert!(r.export_destinations().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

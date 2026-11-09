@@ -1950,7 +1950,7 @@ mod tests {
             let shell = h.state_mut();
             let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
             let ha = crate::jobs::ExportTarget::Group("Ha".into());
-            jobs.start_export(session, ha, root.join("Ha.fits"), ExportFormat::Fits);
+            jobs.start_export(session, ha, root.join("Ha.fits"), ExportFormat::Fits, false);
         }
         h.run_steps(3);
         let back = |h: &Harness<'static, Shell>| {

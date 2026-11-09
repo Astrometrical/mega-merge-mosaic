@@ -34,6 +34,8 @@
 //! Output is written to `<name>.part` beside the destination and renamed
 //! over it only when complete: a failed or cancelled export removes its
 //! partial and scratch files and leaves an existing destination untouched.
+//! [`export_group_with`] and [`export_composite_with`] can instead refuse
+//! to replace an existing destination at all ([`OnExisting::Keep`]).
 //! Cancellation is checked once per tile row. While the TIFF writer runs it
 //! cannot be stopped; a cancel then makes the rest of the image read as
 //! zeros, so the writer finishes at disk speed and the file is discarded.
@@ -91,6 +93,24 @@ impl ExportFormat {
             ExportFormat::Tiff => "TIFF",
         }
     }
+}
+
+/// What an export does when its destination exists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnExisting {
+    /// Replace it once the new file is complete (what `mmm export` does).
+    #[default]
+    Replace,
+    /// Never replace it: the export fails, leaving it as it is, if the
+    /// destination exists when the export starts or by the time the new
+    /// file is complete. For a caller that looked at the destination before
+    /// (and found none, or did not have it confirmed): one there now
+    /// appeared meanwhile. The new file is put in place with a hard link,
+    /// which never replaces; on a file system without hard links (FAT,
+    /// some network shares) the destination is looked for once more just
+    /// before an ordinary rename, so a file appearing in that instant
+    /// would still be replaced.
+    Keep,
 }
 
 /// What an export found (or, from [`export_check`], would find) in the
@@ -183,12 +203,26 @@ pub fn export_check(result: &Path) -> Result<ExportReport> {
 /// Fails, writing nothing, for a group never analysed or never blended,
 /// or whose result no longer matches its analysed canvas (blend again).
 /// [`Error::Cancelled`] when `ctl` is cancelled; progress is reported as
-/// [`EXPORT_STAGE`].
+/// [`EXPORT_STAGE`]. An existing destination is replaced
+/// ([`export_group_with`] can refuse to).
 pub fn export_group(
     session: &Path,
     group: &str,
     out: &Path,
     format: ExportFormat,
+    ctl: &JobCtl,
+) -> Result<ExportReport> {
+    export_group_with(session, group, out, format, OnExisting::Replace, ctl)
+}
+
+/// [`export_group`], doing `on_existing` with an existing destination
+/// ([`OnExisting::Keep`]: fail, leaving it as it is).
+pub fn export_group_with(
+    session: &Path,
+    group: &str,
+    out: &Path,
+    format: ExportFormat,
+    on_existing: OnExisting,
     ctl: &JobCtl,
 ) -> Result<ExportReport> {
     let m = Mosaic::open(session)?;
@@ -225,7 +259,8 @@ pub fn export_group(
         .map(|c| Plane::Channel(0, c))
         .collect();
     let tiles = TileRows::new(vec![&reader], planes);
-    run_export(out, format, tiles, &group_session, &history, ctl)
+    let to = Destination { out, on_existing };
+    run_export(&to, format, tiles, &group_session, &history, ctl)
 }
 
 /// The three channels of a composite to export: each is the name of a
@@ -255,12 +290,26 @@ pub struct CompositeChannels<'a> {
 /// Fails, writing nothing, for a composite that maps no group, a group
 /// never analysed or merged, a result no longer matching its analysed
 /// canvas, or groups of different canvases. [`Error::Cancelled`] when `ctl`
-/// is cancelled; progress is reported as [`EXPORT_STAGE`].
+/// is cancelled; progress is reported as [`EXPORT_STAGE`]. An existing
+/// destination is replaced ([`export_composite_with`] can refuse to).
 pub fn export_composite(
     session: &Path,
     channels: &CompositeChannels,
     out: &Path,
     format: ExportFormat,
+    ctl: &JobCtl,
+) -> Result<ExportReport> {
+    export_composite_with(session, channels, out, format, OnExisting::Replace, ctl)
+}
+
+/// [`export_composite`], doing `on_existing` with an existing destination
+/// ([`OnExisting::Keep`]: fail, leaving it as it is).
+pub fn export_composite_with(
+    session: &Path,
+    channels: &CompositeChannels,
+    out: &Path,
+    format: ExportFormat,
+    on_existing: OnExisting,
     ctl: &JobCtl,
 ) -> Result<ExportReport> {
     let m = Mosaic::open(session)?;
@@ -337,19 +386,65 @@ pub fn export_composite(
         members.iter().map(|g| blend_lines(&m, g, true)).collect(),
     );
     let tiles = TileRows::new(readers.iter().collect(), planes);
-    run_export(out, format, tiles, &sessions[0], &history, ctl)
+    let to = Destination { out, on_existing };
+    run_export(&to, format, tiles, &sessions[0], &history, ctl)
 }
 
-/// Write the planes of `tiles` to `out` through `<out>.part` (see the
-/// module docs); the WCS and pass-through cards come from `wcs_session`.
+/// Where an export goes, and what it does with a file already there.
+struct Destination<'a> {
+    out: &'a Path,
+    on_existing: OnExisting,
+}
+
+impl Destination<'_> {
+    /// [`OnExisting::Keep`]'s refusal: `out` is there.
+    fn appeared(&self) -> Error {
+        let name = self.out.file_name().unwrap_or(self.out.as_os_str());
+        Error::compute(format!(
+            "{} appeared meanwhile and was not replaced",
+            name.to_string_lossy()
+        ))
+    }
+
+    /// Something (a file, a folder, a link) is at `out`.
+    fn taken(&self) -> bool {
+        self.out.symlink_metadata().is_ok()
+    }
+
+    /// Put the complete `part` in place at `out` (see [`OnExisting`]).
+    fn put(&self, part: &Path) -> Result<()> {
+        let out = self.out;
+        if self.on_existing == OnExisting::Replace {
+            return std::fs::rename(part, out).map_err(|e| Error::io(out, e));
+        }
+        match std::fs::hard_link(part, out) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(part);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(self.appeared()),
+            // No hard links here: look once more, then rename.
+            Err(_) if self.taken() => Err(self.appeared()),
+            Err(_) => std::fs::rename(part, out).map_err(|e| Error::io(out, e)),
+        }
+    }
+}
+
+/// Write the planes of `tiles` to `to` through `<out>.part` (see the
+/// module docs and [`OnExisting`]); the WCS and pass-through cards come
+/// from `wcs_session`.
 fn run_export(
-    out: &Path,
+    to: &Destination,
     format: ExportFormat,
     tiles: TileRows,
     wcs_session: &Session,
     history: &[String],
     ctl: &JobCtl,
 ) -> Result<ExportReport> {
+    let out = to.out;
+    if to.on_existing == OnExisting::Keep && to.taken() {
+        return Err(to.appeared());
+    }
     let g = tiles.g;
     let part = sibling(out, "part");
     let written = match format {
@@ -381,9 +476,8 @@ fn run_export(
             return Err(e);
         }
     };
-    std::fs::rename(&part, out).map_err(|e| {
+    to.put(&part).inspect_err(|_| {
         let _ = std::fs::remove_file(&part);
-        Error::io(out, e)
     })?;
     Ok(report)
 }

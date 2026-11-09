@@ -8,7 +8,8 @@ use mmm_core::Error;
 use mmm_core::Result;
 use mmm_core::blend::{BlendParams, Extent, RowSink, blend};
 use mmm_core::export::{
-    CompositeChannels, ExportFormat, ExportReport, export_check, export_composite, export_group,
+    CompositeChannels, ExportFormat, ExportReport, OnExisting, export_check, export_composite,
+    export_composite_with, export_group, export_group_with,
 };
 use mmm_core::formats::InputPanel;
 use mmm_core::formats::fits::FitsPanel;
@@ -727,4 +728,118 @@ fn composite_tiff_export_is_three_channel() {
         .filter(|n| n.starts_with("hoo"))
         .collect();
     assert_eq!(names, ["hoo.tif"]);
+}
+
+/// The files in `dir` whose names start with `prefix`, sorted.
+fn files_starting(dir: &Path, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(prefix))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn export_never_replaces_unless_asked() {
+    let tmp = TempDir::new("keep");
+    let mut m = analysed_mosaic(&tmp.0);
+    blend_group(&mut m, SINGLE_GROUP, None, &JobCtl::none()).unwrap();
+    let keep = OnExisting::Keep;
+    // There when the export starts: refused before anything is written.
+    let out = tmp.0.join("k.fits");
+    std::fs::write(&out, b"old").unwrap();
+    let err = export_group_with(
+        &m.dir,
+        SINGLE_GROUP,
+        &out,
+        ExportFormat::Fits,
+        keep,
+        &JobCtl::none(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "k.fits appeared meanwhile and was not replaced"
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), b"old");
+    assert_eq!(files_starting(&tmp.0, "k."), ["k.fits"]);
+    // Appearing while the export runs (once the file is complete, before
+    // it is put in place): refused, and the newcomer kept.
+    for (format, name) in [
+        (ExportFormat::Fits, "late.fits"),
+        (ExportFormat::Tiff, "late.tif"),
+    ] {
+        let out = tmp.0.join(name);
+        let appear = out.clone();
+        let observer = move |_: &str, done: u64, total: u64| {
+            if done == total && !appear.exists() {
+                std::fs::write(&appear, b"new").unwrap();
+            }
+        };
+        let ctl = JobCtl::new(CancelToken::new(), Some(&observer));
+        let err = export_group_with(&m.dir, SINGLE_GROUP, &out, format, keep, &ctl).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("{name} appeared meanwhile and was not replaced"),
+            "{format:?}"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"new", "{format:?}");
+        assert_eq!(files_starting(&tmp.0, "late."), [name], "no partial file");
+        std::fs::remove_file(&out).unwrap();
+    }
+    // Not there: written as ever.
+    let fresh = tmp.0.join("fresh.fits");
+    export_group_with(
+        &m.dir,
+        SINGLE_GROUP,
+        &fresh,
+        ExportFormat::Fits,
+        keep,
+        &JobCtl::none(),
+    )
+    .unwrap();
+    assert_eq!(read_fits(&fresh).0, CANVAS.0);
+    // Asked to (and export_group, as `mmm export` uses it): replaced.
+    export_group(
+        &m.dir,
+        SINGLE_GROUP,
+        &out,
+        ExportFormat::Fits,
+        &JobCtl::none(),
+    )
+    .unwrap();
+    assert_eq!(read_fits(&out).0, CANVAS.0);
+    std::fs::write(&out, b"old").unwrap();
+    let replace = OnExisting::Replace;
+    export_group_with(
+        &m.dir,
+        SINGLE_GROUP,
+        &out,
+        ExportFormat::Fits,
+        replace,
+        &JobCtl::none(),
+    )
+    .unwrap();
+    assert_eq!(read_fits(&out).0, CANVAS.0);
+}
+
+#[test]
+fn composite_export_never_replaces_unless_asked() {
+    let tmp = TempDir::new("comp-keep");
+    let m = grouped_mosaic(&tmp.0, &[("Ha", 1, 3), ("OIII", 1, 4)]);
+    let out = tmp.0.join("hoo.fits");
+    std::fs::write(&out, b"old").unwrap();
+    let keep = OnExisting::Keep;
+    let ctl = JobCtl::none();
+    let err =
+        export_composite_with(&m.dir, &hoo(), &out, ExportFormat::Fits, keep, &ctl).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "hoo.fits appeared meanwhile and was not replaced"
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), b"old");
+    export_composite(&m.dir, &hoo(), &out, ExportFormat::Fits, &ctl).unwrap();
+    assert_eq!(read_fits(&out).2, 3, "replaced by default");
 }

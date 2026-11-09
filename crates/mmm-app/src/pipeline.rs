@@ -722,7 +722,7 @@ mod tests {
         let gate = r.hold_exports();
         let out = root.join("ha.fits");
         let ha = ExportTarget::Group("Ha".into());
-        let export = r.start_export(&s, ha, out.clone(), ExportFormat::Fits);
+        let export = r.start_export(&s, ha, out.clone(), ExportFormat::Fits, false);
         // A panel edit (it spares exports, so it applies at once) leaves a
         // group needing analysis.
         assert!(matches!(drop_last(&s).apply(&mut s, &mut r), Applied::Done));

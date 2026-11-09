@@ -323,7 +323,7 @@ fn colliding_names_block_export() {
     assert!(h.query_by_label(message).is_none());
     h.get_by_label("m.fits");
     assert!(!footer_disabled(&h, "Export"));
-    // Names differing only in case collide too (Windows and macOS folders).
+    // Any pattern without {name} does it.
     row(&h, "OIII").click();
     retype(&mut h, "File name pattern", "x");
     settle(&mut h);
@@ -343,16 +343,6 @@ fn a_folder_that_cannot_take_the_files_blocks_export() {
     std::fs::create_dir(&out).unwrap();
     let mut h = shown(s, runner());
     open_dialog(&mut h);
-    // Beside the session folder, where a file could be created.
-    let tried = |h: &Harness<'static, State>| {
-        h.state()
-            .w
-            .export_dialog()
-            .write_tried()
-            .map(std::path::Path::to_path_buf)
-    };
-    let root_text = crate::util::plain_path(&root);
-    assert_eq!(tried(&h), Some(PathBuf::from(&root_text)));
     assert!(!footer_disabled(&h, "Export"));
     // Each problem is said beside the folder, and Export waits.
     let gone = crate::util::plain_path(&root.join("gone"));
@@ -366,17 +356,18 @@ fn a_folder_that_cannot_take_the_files_blocks_export() {
         h.get_by_label(why);
         assert!(footer_disabled(&h, "Export"), "{why}");
     }
-    // Typed, nothing is tried in a folder (not in every one on the way).
+    // A folder is only looked at: nothing is created in it, not even for
+    // a moment (its modified time stays as it was).
+    let modified = |dir: &std::path::Path| std::fs::metadata(dir).unwrap().modified().unwrap();
+    let before = modified(&out);
+    std::thread::sleep(Duration::from_millis(20));
     let out_text = crate::util::plain_path(&out);
     retype(&mut h, "Folder", &out_text);
-    settle(&mut h);
-    assert_eq!(tried(&h), Some(PathBuf::from(&root_text)));
-    // Left, it is tried, and Export can go.
     h.key_press(Key::Tab);
     settle(&mut h);
-    assert_eq!(tried(&h), Some(PathBuf::from(&out_text)));
     assert!(!footer_disabled(&h, "Export"));
-    assert_eq!(files_in(&out), BTreeSet::new(), "the try left nothing");
+    assert_eq!(modified(&out), before);
+    assert_eq!(files_in(&out), BTreeSet::new());
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -722,6 +713,217 @@ fn the_dialog_opens_once_something_is_merged() {
     h.get_by_label("Export").click();
     h.run_steps(2);
     assert!(!h.state().w.export_open());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_marks_stay_while_the_folder_is_looked_at_again() {
+    let (root, s) = ready_session("export-marks-stay");
+    std::fs::write(root.join("m_Ha.fits"), b"keep").unwrap();
+    let mut h = shown(s, runner());
+    open_dialog(&mut h);
+    let overwrite = "Overwrite and export";
+    let at = footer_button(&h, overwrite).rect();
+    // The names change (TIFF): until the folder has answered for them, the
+    // last answer's marks and overwrite line stay, and Export waits where
+    // it was.
+    let release = h.state_mut().w.hold_export_checks();
+    h.get_by_label("TIFF").click();
+    h.run_steps(3);
+    let tifs = ["m_Ha.tif", "m_OIII.tif"];
+    assert_eq!(preview(&h, &tifs), ["m_Ha.tif exists", "m_OIII.tif"]);
+    h.get_by_label("1 file already exists and will be replaced");
+    h.get_by_label("Checking the folder\u{2026}");
+    assert!(footer_disabled(&h, overwrite));
+    assert_eq!(footer_button(&h, overwrite).rect(), at, "the footer stays");
+    // Answered: no such TIFF.
+    drop(release);
+    settle(&mut h);
+    assert_eq!(preview(&h, &tifs), tifs);
+    assert!(h.query_by_label_contains("will be replaced").is_none());
+    assert!(!footer_disabled(&h, "Export"));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn colliding_names_say_how_to_part_them() {
+    let (root, mut s) = ready_session("export-collide-case");
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[comp(1, "ha", [Some("Ha"), None, None])],
+    );
+    let mut h = shown(s, runner());
+    open_dialog(&mut h);
+    let rename = "Two exports would have the same file name: rename one of them";
+    let add_name = "Two exports would have the same file name: add {name} to the pattern";
+    // The group Ha and the composite ha differ only in case: one file on
+    // Windows and macOS. The pattern has {name} already.
+    retype(&mut h, "File name pattern", "{name}");
+    settle(&mut h);
+    let names = ["Ha.fits", "OIII.fits", "ha.fits"];
+    assert_eq!(
+        preview(&h, &names),
+        ["Ha.fits same name", "OIII.fits", "ha.fits same name"]
+    );
+    h.get_by_label(rename);
+    assert!(h.query_by_label(add_name).is_none());
+    assert!(footer_disabled(&h, "Export"));
+    // Without {name}, adding it is the way.
+    retype(&mut h, "File name pattern", "{session}");
+    settle(&mut h);
+    h.get_by_label(add_name);
+    assert!(h.query_by_label(rename).is_none());
+    // The composite left out: none.
+    retype(&mut h, "File name pattern", "{name}");
+    row(&h, "ha").click();
+    settle(&mut h);
+    assert!(h.query_by_label(rename).is_none());
+    assert!(!footer_disabled(&h, "Export"));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Export Ha alone to `m.fits` (pattern `{session}`) from the dialog; its
+/// export is held (`gate`).
+fn export_ha_to_m_fits(h: &mut Harness<'static, State>) {
+    open_dialog(h);
+    row(h, "OIII").click();
+    retype(h, "File name pattern", "{session}");
+    settle(h);
+    assert_eq!(preview(h, &["m.fits"]), ["m.fits"]);
+    footer_button(h, "Export").click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Export Ha"]);
+}
+
+/// Open the dialog again and pick OIII alone, for the same `m.fits`.
+fn oiii_to_m_fits(h: &mut Harness<'static, State>) {
+    open_dialog(h);
+    row(h, "Ha").click();
+    row(h, "OIII").click();
+    settle(h);
+}
+
+#[test]
+fn an_export_on_its_way_needs_overwrite() {
+    let (root, s, mut jobs) = merged("export-on-its-way");
+    let gate = jobs.hold_exports();
+    let mut h = shown(s, jobs);
+    export_ha_to_m_fits(&mut h);
+    assert!(!root.join("m.fits").exists(), "held");
+    // m.fits is not there yet, but Ha's export will write it: it counts
+    // as there.
+    oiii_to_m_fits(&mut h);
+    assert_eq!(preview(&h, &["m.fits"]), ["m.fits exists"]);
+    h.get_by_label("1 file already exists and will be replaced");
+    footer_button(&h, "Overwrite and export").click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Export Ha", "Export OIII"]);
+    // OIII's export replaces what Ha's wrote: confirmed.
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    let finished = |label: &str| {
+        h.state()
+            .events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { label: l, .. } if l == label))
+    };
+    assert!(
+        finished("Export Ha") && finished("Export OIII"),
+        "{:?}",
+        h.state().events
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_folder_is_looked_at_again_when_an_export_ends() {
+    let (root, s, mut jobs) = merged("export-relook");
+    let gate = jobs.hold_exports();
+    let mut h = shown(s, jobs);
+    export_ha_to_m_fits(&mut h);
+    oiii_to_m_fits(&mut h);
+    assert_eq!(preview(&h, &["m.fits"]), ["m.fits exists"]);
+    // Ha's export ends with the dialog open: m.fits is on disk now, and
+    // the dialog looks again.
+    gate.open();
+    step_until(&mut h, |st| st.jobs.export_destinations().is_empty());
+    assert!(root.join("m.fits").is_file());
+    settle(&mut h);
+    assert_eq!(preview(&h, &["m.fits"]), ["m.fits exists"]);
+    // Confirmed, OIII's export replaces it.
+    footer_button(&h, "Overwrite and export").click();
+    h.run_steps(2);
+    step_until(&mut h, |st| !st.jobs.busy());
+    assert!(
+        h.state()
+            .events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { label, .. } if label == "Export OIII")),
+        "{:?}",
+        h.state().events
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Whether the last frame painted a 2 pt accent ring around `rect`.
+fn has_focus_ring(h: &Harness<'static, State>, rect: egui::Rect) -> bool {
+    h.output().shapes.iter().any(|c| match &c.shape {
+        egui::Shape::Rect(r) => {
+            r.stroke.width >= 2.0
+                && r.stroke.color == mega_ui::theme::palette::ACCENT_400
+                && r.rect.contains_rect(rect)
+        }
+        _ => false,
+    })
+}
+
+#[test]
+fn a_focused_row_shows_the_focus_ring() {
+    let (root, s) = ready_session("export-ring");
+    let mut h = shown(s, runner());
+    open_dialog(&mut h);
+    let (ha, oiii) = (row(&h, "Ha").rect(), row(&h, "OIII").rect());
+    assert_eq!(focused_label(&h).as_deref(), Some("Ha"));
+    assert!(has_focus_ring(&h, ha) && !has_focus_ring(&h, oiii));
+    tab_to(&mut h, "OIII");
+    assert!(has_focus_ring(&h, oiii) && !has_focus_ring(&h, ha));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A folder dialog that cannot be shown (its thread dies).
+struct BrokenFolder;
+
+impl FolderPicker for BrokenFolder {
+    fn pick_folder(&self, _start: Option<&std::path::Path>) -> Option<PathBuf> {
+        panic!("no folder dialog here (test)");
+    }
+}
+
+#[test]
+fn a_folder_picker_that_fails_says_so() {
+    let (root, s) = ready_session("export-broken-picker");
+    let mut h = shown(s, runner());
+    h.state_mut().w.set_folder_picker(Arc::new(BrokenFolder));
+    open_dialog(&mut h);
+    h.get_by_label("Browse\u{2026}").click();
+    step_until(&mut h, |st| !st.toasts.is_empty());
+    let toast = &h.state().toasts[0].toast;
+    assert_eq!(toast.title, "The folder picker could not be shown.");
+    assert_eq!(toast.tone, mega_ui::theme::Tone::Problem);
+    // The dialog stays, Browse… can be tried again.
+    assert!(h.state().w.export_open());
+    h.run_steps(2);
+    assert!(
+        !h.get_by_label("Browse\u{2026}")
+            .accesskit_node()
+            .is_disabled()
+    );
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -22,30 +22,41 @@
 //!    and `{name}` (the group's or composite's); [`file_names`] makes the
 //!    names safe for any file system.
 //! 6. **The preview**: the exact file names, one per ticked row. Which of
-//!    them exist already is looked up on a worker, again whenever the
-//!    folder, pattern, format or ticked rows change (one lookup at a time).
-//!    The folder's writability is tried once per folder, with a file
-//!    created and removed at once, and not while the folder field has the
-//!    keyboard (not in every folder on the way to the one being typed).
-//!    Until the lookup answers the names show unmarked and Export waits
-//!    ("Checking the folder…"). An existing file
-//!    is marked "exists"; two rows that would write the same name
-//!    (ignoring case, as Windows and macOS do) are marked "same name" and
-//!    the collision message says how to fix it.
+//!    them exist already is looked up on a worker (it only looks: nothing
+//!    is created in the folder), again whenever the folder, pattern,
+//!    format or ticked rows change, and when an export ends (one lookup at
+//!    a time). The folder must be a full path and there; on Unix, one
+//!    whose permissions forbid writing is refused too (Windows' read-only
+//!    mark on folders means nothing, so it is never believed: a folder
+//!    that refuses the file fails the export, which says so in a toast).
+//!    A file is marked "exists" when it is there, or when an export
+//!    running or queued ([`JobRunner::export_destinations`]) is to write
+//!    it. Until the lookup answers Export waits ("Checking the folder…"),
+//!    and each row keeps the mark the last answer gave it, so nothing
+//!    jumps; the status line keeps its room when empty for the same
+//!    reason. Two rows that would write the same name (ignoring case, as
+//!    Windows and macOS do) are marked "same name", and the collision
+//!    message says how to part them: add `{name}` to the pattern, or, when
+//!    it has it, rename one of them.
 //! 7. **The overwrite line**, when files exist: "{n} files already exist
 //!    and will be replaced".
 //! 8. **The footer**: **Cancel**, and **Export**, which becomes **Overwrite
 //!    and export** (Danger) while a ticked file exists. Export is disabled
 //!    while nothing is ticked, the folder is empty, missing, not a full
-//!    path or not writable, two names collide, the folder is being looked
-//!    at, or an analysis runs; the reason is its tooltip, and shows in the
+//!    path or read-only, two names collide, the folder is being looked at,
+//!    or an analysis runs; the reason is its tooltip, and shows in the
 //!    body too (a disabled button takes no keyboard focus).
 //!
 //! **Export** remembers the folder, format, pattern and the rows exported
 //! in the session's `ui` under [`EXPORT_KEY`] (saved with the window's
 //! next save), starts one export job per ticked row
-//! ([`JobRunner::start_export`]) and closes. **Cancel**, Esc and a click on
-//! the backdrop close it, keeping nothing of what changed.
+//! ([`JobRunner::start_export`]) and closes. A job may replace its file
+//! only when the dialog showed it as there; any other file there by the
+//! time the export is written is left alone, and the job fails saying it
+//! "appeared meanwhile and was not replaced". **Cancel**, Esc and a click
+//! on the backdrop close the dialog, keeping nothing of what changed. A
+//! folder dialog that cannot be shown is reported in a toast
+//! ([`ExportDialog::take_problem`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -55,9 +66,10 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Layout, TextStyle};
 use mega_ui::theme::Tone;
 use mega_ui::theme::text::{Type, text};
-use mega_ui::theme::tokens::{CONTROL_HEIGHT, DIALOG_WIDTH, space};
+use mega_ui::theme::tokens::{CONTROL_HEIGHT, DIALOG_WIDTH, radius, space};
 use mega_ui::widgets::{
-    ButtonKind, Dialog, FooterButton, MegaButton, Segment, footer_with, segmented_with, text_input,
+    ButtonKind, Dialog, FooterButton, MegaButton, Segment, focus_ring, footer_with, segmented_with,
+    text_input,
 };
 use mmm_core::export::ExportFormat;
 use mmm_core::mosaic::grouping::is_reserved_device_name;
@@ -98,10 +110,17 @@ const NO_FOLDER: &str = "Choose a folder.";
 const NOT_FULL_PATH: &str = "Give the folder's full path";
 /// A folder that is not there.
 const MISSING_FOLDER: &str = "The folder doesn't exist";
-/// A folder where no file can be created.
+/// A folder that says no file can be created in it (Unix permissions).
 const UNWRITABLE_FOLDER: &str = "The folder can't be written to";
-/// Two ticked rows would write the same file.
-const COLLISION: &str = "Two exports would have the same file name: add {name} to the pattern";
+/// Two ticked rows would write the same file, the pattern lacking `{name}`.
+const COLLISION_ADD_NAME: &str =
+    "Two exports would have the same file name: add {name} to the pattern";
+/// Two ticked rows would write the same file although the pattern has
+/// `{name}` (a group and a composite of one name, or names differing only
+/// in case).
+const COLLISION_RENAME: &str = "Two exports would have the same file name: rename one of them";
+/// The toast when **Browse…** cannot show the folder dialog.
+const PICKER_FAILED: &str = "The folder picker could not be shown.";
 /// The mark of a name that exists already.
 const EXISTS: &str = "exists";
 /// The mark of a name another ticked row would write too.
@@ -405,72 +424,76 @@ struct Lookup {
 /// What a folder lookup found.
 #[derive(Clone, Debug)]
 struct Found {
-    /// Why the folder cannot take the files, if it is not a full path or
-    /// not there.
+    /// Why the folder cannot take the files, if it is not a full path, not
+    /// there, or (on Unix) read-only.
     problem: Option<&'static str>,
     /// The names that exist there already.
     existing: BTreeSet<String>,
-    /// Whether a file could be created there, if that was tried.
-    writable: Option<bool>,
 }
 
-/// Look in `lookup`'s folder (on a worker): is it there (and, with
-/// `try_write`, can a file be created in it), and which of the names
-/// exist.
-fn look(lookup: &Lookup, try_write: bool) -> Found {
+/// Look in `lookup`'s folder (on a worker): is it a full path, there and
+/// not read-only, and which of the names exist. Nothing is created there.
+fn look(lookup: &Lookup) -> Found {
     let folder = &lookup.folder;
     let problem = if !folder.is_absolute() {
         Some(NOT_FULL_PATH)
     } else if !folder.is_dir() {
         Some(MISSING_FOLDER)
+    } else if read_only(folder) {
+        Some(UNWRITABLE_FOLDER)
     } else {
         None
     };
-    if problem.is_some() {
-        return Found {
-            problem,
-            existing: BTreeSet::new(),
-            writable: None,
-        };
-    }
-    Found {
-        problem,
-        existing: lookup
+    let existing = match problem {
+        Some(NOT_FULL_PATH | MISSING_FOLDER) => BTreeSet::new(),
+        _ => lookup
             .names
             .iter()
             .filter(|n| folder.join(n).exists())
             .cloned()
             .collect(),
-        writable: try_write.then(|| writable(folder)),
+    };
+    Found { problem, existing }
+}
+
+/// Whether `folder` says no file can be created in it. Only Unix's
+/// permission bits mean that: Windows marks Documents, Pictures and
+/// customised folders read-only and ignores the mark on folders, so there
+/// it is never taken for a refusal. A folder that refuses the file anyway
+/// fails the export, which says so in a toast.
+fn read_only(folder: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::metadata(folder).is_ok_and(|m| m.permissions().readonly())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = folder;
+        false
     }
 }
 
-/// Whether a file can be created in `folder`: one is, and removed at once.
-fn writable(folder: &Path) -> bool {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let probe = folder.join(format!(
-        ".mmm-export-check-{}-{nanos}.tmp",
-        std::process::id()
-    ));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-    {
-        Ok(file) => {
-            drop(file);
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(e) => e.kind() == std::io::ErrorKind::AlreadyExists,
-    }
+/// `path` as compared with another: without Windows' verbatim prefix,
+/// with its separators normalised, and ignoring case (one file on Windows
+/// and macOS; elsewhere, taking two such names for one is the safe side).
+fn path_key(path: &Path) -> PathBuf {
+    PathBuf::from(plain_path(path).to_lowercase())
+        .components()
+        .collect()
 }
 
 /// Holds folder lookups back until its sender is dropped (tests).
 #[cfg(test)]
 type CheckHold = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>;
+
+/// A folder lookup running: what it looks at, for which rows, the ended
+/// exports' destinations its answer accounts for, and the task.
+struct Looking {
+    lookup: Lookup,
+    picks: Vec<Pick>,
+    covers: BTreeSet<PathBuf>,
+    task: Task<Found>,
+}
 
 /// The dialog while open: the choices being made, and the lookups.
 struct Choosing {
@@ -480,20 +503,22 @@ struct Choosing {
     pattern: String,
     /// The folder dialog, while shown.
     picking: Option<Task<Option<PathBuf>>>,
-    /// The folder lookup running, and what it looks at.
-    looking: Option<(Lookup, Task<Found>)>,
+    /// The folder lookup running.
+    looking: Option<Looking>,
     /// The last lookup's answer, and what it looked at.
     found: Option<(Lookup, Found)>,
+    /// Whether each row's file existed, as the last answer said: it stands
+    /// for the row while the next lookup runs, so nothing jumps.
+    last_marks: BTreeMap<Pick, bool>,
     /// What the choices ask to look at, as last drawn.
     wanted: Option<Lookup>,
-    /// The folder field has the keyboard: what it holds is being typed, so
-    /// its writability is not tried yet (not in every folder on the way).
-    editing_folder: bool,
-    /// The last folder whose writability a lookup was asked to try.
-    write_tried: Option<PathBuf>,
-    /// The last folder whose writability is known, and whether a file
-    /// could be created there.
-    writable: Option<(PathBuf, bool)>,
+    /// The destinations of the exports running or queued, as last seen.
+    in_flight: Vec<PathBuf>,
+    /// The destinations of exports that ended since the lookup in hand
+    /// started: taken as there until the folder has been looked at again.
+    ended: BTreeSet<PathBuf>,
+    /// An export ended: the folder is to be looked at again.
+    relook: bool,
 }
 
 /// What the user did in the dialog this frame.
@@ -507,6 +532,8 @@ enum Act {
 pub struct ExportDialog {
     open: Option<Choosing>,
     picker: Arc<dyn FolderPicker>,
+    /// A problem to report in a toast (the folder dialog could not show).
+    problem: Option<String>,
     #[cfg(test)]
     hold: Option<CheckHold>,
 }
@@ -517,6 +544,7 @@ impl ExportDialog {
         ExportDialog {
             open: None,
             picker,
+            problem: None,
             #[cfg(test)]
             hold: None,
         }
@@ -531,6 +559,12 @@ impl ExportDialog {
     /// Whether the dialog is open.
     pub fn is_open(&self) -> bool {
         self.open.is_some()
+    }
+
+    /// A problem since the last call, for a toast: the folder dialog could
+    /// not be shown.
+    pub fn take_problem(&mut self) -> Option<String> {
+        self.problem.take()
     }
 
     /// Open the dialog on `session`'s remembered choices (else the
@@ -562,10 +596,11 @@ impl ExportDialog {
             picking: None,
             looking: None,
             found: None,
+            last_marks: BTreeMap::new(),
             wanted: None,
-            editing_folder: false,
-            write_tried: None,
-            writable: None,
+            in_flight: jobs.export_destinations(),
+            ended: BTreeSet::new(),
+            relook: false,
         });
     }
 
@@ -580,7 +615,10 @@ impl ExportDialog {
         let Some(c) = &mut self.open else {
             return false;
         };
-        c.poll();
+        if !c.poll() {
+            self.problem = Some(PICKER_FAILED.into());
+        }
+        c.follow_exports(jobs.export_destinations());
         let rows = rows(session, jobs);
         let analysing = jobs.analyzing();
         let session_name = session.name();
@@ -608,6 +646,9 @@ impl ExportDialog {
                 c.picking = Task::spawn("mmm-export-folder", ctx, move || {
                     picker.pick_folder(Some(&start))
                 });
+                if c.picking.is_none() {
+                    self.problem = Some(PICKER_FAILED.into());
+                }
             }
             Some(Act::Export) => {
                 let changed = c.export(session, jobs, &rows, &shown);
@@ -617,22 +658,15 @@ impl ExportDialog {
             None => {}
         }
         // Look again at what the choices are now (after this frame's
-        // clicks and typing).
-        let wanted = Shown::of(c, &rows, &session_name).lookup;
+        // clicks and typing), or once more when an export ended.
+        let now = Shown::of(c, &rows, &session_name);
         #[cfg(test)]
         let hold = self.hold.clone();
-        // The folder's writability is tried once per folder, once it is
-        // no longer being typed.
-        let try_write =
-            |lookup: &Lookup| !c.editing_folder && c.write_tried.as_ref() != Some(&lookup.folder);
-        if let Some(lookup) = &wanted
+        if let Some(lookup) = &now.lookup
             && c.looking.is_none()
-            && (c.found.as_ref().is_none_or(|(l, _)| l != lookup) || try_write(lookup))
+            && (c.relook || c.found.as_ref().is_none_or(|(l, _)| l != lookup))
         {
-            let try_write = try_write(lookup);
-            if try_write {
-                c.write_tried = Some(lookup.folder.clone());
-            }
+            c.relook = false;
             let job = lookup.clone();
             let task = Task::spawn("mmm-export-lookup", ctx, move || {
                 #[cfg(test)]
@@ -641,11 +675,16 @@ impl ExportDialog {
                         .lock()
                         .map(|rx| rx.recv_timeout(crate::testutil::PATIENCE));
                 }
-                look(&job, try_write)
+                look(&job)
             });
-            c.looking = task.map(|t| (lookup.clone(), t));
+            c.looking = task.map(|task| Looking {
+                lookup: lookup.clone(),
+                picks: now.chosen.iter().map(|&i| rows[i].pick.clone()).collect(),
+                covers: c.ended.clone(),
+                task,
+            });
         }
-        c.wanted = wanted;
+        c.wanted = now.lookup;
         false
     }
 
@@ -658,24 +697,17 @@ impl ExportDialog {
     }
 
     /// Open, with no folder dialog shown and the folder looked at for what
-    /// the choices ask now, its writability tried unless it is being typed
-    /// (tests).
+    /// the choices ask now (tests).
     #[cfg(test)]
     pub(crate) fn settled(&self) -> bool {
         self.open.as_ref().is_some_and(|c| {
             c.picking.is_none()
                 && c.looking.is_none()
-                && c.wanted.as_ref().is_none_or(|w| {
-                    c.found.as_ref().is_some_and(|(l, _)| l == w)
-                        && (c.editing_folder || c.write_tried.as_ref() == Some(&w.folder))
-                })
+                && !c.relook
+                && c.wanted
+                    .as_ref()
+                    .is_none_or(|w| c.found.as_ref().is_some_and(|(l, _)| l == w))
         })
-    }
-
-    /// The last folder whose writability a lookup tried (tests).
-    #[cfg(test)]
-    pub(crate) fn write_tried(&self) -> Option<&Path> {
-        self.open.as_ref()?.write_tried.as_deref()
     }
 
     /// The folder as typed (tests).
@@ -707,8 +739,10 @@ impl ExportDialog {
 }
 
 impl Choosing {
-    /// Take the folder dialog's and the lookup's answers.
-    fn poll(&mut self) {
+    /// Take the folder dialog's and the lookup's answers; `false` when the
+    /// folder dialog could not be shown (its thread ended without one).
+    fn poll(&mut self) -> bool {
+        let mut shown = true;
         if let Some(task) = &self.picking {
             match task.poll() {
                 Poll::Pending => {}
@@ -718,30 +752,57 @@ impl Choosing {
                         self.folder = plain_path(&p);
                     }
                 }
-                Poll::Lost => self.picking = None,
+                Poll::Lost => {
+                    self.picking = None;
+                    shown = false;
+                }
             }
         }
-        if let Some((lookup, task)) = &self.looking {
-            match task.poll() {
+        if let Some(looking) = &self.looking {
+            match looking.task.poll() {
                 Poll::Pending => {}
                 Poll::Done(found) => {
-                    if let Some(w) = found.writable {
-                        self.writable = Some((lookup.folder.clone(), w));
-                    }
-                    self.found = Some((lookup.clone(), found));
-                    self.looking = None;
+                    let Looking {
+                        lookup,
+                        picks,
+                        covers,
+                        ..
+                    } = self.looking.take().expect("a lookup");
+                    self.last_marks = picks
+                        .into_iter()
+                        .zip(&lookup.names)
+                        .map(|(p, n)| (p, found.existing.contains(n)))
+                        .collect();
+                    self.ended.retain(|p| !covers.contains(p));
+                    self.found = Some((lookup, found));
                 }
                 Poll::Lost => {
                     // Unknown: never taken for an answer; looked up again.
-                    self.found = None;
                     self.looking = None;
+                    self.found = None;
                 }
             }
         }
+        shown
+    }
+
+    /// Note the exports running or queued (`busy`, their destinations): one
+    /// that ended since last seen has written its file (or not), so the
+    /// folder is looked at again, its file taken as there meanwhile.
+    fn follow_exports(&mut self, busy: Vec<PathBuf>) {
+        for p in &self.in_flight {
+            if !busy.contains(p) {
+                self.ended.insert(p.clone());
+                self.relook = true;
+            }
+        }
+        self.in_flight = busy;
     }
 
     /// **Export**: remember the choices in `session`'s `ui`, then start one
-    /// export job per ticked row. Whether `ui` changed (it did).
+    /// export job per ticked row, allowed to replace its file only when
+    /// the dialog showed it as there (existing, or an export's on its way).
+    /// Whether `ui` changed (it did).
     fn export(
         &self,
         session: &mut OpenSession,
@@ -757,32 +818,37 @@ impl Choosing {
             selection: Some(shown.chosen.iter().map(|&i| rows[i].pick.clone()).collect()),
         };
         choices.save(&mut session.mosaic.config.ui);
-        for (&i, name) in shown.chosen.iter().zip(&shown.names) {
+        for ((&i, name), &replace) in shown.chosen.iter().zip(&shown.names).zip(&shown.exists) {
             let target = rows[i].target.clone();
-            jobs.start_export(session, target, folder.join(name), self.format);
+            jobs.start_export(session, target, folder.join(name), self.format, replace);
         }
         true
     }
 }
 
 /// What the dialog shows for its choices this frame: the rows exported,
-/// their file names, the lookup they need, and what is known of them.
+/// their file names and marks, the lookup they need, and what is known.
 struct Shown {
     /// Indices into the rows of those ticked and tickable, in order.
     chosen: Vec<usize>,
     /// Their file names.
     names: Vec<String>,
+    /// Whether each file is there: found there, or an export on its way
+    /// writes it. While the folder is being looked at again, the last
+    /// answer stands for each row.
+    exists: Vec<bool>,
     /// What to look up for them (`None` without a folder).
     lookup: Option<Lookup>,
     /// The names (lowercase) more than one row would write.
     colliding: BTreeSet<String>,
-    /// The lookup's answer for exactly these choices, once known.
-    found: Option<Found>,
+    /// What to say about them, if any collide.
+    collision: Option<&'static str>,
     /// The folder is being looked at: no answer yet for these choices, or
-    /// another lookup (its writability) still runs.
+    /// a lookup still runs.
     checking: bool,
     /// Why the folder cannot take the files, as known: none chosen, not a
-    /// full path, not there, or no file can be created in it.
+    /// full path, not there, or read-only (the last answer's while the
+    /// folder is being looked at again).
     folder_problem: Option<&'static str>,
 }
 
@@ -800,11 +866,18 @@ impl Shown {
         for n in &names {
             *counts.entry(n.to_lowercase()).or_default() += 1;
         }
-        let colliding = counts
+        let colliding: BTreeSet<String> = counts
             .into_iter()
             .filter(|(_, k)| *k > 1)
             .map(|(n, _)| n)
             .collect();
+        let collision = (!colliding.is_empty()).then(|| {
+            if c.pattern.contains(NAME_TOKEN) {
+                COLLISION_RENAME
+            } else {
+                COLLISION_ADD_NAME
+            }
+        });
         let folder = c.folder.trim();
         let lookup = (!folder.is_empty()).then(|| Lookup {
             folder: PathBuf::from(folder),
@@ -814,31 +887,50 @@ impl Shown {
             .found
             .as_ref()
             .filter(|(l, _)| Some(l) == lookup.as_ref())
-            .map(|(_, f)| f.clone());
-        let checking = lookup.is_some() && (found.is_none() || c.looking.is_some());
+            .map(|(_, f)| f);
+        let coming: BTreeSet<PathBuf> = c
+            .in_flight
+            .iter()
+            .chain(&c.ended)
+            .map(|p| path_key(p))
+            .collect();
+        let exists = chosen
+            .iter()
+            .zip(&names)
+            .map(|(&i, n)| {
+                let on_its_way = lookup
+                    .as_ref()
+                    .is_some_and(|l| coming.contains(&path_key(&l.folder.join(n))));
+                on_its_way
+                    || match found {
+                        Some(f) => f.existing.contains(n),
+                        None => c.last_marks.get(&rows[i].pick).copied().unwrap_or(false),
+                    }
+            })
+            .collect();
+        let checking = lookup.is_some() && (found.is_none() || c.looking.is_some() || c.relook);
         let folder_problem = match &lookup {
             None => Some(NO_FOLDER),
-            Some(l) => found.as_ref().and_then(|f| f.problem).or_else(|| {
-                c.writable
-                    .as_ref()
-                    .is_some_and(|(f, w)| *f == l.folder && !w)
-                    .then_some(UNWRITABLE_FOLDER)
-            }),
+            Some(_) => match found {
+                Some(f) => f.problem,
+                None => c.found.as_ref().and_then(|(_, f)| f.problem),
+            },
         };
         Shown {
             chosen,
             names,
+            exists,
             lookup,
             colliding,
-            found,
+            collision,
             checking,
             folder_problem,
         }
     }
 
-    /// The names that exist already, as known.
+    /// How many of the files are there (or on their way), as shown.
     fn existing(&self) -> usize {
-        self.found.as_ref().map_or(0, |f| f.existing.len())
+        self.exists.iter().filter(|&&e| e).count()
     }
 
     /// Why Export cannot be pressed, if it cannot.
@@ -849,8 +941,8 @@ impl Shown {
             Some(NOTHING_TICKED)
         } else if self.lookup.is_none() {
             Some(NO_FOLDER)
-        } else if !self.colliding.is_empty() {
-            Some(COLLISION)
+        } else if let Some(collision) = self.collision {
+            Some(collision)
         } else if self.checking {
             Some(CHECKING)
         } else {
@@ -973,6 +1065,7 @@ fn row_ui(ui: &mut egui::Ui, row: &Row, ticked: &mut BTreeSet<Pick>) {
         let tickable = row.tickable();
         let mut on = tickable && ticked.contains(&row.pick);
         let r = ui.add_enabled(tickable, egui::Checkbox::new(&mut on, row.name()));
+        focus_ring(ui, &r, radius::SMALL);
         if let Some(why) = row.reason() {
             ui.ctx()
                 .accesskit_node_builder(r.id, |node| node.set_description(why.as_str()));
@@ -1006,8 +1099,7 @@ fn settings_ui(ui: &mut egui::Ui, c: &mut Choosing, shown: &Shown) -> bool {
             ) + 2.0 * ui.spacing().button_padding.x;
             let field = ui.available_width() - button - ui.spacing().item_spacing.x;
             ui.allocate_ui(egui::vec2(field, CONTROL_HEIGHT), |ui| {
-                let r = text_input(ui, &mut c.folder, "Where the files go").labelled_by(label);
-                c.editing_folder = r.has_focus();
+                text_input(ui, &mut c.folder, "Where the files go").labelled_by(label);
             });
             let button = MegaButton::new(ButtonKind::Secondary, BROWSE);
             browse = ui.add_enabled(c.picking.is_none(), button).clicked();
@@ -1076,27 +1168,36 @@ fn text_width(ui: &egui::Ui, t: impl Into<egui::WidgetText>) -> f32 {
 }
 
 /// The preview: each file name, marked "same name" or "exists", or why
-/// there is none; then the collision message and the lookup's progress.
+/// there is none; then a status line: the collision message, the lookup
+/// in progress, or nothing (its room kept, so the footer never jumps as a
+/// lookup starts and ends).
 fn preview_ui(ui: &mut egui::Ui, shown: &Shown) {
     if shown.chosen.is_empty() {
         ui.label(text(Type::Small, NOTHING_TICKED));
         return;
     }
-    let existing = shown.found.as_ref().map(|f| &f.existing);
-    for name in &shown.names {
+    for (name, &exists) in shown.names.iter().zip(&shown.exists) {
         let mut marks = Vec::new();
         if shown.colliding.contains(&name.to_lowercase()) {
             marks.push((SAME_NAME, Tone::Problem));
         }
-        if existing.is_some_and(|e| e.contains(name)) {
+        if exists {
             marks.push((EXISTS, Tone::Warning));
         }
         ui.label(file_line(ui, name, &marks));
     }
-    if !shown.colliding.is_empty() {
-        ui.label(text(Type::Small, COLLISION).color(Tone::Problem.color()));
+    if let Some(collision) = shown.collision {
+        ui.label(text(Type::Small, collision).color(Tone::Problem.color()));
     } else if shown.checking {
         ui.label(text(Type::Small, CHECKING));
+    } else {
+        let line = egui::WidgetText::from(text(Type::Small, CHECKING)).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            ui.available_width(),
+            TextStyle::Small,
+        );
+        ui.allocate_exact_size(egui::vec2(0.0, line.size().y), egui::Sense::hover());
     }
 }
 
@@ -1247,21 +1348,55 @@ mod tests {
             folder,
             names: vec!["a.fits".into(), "b.fits".into()],
         };
-        let found = look(&lookup(root.clone()), true);
+        let found = look(&lookup(root.clone()));
         assert_eq!(found.problem, None);
         assert_eq!(found.existing, BTreeSet::from(["a.fits".to_string()]));
-        assert_eq!(found.writable, Some(true));
-        // Writability is tried only when asked.
-        assert_eq!(look(&lookup(root.clone()), false).writable, None);
-        let missing = look(&lookup(root.join("nope")), true);
+        let missing = look(&lookup(root.join("nope")));
         assert_eq!(missing.problem, Some(MISSING_FOLDER));
         assert!(missing.existing.is_empty());
-        assert_eq!(missing.writable, None);
-        let relative = look(&lookup(PathBuf::from("out")), true);
+        let relative = look(&lookup(PathBuf::from("out")));
         assert_eq!(relative.problem, Some(NOT_FULL_PATH));
-        // The writability check leaves nothing behind.
+        // Nothing is created there.
         let left: Vec<_> = std::fs::read_dir(&root).unwrap().collect();
         assert_eq!(left.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Unix's permission bits are believed; Windows' read-only mark on a
+    /// folder never is (it marks Documents and customised folders so).
+    #[test]
+    fn a_read_only_folder_says_so_on_unix_only() {
+        let root = crate::start::tests::temp_dir("export-read-only");
+        let lookup = Lookup {
+            folder: root.clone(),
+            names: vec!["a.fits".into()],
+        };
+        let mut perms = std::fs::metadata(&root).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&root, perms.clone()).unwrap();
+        let found = look(&lookup);
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&root, perms).unwrap();
+        let want = if cfg!(unix) {
+            Some(UNWRITABLE_FOLDER)
+        } else {
+            None
+        };
+        assert_eq!(found.problem, want);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn paths_compare_as_the_file_system_does() {
+        let a = Path::new("/Astro/Out/m.fits");
+        assert_eq!(path_key(a), path_key(Path::new("/astro/out/M.FITS")));
+        assert_eq!(path_key(a), path_key(Path::new("/Astro/Out/./m.fits")));
+        assert_ne!(path_key(a), path_key(Path::new("/Astro/m.fits")));
+        #[cfg(windows)]
+        assert_eq!(
+            path_key(Path::new(r"\\?\C:\Astro\m.fits")),
+            path_key(Path::new("C:/Astro/m.fits"))
+        );
     }
 }

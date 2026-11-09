@@ -909,7 +909,7 @@ fn panels_edit_spares_exports() {
     let export_gate = jobs.hold_exports();
     let out = root.join("ha.fits");
     let ha = crate::jobs::ExportTarget::Group("Ha".into());
-    let export = jobs.start_export(&s, ha, out.clone(), ExportFormat::Fits);
+    let export = jobs.start_export(&s, ha, out.clone(), ExportFormat::Fits, false);
     let mut edit = PanelsEdit::of(&s);
     edit.panels.pop();
     // The edit cancels the merge but not the export, and waits for the
