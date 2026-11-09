@@ -100,15 +100,18 @@ impl PatchTextures {
             .retain(|id, _| wants.iter().any(|(r, _, l)| r == id && !l.is_empty()));
         let mut out = Vec::new();
         for (id, clip, layers) in wants {
-            let Some(first) = layers.first() else {
+            if layers.is_empty() {
                 continue;
-            };
-            let rect = first.patch.rect.map(|v| v as f64);
+            }
             let e = self.entries.entry(id).or_default();
             e.follow(ctx, id, layers);
-            if let Some((_, texture)) = &e.ready {
+            // The rect of the patch the texture drawn was made from (not
+            // the layers wanted now: a new rect waits for its texture).
+            if let Some((made, texture)) = &e.ready
+                && let Some(first) = made.first()
+            {
                 out.push(Patch {
-                    rect,
+                    rect: first.patch.rect.map(|v| v as f64),
                     clip,
                     texture: texture.clone(),
                 });
@@ -247,4 +250,101 @@ fn layer_image(l: &LayerSpec) -> Option<ColorImage> {
         stretch.push(stretch[stretch.len() - 1]);
     }
     Some(planar_image(&p.data, n, w, (w, h), channels, &stretch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::PATIENCE;
+
+    fn patch(rect: [u64; 4], downsample: u32, channels: u32) -> Arc<PreviewPatch> {
+        let w = (rect[2] - rect[0]).div_ceil(u64::from(downsample)) as u32;
+        let h = (rect[3] - rect[1]).div_ceil(u64::from(downsample)) as u32;
+        let n = (w * h) as usize;
+        Arc::new(PreviewPatch {
+            rect,
+            width: w,
+            height: h,
+            channels,
+            downsample,
+            data: (0..n * channels as usize)
+                .map(|i| 0.1 + (i % 7) as f32 / 10.0)
+                .collect(),
+        })
+    }
+
+    fn layer(patch: Arc<PreviewPatch>) -> LayerSpec {
+        let s = StretchParams {
+            black: 0.0,
+            white: 1.0,
+            midtones: 0.5,
+        };
+        LayerSpec {
+            patch,
+            stretch: vec![s; 3],
+            tint: [1.0; 3],
+            mono: false,
+        }
+    }
+
+    /// Call `patches` until it gives one (the conversion is on a worker).
+    fn until_drawn(
+        t: &mut PatchTextures,
+        ctx: &egui::Context,
+        wants: impl Fn() -> Vec<(u64, [f64; 4], Vec<LayerSpec>)>,
+    ) -> Vec<Patch> {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            let out = t.patches(ctx, wants());
+            if !out.is_empty() {
+                return out;
+            }
+            assert!(std::time::Instant::now() < deadline, "never converted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_downsampled_patch_covers_its_aligned_rect() {
+        // An 8x patch of a 2000 x 1000 aligned rect: ceil(w/8) x ceil(h/8)
+        // samples, drawn over the whole rect (not the texture's size).
+        let p = patch([256, 512, 2256, 1512], 8, 3);
+        assert_eq!((p.width, p.height), (250, 125));
+        let img = convert(&[layer(p.clone())]).unwrap();
+        assert_eq!(img.size, [250, 125]);
+        let ctx = egui::Context::default();
+        let mut t = PatchTextures::default();
+        let clip = [300.0, 600.0, 900.0, 900.0];
+        let out = until_drawn(&mut t, &ctx, || vec![(1, clip, vec![layer(p.clone())])]);
+        assert_eq!(out[0].rect, [256.0, 512.0, 2256.0, 1512.0]);
+        assert_eq!(out[0].clip, clip);
+        assert_eq!(out[0].texture.size(), [250, 125]);
+    }
+
+    #[test]
+    fn the_rect_drawn_is_that_of_the_texture_drawn() {
+        let a = patch([0, 0, 256, 256], 1, 3);
+        let b = patch([256, 256, 768, 512], 1, 3);
+        let ctx = egui::Context::default();
+        let mut t = PatchTextures::default();
+        let clip = [0.0, 0.0, 900.0, 900.0];
+        let out = until_drawn(&mut t, &ctx, || vec![(1, clip, vec![layer(a.clone())])]);
+        assert_eq!(out[0].rect, [0.0, 0.0, 256.0, 256.0]);
+        // The new patch's conversion has just been started: the texture of
+        // the old one is still drawn, over the old rect.
+        let out = t.patches(&ctx, vec![(1, clip, vec![layer(b.clone())])]);
+        assert_eq!(out[0].rect, [0.0, 0.0, 256.0, 256.0]);
+        assert_eq!(out[0].texture.size(), [256, 256]);
+        // Once converted, the new one over its own rect.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            let out = t.patches(&ctx, vec![(1, clip, vec![layer(b.clone())])]);
+            if out[0].rect == [256.0, 256.0, 768.0, 512.0] {
+                assert_eq!(out[0].texture.size(), [512, 256]);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "never converted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }

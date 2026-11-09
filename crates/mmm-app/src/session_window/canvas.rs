@@ -99,6 +99,18 @@ fn canvas_tag(session: &OpenSession, members: &[String]) -> Option<CanvasTag> {
         })
 }
 
+/// How a group's patch is drawn on the canvas shown (see `preview_wants`).
+struct Recipe {
+    group: String,
+    tint: [f32; 3],
+    /// Shown as the channel mean (a plan composition channel).
+    mono: bool,
+    stretch: Vec<StretchParams>,
+    /// `tint` applies only to a patch of fewer than three channels (the plan
+    /// draws colour panels in their own colours).
+    mono_patch_only: bool,
+}
+
 impl SessionWindow {
     /// The view bar across the top of the canvas area. The choices (Plan /
     /// Mosaic and the chips) and the toggles share one row when they fit
@@ -356,7 +368,7 @@ impl SessionWindow {
         };
         // Per layer: the group, its tint, whether it shows as the channel
         // mean, and the canvas's stretch for it.
-        let mut recipe: Vec<(String, [f32; 3], bool, Vec<StretchParams>)> = Vec::new();
+        let mut recipe: Vec<Recipe> = Vec::new();
         match kind {
             ViewKind::Group(g) => {
                 let stretch = if plan {
@@ -370,7 +382,27 @@ impl SessionWindow {
                     self.mosaic.member_stretch(g)
                 };
                 if let Some(s) = stretch {
-                    recipe.push((g.clone(), [1.0; 3], false, s));
+                    // The plan draws a mono group view in its group colour
+                    // (grouping on); the patch beside it must match.
+                    let tint = if plan && session.mosaic.config.grouping.enabled {
+                        let names = group_names(session);
+                        let colours = group_colors(
+                            &load_group_colors(&session.mosaic.config.ui),
+                            names.iter().map(String::as_str),
+                        );
+                        colours.get(g).map_or([1.0; 3], |c| {
+                            [c.r(), c.g(), c.b()].map(|v| f32::from(v) / 255.0)
+                        })
+                    } else {
+                        [1.0; 3]
+                    };
+                    recipe.push(Recipe {
+                        group: g.clone(),
+                        tint,
+                        mono: false,
+                        stretch: s,
+                        mono_patch_only: true,
+                    });
                 }
             }
             ViewKind::Composition(i) => {
@@ -390,14 +422,26 @@ impl SessionWindow {
                         only[slot] = ch.clone();
                         for (g, tint) in channel_tints(&only, |a, b| a == b) {
                             if let Some(s) = stretch.get(slot) {
-                                recipe.push((g, tint, true, vec![*s]));
+                                recipe.push(Recipe {
+                                    group: g,
+                                    tint,
+                                    mono: true,
+                                    stretch: vec![*s],
+                                    mono_patch_only: false,
+                                });
                             }
                         }
                     }
                 } else {
                     for (g, tint) in channel_tints(&c.channels, |a, b| a == b) {
                         if let Some(s) = self.mosaic.member_stretch(&g) {
-                            recipe.push((g, tint, false, s));
+                            recipe.push(Recipe {
+                                group: g,
+                                tint,
+                                mono: false,
+                                stretch: s,
+                                mono_patch_only: false,
+                            });
                         }
                     }
                 }
@@ -411,13 +455,19 @@ impl SessionWindow {
             }
             let layers = recipe
                 .iter()
-                .filter_map(|(g, tint, mono, stretch)| {
-                    let (_, patch) = self.previews.patch(roi.id, g)?;
+                .filter_map(|r| {
+                    let (_, patch) = self.previews.patch(roi.id, &r.group)?;
+                    // A colour patch keeps its own colours.
+                    let tint = if r.mono_patch_only && patch.channels >= 3 {
+                        [1.0; 3]
+                    } else {
+                        r.tint
+                    };
                     Some(LayerSpec {
                         patch,
-                        stretch: stretch.clone(),
-                        tint: *tint,
-                        mono: *mono,
+                        stretch: r.stretch.clone(),
+                        tint,
+                        mono: r.mono,
                     })
                 })
                 .collect();

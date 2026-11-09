@@ -37,7 +37,17 @@ fn shown_on(
     mode: CanvasMode,
     prepare: impl FnOnce(&mut State),
 ) -> (PathBuf, Harness<'static, State>, Arc<Gate>) {
-    let (root, mut s, jobs) = merged(tag);
+    shown_in(merged(tag), rois, mode, prepare)
+}
+
+/// [`shown_on`] for the session `built` (analysed and merged).
+fn shown_in(
+    built: (PathBuf, OpenSession, JobRunner),
+    rois: &[(u64, &str, [u64; 4])],
+    mode: CanvasMode,
+    prepare: impl FnOnce(&mut State),
+) -> (PathBuf, Harness<'static, State>, Arc<Gate>) {
+    let (root, mut s, jobs) = built;
     let rois: Vec<Roi> = rois
         .iter()
         .map(|&(id, name, canvas)| Roi {
@@ -845,5 +855,110 @@ fn previews_never_change_the_stretch() {
     assert_eq!(h.state().w.mosaic().member_stretch("Ha"), Some(mosaic));
     let image = h.state().w.preview_image(7).unwrap();
     assert!(image.pixels.iter().any(|p| p.a() > 0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An analysed two-group session of mono panels with both groups merged.
+fn merged_mono(tag: &str) -> (PathBuf, OpenSession, JobRunner) {
+    let root = temp_dir(tag);
+    let mut s = two_group_mono_session(&root);
+    let mut jobs = runner();
+    jobs.start_analyze(&mut s);
+    let _ = drain(&mut jobs, &mut s);
+    jobs.start_blend(&mut s, "Ha", None);
+    jobs.start_blend(&mut s, "OIII", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.merged = any_merged(&s);
+    s.results = classify_results(&s);
+    (root, s, jobs)
+}
+
+/// `patch`'s channel mean through `stretch`, grey (a plan composition
+/// channel).
+fn mean_image(patch: &mmm_core::mosaic::PreviewPatch, stretch: StretchParams) -> egui::ColorImage {
+    let n = (patch.width * patch.height) as usize;
+    let mut mean = vec![0.0f32; n];
+    for plane in patch.data.chunks_exact(n) {
+        for (m, v) in mean.iter_mut().zip(plane) {
+            *m += v / patch.channels as f32;
+        }
+    }
+    planar_image(
+        &mean,
+        n,
+        patch.width as usize,
+        (patch.width as usize, patch.height as usize),
+        1,
+        &[stretch],
+    )
+}
+
+#[test]
+fn a_plan_patch_takes_the_group_colour() {
+    let (root, mut h, gate) = shown_in(
+        merged_mono("draw-plan-colour"),
+        &[CORE],
+        CanvasMode::Plan,
+        |st| st.run_pipeline = true,
+    );
+    gate.open();
+    // The plan draws a mono group with grouping on in its group colour; the
+    // patch is tinted the same, so it compares fairly with its surroundings.
+    let st = h.state();
+    let names = crate::util::group_names(&st.session);
+    let colours = crate::panel_edits::group_colors(
+        &crate::panel_edits::load_group_colors(&st.session.mosaic.config.ui),
+        names.iter().map(String::as_str),
+    );
+    let c = colours["Ha"];
+    let tint = [c.r(), c.g(), c.b()].map(|v| f32::from(v) / 255.0);
+    assert!(
+        tint[0] != tint[1] || tint[1] != tint[2],
+        "a colour, not grey"
+    );
+    step_to(&mut h, |st| {
+        let (Some(stretch), Some(image)) = (st.w.plan().stretch_for_view(), st.w.preview_image(7))
+        else {
+            return false;
+        };
+        let Some((_, p)) = st.w.previews.patch(7, "Ha") else {
+            return false;
+        };
+        assert_eq!(p.channels, 1);
+        let mut mix = Mix::new([p.width as usize, p.height as usize]);
+        mix.add(&converted(st, 7, "Ha", stretch), tint);
+        *image == mix.image()
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_plan_composite_patch_mixes_its_slots() {
+    let (root, mut h, gate) = shown_on("draw-plan-composite", &[CORE], CanvasMode::Plan, |st| {
+        st.run_pipeline = true;
+        show_hoo(st);
+    });
+    gate.open();
+    step_to(&mut h, |st| {
+        delivered(st, 7, "Ha") == 1 && delivered(st, 7, "OIII") == 1
+    });
+    // Each slot is its group's channel mean through the plan's stretch for
+    // that slot, tinted red, green or blue (OIII is mapped to two slots).
+    step_to(&mut h, |st| {
+        let (Some(stretch), Some(image)) = (st.w.plan().stretch_for_view(), st.w.preview_image(7))
+        else {
+            return false;
+        };
+        if stretch.len() < 3 {
+            return false;
+        }
+        let ha = st.w.previews.patch(7, "Ha").unwrap().1;
+        let oiii = st.w.previews.patch(7, "OIII").unwrap().1;
+        let mut mix = Mix::new([256, 256]);
+        mix.add(&mean_image(&ha, stretch[0]), [1.0, 0.0, 0.0]);
+        mix.add(&mean_image(&oiii, stretch[1]), [0.0, 1.0, 0.0]);
+        mix.add(&mean_image(&oiii, stretch[2]), [0.0, 0.0, 1.0]);
+        *image == mix.image()
+    });
     let _ = std::fs::remove_dir_all(&root);
 }
