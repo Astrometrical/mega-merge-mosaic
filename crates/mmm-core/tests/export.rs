@@ -7,18 +7,22 @@ use std::path::{Path, PathBuf};
 use mmm_core::Error;
 use mmm_core::Result;
 use mmm_core::blend::{BlendParams, Extent, RowSink, blend};
-use mmm_core::export::{ExportFormat, ExportReport, export_check, export_group};
+use mmm_core::export::{
+    CompositeChannels, ExportFormat, ExportReport, export_check, export_composite, export_group,
+};
 use mmm_core::formats::InputPanel;
 use mmm_core::formats::fits::FitsPanel;
 use mmm_core::job::{CancelToken, JobCtl};
-use mmm_core::mosaic::{Mosaic, MosaicConfig, SINGLE_GROUP, analyze_all, blend_group};
+use mmm_core::mosaic::{
+    GroupRule, Grouping, Mosaic, MosaicConfig, SINGLE_GROUP, analyze_all, blend_group,
+};
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
 use mmm_core::settings::BlendSettings;
 use mmm_core::surfaces::Surfaces;
 use mmm_core::synth::{SynthSpec, SynthWcs, generate, write_xisf_solved};
-use mmm_core::tiles::{TILE, TileStore};
+use mmm_core::tiles::{TILE, TileGeometry, TileStore};
 
 const CANVAS: (u64, u64) = (600, 420);
 const CH: u64 = 3;
@@ -443,4 +447,284 @@ fn export_of_unblended_group_says_so() {
         .to_string();
     assert!(err.contains("nope"), "{err}");
     assert!(!out.exists());
+}
+
+/// A grouped mosaic of 2×2 aligned, solved panels per `(name, channels,
+/// seed)` group (assigned by hand), analysed and every group merged.
+fn grouped_mosaic(root: &Path, groups: &[(&str, u64, u64)]) -> Mosaic {
+    let mut paths = Vec::new();
+    let mut names = Vec::new();
+    for &(name, ch, seed) in groups {
+        let spec = SynthSpec {
+            canvas: CANVAS,
+            channels: ch as u32,
+            grid: (2, 2),
+            overlap_frac: 0.25,
+            n_stars: 40,
+            noise_sigma: 0.002,
+            panel_gain_range: (0.7, 1.4),
+            panel_offset_range: (-0.01, 0.02),
+            panel_gradient_range: (0.0, 0.0),
+            global_gradient: (0.0, 0.0, 0.0),
+            panel_shift: vec![],
+            panel_spike_angle: vec![],
+            panel_defects: vec![],
+            mid_blobs: 0,
+            shift_blobs: false,
+            core: None,
+            seed,
+        };
+        let res = generate(&spec, &root.join(format!("gen-{name}"))).unwrap();
+        let out = root.join("panels");
+        std::fs::create_dir_all(&out).unwrap();
+        let n = (CANVAS.0 * CANVAS.1 * ch) as usize;
+        for (i, p) in res.panel_paths.iter().enumerate() {
+            let bytes = std::fs::read(p).unwrap();
+            let planes: Vec<f32> = bytes[4096..4096 + n * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            let path = out.join(format!("{name}_{i}.xisf"));
+            write_xisf_solved(&path, CANVAS.0, CANVAS.1, ch, &planes, &canvas_wcs()).unwrap();
+            paths.push(path);
+            names.push(name.to_string());
+        }
+    }
+    let mut cfg = MosaicConfig::new(paths);
+    cfg.grouping = Grouping {
+        enabled: true,
+        rule: GroupRule::Manual,
+    };
+    for (p, n) in cfg.panels.iter_mut().zip(names) {
+        p.manual_group = Some(n);
+    }
+    let mut m = Mosaic::create(&root.join("m"), cfg).unwrap();
+    analyze_all(&mut m, &JobCtl::none()).unwrap();
+    for &(name, ..) in groups {
+        blend_group(&mut m, name, None, &JobCtl::none()).unwrap();
+    }
+    m
+}
+
+fn hoo<'a>() -> CompositeChannels<'a> {
+    CompositeChannels {
+        name: "HOO",
+        r: Some("Ha"),
+        g: Some("OIII"),
+        b: Some("OIII"),
+    }
+}
+
+/// Plane `p` of planar `data` (`plane` samples each).
+fn plane_of(data: &[f32], plane: usize, p: usize) -> &[f32] {
+    &data[p * plane..(p + 1) * plane]
+}
+
+#[test]
+fn composite_export_maps_groups_to_planes() {
+    let tmp = TempDir::new("comp-map");
+    let m = grouped_mosaic(&tmp.0, &[("Ha", 1, 3), ("OIII", 1, 4)]);
+    let out = tmp.0.join("hoo.fits");
+    let report =
+        export_composite(&m.dir, &hoo(), &out, ExportFormat::Fits, &JobCtl::none()).unwrap();
+    assert_eq!(
+        report,
+        ExportReport {
+            stale_tiles: 0,
+            missing_tiles: 0,
+            width: CANVAS.0,
+            height: CANVAS.1,
+        }
+    );
+    let (w, h, ch, data) = read_fits(&out);
+    assert_eq!((w, h, ch), (CANVAS.0, CANVAS.1, 3));
+    let plane = (w * h) as usize;
+    let ha = direct_blend(&m.group_session_dir("Ha"));
+    let oiii = direct_blend(&m.group_session_dir("OIII"));
+    assert_close(plane_of(&data, plane, 0), &ha.data);
+    assert_close(plane_of(&data, plane, 1), &oiii.data);
+    assert_close(plane_of(&data, plane, 2), &oiii.data);
+    assert!(
+        plane_of(&data, plane, 0)
+            .iter()
+            .zip(plane_of(&data, plane, 1))
+            .any(|(a, b)| a != b),
+        "the groups differ"
+    );
+
+    // WCS and provenance.
+    assert!(InputPanel::open(&out).unwrap().linear_wcs().is_some());
+    let text: String = header_cards(&out)
+        .iter()
+        .filter(|c| c.starts_with("HISTORY "))
+        .map(|c| c[8..].trim_end().to_string() + "\n")
+        .collect();
+    for want in [
+        "composite 'HOO'",
+        "R: group 'Ha'",
+        "G: group 'OIII'",
+        "B: group 'OIII'",
+        "Group 'Ha':",
+        "Group 'OIII':",
+        "feather_px",
+    ] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    assert!(!out.with_extension("fits.part").exists());
+
+    // An unmapped channel is zeros.
+    let out = tmp.0.join("ha-only.fits");
+    let one = CompositeChannels {
+        name: "Ha only",
+        r: Some("Ha"),
+        g: None,
+        b: None,
+    };
+    export_composite(&m.dir, &one, &out, ExportFormat::Fits, &JobCtl::none()).unwrap();
+    let (_, _, ch, data) = read_fits(&out);
+    assert_eq!(ch, 3);
+    assert_close(plane_of(&data, plane, 0), &ha.data);
+    assert!(data[plane..].iter().all(|&v| v == 0.0));
+    let text = header_cards(&out).concat();
+    assert!(text.contains("G: none"), "{text}");
+}
+
+#[test]
+fn composite_export_averages_an_osc_member() {
+    let tmp = TempDir::new("comp-osc");
+    let m = grouped_mosaic(&tmp.0, &[("Ha", 1, 3), ("RGB", 3, 9)]);
+    let out = tmp.0.join("mix.fits");
+    let channels = CompositeChannels {
+        name: "Mix",
+        r: Some("Ha"),
+        g: Some("RGB"),
+        b: None,
+    };
+    export_composite(&m.dir, &channels, &out, ExportFormat::Fits, &JobCtl::none()).unwrap();
+    let (w, h, ch, data) = read_fits(&out);
+    assert_eq!((w, h, ch), (CANVAS.0, CANVAS.1, 3));
+    let plane = (w * h) as usize;
+    let ha = direct_blend(&m.group_session_dir("Ha"));
+    let rgb = direct_blend(&m.group_session_dir("RGB"));
+    assert_eq!(rgb.ch, 3);
+    let mean: Vec<f32> = (0..plane)
+        .map(|i| (rgb.data[i] + rgb.data[plane + i] + rgb.data[2 * plane + i]) / 3.0)
+        .collect();
+    assert_close(plane_of(&data, plane, 0), &ha.data);
+    assert_close(plane_of(&data, plane, 1), &mean);
+    assert!(plane_of(&data, plane, 2).iter().all(|&v| v == 0.0));
+}
+
+#[test]
+fn composite_export_refuses_different_canvases() {
+    let tmp = TempDir::new("comp-canvas");
+    let m = grouped_mosaic(&tmp.0, &[("Ha", 1, 3), ("OIII", 1, 4)]);
+    // OIII's result becomes a store of another size.
+    let wrong = TileGeometry {
+        width: 300,
+        height: 200,
+        channels: 1,
+        tile: TILE,
+    };
+    drop(TileStore::create(&m.result_path("OIII"), wrong).unwrap());
+    let out = tmp.0.join("x.fits");
+    let err = export_composite(&m.dir, &hoo(), &out, ExportFormat::Fits, &JobCtl::none())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("the composite's groups have different canvases"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    assert!(!out.with_extension("fits.part").exists());
+}
+
+#[test]
+fn composite_export_names_its_problems() {
+    let tmp = TempDir::new("comp-errors");
+    let m = grouped_mosaic(&tmp.0, &[("Ha", 1, 3), ("OIII", 1, 4)]);
+    let out = tmp.0.join("x.fits");
+    let go = |c: &CompositeChannels| {
+        export_composite(&m.dir, c, &out, ExportFormat::Fits, &JobCtl::none())
+            .unwrap_err()
+            .to_string()
+    };
+    let none = CompositeChannels {
+        name: "Empty",
+        r: None,
+        g: None,
+        b: None,
+    };
+    assert!(go(&none).contains("the composite maps no groups"));
+    let ghost = CompositeChannels {
+        r: Some("Ghost"),
+        ..none
+    };
+    assert!(go(&ghost).contains("'Ghost'"));
+    // A group whose result is gone reads as not merged yet.
+    std::fs::remove_file(m.result_path("OIII")).unwrap();
+    let err = go(&hoo());
+    assert!(
+        err.contains("group 'OIII' has not been merged yet"),
+        "{err}"
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn composite_export_cancels_and_leaves_the_destination() {
+    let tmp = TempDir::new("comp-cancel");
+    let m = grouped_mosaic(&tmp.0, &[("Ha", 1, 3), ("OIII", 1, 4)]);
+    for (format, name) in [
+        (ExportFormat::Fits, "c.fits"),
+        (ExportFormat::Tiff, "c.tif"),
+    ] {
+        let out = tmp.0.join(name);
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        let observer = move |_: &str, _: u64, _: u64| t2.cancel();
+        let ctl = JobCtl::new(token, Some(&observer));
+        let err = export_composite(&m.dir, &hoo(), &out, format, &ctl).unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{format:?}: {err}");
+        let left: Vec<String> = std::fs::read_dir(&tmp.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("c."))
+            .collect();
+        assert!(left.is_empty(), "{format:?}: {left:?}");
+    }
+    let out = tmp.0.join("keep.fits");
+    std::fs::write(&out, b"old").unwrap();
+    let token = CancelToken::new();
+    token.cancel();
+    let ctl = JobCtl::new(token, None);
+    assert!(export_composite(&m.dir, &hoo(), &out, ExportFormat::Fits, &ctl).is_err());
+    assert_eq!(std::fs::read(&out).unwrap(), b"old");
+}
+
+#[test]
+fn composite_tiff_export_is_three_channel() {
+    let tmp = TempDir::new("comp-tiff");
+    let m = grouped_mosaic(&tmp.0, &[("Ha", 1, 3), ("OIII", 1, 4)]);
+    let out = tmp.0.join("hoo.tif");
+    let report =
+        export_composite(&m.dir, &hoo(), &out, ExportFormat::Tiff, &JobCtl::none()).unwrap();
+    assert_eq!((report.width, report.height), CANVAS);
+    assert!(report.is_complete());
+    let (w, h, ch, data) = tiff_read_planar(&out).unwrap();
+    assert_eq!((w, h, ch), (CANVAS.0, CANVAS.1, 3));
+    let plane = (w * h) as usize;
+    let ha = direct_blend(&m.group_session_dir("Ha"));
+    let oiii = direct_blend(&m.group_session_dir("OIII"));
+    assert_close(plane_of(&data, plane, 0), &ha.data);
+    assert_close(plane_of(&data, plane, 1), &oiii.data);
+    assert_close(plane_of(&data, plane, 2), &oiii.data);
+    let names: Vec<String> = std::fs::read_dir(&tmp.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("hoo"))
+        .collect();
+    assert_eq!(names, ["hoo.tif"]);
 }
