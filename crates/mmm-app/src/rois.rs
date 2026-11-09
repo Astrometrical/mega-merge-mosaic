@@ -12,11 +12,13 @@
 //! worker: the list (new, select, rename, note, delete) and the
 //! reprojection. Each ROI's row and canvas label show its transient
 //! preview's state, as the window reports it ([`RoiPanel::set_states`],
-//! from [`crate::previews`]); an ROI whose label carries controls (Compare
-//! A / B, spec §8.3) has it drawn by the window, so its overlay carries no
-//! label ([`RoiPanel::set_labelled`]): the label is drawn once. Selecting an
-//! ROI asks to go to it ([`RoiOutcome::go_to`]): the window frames it on
-//! whichever canvas shows, through the camera both share.
+//! from [`crate::previews`]), and a row adds [`COARSE_NOTE`] while the
+//! preview in view is coarse ([`RoiPanel::set_coarse`]); an ROI whose label
+//! carries controls (Compare A / B, spec §8.3) has it drawn by the window,
+//! so its overlay carries no label ([`RoiPanel::set_labelled`]): the label
+//! is drawn once. Selecting an ROI asks to go to it ([`RoiOutcome::go_to`]):
+//! the window frames it on whichever canvas shows, through the camera both
+//! share (not on a plan drawn in another frame than the analysed one).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -35,6 +37,10 @@ use crate::util::{Poll, Task};
 
 /// Key in `MosaicConfig.ui` of the ROI list.
 pub const ROIS_KEY: &str = "rois";
+
+/// What an ROI's row adds while its preview in view is coarse (blended
+/// from the 1/8 summaries: [`mmm_core::mosaic::PreviewPatch::coarse`]).
+pub const COARSE_NOTE: &str = "coarse preview: merge mode not shown";
 
 /// A region of interest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -226,6 +232,9 @@ pub struct RoiPanel {
     pub(crate) want_sync: bool,
     /// Each ROI's preview state, by id, as the window last reported it.
     states: BTreeMap<u64, PreviewState>,
+    /// The ROIs whose preview in view is coarse, as the window last
+    /// reported them.
+    coarse: BTreeSet<u64>,
     /// The ROIs whose canvas label the window draws (with its controls).
     labelled: BTreeSet<u64>,
     /// The list widget's own state (a rename in progress).
@@ -267,6 +276,12 @@ impl RoiPanel {
     /// row says it, and its canvas label while it merges.
     pub fn set_states(&mut self, states: BTreeMap<u64, PreviewState>) {
         self.states = states;
+    }
+
+    /// The ROIs whose preview in view is coarse: their rows add
+    /// [`COARSE_NOTE`] (the canvas label does not).
+    pub fn set_coarse(&mut self, ids: BTreeSet<u64>) {
+        self.coarse = ids;
     }
 
     /// The ROIs whose canvas label the window draws, with its controls:
@@ -439,7 +454,11 @@ impl RoiPanel {
             .iter()
             .map(|r| {
                 let state = self.state(r.id).text();
-                let detail = format!("{} · {state}", roi_size_text(r.canvas));
+                let mut detail = format!("{} · {state}", roi_size_text(r.canvas));
+                if self.coarse.contains(&r.id) {
+                    detail.push_str(" · ");
+                    detail.push_str(COARSE_NOTE);
+                }
                 (r.id, r.name.clone(), detail, self.selected == Some(r.id))
             })
             .collect();

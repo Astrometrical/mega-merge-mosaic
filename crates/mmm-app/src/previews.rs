@@ -10,9 +10,11 @@
 //! - **Keys.** A patch is cached by `(ROI id, group)` with the
 //!   [`PreviewKey`] it was made from: the ROI's canvas rect, the draft as
 //!   the group merges with it ([`draft_for`]) and the group's analysis
-//!   stamp ([`analysis_stamp`]: a re-analysis moves it). A cached key that
-//!   differs from the key wanted now makes the ROI out of date; so does a
-//!   group needing an analysis, or never analysed.
+//!   stamp ([`analysis_stamp`]: a re-analysis moves it, also one that
+//!   stopped part-way once it had finished the group; an analysed group no
+//!   entry lists, from an older session, has the sentinel [`UNSTAMPED`]). A
+//!   cached key that differs from the key wanted now makes the ROI out of
+//!   date; so does a group needing an analysis, or never analysed.
 //! - **The scheduler** ([`Previews::schedule`], every frame, with what the
 //!   window wants: the visible ROIs of the groups in view): a running
 //!   preview no longer wanted with its key is cancelled (so settings changed
@@ -76,6 +78,15 @@ macro_rules! note {
 /// Most bytes of patch samples the preview cache keeps.
 pub const PREVIEW_CACHE_BYTES: usize = 1 << 30;
 
+/// The analysis stamp ([`PreviewKey::analysis`]) of a group that is
+/// analysed (it has a directory and needs no analysis) but that no
+/// `"analyze"` provenance entry lists: a session written before analyses
+/// that stopped part-way recorded the groups they finished. Such a group
+/// previews under this fixed sentinel; the next analysis of it records an
+/// entry, whose index (the real stamp, [`analysis_stamp`]) never equals
+/// it, so a patch made under the sentinel then reads out of date.
+pub const UNSTAMPED: usize = usize::MAX;
+
 /// What a preview of an ROI and a group is made from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreviewKey {
@@ -83,13 +94,15 @@ pub struct PreviewKey {
     pub rect: [u64; 4],
     /// The merge settings: the draft with the group's override.
     pub settings: BlendSettings,
-    /// The group's analysis stamp ([`analysis_stamp`]).
+    /// The group's analysis stamp ([`analysis_stamp`]), or [`UNSTAMPED`]
+    /// for an analysed group no `"analyze"` entry lists.
     pub analysis: usize,
 }
 
 impl PreviewKey {
     /// The key a preview of `rect` of `group` is made with now: the draft
-    /// as the group merges with it and the group's analysis stamp. `None`
+    /// as the group merges with it and the group's analysis stamp
+    /// ([`UNSTAMPED`] when it is analysed but no entry lists it). `None`
     /// when the group cannot be previewed: never analysed, or needing a new
     /// analysis.
     pub fn wanted(cfg: &MosaicConfig, group: &str, rect: [u64; 4]) -> Option<Self> {
@@ -99,7 +112,7 @@ impl PreviewKey {
         Some(PreviewKey {
             rect,
             settings: draft_for(cfg, group),
-            analysis: analysis_stamp(cfg, group)?,
+            analysis: analysis_stamp(cfg, group).unwrap_or(UNSTAMPED),
         })
     }
 }
@@ -496,7 +509,8 @@ impl Previews {
     /// Where ROI `roi`'s preview stands for `groups` (the groups in view):
     /// merging while a preview of it runs, out of date when a group's
     /// cached key differs from the key it would be made with now (or it
-    /// has none, or cannot be previewed now), else up to date.
+    /// has none, or cannot be previewed now) or no group is in view (a
+    /// composite mapping none: nothing shows), else up to date.
     pub fn state(&self, roi: u64, groups: &[String], session: &OpenSession) -> PreviewState {
         if self
             .running
@@ -508,6 +522,9 @@ impl Previews {
         let Some(&rect) = self.rects.get(&roi) else {
             return PreviewState::OutOfDate;
         };
+        if groups.is_empty() {
+            return PreviewState::OutOfDate;
+        }
         let cfg = &session.mosaic.config;
         let current = groups.iter().all(|g| {
             let wanted = PreviewKey::wanted(cfg, g, rect);
@@ -518,6 +535,19 @@ impl Previews {
         } else {
             PreviewState::OutOfDate
         }
+    }
+
+    /// Whether ROI `roi`'s preview for `groups` (the groups in view) is
+    /// coarse ([`PreviewPatch::coarse`]: blended from the 1/8 summaries, so
+    /// it does not show the merge mode): the cached patch of one of them, or
+    /// a compare's side A of it, is.
+    pub fn coarse(&self, roi: u64, groups: &[String]) -> bool {
+        groups.iter().any(|g| {
+            self.cache
+                .get(&(roi, g.clone()))
+                .is_some_and(|e| e.patch.coarse)
+                || self.a_patch(roi, g).is_some_and(|p| p.coarse)
+        })
     }
 
     /// End the previews (leaving the session): a compare ends, the one in

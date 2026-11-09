@@ -625,8 +625,16 @@ impl SessionWindow {
             .iter()
             .map(|r| (r.id, self.previews.state(r.id, groups, session)))
             .collect();
+        let coarse: BTreeSet<u64> = self
+            .mosaic
+            .rois()
+            .iter()
+            .map(|r| r.id)
+            .filter(|&id| self.previews.coarse(id, groups))
+            .collect();
         self.labelled = self.labelled_rois(&states, jobs);
         self.mosaic.set_roi_states(states);
+        self.mosaic.set_roi_coarse(coarse);
         self.mosaic.set_roi_labelled(self.labelled.clone());
     }
 

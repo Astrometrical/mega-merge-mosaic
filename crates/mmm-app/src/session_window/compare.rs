@@ -95,13 +95,14 @@ impl SessionWindow {
     /// The ROIs whose canvas label is drawn here, with controls: the
     /// selected one if up to date for the groups in view (`states`) while no
     /// analysis runs or is queued, and the one compared. None while the ROIs
-    /// are hidden.
+    /// are hidden or no group is in view (a composite mapping none: there
+    /// would be nothing to compare).
     pub(super) fn labelled_rois(
         &self,
         states: &BTreeMap<u64, PreviewState>,
         jobs: &JobRunner,
     ) -> BTreeSet<u64> {
-        if !self.look.rois {
+        if !self.look.rois || self.mosaic.members().is_empty() {
             return BTreeSet::new();
         }
         let selected = self

@@ -1218,30 +1218,45 @@ pub(crate) mod tests {
     /// Holds a worker after each progress update it sends, until stepped
     /// past it or opened.
     pub(crate) struct Stepper {
-        /// Steps granted and not taken yet, and whether it is open.
-        state: std::sync::Mutex<(u64, bool)>,
+        /// Steps granted and not taken yet, whether it is open, and how
+        /// many workers wait in [`Stepper::wait`] with no step granted.
+        state: std::sync::Mutex<(u64, bool, usize)>,
         cv: std::sync::Condvar,
     }
 
     impl Stepper {
+        /// Whether a worker is held now, after sending a progress update,
+        /// with no step granted yet (so a step granted now lets it go on to
+        /// exactly its next update).
+        pub(crate) fn held(&self) -> bool {
+            self.state.lock().unwrap().2 > 0
+        }
+
         /// Let the held worker go on to its next progress update.
         pub(crate) fn step(&self) {
-            self.state.lock().unwrap().0 += 1;
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            state.2 = state.2.saturating_sub(1);
             self.cv.notify_all();
         }
 
         /// Hold nothing any more.
         pub(crate) fn open(&self) {
-            self.state.lock().unwrap().1 = true;
+            let mut state = self.state.lock().unwrap();
+            state.1 = true;
+            state.2 = 0;
             self.cv.notify_all();
         }
 
         /// Block until stepped or opened (bounded: never hang a test).
         pub(crate) fn wait(&self) {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            if state.0 == 0 && !state.1 {
+                state.2 += 1;
+            }
             let (mut state, timeout) = self
                 .cv
-                .wait_timeout_while(state, crate::testutil::PATIENCE, |(steps, open)| {
+                .wait_timeout_while(state, crate::testutil::PATIENCE, |(steps, open, _)| {
                     *steps == 0 && !*open
                 })
                 .unwrap();
@@ -1267,7 +1282,7 @@ pub(crate) mod tests {
         /// update it sends (see [`Stepper`]).
         pub(crate) fn hold_progress(&mut self) -> std::sync::Arc<Stepper> {
             let stepper = std::sync::Arc::new(Stepper {
-                state: std::sync::Mutex::new((0, false)),
+                state: std::sync::Mutex::new((0, false, 0)),
                 cv: std::sync::Condvar::new(),
             });
             self.stepper = Some(stepper.clone());

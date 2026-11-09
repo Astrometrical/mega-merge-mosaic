@@ -375,6 +375,165 @@ fn an_analysis_cancels_and_dirties_previews() {
 }
 
 #[test]
+fn a_preview_from_before_a_stopped_reanalysis_is_out_of_date() {
+    let (root, mut h, gate) = shown("previews-stopped-analysis", &[CORE], |_| {});
+    gate.open();
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 1);
+    step_until_row(&mut h, "Core", "up to date");
+    let before = wanted(h.state(), "Ha", CORE.2);
+    // Hidden: nothing merges meanwhile, so only the analysis can date it.
+    h.state_mut().w.look.rois = false;
+    // Both groups analysed again, the run held at each progress update...
+    let stepper = h.state_mut().jobs.hold_progress();
+    let id = {
+        let st = h.state_mut();
+        let id = st.jobs.start_analyze(&mut st.session);
+        st.w.track_analysis(id);
+        id
+    };
+    let stage = |st: &State| {
+        st.jobs
+            .views()
+            .into_iter()
+            .find(|v| v.id == id)
+            .map(|v| v.stage)
+    };
+    // ...and stopped once Ha has finished and OIII has begun.
+    loop {
+        step_to(&mut h, |_| stepper.held());
+        h.step();
+        if stage(h.state()).is_some_and(|s| s.starts_with("OIII: ")) {
+            break;
+        }
+        stepper.step();
+    }
+    h.state_mut().jobs.cancel(id);
+    stepper.open();
+    step_to(&mut h, |st| !st.jobs.busy());
+    h.run_steps(3);
+    let cfg = &h.state().session.mosaic.config;
+    assert!(!cfg.needs_analyze.contains("Ha"), "Ha finished");
+    assert!(cfg.needs_analyze.contains("OIII"), "OIII did not");
+    // Ha was analysed again: the patch it had is out of date.
+    assert_ne!(analysis_stamp(cfg, "Ha"), Some(before.analysis));
+    assert_eq!(h.state().w.previews.cached_key(7, "Ha"), Some(&before));
+    assert!(row_detail(&h, "Core").ends_with("out of date"));
+    // Shown again: merged afresh from the new analysis.
+    h.state_mut().w.look.rois = true;
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 2);
+    let after = wanted(h.state(), "Ha", CORE.2);
+    assert_ne!(after.analysis, before.analysis);
+    assert_eq!(h.state().w.previews.cached_key(7, "Ha"), Some(&after));
+    step_until_row(&mut h, "Core", "up to date");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_analysed_group_without_a_stamp_previews() {
+    // As in a session written before stopped analyses were recorded: Ha is
+    // analysed (it has a directory and needs no analysis) but no "analyze"
+    // entry lists it.
+    let (root, mut h, gate) = shown("previews-unstamped", &[CORE], |st| {
+        let cfg = &mut st.session.mosaic.config;
+        cfg.provenance.retain(|e| e.action != "analyze");
+    });
+    let cfg = &h.state().session.mosaic.config;
+    assert_eq!(analysis_stamp(cfg, "Ha"), None);
+    let key = PreviewKey::wanted(cfg, "Ha", CORE.2).expect("previewable");
+    assert_eq!(key.analysis, crate::previews::UNSTAMPED);
+    gate.open();
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 1);
+    step_until_row(&mut h, "Core", "up to date");
+    assert_eq!(h.state().w.previews.cached_key(7, "Ha"), Some(&key));
+    // A later analysis records a real stamp, replacing the sentinel: the
+    // patch is out of date, and merges again.
+    h.state_mut().w.look.rois = false;
+    {
+        let st = h.state_mut();
+        let id = st.jobs.start_analyze(&mut st.session);
+        st.w.track_analysis(id);
+    }
+    step_to(&mut h, |st| {
+        !st.jobs.busy() && analysis_stamp(&st.session.mosaic.config, "Ha").is_some()
+    });
+    h.run_steps(3);
+    assert!(row_detail(&h, "Core").ends_with("out of date"));
+    h.state_mut().w.look.rois = true;
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 2);
+    let after = wanted(h.state(), "Ha", CORE.2);
+    assert_ne!(after.analysis, crate::previews::UNSTAMPED);
+    assert_eq!(h.state().w.previews.cached_key(7, "Ha"), Some(&after));
+    step_until_row(&mut h, "Core", "up to date");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_empty_view_is_out_of_date_and_offers_no_compare() {
+    let (root, mut h, gate) = shown("previews-empty-view", &[CORE], |_| {});
+    gate.open();
+    step_until_row(&mut h, "Core", "up to date");
+    h.state_mut().w.mosaic.select_roi(7);
+    h.run_steps(3);
+    assert!(h.state().w.labelled.contains(&7), "Compare is offered");
+    // A composite that maps no group: nothing in view to preview, so no
+    // ROI is up to date and none offers Compare (it would do nothing).
+    {
+        let st = h.state_mut();
+        save_compositions(
+            &mut st.session.mosaic.config.ui,
+            &[Composition::new("Empty")],
+        );
+        st.w.select_view(ViewKind::Composition(0));
+    }
+    h.run_steps(5);
+    let st = h.state();
+    assert!(st.w.mosaic().members().is_empty());
+    assert_eq!(
+        st.w.previews.state(7, &[], &st.session),
+        PreviewState::OutOfDate
+    );
+    assert!(row_detail(&h, "Core").ends_with("out of date"));
+    assert!(!h.state().w.labelled.contains(&7));
+    assert!(h.query_by_label("Compare Core").is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_coarse_preview_says_so_on_its_row() {
+    // A patch of Core's tile, made as wanted now, coarse or not.
+    let put = |st: &mut State, coarse: bool| {
+        let key = PreviewKey::wanted(&st.session.mosaic.config, "Ha", CORE.2).unwrap();
+        let patch = mmm_core::mosaic::PreviewPatch {
+            rect: [0, 0, 256, 256],
+            width: 32,
+            height: 32,
+            channels: 3,
+            downsample: 8,
+            coarse,
+            data: vec![0.2; 32 * 32 * 3],
+        };
+        st.w.previews.insert_patch(7, "Ha", key, patch);
+    };
+    let (root, mut h, gate) = shown("previews-coarse", &[CORE], |st| put(st, true));
+    h.run_steps(3);
+    assert!(started(h.state()).is_empty(), "{:?}", log(h.state()));
+    let size = crate::rois::roi_size_text(CORE.2);
+    assert_eq!(
+        row_detail(&h, "Core"),
+        format!("{size} · up to date · coarse preview: merge mode not shown")
+    );
+    // The canvas label is unchanged.
+    let rect = h.state().w.mosaic().viewer_frame().unwrap().0;
+    assert!(painted_roi(&h, rect, "Core").is_some());
+    // A preview that shows the merge mode: no note.
+    put(h.state_mut(), false);
+    h.run_steps(3);
+    assert_eq!(row_detail(&h, "Core"), format!("{size} · up to date"));
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_moved_or_deleted_roi_drops_its_preview() {
     let (root, mut h, gate) = shown("previews-moved", &[CORE, HALO], |_| {});
     gate.open();

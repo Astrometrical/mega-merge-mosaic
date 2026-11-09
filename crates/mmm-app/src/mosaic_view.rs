@@ -460,6 +460,12 @@ impl MosaicView {
         self.rois.set_states(states);
     }
 
+    /// The ROIs whose preview in view is coarse, which their rows say
+    /// ([`RoiPanel::set_coarse`]).
+    pub fn set_roi_coarse(&mut self, ids: BTreeSet<u64>) {
+        self.rois.set_coarse(ids);
+    }
+
     /// The ROIs whose canvas label the window draws, with its controls
     /// ([`RoiPanel::set_labelled`]).
     pub fn set_roi_labelled(&mut self, ids: BTreeSet<u64>) {
