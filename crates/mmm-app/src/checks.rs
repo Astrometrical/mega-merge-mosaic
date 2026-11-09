@@ -19,10 +19,18 @@
 //! checks measure the seams with the feather of the group's last whole merge
 //! when it has one, else the draft's ([`group_feathers`]); the seam lines go
 //! into the report for the canvas. A whole-canvas merge ending re-runs the
-//! checks, and so does a draft feather change, once typing has paused for
-//! [`CHECKS_DEBOUNCE`].
+//! checks once no other whole-canvas merge is queued or running (Merge all
+//! runs them once, after its last merge, however that ends), and so does a
+//! draft feather change, once typing has paused for [`CHECKS_DEBOUNCE`].
+//!
+//! Measuring a group's seams is the run's costly part (a health pass over
+//! its L8 owner map), so a run measures again only the groups whose
+//! [`SeamKey`] changed (their analysis, panels, feather or merged state)
+//! and keeps the others' last seams ([`SeamCache`]): a draft feather pause
+//! measures the groups that follow the draft, a merge its group.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mmm_core::checks::{
@@ -31,7 +39,7 @@ use mmm_core::checks::{
 };
 use mmm_core::health::{SeamLine, health_with_lines};
 use mmm_core::mosaic::grouping::Groups;
-use mmm_core::mosaic::{Mosaic, MosaicConfig, PanelEntry};
+use mmm_core::mosaic::{Mosaic, MosaicConfig, PanelEntry, analysis_stamp};
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
@@ -84,6 +92,34 @@ fn draft_feathers(cfg: &MosaicConfig) -> BTreeMap<String, f32> {
         .collect()
 }
 
+/// What one group's seam checks and lines depend on: when it changes, its
+/// seams are measured again (a health pass over its L8 owner map, ~0.9 GB
+/// transient for 12 full-size panels); otherwise the last measure is kept.
+#[derive(Clone, Debug, PartialEq)]
+struct SeamKey {
+    /// The group's analysis: its newest `"analyze"` provenance entry
+    /// ([`analysis_stamp`]), and its session directory.
+    stamp: Option<usize>,
+    dir: Option<String>,
+    /// Its member panels.
+    panels: Vec<PathBuf>,
+    /// The feather they are measured with, and whether it is a merge's.
+    feather: GroupFeather,
+}
+
+/// One group's measured seams: its seam checks and seam lines.
+#[derive(Clone, Debug)]
+struct Seams {
+    checks: Vec<Check>,
+    lines: Vec<SeamLine>,
+}
+
+/// The last measured seams of each group, with what they were measured
+/// from. The engine keeps it between runs and hands it to each run's
+/// worker (moved, never copied or locked on the UI thread), which hands
+/// back the entries of the groups it saw.
+type SeamCache = BTreeMap<String, (SeamKey, Seams)>;
+
 /// One run's results.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChecksReport {
@@ -108,20 +144,36 @@ pub struct CheckCounts {
     pub passed: usize,
 }
 
+/// A finished run: its report, the seam cache to keep, and the groups
+/// whose seams it measured.
+struct ChecksRun {
+    report: ChecksReport,
+    cache: SeamCache,
+    /// The groups whose seams were measured, not taken from the cache
+    /// (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    measured: Vec<String>,
+}
+
 /// Run every check over `mosaic` (worker thread: reads panel headers and
 /// the groups' analyses). `groups`: the resolved groups, if known;
 /// otherwise they are resolved here. `aligned`: whether the input is
 /// pre-aligned (`None`: not known yet). `feathers`: the feather each group's
-/// seams are measured with.
+/// seams are measured with. `cache`: the seams measured before; a group
+/// whose [`SeamKey`] is unchanged keeps its entry, any other is measured
+/// again. The cache handed back holds the groups seen this run.
 fn run_checks(
     mosaic: &Mosaic,
     groups: Option<Groups>,
     aligned: Option<bool>,
     feathers: &BTreeMap<String, GroupFeather>,
-) -> ChecksReport {
+    mut cache: SeamCache,
+) -> ChecksRun {
     let cfg = &mosaic.config;
     let mut errors = Vec::new();
     let mut seams = BTreeMap::new();
+    let mut kept = SeamCache::new();
+    let mut measured = Vec::new();
     let mut facts = Vec::new();
     for p in &cfg.panels {
         match panel_facts(&p.path) {
@@ -146,7 +198,7 @@ fn run_checks(
     };
     checks.extend(file_checks(cfg));
     let names = groups.map(|g| g.processing_groups()).unwrap_or_default();
-    for (group, _) in names {
+    for (group, panels) in names {
         // Never analysed, out of date, or being analysed right now.
         if !cfg.group_dirs.contains_key(&group) || cfg.needs_analyze.contains(&group) {
             continue;
@@ -167,10 +219,29 @@ fn run_checks(
                     feather_px: draft_for(cfg, &group).feather_px,
                     merged: false,
                 });
-                match measure_seams(&session, &graph, feather.feather_px) {
-                    Ok(Some((health, lines))) => {
-                        checks.extend(seam_checks(&group, &session, &health, feather.merged));
-                        seams.insert(group.clone(), lines);
+                let key = SeamKey {
+                    stamp: analysis_stamp(cfg, &group),
+                    dir: cfg.group_dirs.get(&group).cloned(),
+                    panels,
+                    feather,
+                };
+                let found = match cache.remove(&group).filter(|(k, _)| *k == key) {
+                    Some((_, found)) => Ok(Some(found)),
+                    None => {
+                        measured.push(group.clone());
+                        measure_seams(&session, &graph, feather.feather_px).map(|m| {
+                            m.map(|(health, lines)| Seams {
+                                checks: seam_checks(&group, &session, &health, feather.merged),
+                                lines,
+                            })
+                        })
+                    }
+                };
+                match found {
+                    Ok(Some(found)) => {
+                        checks.extend(found.checks.iter().cloned());
+                        seams.insert(group.clone(), found.lines.clone());
+                        kept.insert(group.clone(), (key, found));
                     }
                     // No photometry yet: nothing to measure.
                     Ok(None) => {}
@@ -184,10 +255,14 @@ fn run_checks(
             )),
         }
     }
-    ChecksReport {
-        checks,
-        errors,
-        seams,
+    ChecksRun {
+        report: ChecksReport {
+            checks,
+            errors,
+            seams,
+        },
+        cache: kept,
+        measured,
     }
 }
 
@@ -212,7 +287,7 @@ fn measure_seams(
 
 /// Runs the checks off the UI thread and keeps the last report.
 pub struct ChecksEngine {
-    task: Option<Task<ChecksReport>>,
+    task: Option<Task<ChecksRun>>,
     /// A run is wanted (once the running one, if any, ends).
     dirty: bool,
     report: Option<ChecksReport>,
@@ -224,8 +299,17 @@ pub struct ChecksEngine {
     /// When the draft feather last changed, while a run waits for typing
     /// to pause.
     pending: Option<Instant>,
+    /// A whole-canvas merge has finished while others were still queued
+    /// or running: run once the last has ended, however it ended.
+    merge_waiting: bool,
+    /// The groups' last measured seams, handed to each run's worker and
+    /// taken back with its report ([`SeamCache`]).
+    seam_cache: SeamCache,
     /// How long typing must pause before the checks run again.
     debounce: Duration,
+    /// The groups whose seams the last run measured (tests).
+    #[cfg(test)]
+    measured: Vec<String>,
     /// Runs started (tests).
     #[cfg(test)]
     runs: usize,
@@ -248,9 +332,13 @@ impl ChecksEngine {
             panels_seen: Vec::new(),
             drafts_seen: None,
             pending: None,
+            merge_waiting: false,
+            seam_cache: SeamCache::new(),
             debounce: CHECKS_DEBOUNCE,
             #[cfg(test)]
             runs: 0,
+            #[cfg(test)]
+            measured: Vec::new(),
         }
     }
 
@@ -261,9 +349,10 @@ impl ChecksEngine {
     }
 
     /// Take a finished run, notice what calls for a new one (resolved
-    /// groups or inputs changed, a previews or analysis job or a
-    /// whole-canvas merge ended in `events`, a draft feather changed and
-    /// typing paused), and start it. Call every frame after the runner's poll.
+    /// groups or inputs changed, a previews or analysis job ended in
+    /// `events`, a whole-canvas merge finished and no other is queued or
+    /// running any more, a draft feather changed and typing paused), and
+    /// start it. Call every frame after the runner's poll.
     pub fn poll(
         &mut self,
         ctx: &egui::Context,
@@ -286,9 +375,14 @@ impl ChecksEngine {
         if let Some(task) = &self.task {
             match task.poll() {
                 Poll::Pending => {}
-                Poll::Done(report) => {
+                Poll::Done(run) => {
                     self.task = None;
-                    self.report = Some(report);
+                    self.report = Some(run.report);
+                    self.seam_cache = run.cache;
+                    #[cfg(test)]
+                    {
+                        self.measured = run.measured;
+                    }
                 }
                 Poll::Lost => {
                     self.task = None;
@@ -309,15 +403,23 @@ impl ChecksEngine {
         for event in events {
             self.dirty |= match event {
                 JobEvent::Finished { id, label } => {
+                    let merge = jobs.whole_canvas(*id)
+                        && matches!(jobs.target(*id), Some((JobTarget::Blend, _)));
+                    self.merge_waiting |= merge;
                     pipeline_job(Some(label))
-                        || (jobs.whole_canvas(*id)
-                            && matches!(jobs.target(*id), Some((JobTarget::Blend, _))))
                 }
                 JobEvent::Cancelled { id } | JobEvent::Failed { id, .. } => {
                     pipeline_job(jobs.label(*id))
                 }
                 JobEvent::Preview(_) => false,
             };
+        }
+        // Merge all: one run when the last whole-canvas merge has ended
+        // (finished, cancelled or failed), not one per merge alongside the
+        // next.
+        if self.merge_waiting && jobs.run_of(JobTarget::Blend).is_none() {
+            self.merge_waiting = false;
+            self.dirty = true;
         }
         self.watch_draft(ctx, &session.mosaic.config, now);
         if self.dirty && self.task.is_none() {
@@ -331,8 +433,9 @@ impl ChecksEngine {
             let groups = session.groups.clone();
             // No analysed frame yet: the input mode is unknown, so no distortion verdict.
             let aligned = session.frame.as_ref().map(|f| is_aligned(Some(f)));
+            let cache = std::mem::take(&mut self.seam_cache);
             self.task = Task::spawn("mmm-checks", ctx, move || {
-                run_checks(&mosaic, groups, aligned, &feathers)
+                run_checks(&mosaic, groups, aligned, &feathers, cache)
             });
         }
     }
@@ -596,6 +699,117 @@ mod tests {
         settle(&mut e, &s, &r);
         assert_eq!(e.runs, before + 1, "a whole merge");
         assert!(mmm_core::mosaic::last_merge_settings(&s.mosaic.config, "Ha").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Poll the runner, then the engine with its events, as the shell does
+    /// each frame, until no job is left (bounded); or, with `until`, until
+    /// job `until` has finished. Whether a checks run started meanwhile
+    /// while a whole-canvas merge was still running or queued.
+    fn follow_jobs(
+        e: &mut ChecksEngine,
+        s: &mut OpenSession,
+        r: &mut JobRunner,
+        until: Option<u64>,
+    ) -> bool {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        let mut early = false;
+        loop {
+            let events = r.poll(s);
+            let before = e.runs;
+            e.poll(&ctx, s, r, &events);
+            early |= e.runs > before && r.run_of(JobTarget::Blend).is_some();
+            let done = match until {
+                Some(id) => events
+                    .iter()
+                    .any(|ev| matches!(ev, JobEvent::Finished { id: f, .. } if *f == id)),
+                None => !r.busy(),
+            };
+            if done {
+                return early;
+            }
+            assert!(Instant::now() < deadline, "the jobs never finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn merge_all_runs_the_checks_once_after_the_last_merge() {
+        let (root, mut s, mut r) = analyzed("checks-merge-all");
+        let mut e = ChecksEngine::new();
+        settle(&mut e, &s, &r);
+        let before = e.runs;
+        // Merge all: each group's whole-canvas merge, queued together.
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        let early = follow_jobs(&mut e, &mut s, &mut r, None);
+        settle(&mut e, &s, &r);
+        assert!(!early, "no run while a merge is still to come");
+        assert_eq!(e.runs, before + 1, "one run, after the last merge");
+        // A queue that ends cancelled still runs them, once.
+        let before = e.runs;
+        let ha = r.start_blend(&mut s, "Ha", None);
+        let oiii = r.start_blend(&mut s, "OIII", None);
+        let early = follow_jobs(&mut e, &mut s, &mut r, Some(ha));
+        assert!(!early);
+        assert_eq!(e.runs, before, "waiting for OIII's merge");
+        r.cancel(oiii);
+        follow_jobs(&mut e, &mut s, &mut r, None);
+        settle(&mut e, &s, &r);
+        assert_eq!(e.runs, before + 1, "one run once the queue has ended");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seams_are_measured_again_only_where_their_inputs_changed() {
+        use crate::blend_settings::{load_draft, save_draft};
+        use mmm_core::settings::BlendSettings;
+        let (root, mut s, mut r) = analyzed("checks-seam-cache");
+        let mut e = ChecksEngine::new();
+        settle(&mut e, &s, &r);
+        assert_eq!(e.measured, ["Ha", "OIII"], "the first run measures all");
+        let first = e.report().unwrap().clone();
+        // Nothing changed: nothing measured again, the same report.
+        e.request();
+        settle(&mut e, &s, &r);
+        assert!(e.measured.is_empty(), "{:?}", e.measured);
+        assert_eq!(e.report(), Some(&first));
+        // Ha merged: its seams describe its merge now; OIII's are kept.
+        let ctx = egui::Context::default();
+        r.start_blend(&mut s, "Ha", None);
+        let events = crate::jobs::tests::drain(&mut r, &mut s);
+        e.poll(&ctx, &s, &r, &events);
+        settle(&mut e, &s, &r);
+        assert_eq!(e.measured, ["Ha"]);
+        // A draft feather change, once typing pauses: only the group that
+        // follows the draft (OIII; Ha has its merge's).
+        let t0 = Instant::now();
+        e.poll_at(&ctx, &s, &r, &[], t0);
+        let draft = load_draft(&s.mosaic.config);
+        let typed = BlendSettings {
+            feather_px: draft.feather_px + 8.0,
+            ..draft
+        };
+        save_draft(&mut s.mosaic.config.ui, &typed);
+        e.poll_at(&ctx, &s, &r, &[], t0 + Duration::from_millis(10));
+        e.poll_at(&ctx, &s, &r, &[], t0 + Duration::from_secs(5));
+        settle(&mut e, &s, &r);
+        assert_eq!(e.measured, ["OIII"]);
+        // Ha analysed again: Ha's.
+        let analysed = s.mosaic.config.settings_for("Ha").0;
+        s.mosaic.config.push_provenance(
+            "analyze",
+            None,
+            serde_json::json!({ "groups": { "Ha": analysed } }),
+        );
+        e.request();
+        settle(&mut e, &s, &r);
+        assert_eq!(e.measured, ["Ha"]);
+        // What is kept is what was measured: a fresh engine agrees.
+        let mut fresh = ChecksEngine::new();
+        settle(&mut fresh, &s, &r);
+        assert_eq!(fresh.report(), e.report());
         let _ = std::fs::remove_dir_all(&root);
     }
 
