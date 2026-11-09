@@ -349,8 +349,8 @@ mock-up (2026-11-09) and decided it ships in this version:
   updating live as settings change.
 - **A / B** on the label is a **toggle**: the selected side stays shown.
 - A **momentary switch** shows the *other* side only while held (from A it
-  peeks at B, from B at A). Three, all built so the user can keep the ones
-  that feel right on real panels:
+  peeks at B, from B at A). There are three, and all three stay, so each
+  user uses whichever feels natural:
   - holding **Space**;
   - pressing and holding the **selected** A / B button (clicking the other
     button switches to it);
@@ -358,9 +358,11 @@ mock-up (2026-11-09) and decided it ships in this version:
     pans).
 - **Use A** restores A's settings into the draft. **Done** leaves compare and
   keeps the draft.
-- The label's controls keep a stable position: the buttons come before the
-  settings text (the user's first suggestion; the other, the settings text
-  on a second row, can be tried in the mock-up and swapped in if preferred).
+- The label's controls keep a stable position. Outside compare the label is
+  one row (name, **Compare**, state). In compare the controls stay on the
+  first row (name, **A / B**, **Use A**, **Done**) and the settings text
+  ("A · feather 40 px · flatten 2") moves to a second row, so the buttons
+  never move as the text changes.
 - One ROI in compare at a time.
 
 ## 9. Problems and checks
@@ -632,8 +634,9 @@ four hard-coded ones).
   auto-merge of dirty ROIs in view, priority to the group or composite in
   view, cancel and restart on fast settings changes.
 - Compare A/B ships (mock-up tried 2026-11-09): controls on the canvas
-  label, A/B a toggle, momentary peeks at the other side (Space, holding the
-  selected button, holding on the preview), one ROI at a time (§8.3).
+  label, A/B a toggle, all three momentary peeks at the other side kept
+  (Space, holding the selected button, holding on the preview), the settings
+  text on a second label row only in compare, one ROI at a time (§8.3).
 - The inspector layout (option A), foldable. Problems sit alongside panels,
   ROIs and settings. "See all checks ›" ends the problems list. Settings
   findability is a focus area.

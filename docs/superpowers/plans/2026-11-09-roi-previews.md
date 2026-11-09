@@ -298,7 +298,11 @@ pub enum Side { A, B }
   - Pressing and holding the left mouse button on the compared ROI's preview peeks, on either canvas. A drag that moves past the drag threshold still pans and cancels the peek.
 - **Use A** puts A's settings back into the draft through the normal draft edit, so B re-merges and matches A. It then leaves compare. **Done** leaves compare and keeps the draft.
 - **Leaving compare:** compare also ends when the ROI is deleted or hidden, when the view's groups change, when an analysis starts, or when you leave the session.
-- **The label row:** name, then the controls (Compare, or A | B, Use A and Done), then the state text. The state text reads "A · feather {n} px · flatten {f}" or "B · …", and "B · merging…" while B re-merges. The buttons never move as the text changes.
+- **The label layout:**
+  - Outside compare it is one row: name, **Compare**, state ("up to date", "{name} · merging…" as in Task 5).
+  - In compare, the first row holds the controls: name, **A | B**, **Use A**, **Done**. The settings text moves to a second row: "A · feather {n} px · flatten {f}", or "B · …", or "B · merging…" while B re-merges.
+  - The buttons never move as the text changes.
+- **All three momentary switches are permanent features** (the user's decision), not experiments.
 - **Accessibility:** the A and B buttons expose their pressed state, and a peek is announced through the label's description. A peek is shown by more than colour: an underline on the shown button.
 
 - [ ] **Step 1: Write the failing tests:**
