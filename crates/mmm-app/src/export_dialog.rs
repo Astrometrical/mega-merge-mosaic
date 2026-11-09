@@ -13,8 +13,9 @@
 //!    queued; otherwise it is greyed with its reason as text ("not
 //!    merged", "out of date", "maps no groups", "missing group {g}",
 //!    "merging…"), which is also its accessible description. "Settings
-//!    changed" never stops a row. On opening, the ready rows are ticked:
-//!    all of them, or with a remembered selection, the remembered ones.
+//!    changed" never stops a row. On opening, every ready row is ticked but
+//!    those the user unticked before ([`Choices::excluded`]): a group merged
+//!    or a composite made since starts ticked too.
 //! 3. **Folder**: typed, or picked with **Browse…** (a native folder dialog
 //!    on a worker, [`FolderPicker`]).
 //! 4. **Format**: FITS or TIFF, with a one-line note on what it holds.
@@ -47,7 +48,7 @@
 //!    or an analysis runs; the reason is its tooltip, and shows in the
 //!    body too (a disabled button takes no keyboard focus).
 //!
-//! **Export** remembers the folder, format, pattern and the rows exported
+//! **Export** remembers the folder, format, pattern and the rows unticked
 //! in the session's `ui` under [`EXPORT_KEY`] (saved with the window's
 //! next save), starts one export job per ticked row
 //! ([`JobRunner::start_export`]) and closes. A job may replace its file
@@ -87,7 +88,10 @@ use crate::session_window::{compositions_of, counted, out_of_date};
 use crate::util::{Poll, Task, group_names, plain_path};
 
 /// Key in `MosaicConfig.ui` of the remembered choices: `{ folder, format:
-/// "fits" | "tiff", pattern, selection: [ {group: name} | {composite: id} ] }`.
+/// "fits" | "tiff", pattern, excluded: [ {group: name} | {composite: id} ]
+/// }`, `excluded` being the rows the user unticked. A `selection` saved by
+/// an earlier build (the rows exported) is not read, and goes with the next
+/// save.
 pub const EXPORT_KEY: &str = "export";
 /// The file name pattern until another is chosen.
 pub const DEFAULT_PATTERN: &str = "{session}_{name}";
@@ -256,7 +260,7 @@ fn safe_stem(stem: &str) -> String {
     safe
 }
 
-/// A row of the dialog, as remembered in the selection: a group by name or
+/// A row of the dialog, as remembered among the exclusions: a group by name or
 /// a composite by id (a composite may share a group's name).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -276,9 +280,9 @@ pub struct Choices {
     pub format: ExportFormat,
     /// The file name pattern.
     pub pattern: String,
-    /// The rows exported last; `None` before any export (every ready row
-    /// starts ticked then).
-    pub selection: Option<Vec<Pick>>,
+    /// The rows the user unticked: they start unticked, and every other
+    /// ready row starts ticked (one created or merged since, too).
+    pub excluded: Vec<Pick>,
 }
 
 impl Choices {
@@ -286,8 +290,11 @@ impl Choices {
     /// read by itself: one missing or malformed (a blank folder or pattern,
     /// a format other than "fits" or "tiff") is its default: `folder`
     /// (where the session folder is; written without Windows' verbatim
-    /// prefix, [`plain_path`]), FITS, [`DEFAULT_PATTERN`], no selection. A
-    /// malformed entry of the selection is skipped.
+    /// prefix, [`plain_path`]), FITS, [`DEFAULT_PATTERN`], nothing
+    /// excluded. A malformed entry of `excluded` is skipped. A `selection`
+    /// an earlier build saved (the rows exported, not those left out) is
+    /// ignored: read as exclusions it would leave out every row made
+    /// since, and every ready row starting ticked is the spec's rule.
     pub fn load(ui: &Value, folder: &Path) -> Self {
         let saved = ui.get(EXPORT_KEY).filter(|v| v.is_object());
         let text = |key: &str| {
@@ -301,19 +308,20 @@ impl Choices {
             Some("tiff") => ExportFormat::Tiff,
             _ => ExportFormat::Fits,
         };
-        let selection = saved
-            .and_then(|s| s.get("selection"))
+        let excluded = saved
+            .and_then(|s| s.get("excluded"))
             .and_then(Value::as_array)
             .map(|list| {
                 list.iter()
                     .filter_map(|v| serde_json::from_value::<Pick>(v.clone()).ok())
                     .collect()
-            });
+            })
+            .unwrap_or_default();
         Choices {
             folder: text("folder").unwrap_or_else(|| plain_path(folder)),
             format,
             pattern: text("pattern").unwrap_or_else(|| DEFAULT_PATTERN.into()),
-            selection,
+            excluded,
         }
     }
 
@@ -331,10 +339,8 @@ impl Choices {
         };
         saved.insert("format".into(), format.into());
         saved.insert("pattern".into(), self.pattern.clone().into());
-        if let Some(selection) = &self.selection
-            && let Ok(v) = serde_json::to_value(selection)
-        {
-            saved.insert("selection".into(), v);
+        if let Ok(v) = serde_json::to_value(&self.excluded) {
+            saved.insert("excluded".into(), v);
         }
         if let Some(obj) = ui.as_object_mut() {
             obj.insert(EXPORT_KEY.into(), Value::Object(saved));
@@ -507,6 +513,9 @@ struct Looking {
 /// The dialog while open: the choices being made, and the lookups.
 struct Choosing {
     ticked: BTreeSet<Pick>,
+    /// The rows the user unticked: the remembered ones, as ticked and
+    /// unticked since.
+    excluded: BTreeSet<Pick>,
     folder: String,
     format: ExportFormat,
     pattern: String,
@@ -577,28 +586,24 @@ impl ExportDialog {
     }
 
     /// Open the dialog on `session`'s remembered choices (else the
-    /// defaults: beside the session folder, FITS, [`DEFAULT_PATTERN`]), its
-    /// ready rows ticked (with a remembered selection, those of it). No
-    /// I/O. Nothing if it is open already.
+    /// defaults: beside the session folder, FITS, [`DEFAULT_PATTERN`]),
+    /// every ready row ticked but those the user unticked
+    /// ([`Choices::excluded`]). No I/O. Nothing if it is open already.
     pub fn open(&mut self, session: &OpenSession, jobs: &JobRunner) {
         if self.open.is_some() {
             return;
         }
         let dir = &session.mosaic.dir;
         let choices = Choices::load(&session.mosaic.config.ui, dir.parent().unwrap_or(dir));
+        let excluded: BTreeSet<Pick> = choices.excluded.into_iter().collect();
         let ticked = rows(session, jobs)
             .into_iter()
-            .filter(|r| r.tickable())
-            .filter(|r| {
-                choices
-                    .selection
-                    .as_ref()
-                    .is_none_or(|chosen| chosen.contains(&r.pick))
-            })
+            .filter(|r| r.tickable() && !excluded.contains(&r.pick))
             .map(|r| r.pick)
             .collect();
         self.open = Some(Choosing {
             ticked,
+            excluded,
             folder: choices.folder,
             format: choices.format,
             pattern: choices.pattern,
@@ -820,11 +825,17 @@ impl Choosing {
         shown: &Shown,
     ) -> bool {
         let folder = PathBuf::from(self.folder.trim());
+        // The rows unticked, of those the session still has.
+        let excluded = rows
+            .iter()
+            .filter(|r| self.excluded.contains(&r.pick))
+            .map(|r| r.pick.clone())
+            .collect();
         let choices = Choices {
             folder: self.folder.trim().to_string(),
             format: self.format,
             pattern: self.pattern.clone(),
-            selection: Some(shown.chosen.iter().map(|&i| rows[i].pick.clone()).collect()),
+            excluded,
         };
         choices.save(&mut session.mosaic.config.ui);
         for ((&i, name), &replace) in shown.chosen.iter().zip(&shown.names).zip(&shown.exists) {
@@ -976,7 +987,7 @@ fn body(
         .max_height(body_max_height(ui))
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            rows_ui(ui, rows, &mut c.ticked);
+            rows_ui(ui, rows, &mut c.ticked, &mut c.excluded);
             ui.add_space(space::M);
             if settings_ui(ui, c, shown) {
                 act = Some(Act::Browse);
@@ -1040,7 +1051,12 @@ fn body_max_height(ui: &egui::Ui) -> f32 {
 
 /// The counts, then the rows: the groups, then the composites, each part
 /// under its heading.
-fn rows_ui(ui: &mut egui::Ui, rows: &[Row], ticked: &mut BTreeSet<Pick>) {
+fn rows_ui(
+    ui: &mut egui::Ui,
+    rows: &[Row],
+    ticked: &mut BTreeSet<Pick>,
+    excluded: &mut BTreeSet<Pick>,
+) {
     let groups = rows
         .iter()
         .filter(|r| matches!(r.pick, Pick::Group(_)))
@@ -1062,14 +1078,20 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[Row], ticked: &mut BTreeSet<Pick>) {
         ui.add_space(space::S);
         ui.label(text(Type::Overline, heading));
         for r in part {
-            row_ui(ui, r, ticked);
+            row_ui(ui, r, ticked, excluded);
         }
     }
 }
 
 /// A row: its checkbox (disabled unless it can be ticked) and, when it
-/// cannot, its reason as text, also its checkbox's description.
-fn row_ui(ui: &mut egui::Ui, row: &Row, ticked: &mut BTreeSet<Pick>) {
+/// cannot, its reason as text, also its checkbox's description. Unticked,
+/// the row is `excluded` (it starts unticked next time); ticked, no more.
+fn row_ui(
+    ui: &mut egui::Ui,
+    row: &Row,
+    ticked: &mut BTreeSet<Pick>,
+    excluded: &mut BTreeSet<Pick>,
+) {
     ui.horizontal(|ui| {
         let tickable = row.tickable();
         let mut on = tickable && ticked.contains(&row.pick);
@@ -1083,8 +1105,10 @@ fn row_ui(ui: &mut egui::Ui, row: &Row, ticked: &mut BTreeSet<Pick>) {
         if r.changed() && tickable {
             if on {
                 ticked.insert(row.pick.clone());
+                excluded.remove(&row.pick);
             } else {
                 ticked.remove(&row.pick);
+                excluded.insert(row.pick.clone());
             }
         }
     });
@@ -1304,7 +1328,7 @@ mod tests {
             folder: "/somewhere".into(),
             format: ExportFormat::Fits,
             pattern: DEFAULT_PATTERN.into(),
-            selection: None,
+            excluded: Vec::new(),
         };
         // Nothing saved, or not an object.
         assert_eq!(Choices::load(&json!({}), folder), defaults);
@@ -1314,21 +1338,25 @@ mod tests {
             "folder": 3,
             "format": "xisf",
             "pattern": " ",
-            "selection": [{"group": "Ha"}, {"bad": 1}, {"composite": 2}, "x"],
+            "excluded": [{"group": "Ha"}, {"bad": 1}, {"composite": 2}, "x"],
         }});
         assert_eq!(
             Choices::load(&saved, folder),
             Choices {
-                selection: Some(vec![Pick::Group("Ha".into()), Pick::Composite(2)]),
+                excluded: vec![Pick::Group("Ha".into()), Pick::Composite(2)],
                 ..defaults.clone()
             }
         );
+        // The rows an earlier build saved as exported are not read: every
+        // ready row starts ticked.
+        let old = json!({EXPORT_KEY: {"selection": [{"group": "Ha"}]}});
+        assert_eq!(Choices::load(&old, folder), defaults);
         // What is saved loads back.
         let chosen = Choices {
             folder: "/out".into(),
             format: ExportFormat::Tiff,
             pattern: "{name}".into(),
-            selection: Some(vec![Pick::Composite(4), Pick::Group("OIII".into())]),
+            excluded: vec![Pick::Composite(4), Pick::Group("OIII".into())],
         };
         let mut ui = json!({"other": 1});
         chosen.save(&mut ui);
@@ -1338,7 +1366,7 @@ mod tests {
                 "folder": "/out",
                 "format": "tiff",
                 "pattern": "{name}",
-                "selection": [{"composite": 4}, {"group": "OIII"}],
+                "excluded": [{"composite": 4}, {"group": "OIII"}],
             })
         );
         assert_eq!(ui["other"], 1, "the rest of ui is kept");

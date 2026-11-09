@@ -1624,8 +1624,9 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   (`Readiness::reason`: "not merged", "out of date", "maps no groups",
   "missing group {g}", "merging…"), which is also its accessible
   description. A group with only its settings changed is still ready. On
-  opening, the ready rows are ticked (the remembered ones when there is a
-  remembered selection). Then the folder (typed, or **Browse…** through a
+  opening, every ready row is ticked except those the user unticked before
+  (`Choices::excluded`), so a group merged or a composite made since starts
+  ticked too (spec §14: the common case is one click). Then the folder (typed, or **Browse…** through a
   native dialog on a worker), the format (FITS or TIFF) and the file name
   pattern: `{session}` and `{name}` (`file_names` makes names safe for any
   file system, including Windows reserved device names; the default is
@@ -1643,10 +1644,15 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   already exist and will be replaced" and Export becomes **Overwrite and
   export**. The disabled Export's reason is its tooltip and shows in the
   body. **Export** saves the choices under `ui.export` (`EXPORT_KEY`:
-  folder, format, pattern, and the selection as `{group: name}` or
-  `{composite: id}` entries), starts one job per ticked row and closes;
-  **Cancel**, Esc and a click on the backdrop close it, keeping nothing. A
-  failed export is a toast, never a dialog message.
+  folder, format, pattern, and `excluded`, the rows unticked by hand as
+  `{group: name}` or `{composite: id}` entries, of those the session still
+  has; ticking a row again takes it out), starts one job per ticked row and
+  closes. A `selection` saved by earlier builds (the rows exported) is
+  ignored and goes with the next save: read as "everything else excluded"
+  it would leave out what was made since. **Cancel**, Esc and a click on
+  the backdrop close it, keeping nothing; closed from the keyboard, the
+  focus goes back to what opened it (`Dialog::close`). A failed export is a
+  toast, never a dialog message.
 - **The dialog frame** (`mega_ui::widgets::Dialog`, `dialog.rs`). A modal on
   `egui::Modal`: a backdrop, a titled card (`DIALOG_WIDTH`), a body closure
   and `DialogResponse { inner, close }` (Esc or a backdrop click). Keyboard

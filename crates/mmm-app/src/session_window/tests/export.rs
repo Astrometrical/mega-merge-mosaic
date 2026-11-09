@@ -465,7 +465,7 @@ fn choices_are_remembered() {
         "folder": out_text,
         "format": "tiff",
         "pattern": "{name}",
-        "selection": [{"group": "Ha"}],
+        "excluded": [{"group": "OIII"}],
     });
     assert_eq!(h.state().session.mosaic.config.ui[EXPORT_KEY], want);
     let dir = h.state().session.mosaic.dir.clone();
@@ -475,7 +475,7 @@ fn choices_are_remembered() {
     super::super::top_bar::cancel_step(EXPORT_STEP, &mut h.state_mut().jobs);
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
-    // Opened again: as chosen; OIII, ready but not chosen, stays unticked.
+    // Opened again: as chosen; OIII, ready but unticked, stays unticked.
     open_dialog(&mut h);
     let expect = |h: &Harness<'static, State>| {
         let d = h.state().w.export_dialog();
@@ -498,6 +498,60 @@ fn choices_are_remembered() {
     step_until(&mut h, |st| st.w.view().is_some());
     open_dialog(&mut h);
     expect(&h);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_row_ready_later_starts_ticked() {
+    let (root, mut s) = ready_session("export-ready-later");
+    // SII, a third group (by hand), is not merged yet.
+    for p in &mut s.mosaic.config.panels[6..] {
+        p.manual_group = Some("SII".into());
+    }
+    s.groups = s.mosaic.groups().ok();
+    let mut h = shown(s, runner());
+    // Exported with OIII unticked.
+    open_dialog(&mut h);
+    assert_eq!(row_state(&h, "SII"), greyed("not merged"));
+    row(&h, "OIII").click();
+    settle(&mut h);
+    let gate = h.state_mut().jobs.hold_exports();
+    footer_button(&h, "Export").click();
+    h.run_steps(2);
+    assert_eq!(labels(&h.state().jobs), ["Export Ha"]);
+    super::super::top_bar::cancel_step(EXPORT_STEP, &mut h.state_mut().jobs);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
+    // Then SII is merged and a composite made: both start ticked; only the
+    // row unticked stays so.
+    {
+        let session = &mut h.state_mut().session;
+        session.results.insert("SII".into(), ResultState::Complete);
+        save_compositions(
+            &mut session.mosaic.config.ui,
+            &[comp(1, "SHO", [Some("SII"), Some("Ha"), Some("OIII")])],
+        );
+    }
+    h.run_steps(2);
+    open_dialog(&mut h);
+    assert_eq!(row_state(&h, "Ha"), ticked());
+    assert_eq!(row_state(&h, "OIII"), (true, false, None));
+    assert_eq!(row_state(&h, "SII"), ticked());
+    assert_eq!(row_state(&h, "SHO"), ticked());
+    // Ticked again by hand, it is not left out any more.
+    row(&h, "OIII").click();
+    settle(&mut h);
+    let gate = h.state_mut().jobs.hold_exports();
+    footer_button(&h, "Export").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().session.mosaic.config.ui[EXPORT_KEY]["excluded"],
+        json!([])
+    );
+    super::super::top_bar::cancel_step(EXPORT_STEP, &mut h.state_mut().jobs);
+    gate.open();
+    step_until(&mut h, |st| !st.jobs.busy());
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -556,16 +610,16 @@ fn a_composite_with_a_missing_group_is_not_exportable() {
             comp(3, "Fine", [Some("Ha"), Some("OIII"), None]),
         ],
     );
-    // Even when it was chosen last time.
+    // Even when it was not left out last time (the groups were).
     s.mosaic.config.ui[EXPORT_KEY] = json!({
-        "selection": [{"composite": 1}, {"composite": 2}, {"composite": 3}],
+        "excluded": [{"group": "Ha"}, {"group": "OIII"}],
     });
     let mut h = shown(s, runner());
     open_dialog(&mut h);
     assert_eq!(row_state(&h, "Gone"), greyed("missing group SII"));
     assert_eq!(row_state(&h, "Half"), greyed("missing group SII"));
     assert_eq!(row_state(&h, "Fine"), ticked());
-    // The groups were not chosen last time.
+    // The groups were left out last time.
     assert_eq!(row_state(&h, "Ha"), (true, false, None));
     let st = h.state();
     let gone = ExportTarget::Composite {
