@@ -1016,9 +1016,9 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   R, G or B × weight; overlaps within one group add up (a known limitation).
 - **ROIs and composite views**: ROIs live in `ui.rois` (name, note, sky
   corners when the frame has a WCS, canvas rect), are reprojected through
-  the analysed frame on a worker, and show their size and the fraction of
-  fresh level-0 tiles per group of the view. Merging an ROI merges it once
-  per group of the view (not while the ROIs are being reprojected). Composite
+  the analysed frame on a worker, and show their size (phase 2 also showed
+  the fraction of fresh level-0 tiles and merged an ROI per group; both went
+  in plan 4, see "Transient ROI previews (plan 4)"). Composite
   views mix each member group's tiles (through its own stretch) on the
   viewer's loader threads (`CompositeTileSource`); members must share one
   canvas, and a member not merged yet adds nothing and is named above the
@@ -1029,7 +1029,7 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
 ## Standalone app (phase 3, 2026-11)
 
 Phase 3 adds the panel list and the plan, cached previews, an automatic
-preview-then-analysis pipeline, a checks engine, Blend ROIs, composition
+preview-then-analysis pipeline, a checks engine, ROIs, composition
 views and export. No algorithm changed. Core additions are bookkeeping
 (`set_inputs`, the lock), `preview` and `export`.
 
@@ -1071,7 +1071,7 @@ views and export. No algorithm changed. Core additions are bookkeeping
   `run`). Previews derive and keep their own frame
   (`previews/frame.mmm-frame.json`) and never write the analysed one. Plan
   places panels in the previews' frame (the analysed one until a complete
-  previews run has saved one); ROI reprojection, Blend ROI and blends use the
+  previews run has saved one); ROI reprojection, ROI previews and blends use the
   analysed frame, so adding panels never moves a persisted ROI before the
   analysis that changes the blend's canvas. The app keeps the analysed frame
   in memory (`OpenSession::frame`, read on open and after each analysis).
@@ -1209,10 +1209,9 @@ views and export. No algorithm changed. Core additions are bookkeeping
   reprojected through the analysed frame after each analysis, so it follows
   the frame when the analysis of changed panels moves it (a rotated
   re-derive grows the box slightly; without a WCS the canvas rect is used as
-  stored). Merging an ROI merges it once per group of the current view
-  with the merge settings draft, uncommitted (ROI merges stay out of the
-  step strip; see "Merge jobs carry their settings" below); **Merge** merges
-  every group.
+  stored). Phase 3 merged an ROI into the stores; since plan 4 an ROI is
+  previewed in memory instead ("Transient ROI previews (plan 4)" below), and
+  **Merge** merges every group.
 - **Export.** `mmm_core::export` writes a group's result for the whole canvas
   as linear 32-bit float, **unclamped**: FITS (WCS cards plus `HISTORY`
   provenance: mmm version and the group's latest blend settings) or TIFF
@@ -1274,8 +1273,8 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   without the group in a session of one group (an OSC mosaic: "Merging · 43
   %"; its jobs and toasts are "Merge" and "Merge finished"). A step that
   cannot act now says why in its tooltip (Merge: the merge guard's reason;
-  Export: `MosaicView::export_block_reason`). ROI merges are not shown in
-  the strip.
+  Export: `MosaicView::export_block_reason`). ROI previews are not jobs and
+  not shown in the strip.
 - **Merge states and predicates** (`steps.rs`). One set of predicates
   derives every place's Merge state. `out_of_date(session, group)`: the
   group's result is not Complete, it needs analysis, or a region of it was
@@ -1390,10 +1389,10 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   in the mapping until the run ends, and `blend_tiles` can fail before the
   sink exists), so neither replaces the other.
 - **ROI merges are gone from the app (plan 4).** The ROI list no longer
-  has "Merge ROI" (`MosaicView::merge_roi`, `JobRunner::start_blend_with` and
-  `blend_settings::draft_for` are removed); a region is drawn on either
-  canvas (**Draw ROI** or `D` arms the shown canvas's draw tool), named
-  "Region n", and previews of it are transient (tasks 5-6) rather than
+  has "Merge ROI" (`MosaicView::merge_roi` and `JobRunner::start_blend_with`
+  are removed; `blend_settings::draft_for` is kept, now the settings a
+  preview is made with); a region is drawn on either canvas and previews of
+  it are transient ("Transient ROI previews (plan 4)" below) rather than
   written into a store. `JobRunner::start_blend` still accepts a rect and
   mmm-core keeps ROI plans (never `fresh`) and
   `mmm_core::mosaic::region_differs` (a `whole: false` entry newer than the
@@ -1486,14 +1485,90 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   change the session is taken down when the session closes or another
   opens (`Toasts::dismiss`).
 
+## Transient ROI previews (plan 4, 2026-11)
+
+Spec §8. A region of interest shows what a merge of it would look like with
+the current merge settings draft, without a merge: nothing is written to a
+store, to provenance or to `mosaic.json`.
+
+- **Core entry** (`mmm_core::mosaic::preview`). `plan_preview(m, group,
+  rect, settings)` reads no file (it refuses a group never analysed or with
+  `needs_analyze`); `run_preview(&PreviewPlan, &JobCtl)` opens the group's
+  `Session`, aligns the rect outward to tiles and blends it into a
+  `PreviewPatch` (planar `f32`, tile-aligned `rect`, `downsample`) on any
+  thread, cancellably (stage `"preview"`). At downsample 1 the patch equals
+  the stored tiles of a whole merge there. `PREVIEW_MAX_PIXELS` (2048²)
+  caps the patch: a rect over it is blended at downsample 8 (the blend
+  supports only 1 and 8, `preview_downsample`); a rect over the cap even
+  then is refused. Reading panels may fill the derived decoded-panel cache,
+  as any panel read does.
+- **Runner, cache and scheduler** (`previews.rs`, `Previews`). One worker
+  thread ("mmm-preview"), not the `JobRunner`: no job event, no toast, no
+  strip entry. Patches are cached by `(ROI id, group)` with the
+  `PreviewKey` they were made from: the ROI's canvas rect, the draft as the
+  group merges with it (`draft_for`, the override applied) and the group's
+  analysis stamp (`mmm_core::mosaic::analysis_stamp`: the index of the
+  newest `"analyze"` provenance entry listing the group, which moves on
+  every re-analysis). A cached key unlike `PreviewKey::wanted` makes the
+  ROI out of date (`PreviewState`: Merging, UpToDate, OutOfDate). Each frame
+  `poll` delivers a finished patch (dropped if cancelled or its key is no
+  longer wanted; a failure is logged, no toast, and not retried with the
+  same key) and `schedule` cancels a running preview that is no longer
+  wanted, then, with the worker idle, starts the most urgent entry whose
+  key differs (`Wanted::priority`: groups in view first, then nearest the
+  view's centre). One preview is in flight and nothing is queued, so edits
+  faster than previews never build a backlog. The cache is an LRU by last
+  drawn up to `PREVIEW_CACHE_BYTES` (1 GiB), never evicting the patch just
+  made. `keep_rois` and `forget_roi` drop patches of ROIs moved or deleted;
+  `stop` (leaving the session) cancels and hands the worker's handle to the
+  session reaper so the session lock outlives it.
+- **Drawing** (`preview_draw.rs`, `PatchTextures`). A patch becomes a
+  texture on a worker (`convert`), with the stretch of the canvas beneath
+  it (read, never changing the display stretch), and goes to the canvas as
+  a `canvas_layers::Patch` clipped to its ROI. A group view has one layer; a
+  composite one layer per member, tinted and added like the canvas's
+  composite; on the plan a patch takes its group's colour. A texture is
+  re-converted only when a layer's patch, stretch, tint or mode changes; the
+  old one shows meanwhile. The plan shows no ROIs or patches, and cannot arm
+  a draw, while its frame differs from the analysed one
+  (`PlanView::frame_matches`).
+- **ROIs on both canvases** (`rois.rs`, `session_window/sections.rs`). Each
+  `Roi` has an `id` (unique, never reused while the session is open;
+  entries saved without one get fresh ids on load) and new ones are named
+  "Region n" (`unique_roi_name`; older "ROI n" names stay). **Draw ROI** or
+  `D` arms the draw tool (`canvas_layers::Tool::DrawRect`) on the canvas
+  shown, mosaic or plan; the rect is stored sky-anchored as before. The ROI
+  list is a mega-ui `ordered_list`: a click selects and frames the ROI on the
+  canvas shown, double-click or F2 renames, drag or Move up / Move down
+  reorders, and Delete removes it with a toast whose **Undo** puts it back.
+  The row shows the preview state. `R` toggles the overlays.
+- **mega-ui pieces.** `canvas_layers` is what both canvases share for
+  drawing over their content: `Overlay` rectangles, image `Patch`es, the
+  `Tool` in progress, and `Hold` (a primary press held on the canvas; past
+  the click distance it is a drag). `widgets::ordered_list` reports
+  `ListEvent`s and changes nothing itself. `widgets::CanvasLabel` is a name,
+  a row of controls and a line of text over a canvas rect, kept inside the
+  canvas (it slides left, drops below `avoid` rects such as the canvas's own
+  buttons, and is lifted inside the bottom edge); the window anchors it at
+  the ROI's visible top-left. It reports the control clicked and the control
+  held. All three are in the gallery, which is paged (several snapshot images
+  of at most 4096 pt) so new sections never exceed the texture cap.
+- **Compare A / B** is described under "Standalone app: the session
+  window" above (`session_window/compare.rs`, `previews::Compare`): the
+  toggle, the three momentary peeks (Space only with no widget focused, the
+  selected button held, the preview held), **Use A** (A's settings back
+  through the draft and A's patches back into the cache, so nothing
+  re-merges), **Done**, when compare ends, and the label layout (one row;
+  the shown side's settings on a second row in compare). Compare shows only
+  on the selected ROI's label and the compared ROI.
+
 ## Coming in project 3
 
-Plans 2 (the panel list and grouping) and 3 (draft merge settings and
-per-group staleness, in the session window above) are built. Plans 4-6 of
-project 3 change the session window as follows; none of it is built yet.
+Plans 2 (the panel list and grouping), 3 (draft merge settings and
+per-group staleness) and 4 (ROIs, transient previews and Compare A/B), in the
+session window above, are built. Plans 5 and 6 of project 3 change it as
+follows; none of it is built yet.
 
-- **Plan 4, ROIs.** An ROI list with transient previews, drawing an ROI on the
-  plan, and the Draw ROI shortcut.
 - **Plan 5, composites and export.** A composites popover and the new Export
   dialog.
 - **Plan 6, checks and overlays.** New checks and badges, click-to-zoom from
