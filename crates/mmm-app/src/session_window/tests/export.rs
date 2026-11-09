@@ -124,13 +124,18 @@ fn field<'h>(h: &'h Harness<'static, State>, label: &'h str) -> egui_kittest::No
     h.get_by_role_and_label(Role::TextInput, label)
 }
 
-/// Replace what the text field `label` holds with `text`, as typed.
+/// Replace what the text field `label` holds with `text`, as typed (the
+/// field keeps the keyboard).
 fn retype(h: &mut Harness<'static, State>, label: &str, text: &str) {
     field(h, label).focus();
     h.step();
     h.key_combination_modifiers(Modifiers::COMMAND, &[Key::A]);
     h.step();
-    field(h, label).type_text(text);
+    if text.is_empty() {
+        h.key_press(Key::Backspace);
+    } else {
+        field(h, label).type_text(text);
+    }
     h.run_steps(2);
 }
 
@@ -332,6 +337,51 @@ fn colliding_names_block_export() {
 }
 
 #[test]
+fn a_folder_that_cannot_take_the_files_blocks_export() {
+    let (root, s) = ready_session("export-folder");
+    let out = root.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let mut h = shown(s, runner());
+    open_dialog(&mut h);
+    // Beside the session folder, where a file could be created.
+    let tried = |h: &Harness<'static, State>| {
+        h.state()
+            .w
+            .export_dialog()
+            .write_tried()
+            .map(std::path::Path::to_path_buf)
+    };
+    let root_text = crate::util::plain_path(&root);
+    assert_eq!(tried(&h), Some(PathBuf::from(&root_text)));
+    assert!(!footer_disabled(&h, "Export"));
+    // Each problem is said beside the folder, and Export waits.
+    let gone = crate::util::plain_path(&root.join("gone"));
+    for (typed, why) in [
+        (gone.as_str(), "The folder doesn't exist"),
+        ("out", "Give the folder's full path"),
+        ("", "Choose a folder."),
+    ] {
+        retype(&mut h, "Folder", typed);
+        settle(&mut h);
+        h.get_by_label(why);
+        assert!(footer_disabled(&h, "Export"), "{why}");
+    }
+    // Typed, nothing is tried in a folder (not in every one on the way).
+    let out_text = crate::util::plain_path(&out);
+    retype(&mut h, "Folder", &out_text);
+    settle(&mut h);
+    assert_eq!(tried(&h), Some(PathBuf::from(&root_text)));
+    // Left, it is tried, and Export can go.
+    h.key_press(Key::Tab);
+    settle(&mut h);
+    assert_eq!(tried(&h), Some(PathBuf::from(&out_text)));
+    assert!(!footer_disabled(&h, "Export"));
+    assert_eq!(files_in(&out), BTreeSet::new(), "the try left nothing");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn existing_files_need_overwrite() {
     let (root, s) = ready_session("export-overwrite");
     let ha = root.join("m_Ha.fits");
@@ -418,17 +468,19 @@ fn choices_are_remembered() {
     h.run_steps(2);
     assert!(!h.state().w.export_open());
     assert_eq!(labels(&h.state().jobs), ["Export Ha"]);
-    // Kept in the session's settings, saved with them.
-    assert_eq!(
-        h.state().session.mosaic.config.ui[EXPORT_KEY],
-        json!({
-            "folder": out_text,
-            "format": "tiff",
-            "pattern": "{name}",
-            "selection": [{"group": "Ha"}],
-        })
-    );
-    assert!(h.state().w.save.pending(), "the save is due");
+    // Kept in the session's settings, and saved with them (the window's
+    // save, rate-limited).
+    let want = json!({
+        "folder": out_text,
+        "format": "tiff",
+        "pattern": "{name}",
+        "selection": [{"group": "Ha"}],
+    });
+    assert_eq!(h.state().session.mosaic.config.ui[EXPORT_KEY], want);
+    let dir = h.state().session.mosaic.dir.clone();
+    step_until(&mut h, |_| {
+        mmm_core::mosaic::Mosaic::open(&dir).is_ok_and(|m| m.config.ui[EXPORT_KEY] == want)
+    });
     super::super::top_bar::cancel_step(EXPORT_STEP, &mut h.state_mut().jobs);
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
@@ -445,7 +497,7 @@ fn choices_are_remembered() {
     expect(&h);
     // Cancel keeps nothing of what changed meanwhile.
     h.get_by_label("FITS").click();
-    h.run_steps(2);
+    settle(&mut h);
     footer_button(&h, "Cancel").click();
     h.run_steps(2);
     assert!(!h.state().w.export_open());

@@ -23,10 +23,12 @@
 //!    names safe for any file system.
 //! 6. **The preview**: the exact file names, one per ticked row. Which of
 //!    them exist already is looked up on a worker, again whenever the
-//!    folder, pattern, format or ticked rows change (one lookup at a time;
-//!    the folder's writability is tried once per folder, with a file
-//!    created and removed at once). Until it answers the names show
-//!    unmarked and Export waits ("Checking the folder…"). An existing file
+//!    folder, pattern, format or ticked rows change (one lookup at a time).
+//!    The folder's writability is tried once per folder, with a file
+//!    created and removed at once, and not while the folder field has the
+//!    keyboard (not in every folder on the way to the one being typed).
+//!    Until the lookup answers the names show unmarked and Export waits
+//!    ("Checking the folder…"). An existing file
 //!    is marked "exists"; two rows that would write the same name
 //!    (ignoring case, as Windows and macOS do) are marked "same name" and
 //!    the collision message says how to fix it.
@@ -403,10 +405,13 @@ struct Lookup {
 /// What a folder lookup found.
 #[derive(Clone, Debug)]
 struct Found {
-    /// Why the folder cannot take the files, if it cannot.
+    /// Why the folder cannot take the files, if it is not a full path or
+    /// not there.
     problem: Option<&'static str>,
     /// The names that exist there already.
     existing: BTreeSet<String>,
+    /// Whether a file could be created there, if that was tried.
+    writable: Option<bool>,
 }
 
 /// Look in `lookup`'s folder (on a worker): is it there (and, with
@@ -418,21 +423,26 @@ fn look(lookup: &Lookup, try_write: bool) -> Found {
         Some(NOT_FULL_PATH)
     } else if !folder.is_dir() {
         Some(MISSING_FOLDER)
-    } else if try_write && !writable(folder) {
-        Some(UNWRITABLE_FOLDER)
     } else {
         None
     };
-    let existing = match problem {
-        Some(_) => BTreeSet::new(),
-        None => lookup
+    if problem.is_some() {
+        return Found {
+            problem,
+            existing: BTreeSet::new(),
+            writable: None,
+        };
+    }
+    Found {
+        problem,
+        existing: lookup
             .names
             .iter()
             .filter(|n| folder.join(n).exists())
             .cloned()
             .collect(),
-    };
-    Found { problem, existing }
+        writable: try_write.then(|| writable(folder)),
+    }
 }
 
 /// Whether a file can be created in `folder`: one is, and removed at once.
@@ -476,6 +486,14 @@ struct Choosing {
     found: Option<(Lookup, Found)>,
     /// What the choices ask to look at, as last drawn.
     wanted: Option<Lookup>,
+    /// The folder field has the keyboard: what it holds is being typed, so
+    /// its writability is not tried yet (not in every folder on the way).
+    editing_folder: bool,
+    /// The last folder whose writability a lookup was asked to try.
+    write_tried: Option<PathBuf>,
+    /// The last folder whose writability is known, and whether a file
+    /// could be created there.
+    writable: Option<(PathBuf, bool)>,
 }
 
 /// What the user did in the dialog this frame.
@@ -545,6 +563,9 @@ impl ExportDialog {
             looking: None,
             found: None,
             wanted: None,
+            editing_folder: false,
+            write_tried: None,
+            writable: None,
         });
     }
 
@@ -600,15 +621,18 @@ impl ExportDialog {
         let wanted = Shown::of(c, &rows, &session_name).lookup;
         #[cfg(test)]
         let hold = self.hold.clone();
+        // The folder's writability is tried once per folder, once it is
+        // no longer being typed.
+        let try_write =
+            |lookup: &Lookup| !c.editing_folder && c.write_tried.as_ref() != Some(&lookup.folder);
         if let Some(lookup) = &wanted
             && c.looking.is_none()
-            && c.found.as_ref().is_none_or(|(l, _)| l != lookup)
+            && (c.found.as_ref().is_none_or(|(l, _)| l != lookup) || try_write(lookup))
         {
-            // The folder's writability is tried once per folder.
-            let try_write = c
-                .found
-                .as_ref()
-                .is_none_or(|(l, f)| l.folder != lookup.folder || f.problem.is_some());
+            let try_write = try_write(lookup);
+            if try_write {
+                c.write_tried = Some(lookup.folder.clone());
+            }
             let job = lookup.clone();
             let task = Task::spawn("mmm-export-lookup", ctx, move || {
                 #[cfg(test)]
@@ -634,16 +658,24 @@ impl ExportDialog {
     }
 
     /// Open, with no folder dialog shown and the folder looked at for what
-    /// the choices ask now (tests).
+    /// the choices ask now, its writability tried unless it is being typed
+    /// (tests).
     #[cfg(test)]
     pub(crate) fn settled(&self) -> bool {
         self.open.as_ref().is_some_and(|c| {
             c.picking.is_none()
                 && c.looking.is_none()
-                && c.wanted
-                    .as_ref()
-                    .is_none_or(|w| c.found.as_ref().is_some_and(|(l, _)| l == w))
+                && c.wanted.as_ref().is_none_or(|w| {
+                    c.found.as_ref().is_some_and(|(l, _)| l == w)
+                        && (c.editing_folder || c.write_tried.as_ref() == Some(&w.folder))
+                })
         })
+    }
+
+    /// The last folder whose writability a lookup tried (tests).
+    #[cfg(test)]
+    pub(crate) fn write_tried(&self) -> Option<&Path> {
+        self.open.as_ref()?.write_tried.as_deref()
     }
 
     /// The folder as typed (tests).
@@ -693,6 +725,9 @@ impl Choosing {
             match task.poll() {
                 Poll::Pending => {}
                 Poll::Done(found) => {
+                    if let Some(w) = found.writable {
+                        self.writable = Some((lookup.folder.clone(), w));
+                    }
                     self.found = Some((lookup.clone(), found));
                     self.looking = None;
                 }
@@ -743,6 +778,12 @@ struct Shown {
     colliding: BTreeSet<String>,
     /// The lookup's answer for exactly these choices, once known.
     found: Option<Found>,
+    /// The folder is being looked at: no answer yet for these choices, or
+    /// another lookup (its writability) still runs.
+    checking: bool,
+    /// Why the folder cannot take the files, as known: none chosen, not a
+    /// full path, not there, or no file can be created in it.
+    folder_problem: Option<&'static str>,
 }
 
 impl Shown {
@@ -774,12 +815,24 @@ impl Shown {
             .as_ref()
             .filter(|(l, _)| Some(l) == lookup.as_ref())
             .map(|(_, f)| f.clone());
+        let checking = lookup.is_some() && (found.is_none() || c.looking.is_some());
+        let folder_problem = match &lookup {
+            None => Some(NO_FOLDER),
+            Some(l) => found.as_ref().and_then(|f| f.problem).or_else(|| {
+                c.writable
+                    .as_ref()
+                    .is_some_and(|(f, w)| *f == l.folder && !w)
+                    .then_some(UNWRITABLE_FOLDER)
+            }),
+        };
         Shown {
             chosen,
             names,
             lookup,
             colliding,
             found,
+            checking,
+            folder_problem,
         }
     }
 
@@ -798,11 +851,10 @@ impl Shown {
             Some(NO_FOLDER)
         } else if !self.colliding.is_empty() {
             Some(COLLISION)
+        } else if self.checking {
+            Some(CHECKING)
         } else {
-            match &self.found {
-                None => Some(CHECKING),
-                Some(f) => f.problem,
-            }
+            self.folder_problem
         }
     }
 }
@@ -954,16 +1006,13 @@ fn settings_ui(ui: &mut egui::Ui, c: &mut Choosing, shown: &Shown) -> bool {
             ) + 2.0 * ui.spacing().button_padding.x;
             let field = ui.available_width() - button - ui.spacing().item_spacing.x;
             ui.allocate_ui(egui::vec2(field, CONTROL_HEIGHT), |ui| {
-                text_input(ui, &mut c.folder, "Where the files go").labelled_by(label);
+                let r = text_input(ui, &mut c.folder, "Where the files go").labelled_by(label);
+                c.editing_folder = r.has_focus();
             });
             let button = MegaButton::new(ButtonKind::Secondary, BROWSE);
             browse = ui.add_enabled(c.picking.is_none(), button).clicked();
         });
-        let problem = match &shown.lookup {
-            None => Some(NO_FOLDER),
-            Some(_) => shown.found.as_ref().and_then(|f| f.problem),
-        };
-        if let Some(why) = problem {
+        if let Some(why) = shown.folder_problem {
             ui.label(text(Type::Small, why).color(Tone::Problem.color()));
         }
     });
@@ -1046,7 +1095,7 @@ fn preview_ui(ui: &mut egui::Ui, shown: &Shown) {
     }
     if !shown.colliding.is_empty() {
         ui.label(text(Type::Small, COLLISION).color(Tone::Problem.color()));
-    } else if shown.lookup.is_some() && shown.found.is_none() {
+    } else if shown.checking {
         ui.label(text(Type::Small, CHECKING));
     }
 }
@@ -1197,9 +1246,13 @@ mod tests {
         let found = look(&lookup(root.clone()), true);
         assert_eq!(found.problem, None);
         assert_eq!(found.existing, BTreeSet::from(["a.fits".to_string()]));
+        assert_eq!(found.writable, Some(true));
+        // Writability is tried only when asked.
+        assert_eq!(look(&lookup(root.clone()), false).writable, None);
         let missing = look(&lookup(root.join("nope")), true);
         assert_eq!(missing.problem, Some(MISSING_FOLDER));
         assert!(missing.existing.is_empty());
+        assert_eq!(missing.writable, None);
         let relative = look(&lookup(PathBuf::from("out")), true);
         assert_eq!(relative.problem, Some(NOT_FULL_PATH));
         // The writability check leaves nothing behind.
