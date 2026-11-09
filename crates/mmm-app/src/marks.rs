@@ -11,9 +11,10 @@
 //!   and its seam's share one badge, spec §7.4), an area. One badge,
 //!   counting them, with the problem icon, said for what and where ("2
 //!   problems at {file}", "… at the overlap of {a} and {b}", "… in a
-//!   coverage gap"), its problems' titles on hover. Places of a kind whose
-//!   badges would sit on one spot ([`COINCIDENT_PX`]: a composite's members
-//!   on the same pointings) share one mark, so no badge hides another
+//!   coverage gap"), its problems' titles on hover. Places of a kind at the
+//!   same pointing (panels sharing at least [`SAME_POINTING_IOU`] of their
+//!   area: a composite's members imaged there through other filters, framed
+//!   however far apart) share one mark, so no badge hides another
 //!   ([`Places::coincide`]).
 //! - **Where.** A place's rect comes from the analysis (the plan's
 //!   [`Layout`], in the analysed frame) and the checks' seam lines
@@ -125,25 +126,29 @@ impl Place {
     }
 }
 
-/// How near two badges of the same kind of place sit to be one badge, in
-/// canvas px along each axis: one L8 cell. A composite's members imaged
-/// on the same pointings put their panels, and so their problems, on the
-/// same spots.
-pub const COINCIDENT_PX: f64 = 8.0;
+/// How much of their area (intersection over union of their analysed
+/// bboxes) two panels share to be at the same pointing, so their problems
+/// share a badge. Distinct pointings of a mosaic share far less than half
+/// (mosaic overlaps are typically 10–20% of a panel), while a composite's
+/// members imaged at one pointing through other filters share most of
+/// their area, however many px apart registration frames them. Scale-free:
+/// the same at any panel size or binning.
+pub const SAME_POINTING_IOU: f64 = 0.5;
 
-/// Whether two places are of the same kind (panel, pair, area), so their
-/// badges can be one.
-fn same_kind(a: &Place, b: &Place) -> bool {
-    std::mem::discriminant(a) == std::mem::discriminant(b)
-}
-
-/// Whether two badge points are within [`COINCIDENT_PX`] of each other.
-fn near(a: [f64; 2], b: [f64; 2]) -> bool {
-    (a[0] - b[0]).abs() <= COINCIDENT_PX && (a[1] - b[1]).abs() <= COINCIDENT_PX
+/// Intersection over union of two rects (`[x0, y0, x1, y1]`); 0 when
+/// they do not overlap.
+fn iou(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let area = |r: [f64; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
+    let Some(i) = intersect(a, b) else {
+        return 0.0;
+    };
+    let shared = area(i);
+    let union = area(a) + area(b) - shared;
+    if union > 0.0 { shared / union } else { 0.0 }
 }
 
 /// The unaccepted problems at one badge place (and any other of its kind
-/// whose badge would sit on it): one badge.
+/// at the same pointing, [`Places::coincide`]): one badge.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProblemMark {
     /// The badge's id ([`CanvasBadge::id`]), its place's: the same while
@@ -155,8 +160,8 @@ pub struct ProblemMark {
     /// an area; the first of `places`.
     pub place: Place,
     /// Every badge place it counts, in place order: `place`, then those of
-    /// the same kind whose badge sits within [`COINCIDENT_PX`] of it (a
-    /// composite's members on the same pointings).
+    /// the same kind at the same pointing ([`Places::coincide`]: a
+    /// composite's members imaged there).
     pub places: Vec<Place>,
     /// The place's rect in the analysed frame ([`place_rect`]; for a pair
     /// whose overlap does not resolve, its seam's lines' bbox), if it
@@ -260,10 +265,9 @@ fn concerns(check: &Check, group: &str, panels: &[PathBuf]) -> bool {
 /// groups shown), one mark per badge place ([`Place::badged`]: a pair's
 /// overlap and seam problems together), in place order, each with its rect
 /// from `layout` and the report's seam lines: a pair's overlap, else its
-/// seam's lines. Places of a kind whose badges would sit within
-/// [`COINCIDENT_PX`] of each other (a composite's members on the same
-/// pointings) share the first one's mark, so no badge hides another.
-/// None without a report.
+/// seam's lines. Places of a kind at the same pointing ([`Places::coincide`]:
+/// a composite's members imaged there) share the first one's mark, so no
+/// badge hides another. None without a report.
 pub fn problem_marks(
     session: &OpenSession,
     layout: &Layout,
@@ -299,13 +303,9 @@ pub fn problem_marks(
                 _ => None,
             })
         });
-        let spot = rect.map(|r| badge_point(&place, r));
-        let with = marks.iter_mut().find(|(m, _)| {
-            same_kind(&m.place, &place)
-                && m.rect
-                    .zip(spot)
-                    .is_some_and(|(r, at)| near(badge_point(&m.place, r), at))
-        });
+        let with = marks
+            .iter_mut()
+            .find(|(m, _)| places.coincide(&m.place, &place));
         match with {
             Some((m, gathered)) => {
                 m.places.push(place);
@@ -460,20 +460,45 @@ impl<'a> Places<'a> {
         Some(covering_px(self.rect(&place)?))
     }
 
+    /// Whether panels `p` and `q` are at the same pointing: the same panel,
+    /// or analysed bboxes sharing at least [`SAME_POINTING_IOU`] of their
+    /// union. Never for a panel the session no longer has or the analysis
+    /// has not placed.
+    fn same_pointing(&self, p: &Path, q: &Path) -> bool {
+        if p == q {
+            return true;
+        }
+        match (
+            self.rect(&Place::Panel(p.to_path_buf())),
+            self.rect(&Place::Panel(q.to_path_buf())),
+        ) {
+            (Some(a), Some(b)) => iou(a, b) >= SAME_POINTING_IOU,
+            _ => false,
+        }
+    }
+
     /// Whether `a` and `b` are badged as one ([`problem_marks`]): the same
-    /// badge place ([`Place::badged`]), or two of the same kind whose
-    /// badges sit within [`COINCIDENT_PX`] of each other where the analysis
-    /// places them (a composite's members on the same pointings).
+    /// badge place ([`Place::badged`]), or two of the same kind at the same
+    /// pointing (a composite's members imaged there, however far apart
+    /// registration frames them): two panels at the same pointing
+    /// ([`SAME_POINTING_IOU`]), two pairs whose panels are crosswise (each
+    /// of one pair at the same pointing as one of the other), two areas
+    /// whose rects share as much.
     pub fn coincide(&self, a: &Place, b: &Place) -> bool {
         let (a, b) = (a.clone().badged(), b.clone().badged());
         if a == b {
             return true;
         }
-        if !same_kind(&a, &b) {
-            return false;
-        }
-        match (self.rect(&a), self.rect(&b)) {
-            (Some(ra), Some(rb)) => near(badge_point(&a, ra), badge_point(&b, rb)),
+        let same = |p: &Path, q: &Path| self.same_pointing(p, q);
+        match (&a, &b) {
+            (Place::Panel(p), Place::Panel(q)) => same(p, q),
+            (Place::Overlap(a1, b1), Place::Overlap(a2, b2)) => {
+                (same(a1, a2) && same(b1, b2)) || (same(a1, b2) && same(b1, a2))
+            }
+            (Place::Area(r), Place::Area(s)) => {
+                iou(r.map(|v| v as f64), s.map(|v| v as f64)) >= SAME_POINTING_IOU
+            }
+            // Seams are badged as their pairs; other kinds never match.
             _ => false,
         }
     }
@@ -920,13 +945,23 @@ mod tests {
     }
 
     #[test]
-    fn coincident_badges_of_a_composite_are_one() {
-        let (root, s, p, mut layout) = fixture("marks-coincident");
-        // OIII's first panels on Ha's pointings (as the synthetic groups
-        // are), its third a cell and a half off Ha's.
-        layout.rects.insert(p[4].clone(), layout.rects[&p[0]]);
-        layout.rects.insert(p[5].clone(), layout.rects[&p[1]]);
-        layout.rects.insert(p[6].clone(), [212.0, 0.0, 312.0, 80.0]);
+    fn a_composites_problems_at_one_pointing_share_a_badge() {
+        let (root, s, p, mut layout) = fixture("marks-one-pointing");
+        // Ha's first two panels side by side with an ordinary 15% overlap,
+        // its third apart; OIII's first two at the same pointings framed
+        // 5% of a panel off (50 and 40 px, far more than a cell), its third
+        // at a pointing of its own (a quarter of Ha's third's area shared).
+        let rects = [
+            (0, [0.0, 0.0, 1000.0, 800.0]),
+            (1, [850.0, 0.0, 1850.0, 800.0]),
+            (2, [0.0, 3000.0, 1000.0, 3800.0]),
+            (4, [50.0, 40.0, 1050.0, 840.0]),
+            (5, [900.0, 40.0, 1900.0, 840.0]),
+            (6, [600.0, 3000.0, 1600.0, 3800.0]),
+        ];
+        for (i, r) in rects {
+            layout.rects.insert(p[i].clone(), r);
+        }
         let thin = |a: usize, b: usize, g: &str| {
             let mut c = problem(CheckTarget::Overlap(p[a].clone(), p[b].clone()), &[g]);
             c.message = format!("Thin in {g}");
@@ -945,6 +980,7 @@ mod tests {
                 alone(4, "OIII"),
                 alone(2, "Ha"),
                 alone(6, "OIII"),
+                alone(1, "Ha"),
             ],
             errors: Vec::new(),
             seams: Seams::new(),
@@ -958,15 +994,18 @@ mod tests {
                 (b.as_ref().map(|b| b.at), b.map_or(0, |b| b.count))
             })
             .collect();
-        // One badge per spot: the pair's two thin overlaps, the first
-        // panels' two problems; the third panels stay apart.
+        // One badge per pointing, at its first place: the first panels'
+        // two problems, the pair's two thin overlaps (its members match
+        // crosswise); the neighbours of one group (15% shared) and the
+        // third panels (25%) stay apart.
         assert_eq!(
             counts,
             [
-                (Some([100.0, 0.0]), 2),
-                (Some([300.0, 0.0]), 1),
-                (Some([312.0, 0.0]), 1),
-                (Some([80.0, 40.0]), 2),
+                (Some([1000.0, 0.0]), 2),
+                (Some([1850.0, 0.0]), 1),
+                (Some([1000.0, 3000.0]), 1),
+                (Some([1600.0, 3000.0]), 1),
+                (Some([925.0, 400.0]), 2),
             ],
             "{marks:?}"
         );
@@ -981,7 +1020,7 @@ mod tests {
                 format!("{} alone", file_name(&p[4]))
             ]
         );
-        assert_eq!(titles(&marks[3]), ["Thin in OIII", "Thin in Ha"]);
+        assert_eq!(titles(&marks[4]), ["Thin in OIII", "Thin in Ha"]);
         // Said for what and where: the place in its name, the problems'
         // titles (one per line) on hover.
         let n = |i: usize| file_name(&p[i]);
@@ -990,6 +1029,12 @@ mod tests {
             .filter_map(ProblemMark::placed_badge)
             .map(|b| (b.description, b.hover))
             .collect();
+        let one = |i: usize| {
+            (
+                format!("1 problem at {}", n(i)),
+                Some(format!("{} alone", n(i))),
+            )
+        };
         assert_eq!(
             said,
             [
@@ -997,14 +1042,9 @@ mod tests {
                     format!("2 problems at {} and {}", n(0), n(4)),
                     Some(format!("{} alone\n{} alone", n(0), n(4)))
                 ),
-                (
-                    format!("1 problem at {}", n(2)),
-                    Some(format!("{} alone", n(2)))
-                ),
-                (
-                    format!("1 problem at {}", n(6)),
-                    Some(format!("{} alone", n(6)))
-                ),
+                one(1),
+                one(2),
+                one(6),
                 (
                     format!(
                         "2 problems at the overlap of {} and {}, and of {} and {}",
@@ -1022,35 +1062,56 @@ mod tests {
             checks: vec![thin(0, 1, "Ha")],
             ..report.clone()
         };
-        let one = problem_marks(&s, &layout, Some(&ha_only), &both);
-        assert_eq!(one[0].id, marks[3].id);
+        let alone_ha = problem_marks(&s, &layout, Some(&ha_only), &both);
+        assert_eq!(alone_ha[0].id, marks[4].id);
         // The chips count each group's own.
         assert_eq!(
             problem_count(&s, &report, "Ha") + problem_count(&s, &report, "OIII"),
-            6
+            7
         );
-        // A group view has only its own.
+        // A group view has only its own: one badge per place.
         let ha = problem_marks(&s, &layout, Some(&report), &both[..1]);
-        assert_eq!(ha.len(), 3);
+        assert_eq!(ha.len(), 4);
         assert!(ha.iter().all(|m| m.problems.len() == 1));
-        // Both groups' holes in one gap: one badge, said as a gap.
-        let hole = |g: &str| {
+        // Both groups' holes in one gap (framed 40 px apart): one badge,
+        // said as a gap; a gap elsewhere has its own.
+        let hole = |g: &str, r: [u64; 4]| {
             let mut c = problem(CheckTarget::Group(g.into()), &[g]);
-            c.rect = Some([20, 30, 60, 50]);
+            c.rect = Some(r);
             c.message = format!("A gap in {g}");
             c
         };
         let gaps = ChecksReport {
-            checks: vec![hole("Ha"), hole("OIII")],
+            checks: vec![
+                hole("Ha", [1000, 800, 1400, 1200]),
+                hole("OIII", [1040, 840, 1440, 1240]),
+                hole("OIII", [2000, 800, 2400, 1200]),
+            ],
             ..report.clone()
         };
         let marks = problem_marks(&s, &layout, Some(&gaps), &both);
-        let b = marks[0].placed_badge().unwrap();
+        let got: Vec<(u32, [f64; 2], String, Option<String>)> = marks
+            .iter()
+            .filter_map(ProblemMark::placed_badge)
+            .map(|b| (b.count, b.at, b.description, b.hover))
+            .collect();
         assert_eq!(
-            (marks.len(), b.at, b.description.as_str()),
-            (1, [40.0, 40.0], "2 problems in a coverage gap")
+            got,
+            [
+                (
+                    2,
+                    [1200.0, 1000.0],
+                    "2 problems in a coverage gap".to_string(),
+                    Some("A gap in Ha\nA gap in OIII".to_string())
+                ),
+                (
+                    1,
+                    [2200.0, 1000.0],
+                    "1 problem in a coverage gap".to_string(),
+                    Some("A gap in OIII".to_string())
+                ),
+            ]
         );
-        assert_eq!(b.hover.as_deref(), Some("A gap in Ha\nA gap in OIII"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1903,14 +1903,18 @@ error is still a toast.
   composite's members). A panel's badge sits at its top-right corner; an
   overlap and a seam of the same pair share one badge at the overlap's
   centre, counting both; a hole (a Group target with a rect) badges its
-  rect. Places of a kind whose badges would sit within one L8 cell
-  (`COINCIDENT_PX`, 8 px) of each other share one badge counting all their
-  problems: a composite's members imaged on the same pointings put their
-  panels, and so their problems, on one spot, and stacked badges would
-  hide each other. Its id is the first place's (in place order) and it
-  opens its first problem, in the Problems list's order. Session-targeted
-  problems, and Group-targeted ones without a rect, have no canvas badge
-  (they count on chips and in the Problems list). On the plan, panel
+  rect. Places of a kind at the same pointing share one badge counting
+  all their problems, so stacked badges never hide each other: two panels
+  whose analysed bboxes' IoU is at least `SAME_POINTING_IOU = 0.5` (a
+  composite's members imaged at one pointing through other filters share
+  most of their area, however many px apart registration frames them,
+  while distinct pointings of a mosaic share far less than half: overlaps
+  are typically 10–20%), two pairs whose panels match crosswise that way,
+  two holes whose rects do. The rule is scale-free (no px distance). Its
+  id is the first place's (in place order) and it opens its first
+  problem, in the Problems list's order. Session-targeted problems, and
+  Group-targeted ones without a rect, have no canvas badge (they count on
+  chips and in the Problems list). On the plan, panel
   badges always show; the analysed-frame overlays (overlap, seam and area
   badges, seam lines) follow `frame_matches`. A panel's outline turns the
   problem colour only for a Panel-targeted problem (every panel a shared
@@ -1950,7 +1954,7 @@ error is still a toast.
   keeps its own selected outline). Panels lists all of a pair's checks,
   overlap and seam together, under "Overlap {a} – {b}" or
   "Seam {a} – {b}"; in a composite, a selected panel, overlap or seam
-  lists every shown group's checks at that spot too (the places its badge
+  lists every shown group's checks at that pointing too (the places its badge
   counts, matched by geometry since the files differ). A selection goes
   with Esc, another selection, an empty click on the plan (the mosaic has
   no click-selection), or its panels leaving the session.

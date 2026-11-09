@@ -17,8 +17,8 @@
 //!   checks, every severity, with Accept, Un-accept and Open; or "Overlap
 //!   {a} – {b}" / "Seam {a} – {b}" and the checks of that pair of panels,
 //!   its overlap's and its seam's together. In a composite each lists
-//!   every shown group's checks at that spot too, as its badge counts them
-//!   (a member's panel or pair on the same pointing).
+//!   every shown group's checks at that pointing too, as its badge counts
+//!   them (a member's panel or pair imaged there).
 //! - **ROIs**: **Draw ROI** (also the `D` key, which reveals the section so
 //!   its hint shows) arms the draw tool on the canvas shown, plan or mosaic
 //!   (a crosshair over it while armed), then the ROI list
@@ -418,7 +418,7 @@ fn shown_panels(session: &OpenSession, groups: &[String]) -> BTreeSet<PathBuf> {
 /// selected: a panel's details and checks ([`PlanView::selection_ui`]), or
 /// an overlap's or a seam's heading and checks ([`place_ui`]). In a view of
 /// several groups (a composite), a place lists every shown group's checks
-/// at that spot, as its badge counts them ([`Places::coincide`]).
+/// at that pointing, as its badge counts them ([`Places::coincide`]).
 fn panels_ui(
     ui: &mut egui::Ui,
     (session, groups): (&OpenSession, &[String]),
@@ -504,8 +504,8 @@ fn panels_ui(
 /// The selected overlap's or seam's details: "Overlap {a} – {b}" or "Seam
 /// {a} – {b}" (the panels' names, naming what was selected), then every
 /// check of that pair of panels, its overlap's and its seam's, and of the
-/// shown groups' pairs at the same spot (as the pair's badge counts them),
-/// with Accept, Un-accept and Open.
+/// shown groups' pairs at the same pointing (as the pair's badge counts
+/// them), with Accept, Un-accept and Open.
 fn place_ui(
     ui: &mut egui::Ui,
     (session, groups): (&OpenSession, &[String]),

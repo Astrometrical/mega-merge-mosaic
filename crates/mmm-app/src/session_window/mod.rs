@@ -39,7 +39,7 @@
 //!   toggles.
 //! - **Problems in place** ([`crate::marks`]): both canvases badge the shown
 //!   groups' unaccepted problems where they are, one badge per place
-//!   (counting them; a composite's members' places on one spot share it),
+//!   (counting them; a composite's members' places at one pointing share it),
 //!   named for what and where, its problems' titles on hover; Outlines and
 //!   Seams draw over both. A badge clicked opens its first problem
 //!   ([`SessionWindow::open_badge`]).
