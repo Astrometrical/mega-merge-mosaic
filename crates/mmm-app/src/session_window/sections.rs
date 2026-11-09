@@ -7,10 +7,14 @@
 //! - **Panels**: "{n} panels · {g} groups · {canvas}", the previews'
 //!   progress (with **Resume** once paused), and the selected panel's
 //!   details and checks.
-//! - **ROIs**: **Draw ROI** (also the `D` key) arms the draw tool on the
-//!   canvas shown, plan or mosaic, then the ROI list
+//! - **ROIs**: **Draw ROI** (also the `D` key, which reveals the section so
+//!   its hint shows) arms the draw tool on the canvas shown, plan or mosaic
+//!   (a crosshair over it while armed), then the ROI list
 //!   ([`MosaicView::rois_ui`]). Picking an ROI frames it on the canvas
-//!   shown ([`SessionWindow::frame`]).
+//!   shown ([`SessionWindow::go_to_roi`]); on a plan drawn in another frame
+//!   than the analysed one nothing moves and a toast says why (the reason
+//!   **Draw ROI** gives there: a toast rather than a tooltip, since the
+//!   list's rows carry none and the click must not pass unexplained).
 //! - **Merge settings** ([`MosaicView::settings_ui`]), then the health.
 //! - **Composites**: each composite's editor and **Delete composite**.
 //! - **Notes**: the session's notes, saved with the session (debounced).
@@ -146,7 +150,7 @@ impl SessionWindow {
             self.set_mode(mode);
         }
         if let Some(rect) = act.go_to {
-            self.frame(rect);
+            self.go_to_roi(session, rect);
         }
         if act.draw_roi {
             self.start_drawing_roi(session);

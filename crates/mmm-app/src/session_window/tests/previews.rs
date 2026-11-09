@@ -534,6 +534,25 @@ fn a_coarse_preview_says_so_on_its_row() {
 }
 
 #[test]
+fn no_patch_draws_until_the_rois_are_synced() {
+    let (root, mut h, gate) = shown("previews-unsynced", &[CORE], |_| {});
+    gate.open();
+    step_to(&mut h, |st| st.w.shown_patches().last().len() == 1);
+    let conversions = h.state().w.shown_patches().conversions(7);
+    // The ROIs asked to be reprojected, as an analysis applying does: until
+    // they are, no patch draws (one could land at a rect gone stale).
+    h.state_mut().w.mosaic.want_roi_sync();
+    h.step();
+    assert!(!h.state().w.mosaic().rois_synced());
+    assert!(h.state().w.shown_patches().last().is_empty());
+    // Synced: it draws again, from the texture it had.
+    step_to(&mut h, |st| st.w.shown_patches().last().len() == 1);
+    assert!(h.state().w.mosaic().rois_synced());
+    assert_eq!(h.state().w.shown_patches().conversions(7), conversions);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_moved_or_deleted_roi_drops_its_preview() {
     let (root, mut h, gate) = shown("previews-moved", &[CORE, HALO], |_| {});
     gate.open();

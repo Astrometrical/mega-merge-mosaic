@@ -26,7 +26,9 @@
 //!   composite) and pushes it into both canvases, so they always agree.
 //!   Switching between plan and mosaic, or to another view, hands the shown
 //!   canvas's [`Camera`] to both first, so nothing moves. Going to an ROI
-//!   ([`SessionWindow::frame`]) hands both the camera that frames it.
+//!   ([`SessionWindow::go_to_roi`]) hands both the camera that frames it
+//!   (not from a plan drawn in another frame than the analysed one, which
+//!   says why in a toast instead).
 //! - **Mode.** The window opens on the mosaic once something is merged
 //!   ([`OpenSession::merged`]), else on the plan; **Mosaic** cannot be
 //!   chosen before something is merged or a merge has started.
@@ -232,6 +234,12 @@ pub struct SessionWindow {
     pub(crate) list_rect: Option<egui::Rect>,
 }
 
+/// Why the plan cannot draw a region or go to one while it draws in
+/// another frame than the analysed one the regions are anchored in
+/// ([`PlanView::frame_matches`]): **Draw ROI**'s disabled tooltip, and the
+/// toast of a region picked meanwhile.
+const FRAME_BEHIND: &str = "Available once the analysis catches up with the panels";
+
 /// Inspector section ids, in their fixed order.
 const PROBLEMS: &str = "problems";
 const PANELS: &str = "panels";
@@ -308,9 +316,31 @@ impl SessionWindow {
             return Some("Available once the canvas has been drawn.");
         }
         if self.mode() == CanvasMode::Plan && !self.plan.frame_matches(session) {
-            return Some("Available once the analysis catches up with the panels");
+            return Some(FRAME_BEHIND);
         }
         None
+    }
+
+    /// Go to ROI rect `rect` (one picked in the list): frame it on the
+    /// canvas shown ([`SessionWindow::frame`]). Not on a plan drawn in
+    /// another frame than the analysed one the ROIs are anchored in
+    /// ([`PlanView::frame_matches`]), where it would frame the wrong place:
+    /// nothing moves, and a toast gives the reason **Draw ROI** gives there
+    /// ([`FRAME_BEHIND`]). The mosaic always frames it.
+    pub(super) fn go_to_roi(&mut self, session: &OpenSession, rect: [u64; 4]) {
+        if self.mode() == CanvasMode::Plan && !self.plan.frame_matches(session) {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Info,
+                    title: FRAME_BEHIND.into(),
+                    detail: None,
+                    action: None,
+                },
+                undo: None,
+            });
+            return;
+        }
+        self.frame(rect);
     }
 
     /// Whether the shown canvas has the draw tool armed.

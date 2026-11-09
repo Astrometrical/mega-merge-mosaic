@@ -7,13 +7,13 @@
 //! | `[` / `]` | previous / next group or composite, round the chips | the chips |
 //! | `O` | **Outlines** | the toggle |
 //! | `R` | **ROIs** | the toggle |
-//! | `D` | **Draw ROI**: arm the draw tool on the canvas shown | the section's button |
+//! | `D` | **Draw ROI**: arm the draw tool on the canvas shown (a crosshair over it), revealing the ROIs section | the section's button |
 //! | `L` | **Linked** (not for a mono view) | the toggle |
 //! | `S` | **Strong** | the toggle |
 //! | `Ctrl+Enter` (`Cmd+Enter` on macOS) | **Merge**, while the main button offers it | the main button |
 //! | `Delete` (and `Backspace` on macOS) | remove the selected panels (a toast offers Undo), while the panel list is open | the row menu's **Remove** |
 //! | `Esc` | clear the selection, in the panel list and on the plan | |
-//! | `Space`, held | comparing an ROI (spec §8.3): show the other side while held | the **A** / **B** buttons |
+//! | `Space`, held | comparing an ROI (spec §8.3): show the other side while held (Esc first if a control has the focus, as the toggle's tooltip says) | the **A** / **B** buttons |
 //!
 //! The letters, brackets, Delete and Space count with no modifier held. None
 //! acts while a text field has the keyboard (notes, names, a path) or the
@@ -142,6 +142,11 @@ impl SessionWindow {
         }
         if pressed(DRAW_ROI) {
             self.start_drawing_roi(session);
+            // The section shows what the armed tool does and that Esc
+            // cancels it, however it was left.
+            if self.drawing_roi() {
+                self.inspector.reveal(super::ROIS);
+            }
         }
         let mut stretch = DisplayStretch::load(&session.mosaic.config.ui);
         let before = stretch;

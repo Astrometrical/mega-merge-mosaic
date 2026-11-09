@@ -638,6 +638,55 @@ fn plan_rois_wait_while_the_frames_differ() {
 }
 
 #[test]
+fn going_to_an_roi_waits_while_the_plan_frame_differs() {
+    use mmm_core::reference::ReferenceFrame;
+    let (root, mut s, jobs) = merged("window-plan-goto");
+    add_roi(&mut s);
+    let mut state = State::new(s, jobs);
+    state.w.set_mode(CanvasMode::Plan);
+    state.w.inspector_mut().reveal(ROIS);
+    let mut h = harness(state);
+    step_until(&mut h, plan_placed);
+    h.run_steps(3);
+    let fit = h.state().w.plan().camera().unwrap();
+    // The plan draws in another frame than the analysed one, which the
+    // ROI is anchored in: picking it goes nowhere, and a toast says why.
+    h.state_mut().session.frame = Some(ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.run_steps(3);
+    h.get_by_label("ROI 1").click();
+    h.run_steps(3);
+    assert_eq!(h.state().w.mosaic().selected_roi(), Some(1), "selected");
+    assert_camera(h.state().w.plan().camera(), fit);
+    let titles: Vec<String> = h
+        .state()
+        .toasts
+        .iter()
+        .map(|t| t.toast.title.clone())
+        .collect();
+    assert_eq!(
+        titles,
+        ["Available once the analysis catches up with the panels"]
+    );
+    // The mosaic is unaffected: picking it there frames it.
+    h.get_by_label("Mosaic").click();
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Mosaic && st.w.mosaic().viewer_frame().is_some()
+    });
+    h.run_steps(2);
+    let before = h.state().w.mosaic().camera().unwrap();
+    h.get_by_label("ROI 1").click();
+    h.run_steps(3);
+    let after = h.state().w.mosaic().camera().unwrap();
+    assert!(after.zoom > before.zoom * 1.5, "{before:?} → {after:?}");
+    assert_eq!(h.state().toasts.len(), 1, "no second toast");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn drawing_on_the_plan_adds_a_region() {
     let (root, s, jobs) = merged("window-draw-roi");
     let mut state = State::new(s, jobs);
@@ -769,6 +818,54 @@ fn the_d_key_arms_the_draw_tool() {
     h.get_by_label("Mosaic").click();
     h.run_steps(3);
     assert!(!h.state().w.plan().drawing() && !h.state().w.mosaic().drawing());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_d_key_reveals_the_rois_section_and_the_armed_tool_shows() {
+    use egui::Key;
+    let (root, s, jobs) = merged("window-d-reveals");
+    let mut h = harness(State::new(s, jobs));
+    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    h.run_steps(2);
+    // ROIs folded (Problems open), the inspector folded too.
+    assert!(!h.state().w.inspector().open.contains(ROIS));
+    h.key_press(Key::I);
+    h.run_steps(2);
+    assert!(h.state().w.inspector().folded);
+    let centre = h.state().w.mosaic().viewer_frame().unwrap().0.center();
+    let cursor = |h: &Harness<'static, State>| h.output().platform_output.cursor_icon;
+    h.hover_at(centre);
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Default);
+    // D arms the tool and opens the section, so its hint (and Esc) show;
+    // the pointer over the canvas is a crosshair.
+    h.key_press(Key::D);
+    h.run_steps(3);
+    assert!(h.state().w.mosaic().drawing());
+    assert!(!h.state().w.inspector().folded);
+    assert!(h.state().w.inspector().open.contains(ROIS));
+    h.get_by_label("Drag on the image to draw; Esc cancels.");
+    let centre = h.state().w.mosaic().viewer_frame().unwrap().0.center();
+    h.hover_at(centre);
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair);
+    // Esc disarms it: the plain pointer again.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().w.mosaic().drawing());
+    assert_eq!(cursor(&h), egui::CursorIcon::Default);
+    // On the plan too.
+    h.key_press(Key::M);
+    step_until(&mut h, plan_placed);
+    h.run_steps(2);
+    h.key_press(Key::D);
+    h.run_steps(2);
+    assert!(h.state().w.plan().drawing());
+    let centre = h.state().w.plan().canvas_frame().unwrap().0.center();
+    h.hover_at(centre);
+    h.run_steps(2);
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair);
     let _ = std::fs::remove_dir_all(&root);
 }
 

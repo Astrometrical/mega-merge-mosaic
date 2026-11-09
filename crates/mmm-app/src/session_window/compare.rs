@@ -19,12 +19,14 @@
 //!   switches show the other side while held ([`Peek`]): Space (only while
 //!   no widget has the keyboard focus, so a focused control keeps Space to
 //!   press it, and not while typing or in a dialog; letting go ends it
-//!   wherever the focus has gone), pressing and holding the selected button
-//!   (clicking the other switches to it), and pressing and holding the left
-//!   mouse button on the compared ROI's preview on either canvas (a drag
-//!   past the click distance still pans, and ends the peek; a press on the
-//!   canvas's own buttons is none; on the plan a click there selects no
-//!   panel). None lasts while the window has no focus. The label's
+//!   wherever the focus has gone; the toggle's tooltip says "Esc, then hold
+//!   Space to peek", Esc letting go of the focus), pressing and holding the
+//!   selected button (clicking the other switches to it), and pressing and
+//!   holding the left mouse button on the compared ROI's preview on either
+//!   canvas (a drag past the click distance still pans, and ends the peek; a
+//!   press on the canvas's own buttons is none; on the plan a click there
+//!   selects no panel, unless the plan draws in another frame, showing no
+//!   ROI). None lasts while the window has no focus. The label's
 //!   accessible description says what shows, and "Peeking…" while a switch
 //!   is held.
 //! - **Use A** puts A's settings back in the draft through the Merge
@@ -45,7 +47,7 @@ use egui::Modifiers;
 use mega_ui::widgets::{CanvasLabel, LabelControl, canvas_label};
 use mmm_core::settings::BlendSettings;
 
-use super::shortcuts::{PEEK, keyed};
+use super::shortcuts::PEEK;
 use super::{CanvasMode, SessionWindow};
 use crate::blend_settings::{draft_for, feather_text, load_draft};
 use crate::jobs::JobRunner;
@@ -318,10 +320,12 @@ impl SessionWindow {
             format!("Use A for {name}"),
             format!("Done comparing {name}"),
         );
-        let toggle_tip = keyed(
+        // Space presses a focused control (the toggle itself, once clicked):
+        // Esc lets go of the focus first.
+        let toggle_tip = format!(
             "A: the preview as compare began. B: the Merge settings now. Hold the selected one, \
-             or the preview, to see the other",
-            PEEK,
+             or the preview, to see the other. Esc, then hold {} to peek",
+            PEEK.symbol_or_name()
         );
         let controls = [
             LabelControl::Toggle {

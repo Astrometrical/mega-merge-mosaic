@@ -507,18 +507,30 @@ impl SessionWindow {
     }
 
     /// Hand the canvas shown the patches of its visible ROIs; the other
-    /// canvas drops its textures.
+    /// canvas drops its textures. While the ROIs are not synced with the
+    /// current frame (between an analysis applying and their reprojection
+    /// landing) it is handed none, a patch could be drawn at an old rect;
+    /// its textures are kept meanwhile ([`PatchTextures::withhold`]).
     fn give_patches(&mut self, ctx: &egui::Context, session: &OpenSession) {
+        let synced = self.mosaic.rois_synced();
         let wants = self.preview_wants(session);
         match self.mode() {
             CanvasMode::Plan => {
                 self.mosaic_patches.patches(ctx, Vec::new());
-                let patches = self.plan_patches.patches(ctx, wants);
+                let patches = if synced {
+                    self.plan_patches.patches(ctx, wants)
+                } else {
+                    self.plan_patches.withhold()
+                };
                 self.plan.set_patches(patches);
             }
             CanvasMode::Mosaic => {
                 self.plan_patches.patches(ctx, Vec::new());
-                let patches = self.mosaic_patches.patches(ctx, wants);
+                let patches = if synced {
+                    self.mosaic_patches.patches(ctx, wants)
+                } else {
+                    self.mosaic_patches.withhold()
+                };
                 self.mosaic.set_patches(patches);
             }
         }
@@ -553,8 +565,14 @@ impl SessionWindow {
                     Vec::new()
                 };
                 self.plan.set_overlays(overlays);
-                // A click on the compared preview is its peek, no selection.
-                let quiet = self.previews.compare().and_then(|c| c.rect());
+                // A click on the compared preview is its peek, no selection;
+                // not while the plan draws in another frame (it shows no ROI
+                // or patch there).
+                let quiet = self
+                    .previews
+                    .compare()
+                    .and_then(|c| c.rect())
+                    .filter(|_| matches);
                 self.plan.set_quiet(quiet);
                 self.plan.show(ui, session, &feed, &self.look);
                 if let Some((rect, canvas)) = self.plan.take_drawn()

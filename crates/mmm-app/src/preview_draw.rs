@@ -18,7 +18,9 @@
 //!   takes tens of milliseconds, too long for a frame. A texture is
 //!   converted again only when one of its layers' patch, stretch, tint or
 //!   mode changes (the key); the texture drawn meanwhile is the previous
-//!   one. Textures of ROIs not drawn this frame are dropped.
+//!   one. Textures of ROIs not drawn this frame are dropped, except while
+//!   the window withholds every patch (the ROIs being reprojected:
+//!   [`PatchTextures::withhold`]), when all are kept for the frame after.
 //! - **Compare** (spec §8.3): the compared ROI has a texture per side, the
 //!   live preview (B) and the frozen A, both kept converted (each with the
 //!   canvas's stretch, so they compare fairly) and only the side shown
@@ -156,6 +158,19 @@ impl PatchTextures {
             self.last = out.clone();
         }
         out
+    }
+
+    /// No patch to draw this frame, every texture kept as it is (ready or
+    /// converting): the ROIs' rects are being reprojected, so a patch could
+    /// land at a stale rect. Once they are synced, the same wants draw
+    /// again with nothing converted again.
+    pub fn withhold(&mut self) -> Vec<Patch> {
+        #[cfg(test)]
+        {
+            self.drawn.clear();
+            self.last.clear();
+        }
+        Vec::new()
     }
 
     /// A ready texture of another entry than `at` converted from `layers`.

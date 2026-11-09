@@ -699,6 +699,55 @@ fn a_click_in_the_compared_preview_selects_no_panel_on_the_plan() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn the_toggle_tip_tells_keyboard_users_how_to_peek() {
+    let (root, mut h, gate) = up_to_date("compare-toggle-tip");
+    h.get_by_label("Compare Core").click();
+    h.run_steps(2);
+    assert!(compare(h.state()).is_some());
+    // Space presses a focused control: Esc lets go of the focus first.
+    let at = h.get_by_label("Show A of Core").rect().center();
+    let want = "A: the preview as compare began. B: the Merge settings now. Hold the selected \
+                one, or the preview, to see the other. Esc, then hold Space to peek";
+    assert!(tooltip_shows(&mut h, at, want), "{want}");
+    gate.open();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_plan_in_another_frame_keeps_no_quiet_rect() {
+    let (root, mut h, gate) = up_to_date("compare-plan-frame");
+    gate.open();
+    h.key_press(egui::Key::M);
+    step_to(&mut h, |st| {
+        st.w.mode() == CanvasMode::Plan && plan_placed(st)
+    });
+    h.run_steps(3);
+    h.get_by_label("Compare Core").click();
+    h.run_steps(2);
+    assert!(compare(h.state()).is_some());
+    // A canvas-changing edit: the plan draws in another frame than the
+    // analysed one, and shows no ROI or patch; the compare goes on.
+    h.state_mut().session.frame = Some(mmm_core::reference::ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.run_steps(3);
+    assert!(compare(h.state()).is_some());
+    // A click where Core was is an ordinary click: it selects the panel
+    // under it, as nothing of Core shows there.
+    let rect = frame(&h);
+    let cam = h.state().w.plan().camera().unwrap();
+    let at = screen(rect, cam, (150.0, 155.0));
+    h.hover_at(at);
+    h.drag_at(at);
+    let_go(&mut h, at);
+    h.run_steps(2);
+    assert!(h.state().w.plan().selected().is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// "Big": most of the 600 × 420 canvas.
 const BIG: (u64, &str, [u64; 4]) = (11, "Big", [50, 50, 550, 400]);
 
