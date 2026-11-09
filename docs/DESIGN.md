@@ -1389,19 +1389,20 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   the possibly long blend reads the panels, while the sink's sits unflushed
   in the mapping until the run ends, and `blend_tiles` can fail before the
   sink exists), so neither replaces the other.
-- **ROI merges use the draft.** An ROI merge (`MosaicView::merge_roi`)
-  queues each group with `JobRunner::start_blend_with` and the draft through
-  the group's override (`blend_settings::draft_for`), without committing it,
-  so "change a merge setting, merge an ROI, look" (spec §11) shows the
-  draft; an invalid feather blocks it like any merge. ROI plans are never
-  `fresh`. ROI merges still write into the real stores until plan 4 makes
-  them transient previews, so a region merged with other settings than the
-  group's last whole merge mixes settings inside a complete store:
+- **ROI merges are gone from the app (plan 4).** The ROI list no longer
+  has "Merge ROI" (`MosaicView::merge_roi`, `JobRunner::start_blend_with` and
+  `blend_settings::draft_for` are removed); a region is drawn on either
+  canvas (**Draw ROI** or `D` arms the shown canvas's draw tool), named
+  "Region n", and previews of it are transient (tasks 5-6) rather than
+  written into a store. `JobRunner::start_blend` still accepts a rect and
+  mmm-core keeps ROI plans (never `fresh`) and
   `mmm_core::mosaic::region_differs` (a `whole: false` entry newer than the
   newest whole entry records other settings; no whole entry: false; only a
-  later whole merge clears it) makes the group out of date, never "Settings
-  changed", so Merge re-merges it over the whole canvas (the sink rewrites
-  the patch even when that merge is not `fresh`).
+  later whole merge clears it), because the CLI's `--roi` and sessions
+  touched by plan-3 builds still carry such entries: they make the group
+  out of date, never "Settings changed", so Merge re-merges it over the
+  whole canvas (the sink rewrites the patch even when that merge is not
+  `fresh`).
 - **Per-group panel edits.** An add, remove, move or rule change works out
   on a worker which groups it touches (`affected_groups(old, new)`) and
   applies with `set_inputs_affecting`: only those groups' stores are

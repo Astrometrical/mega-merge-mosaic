@@ -101,6 +101,7 @@ use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView, group_members};
+use crate::rois::Roi;
 use crate::session::OpenSession;
 use crate::util::{Debounce, group_names};
 use view_state::ViewState;
@@ -143,6 +144,14 @@ pub enum Undo {
     /// Put back the analysis settings from before the change, as an
     /// ordinary analysis edit (queued behind running jobs like any).
     Analyze(AnalyzeSettings),
+    /// Put a deleted ROI back at its index in the list (the end, if it is
+    /// shorter by now), selected, with the id it had.
+    RoiDelete {
+        /// Where it was.
+        index: usize,
+        /// The ROI as it was.
+        roi: Roi,
+    },
 }
 
 /// A toast the window asks the shell to show.
@@ -248,7 +257,40 @@ impl SessionWindow {
             return;
         }
         self.carry_camera();
+        // A rectangle half-armed on the canvas going away would draw on
+        // it unseen.
+        self.plan.set_drawing(false);
+        self.mosaic.set_drawing(false);
         self.mode = Some(mode);
+    }
+
+    /// Whether the shown canvas has been drawn, so a rectangle can be drawn
+    /// on it.
+    pub(super) fn can_draw_roi(&self) -> bool {
+        match self.mode() {
+            CanvasMode::Plan => self.plan.canvas_frame().is_some(),
+            CanvasMode::Mosaic => self.mosaic.viewer_frame().is_some(),
+        }
+    }
+
+    /// Whether the shown canvas has the draw tool armed.
+    pub(super) fn drawing_roi(&self) -> bool {
+        match self.mode() {
+            CanvasMode::Plan => self.plan.drawing(),
+            CanvasMode::Mosaic => self.mosaic.drawing(),
+        }
+    }
+
+    /// Arm the draw tool on the canvas shown (plan or mosaic): the next drag
+    /// draws a new ROI. Nothing before the canvas has been drawn.
+    pub(super) fn start_drawing_roi(&mut self) {
+        if !self.can_draw_roi() {
+            return;
+        }
+        match self.mode() {
+            CanvasMode::Plan => self.plan.set_drawing(true),
+            CanvasMode::Mosaic => self.mosaic.set_drawing(true),
+        }
     }
 
     /// The group or composite shown (once the first frame has picked one).
@@ -445,6 +487,17 @@ impl SessionWindow {
                 undo: Some(Undo::Analyze(previous)),
             });
         }
+        if let Some((index, roi)) = self.mosaic.take_roi_deleted() {
+            self.push_toast(WindowToast {
+                toast: mega_ui::widgets::Toast {
+                    tone: mega_ui::theme::Tone::Neutral,
+                    title: format!("{} deleted", roi.name),
+                    detail: None,
+                    action: Some("Undo".into()),
+                },
+                undo: Some(Undo::RoiDelete { index, roi }),
+            });
+        }
     }
 
     /// The window's every-frame work, drawn or not: pick the mode and the
@@ -512,6 +565,7 @@ impl SessionWindow {
             Undo::Analyze(previous) => {
                 self.mosaic.edit_analysis(previous, session, jobs);
             }
+            Undo::RoiDelete { index, roi } => self.mosaic.restore_roi(session, index, roi),
         }
         self.save_panel_choices();
     }

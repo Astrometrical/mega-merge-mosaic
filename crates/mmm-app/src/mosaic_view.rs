@@ -21,17 +21,16 @@
 //!   named over the image's bottom-left corner (an overlay: the image keeps
 //!   the plan's place); groups on different canvases cannot be mixed: the
 //!   view says why instead.
-//! - **ROIs** ([`crate::rois`]): drawn on the canvas with the viewer's draw
-//!   tool, named, noted, selected (the window then frames it,
-//!   [`MosaicView::rois_ui`]) and deleted;
-//!   kept in `MosaicConfig.ui`. Reading the frame and reprojecting them
-//!   (sky ↔ canvas) and counting how many of an ROI's level-0 tiles are
-//!   fresh (per group of the view) run on workers ([`RoiPanel`]).
-//!   [`MosaicView::merge_roi`] starts one merge of the selected ROI per
-//!   group of the view with the merge settings draft, uncommitted (the job
-//!   runner queues them; newer work wins per group), once the ROIs follow
-//!   the current frame;
-//!   [`MosaicView::merge_these`] merges the groups it is given over the whole
+//! - **ROIs** ([`crate::rois`]): drawn on either canvas with its draw tool
+//!   (the window arms it; the mosaic takes the rect through
+//!   [`MosaicView::on_drawn`]), named, noted, reordered, selected (the
+//!   window then frames it, [`MosaicView::rois_ui`]) and deleted (with an
+//!   undo, [`MosaicView::take_roi_deleted`]); kept in `MosaicConfig.ui`.
+//!   Reading the frame and reprojecting them (sky ↔ canvas) and counting
+//!   how many of an ROI's level-0 tiles are fresh (per group of the view)
+//!   run on workers ([`RoiPanel`]). There is no ROI merge: an ROI's
+//!   preview is transient and comes with the preview runner.
+//!   //!   [`MosaicView::merge_these`] merges the groups it is given over the whole
 //!   canvas, committing the merge settings draft first.
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
 //!   merge settings (a draft kept in `ui`, edited at once) and analysis
@@ -115,7 +114,7 @@ use mmm_core::stretch::StretchParams;
 use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
 
-use crate::blend_settings::{SettingsPanel, draft_for, load_draft};
+use crate::blend_settings::{SettingsPanel, load_draft};
 use crate::camera::Camera;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
@@ -655,30 +654,6 @@ impl MosaicView {
         self.merge_guard(session, jobs, &[group.to_string()])
     }
 
-    /// Why no merge of the selected ROI may start now, if any (`None`:
-    /// [`MosaicView::merge_roi`] is allowed).
-    pub fn merge_roi_block_reason(
-        &self,
-        session: &OpenSession,
-        jobs: &JobRunner,
-    ) -> Option<String> {
-        if self.members.is_empty() {
-            return Some("There is nothing to merge in this view.".into());
-        }
-        if let Some(why) = self.merge_guard(session, jobs, &self.members) {
-            return Some(why);
-        }
-        if self.rois.selected_rect().is_none() {
-            return Some("Select or draw a region of interest first.".into());
-        }
-        if !self.rois.synced() {
-            return Some(
-                "Waiting for the regions of interest to follow the latest analysis.".into(),
-            );
-        }
-        None
-    }
-
     /// Why no merge of `groups` may start now, if any: the store
     /// recreation guard of the module docs, and every group analysed.
     fn merge_guard(
@@ -762,38 +737,16 @@ impl MosaicView {
                 .set_problem(format!("Merge settings not saved: {e}"));
             return false;
         }
-        self.merge_groups(session, jobs, groups, None)
+        self.merge_groups(session, jobs, groups)
     }
 
-    /// Merge the selected ROI for each group of the view (newer work wins
-    /// per group in the job runner) with the merge settings draft, through
-    /// each group's override, without committing it (spec §11: change a
-    /// setting, merge an ROI, look); nothing while
-    /// [`MosaicView::merge_roi_block_reason`] gives a reason (e.g. while the
-    /// ROIs are being reprojected: the rect may still be from an older
-    /// frame, or while the feather text is invalid). A region merged with
-    /// settings other than its group's last whole merge makes the group out
-    /// of date ([`mmm_core::mosaic::region_differs`]) until Merge re-merges
-    /// it.
-    pub fn merge_roi(&mut self, session: &mut OpenSession, jobs: &mut JobRunner) {
-        if self.merge_roi_block_reason(session, jobs).is_some() {
-            return;
-        }
-        let Some(rect) = self.rois.selected_rect() else {
-            return;
-        };
-        self.merge_groups(session, jobs, self.members.clone(), Some(rect));
-    }
-
-    /// Merge `rect` of each of `groups`: `None` (the whole canvas) with the
-    /// committed settings (a whole merge commits the draft first), an ROI
-    /// with the draft ([`draft_for`]).
+    /// Merge each of `groups` over the whole canvas with the committed
+    /// settings (a whole merge commits the draft first).
     fn merge_groups(
         &mut self,
         session: &mut OpenSession,
         jobs: &mut JobRunner,
         groups: Vec<String>,
-        rect: Option<[u64; 4]>,
     ) -> bool {
         // The export check maps result stores a merge may recreate; an
         // analysis edit waiting to apply would cancel the merge anyway.
@@ -802,13 +755,7 @@ impl MosaicView {
         }
         let any = !groups.is_empty();
         for g in groups {
-            let id = match rect {
-                None => jobs.start_blend(session, &g, None),
-                Some(_) => {
-                    let draft = draft_for(&session.mosaic.config, &g);
-                    jobs.start_blend_with(session, &g, rect, draft)
-                }
-            };
+            let id = jobs.start_blend(session, &g, None);
             self.merge_jobs.insert(id, g);
         }
         any
@@ -863,7 +810,7 @@ impl MosaicView {
             .collect();
         match self.export.ui(ctx, session, can_merge, &merging) {
             Some(ExportAction::BlendFirst(groups)) => {
-                self.merge_groups(session, jobs, groups, None);
+                self.merge_groups(session, jobs, groups);
             }
             Some(ExportAction::Export(dests, format)) => {
                 for (group, out) in dests {
@@ -882,15 +829,26 @@ impl MosaicView {
             .is_some_and(|v| v.tool() == Tool::DrawRect)
     }
 
-    /// The ROI list: "+ new ROI" (the viewer's draw tool), and each ROI's
-    /// name, note and freshness; changes are saved (debounced). The canvas
-    /// rect of an ROI just picked, to go to: the caller frames it on the
-    /// canvas it shows (both canvases share the camera, so nothing here
-    /// moves the viewer).
+    /// The ROIs as canvas overlays (the window gives them to the plan too).
+    pub fn roi_overlays(&self) -> Vec<mega_ui::canvas_layers::Overlay> {
+        self.rois.overlays()
+    }
+
+    /// Arm (or disarm) the viewer's ROI draw tool: the next drag draws a
+    /// rectangle. Nothing without a viewer.
+    pub fn set_drawing(&mut self, on: bool) {
+        if let Some(v) = &mut self.viewer {
+            v.set_tool(if on { Tool::DrawRect } else { Tool::Navigate });
+        }
+    }
+
+    /// The ROI list: each ROI's name, size and state, and the note of the
+    /// selected one; changes are saved (debounced). The canvas rect of an
+    /// ROI just picked, to go to: the caller frames it on the canvas it
+    /// shows (both canvases share the camera, so nothing here moves the
+    /// viewer).
     pub fn rois_ui(&mut self, ui: &mut egui::Ui, session: &mut OpenSession) -> Option<[u64; 4]> {
-        let out = self
-            .rois
-            .ui(ui, &mut session.mosaic.config.ui, self.viewer.as_mut());
+        let out = self.rois.ui(ui, &mut session.mosaic.config.ui);
         if out.changed {
             self.save.touch();
         }
@@ -1503,9 +1461,24 @@ impl MosaicView {
         }
     }
 
-    /// A rectangle drawn on the canvas becomes a new ROI, selected and
-    /// saved (debounced).
-    fn on_drawn(&mut self, session: &mut OpenSession, r: [f64; 4], canvas: (u64, u64)) {
+    /// The ROI the list deleted since the last call, with its index, once:
+    /// the window offers to undo it.
+    pub fn take_roi_deleted(&mut self) -> Option<(usize, Roi)> {
+        self.rois.take_deleted()
+    }
+
+    /// Put back a deleted ROI at its index, selected (saved, debounced).
+    pub fn restore_roi(&mut self, session: &mut OpenSession, index: usize, roi: Roi) {
+        self.rois.load_once(&session.mosaic.config.ui);
+        if self.rois.restore(&mut session.mosaic.config.ui, index, roi) {
+            self.save.touch();
+        }
+    }
+
+    /// A rectangle drawn on a canvas (`r` in its image pixels, which is
+    /// `canvas` pixels wide and high) becomes a new ROI, selected and saved
+    /// (debounced).
+    pub fn on_drawn(&mut self, session: &mut OpenSession, r: [f64; 4], canvas: (u64, u64)) {
         if self.rois.on_drawn(&mut session.mosaic.config.ui, r, canvas) {
             self.save.touch();
         }

@@ -7,6 +7,7 @@
 //! | `[` / `]` | previous / next group or composite, round the chips | the chips |
 //! | `O` | **Outlines** | the toggle |
 //! | `R` | **ROIs** | the toggle |
+//! | `D` | **Draw ROI**: arm the draw tool on the canvas shown | the section's button |
 //! | `L` | **Linked** (not for a mono view) | the toggle |
 //! | `S` | **Strong** | the toggle |
 //! | `Ctrl+Enter` (`Cmd+Enter` on macOS) | **Merge**, while the main button offers it | the main button |
@@ -44,6 +45,8 @@ pub(super) const NEXT_VIEW: Key = Key::CloseBracket;
 pub(super) const OUTLINES: Key = Key::O;
 /// Toggles **ROIs**.
 pub(super) const ROIS: Key = Key::R;
+/// Arms the draw tool for a new ROI, as **Draw ROI** does.
+pub(super) const DRAW_ROI: Key = Key::D;
 /// Toggles **Linked**.
 pub(super) const LINKED: Key = Key::L;
 /// Toggles **Strong**.
@@ -129,6 +132,9 @@ impl SessionWindow {
         }
         if pressed(ROIS) {
             self.look.rois = !self.look.rois;
+        }
+        if pressed(DRAW_ROI) {
+            self.start_drawing_roi();
         }
         let mut stretch = DisplayStretch::load(&session.mosaic.config.ui);
         let before = stretch;

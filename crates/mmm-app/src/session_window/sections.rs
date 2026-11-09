@@ -7,10 +7,10 @@
 //! - **Panels**: "{n} panels · {g} groups · {canvas}", the previews'
 //!   progress (with **Resume** once paused), and the selected panel's
 //!   details and checks.
-//! - **ROIs**: the ROI list ([`MosaicView::rois_ui`]) and **Merge ROI**.
-//!   Picking an ROI frames it on the canvas shown
-//!   ([`SessionWindow::frame`]). Drawing an ROI needs the mosaic for now:
-//!   starting to draw switches the canvas to it.
+//! - **ROIs**: **Draw ROI** (also the `D` key) arms the draw tool on the
+//!   canvas shown, plan or mosaic, then the ROI list
+//!   ([`MosaicView::rois_ui`]). Picking an ROI frames it on the canvas
+//!   shown ([`SessionWindow::frame`]).
 //! - **Merge settings** ([`MosaicView::settings_ui`]), then the health.
 //! - **Composites**: each composite's editor and **Delete composite**.
 //! - **Notes**: the session's notes, saved with the session (debounced).
@@ -53,6 +53,8 @@ struct Actions {
     deleted: Option<usize>,
     /// An ROI was picked: frame this canvas rect.
     go_to: Option<[u64; 4]>,
+    /// **Draw ROI** was used: arm the draw tool on the canvas shown.
+    draw_roi: bool,
 }
 
 impl SessionWindow {
@@ -107,7 +109,8 @@ impl SessionWindow {
                 badge: None,
             },
         ];
-        let mode = self.mode();
+        let can_draw = self.can_draw_roi();
+        let drawing = self.drawing_roi();
         let mut act = Actions::default();
         let SessionWindow {
             plan,
@@ -125,7 +128,7 @@ impl SessionWindow {
             ui.push_id(id, |ui| match id {
                 PROBLEMS => problems_ui(ui, session, checks, show_all_checks, &mut out.accept),
                 PANELS => panels_ui(ui, session, plan, pipeline, checks, &mut out.accept),
-                ROIS => rois_ui(ui, session, jobs, mosaic, mode, &mut act),
+                ROIS => rois_ui(ui, session, mosaic, (can_draw, drawing), &mut act),
                 MERGE_SETTINGS => {
                     mosaic.settings_ui(ui, session, jobs);
                     ui.add_space(space::L);
@@ -141,6 +144,9 @@ impl SessionWindow {
         }
         if let Some(rect) = act.go_to {
             self.frame(rect);
+        }
+        if act.draw_roi {
+            self.start_drawing_roi();
         }
         if let Some(i) = act.deleted {
             self.composite_deleted(session, i);
@@ -337,31 +343,30 @@ fn panels_ui(
 fn rois_ui(
     ui: &mut egui::Ui,
     session: &mut OpenSession,
-    jobs: &mut JobRunner,
     mosaic: &mut MosaicView,
-    mode: CanvasMode,
+    (can_draw, drawing): (bool, bool),
     act: &mut Actions,
 ) {
-    let drawing = mosaic.drawing();
-    act.go_to = mosaic.rois_ui(ui, session);
-    // ROIs are drawn on the mosaic (until the plan takes them).
-    if !drawing && mosaic.drawing() && mode == CanvasMode::Plan {
-        act.mode = Some(CanvasMode::Mosaic);
-    }
-    ui.add_space(space::S);
-    let why = mosaic.merge_roi_block_reason(session, jobs);
     if ui
         .add_enabled(
-            why.is_none(),
-            MegaButton::new(ButtonKind::Secondary, "Merge ROI"),
+            can_draw && !drawing,
+            MegaButton::new(ButtonKind::Secondary, "Draw ROI"),
         )
-        .on_hover_text("Merge the selected region of interest for this view's groups")
-        .on_disabled_hover_text(why.unwrap_or_default())
+        .on_hover_text(shortcuts::keyed("Draw ROI", shortcuts::DRAW_ROI))
+        .on_disabled_hover_text(if drawing {
+            "Drag on the image to draw; Esc cancels."
+        } else {
+            "Shown once the canvas has been drawn."
+        })
         .clicked()
     {
-        mosaic.merge_roi(session, jobs);
-        act.mode = Some(CanvasMode::Mosaic);
+        act.draw_roi = true;
     }
+    if drawing {
+        muted(ui, "Drag on the image to draw; Esc cancels.");
+    }
+    ui.add_space(space::S);
+    act.go_to = mosaic.rois_ui(ui, session);
 }
 
 fn composites_ui(

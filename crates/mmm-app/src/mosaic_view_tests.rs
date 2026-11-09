@@ -100,6 +100,7 @@ fn labels(jobs: &JobRunner) -> Vec<String> {
 /// An ROI named `name` over canvas rect `canvas`.
 fn roi(name: &str, canvas: [u64; 4]) -> Roi {
     Roi {
+        id: 1,
         name: name.into(),
         note: String::new(),
         sky: None,
@@ -272,7 +273,7 @@ fn stretch_holds_while_merging() {
     {
         let st = h.state_mut();
         st.view
-            .merge_groups(&mut st.session, &mut st.jobs, vec!["Ha".into()], None);
+            .merge_groups(&mut st.session, &mut st.jobs, vec!["Ha".into()]);
     }
     let (mut last, mut updates, mut moved) = (0, 0, false);
     loop {
@@ -715,11 +716,11 @@ fn recompute_without_statistics_keeps_the_stretch() {
 }
 
 #[test]
-fn merge_roi_starts_one_merge_per_view_group() {
+fn a_drawn_rect_becomes_a_region() {
     use crate::compositions::{Composition, save_compositions};
     use crate::testutil::CANVAS;
 
-    let (root, mut s, mut jobs) = analyzed("mosaic-roi-groups");
+    let (root, mut s, _jobs) = analyzed("mosaic-roi-groups");
     let mut hoo = Composition::new("HOO");
     hoo.channels = [
         Some(("Ha".into(), 1.0)),
@@ -729,96 +730,29 @@ fn merge_roi_starts_one_merge_per_view_group() {
     save_compositions(&mut s.mosaic.config.ui, &[hoo]);
     let mut view = MosaicView::new();
     view.set_view(&s, ViewKind::Composition(0));
-    assert_eq!(view.members, ["Ha", "OIII"]);
-    assert_eq!(
-        view.group(),
-        Some("Ha"),
-        "the first member's health is shown"
-    );
-    for g in ["Ha", "OIII"] {
-        member(&mut view, g).reopen = false;
-    }
 
-    // A drawn rect becomes "ROI 1" in whole canvas pixels, selected and
+    // A drawn rect becomes "Region 1" in whole canvas pixels, selected and
     // saved in the session's ui.
     view.on_drawn(&mut s, [10.4, 20.0, 299.5, 200.0], CANVAS);
     let rois = view.rois.rois();
     assert_eq!(rois.len(), 1);
-    assert_eq!(rois[0].name, "ROI 1");
+    assert_eq!(rois[0].name, "Region 1");
     assert_eq!(rois[0].canvas, [10, 20, 300, 200]);
-    assert_eq!(view.rois.selected, Some(0));
+    assert_eq!(view.rois.selected, Some(rois[0].id));
     assert!(view.save.pending() && view.rois.want_sync && view.rois.want_fresh);
     assert_eq!(
         crate::rois::load_rois(&s.mosaic.config.ui),
         view.rois.rois(),
         "kept in ui"
     );
+    // The next goes to the end of the list, with its own id.
     view.on_drawn(&mut s, [0.0, 0.0, 50.0, 50.0], CANVAS);
-    assert_eq!(view.rois.rois()[1].name, "ROI 2");
-    assert_eq!(view.rois.selected, Some(1));
-    view.rois.selected = Some(0);
-
-    // Not while the ROIs are being reprojected (the rect may be from an
-    // older frame).
-    let why = view.merge_roi_block_reason(&s, &jobs).expect("blocked");
-    assert!(why.contains("regions of interest"), "{why}");
-    view.merge_roi(&mut s, &mut jobs);
-    assert!(!jobs.busy() && view.merge_jobs.is_empty());
-    view.rois.want_sync = false;
-
-    // Merge ROI: one merge of the ROI for each group of the view.
-    assert_eq!(view.merge_roi_block_reason(&s, &jobs), None);
-    let gate = jobs.hold();
-    view.merge_roi(&mut s, &mut jobs);
-    assert_eq!(labels(&jobs), ["Merge Ha", "Merge OIII"]);
-    let mut groups: Vec<&String> = view.merge_jobs.values().collect();
-    groups.sort();
-    assert_eq!(groups, ["Ha", "OIII"]);
-    gate.open();
-    for e in drain(&mut jobs, &mut s) {
-        assert!(matches!(e, JobEvent::Finished { .. }), "{e:?}");
-        view.on_event(&e);
-    }
-    assert!(view.merge_jobs.is_empty());
-    let merges: Vec<_> = s
-        .mosaic
-        .config
-        .provenance
-        .iter()
-        .filter(|p| p.action == "blend")
-        .map(|p| (p.group.clone(), p.detail["rect"].clone()))
-        .collect();
-    assert_eq!(merges.len(), 2);
-    // Each merge covered the ROI (recorded tile-aligned: 256-px tiles).
-    for (_, rect) in &merges {
-        assert_eq!(*rect, serde_json::json!([0, 0, 512, 256]));
-    }
-
-    // A group view merges just that group's ROI (once its result, asked
-    // for again by the merge's end, has been looked at)...
-    view.set_view(&s, ViewKind::Group("OIII".into()));
-    assert_eq!(view.members, ["OIII"]);
-    assert!(member(&mut view, "OIII").reopen);
-    assert!(view.merge_roi_block_reason(&s, &jobs).is_some());
-    member(&mut view, "OIII").reopen = false;
-    let gate = jobs.hold();
-    view.merge_roi(&mut s, &mut jobs);
-    assert_eq!(labels(&jobs), ["Merge OIII"]);
-    gate.open();
-    drain(&mut jobs, &mut s);
-    // ...but merging the whole mosaic merges every group (spec §5.4).
-    let gate = jobs.hold();
-    view.merge_all(&mut s, &mut jobs);
-    assert_eq!(labels(&jobs), ["Merge Ha", "Merge OIII"]);
-    gate.open();
-    drain(&mut jobs, &mut s);
-    // No selected ROI: nothing to merge, and the reason says so.
-    view.rois.selected = None;
-    let why = view.merge_roi_block_reason(&s, &jobs).expect("blocked");
-    assert!(why.contains("region of interest"), "{why}");
+    let rois = view.rois.rois();
+    assert_eq!(rois[1].name, "Region 2");
+    assert_ne!(rois[0].id, rois[1].id);
+    assert_eq!(view.rois.selected, Some(rois[1].id));
     let _ = std::fs::remove_dir_all(&root);
 }
-
 #[test]
 fn composition_shows_merged_members() {
     use crate::compositions::{Composition, load_compositions, save_compositions};
@@ -997,20 +931,14 @@ fn no_merge_while_the_export_check_runs() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(can_merge(&view, &s, &jobs), "allowed when idle");
-    view.rois.rois.push(roi("ROI 1", [0, 0, 64, 64]));
-    view.rois.selected = Some(0);
-    view.rois.want_sync = false;
-    assert_eq!(view.merge_roi_block_reason(&s, &jobs), None);
     view.open_export(&s);
     let (release, rx) = std::sync::mpsc::channel();
     view.export.force_checking(&ctx, rx);
     assert!(!view.export.idle());
     let why = view.merge_block_reason(&s, &jobs).expect("blocked");
     assert!(why.contains("export"), "{why}");
-    assert!(view.merge_roi_block_reason(&s, &jobs).is_some());
     view.merge_all(&mut s, &mut jobs);
-    view.merge_roi(&mut s, &mut jobs);
-    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], Some([0, 0, 64, 64]));
+    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()]);
     assert!(!jobs.busy(), "no merge job started during the check");
     assert!(view.merge_jobs.is_empty());
     drop(release);
@@ -1324,7 +1252,7 @@ fn a_draft_edit_does_not_block_merging() {
     d.feather_px = 128.0;
     view.settings.edit_draft(&mut s.mosaic.config, d);
     assert_eq!(view.merge_block_reason(&s, &jobs), None);
-    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
+    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()]);
     assert!(jobs.busy(), "the merge started");
     drain(&mut jobs, &mut s);
     let _ = std::fs::remove_dir_all(&root);
@@ -1342,7 +1270,6 @@ fn an_invalid_feather_blocks_merge() {
         view.merge_block_reason(&s, &jobs).as_deref(),
         Some("Feather width must be a number above 0")
     );
-    assert!(view.merge_roi_block_reason(&s, &jobs).is_some());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1357,7 +1284,7 @@ fn analysis_edit_waits_for_merges_and_blocks_merging() {
     member(&mut view, "Ha").reopen = false;
     assert_eq!(view.merge_block_reason(&s, &jobs), None);
     let gate = jobs.hold();
-    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()], None);
+    view.merge_groups(&mut s, &mut jobs, vec!["Ha".into()]);
     let mut a = s.mosaic.config.analyze.clone();
     a.gain = mmm_core::photometry::GainMode::Unity;
     assert_eq!(view.edit_analysis(a, &mut s, &mut jobs), None);

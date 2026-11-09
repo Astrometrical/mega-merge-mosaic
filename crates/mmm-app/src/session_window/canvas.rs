@@ -352,7 +352,16 @@ impl SessionWindow {
                     complete: pipeline.previews_complete(),
                     checks: checks.report(),
                 };
+                let overlays = if self.look.rois {
+                    self.mosaic.roi_overlays()
+                } else {
+                    Vec::new()
+                };
+                self.plan.set_overlays(overlays);
                 self.plan.show(ui, session, &feed, &self.look);
+                if let Some((rect, canvas)) = self.plan.take_drawn() {
+                    self.mosaic.on_drawn(session, rect, canvas);
+                }
                 // The plan's selection changed (a click, Esc): a panel just
                 // selected opens its details in the inspector; the list
                 // follows (drawn already: from the next frame).

@@ -58,6 +58,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{Color32, ColorImage, RichText};
+use mega_ui::canvas_layers::{Overlay, Tool};
 use mega_ui::plan::{Layer, PlacedItem, PlanCanvas};
 use mega_ui::theme::palette;
 use mega_ui::theme::tokens::space;
@@ -114,8 +115,8 @@ pub struct CanvasLook {
     pub outlines: bool,
     /// Panel numbers.
     pub numbers: bool,
-    /// The regions of interest (the merged mosaic draws them; the plan
-    /// does not yet).
+    /// The regions of interest, outlined and named on the plan and on the
+    /// merged mosaic alike.
     pub rois: bool,
     /// The automatic display stretch's toggles.
     pub stretch: DisplayStretch,
@@ -660,6 +661,11 @@ pub struct PlanView {
     hovered: Option<PathBuf>,
     /// The panel to highlight (pointed at elsewhere).
     highlight: Option<PathBuf>,
+    /// What the window has drawn over the plan (the ROIs).
+    overlays: Vec<Overlay>,
+    /// A rectangle just drawn, with the canvas it is on: see
+    /// [`PlanView::take_drawn`].
+    drawn: Option<([f64; 4], (u64, u64))>,
     held_camera: Option<HeldCamera>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
@@ -734,6 +740,8 @@ impl PlanView {
             selected: None,
             hovered: None,
             highlight: None,
+            overlays: Vec::new(),
+            drawn: None,
             held_camera: None,
             textures_for: None,
             textures: HashMap::new(),
@@ -772,6 +780,32 @@ impl PlanView {
     /// when drawn).
     pub fn select_view(&mut self, view: ViewKind) {
         self.view = Some(view);
+    }
+
+    /// Draw these over the panels (canvas coordinates) from the next frame
+    /// on: the ROIs, when the look has them.
+    pub fn set_overlays(&mut self, overlays: Vec<Overlay>) {
+        self.overlays = overlays;
+    }
+
+    /// Arm (or disarm) the draw tool: the next drag draws a rectangle
+    /// ([`PlanView::take_drawn`]) instead of panning, and clicks select
+    /// nothing.
+    pub fn set_drawing(&mut self, on: bool) {
+        self.canvas
+            .set_tool(if on { Tool::DrawRect } else { Tool::Navigate });
+    }
+
+    /// Whether the draw tool is armed.
+    pub fn drawing(&self) -> bool {
+        self.canvas.tool() == Tool::DrawRect
+    }
+
+    /// The rectangle the user finished drawing since the last call, once,
+    /// as `[x0, y0, x1, y1]` in canvas coordinates with the size of the
+    /// canvas it was drawn on.
+    pub fn take_drawn(&mut self) -> Option<([f64; 4], (u64, u64))> {
+        self.drawn.take()
     }
 
     /// The view shown (once drawn).
@@ -974,9 +1008,17 @@ impl PlanView {
             held.extent = Some(extent);
             held.drawn = false;
         }
+        self.canvas.set_overlays(self.overlays.clone());
         let r = self
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);
+        if let Some(rect) = r.drawn_rect {
+            let size = (
+                extent[2].ceil().max(0.0) as u64,
+                extent[3].ceil().max(0.0) as u64,
+            );
+            self.drawn = Some((rect, size));
+        }
         if self.canvas.last_frame().is_some_and(|(_, t)| t == now) {
             if let Some(held) = &mut self.held_camera {
                 held.drawn = true;
