@@ -66,6 +66,18 @@ pub fn load_draft(cfg: &MosaicConfig) -> BlendSettings {
         .unwrap_or_else(|| cfg.blend.clone())
 }
 
+/// The draft as `group` would merge with it: [`load_draft`] with the
+/// group's override applied (what a transient preview of the group is made
+/// with, [`crate::previews`]).
+pub fn draft_for(cfg: &MosaicConfig, group: &str) -> BlendSettings {
+    let over = cfg
+        .group_overrides
+        .get(group)
+        .map(|o| o.blend.clone())
+        .unwrap_or_default();
+    load_draft(cfg).with(&over)
+}
+
 /// Store `draft` in `ui` (`MosaicConfig.ui`), keeping everything else
 /// there (a `ui` that is not a JSON object becomes one).
 pub fn save_draft(ui: &mut Value, draft: &BlendSettings) {

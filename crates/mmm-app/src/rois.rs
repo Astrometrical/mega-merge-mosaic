@@ -9,14 +9,15 @@
 //! list itself is UI state, saved like the display stretch.
 //!
 //! [`RoiPanel`] is the ROI list (the session window's ROIs section) and its
-//! workers: the list (new, select, rename, note, delete), the
-//! reprojection, and how fresh each group of the view is inside each ROI.
-//! Selecting an ROI asks to go to it ([`RoiOutcome::go_to`]): the window
-//! frames it on whichever canvas shows, through the camera both share.
+//! worker: the list (new, select, rename, note, delete) and the
+//! reprojection. Each ROI's row and canvas label show its transient
+//! preview's state, as the window reports it ([`RoiPanel::set_states`],
+//! from [`crate::previews`]). Selecting an ROI asks to go to it
+//! ([`RoiOutcome::go_to`]): the window frames it on whichever canvas shows,
+//! through the camera both share.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use egui::RichText;
 use mega_ui::canvas_layers::Overlay;
@@ -27,7 +28,7 @@ use mmm_core::reference::ReferenceFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::tile_source::{MosaicTileSource, fresh_fraction};
+use crate::previews::PreviewState;
 use crate::util::{Poll, Task};
 
 /// Key in `MosaicConfig.ui` of the ROI list.
@@ -206,16 +207,10 @@ pub fn roi_size_text(r: [u64; 4]) -> String {
     format!("{w} × {h} ({:.1} MP)", (w * h) as f64 / 1e6)
 }
 
-/// Per member group of the view: `(valid, total)` level-0 tiles inside an
-/// ROI, or `None` when the group has no result open.
-pub type MemberCounts = Vec<(String, Option<(usize, usize)>)>;
-/// [`MemberCounts`] of each ROI rect.
-type FreshCounts = Vec<([u64; 4], MemberCounts)>;
-
 /// The session's ROIs: the list (kept in `MosaicConfig.ui`), the
-/// selection, and the sync and freshness workers. Methods that change the
-/// list write it into the session's `ui` and return true; the view then
-/// saves (debounced).
+/// selection, the sync worker and each ROI's preview state (the window
+/// reports it). Methods that change the list write it into the session's
+/// `ui` and return true; the view then saves (debounced).
 #[derive(Default)]
 pub struct RoiPanel {
     /// The ROIs, as in `ui.rois`.
@@ -227,11 +222,8 @@ pub struct RoiPanel {
     sync: Option<Task<(Vec<Roi>, Vec<Roi>)>>,
     /// Reproject (read the frame) once possible.
     pub(crate) want_sync: bool,
-    /// [`MemberCounts`] by ROI rect.
-    fresh: BTreeMap<[u64; 4], MemberCounts>,
-    fresh_task: Option<Task<FreshCounts>>,
-    /// Count fresh tiles once possible.
-    pub(crate) want_fresh: bool,
+    /// Each ROI's preview state, by id, as the window last reported it.
+    states: BTreeMap<u64, PreviewState>,
     /// The list widget's own state (a rename in progress).
     list: ListState,
     /// One above every id given so far this session: ids are never reused.
@@ -258,20 +250,27 @@ impl RoiPanel {
 
     /// No reprojection running or wanted: the canvas rects follow the
     /// current frame (as far as the last analysis knows it).
-    #[cfg(test)]
     pub fn synced(&self) -> bool {
         self.sync.is_none() && !self.want_sync
     }
 
     /// No worker running.
     pub fn idle(&self) -> bool {
-        self.sync.is_none() && self.fresh_task.is_none()
+        self.sync.is_none()
     }
 
-    /// The view (its groups) changed: freshness is counted again.
-    pub fn view_changed(&mut self) {
-        self.fresh.clear();
-        self.want_fresh = true;
+    /// Each ROI's preview state, by id (an ROI missing is out of date): its
+    /// row says it, and its canvas label while it merges.
+    pub fn set_states(&mut self, states: BTreeMap<u64, PreviewState>) {
+        self.states = states;
+    }
+
+    /// ROI `id`'s preview state.
+    fn state(&self, id: u64) -> PreviewState {
+        self.states
+            .get(&id)
+            .copied()
+            .unwrap_or(PreviewState::OutOfDate)
     }
 
     /// A rectangle drawn on the canvas (image coordinates of a
@@ -300,22 +299,14 @@ impl RoiPanel {
     }
 
     /// The rects changed (draw, delete, reprojection): keep the list in
-    /// `ui` and count freshness again.
+    /// `ui`.
     fn geometry_changed(&mut self, ui: &mut Value) {
         save_rois(ui, &self.rois);
-        self.want_fresh = true;
     }
 
-    /// Start the sync (reading the frame at `frame`) and freshness counts
-    /// over `members` (each group of the view and its open result) on
-    /// workers when asked for. A freshness task holds the sources: the
-    /// caller tracks any it gives up meanwhile (`mosaic_view`).
-    pub fn start_tasks(
-        &mut self,
-        ctx: &egui::Context,
-        frame: PathBuf,
-        members: Vec<(String, Option<Arc<MosaicTileSource>>)>,
-    ) {
+    /// Start the sync (reading the frame at `frame`) on a worker when asked
+    /// for.
+    pub fn start_sync(&mut self, ctx: &egui::Context, frame: PathBuf) {
         if self.want_sync && self.sync.is_none() {
             self.want_sync = false;
             if !self.rois.is_empty() {
@@ -327,29 +318,9 @@ impl RoiPanel {
                 });
             }
         }
-        if self.want_fresh && self.fresh_task.is_none() {
-            self.want_fresh = false;
-            let rects: Vec<[u64; 4]> = self.rois.iter().map(|r| r.canvas).collect();
-            if rects.is_empty() || members.is_empty() {
-                self.fresh.clear();
-                return;
-            }
-            self.fresh_task = Task::spawn("mmm-roi-fresh", ctx, move || {
-                rects
-                    .into_iter()
-                    .map(|r| {
-                        let per = members
-                            .iter()
-                            .map(|(g, s)| (g.clone(), s.as_ref().map(|s| s.fresh_counts(r))))
-                            .collect();
-                        (r, per)
-                    })
-                    .collect()
-            });
-        }
     }
 
-    /// Apply finished workers; true if the list changed (written to `ui`).
+    /// Apply a finished sync; true if the list changed (written to `ui`).
     pub fn poll(&mut self, ui: &mut Value) -> bool {
         let mut changed = false;
         if let Some(task) = &self.sync {
@@ -380,21 +351,12 @@ impl RoiPanel {
                 }
             }
         }
-        if let Some(task) = &self.fresh_task {
-            match task.poll() {
-                Poll::Pending => {}
-                Poll::Lost => self.fresh_task = None,
-                Poll::Done(counts) => {
-                    self.fresh_task = None;
-                    self.fresh = counts.into_iter().collect();
-                }
-            }
-        }
         changed
     }
 
     /// The ROIs as canvas overlays (drawn on both canvases): the selected
-    /// one solid in the accent colour, the others dashed.
+    /// one solid in the accent colour, the others dashed; each labelled
+    /// with its name, followed by " · merging…" while its preview merges.
     pub fn overlays(&self) -> Vec<Overlay> {
         self.rois
             .iter()
@@ -407,18 +369,14 @@ impl RoiPanel {
                     } else {
                         palette::TEXT_BODY
                     },
-                    label: r.name.clone(),
+                    label: match self.state(r.id) {
+                        PreviewState::Merging => format!("{} · merging…", r.name),
+                        _ => r.name.clone(),
+                    },
                     dashed: !selected,
                 }
             })
             .collect()
-    }
-
-    /// The state shown on ROI `roi`'s row.
-    fn state_text(&self, _roi: &Roi) -> &'static str {
-        // Previews come with the transient preview runner; until then
-        // nothing is ever out of date.
-        "up to date"
     }
 
     /// Take the ROI the list just deleted, with the index it had: the
@@ -447,8 +405,7 @@ impl RoiPanel {
     /// ([`RoiOutcome::go_to`]; the caller moves the camera); rename,
     /// reorder and delete are the list's ([`ordered_list_with`]), a delete
     /// is kept for [`RoiPanel::take_deleted`]. A change of the list is
-    /// written to `ui` ([`RoiOutcome::changed`]); a rename, a move or a
-    /// note edit does not count freshness again.
+    /// written to `ui` ([`RoiOutcome::changed`]).
     pub fn ui(&mut self, ui: &mut egui::Ui, cfg_ui: &mut Value) -> RoiOutcome {
         if self.rois.is_empty() {
             ui.label(
@@ -463,7 +420,8 @@ impl RoiPanel {
             .rois
             .iter()
             .map(|r| {
-                let detail = format!("{} · {}", roi_size_text(r.canvas), self.state_text(r));
+                let state = self.state(r.id).text();
+                let detail = format!("{} · {state}", roi_size_text(r.canvas));
                 (r.id, r.name.clone(), detail, self.selected == Some(r.id))
             })
             .collect();
@@ -477,7 +435,7 @@ impl RoiPanel {
             })
             .collect();
         let mut note_edited = false;
-        let (rois, fresh) = (&mut self.rois, &self.fresh);
+        let rois = &mut self.rois;
         let events = ordered_list_with(ui, "rois", &rows, &mut self.list, |ui, id| {
             if let Some(roi) = rois.iter_mut().find(|r| r.id == id) {
                 ui.horizontal(|ui| {
@@ -487,19 +445,11 @@ impl RoiPanel {
                         .labelled_by(l.id)
                         .changed();
                 });
-                let state = fresh
-                    .get(&roi.canvas)
-                    .map_or_else(|| "…".to_string(), fresh_text);
-                ui.label(
-                    RichText::new(format!("Merged tiles: {state}"))
-                        .small()
-                        .color(palette::TEXT_MUTED),
-                );
             }
         });
         let mut out = RoiOutcome::default();
         let mut rewrite = note_edited;
-        let mut recount = false;
+        let mut deleted = false;
         for event in events {
             match event {
                 ListEvent::Select(id) => self.selected = Some(id),
@@ -527,41 +477,21 @@ impl RoiPanel {
                             self.selected = None;
                         }
                         self.deleted = Some((at, roi));
-                        recount = true;
+                        deleted = true;
                     }
                 }
             }
         }
-        if recount {
+        if deleted {
             self.geometry_changed(cfg_ui);
             out.go_to = None;
             out.changed = true;
         } else if rewrite {
-            // Names, order and notes only: saved, but nothing to recount.
+            // Names, order and notes only.
             save_rois(cfg_ui, &self.rois);
             out.changed = true;
         }
         out
-    }
-}
-
-/// How fresh an ROI is for the view's groups: "fresh", "stale (NN%
-/// fresh)", "not merged" or "no tiles"; with several groups, each
-/// prefixed by its name.
-pub fn fresh_text(counts: &MemberCounts) -> String {
-    let one = |c: &Option<(usize, usize)>| match c.map(fresh_fraction) {
-        None => "not merged".to_string(),
-        Some(None) => "no tiles".to_string(),
-        Some(Some(f)) if f >= 1.0 => "fresh".to_string(),
-        Some(Some(f)) => format!("stale ({:.0}% fresh)", (f * 100.0).floor()),
-    };
-    match counts.as_slice() {
-        [(_, c)] => one(c),
-        _ => counts
-            .iter()
-            .map(|(g, c)| format!("{g} {}", one(c)))
-            .collect::<Vec<_>>()
-            .join(", "),
     }
 }
 
@@ -747,16 +677,5 @@ mod tests {
         let top = panel.rois().iter().map(|r| r.id).max().unwrap();
         assert!(panel.on_drawn(&mut ui, [0.0, 0.0, 9.0, 9.0], (1000, 1000)));
         assert!(panel.rois().last().unwrap().id > top);
-    }
-
-    #[test]
-    fn fresh_text_per_member() {
-        let one = |c| vec![("Ha".to_string(), c)];
-        assert_eq!(fresh_text(&one(Some((2, 2)))), "fresh");
-        assert_eq!(fresh_text(&one(Some((1, 3)))), "stale (33% fresh)");
-        assert_eq!(fresh_text(&one(Some((0, 0)))), "no tiles");
-        assert_eq!(fresh_text(&one(None)), "not merged");
-        let two = vec![("Ha".to_string(), Some((4, 4))), ("OIII".to_string(), None)];
-        assert_eq!(fresh_text(&two), "Ha fresh, OIII not merged");
     }
 }

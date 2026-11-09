@@ -40,8 +40,17 @@
 //!   window is drawn: [`SessionWindow::on_event`] for each job event,
 //!   [`SessionWindow::poll_panels`], [`SessionWindow::poll_settings`],
 //!   [`SessionWindow::track_analysis`] and [`SessionWindow::poll`] (the
-//!   merged mosaic's work, the plan's texture release and the window's
-//!   saves).
+//!   merged mosaic's work, the ROI previews, the plan's texture release and
+//!   the window's saves).
+//! - **ROI previews** ([`crate::previews`]): each frame the window asks for
+//!   a preview of every ROI in view on the shown canvas, for each group in
+//!   view (a composite's members in R, G, B order), the group first, then
+//!   the ROI nearest the centre of the view
+//!   ([`SessionWindow::wanted_previews`]); none while the ROIs are hidden
+//!   or being reprojected, an analysis runs or is queued, an edit waits, or
+//!   the typed merge settings are invalid. Previews run on their own
+//!   thread, never as jobs: no job event, no toast, nothing written. Each
+//!   ROI's row and canvas label say how its preview stands.
 //! - **View state** ([`view_state`]): plan or mosaic, the view, the camera,
 //!   the inspector's fold and open sections, the panel list and the
 //!   Outlines and ROIs toggles are written into `ui` whenever they change.
@@ -101,6 +110,7 @@ use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView, group_members};
+use crate::previews::{PreviewKey, Previews, Wanted};
 use crate::rois::Roi;
 use crate::session::OpenSession;
 use crate::util::{Debounce, group_names};
@@ -197,6 +207,8 @@ pub struct SessionWindow {
     was_typing: bool,
     /// Merge settings was opened by itself after the first analysis.
     settings_revealed: bool,
+    /// The ROIs' transient previews.
+    previews: Previews,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -237,6 +249,7 @@ impl SessionWindow {
             panel_list_open: false,
             was_typing: false,
             settings_revealed: false,
+            previews: Previews::new(),
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -498,10 +511,12 @@ impl SessionWindow {
         }
     }
 
-    /// Follow the ROI list: one deleted since the last frame raises its
-    /// "{name} deleted" toast, whose Undo puts it back.
+    /// Follow the ROI list: one deleted since the last frame drops its
+    /// previews and raises its "{name} deleted" toast, whose Undo puts it
+    /// back.
     fn follow_rois(&mut self) {
         if let Some((index, roi)) = self.mosaic.take_roi_deleted() {
+            self.previews.forget_roi(roi.id);
             self.push_toast(WindowToast {
                 toast: mega_ui::widgets::Toast {
                     tone: mega_ui::theme::Tone::Neutral,
@@ -516,17 +531,106 @@ impl SessionWindow {
 
     /// The window's every-frame work, drawn or not: pick the mode and the
     /// view (on the first frame, as saved), the mosaic's work
-    /// ([`MosaicView::poll`]), the ROI list's delete toast, the plan's texture release, and the
-    /// rate-limited save (with the view, if it changed). Call every frame
-    /// after the runner's poll and [`SessionWindow::track_analysis`],
+    /// ([`MosaicView::poll`]), the ROI list's delete toast, the ROI previews
+    /// ([`SessionWindow::follow_previews`]), the plan's texture release, and
+    /// the rate-limited save (with the view, if it changed). Call every
+    /// frame after the runner's poll and [`SessionWindow::track_analysis`],
     /// before drawing.
     pub fn poll(&mut self, ctx: &egui::Context, session: &mut OpenSession, jobs: &mut JobRunner) {
         self.follow_session(session, jobs);
         self.mosaic.poll(ctx, session, jobs);
         self.follow_rois();
+        self.follow_previews(ctx, session, jobs);
         self.plan.release_if_hidden(Instant::now());
         self.keep_view_state(session);
         self.save_if_due(ctx, session);
+    }
+
+    /// The ROIs' transient previews, every frame: take a finished one,
+    /// follow the ROIs (one moved or deleted drops its previews), schedule
+    /// what is wanted now ([`SessionWindow::wanted_previews`]) and hand each
+    /// ROI's state, for the groups in view, to the list and the canvas
+    /// labels.
+    fn follow_previews(&mut self, ctx: &egui::Context, session: &OpenSession, jobs: &JobRunner) {
+        self.previews.poll();
+        self.previews.keep_rois(self.mosaic.rois());
+        let wanted = self.wanted_previews(session, jobs);
+        self.previews.schedule(ctx, session, &wanted);
+        let groups = self.mosaic.members();
+        let states = self
+            .mosaic
+            .rois()
+            .iter()
+            .map(|r| (r.id, self.previews.state(r.id, groups, session)))
+            .collect();
+        self.mosaic.set_roi_states(states);
+    }
+
+    /// The previews wanted this frame: each ROI in view on the shown canvas
+    /// for each group in view (a composite's members in R, G, B order), with
+    /// what it would be made from now ([`PreviewKey::wanted`]: a group never
+    /// analysed, or needing a new analysis, is skipped) and its priority:
+    /// the group's place in the view, then the squared distance from the
+    /// ROI's centre to the centre of the view. None while the ROIs are
+    /// hidden or not yet reprojected for the current frame, an analysis
+    /// runs or is queued, an edit (panels, analysis settings) waits, or the
+    /// typed merge settings are invalid; none before the shown canvas has
+    /// been drawn, or on a plan drawn in another frame than the analysed
+    /// one (it shows no ROIs then).
+    pub(super) fn wanted_previews(&self, session: &OpenSession, jobs: &JobRunner) -> Vec<Wanted> {
+        let waiting = jobs.analyzing() || self.has_waiting_edits();
+        if !self.look.rois
+            || !self.mosaic.rois_synced()
+            || waiting
+            || self.mosaic.input_error().is_some()
+            || (self.mode() == CanvasMode::Plan && !self.plan.frame_matches(session))
+        {
+            return Vec::new();
+        }
+        let Some((view, centre)) = self.visible_canvas() else {
+            return Vec::new();
+        };
+        let cfg = &session.mosaic.config;
+        let mut out = Vec::new();
+        for (order, group) in self.mosaic.members().iter().enumerate() {
+            let order = u8::try_from(order).unwrap_or(u8::MAX);
+            for roi in self.mosaic.rois() {
+                let r = roi.canvas.map(|v| v as f64);
+                if r[0] >= view[2] || r[2] <= view[0] || r[1] >= view[3] || r[3] <= view[1] {
+                    continue;
+                }
+                let Some(key) = PreviewKey::wanted(cfg, group, roi.canvas) else {
+                    break;
+                };
+                let dx = (r[0] + r[2]) / 2.0 - centre.0;
+                let dy = (r[1] + r[3]) / 2.0 - centre.1;
+                out.push(Wanted {
+                    roi: roi.id,
+                    group: group.clone(),
+                    key,
+                    priority: (order, (dx * dx + dy * dy) as u64),
+                });
+            }
+        }
+        out
+    }
+
+    /// The canvas rect the shown canvas shows (`[x0, y0, x1, y1]`) and its
+    /// centre: its camera over its last frame's size. `None` before it has
+    /// been drawn.
+    fn visible_canvas(&self) -> Option<([f64; 4], (f64, f64))> {
+        let (rect, _) = match self.mode() {
+            CanvasMode::Plan => self.plan.canvas_frame(),
+            CanvasMode::Mosaic => self.mosaic.viewer_frame(),
+        }?;
+        let cam = self.shown_camera()?;
+        if cam.zoom <= 0.0 {
+            return None;
+        }
+        let hw = f64::from(rect.width()) / 2.0 / cam.zoom;
+        let hh = f64::from(rect.height()) / 2.0 / cam.zoom;
+        let (cx, cy) = cam.centre;
+        Some(([cx - hw, cy - hh, cx + hw, cy + hh], cam.centre))
     }
 
     /// The shown view's key, for the summary and the saved view: a group

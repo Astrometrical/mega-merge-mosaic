@@ -745,7 +745,7 @@ fn a_drawn_rect_becomes_a_region() {
     assert_eq!(rois[0].name, "Region 1");
     assert_eq!(rois[0].canvas, [10, 20, 300, 200]);
     assert_eq!(view.rois.selected, Some(rois[0].id));
-    assert!(view.save.pending() && view.rois.want_sync && view.rois.want_fresh);
+    assert!(view.save.pending() && view.rois.want_sync);
     assert_eq!(
         crate::rois::load_rois(&s.mosaic.config.ui),
         view.rois.rois(),
@@ -1322,8 +1322,8 @@ fn analysis_edit_waits_for_merges_and_blocks_merging() {
         mmm_core::photometry::GainMode::Unity
     );
     assert!(!view.settings.has_pending());
-    // The view's results, ROI freshness and health are looked at again.
-    assert!(view.rois.want_fresh && view.want_health);
+    // The view's results and health are looked at again.
+    assert!(view.want_health);
     let _ = std::fs::remove_dir_all(&root);
 }
 

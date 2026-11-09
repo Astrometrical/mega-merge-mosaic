@@ -65,6 +65,8 @@ struct State {
     files: Arc<AskedFiles>,
     /// The toasts the window raised, in order.
     toasts: Vec<WindowToast>,
+    /// The job runner's events, in order.
+    events: Vec<JobEvent>,
 }
 
 impl State {
@@ -80,6 +82,7 @@ impl State {
             accepted: Vec::new(),
             files,
             toasts: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -125,6 +128,7 @@ fn harness_sized(state: State, size: egui::Vec2) -> Harness<'static, State> {
                     s.w.ui(ui, &mut s.session, &mut s.jobs, &mut s.pipeline, &s.checks);
                 s.accepted.extend(out.accept);
                 s.toasts.extend(out.toasts);
+                s.events.extend(events);
             },
             state,
         )
@@ -236,6 +240,25 @@ fn painted(
     })
 }
 
+/// The first label of ROI `name` painted inside `rect` in the last frame
+/// (its name, followed by " · merging…" while its preview merges): its
+/// position and size.
+fn painted_roi(
+    h: &Harness<'_, State>,
+    rect: egui::Rect,
+    name: &str,
+) -> Option<(egui::Pos2, egui::Vec2)> {
+    let merging = format!("{name} · merging…");
+    h.output().shapes.iter().find_map(|cs| match &cs.shape {
+        egui::Shape::Text(t)
+            if (t.galley.text() == name || t.galley.text() == merging) && rect.contains(t.pos) =>
+        {
+            Some((t.pos, t.galley.size()))
+        }
+        _ => None,
+    })
+}
+
 /// Asserts the last frame the mosaic painted put each ROI's label where
 /// `cam` puts the ROI's top-left corner: the painted frame itself.
 fn assert_mosaic_painted_with(h: &Harness<'_, State>, cam: Camera) {
@@ -245,7 +268,7 @@ fn assert_mosaic_painted_with(h: &Harness<'_, State>, cam: Camera) {
         // The viewer writes an overlay's label just inside its corner.
         let corner = (r.canvas[0] as f64, r.canvas[1] as f64);
         let want = screen(rect, cam, corner) + egui::vec2(4.0, 2.0);
-        let (got, _) = painted(h, rect, &r.name).expect("ROI label painted");
+        let (got, _) = painted_roi(h, rect, &r.name).expect("ROI label painted");
         assert!(
             (got - want).length() < 1.0,
             "{} painted at {got:?}; the camera puts it at {want:?}",
@@ -581,7 +604,7 @@ fn plan_rois_wait_while_the_frames_differ() {
     step_until(&mut h, plan_placed);
     h.run_steps(3);
     let (rect, _) = h.state().w.plan().canvas_frame().unwrap();
-    assert!(painted(&h, rect, "ROI 1").is_some(), "frames agree");
+    assert!(painted_roi(&h, rect, "ROI 1").is_some(), "frames agree");
     assert!(!disabled(&h, "Draw ROI"));
     // A canvas-changing edit: the analysed frame is not the one the plan
     // draws in until the analysis ends.
@@ -591,7 +614,10 @@ fn plan_rois_wait_while_the_frames_differ() {
         wcs: None,
     });
     h.run_steps(3);
-    assert!(painted(&h, rect, "ROI 1").is_none(), "no outlines offset");
+    assert!(
+        painted_roi(&h, rect, "ROI 1").is_none(),
+        "no outlines offset"
+    );
     assert!(disabled(&h, "Draw ROI"));
     h.key_press(egui::Key::D);
     h.run_steps(2);
@@ -607,7 +633,7 @@ fn plan_rois_wait_while_the_frames_differ() {
     h.run_steps(2);
     assert!(!disabled(&h, "Draw ROI"));
     let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
-    assert!(painted(&h, frame, "ROI 1").is_some());
+    assert!(painted_roi(&h, frame, "ROI 1").is_some());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -671,7 +697,7 @@ fn drawing_on_the_plan_adds_a_region() {
     });
     h.run_steps(2);
     let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
-    assert!(painted(&h, frame, "Region 1").is_some());
+    assert!(painted_roi(&h, frame, "Region 1").is_some());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -688,15 +714,15 @@ fn the_plan_draws_roi_outlines() {
     let cam = h.state().w.plan().camera().expect("a camera");
     // The label sits just inside the ROI's top-left corner, as on the mosaic.
     let want = screen(rect, cam, (100.0, 100.0)) + egui::vec2(4.0, 2.0);
-    let (got, _) = painted(&h, rect, "ROI 1").expect("ROI label painted on the plan");
+    let (got, _) = painted_roi(&h, rect, "ROI 1").expect("ROI label painted on the plan");
     assert!((got - want).length() < 1.0, "{got:?} != {want:?}");
     // R hides them on the plan too.
     h.key_press(egui::Key::R);
     h.run_steps(3);
-    assert!(painted(&h, rect, "ROI 1").is_none());
+    assert!(painted_roi(&h, rect, "ROI 1").is_none());
     h.key_press(egui::Key::R);
     h.run_steps(3);
-    assert!(painted(&h, rect, "ROI 1").is_some());
+    assert!(painted_roi(&h, rect, "ROI 1").is_some());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -796,6 +822,28 @@ fn saved_rois(h: &Harness<'static, State>) -> Vec<(u64, String)> {
         .into_iter()
         .map(|r| (r.id, r.name))
         .collect()
+}
+
+/// The detail line ROI row `name` reads (size, then state).
+fn row_detail(h: &Harness<'static, State>, name: &str) -> String {
+    h.get_by_label(name)
+        .accesskit_node()
+        .description()
+        .unwrap_or_default()
+}
+
+/// Step until ROI row `name` reads `state` (bounded by [`PATIENCE`]).
+fn step_until_row(h: &mut Harness<'static, State>, name: &str, state: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while !row_detail(h, name).ends_with(state) {
+        assert!(
+            Instant::now() < deadline,
+            "{name} reads {:?}, never {state:?}",
+            row_detail(h, name)
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Hover the row of `name` so its actions show.
@@ -932,10 +980,10 @@ fn merge_roi_is_gone() {
     h.run_steps(3);
     assert!(!h.state().jobs.busy());
     assert!(labels(&h.state().jobs).is_empty());
-    // Every row reads its state in text.
-    let core = h.get_by_label("Core");
-    let detail = core.accesskit_node().description().unwrap_or_default();
-    assert!(detail.ends_with("up to date"), "{detail}");
+    // Every row reads its state in text: "up to date" once its preview has
+    // merged by itself, through no job.
+    step_until_row(&mut h, "Core", "up to date");
+    assert!(labels(&h.state().jobs).is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2568,7 +2616,7 @@ fn a_composite_with_an_unmerged_member_keeps_the_canvas_in_place() {
         "the mosaic in {mosaic:?}, the plan in {plan:?}"
     );
     assert_camera(h.state().w.mosaic().camera(), cam);
-    let (got, _) = painted(&h, mosaic, "ROI 1").expect("ROI label painted");
+    let (got, _) = painted_roi(&h, mosaic, "ROI 1").expect("ROI label painted");
     let want = screen(plan, cam, (100.0, 100.0)) + egui::vec2(4.0, 2.0);
     assert!((got - want).length() < 1.0, "{got:?} != {want:?}");
     let _ = std::fs::remove_dir_all(&root);
@@ -3628,3 +3676,5 @@ fn a_region_entry_with_other_settings_still_makes_the_group_out_of_date() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+mod previews;

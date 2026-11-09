@@ -26,10 +26,11 @@
 //!   [`MosaicView::on_drawn`]), named, noted, reordered, selected (the
 //!   window then frames it, [`MosaicView::rois_ui`]) and deleted (with an
 //!   undo, [`MosaicView::take_roi_deleted`]); kept in `MosaicConfig.ui`.
-//!   Reading the frame and reprojecting them (sky ↔ canvas) and counting
-//!   how many of an ROI's level-0 tiles are fresh (per group of the view)
-//!   run on workers ([`RoiPanel`]). There is no ROI merge: an ROI's
-//!   preview is transient and comes with the preview runner.
+//!   Reading the frame and reprojecting them (sky ↔ canvas) runs on a
+//!   worker ([`RoiPanel`]). There is no ROI merge: an ROI's preview is
+//!   transient, made by the window's preview runner ([`crate::previews`]),
+//!   and the list and the canvas labels show its state
+//!   ([`MosaicView::set_roi_states`]).
 //!   [`MosaicView::merge_these`] merges the groups it is given over the whole
 //!   canvas, committing the merge settings draft first.
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
@@ -59,7 +60,7 @@
 //!
 //! Everything slow runs on background threads ([`Task`]): opening each
 //! result ([`open_result`]), the automatic stretch statistics, the health
-//! metrics, the ROI sync and freshness counts. The one write on the UI
+//! metrics and the ROI sync. The one write on the UI
 //! thread is the debounced `mosaic.json` save of the ROI list (at most once
 //! per [`SAVE_INTERVAL`](crate::util::SAVE_INTERVAL)), the same documented
 //! exception as the job runner's plan/apply saves.
@@ -81,8 +82,8 @@
 //!   merge queued behind an analysis would start the moment it is applied,
 //!   before the check);
 //! - a source given up (out of date, view switched, replaced) is tracked by
-//!   a `Weak` until the viewer's loader threads and any statistics or
-//!   freshness task have dropped it; merging stays blocked until then. A
+//!   a `Weak` until the viewer's loader threads and any statistics task
+//!   have dropped it; merging stays blocked until then. A
 //!   composite holds every member's reader, so a member given up stays
 //!   tracked until the composite itself is dropped: all member readers are
 //!   released before any member's store may be recreated;
@@ -272,8 +273,8 @@ pub struct MosaicView {
     /// Why the view cannot be drawn though its results are open (e.g. a
     /// composition of groups on different canvases).
     view_problem: Option<String>,
-    /// Sources given up but maybe still mapped by loader, statistics or
-    /// freshness threads (directly or inside a composite).
+    /// Sources given up but maybe still mapped by loader or statistics
+    /// threads (directly or inside a composite).
     retired: Vec<Weak<MosaicTileSource>>,
     /// A camera the viewer paints its next frame through: one set from
     /// outside, or the last one shown when the viewer was rebuilt.
@@ -358,10 +359,7 @@ impl MosaicView {
     /// Show `view` from the next frame on (its groups are resolved then; one
     /// that no longer exists falls back to the first group).
     pub fn select_view(&mut self, view: ViewKind) {
-        if self.view.as_ref() != Some(&view) {
-            self.rois.view_changed();
-            self.view = Some(view);
-        }
+        self.view = Some(view);
     }
 
     /// The groups of the view, in order.
@@ -442,6 +440,33 @@ impl MosaicView {
         self.rois.rois()
     }
 
+    /// The ROIs' canvas rects follow the current frame: no reprojection is
+    /// running or wanted ([`RoiPanel::synced`]).
+    pub fn rois_synced(&self) -> bool {
+        self.rois.synced()
+    }
+
+    /// Each ROI's preview state, by id ([`RoiPanel::set_states`]): the ROI
+    /// list says it, and the canvas labels while a preview merges.
+    pub fn set_roi_states(&mut self, states: BTreeMap<u64, crate::previews::PreviewState>) {
+        self.rois.set_states(states);
+    }
+
+    /// Why the typed merge settings are refused, if they are
+    /// ([`SettingsPanel::input_error`]): no merge, and no preview, meanwhile.
+    pub fn input_error(&self) -> Option<&'static str> {
+        self.settings.input_error()
+    }
+
+    /// Move ROI `id` to canvas rect `canvas`, as a reprojection does
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn move_roi(&mut self, id: u64, canvas: [u64; 4]) {
+        if let Some(r) = self.rois.rois.iter_mut().find(|r| r.id == id) {
+            r.canvas = canvas;
+        }
+    }
+
     fn member(&self) -> Option<&Member> {
         self.results.get(self.group.as_ref()?)
     }
@@ -452,8 +477,8 @@ impl MosaicView {
         self.viewer.is_none().then(|| self.placeholder())
     }
 
-    /// True once drawn with nothing pending: no open, statistics, health,
-    /// ROI or freshness task, and the viewer (if any) has drawn and loaded
+    /// True once drawn with nothing pending: no open, statistics, health
+    /// or ROI sync task, and the viewer (if any) has drawn and loaded
     /// its tiles. A session without groups settles at once.
     pub fn is_settled(&self) -> bool {
         self.shown
@@ -533,7 +558,6 @@ impl MosaicView {
             if self.group.as_ref() == Some(&group) {
                 self.want_health = true;
             }
-            self.rois.want_fresh = true;
         }
     }
 
@@ -578,7 +602,7 @@ impl MosaicView {
 
     /// The view's every-frame work, whether or not the canvas is drawn:
     /// resolve the view's groups, poll and start the background work
-    /// (opening results, stretches, health, ROI sync and freshness), follow
+    /// (opening results, stretches, health, ROI sync), follow
     /// merges and analyses, release given-up sources, and save. Call every
     /// frame after the runner's poll (and [`MosaicView::track_analysis`]),
     /// before anything is drawn. The stretch toggles followed are the
@@ -617,8 +641,8 @@ impl MosaicView {
     }
 
     /// Settings were applied: the view's results went stale (their tiles
-    /// load again to show it), and ROI freshness and health are computed
-    /// again (health depends on the feather).
+    /// load again to show it), and health is computed again (it depends on
+    /// the feather).
     fn on_settings_applied(&mut self, impact: ChangeImpact) {
         if impact == ChangeImpact::None {
             return;
@@ -628,7 +652,6 @@ impl MosaicView {
                 src.bump();
             }
         }
-        self.rois.want_fresh = true;
         self.want_health = true;
     }
 
@@ -1067,9 +1090,6 @@ impl MosaicView {
             self.health = None;
             self.want_health = true;
         }
-        if self.view.as_ref() != Some(&view) {
-            self.rois.view_changed();
-        }
         self.view = Some(view);
         self.members = members;
     }
@@ -1253,18 +1273,8 @@ impl MosaicView {
                 });
             }
         }
-        let members = self
-            .members
-            .iter()
-            .map(|g| {
-                (
-                    g.clone(),
-                    self.results.get(g).and_then(|m| m.source.clone()),
-                )
-            })
-            .collect();
         self.rois
-            .start_tasks(ctx, session.mosaic.dir.join(FRAME_FILE), members);
+            .start_sync(ctx, session.mosaic.dir.join(FRAME_FILE));
         let now = Instant::now();
         if self.save.due(now) {
             self.save.saved(now);
@@ -1414,7 +1424,6 @@ impl MosaicView {
                 }
             }
         }
-        self.rois.want_fresh = true;
     }
 
     /// Follow the running merge of a group of the view: bump its source's
@@ -1439,7 +1448,6 @@ impl MosaicView {
             None if m.opening.is_none() => m.reopen = true,
             None => {}
         }
-        self.rois.want_fresh = true;
     }
 
     /// Apply finished automatic stretches worked out for the current look.

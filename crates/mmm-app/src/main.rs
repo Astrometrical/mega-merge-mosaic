@@ -19,6 +19,7 @@ mod panel_edits;
 mod panel_list;
 mod pipeline;
 mod plan_view;
+mod previews;
 mod rois;
 mod session;
 mod session_window;
