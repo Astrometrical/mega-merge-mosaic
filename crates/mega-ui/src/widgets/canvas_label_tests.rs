@@ -19,6 +19,10 @@ struct State {
     shown: usize,
     text: String,
     clip: Option<Rect>,
+    /// Where the label's corner goes (default [`CORNER`]).
+    corner: Pos2,
+    /// What the label keeps clear of.
+    avoid: Option<Rect>,
     /// What the label reported, frame by frame.
     log: Vec<LabelResponse>,
     /// The canvas beneath had the press, frame by frame.
@@ -67,7 +71,8 @@ fn harness(comparing: bool) -> Harness<'static, State> {
                     primary: false,
                 }];
                 let label = CanvasLabel {
-                    corner: CORNER,
+                    corner: s.corner,
+                    avoid: s.avoid,
                     clip: s.clip.unwrap_or(rect),
                     name: "Core",
                     color: palette::ACCENT_400,
@@ -95,6 +100,8 @@ fn harness(comparing: bool) -> Harness<'static, State> {
                     "up to date".into()
                 },
                 clip: None,
+                corner: CORNER,
+                avoid: None,
                 log: Vec::new(),
                 canvas_pressed: Vec::new(),
             },
@@ -328,4 +335,61 @@ fn nothing_outside_the_clip_is_drawn_or_sensed() {
             .all(|r| r.clicked.is_none()),
         "a control out of the clip was clicked"
     );
+}
+
+#[test]
+fn the_label_moves_into_its_clip_and_clear_of_what_it_avoids() {
+    let mut h = harness(true);
+    h.run_steps(3);
+    let width = rect_of(&h, "Done comparing Core").right() - CORNER.x;
+    // Its corner near the right edge: the label slides left to fit.
+    h.state_mut().corner = Pos2::new(SCREEN.x - width / 2.0, CORNER.y);
+    h.run_steps(2);
+    let done = rect_of(&h, "Done comparing Core");
+    assert!(done.right() <= SCREEN.x, "{done:?}");
+    let name = painted(&h, "Core").unwrap();
+    assert!(name.left() < SCREEN.x - width / 2.0, "moved left: {name:?}");
+    // Something to avoid where it would go (a canvas's own buttons): it
+    // goes below.
+    let avoid = Rect::from_min_size(CORNER, Vec2::new(150.0, 40.0));
+    h.state_mut().corner = CORNER;
+    h.state_mut().avoid = Some(avoid);
+    h.run_steps(2);
+    let name = painted(&h, "Core").unwrap();
+    assert!(name.top() > avoid.bottom(), "{name:?} under {avoid:?}");
+    for c in [
+        "Show A of Core",
+        "Show B of Core",
+        "Use A for Core",
+        "Done comparing Core",
+    ] {
+        assert!(!rect_of(&h, c).intersects(avoid), "{c}");
+    }
+    // Clear of it already: where it was.
+    h.state_mut().avoid = Some(Rect::from_min_size(
+        Pos2::new(600.0, 400.0),
+        Vec2::splat(20.0),
+    ));
+    h.run_steps(2);
+    assert_eq!(painted(&h, "Core").unwrap().min, CORNER + LABEL_OFFSET);
+}
+
+#[test]
+fn nothing_is_held_while_the_window_has_no_focus() {
+    let mut h = harness(true);
+    h.run_steps(3);
+    let b = rect_of(&h, "Show B of Core").center();
+    press(&mut h, b);
+    assert_eq!(last(&h).held, Some((0, 1)));
+    // The window loses the focus with the button still down (egui keeps
+    // the pointer as it was).
+    h.input_mut().focused = false;
+    h.event(egui::Event::WindowFocused(false));
+    h.step();
+    h.step();
+    assert_eq!(last(&h).held, None);
+    h.input_mut().focused = true;
+    h.event(egui::Event::WindowFocused(true));
+    h.step();
+    release(&mut h, b);
 }

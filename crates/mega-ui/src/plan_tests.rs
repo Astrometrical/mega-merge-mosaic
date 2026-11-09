@@ -661,3 +661,35 @@ fn a_held_press_is_reported_until_released() {
     h.drop_at(at);
     h.run();
 }
+
+#[test]
+fn a_press_on_the_plans_buttons_is_no_hold() {
+    let mut h = harness(
+        [0.0, 0.0, 1000.0, 1000.0],
+        vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+    );
+    h.run();
+    let held = |h: &Harness<'_, State>| h.state().log.last().and_then(|r| r.held);
+    let controls = h.state().canvas.controls_rect().expect("buttons drawn");
+    // Over the item: "Home" is on top of it.
+    let home = h.get_by_label("Home").rect().center();
+    assert!(controls.contains(home));
+    h.hover_at(home);
+    h.step();
+    h.drag_at(home);
+    h.step();
+    assert_eq!(held(&h), None);
+    h.run_steps(100);
+    assert_eq!(held(&h), None);
+    h.drop_at(home);
+    h.run();
+    // Beside it, on the item: a hold.
+    let at = to_screen(&h, (500.0, 500.0));
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    assert!(held(&h).is_some());
+    h.drop_at(at);
+    h.run();
+}

@@ -28,7 +28,8 @@ use egui::{
 use super::cache::{DEFAULT_CAPACITY, TileCache};
 use super::{Fetched, PyramidGeometry, TileKey, TileSource, View, pick_level, visible_tiles};
 use crate::canvas_layers::{
-    DrawStep, Hold, Overlay, Patch, Tool, drawing_rect, follow_draw, follow_hold, paint_layers,
+    DrawStep, Hold, Overlay, Patch, Pressed, Tool, drawing_rect, follow_draw, follow_hold,
+    paint_layers, pointer_over,
 };
 use crate::theme::palette;
 
@@ -246,8 +247,10 @@ pub struct TiledViewer {
     opacity: f32,
     /// Set once any tile has been painted.
     drawn_any: bool,
-    /// The press held on the viewer, while it is.
-    held: Option<Hold>,
+    /// The press on the viewer, while it lasts ([`follow_hold`]).
+    held: Pressed,
+    /// The screen rect of the zoom buttons, as last drawn.
+    controls: Option<Rect>,
 }
 
 impl TiledViewer {
@@ -285,6 +288,7 @@ impl TiledViewer {
             opacity: 1.0,
             drawn_any: false,
             held: None,
+            controls: None,
         }
     }
 
@@ -344,6 +348,13 @@ impl TiledViewer {
     /// The tile opacity set with [`TiledViewer::set_opacity`].
     pub fn opacity(&self) -> f32 {
         self.opacity
+    }
+
+    /// The screen rect the viewer's own buttons (zoom in, zoom out, home)
+    /// took in the last frame drawn; none in presentation mode. Something
+    /// drawn over the viewer can keep clear of it.
+    pub fn controls_rect(&self) -> Option<Rect> {
+        self.controls
     }
 
     /// True once any tile has been painted.
@@ -478,6 +489,7 @@ impl TiledViewer {
         let backlog = self.receive(ui.ctx(), generation);
         self.paint(&ui.painter_at(rect), rect, now, generation);
         self.paint_overlays(&ui.painter_at(rect), rect, now);
+        self.controls = None;
         if !self.presentation {
             self.overlay_buttons(ui, rect);
         }
@@ -488,8 +500,7 @@ impl TiledViewer {
             ui.ctx().request_repaint();
         }
         ViewerResponse {
-            hovered_image_pos: response
-                .hover_pos()
+            hovered_image_pos: pointer_over(ui, &response)
                 .map(|p| self.view.screen_to_image(p, rect, now)),
             drawn_rect,
             held,
@@ -548,7 +559,7 @@ impl TiledViewer {
         {
             self.view.zoom_by(2.0, p, rect, now);
         }
-        if let Some(p) = response.hover_pos() {
+        if let Some(p) = pointer_over(ui, response) {
             let line = ui.ctx().options(|o| o.input_options.line_scroll_speed);
             let notches: f32 = ui.input(|i| {
                 i.events
@@ -759,7 +770,9 @@ impl TiledViewer {
             OverlayButton::new("Home", 60.0, "Fit the whole image"),
         ];
         let cmds = [Command::Zoom(2.0), Command::Zoom(0.5), Command::Home];
-        if let Some(i) = overlay_buttons(ui, rect, &buttons) {
+        let (clicked, controls) = overlay_buttons(ui, rect, &buttons);
+        self.controls = Some(controls);
+        if let Some(i) = clicked {
             self.commands.push(cmds[i]);
         }
     }
@@ -797,13 +810,20 @@ impl<'a> OverlayButton<'a> {
 }
 
 /// Draw a row of 28-px-high buttons over the top-left corner of `rect`;
-/// returns the index of the one clicked this frame.
-pub(crate) fn overlay_buttons(ui: &mut Ui, rect: Rect, buttons: &[OverlayButton]) -> Option<usize> {
+/// returns the index of the one clicked this frame, and the rect the row
+/// takes.
+pub(crate) fn overlay_buttons(
+    ui: &mut Ui,
+    rect: Rect,
+    buttons: &[OverlayButton],
+) -> (Option<usize>, Rect) {
     let mut x = rect.min.x + 8.0;
     let y = rect.min.y + 8.0;
     let mut clicked = None;
+    let mut row = Rect::NOTHING;
     for (i, b) in buttons.iter().enumerate() {
         let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(b.width, 28.0));
+        row = row.union(r);
         let resp = ui
             .scope_builder(
                 egui::UiBuilder::new()
@@ -824,7 +844,7 @@ pub(crate) fn overlay_buttons(ui: &mut Ui, rect: Rect, buttons: &[OverlayButton]
         }
         x += b.width + 4.0;
     }
-    clicked
+    (clicked, row)
 }
 
 /// Texture sampling for a tile of `level`. Only level 0 is ever magnified as

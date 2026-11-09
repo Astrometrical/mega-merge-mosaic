@@ -15,7 +15,8 @@ use egui::{
 };
 
 use crate::canvas_layers::{
-    DrawStep, Hold, Overlay, Patch, Tool, drawing_rect, follow_draw, follow_hold, paint_layers,
+    DrawStep, Hold, Overlay, Patch, Pressed, Tool, drawing_rect, follow_draw, follow_hold,
+    paint_layers, pointer_over,
 };
 use crate::theme::palette;
 use crate::viewer::{OverlayButton, View, drag_delta, overlay_buttons};
@@ -147,8 +148,10 @@ pub struct PlanCanvas {
     /// The rectangle being drawn: its fixed corner and the current one, in
     /// canvas coordinates.
     drawing: Option<((f64, f64), (f64, f64))>,
-    /// The press held on the canvas, while it is.
-    held: Option<Hold>,
+    /// The press on the canvas, while it lasts ([`follow_hold`]).
+    held: Pressed,
+    /// The screen rect of the canvas's buttons, as last drawn.
+    controls: Option<Rect>,
 }
 
 impl Default for PlanCanvas {
@@ -171,6 +174,7 @@ impl PlanCanvas {
             tool: Tool::Navigate,
             drawing: None,
             held: None,
+            controls: None,
         }
     }
 
@@ -195,6 +199,13 @@ impl PlanCanvas {
     /// The current tool.
     pub fn tool(&self) -> Tool {
         self.tool
+    }
+
+    /// The screen rect the canvas's own buttons (zoom, home, zoom to
+    /// selection) took in the last frame drawn. Something drawn over the
+    /// canvas can keep clear of it.
+    pub fn controls_rect(&self) -> Option<Rect> {
+        self.controls
     }
 
     /// The current view (canvas coordinates are the view's image pixels).
@@ -345,7 +356,9 @@ impl PlanCanvas {
             Command::Home,
             Command::ZoomToSelection,
         ];
-        if let Some(i) = overlay_buttons(ui, rect, &buttons) {
+        let (clicked, controls) = overlay_buttons(ui, rect, &buttons);
+        self.controls = Some(controls);
+        if let Some(i) = clicked {
             self.commands.push(cmds[i]);
         }
 
@@ -398,7 +411,7 @@ impl PlanCanvas {
         if response.dragged() && self.tool == Tool::Navigate {
             self.view.pan_by(drag_delta(response), now);
         }
-        let Some(p) = response.hover_pos() else {
+        let Some(p) = pointer_over(ui, response) else {
             return;
         };
         let line = ui.ctx().options(|o| o.input_options.line_scroll_speed);

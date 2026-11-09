@@ -389,6 +389,7 @@ fn canvas_label_section(ui: &mut Ui) {
             &CanvasLabel {
                 corner: region.left_top(),
                 clip: strip,
+                avoid: None,
                 name,
                 color,
                 controls,

@@ -4,11 +4,14 @@
 //! changes.
 //!
 //! - **Where.** At the top-left corner of the rect it names (in screen
-//!   points), its name exactly where an [`Overlay`](crate::canvas_layers::Overlay)'s
-//!   painted label would be ([`LABEL_OFFSET`]), on a translucent panel so it
-//!   reads over any image. Draw it after the canvas, so it is on top, and
-//!   pass the canvas's viewport as its clip: nothing outside is drawn or
-//!   sensed.
+//!   points), its name exactly where an
+//!   [`Overlay`](crate::canvas_layers::Overlay)'s painted label would be
+//!   ([`LABEL_OFFSET`]), on a translucent panel so it reads over any image.
+//!   Draw it after the canvas, so it is on top, and pass the canvas's
+//!   viewport as its clip: nothing outside is drawn or sensed. A label that
+//!   would run past the clip's right edge slides left to fit, and one that
+//!   would cover what it must keep clear of ([`CanvasLabel::avoid`], e.g.
+//!   the canvas's own buttons) goes below it.
 //! - **Presses.** The label takes the presses that land on it: the canvas
 //!   beneath neither pans nor clicks there. Each frame it reports the
 //!   control clicked and the control the primary button is held down on
@@ -27,7 +30,7 @@ use std::sync::Arc;
 
 use egui::{
     Color32, CornerRadius, Galley, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextStyle, Ui,
-    UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
+    UiBuilder, Vec2, WidgetInfo, WidgetType, pos2, vec2,
 };
 
 use super::button::{ButtonKind, focus_ring, looks};
@@ -78,6 +81,9 @@ pub struct CanvasLabel<'a> {
     pub corner: Pos2,
     /// The canvas's viewport: nothing outside is drawn or sensed.
     pub clip: Rect,
+    /// A rect to keep clear of (e.g. the canvas's own buttons,
+    /// `controls_rect`), if any.
+    pub avoid: Option<Rect>,
     /// The name, first on the first row.
     pub name: &'a str,
     /// The name's colour (that of the rect it names).
@@ -198,6 +204,25 @@ pub fn canvas_label(
     if let Some((at, g)) = &text {
         bounds = bounds.union(Rect::from_min_size(*at, g.size()));
     }
+    // Into the clip sideways, then clear of what to avoid (below it).
+    let mut shift = Vec2::ZERO;
+    let laid = bounds.expand2(LABEL_OFFSET);
+    if laid.right() > clip.right() {
+        shift.x = (clip.right() - laid.right()).max(clip.left() - laid.left());
+    }
+    if let Some(avoid) = label.avoid
+        && avoid.intersects(laid.translate(shift))
+    {
+        shift.y = avoid.bottom() + space::XS - laid.top();
+    }
+    let name_rect = name_rect.translate(shift);
+    let bounds = bounds.translate(shift);
+    for p in &mut placed {
+        for r in &mut p.rects {
+            *r = r.translate(shift);
+        }
+    }
+    let text = text.map(|(at, g)| (at + shift, g));
 
     // The panel, sensing presses so the canvas beneath gets none; the
     // controls sense on top of it.
@@ -218,9 +243,16 @@ pub fn canvas_label(
     );
     painter.galley(name_rect.min, name, label.color);
 
-    // The control held since an earlier frame of this press, if any.
+    // The control held since an earlier frame of this press, if any;
+    // nothing is held while the window has no focus (egui keeps the
+    // pointer as it was when the focus went).
     let press_id = id.with("press");
-    let (down, start) = ui.input(|i| (i.pointer.primary_down(), i.pointer.press_start_time()));
+    let (down, start) = ui.input(|i| {
+        (
+            i.pointer.primary_down() && i.focused,
+            i.pointer.press_start_time(),
+        )
+    });
     let mut out = LabelResponse {
         clicked: None,
         held: ui

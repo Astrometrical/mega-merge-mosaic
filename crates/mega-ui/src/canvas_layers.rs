@@ -48,7 +48,9 @@ pub struct Overlay {
 /// navigate tool, and not released yet), as the canvas reports it each
 /// frame. A press held still stays a hold however long it lasts; once the
 /// pointer has moved further than a click may, it is a drag (it pans) for
-/// the rest of the press.
+/// the rest of the press. A press on a control drawn over the canvas (its
+/// own zoom buttons, say) is none, nor is anything while the window does
+/// not have the focus (a press it interrupts is over).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hold {
     /// Where the button went down, in canvas coordinates (through the view
@@ -58,34 +60,70 @@ pub struct Hold {
     pub moved: bool,
 }
 
+/// A press followed by [`follow_hold`] across frames: its hold, or `None`
+/// for a press that is no hold (it went to a control on top of the
+/// canvas, or the window lost the focus).
+pub(crate) type Pressed = Option<Option<Hold>>;
+
 /// Follow a press held on `response` (a canvas with the navigate tool):
-/// `held` keeps it across frames. `to_canvas` maps a screen point to canvas
-/// coordinates. The hold this frame, if any.
+/// `pressed` keeps it across frames. `to_canvas` maps a screen point to
+/// canvas coordinates. The hold this frame, if any.
 pub(crate) fn follow_hold(
     ui: &egui::Ui,
     response: &egui::Response,
-    held: &mut Option<Hold>,
+    pressed: &mut Pressed,
     to_canvas: &dyn Fn(Pos2) -> (f64, f64),
 ) -> Option<Hold> {
-    let (down, origin, latest) = ui.input(|i| {
+    let (down, origin, latest, focused) = ui.input(|i| {
         (
             i.pointer.primary_down(),
             i.pointer.press_origin(),
             i.pointer.latest_pos(),
+            i.focused,
         )
     });
     let Some(origin) = origin.filter(|_| down && response.is_pointer_button_down_on()) else {
-        *held = None;
+        *pressed = None;
         return None;
     };
-    let max = ui.ctx().options(|o| o.input_options.max_click_dist);
-    let moved = latest.is_some_and(|p| p.distance(origin) > max);
-    let h = held.get_or_insert(Hold {
-        origin: to_canvas(origin),
-        moved: false,
+    if !focused {
+        *pressed = Some(None);
+        return None;
+    }
+    let held = pressed.get_or_insert_with(|| {
+        (!control_on_top(ui.ctx(), response.id)).then(|| Hold {
+            origin: to_canvas(origin),
+            moved: false,
+        })
     });
-    h.moved |= moved;
+    let h = held.as_mut()?;
+    let max = ui.ctx().options(|o| o.input_options.max_click_dist);
+    h.moved |= latest.is_some_and(|p| p.distance(origin) > max);
     Some(*h)
+}
+
+/// Whether a widget sensing clicks other than `canvas` is under the pointer
+/// on top of it (egui then gives the press's click to that widget, its drag
+/// to the canvas).
+fn control_on_top(ctx: &egui::Context, canvas: egui::Id) -> bool {
+    let hovered: Vec<egui::Id> = ctx.interaction_snapshot(|s| s.hovered.iter().copied().collect());
+    hovered.into_iter().any(|id| {
+        id != canvas
+            && ctx
+                .read_response(id)
+                .is_some_and(|r| r.sense.senses_click())
+    })
+}
+
+/// Where the pointer is over the canvas of `response`, even under a
+/// widget drawn over it (a canvas label's panel takes the presses there,
+/// not the wheel or the readout); none while another layer covers it.
+pub(crate) fn pointer_over(ui: &egui::Ui, response: &egui::Response) -> Option<Pos2> {
+    if !response.contains_pointer() {
+        return None;
+    }
+    ui.input(|i| i.pointer.hover_pos())
+        .filter(|p| response.rect.contains(*p))
 }
 
 /// An image drawn over a canvas: `texture` is stretched over `rect` and

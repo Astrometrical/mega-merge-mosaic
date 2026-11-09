@@ -267,6 +267,7 @@ impl SessionWindow {
             let label = CanvasLabel {
                 corner,
                 clip: viewport,
+                avoid: None,
                 name,
                 color,
                 controls: &controls,
@@ -329,6 +330,7 @@ impl SessionWindow {
         let label = CanvasLabel {
             corner,
             clip: viewport,
+            avoid: None,
             name,
             color,
             controls: &controls,

@@ -1305,3 +1305,118 @@ fn a_held_press_is_reported_until_released() {
     h.drop_at(at);
     h.step();
 }
+
+#[test]
+fn a_press_on_the_viewers_buttons_is_no_hold() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = holding_harness(TiledViewer::new_synchronous(src));
+    h.run();
+    let controls = h.state().viewer.controls_rect().expect("buttons drawn");
+    // On "+" (the zoom button over the image): no hold, however long.
+    let plus = h.get_by_label("+").rect().center();
+    assert!(controls.contains(plus));
+    h.hover_at(plus);
+    h.step();
+    h.drag_at(plus);
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.run_steps(100);
+    assert_eq!(last_held(&h), None);
+    h.drop_at(plus);
+    h.step();
+    // On the image: a hold.
+    let at = Pos2::new(600.0, 400.0);
+    h.hover_at(at);
+    h.step();
+    h.drag_at(at);
+    h.step();
+    assert!(last_held(&h).is_some());
+    // The window losing the focus ends it, for the rest of the press.
+    h.input_mut().focused = false;
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.input_mut().focused = true;
+    h.step();
+    assert_eq!(last_held(&h), None);
+    h.drop_at(at);
+    h.step();
+}
+
+/// A viewer with a canvas label over it, and what the viewer reported.
+struct Labelled {
+    viewer: TiledViewer,
+    log: Vec<ViewerResponse>,
+}
+
+#[test]
+fn the_wheel_and_the_readout_work_over_a_label() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut Labelled| {
+                let r = s.viewer.show(ui);
+                s.log.push(r);
+                let (rect, _) = s.viewer.last_frame().unwrap();
+                let controls = [crate::widgets::LabelControl::Button {
+                    text: "Compare",
+                    accessible: "Compare Region 1",
+                    tooltip: None,
+                    primary: false,
+                }];
+                crate::widgets::canvas_label(
+                    ui,
+                    "label",
+                    &crate::widgets::CanvasLabel {
+                        corner: Pos2::new(400.0, 300.0),
+                        clip: rect,
+                        avoid: None,
+                        name: "Region 1",
+                        color: palette::TEXT_BODY,
+                        controls: &controls,
+                        text: "up to date",
+                        text_below: false,
+                        accessible: "Region 1 on the canvas",
+                        description: "",
+                    },
+                );
+            },
+            Labelled {
+                viewer: TiledViewer::new_synchronous(src),
+                log: Vec::new(),
+            },
+        );
+    h.run();
+    // Over the label's panel, beside its button.
+    let over = h
+        .get_by_label("Region 1 on the canvas")
+        .rect()
+        .left_center()
+        + Vec2::new(6.0, 0.0);
+    h.hover_at(over);
+    h.step();
+    let readout = h.state().log.last().unwrap().hovered_image_pos;
+    assert!(readout.is_some(), "the pixel readout");
+    let (_, z0) = centre_zoom(&h.state().viewer);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: Vec2::new(0.0, 1.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run();
+    let (_, z1) = centre_zoom(&h.state().viewer);
+    assert!(z1 > z0 * 1.1, "the wheel zooms: {z0} -> {z1}");
+    // A press there is still the label's: no pan, no hold.
+    let c0 = centre_zoom(&h.state().viewer).0;
+    h.drag_at(over);
+    h.step();
+    h.hover_at(over + Vec2::new(80.0, 0.0));
+    h.step();
+    h.drop_at(over + Vec2::new(80.0, 0.0));
+    h.run();
+    assert_eq!(centre_zoom(&h.state().viewer).0, c0);
+    assert!(h.state().log.iter().all(|r| r.held.is_none()));
+}
