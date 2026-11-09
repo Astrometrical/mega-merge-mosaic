@@ -503,6 +503,40 @@ fn drawn_rects(h: &Harness<'_, State>) -> Vec<[f64; 4]> {
 }
 
 #[test]
+fn the_plan_cursor_is_a_crosshair_while_the_draw_tool_is_armed() {
+    let mut h = harness(
+        [0.0, 0.0, 1000.0, 1000.0],
+        vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+    );
+    h.run();
+    let cursor = |h: &Harness<'static, State>| h.output().platform_output.cursor_icon;
+    let over = to_screen(&h, (500.0, 500.0));
+    h.hover_at(over);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "navigating");
+    // Armed: a crosshair over the canvas, and while drawing.
+    h.state_mut().canvas.set_tool(Tool::DrawRect);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair);
+    let to = to_screen(&h, (600.0, 600.0));
+    h.drag_at(over);
+    h.step();
+    h.hover_at(to);
+    h.step();
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair, "drawing");
+    // Released: the rect is drawn and the tool disarmed.
+    h.drop_at(to);
+    h.run();
+    assert_eq!(h.state().canvas.tool(), Tool::Navigate);
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "disarmed");
+    // Armed, off the canvas: none.
+    h.state_mut().canvas.set_tool(Tool::DrawRect);
+    h.hover_at(Pos2::new(-10.0, -10.0));
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "off the canvas");
+}
+
+#[test]
 fn the_plan_draw_tool_returns_a_rect() {
     let mut h = harness(
         [0.0, 0.0, 1000.0, 1000.0],

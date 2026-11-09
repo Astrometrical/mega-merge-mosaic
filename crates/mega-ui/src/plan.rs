@@ -16,7 +16,7 @@ use egui::{
 
 use crate::canvas_layers::{
     DrawStep, Hold, Overlay, Patch, Pressed, Tool, drawing_rect, follow_draw, follow_hold,
-    paint_layers, pointer_over,
+    paint_layers, pointer_over, show_tool_cursor,
 };
 use crate::theme::palette;
 use crate::viewer::{OverlayButton, View, drag_delta, overlay_buttons};
@@ -189,8 +189,9 @@ impl PlanCanvas {
     }
 
     /// What a drag does from now on (a rectangle being drawn is dropped).
-    /// With [`Tool::DrawRect`] a drag draws instead of panning, and clicks
-    /// are not reported.
+    /// With [`Tool::DrawRect`] a drag draws instead of panning, clicks are
+    /// not reported, and the pointer over the canvas is a crosshair
+    /// ([`crate::canvas_layers::DRAW_CURSOR`]).
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.drawing = None;
@@ -293,6 +294,7 @@ impl PlanCanvas {
 
         // Input before hit-testing and painting, so both use this frame's view.
         let drawn_rect = self.handle_draw(ui, &response, rect, extent, now);
+        show_tool_cursor(ui, &response, self.tool);
         self.handle_pan_zoom(ui, &response, rect, now);
         let navigating = self.tool == Tool::Navigate && drawn_rect.is_none();
         let held = if navigating {

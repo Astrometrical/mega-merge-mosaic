@@ -1,7 +1,8 @@
 //! What the tiled viewer and the plan canvas share for drawing over their
 //! content: [`Overlay`] rectangles, image [`Patch`]es, the in-progress
-//! rectangle of [`Tool::DrawRect`], and the one function that paints them
-//! all (`paint_layers`); and a press held on either canvas ([`Hold`]).
+//! rectangle of [`Tool::DrawRect`] (with its pointer, [`DRAW_CURSOR`]), and
+//! the one function that paints them all (`paint_layers`); and a press held
+//! on either canvas ([`Hold`]).
 
 use egui::{
     Align2, Color32, Pos2, Rect, Shape, Stroke, StrokeKind, TextStyle, TextureHandle, Vec2,
@@ -18,6 +19,10 @@ const OVERLAY_DASH: (f32, f32) = (6.0, 4.0);
 /// [`crate::widgets::CanvasLabel`] puts its name there too).
 pub const LABEL_OFFSET: Vec2 = Vec2::new(space::XS, 2.0);
 
+/// The pointer over a canvas while [`Tool::DrawRect`] is armed, so the
+/// next drag is seen to draw rather than pan.
+pub const DRAW_CURSOR: egui::CursorIcon = egui::CursorIcon::Crosshair;
+
 /// What a primary-button drag does on a canvas.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tool {
@@ -26,8 +31,20 @@ pub enum Tool {
     Navigate,
     /// Drag draws a rectangle, reported on release as the canvas
     /// response's `drawn_rect`; Esc cancels. The tool returns to
-    /// [`Tool::Navigate`] after a rect is drawn or cancelled.
+    /// [`Tool::Navigate`] after a rect is drawn or cancelled. While it is
+    /// armed the pointer over the canvas is [`DRAW_CURSOR`].
     DrawRect,
+}
+
+/// Show [`DRAW_CURSOR`] while `tool` is [`Tool::DrawRect`] and the pointer
+/// is over the canvas of `response` (or drawing on it). Call after the
+/// canvas's input (so a rect just drawn, which disarms the tool, shows the
+/// plain pointer) and before the controls drawn over it, which may set
+/// their own.
+pub(crate) fn show_tool_cursor(ui: &egui::Ui, response: &egui::Response, tool: Tool) {
+    if tool == Tool::DrawRect && (pointer_over(ui, response).is_some() || response.dragged()) {
+        ui.ctx().set_cursor_icon(DRAW_CURSOR);
+    }
 }
 
 /// A rectangle drawn over a canvas, in canvas coordinates (the viewer's

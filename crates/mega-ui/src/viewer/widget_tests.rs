@@ -631,6 +631,39 @@ fn drawn_rect_reported_in_image_coords() {
 }
 
 #[test]
+fn the_cursor_is_a_crosshair_while_the_draw_tool_is_armed() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    let over = Pos2::new(500.0, 400.0);
+    let cursor = |h: &Harness<'static, Drawing>| h.output().platform_output.cursor_icon;
+    h.hover_at(over);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "navigating");
+    // Armed: a crosshair over the canvas, and while drawing.
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair);
+    h.drag_at(over);
+    h.step();
+    h.hover_at(Pos2::new(600.0, 450.0));
+    h.step();
+    assert_eq!(cursor(&h), egui::CursorIcon::Crosshair, "drawing");
+    // Off the canvas: none.
+    h.drop_at(Pos2::new(600.0, 450.0));
+    h.run();
+    h.state_mut().viewer.set_tool(Tool::DrawRect);
+    h.hover_at(Pos2::new(-10.0, -10.0));
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "off the canvas");
+    // A rect drawn disarms the tool: the cursor goes back.
+    drag(&mut h, over, Pos2::new(600.0, 450.0));
+    assert_eq!(h.state().viewer.tool(), Tool::Navigate);
+    h.hover_at(over);
+    h.run();
+    assert_eq!(cursor(&h), egui::CursorIcon::Default, "disarmed");
+}
+
+#[test]
 fn overlays_drawn_and_zoom_to_rect() {
     let src = TestSource::new(20_000, 10_000);
     let mut h = drawing_harness(TiledViewer::new_synchronous(src));

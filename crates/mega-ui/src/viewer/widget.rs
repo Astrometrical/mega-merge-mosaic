@@ -29,7 +29,7 @@ use super::cache::{DEFAULT_CAPACITY, TileCache};
 use super::{Fetched, PyramidGeometry, TileKey, TileSource, View, pick_level, visible_tiles};
 use crate::canvas_layers::{
     DrawStep, Hold, Overlay, Patch, Pressed, Tool, drawing_rect, follow_draw, follow_hold,
-    paint_layers, pointer_over,
+    paint_layers, pointer_over, show_tool_cursor,
 };
 use crate::theme::palette;
 
@@ -217,8 +217,9 @@ enum Command {
 }
 
 /// Deep-zoom viewer over a [`TileSource`]: drag pans (or draws a rectangle
-/// with [`Tool::DrawRect`]), the scroll wheel zooms about the cursor,
-/// double-click zooms in 2x, and `+` / `−` / `Home` buttons sit top-left.
+/// with [`Tool::DrawRect`], the pointer a crosshair while it is armed), the
+/// scroll wheel zooms about the cursor, double-click zooms in 2x, and `+` /
+/// `−` / `Home` buttons sit top-left.
 /// [`Patch`] images and [`Overlay`] rectangles are drawn over the image.
 pub struct TiledViewer {
     source: Arc<dyn TileSource>,
@@ -469,7 +470,9 @@ impl TiledViewer {
         let drawn_rect = if self.presentation {
             None
         } else {
-            self.handle_input(ui, &response, rect, now)
+            let drawn = self.handle_input(ui, &response, rect, now);
+            show_tool_cursor(ui, &response, self.tool);
+            drawn
         };
         let held = if self.presentation || self.tool != Tool::Navigate || drawn_rect.is_some() {
             self.held = None;
