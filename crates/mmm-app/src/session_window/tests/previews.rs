@@ -16,13 +16,13 @@ use mmm_core::stretch::StretchParams;
 
 /// "Core" (id 7) and "Halo" (id 9): both in the first 256 × 256 tile of
 /// the 600 × 420 synthetic canvas.
-const CORE: (u64, &str, [u64; 4]) = (7, "Core", [100, 100, 200, 160]);
-const HALO: (u64, &str, [u64; 4]) = (9, "Halo", [0, 0, 64, 64]);
+pub(super) const CORE: (u64, &str, [u64; 4]) = (7, "Core", [100, 100, 200, 160]);
+pub(super) const HALO: (u64, &str, [u64; 4]) = (9, "Halo", [0, 0, 64, 64]);
 
 /// A merged two-group session with `rois`, its window showing the mosaic of
 /// Ha with the ROIs section open (once `prepare` has adjusted it, before
 /// the first frame). Every preview started waits for the returned gate.
-fn shown(
+pub(super) fn shown(
     tag: &str,
     rois: &[(u64, &str, [u64; 4])],
     prepare: impl FnOnce(&mut State),
@@ -31,7 +31,7 @@ fn shown(
 }
 
 /// [`shown`] on the canvas `mode` (drawn, with the plan's panels placed).
-fn shown_on(
+pub(super) fn shown_on(
     tag: &str,
     rois: &[(u64, &str, [u64; 4])],
     mode: CanvasMode,
@@ -73,7 +73,7 @@ fn shown_in(
 }
 
 /// The HOO composite (R Ha, G and B OIII), shown.
-fn show_hoo(st: &mut State) {
+pub(super) fn show_hoo(st: &mut State) {
     let mut hoo = Composition::new("HOO");
     hoo.channels = [
         Some(("Ha".into(), 1.0)),
@@ -84,12 +84,12 @@ fn show_hoo(st: &mut State) {
     st.w.select_view(ViewKind::Composition(0));
 }
 
-fn log(st: &State) -> Vec<Logged> {
+pub(super) fn log(st: &State) -> Vec<Logged> {
     st.w.previews.log().to_vec()
 }
 
 /// The previews started so far, in order: `(roi, group)`.
-fn started(st: &State) -> Vec<(u64, String)> {
+pub(super) fn started(st: &State) -> Vec<(u64, String)> {
     log(st)
         .into_iter()
         .filter_map(|e| match e {
@@ -100,7 +100,7 @@ fn started(st: &State) -> Vec<(u64, String)> {
 }
 
 /// The key the last preview started was made with.
-fn last_started_key(st: &State) -> PreviewKey {
+pub(super) fn last_started_key(st: &State) -> PreviewKey {
     log(st)
         .into_iter()
         .rev()
@@ -112,7 +112,7 @@ fn last_started_key(st: &State) -> PreviewKey {
 }
 
 /// How many times `(roi, group)`'s preview was delivered into the cache.
-fn delivered(st: &State, roi: u64, group: &str) -> usize {
+pub(super) fn delivered(st: &State, roi: u64, group: &str) -> usize {
     log(st)
         .iter()
         .filter(|e| **e == Logged::Delivered(roi, group.into()))
@@ -120,7 +120,7 @@ fn delivered(st: &State, roi: u64, group: &str) -> usize {
 }
 
 /// How many times `(roi, group)`'s preview was cancelled.
-fn cancelled(st: &State, roi: u64, group: &str) -> usize {
+pub(super) fn cancelled(st: &State, roi: u64, group: &str) -> usize {
     log(st)
         .iter()
         .filter(|e| **e == Logged::Cancelled(roi, group.into()))
@@ -128,7 +128,7 @@ fn cancelled(st: &State, roi: u64, group: &str) -> usize {
 }
 
 /// The key a preview of `rect` of `group` is wanted with now.
-fn wanted(st: &State, group: &str, rect: [u64; 4]) -> PreviewKey {
+pub(super) fn wanted(st: &State, group: &str, rect: [u64; 4]) -> PreviewKey {
     let cfg = &st.session.mosaic.config;
     PreviewKey {
         rect,
@@ -157,12 +157,12 @@ fn until_sent(h: &Harness<'static, State>, n: usize) {
 }
 
 /// The draft's feather width.
-fn draft_feather(st: &State) -> f32 {
+pub(super) fn draft_feather(st: &State) -> f32 {
     crate::blend_settings::load_draft(&st.session.mosaic.config).feather_px
 }
 
 /// Let the held preview go, holding those started from now on.
-fn release(h: &mut Harness<'static, State>, gate: Arc<Gate>) -> Arc<Gate> {
+pub(super) fn release(h: &mut Harness<'static, State>, gate: Arc<Gate>) -> Arc<Gate> {
     let next = h.state_mut().w.previews.hold();
     gate.open();
     next
@@ -702,7 +702,12 @@ fn previews_run_on_the_plan_and_wait_while_its_frame_differs() {
 // ---- Drawing the patches (plan 4 task 6) ----
 
 /// What converting `group`'s cached patch of `roi` through `stretch` gives.
-fn converted(st: &State, roi: u64, group: &str, stretch: &[StretchParams]) -> egui::ColorImage {
+pub(super) fn converted(
+    st: &State,
+    roi: u64,
+    group: &str,
+    stretch: &[StretchParams],
+) -> egui::ColorImage {
     let (_, p) = st.w.previews.patch(roi, group).expect("a patch");
     let n = (p.width * p.height) as usize;
     planar_image(
@@ -717,7 +722,7 @@ fn converted(st: &State, roi: u64, group: &str, stretch: &[StretchParams]) -> eg
 
 /// ROI `roi` is drawn with its group's patch through the stretch the canvas
 /// has now (the mosaic's member stretch, or the plan's).
-fn drawn_with_canvas_stretch(st: &State, roi: u64, group: &str) -> bool {
+pub(super) fn drawn_with_canvas_stretch(st: &State, roi: u64, group: &str) -> bool {
     let stretch = match st.w.mode() {
         CanvasMode::Mosaic => st.w.mosaic().member_stretch(group),
         CanvasMode::Plan => st.w.plan().stretch_for_view().map(<[_]>::to_vec),

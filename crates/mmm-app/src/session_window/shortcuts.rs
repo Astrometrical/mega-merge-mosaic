@@ -13,11 +13,13 @@
 //! | `Ctrl+Enter` (`Cmd+Enter` on macOS) | **Merge**, while the main button offers it | the main button |
 //! | `Delete` (and `Backspace` on macOS) | remove the selected panels (a toast offers Undo), while the panel list is open | the row menu's **Remove** |
 //! | `Esc` | clear the selection, in the panel list and on the plan | |
+//! | `Space`, held | comparing an ROI (spec §8.3): show the other side while held | the **A** / **B** buttons |
 //!
-//! The letters, brackets and Delete count with no modifier held. None acts
-//! while a text field has the keyboard (notes, names, a path) or the Export
-//! dialog is open; a focused button or chip (keyboard navigation) does not
-//! stop them. The canvas always shows (the panel list sits beside it), so
+//! The letters, brackets, Delete and Space count with no modifier held. None
+//! acts while a text field has the keyboard (notes, names, a path) or the
+//! Export dialog is open (a Space held since before still ends its peek when
+//! let go: [`SessionWindow::follow_peek_key`]); a focused button or chip
+//! (keyboard navigation) does not stop them. The canvas always shows (the panel list sits beside it), so
 //! the canvas's own (`M`, the brackets and the toggles) act with the list
 //! open too. A key that is a shortcut is consumed, so no widget sees it
 //! too, except Esc: an Esc that closes a menu or leaves a text field does
@@ -59,6 +61,8 @@ pub(super) const REMOVE: Key = Key::Delete;
 pub(super) const REMOVE_MAC: Key = Key::Backspace;
 /// Clears the selection.
 pub(super) const CLEAR: Key = Key::Escape;
+/// Held while comparing an ROI: shows the side not selected.
+pub(super) const PEEK: Key = Key::Space;
 
 /// `text` naming its shortcut `key`: "Outlines (O)".
 pub(super) fn keyed(text: &str, key: Key) -> String {
@@ -84,7 +88,9 @@ impl SessionWindow {
         jobs: &mut JobRunner,
         pipeline: &Pipeline,
     ) {
-        if ctx.text_edit_focused() || self.mosaic.export_open() {
+        let typing = ctx.text_edit_focused() || self.mosaic.export_open();
+        self.follow_peek_key(ctx, typing);
+        if typing {
             return;
         }
         let pressed = |key: Key| {

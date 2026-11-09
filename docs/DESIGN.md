@@ -1445,6 +1445,26 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   whether one had the keyboard last frame). None acts while a text field
   has the keyboard (`Context::text_edit_focused`; a button or chip focused
   by keyboard navigation does not stop them) or the Export dialog is open.
+  `Space`, held while comparing an ROI, shows the other side (below); a
+  Space held from before still ends its peek when let go, wherever the
+  keyboard focus has gone.
+- **Compare A / B** (spec §8.3; `session_window/compare.rs`,
+  `previews::Compare`). An ROI up to date for the groups in view (no
+  analysis running) has its canvas label drawn by the window with
+  **Compare** (mega-ui `CanvasLabel`, at the corner where the canvas would
+  paint the label, which it then does not). Compare freezes the ROI's
+  patches as A with the draft they were made from; A is held outside the
+  preview cache (never evicted, counted towards its cap once) and never
+  merged again; B is the live preview. The A | B toggle stays; Space, the
+  selected button held, or the left button held on the compared preview
+  (the canvases report a `canvas_layers::Hold`; past the click distance it
+  is a drag, which pans and ends the peek) show the other side while held.
+  Both sides' textures stay converted with the canvas's stretch, so a
+  switch shows at once. **Use A** puts A's settings back through the draft
+  edit (`SettingsPanel::edit_draft`) and A's patches back into the cache;
+  **Done** keeps the draft. Compare ends when its ROI is deleted, moved or
+  hidden, the view's groups change, an analysis starts, or the session is
+  left. One ROI at a time.
 - **Back to start** (`Shell::close_session`). Cancels the running jobs and
   waits up to 3 s (`STOP_WAIT`) for them to stop, which can block the UI for
   that long, then flushes the pending saves (an edit waiting for the jobs

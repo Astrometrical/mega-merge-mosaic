@@ -35,9 +35,22 @@
 //! - **The cache** keeps at most [`PREVIEW_CACHE_BYTES`] of patch samples:
 //!   the least recently drawn ([`Previews::patch`] marks a patch drawn) go
 //!   first, never the patch just made.
+//! - **Compare A / B** (spec §8.3; [`Previews::start_compare`]): one ROI at
+//!   a time. Its patches of the groups in view, up to date, are frozen as
+//!   side **A** with the draft they were made from ([`Compare`]): held
+//!   outside the cache, so the LRU never evicts them (they count towards
+//!   its cap, once when the cache shares them) and nothing merges them
+//!   again. **B** is the live preview, cached and scheduled as any. The
+//!   selected side shows; a momentary switch ([`Peek`]) held shows the
+//!   other ([`Compare::shown`]). The compare ends when its ROI is deleted
+//!   or moved ([`Previews::forget_roi`], [`Previews::keep_rois`]), on
+//!   [`Previews::stop`], on [`Previews::use_a`] (A's patches go back into
+//!   the cache: with A's settings back in the draft they are the previews
+//!   wanted, so nothing merges) and when the window ends it
+//!   ([`Previews::end_compare`]).
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
@@ -112,6 +125,87 @@ impl PreviewState {
             PreviewState::UpToDate => "up to date",
             PreviewState::OutOfDate => "out of date",
         }
+    }
+}
+
+/// A side of a compare (spec §8.3): **A**, the preview frozen when the
+/// compare began, or **B**, the live preview (what every ROI not compared
+/// shows too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Side {
+    /// The preview as it was when the compare began.
+    A,
+    /// The live preview, following the draft.
+    B,
+}
+
+impl Side {
+    /// The other side.
+    pub fn other(self) -> Side {
+        match self {
+            Side::A => Side::B,
+            Side::B => Side::A,
+        }
+    }
+
+    /// "A" or "B".
+    pub fn letter(self) -> &'static str {
+        match self {
+            Side::A => "A",
+            Side::B => "B",
+        }
+    }
+}
+
+/// A momentary switch of a compare: while one is held, the side not
+/// selected shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Peek {
+    /// Space, held (not while typing or in a dialog).
+    Space,
+    /// The selected A / B button, pressed and held.
+    Button,
+    /// The left mouse button held on the compared ROI's preview (until it
+    /// drags).
+    Preview,
+}
+
+/// The ROI being compared (spec §8.3).
+#[derive(Clone, Debug)]
+pub struct Compare {
+    /// The ROI's id.
+    pub roi: u64,
+    /// Side A: per group in view when the compare began, its patch and
+    /// what it was made from. Pinned: never evicted, never merged again.
+    pub a: BTreeMap<String, (PreviewKey, Arc<PreviewPatch>)>,
+    /// The draft A was made from (before any group's override): what
+    /// **Use A** puts back.
+    pub a_settings: BlendSettings,
+    /// The side the A / B toggle has chosen.
+    pub selected: Side,
+    /// The momentary switches held.
+    pub peeks: BTreeSet<Peek>,
+}
+
+impl Compare {
+    /// The side shown: the one selected, or the other while a momentary
+    /// switch is held.
+    pub fn shown(&self) -> Side {
+        if self.peeks.is_empty() {
+            self.selected
+        } else {
+            self.selected.other()
+        }
+    }
+
+    /// Whether a momentary switch is held.
+    pub fn peeking(&self) -> bool {
+        !self.peeks.is_empty()
+    }
+
+    /// The ROI's canvas rect A was made over.
+    pub fn rect(&self) -> Option<[u64; 4]> {
+        self.a.values().next().map(|(k, _)| k.rect)
     }
 }
 
@@ -232,6 +326,8 @@ pub struct Previews {
     wanted: Vec<Wanted>,
     /// Keys that failed, not tried again until the key changes.
     failed: BTreeMap<(u64, String), PreviewKey>,
+    /// The ROI being compared, with its side A.
+    compare: Option<Compare>,
     /// Hold the previews started from now on (tests).
     #[cfg(test)]
     gate: Option<Arc<tests::Gate>>,
@@ -272,6 +368,7 @@ impl Previews {
             rects: BTreeMap::new(),
             wanted: Vec::new(),
             failed: BTreeMap::new(),
+            compare: None,
             #[cfg(test)]
             gate: None,
             #[cfg(test)]
@@ -357,8 +454,8 @@ impl Previews {
 
     /// The ROIs as they are now: the running preview of one gone or moved
     /// (another canvas rect, e.g. reprojected after a frame change) is
-    /// cancelled, and its patches are dropped. Call every frame before
-    /// [`Previews::schedule`].
+    /// cancelled, and its patches are dropped (its compare ends). Call every
+    /// frame before [`Previews::schedule`].
     pub fn keep_rois(&mut self, rois: &[Roi]) {
         self.rects = rois.iter().map(|r| (r.id, r.canvas)).collect();
         if let Some(job) = &self.running
@@ -368,6 +465,13 @@ impl Previews {
             self.cancel_running();
         }
         let rects = &self.rects;
+        if self
+            .compare
+            .as_ref()
+            .is_some_and(|c| c.rect().is_none_or(|r| rects.get(&c.roi) != Some(&r)))
+        {
+            self.compare = None;
+        }
         self.cache
             .retain(|(roi, _), e| rects.get(roi) == Some(&e.key.rect));
         self.failed
@@ -416,13 +520,14 @@ impl Previews {
         }
     }
 
-    /// End the previews (leaving the session): the one in flight is
-    /// cancelled and the worker thread let go of; it ends once that preview
-    /// has (a decode in progress is not interrupted). Its handle, if there
-    /// is one, for the caller to wait for: nothing may read or write the
-    /// session's files once its lock is released. A later
+    /// End the previews (leaving the session): a compare ends, the one in
+    /// flight is cancelled and the worker thread let go of; it ends once
+    /// that preview has (a decode in progress is not interrupted). Its
+    /// handle, if there is one, for the caller to wait for: nothing may read
+    /// or write the session's files once its lock is released. A later
     /// [`Previews::schedule`] would start a new thread.
     pub fn stop(&mut self) -> Option<JoinHandle<()>> {
+        self.compare = None;
         if let Some(job) = self.running.take() {
             job.token.cancel();
             note!(self, Logged::Cancelled(job.roi, job.group));
@@ -430,9 +535,12 @@ impl Previews {
         self.worker.take().map(|w| w.handle)
     }
 
-    /// ROI `roi` was deleted: its running preview is cancelled and its
-    /// patches dropped.
+    /// ROI `roi` was deleted: its running preview is cancelled, its
+    /// patches dropped and its compare ended.
     pub fn forget_roi(&mut self, roi: u64) {
+        if self.compare.as_ref().is_some_and(|c| c.roi == roi) {
+            self.compare = None;
+        }
         if self
             .running
             .as_ref()
@@ -445,12 +553,106 @@ impl Previews {
         self.rects.remove(&roi);
     }
 
-    /// Bytes of samples the cache holds.
+    /// Bytes of samples held: the cache's patches, and a compare's side A
+    /// (a patch the cache holds too is counted once).
     pub fn bytes(&self) -> usize {
-        self.cache
-            .values()
-            .map(|e| e.patch.data.len() * size_of::<f32>())
-            .sum()
+        let size = |p: &PreviewPatch| p.data.len() * size_of::<f32>();
+        let cached: usize = self.cache.values().map(|e| size(&e.patch)).sum();
+        let pinned: usize = self
+            .compare
+            .iter()
+            .flat_map(|c| c.a.values())
+            .filter(|(_, p)| !self.cache.values().any(|e| Arc::ptr_eq(&e.patch, p)))
+            .map(|(_, p)| size(p))
+            .sum();
+        cached + pinned
+    }
+
+    /// Compare ROI `roi` (spec §8.3): its cached patches of `groups` (the
+    /// groups in view) become side A, made from the draft `settings`,
+    /// pinned; B, the live preview, is selected. A compare running ends
+    /// first (one ROI at a time). False, with no compare, when a group has
+    /// no patch of the ROI. Offer it only for an ROI up to date for
+    /// `groups` ([`Previews::state`]): A is then what the draft makes now.
+    pub fn start_compare(&mut self, roi: u64, groups: &[String], settings: BlendSettings) -> bool {
+        self.compare = None;
+        let mut a = BTreeMap::new();
+        for g in groups {
+            let Some(e) = self.cache.get(&(roi, g.clone())) else {
+                return false;
+            };
+            a.insert(g.clone(), (e.key.clone(), e.patch.clone()));
+        }
+        if a.is_empty() {
+            return false;
+        }
+        self.compare = Some(Compare {
+            roi,
+            a,
+            a_settings: settings,
+            selected: Side::B,
+            peeks: BTreeSet::new(),
+        });
+        true
+    }
+
+    /// End the compare, if any (**Done**, or its view no longer holds): A
+    /// is let go of, B stays.
+    pub fn end_compare(&mut self) {
+        self.compare = None;
+    }
+
+    /// **Use A**: end the compare, A's patches going back into the cache as
+    /// the ROI's previews (each made from what its key says, so once the
+    /// caller has put A's settings back in the draft they are what is
+    /// wanted, and nothing merges again). A's draft settings, for the
+    /// caller to put back; `None` when not comparing.
+    pub fn use_a(&mut self) -> Option<BlendSettings> {
+        let c = self.compare.take()?;
+        for (group, (key, patch)) in c.a {
+            if self.rects.get(&c.roi) == Some(&key.rect) {
+                self.insert_arc(c.roi, group, key, patch);
+            }
+        }
+        Some(c.a_settings)
+    }
+
+    /// The compare running, if any.
+    pub fn compare(&self) -> Option<&Compare> {
+        self.compare.as_ref()
+    }
+
+    /// The side shown now: [`Compare::shown`], or B outside compare.
+    pub fn shown_side(&self) -> Side {
+        self.compare.as_ref().map_or(Side::B, Compare::shown)
+    }
+
+    /// Choose `side` with the A / B toggle (nothing outside compare).
+    pub fn select_side(&mut self, side: Side) {
+        if let Some(c) = &mut self.compare {
+            c.selected = side;
+        }
+    }
+
+    /// Momentary switch `peek` is held now, or not (nothing outside
+    /// compare). Whether the side shown changed.
+    pub fn set_peek(&mut self, peek: Peek, held: bool) -> bool {
+        let Some(c) = &mut self.compare else {
+            return false;
+        };
+        let before = c.shown();
+        if held {
+            c.peeks.insert(peek);
+        } else {
+            c.peeks.remove(&peek);
+        }
+        c.shown() != before
+    }
+
+    /// Side A's patch of ROI `roi` and `group`, while it is compared.
+    pub fn a_patch(&self, roi: u64, group: &str) -> Option<Arc<PreviewPatch>> {
+        let c = self.compare.as_ref().filter(|c| c.roi == roi)?;
+        c.a.get(group).map(|(_, p)| p.clone())
     }
 
     /// Whether `(roi, group)` is wanted with `key` (as last scheduled).
@@ -543,14 +745,20 @@ impl Previews {
         self.failed.insert((roi, group), key);
     }
 
-    /// Cache `patch`, then drop the least recently drawn patches (never
-    /// this one) while the cache holds more than its cap.
+    /// Cache `patch` ([`Previews::insert_arc`]).
     fn insert(&mut self, roi: u64, group: String, key: PreviewKey, patch: PreviewPatch) {
+        self.insert_arc(roi, group, key, Arc::new(patch));
+    }
+
+    /// Cache `patch`, then drop the least recently drawn patches (never
+    /// this one, never a compare's A) while more than the cap is held
+    /// ([`Previews::bytes`]).
+    fn insert_arc(&mut self, roi: u64, group: String, key: PreviewKey, patch: Arc<PreviewPatch>) {
         let at = (roi, group);
         self.failed.remove(&at);
         let entry = Entry {
             key,
-            patch: Arc::new(patch),
+            patch,
             drawn: Cell::new(self.tick()),
         };
         self.cache.insert(at.clone(), entry);
@@ -751,5 +959,43 @@ pub(crate) mod tests {
         p.insert_patch(7, "Ha", key(0), patch_of(10));
         assert_eq!(held(&p), [7]);
         assert_eq!(p.bytes(), 40);
+    }
+
+    #[test]
+    fn a_is_never_evicted_while_comparing() {
+        let mut p = Previews::new();
+        let ha = ["Ha".to_string()];
+        // No patch to freeze: no compare.
+        assert!(!p.start_compare(1, &ha, BlendSettings::default()));
+        assert!(p.compare().is_none());
+        p.insert_patch(1, "Ha", key(0), patch_of(1000));
+        assert!(p.start_compare(1, &ha, BlendSettings::default()));
+        let a = p.compare().unwrap().a["Ha"].1.clone();
+        // Room for two patches in all; A, the cached patch itself, counts
+        // once.
+        p.set_cap(2 * 1000 * size_of::<f32>());
+        assert_eq!(p.bytes(), 4000);
+        // B merged again with other settings: a patch of its own, and A
+        // still counts.
+        p.insert_patch(1, "Ha", key(1), patch_of(1000));
+        assert_eq!(p.bytes(), 8000);
+        // Another ROI's patch: the least recently drawn cached patch goes
+        // (B), never A.
+        p.insert_patch(2, "Ha", key(0), patch_of(1000));
+        assert_eq!(held(&p), [2]);
+        assert!(Arc::ptr_eq(&p.compare().unwrap().a["Ha"].1, &a));
+        assert_eq!(p.bytes(), 8000);
+        // More, drawn or not: A stays.
+        for roi in 3..6 {
+            p.insert_patch(roi, "Ha", key(0), patch_of(1000));
+            assert!(Arc::ptr_eq(&p.compare().unwrap().a["Ha"].1, &a));
+            assert!(p.bytes() <= 8000);
+        }
+        // Compare on another ROI ends this one: A goes.
+        assert!(p.start_compare(5, &ha, BlendSettings::default()));
+        assert_eq!(p.compare().unwrap().roi, 5);
+        assert_eq!(p.bytes(), 4000);
+        p.end_compare();
+        assert!(p.compare().is_none());
     }
 }

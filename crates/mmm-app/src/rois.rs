@@ -12,14 +12,16 @@
 //! worker: the list (new, select, rename, note, delete) and the
 //! reprojection. Each ROI's row and canvas label show its transient
 //! preview's state, as the window reports it ([`RoiPanel::set_states`],
-//! from [`crate::previews`]). Selecting an ROI asks to go to it
-//! ([`RoiOutcome::go_to`]): the window frames it on whichever canvas shows,
-//! through the camera both share.
+//! from [`crate::previews`]); an ROI whose label carries controls (Compare
+//! A / B, spec §8.3) has it drawn by the window, so its overlay carries no
+//! label ([`RoiPanel::set_labelled`]): the label is drawn once. Selecting an
+//! ROI asks to go to it ([`RoiOutcome::go_to`]): the window frames it on
+//! whichever canvas shows, through the camera both share.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use egui::RichText;
+use egui::{Color32, RichText};
 use mega_ui::canvas_layers::Overlay;
 use mega_ui::theme::palette;
 use mega_ui::widgets::ordered_list::{ListEvent, ListRow, ListState, ordered_list_with};
@@ -224,6 +226,8 @@ pub struct RoiPanel {
     pub(crate) want_sync: bool,
     /// Each ROI's preview state, by id, as the window last reported it.
     states: BTreeMap<u64, PreviewState>,
+    /// The ROIs whose canvas label the window draws (with its controls).
+    labelled: BTreeSet<u64>,
     /// The list widget's own state (a rename in progress).
     list: ListState,
     /// One above every id given so far this session: ids are never reused.
@@ -263,6 +267,22 @@ impl RoiPanel {
     /// row says it, and its canvas label while it merges.
     pub fn set_states(&mut self, states: BTreeMap<u64, PreviewState>) {
         self.states = states;
+    }
+
+    /// The ROIs whose canvas label the window draws, with its controls:
+    /// their overlays carry no label.
+    pub fn set_labelled(&mut self, ids: BTreeSet<u64>) {
+        self.labelled = ids;
+    }
+
+    /// The colour ROI `id` is drawn in (outline and label): the accent
+    /// when selected.
+    pub fn color(&self, id: u64) -> Color32 {
+        if self.selected == Some(id) {
+            palette::ACCENT_400
+        } else {
+            palette::TEXT_BODY
+        }
     }
 
     /// ROI `id`'s preview state.
@@ -356,7 +376,8 @@ impl RoiPanel {
 
     /// The ROIs as canvas overlays (drawn on both canvases): the selected
     /// one solid in the accent colour, the others dashed; each labelled
-    /// with its name, followed by " · merging…" while its preview merges.
+    /// with its name, followed by " · merging…" while its preview merges,
+    /// except those whose label the window draws ([`RoiPanel::set_labelled`]).
     pub fn overlays(&self) -> Vec<Overlay> {
         self.rois
             .iter()
@@ -364,12 +385,9 @@ impl RoiPanel {
                 let selected = self.selected == Some(r.id);
                 Overlay {
                     rect: r.canvas.map(|v| v as f64),
-                    color: if selected {
-                        palette::ACCENT_400
-                    } else {
-                        palette::TEXT_BODY
-                    },
+                    color: self.color(r.id),
                     label: match self.state(r.id) {
+                        _ if self.labelled.contains(&r.id) => String::new(),
                         PreviewState::Merging => format!("{} · merging…", r.name),
                         _ => r.name.clone(),
                     },

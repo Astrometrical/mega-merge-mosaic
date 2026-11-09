@@ -30,7 +30,8 @@
 //!   worker ([`RoiPanel`]). There is no ROI merge: an ROI's preview is
 //!   transient, made by the window's preview runner ([`crate::previews`]),
 //!   and the list and the canvas labels show its state
-//!   ([`MosaicView::set_roi_states`]).
+//!   ([`MosaicView::set_roi_states`]); the window draws the labels that
+//!   carry controls itself ([`MosaicView::set_roi_labelled`]).
 //!   [`MosaicView::merge_these`] merges the groups it is given over the whole
 //!   canvas, committing the merge settings draft first.
 //! - **Merge settings** ([`crate::blend_settings`]): the mosaic-wide
@@ -101,6 +102,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
+use mega_ui::canvas_layers::Hold;
 use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::{radius, space};
 use mega_ui::theme::{palette, scrim};
@@ -110,7 +112,7 @@ use mmm_core::mosaic::{FRAME_FILE, commit_blend_settings};
 use mmm_core::overlap::OverlapGraph;
 use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
-use mmm_core::settings::{AnalyzeSettings, ChangeImpact};
+use mmm_core::settings::{AnalyzeSettings, BlendSettings, ChangeImpact};
 use mmm_core::stretch::StretchParams;
 use mmm_core::surfaces::Surfaces;
 use serde_json::Value;
@@ -313,6 +315,8 @@ pub struct MosaicView {
     tag: Option<CanvasTag>,
     /// The tag was clicked: the window reveals Merge settings.
     reveal_settings: bool,
+    /// The press held on the viewer in the last frame drawn.
+    hold: Option<Hold>,
 }
 
 impl Default for MosaicView {
@@ -355,6 +359,7 @@ impl MosaicView {
             patches: Vec::new(),
             tag: None,
             reveal_settings: false,
+            hold: None,
             settings: SettingsPanel::new(),
         }
     }
@@ -453,6 +458,23 @@ impl MosaicView {
     /// list says it, and the canvas labels while a preview merges.
     pub fn set_roi_states(&mut self, states: BTreeMap<u64, crate::previews::PreviewState>) {
         self.rois.set_states(states);
+    }
+
+    /// The ROIs whose canvas label the window draws, with its controls
+    /// ([`RoiPanel::set_labelled`]).
+    pub fn set_roi_labelled(&mut self, ids: BTreeSet<u64>) {
+        self.rois.set_labelled(ids);
+    }
+
+    /// The colour ROI `id` is drawn in ([`RoiPanel::color`]).
+    pub fn roi_color(&self, id: u64) -> Color32 {
+        self.rois.color(id)
+    }
+
+    /// The primary button held on the viewer in the last frame drawn (the
+    /// navigate tool), in canvas coordinates.
+    pub fn hold(&self) -> Option<Hold> {
+        self.hold
     }
 
     /// Why the typed merge settings are refused, if they are
@@ -960,6 +982,13 @@ impl MosaicView {
         self.rois.want_sync = true;
     }
 
+    /// Make `draft` the merge settings draft, as an edit of the Merge
+    /// settings does ([`SettingsPanel::edit_draft`]): the window saves it
+    /// (debounced) once it takes the change.
+    pub fn edit_draft(&mut self, session: &mut OpenSession, draft: BlendSettings) {
+        self.settings.edit_draft(&mut session.mosaic.config, draft);
+    }
+
     /// Whether the merge settings draft changed since the last call
     /// ([`SettingsPanel::take_draft_changed`]).
     pub fn take_draft_changed(&mut self) -> bool {
@@ -1020,6 +1049,7 @@ impl MosaicView {
         plan_stretch: Option<&[StretchParams]>,
     ) {
         self.shown = true;
+        self.hold = None;
         self.plan_stretch = plan_stretch.map(<[StretchParams]>::to_vec);
         if self.resolved.as_ref() != self.view.as_ref() {
             // A view selected since the last poll: drawn from the next frame.
@@ -1046,7 +1076,9 @@ impl MosaicView {
                 }
                 viewer.set_overlays(overlays);
                 viewer.set_patches(self.patches.clone());
-                drawn = viewer.show(ui).drawn_rect;
+                let shown = viewer.show(ui);
+                drawn = shown.drawn_rect;
+                self.hold = shown.held;
                 // A composition shows its merged groups; the others are
                 // named over the image, which keeps the plan's place.
                 if let Some((rect, _)) = viewer.last_frame() {

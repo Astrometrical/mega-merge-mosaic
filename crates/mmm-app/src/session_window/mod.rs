@@ -51,6 +51,10 @@
 //!   the typed merge settings are invalid. Previews run on their own
 //!   thread, never as jobs: no job event, no toast, nothing written. Each
 //!   ROI's row and canvas label say how its preview stands.
+//! - **Compare A / B** ([`compare`]): an ROI up to date offers **Compare**
+//!   on its canvas label; comparing, its label holds A | B, **Use A** and
+//!   **Done**, and Space, the selected button or a press on its preview
+//!   shows the other side while held.
 //! - **View state** ([`view_state`]): plan or mosaic, the view, the camera,
 //!   the inspector's fold and open sections, the panel list and the
 //!   Outlines and ROIs toggles are written into `ui` whenever they change.
@@ -61,11 +65,11 @@
 //!   through it (no fit is painted first). With nothing saved: the mosaic
 //!   once something is merged, the first group, Problems open, Outlines and
 //!   ROIs on.
-//! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `L`, `S`
-//!   and `Ctrl+Enter`, each named in its control's tooltip, `Delete`
-//!   (removes the panels selected in the open list) and `Esc` (clears the
-//!   selection); none while a text field has the keyboard or the Export
-//!   dialog is open.
+//! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `D`, `L`,
+//!   `S` and `Ctrl+Enter`, each named in its control's tooltip, `Delete`
+//!   (removes the panels selected in the open list), `Esc` (clears the
+//!   selection) and `Space` held (comparing, shows the other side); none
+//!   while a text field has the keyboard or the Export dialog is open.
 //! - **Saves.** The view state, the display stretch toggles, the composites,
 //!   the notes and the user's grouping choice (noted by the panel list,
 //!   [`PanelList::take_ui_changed`]) live in the session's
@@ -80,12 +84,14 @@
 //!   screen reads them there).
 
 mod canvas;
+mod compare;
 mod sections;
 mod shortcuts;
 mod steps;
 mod top_bar;
 pub mod view_state;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -111,7 +117,7 @@ use crate::panel_list::{PanelList, PanelListOutput};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{CanvasLook, PlanView, group_members};
 use crate::preview_draw::PatchTextures;
-use crate::previews::{PreviewKey, Previews, Wanted};
+use crate::previews::{PreviewKey, PreviewState, Previews, Wanted};
 use crate::rois::Roi;
 use crate::session::OpenSession;
 use crate::util::{Debounce, group_names};
@@ -213,6 +219,11 @@ pub struct SessionWindow {
     /// The textures of the ROIs' patches on the mosaic and on the plan.
     mosaic_patches: PatchTextures,
     plan_patches: PatchTextures,
+    /// The ROIs whose canvas label the window draws, with controls
+    /// ([`compare`]).
+    labelled: BTreeSet<u64>,
+    /// Space has been held since a press while comparing ([`compare`]).
+    peek_key: bool,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -256,6 +267,8 @@ impl SessionWindow {
             previews: Previews::new(),
             mosaic_patches: PatchTextures::default(),
             plan_patches: PatchTextures::default(),
+            labelled: BTreeSet::new(),
+            peek_key: false,
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -402,6 +415,12 @@ impl SessionWindow {
             CanvasMode::Plan => &self.plan_patches,
             CanvasMode::Mosaic => &self.mosaic_patches,
         }
+    }
+
+    /// The side of ROI `roi` drawn on the canvas shown last frame.
+    #[cfg(test)]
+    fn preview_drawn_side(&self, roi: u64) -> Option<crate::previews::Side> {
+        self.shown_patches().drawn_side(roi)
     }
 
     /// The image ROI `roi`'s patch was converted to on the canvas shown.
@@ -587,23 +606,28 @@ impl SessionWindow {
     }
 
     /// The ROIs' transient previews, every frame: follow the ROIs (one
-    /// moved or deleted drops its previews), work out what is wanted now
-    /// ([`SessionWindow::wanted_previews`]), take a finished preview only if
-    /// it is still wanted, schedule, and hand each ROI's state, for the
-    /// groups in view, to the list and the canvas labels.
+    /// moved or deleted drops its previews and its compare), end a compare
+    /// whose view no longer holds ([`SessionWindow::follow_compare`]), work
+    /// out what is wanted now ([`SessionWindow::wanted_previews`]), take a
+    /// finished preview only if it is still wanted, schedule, and hand each
+    /// ROI's state, for the groups in view, to the list and the canvas
+    /// labels, noting which labels the window draws with controls.
     fn follow_previews(&mut self, ctx: &egui::Context, session: &OpenSession, jobs: &JobRunner) {
         self.previews.keep_rois(self.mosaic.rois());
+        self.follow_compare(jobs);
         let wanted = self.wanted_previews(session, jobs);
         self.previews.poll(&wanted);
         self.previews.schedule(ctx, session, &wanted);
         let groups = self.mosaic.members();
-        let states = self
+        let states: BTreeMap<u64, PreviewState> = self
             .mosaic
             .rois()
             .iter()
             .map(|r| (r.id, self.previews.state(r.id, groups, session)))
             .collect();
+        self.labelled = self.labelled_rois(&states, jobs);
         self.mosaic.set_roi_states(states);
+        self.mosaic.set_roi_labelled(self.labelled.clone());
     }
 
     /// The previews wanted this frame: each ROI in view on the shown canvas

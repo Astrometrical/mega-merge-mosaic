@@ -19,6 +19,12 @@
 //!   converted again only when one of its layers' patch, stretch, tint or
 //!   mode changes (the key); the texture drawn meanwhile is the previous
 //!   one. Textures of ROIs not drawn this frame are dropped.
+//! - **Compare** (spec §8.3): the compared ROI has a texture per side, the
+//!   live preview (B) and the frozen A, both kept converted (each with the
+//!   canvas's stretch, so they compare fairly) and only the side shown
+//!   drawn: switching sides shows the other at once. A texture whose layers
+//!   another already holds converted borrows it (A, as the compare begins,
+//!   is B's).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,6 +34,7 @@ use mega_ui::canvas_layers::Patch;
 use mmm_core::mosaic::PreviewPatch;
 use mmm_core::stretch::StretchParams;
 
+use crate::previews::Side;
 use crate::tile_source::{Mix, planar_image};
 use crate::util::{Poll, Task};
 
@@ -60,7 +67,21 @@ fn same_layers(a: &[LayerSpec], b: &[LayerSpec]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.same(y))
 }
 
-/// What one ROI draws on one canvas.
+/// What one of an ROI's textures on the canvas shown is converted from.
+pub struct PatchWant {
+    /// The ROI.
+    pub roi: u64,
+    /// Which of its previews: the live one (B), or a compare's frozen A.
+    pub side: Side,
+    /// The ROI's canvas rect: nothing outside it is drawn.
+    pub clip: [f64; 4],
+    /// The layers (none: nothing drawn, nothing kept).
+    pub layers: Vec<LayerSpec>,
+    /// Drawn this frame. A side not shown is kept converted all the same.
+    pub shown: bool,
+}
+
+/// One texture of an ROI on one canvas.
 #[derive(Default)]
 struct Entry {
     /// The texture drawn, with the layers it was converted from.
@@ -77,44 +98,57 @@ struct Entry {
     conversions: usize,
 }
 
-/// The textures of the ROIs' patches on the canvas shown: one per ROI, kept
-/// while the ROI keeps being drawn.
+/// The textures of the ROIs' patches on the canvas shown: one per ROI and
+/// side, kept while it keeps being wanted.
 #[derive(Default)]
 pub struct PatchTextures {
-    entries: BTreeMap<u64, Entry>,
+    entries: BTreeMap<(u64, Side), Entry>,
+    /// Each ROI's side drawn last frame (tests).
+    #[cfg(test)]
+    drawn: BTreeMap<u64, Side>,
     /// What the canvas was last given (tests).
     #[cfg(test)]
     last: Vec<Patch>,
 }
 
 impl PatchTextures {
-    /// The patches to draw this frame. `wants`: per ROI drawn (id, canvas
-    /// rect, layers); one with no layers draws nothing. Textures of other
-    /// ROIs are dropped. Call every frame the canvas is drawn.
-    pub fn patches(
-        &mut self,
-        ctx: &egui::Context,
-        wants: Vec<(u64, [f64; 4], Vec<LayerSpec>)>,
-    ) -> Vec<Patch> {
-        self.entries
-            .retain(|id, _| wants.iter().any(|(r, _, l)| r == id && !l.is_empty()));
+    /// The patches to draw this frame: those of `wants` shown whose texture
+    /// is ready. Each want's texture is kept converted, shown or not; one
+    /// with no layers draws nothing. Textures not wanted are dropped. Call
+    /// every frame the canvas is drawn.
+    pub fn patches(&mut self, ctx: &egui::Context, wants: Vec<PatchWant>) -> Vec<Patch> {
+        self.entries.retain(|(roi, side), _| {
+            wants
+                .iter()
+                .any(|w| (w.roi, w.side) == (*roi, *side) && !w.layers.is_empty())
+        });
+        #[cfg(test)]
+        self.drawn.clear();
         let mut out = Vec::new();
-        for (id, clip, layers) in wants {
-            if layers.is_empty() {
+        for w in wants {
+            if w.layers.is_empty() {
                 continue;
             }
-            let e = self.entries.entry(id).or_default();
-            e.follow(ctx, id, layers);
+            let at = (w.roi, w.side);
+            let lent = self.lend(at, &w.layers);
+            let e = self.entries.entry(at).or_default();
+            if let Some(lent) = lent {
+                e.borrow(lent, &w.layers);
+            }
+            e.follow(ctx, w.roi, w.layers);
             // The rect of the patch the texture drawn was made from (not
             // the layers wanted now: a new rect waits for its texture).
-            if let Some((made, texture)) = &e.ready
+            if w.shown
+                && let Some((made, texture)) = &e.ready
                 && let Some(first) = made.first()
             {
                 out.push(Patch {
                     rect: first.patch.rect.map(|v| v as f64),
-                    clip,
+                    clip: w.clip,
                     texture: texture.clone(),
                 });
+                #[cfg(test)]
+                self.drawn.insert(w.roi, w.side);
             }
         }
         #[cfg(test)]
@@ -124,16 +158,43 @@ impl PatchTextures {
         out
     }
 
-    /// The image the texture of ROI `roi` was converted to (tests).
-    #[cfg(test)]
-    pub fn image(&self, roi: u64) -> Option<Arc<ColorImage>> {
-        self.entries.get(&roi)?.image.clone()
+    /// A ready texture of another entry than `at` converted from `layers`.
+    fn lend(&self, at: (u64, Side), layers: &[LayerSpec]) -> Option<Lent> {
+        self.entries
+            .iter()
+            .filter(|(k, _)| **k != at)
+            .find_map(|(_, e)| {
+                let (made, texture) = e.ready.as_ref()?;
+                same_layers(made, layers).then(|| Lent {
+                    layers: made.clone(),
+                    texture: texture.clone(),
+                    #[cfg(test)]
+                    image: e.image.clone(),
+                })
+            })
     }
 
-    /// How many conversions ROI `roi`'s texture took so far (tests).
+    /// The image of ROI `roi`'s texture drawn last frame (tests).
+    #[cfg(test)]
+    pub fn image(&self, roi: u64) -> Option<Arc<ColorImage>> {
+        let side = *self.drawn.get(&roi)?;
+        self.entries.get(&(roi, side))?.image.clone()
+    }
+
+    /// The side of ROI `roi` drawn last frame (tests).
+    #[cfg(test)]
+    pub fn drawn_side(&self, roi: u64) -> Option<Side> {
+        self.drawn.get(&roi).copied()
+    }
+
+    /// How many conversions ROI `roi`'s textures took so far (tests).
     #[cfg(test)]
     pub fn conversions(&self, roi: u64) -> usize {
-        self.entries.get(&roi).map_or(0, |e| e.conversions)
+        self.entries
+            .iter()
+            .filter(|((r, _), _)| *r == roi)
+            .map(|(_, e)| e.conversions)
+            .sum()
     }
 
     /// The patches the canvas was last given (tests).
@@ -143,7 +204,34 @@ impl PatchTextures {
     }
 }
 
+/// A texture lent by one entry to another wanting the same layers.
+struct Lent {
+    layers: Vec<LayerSpec>,
+    texture: TextureHandle,
+    #[cfg(test)]
+    image: Option<Arc<ColorImage>>,
+}
+
 impl Entry {
+    /// Take `lent` (converted from `layers`) as the texture drawn, unless
+    /// it is already, dropping a conversion of other layers in flight.
+    fn borrow(&mut self, lent: Lent, layers: &[LayerSpec]) {
+        if self
+            .ready
+            .as_ref()
+            .is_some_and(|(k, _)| same_layers(k, layers))
+        {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.image = lent.image;
+        }
+        self.ready = Some((lent.layers, lent.texture));
+        self.pending = None;
+        self.failed = None;
+    }
+
     /// Take a finished conversion, and start one for `layers` unless the
     /// texture (or the conversion in flight) is already theirs.
     fn follow(&mut self, ctx: &egui::Context, id: u64, layers: Vec<LayerSpec>) {
@@ -287,11 +375,22 @@ mod tests {
         }
     }
 
+    /// ROI `roi`'s live preview over `clip`, shown.
+    fn want(roi: u64, clip: [f64; 4], layers: Vec<LayerSpec>) -> PatchWant {
+        PatchWant {
+            roi,
+            side: Side::B,
+            clip,
+            layers,
+            shown: true,
+        }
+    }
+
     /// Call `patches` until it gives one (the conversion is on a worker).
     fn until_drawn(
         t: &mut PatchTextures,
         ctx: &egui::Context,
-        wants: impl Fn() -> Vec<(u64, [f64; 4], Vec<LayerSpec>)>,
+        wants: impl Fn() -> Vec<PatchWant>,
     ) -> Vec<Patch> {
         let deadline = std::time::Instant::now() + PATIENCE;
         loop {
@@ -315,7 +414,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut t = PatchTextures::default();
         let clip = [300.0, 600.0, 900.0, 900.0];
-        let out = until_drawn(&mut t, &ctx, || vec![(1, clip, vec![layer(p.clone())])]);
+        let out = until_drawn(&mut t, &ctx, || vec![want(1, clip, vec![layer(p.clone())])]);
         assert_eq!(out[0].rect, [256.0, 512.0, 2256.0, 1512.0]);
         assert_eq!(out[0].clip, clip);
         assert_eq!(out[0].texture.size(), [250, 125]);
@@ -328,17 +427,17 @@ mod tests {
         let ctx = egui::Context::default();
         let mut t = PatchTextures::default();
         let clip = [0.0, 0.0, 900.0, 900.0];
-        let out = until_drawn(&mut t, &ctx, || vec![(1, clip, vec![layer(a.clone())])]);
+        let out = until_drawn(&mut t, &ctx, || vec![want(1, clip, vec![layer(a.clone())])]);
         assert_eq!(out[0].rect, [0.0, 0.0, 256.0, 256.0]);
         // The new patch's conversion has just been started: the texture of
         // the old one is still drawn, over the old rect.
-        let out = t.patches(&ctx, vec![(1, clip, vec![layer(b.clone())])]);
+        let out = t.patches(&ctx, vec![want(1, clip, vec![layer(b.clone())])]);
         assert_eq!(out[0].rect, [0.0, 0.0, 256.0, 256.0]);
         assert_eq!(out[0].texture.size(), [256, 256]);
         // Once converted, the new one over its own rect.
         let deadline = std::time::Instant::now() + PATIENCE;
         loop {
-            let out = t.patches(&ctx, vec![(1, clip, vec![layer(b.clone())])]);
+            let out = t.patches(&ctx, vec![want(1, clip, vec![layer(b.clone())])]);
             if out[0].rect == [256.0, 256.0, 768.0, 512.0] {
                 assert_eq!(out[0].texture.size(), [512, 256]);
                 break;
@@ -346,5 +445,63 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "never converted");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn both_sides_stay_converted_and_only_the_shown_one_draws() {
+        let a = patch([0, 0, 256, 256], 1, 3);
+        let b = patch([0, 0, 256, 256], 1, 1);
+        let ctx = egui::Context::default();
+        let mut t = PatchTextures::default();
+        let clip = [0.0, 0.0, 900.0, 900.0];
+        let sides = |shown: Side| {
+            let (a, b) = (a.clone(), b.clone());
+            move || {
+                vec![
+                    PatchWant {
+                        side: Side::A,
+                        shown: shown == Side::A,
+                        ..want(1, clip, vec![layer(a.clone())])
+                    },
+                    PatchWant {
+                        shown: shown == Side::B,
+                        ..want(1, clip, vec![layer(b.clone())])
+                    },
+                ]
+            }
+        };
+        let out = until_drawn(&mut t, &ctx, sides(Side::B));
+        assert_eq!(out.len(), 1, "one side drawn");
+        assert_eq!(t.drawn_side(1), Some(Side::B));
+        // A was converted meanwhile: switching draws it at once, with no
+        // new conversion.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while t
+            .entries
+            .get(&(1, Side::A))
+            .is_none_or(|e| e.ready.is_none())
+        {
+            assert!(std::time::Instant::now() < deadline, "A never converted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            t.patches(&ctx, sides(Side::B)());
+        }
+        let conversions = t.conversions(1);
+        let out = t.patches(&ctx, sides(Side::A)());
+        assert_eq!((out.len(), t.drawn_side(1)), (1, Some(Side::A)));
+        assert_eq!(t.conversions(1), conversions);
+        // A side wanting what the other has converted borrows its texture.
+        let mut t = PatchTextures::default();
+        until_drawn(&mut t, &ctx, || vec![want(2, clip, vec![layer(a.clone())])]);
+        let both = vec![
+            want(2, clip, vec![layer(a.clone())]),
+            PatchWant {
+                side: Side::A,
+                shown: false,
+                ..want(2, clip, vec![layer(a.clone())])
+            },
+        ];
+        t.patches(&ctx, both);
+        assert_eq!(t.conversions(2), 1, "borrowed, not converted");
+        assert!(t.entries[&(2, Side::A)].ready.is_some());
     }
 }

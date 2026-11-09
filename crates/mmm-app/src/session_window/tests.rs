@@ -3677,4 +3677,5 @@ fn a_region_entry_with_other_settings_still_makes_the_group_out_of_date() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+mod compare;
 mod previews;

@@ -35,7 +35,8 @@ use crate::mosaic_view::{CanvasTag, view_members};
 use crate::panel_edits::{group_colors, load_group_colors};
 use crate::pipeline::Pipeline;
 use crate::plan_view::{PlanFeed, group_members};
-use crate::preview_draw::LayerSpec;
+use crate::preview_draw::{LayerSpec, PatchWant};
+use crate::previews::Side;
 use crate::session::OpenSession;
 use crate::tile_source::channel_tints;
 use crate::util::group_names;
@@ -350,12 +351,14 @@ impl SessionWindow {
     }
 
     /// The layers each visible ROI's patch is drawn from on the canvas shown
-    /// (see `preview_draw`): per ROI in view, its id, canvas rect and one
+    /// (see `preview_draw`): per ROI in view, its live preview (B) with one
     /// layer per group of the view that has a patch, converted with the
-    /// stretch of the canvas beneath (read only). Nothing while the ROIs are
-    /// hidden, the plan draws in another frame than the analysed one, the
-    /// canvas has not been drawn, or the canvas has no stretch yet.
-    fn preview_wants(&self, session: &OpenSession) -> Vec<(u64, [f64; 4], Vec<LayerSpec>)> {
+    /// stretch of the canvas beneath (read only); the compared ROI has its
+    /// side A too, through the same stretch, and only the side shown is
+    /// drawn. Nothing while the ROIs are hidden, the plan draws in another
+    /// frame than the analysed one, the canvas has not been drawn, or the
+    /// canvas has no stretch yet.
+    fn preview_wants(&self, session: &OpenSession) -> Vec<PatchWant> {
         let plan = self.mode() == CanvasMode::Plan;
         if !self.look.rois || (plan && !self.plan.frame_matches(session)) {
             return Vec::new();
@@ -447,31 +450,58 @@ impl SessionWindow {
                 }
             }
         }
+        // A recipe's layer of `patch`.
+        let layer = |r: &Recipe, patch: std::sync::Arc<mmm_core::mosaic::PreviewPatch>| {
+            // A colour patch keeps its own colours.
+            let tint = if r.mono_patch_only && patch.channels >= 3 {
+                [1.0; 3]
+            } else {
+                r.tint
+            };
+            LayerSpec {
+                patch,
+                stretch: r.stretch.clone(),
+                tint,
+                mono: r.mono,
+            }
+        };
+        let compared = self.previews.compare().map(|c| c.roi);
         let mut out = Vec::new();
         for roi in self.mosaic.rois() {
-            let r = roi.canvas.map(|v| v as f64);
-            if r[0] >= view[2] || r[2] <= view[0] || r[1] >= view[3] || r[3] <= view[1] {
+            let clip = roi.canvas.map(|v| v as f64);
+            let c = clip;
+            if c[0] >= view[2] || c[2] <= view[0] || c[1] >= view[3] || c[3] <= view[1] {
                 continue;
             }
+            let shown = if compared == Some(roi.id) {
+                self.previews.shown_side()
+            } else {
+                Side::B
+            };
             let layers = recipe
                 .iter()
-                .filter_map(|r| {
-                    let (_, patch) = self.previews.patch(roi.id, &r.group)?;
-                    // A colour patch keeps its own colours.
-                    let tint = if r.mono_patch_only && patch.channels >= 3 {
-                        [1.0; 3]
-                    } else {
-                        r.tint
-                    };
-                    Some(LayerSpec {
-                        patch,
-                        stretch: r.stretch.clone(),
-                        tint,
-                        mono: r.mono,
-                    })
-                })
+                .filter_map(|r| Some(layer(r, self.previews.patch(roi.id, &r.group)?.1)))
                 .collect();
-            out.push((roi.id, r, layers));
+            out.push(PatchWant {
+                roi: roi.id,
+                side: Side::B,
+                clip,
+                layers,
+                shown: shown == Side::B,
+            });
+            if compared == Some(roi.id) {
+                let layers = recipe
+                    .iter()
+                    .filter_map(|r| Some(layer(r, self.previews.a_patch(roi.id, &r.group)?)))
+                    .collect();
+                out.push(PatchWant {
+                    roi: roi.id,
+                    side: Side::A,
+                    clip,
+                    layers,
+                    shown: shown == Side::A,
+                });
+            }
         }
         out
     }
@@ -582,6 +612,8 @@ impl SessionWindow {
                 }
             }
         }
+        // Over the canvas: the ROI labels with controls (Compare A / B).
+        self.roi_labels(ui, session);
     }
 
     /// Whether the view shows one channel, so **Linked** has nothing to

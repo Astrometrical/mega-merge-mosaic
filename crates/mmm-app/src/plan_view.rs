@@ -673,6 +673,8 @@ pub struct PlanView {
     /// A rectangle just drawn, with the canvas it is on: see
     /// [`PlanView::take_drawn`].
     drawn: Option<([f64; 4], (u64, u64))>,
+    /// The press held on the canvas in the last frame drawn.
+    hold: Option<mega_ui::canvas_layers::Hold>,
     held_camera: Option<HeldCamera>,
     /// The view key and previews generation the textures belong to.
     textures_for: Option<(String, u64)>,
@@ -750,6 +752,7 @@ impl PlanView {
             overlays: Vec::new(),
             patches: Vec::new(),
             drawn: None,
+            hold: None,
             held_camera: None,
             textures_for: None,
             textures: HashMap::new(),
@@ -820,6 +823,12 @@ impl PlanView {
     /// canvas it was drawn on.
     pub fn take_drawn(&mut self) -> Option<([f64; 4], (u64, u64))> {
         self.drawn.take()
+    }
+
+    /// The primary button held on the canvas in the last frame drawn (the
+    /// navigate tool), in canvas coordinates.
+    pub fn hold(&self) -> Option<mega_ui::canvas_layers::Hold> {
+        self.hold
     }
 
     /// The view shown (once drawn).
@@ -954,6 +963,7 @@ impl PlanView {
         self.last_shown = Some(Instant::now());
         // Set again if the canvas is drawn and the pointer is on a panel.
         self.hovered = None;
+        self.hold = None;
         if self.info_generation != feed.generation {
             // The panel files may have changed: read their headers again.
             self.info_generation = feed.generation;
@@ -1040,6 +1050,7 @@ impl PlanView {
         let r = self
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);
+        self.hold = r.held;
         if let Some(rect) = r.drawn_rect {
             let size = (
                 extent[2].ceil().max(0.0) as u64,
