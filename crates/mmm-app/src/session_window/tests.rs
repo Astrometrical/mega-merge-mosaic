@@ -195,10 +195,21 @@ fn labels(jobs: &JobRunner) -> Vec<String> {
     jobs.views().into_iter().map(|v| v.label).collect()
 }
 
-/// The **+** chip (the canvas's zoom-in button is a "+" too, but no
-/// toggle).
+/// The **+** chip's accessible name (it shows "+").
+const NEW_COMPOSITE: &str = "New composite";
+
+/// The **+** chip.
 fn plus_chip<'h>(h: &'h Harness<'static, State>) -> Option<egui_kittest::Node<'h>> {
-    h.query(By::new().label("+").predicate(|n| n.toggled().is_some()))
+    h.query(By::new().role(Role::Button).label(NEW_COMPOSITE))
+}
+
+/// Whether the **+** chip says its popover is open.
+fn plus_expanded(h: &Harness<'static, State>) -> Option<bool> {
+    plus_chip(h)
+        .expect("a + chip")
+        .accesskit_node()
+        .data()
+        .is_expanded()
 }
 
 fn disabled(h: &Harness<'static, State>, label: &str) -> bool {
@@ -1318,24 +1329,30 @@ fn the_plus_popover_works_from_the_keyboard() {
     let s = two_group_session(&root);
     let mut h = harness(State::new(s, runner()));
     step_until(&mut h, |st| st.w.view().is_some());
+    // The chip shows "+" and is named for what it does, its popover shut.
+    assert_eq!(plus_expanded(&h), Some(false));
     // Enter opens it and the focus lands on the first preset; Enter makes it.
     open_plus_by_keyboard(&mut h, egui::Key::Enter);
+    assert_eq!(plus_expanded(&h), Some(true), "it says it is open");
     assert_eq!(focused_label(&h).as_deref(), Some("HOO"));
     h.key_press(egui::Key::Enter);
     h.run_steps(3);
     assert_eq!(saved_comps(&h).len(), 1);
     assert_eq!(saved_comps(&h)[0].1, "HOO");
     assert!(h.query_by_label("Custom").is_none(), "the popover closed");
+    assert_eq!(plus_expanded(&h), Some(false));
     // The focus is back on the + chip; Space opens it again, Escape closes
     // it and the focus is back again.
-    assert_eq!(focused_label(&h).as_deref(), Some("+"));
+    assert_eq!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
     h.key_press(egui::Key::Space);
     h.run_steps(3);
     h.get_by_label("Custom");
+    assert_eq!(plus_expanded(&h), Some(true));
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
     assert!(h.query_by_label("Custom").is_none());
-    assert_eq!(focused_label(&h).as_deref(), Some("+"));
+    assert_eq!(plus_expanded(&h), Some(false));
+    assert_eq!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
     assert_eq!(saved_comps(&h).len(), 1, "Escape makes nothing");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1359,7 +1376,7 @@ fn a_click_elsewhere_keeps_the_focus_it_gave() {
     assert!(h.query_by_label("Custom").is_none(), "the popover closed");
     let field = h.get_by_role_and_label(Role::TextInput, "Feather (px)");
     assert!(field.is_focused(), "focus on the feather field");
-    assert_ne!(focused_label(&h).as_deref(), Some("+"));
+    assert_ne!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1412,7 +1429,7 @@ fn the_custom_form_works_from_the_keyboard() {
         [(1, "Keys".to_string(), vec![some("OIII"), None, None])]
     );
     assert!(h.query_by_label("Custom").is_none());
-    assert_eq!(focused_label(&h).as_deref(), Some("+"));
+    assert_eq!(focused_label(&h).as_deref(), Some(NEW_COMPOSITE));
     // A draft left open is dropped: close with Escape, reopen, it is empty.
     open_plus_by_keyboard(&mut h, egui::Key::Enter);
     tab_to(&mut h, "Name");

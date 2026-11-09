@@ -1,8 +1,10 @@
 //! The canvas and its view bar: **Plan** / **Mosaic**, a chip per group
 //! (its colour, "{group} · {panels}") and per composite (dashed) then
-//! **+** — chips only with two or more groups — and at the right the
-//! **Outlines**, **ROIs**, **Linked** and **Strong** toggles (on a row of
-//! their own when the bar is too narrow). **Mosaic** can be chosen once
+//! **+** (named "New composite" to assistive technology, which hears
+//! whether its popover is open) — chips only with two or more groups —
+//! and at the right the **Outlines**, **ROIs**, **Linked** and **Strong**
+//! toggles (on a row of their own when the bar is too narrow). **Mosaic**
+//! can be chosen once
 //! something is merged or a merge has started. **Linked** is disabled for
 //! a mono view ([`SessionWindow::is_mono`]). The stretch
 //! toggles are the session's ([`DisplayStretch`] in `MosaicConfig.ui`):
@@ -283,8 +285,16 @@ impl SessionWindow {
                 dashed: false,
                 mark: None,
             };
-            let r = chip(ui, plus).on_hover_text("New composite");
-            plus_popover(&r, session, groups, act);
+            let r = chip(ui, plus).on_hover_text(NEW_COMPOSITE);
+            let open = plus_popover(&r, session, groups, act);
+            // Named for what it does (it shows "+"), and a menu button, not
+            // a toggle: it says whether its popover is open, as the Custom
+            // form's R/G/B buttons do.
+            ui.ctx().accesskit_node_builder(r.id, |node| {
+                node.set_label(NEW_COMPOSITE);
+                node.clear_toggled();
+                node.set_expanded(open);
+            });
         }
         one_row_width(ui, &widths) + extra
     }
@@ -684,15 +694,19 @@ struct CustomForm {
     open: Option<usize>,
 }
 
+/// The **+** chip's accessible name and hover text.
+const NEW_COMPOSITE: &str = "New composite";
+
 /// The popover of the **+** chip `plus`: the presets the groups allow (one
 /// click makes one), then the Custom form (a name and a group, or None, per
-/// channel, and **Create**). What it makes goes to `act`.
+/// channel, and **Create**). What it makes goes to `act`. Whether it is
+/// open (shown this frame).
 fn plus_popover(
     plus: &egui::Response,
     session: &OpenSession,
     groups: &[String],
     act: &mut BarActions,
-) {
+) -> bool {
     // Not the chip's id: the chip moves when a composite is added.
     let key = egui::Id::new("mmm-plus-custom-form");
     let open_key = egui::Id::new("mmm-plus-popover-open");
@@ -837,4 +851,5 @@ fn plus_popover(
             }
         }
     }
+    shown.is_some()
 }

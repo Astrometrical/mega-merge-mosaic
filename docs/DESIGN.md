@@ -1574,7 +1574,10 @@ Spec: `docs/superpowers/specs/2026-11-08-in-session-experience-design.md`
   allow, one click making one, then **Custom**: a name and a group, or
   None, for each channel, and **Create**. It works from the keyboard (Enter
   opens it, the focus lands on the first preset), and a click outside, such
-  as into a text field, closes it.
+  as into a text field, closes it. The chip shows "+" and its hover text
+  says "New composite"; that is also its accessible name, and it reports
+  its popover's expanded state (a menu button, not a toggle), as the Custom
+  form's R/G/B buttons do.
 - **The composites list** (the inspector's Composites section,
   `sections.rs`): the composites as an ordered list (pick, rename, reorder,
   delete with Undo); the picked one shows its channel editor. An OSC member
