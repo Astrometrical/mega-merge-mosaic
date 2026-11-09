@@ -1133,8 +1133,50 @@ fn no_chips_for_a_single_group() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The Composites list's row called `name` (the chips are called the same,
+/// but are no list items).
+fn comp_row<'h>(h: &'h Harness<'static, State>, name: &'h str) -> egui_kittest::Node<'h> {
+    h.get(By::new().role(Role::ListItem).label(name))
+}
+
+/// Hover the Composites row `name` so its actions show.
+fn hover_comp_row(h: &mut Harness<'static, State>, name: &str) {
+    let at = comp_row(h, name).rect().center();
+    h.hover_at(at);
+    h.run_steps(2);
+}
+
+/// The saved composites as (id, name, channel groups).
+fn saved_comps(h: &Harness<'static, State>) -> Vec<(u64, String, Vec<Option<String>>)> {
+    load_compositions(&h.state().session.mosaic.config.ui)
+        .into_iter()
+        .map(|c| {
+            let groups = c
+                .channels
+                .iter()
+                .map(|s| s.as_ref().map(|(g, _)| g.clone()));
+            (c.id, c.name, groups.collect())
+        })
+        .collect()
+}
+
+fn some(g: &str) -> Option<String> {
+    Some(g.to_string())
+}
+
+/// A button called `label` that is no toggle (the chips are called the
+/// same).
+fn button<'h>(h: &'h Harness<'static, State>, label: &'h str) -> egui_kittest::Node<'h> {
+    h.get(
+        By::new()
+            .role(Role::Button)
+            .label(label)
+            .predicate(|n| n.toggled().is_none()),
+    )
+}
+
 #[test]
-fn plus_adds_a_composite_and_opens_composites() {
+fn the_plus_popover_creates_a_preset() {
     let root = temp_dir("window-plus");
     let s = two_group_session(&root);
     let dir = s.mosaic.dir.clone();
@@ -1142,23 +1184,272 @@ fn plus_adds_a_composite_and_opens_composites() {
     step_until(&mut h, |st| st.w.view().is_some());
     assert!(!h.state().w.inspector().is_open("composites"));
     plus_chip(&h).expect("a + chip").click();
-    h.run_steps(2);
+    h.run_steps(3);
+    // Only what Ha and OIII allow, then Custom.
+    button(&h, "HOO");
+    for absent in ["RGB", "SHO", "HSO"] {
+        assert!(
+            h.query(By::new().role(Role::Button).label(absent))
+                .is_none(),
+            "{absent}"
+        );
+    }
+    h.get_by_label("Custom");
+    assert!(saved_comps(&h).is_empty(), "opening the popover makes none");
+    button(&h, "HOO").click();
+    h.run_steps(3);
+    let hoo = vec![some("Ha"), some("OIII"), some("OIII")];
+    assert_eq!(saved_comps(&h), [(1, "HOO".to_string(), hoo)]);
     let st = h.state();
-    let list = load_compositions(&st.session.mosaic.config.ui);
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0].name, "Composite 1");
     let comp = Some(ViewKind::Composition(1));
     assert_eq!(st.w.view(), comp.as_ref());
     assert_eq!(st.w.plan().view(), comp.as_ref());
     assert_eq!(st.w.mosaic().view(), comp.as_ref());
     assert!(st.w.inspector().is_open("composites"));
-    // Its chip, and its editor in the Composites section.
-    h.get_by_label("Composite 1");
-    h.get_by_label("Delete composite");
+    // The popover closed; the chip and the selected row are there.
+    assert!(h.query_by_label("Custom").is_none());
+    assert!(
+        comp_row(&h, "HOO")
+            .accesskit_node()
+            .is_selected()
+            .unwrap_or(false)
+    );
+    // Again: a unique name.
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    button(&h, "HOO").click();
+    h.run_steps(3);
+    let names: Vec<(u64, String)> = saved_comps(&h).into_iter().map(|c| (c.0, c.1)).collect();
+    assert_eq!(names, [(1, "HOO".into()), (2, "HOO 2".into())]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
     // Saved.
     step_until(&mut h, |_| {
-        MosaicConfig::load(&dir).is_ok_and(|c| load_compositions(&c.ui).len() == 1)
+        MosaicConfig::load(&dir).is_ok_and(|c| load_compositions(&c.ui).len() == 2)
     });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_custom_form_creates_a_composite() {
+    let root = temp_dir("window-custom");
+    let s = two_group_session(&root);
+    let mut h = harness(State::new(s, runner()));
+    step_until(&mut h, |st| st.w.view().is_some());
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    // Nothing named, nothing mapped: Create is off.
+    assert!(button(&h, "Create").accesskit_node().is_disabled());
+    h.get_by_role_and_label(Role::TextInput, "Name").focus();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Mine");
+    h.run_steps(2);
+    assert!(
+        button(&h, "Create").accesskit_node().is_disabled(),
+        "named, but nothing mapped"
+    );
+    // R from OIII.
+    button(&h, "R: None").click();
+    h.run_steps(3);
+    h.get_by_label("OIII").click();
+    h.run_steps(3);
+    assert!(!button(&h, "Create").accesskit_node().is_disabled());
+    button(&h, "Create").click();
+    h.run_steps(3);
+    assert_eq!(
+        saved_comps(&h),
+        [(1, "Mine".to_string(), vec![some("OIII"), None, None])]
+    );
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(1)));
+    assert!(h.state().w.inspector().is_open("composites"));
+    assert!(h.query_by_label("Custom").is_none(), "the popover closed");
+    // A taken name cannot be created again.
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "Name").focus();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Name")
+        .type_text("Mine");
+    h.run_steps(2);
+    button(&h, "R: None").click();
+    h.run_steps(3);
+    h.get_by_label("Ha").click();
+    h.run_steps(3);
+    assert!(
+        button(&h, "Create").accesskit_node().is_disabled(),
+        "the name is taken"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A composite mapping `group` to R.
+fn comp_of(id: u64, name: &str, group: &str) -> Composition {
+    let mut c = Composition::new(name);
+    c.id = id;
+    c.channels[0] = Some((group.into(), 1.0));
+    c
+}
+
+#[test]
+fn composites_rename_reorder_and_delete_with_undo() {
+    let root = temp_dir("window-comp-list");
+    let mut s = two_group_session(&root);
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[
+            comp_of(1, "A", "Ha"),
+            comp_of(2, "B", "OIII"),
+            comp_of(3, "C", "Ha"),
+        ],
+    );
+    let mut state = State::new(s, runner());
+    state.w.inspector_mut().reveal(COMPOSITES);
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(3);
+    let selected = |h: &Harness<'static, State>, name: &str| {
+        comp_row(h, name)
+            .accesskit_node()
+            .is_selected()
+            .unwrap_or(false)
+    };
+    // Clicking a row shows that composite, and opens its channel editor.
+    comp_row(&h, "B").click();
+    h.run_steps(3);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    assert!(selected(&h, "B"));
+    assert_eq!(h.get_all_by_role(Role::ComboBox).count(), 3, "R, G and B");
+    assert!(h.query_by_label("Weight").is_none());
+    // Reorder: B up. The order is saved, the view stays on B (its id).
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Move B up").click();
+    h.run_steps(3);
+    let order = |h: &Harness<'static, State>| -> Vec<String> {
+        saved_comps(h).into_iter().map(|c| c.1).collect()
+    };
+    assert_eq!(order(&h), ["B", "A", "C"]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    // Rename: the id, and so the view, stay.
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Rename B").click();
+    h.run_steps(3);
+    h.get_by_role(Role::TextInput).type_text("Blue");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(order(&h), ["Blue", "A", "C"]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    let key = h.state().w.view_key(&h.state().session.mosaic.config.ui);
+    assert_eq!(key.as_deref(), Some("comp:2"));
+    // A name another composite has is refused, with a toast.
+    hover_comp_row(&mut h, "A");
+    h.get_by_label("Rename A").click();
+    h.run_steps(3);
+    h.get_by_role(Role::TextInput).type_text("C");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(order(&h), ["Blue", "A", "C"]);
+    assert!(
+        !std::mem::take(&mut h.state_mut().toasts).is_empty(),
+        "the refusal is a toast"
+    );
+    // Channel editor (Blue is selected): G from Ha.
+    h.get_all_by_role(Role::ComboBox).nth(1).unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Ha").click();
+    h.run_steps(3);
+    assert_eq!(
+        saved_comps(&h).remove(0).2,
+        vec![some("OIII"), some("Ha"), None]
+    );
+    // Delete the highest id (C): a toast with Undo, and a new composite
+    // does not take C's id.
+    hover_comp_row(&mut h, "C");
+    h.get_by_label("Delete C").click();
+    h.run_steps(3);
+    assert_eq!(order(&h), ["Blue", "A"]);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(2)));
+    let toasts = std::mem::take(&mut h.state_mut().toasts);
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert_eq!(toasts[0].toast.title, "C deleted");
+    assert_eq!(toasts[0].toast.action.as_deref(), Some("Undo"));
+    let Some(undo @ Undo::CompositeDelete { .. }) = toasts.into_iter().next().and_then(|t| t.undo)
+    else {
+        panic!("a composite undo");
+    };
+    plus_chip(&h).expect("a + chip").click();
+    h.run_steps(3);
+    button(&h, "HOO").click();
+    h.run_steps(3);
+    let fresh = saved_comps(&h).pop().unwrap();
+    assert_eq!((fresh.0, fresh.1.as_str()), (4, "HOO"));
+    // Undo puts C back at its place with its id.
+    {
+        let st = h.state_mut();
+        st.w.undo(undo, &mut st.session, &mut st.jobs);
+    }
+    h.run_steps(3);
+    let all: Vec<(u64, String)> = saved_comps(&h).into_iter().map(|c| (c.0, c.1)).collect();
+    assert_eq!(
+        all,
+        [
+            (2, "Blue".into()),
+            (1, "A".into()),
+            (3, "C".into()),
+            (4, "HOO".into())
+        ]
+    );
+    // Delete the shown one: the first group shows.
+    h.state_mut().w.select_view(ViewKind::Composition(2));
+    h.run_steps(3);
+    hover_comp_row(&mut h, "Blue");
+    h.get_by_label("Delete Blue").click();
+    h.run_steps(3);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Group("Ha".into())));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_composite_with_a_missing_group_says_so() {
+    let root = temp_dir("window-comp-missing");
+    let mut s = two_group_session(&root);
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[comp_of(1, "Gone", "SII"), comp_of(2, "Fine", "Ha")],
+    );
+    let mut state = State::new(s, runner());
+    state.w.inspector_mut().reveal(COMPOSITES);
+    let mut h = harness(state);
+    step_until(&mut h, |st| st.w.view().is_some());
+    h.run_steps(3);
+    let detail = |h: &Harness<'static, State>, name: &str| {
+        comp_row(h, name)
+            .accesskit_node()
+            .description()
+            .unwrap_or_default()
+    };
+    assert_eq!(detail(&h, "Gone"), "missing group SII");
+    assert_eq!(detail(&h, "Fine"), "R Ha · G None · B None");
+    // The mapping is kept, and the editor shows the group as missing.
+    comp_row(&h, "Gone").click();
+    h.run_steps(3);
+    let r = h
+        .get_all_by_role(Role::ComboBox)
+        .next()
+        .expect("R's editor");
+    assert_eq!(r.accesskit_node().value().as_deref(), Some("SII (missing)"));
+    assert_eq!(saved_comps(&h)[0].2, vec![some("SII"), None, None]);
+    // The group comes back (named SII by hand): nothing is missing.
+    {
+        let st = h.state_mut();
+        for p in &mut st.session.mosaic.config.panels[6..] {
+            p.manual_group = Some("SII".into());
+        }
+        st.session.groups = st.session.mosaic.groups().ok();
+    }
+    h.run_steps(3);
+    assert_eq!(detail(&h, "Gone"), "R SII · G None · B None");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1177,10 +1468,8 @@ fn deleting_a_composite_keeps_the_view() {
     h.state_mut().w.inspector_mut().reveal("composites");
     h.run_steps(2);
     // A goes: B, shown, stays shown.
-    h.get_all_by_label("Delete composite")
-        .next()
-        .expect("A's delete")
-        .click();
+    hover_comp_row(&mut h, "A");
+    h.get_by_label("Delete A").click();
     h.run_steps(2);
     let st = h.state();
     let names: Vec<String> = load_compositions(&st.session.mosaic.config.ui)
@@ -1193,7 +1482,8 @@ fn deleting_a_composite_keeps_the_view() {
     assert_eq!(st.w.plan().view(), b.as_ref());
     assert_eq!(st.w.mosaic().view(), b.as_ref());
     // B goes too: the first group shows.
-    h.get_by_label("Delete composite").click();
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Delete B").click();
     h.run_steps(2);
     let ha = Some(ViewKind::Group("Ha".into()));
     assert_eq!(h.state().w.view(), ha.as_ref());
@@ -1285,10 +1575,8 @@ fn views_follow_a_composite_by_id_across_reorder_and_delete() {
     let key = h.state().w.view_key(&h.state().session.mosaic.config.ui);
     assert_eq!(key, Some(format!("comp:{b}")));
     // The editors now run C, B, A. C goes: B stays shown.
-    h.get_all_by_label("Delete composite")
-        .next()
-        .expect("C's delete")
-        .click();
+    hover_comp_row(&mut h, "C");
+    h.get_by_label("Delete C").click();
     h.run_steps(2);
     let names: Vec<String> = load_compositions(&h.state().session.mosaic.config.ui)
         .into_iter()
@@ -1298,10 +1586,8 @@ fn views_follow_a_composite_by_id_across_reorder_and_delete() {
     assert_eq!(h.state().w.view(), shown.as_ref());
     // B goes: the first group shows; A keeps its id.
     h.run_steps(2);
-    h.get_all_by_label("Delete composite")
-        .next()
-        .expect("B's delete")
-        .click();
+    hover_comp_row(&mut h, "B");
+    h.get_by_label("Delete B").click();
     h.run_steps(2);
     let ha = Some(ViewKind::Group("Ha".into()));
     assert_eq!(h.state().w.view(), ha.as_ref());

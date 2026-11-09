@@ -20,15 +20,18 @@
 
 use std::path::Path;
 
+use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
+use mega_ui::widgets::menu::submenu;
 use mega_ui::widgets::{ChipMark, ChoiceChip, Segment, choice_chip, segmented_with};
 use mmm_core::mosaic::{OutOfDateReason, out_of_date_reason};
 
 use super::shortcuts::{self, keyed, views_hint};
 use super::steps::{draft_changed, out_of_date};
 use super::{COMPOSITES, CanvasMode, MERGE_SETTINGS, SessionWindow, compositions_of};
+use crate::bands::{group_bands, presets_for};
 use crate::checks::ChecksEngine;
-use crate::compositions::{ViewKind, add_composition};
+use crate::compositions::{Channels, Composition, ViewKind, create_composition, unique_name};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::JobRunner;
 use crate::mosaic_view::{CanvasTag, view_members};
@@ -38,6 +41,7 @@ use crate::plan_view::{PlanFeed, group_members};
 use crate::preview_draw::{LayerSpec, PatchWant};
 use crate::previews::Side;
 use crate::session::OpenSession;
+use crate::stretch_panel::channel_name;
 use crate::tile_source::channel_tints;
 use crate::util::group_names;
 use mmm_core::stretch::StretchParams;
@@ -52,7 +56,8 @@ const ONE_CHANNEL: &str = "One channel: nothing to link";
 struct BarActions {
     mode: Option<CanvasMode>,
     view: Option<ViewKind>,
-    add_composite: bool,
+    /// **+** made this composite: its name and channels.
+    create: Option<(String, Channels)>,
     /// **Merge this group** was chosen on this group's chip.
     merge_group: Option<String>,
 }
@@ -172,8 +177,8 @@ impl SessionWindow {
         if let Some(g) = act.merge_group {
             self.merge_group(session, jobs, &g);
         }
-        if act.add_composite {
-            let id = add_composition(&mut session.mosaic.config.ui, &groups);
+        if let Some((name, channels)) = act.create {
+            let id = create_composition(&mut session.mosaic.config.ui, &name, channels);
             self.save.touch();
             self.select_view(ViewKind::Composition(id));
             self.inspector.reveal(COMPOSITES);
@@ -279,9 +284,8 @@ impl SessionWindow {
                 dashed: false,
                 mark: None,
             };
-            if chip(ui, plus).on_hover_text("New composite").clicked() {
-                act.add_composite = true;
-            }
+            let r = chip(ui, plus).on_hover_text("New composite");
+            plus_popover(&r, session, groups, act);
         }
         one_row_width(ui, &widths) + extra
     }
@@ -670,4 +674,99 @@ impl SessionWindow {
 fn one_row_width(ui: &egui::Ui, widths: &[f32]) -> f32 {
     let gaps = widths.len().saturating_sub(1) as f32;
     widths.iter().sum::<f32>() + gaps * ui.spacing().item_spacing.x
+}
+
+/// The Custom form's draft, kept in egui memory while the popover is open.
+#[derive(Clone, Default)]
+struct CustomForm {
+    name: String,
+    channels: [Option<String>; 3],
+}
+
+/// The popover of the **+** chip `plus`: the presets the groups allow (one
+/// click makes one), then the Custom form (a name and a group, or None, per
+/// channel, and **Create**). What it makes goes to `act`.
+fn plus_popover(
+    plus: &egui::Response,
+    session: &OpenSession,
+    groups: &[String],
+    act: &mut BarActions,
+) {
+    let list: Vec<Composition> = compositions_of(session);
+    let taken: Vec<String> = list.iter().map(|c| c.name.clone()).collect();
+    let bands = group_bands(session);
+    let presets = presets_for(&bands);
+    let key = plus.id.with("custom-form");
+    egui::Popup::menu(plus)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.label(text(Type::Small, "Presets"));
+            if presets.is_empty() {
+                ui.label(text(Type::Small, "None: no group is named for a band."));
+            }
+            for p in &presets {
+                let mapping = p.mapping(&bands);
+                let hint = mapping
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let g = m.as_ref().map_or("None", |(g, _)| g.as_str());
+                        format!("{} {g}", channel_name(i, 3))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if ui.button(p.label).on_hover_text(hint).clicked() {
+                    act.create = Some((unique_name(p.label, &taken), mapping));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(text(Type::Small, "Custom"));
+            let mut form: CustomForm = ui.data(|d| d.get_temp(key)).unwrap_or_default();
+            ui.horizontal(|ui| {
+                let label = ui.label("Name");
+                ui.text_edit_singleline(&mut form.name)
+                    .labelled_by(label.id);
+            });
+            for (i, slot) in form.channels.iter_mut().enumerate() {
+                // A submenu, not a combo box: egui keeps one popup open at a
+                // time, so a combo's would close this one.
+                let label = format!(
+                    "{}: {}",
+                    channel_name(i, 3),
+                    slot.as_deref().unwrap_or("None")
+                );
+                submenu(ui, &label, |ui| {
+                    if ui.selectable_label(slot.is_none(), "None").clicked() {
+                        *slot = None;
+                    }
+                    for g in groups {
+                        let picked = slot.as_deref() == Some(g.as_str());
+                        if ui.selectable_label(picked, g).clicked() {
+                            *slot = Some(g.clone());
+                        }
+                    }
+                });
+            }
+            let name = form.name.trim().to_string();
+            let why = if name.is_empty() {
+                Some("Give it a name.")
+            } else if taken.contains(&name) {
+                Some("Another composite has this name.")
+            } else if form.channels.iter().all(Option::is_none) {
+                Some("Map at least one channel.")
+            } else {
+                None
+            };
+            let create = ui
+                .add_enabled(why.is_none(), egui::Button::new("Create"))
+                .on_disabled_hover_text(why.unwrap_or_default());
+            if create.clicked() {
+                let channels = form.channels.clone().map(|g| g.map(|g| (g, 1.0)));
+                act.create = Some((name, channels));
+                form = CustomForm::default();
+                ui.close();
+            }
+            ui.data_mut(|d| d.insert_temp(key, form));
+        });
 }

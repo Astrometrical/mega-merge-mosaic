@@ -25,7 +25,7 @@ pub const VIEW_STATE_KEY: &str = "session_view";
 pub struct ViewState {
     /// Plan or mosaic.
     pub mode: CanvasMode,
-    /// The group (its name) or composite (`comp:<name>`) shown.
+    /// The group (its name) or composite (`comp:<id>`) shown.
     pub view: Option<String>,
     /// Where the canvas looks.
     pub camera: Option<Camera>,

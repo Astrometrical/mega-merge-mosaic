@@ -113,6 +113,7 @@ use crate::camera::Camera;
 use crate::checks::ChecksEngine;
 use crate::compositions::{
     Composition, ViewKind, composition_stretch_key, load_compositions, migrate_composition_ids,
+    restore_composition,
 };
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
@@ -173,6 +174,15 @@ pub enum Undo {
         /// The ROI as it was.
         roi: Roi,
     },
+    /// Put a deleted composite back at its index in the list (the end, if
+    /// it is shorter by now), shown. It keeps its id unless another
+    /// composite has it by now, and its name unless taken.
+    CompositeDelete {
+        /// Where it was.
+        index: usize,
+        /// The composite as it was.
+        composite: Composition,
+    },
 }
 
 /// A toast the window asks the shell to show.
@@ -198,6 +208,8 @@ pub struct SessionWindow {
     look: CanvasLook,
     /// Problems lists every check, notes and passed ones too.
     show_all_checks: bool,
+    /// The Composites list: the rename in progress.
+    composite_list: mega_ui::widgets::ordered_list::ListState,
     notes_mode: NotesMode,
     /// The plan's selected panel as last seen: a new one opens Panels, and
     /// one picked on the plan selects its row in the panel list.
@@ -264,6 +276,7 @@ impl SessionWindow {
             view: None,
             look: CanvasLook::default(),
             show_all_checks: false,
+            composite_list: Default::default(),
             notes_mode: NotesMode::default(),
             selected: None,
             bar_widths: None,
@@ -790,6 +803,11 @@ impl SessionWindow {
                 self.mosaic.edit_analysis(previous, session, jobs);
             }
             Undo::RoiDelete { index, roi } => self.mosaic.restore_roi(session, index, roi),
+            Undo::CompositeDelete { index, composite } => {
+                let id = restore_composition(&mut session.mosaic.config.ui, index, composite);
+                self.save.touch();
+                self.select_view(ViewKind::Composition(id));
+            }
         }
         self.save_panel_choices();
     }

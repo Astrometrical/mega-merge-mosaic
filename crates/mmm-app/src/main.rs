@@ -7,6 +7,7 @@
 //! checks launch the GUI.
 
 mod app;
+mod bands;
 mod blend_settings;
 mod camera;
 mod checks;

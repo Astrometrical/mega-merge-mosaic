@@ -135,10 +135,15 @@ pub fn build_hero(facts: &CardFacts) -> HeroData {
     let last = summary.and_then(|s| s.last_view.as_deref());
     let start = last
         .and_then(|l| {
-            // An earlier mmm named a composition's view by its name.
+            // An exact key wins over all; an earlier mmm named a
+            // composition's view by its name, so that match comes only
+            // when no key matched (a composite named "2" is not id 2).
             let legacy =
                 |k: &Keyed| k.key.starts_with("comp:") && l == format!("comp:{}", k.view.label);
-            keyed.iter().position(|k| k.key == l || legacy(k))
+            keyed
+                .iter()
+                .position(|k| k.key == l)
+                .or_else(|| keyed.iter().position(legacy))
         })
         .unwrap_or(0);
     HeroData {

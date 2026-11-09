@@ -13,6 +13,9 @@ use crate::stretch_panel::channel_name;
 /// Key in `MosaicConfig.ui` of the compositions list.
 pub const COMPOSITIONS_KEY: &str = "compositions";
 
+/// What the R, G and B channels show: a group and its weight, or nothing.
+pub type Channels = [Option<(String, f32)>; 3];
+
 /// A named mix of groups into the R, G and B channels.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Composition {
@@ -25,11 +28,12 @@ pub struct Composition {
     /// Shown name.
     pub name: String,
     /// Per output channel (R, G, B): the group shown and its weight.
-    pub channels: [Option<(String, f32)>; 3],
+    pub channels: Channels,
 }
 
 impl Composition {
-    /// An empty composition called `name`.
+    /// An empty composition called `name` (without an id).
+    #[cfg(test)]
     pub fn new(name: impl Into<String>) -> Self {
         Composition {
             id: 0,
@@ -141,95 +145,113 @@ pub fn composition_stretch_key(id: impl std::fmt::Display) -> String {
     format!("comp:{id}")
 }
 
-/// A name for a new composition that none of `taken` has:
-/// "Composite 1", "Composite 2", ….
-pub fn unique_composition_name(taken: &[String]) -> String {
-    (1..)
-        .map(|i| format!("Composite {i}"))
+/// Key in `MosaicConfig.ui` of the next composition id to hand out. Ids are
+/// never reused, so a new composition never inherits a deleted one's saved
+/// stretch or view (`comp:{id}`).
+pub const NEXT_ID_KEY: &str = "composition_next_id";
+
+/// The next id to hand out: the saved counter, or one past the highest id
+/// in `list` if that is more.
+fn next_id(ui: &Value, list: &[Composition]) -> u64 {
+    let counter = ui.get(NEXT_ID_KEY).and_then(Value::as_u64).unwrap_or(0);
+    counter.max(list.iter().map(|c| c.id).max().unwrap_or(0) + 1)
+}
+
+/// `base`, or "`base` 2", "`base` 3", … when `taken` has it: a name none of
+/// `taken` has.
+pub fn unique_name(base: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|t| t == base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|i| format!("{base} {i}"))
         .find(|n| !taken.contains(n))
         .unwrap_or_default()
 }
 
-/// Add a new composition to the compositions in `ui`, named by
-/// [`unique_composition_name`] and mapping the first of `groups` to R, G
-/// and B in turn (the last one repeated, HOO-like); returns its id. Not
-/// saved to disk (the caller rate-limits that).
-pub fn add_composition(ui: &mut Value, groups: &[String]) -> u64 {
+/// Add a composition called `name` mapping `channels` (weights as given)
+/// to the compositions in `ui`, with a new id; returns that id. The caller
+/// has made `name` unique ([`unique_name`]). Not saved to disk (the caller
+/// rate-limits that).
+pub fn create_composition(ui: &mut Value, name: &str, channels: [Option<(String, f32)>; 3]) -> u64 {
     let mut list = load_compositions(ui);
-    let taken: Vec<String> = list.iter().map(|c| c.name.clone()).collect();
-    let mut c = Composition::new(unique_composition_name(&taken));
-    c.id = list.iter().map(|o| o.id).max().unwrap_or(0) + 1;
-    if let Some(last) = groups.len().checked_sub(1) {
-        let pick = |i: usize| Some((groups[i.min(last)].clone(), 1.0));
-        c.channels = [pick(0), pick(1), pick(2)];
+    let id = next_id(ui, &list);
+    list.push(Composition {
+        id,
+        name: name.to_string(),
+        channels,
+    });
+    save_compositions(ui, &list);
+    id
+}
+
+/// Put `c`, deleted from `index`, back there (the end, if the list is
+/// shorter by now); returns its id. It keeps its id unless another
+/// composition has it by now, and its name unless taken: then it gets a
+/// fresh id ([`create_composition`]'s) or a [`unique_name`].
+pub fn restore_composition(ui: &mut Value, index: usize, mut c: Composition) -> u64 {
+    let mut list = load_compositions(ui);
+    if list.iter().any(|o| o.id == c.id) || c.id == 0 {
+        c.id = next_id(ui, &list);
     }
+    let taken: Vec<String> = list.iter().map(|o| o.name.clone()).collect();
+    c.name = unique_name(&c.name, &taken);
     let id = c.id;
-    list.push(c);
+    list.insert(index.min(list.len()), c);
     save_compositions(ui, &list);
     id
 }
 
 /// Store `c` as the compositions in `ui`, keeping everything else there (a
-/// `ui` that is not a JSON object becomes one).
+/// `ui` that is not a JSON object becomes one). The id counter
+/// ([`NEXT_ID_KEY`]) moves past the highest id, so deleting the last
+/// composition never frees its id.
 pub fn save_compositions(ui: &mut Value, c: &[Composition]) {
     if !ui.is_object() {
         *ui = Value::Object(Default::default());
     }
+    let next = next_id(ui, c);
     if let (Some(obj), Ok(v)) = (ui.as_object_mut(), serde_json::to_value(c)) {
         obj.insert(COMPOSITIONS_KEY.to_string(), v);
+        obj.insert(NEXT_ID_KEY.to_string(), Value::from(next));
     }
 }
 
-/// Editor of one composition (name, and a group and weight per channel);
-/// true if changed. `groups` are the groups to choose from; `others` are
-/// the names of the other compositions. The name is edited in a draft kept
-/// in egui memory and taken only when it is non-empty (trimmed) and none of
-/// `others`; otherwise the editor says why and the name stays as it was.
-pub fn composition_editor(
-    ui: &mut egui::Ui,
-    c: &mut Composition,
-    groups: &[String],
-    others: &[String],
-) -> bool {
-    let mut changed = false;
-    let id = ui.id().with("mmm-composition-name");
-    // (the name the draft was made for, the draft)
-    let mut draft: (String, String) = ui
-        .data(|d| d.get_temp(id))
-        .filter(|(for_name, _): &(String, String)| *for_name == c.name)
-        .unwrap_or_else(|| (c.name.clone(), c.name.clone()));
-    ui.horizontal(|ui| {
-        let label = ui.label(RichText::new("Name").color(palette::TEXT_BODY));
-        if ui
-            .text_edit_singleline(&mut draft.1)
-            .labelled_by(label.id)
-            .changed()
-        {
-            let name = draft.1.trim();
-            if !name.is_empty() && name != c.name && !others.iter().any(|o| o == name) {
-                c.name = name.to_string();
-                draft.0 = c.name.clone();
-                changed = true;
-            }
-        }
-    });
-    let name = draft.1.trim();
-    let problem = if name.is_empty() {
-        Some("A composite needs a name.")
-    } else if others.iter().any(|o| o == name) {
-        Some("Another composite has this name.")
-    } else {
-        None
-    };
-    if let Some(p) = problem {
-        ui.label(RichText::new(p).small().color(palette::HA_400));
+/// What a composition's row says under its name: "R {g} · G {g} · B {g}"
+/// ("None" for a channel without a group), or "missing group {g}" for the
+/// first mapped group that is not in `groups`.
+pub fn composition_detail(c: &Composition, groups: &[String]) -> String {
+    let mapped = c.channels.iter().flatten().map(|(g, _)| g);
+    if let Some(missing) = mapped.clone().find(|g| !groups.contains(g)) {
+        return format!("missing group {missing}");
     }
-    ui.data_mut(|d| d.insert_temp(id, draft));
+    c.channels
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let g = slot.as_ref().map_or("None", |(g, _)| g.as_str());
+            format!("{} {g}", channel_name(i, 3))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Editor of one composition's channels (a group, or "None", for each of
+/// R, G and B); true if changed. `groups` are the groups to choose from. A
+/// mapped group that is not among them is kept and shown as missing. The
+/// weights stay as they are (1) and are not shown.
+pub fn channel_editor(ui: &mut egui::Ui, c: &mut Composition, groups: &[String]) -> bool {
+    let mut changed = false;
     for (i, slot) in c.channels.iter_mut().enumerate() {
         ui.push_id(i, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(channel_name(i, 3)).color(palette::TEXT_BODY));
-                let current = slot.as_ref().map_or("None", |(g, _)| g.as_str());
+                let name = channel_name(i, 3);
+                let label = ui.label(RichText::new(name).color(palette::TEXT_BODY));
+                let current = match slot {
+                    None => "None".to_string(),
+                    Some((g, _)) if groups.contains(g) => g.clone(),
+                    Some((g, _)) => format!("{g} (missing)"),
+                };
                 egui::ComboBox::from_id_salt("group")
                     .selected_text(current)
                     .show_ui(ui, |ui| {
@@ -245,12 +267,9 @@ pub fn composition_editor(
                                 changed = true;
                             }
                         }
-                    });
-                if let Some((_, w)) = slot {
-                    changed |= ui
-                        .add(egui::Slider::new(w, 0.0..=2.0).text("Weight"))
-                        .changed();
-                }
+                    })
+                    .response
+                    .labelled_by(label.id);
             });
         });
     }
@@ -310,8 +329,6 @@ mod tests {
             "7",
             "a composition's stretch key never equals a group's"
         );
-        let taken = vec!["Composite 1".to_string(), "Composite 3".to_string()];
-        assert_eq!(unique_composition_name(&taken), "Composite 2");
     }
 
     #[test]
@@ -345,29 +362,78 @@ mod tests {
         assert_eq!(ui, before);
     }
 
-    #[test]
-    fn added_composition_maps_the_first_groups() {
-        let mut ui = serde_json::json!({ "other": 1 });
-        let groups = vec!["Ha".to_string(), "OIII".to_string()];
-        assert_eq!(add_composition(&mut ui, &groups), 1);
-        assert_eq!(add_composition(&mut ui, &[]), 2);
-        let list = load_compositions(&ui);
-        assert_eq!(list[0].name, "Composite 1");
-        let mapped: Vec<Option<&str>> = list[0]
-            .channels
-            .iter()
-            .map(|c| c.as_ref().map(|(g, _)| g.as_str()))
-            .collect();
-        assert_eq!(mapped, [Some("Ha"), Some("OIII"), Some("OIII")]);
-        assert_eq!(list[0].id, 1);
-        let mut second = Composition::new("Composite 2");
-        second.id = 2;
-        assert_eq!(list[1], second);
-        assert_eq!(ui["other"], 1);
+    fn channels_of(groups: [Option<&str>; 3]) -> [Option<(String, f32)>; 3] {
+        groups.map(|g| g.map(|g| (g.to_string(), 1.0)))
     }
 
     #[test]
-    fn composition_editor_edits_and_refuses_bad_names() {
+    fn created_compositions_map_their_channels_with_fresh_ids() {
+        let mut ui = serde_json::json!({ "other": 1 });
+        let hoo = channels_of([Some("Ha"), Some("OIII"), Some("OIII")]);
+        assert_eq!(create_composition(&mut ui, "HOO", hoo.clone()), 1);
+        assert_eq!(
+            create_composition(&mut ui, "Empty", channels_of([None, None, None])),
+            2
+        );
+        let list = load_compositions(&ui);
+        assert_eq!(list[0].name, "HOO");
+        assert_eq!(list[0].channels, hoo);
+        assert_eq!(list[0].id, 1);
+        assert_eq!(ui["other"], 1);
+        let taken = vec!["SHO".to_string(), "SHO 2".to_string()];
+        assert_eq!(unique_name("SHO", &taken), "SHO 3");
+        assert_eq!(unique_name("HOO", &taken), "HOO");
+    }
+
+    #[test]
+    fn ids_are_never_reused() {
+        let mut ui = serde_json::json!({});
+        for name in ["A", "B", "C"] {
+            create_composition(&mut ui, name, channels_of([Some("Ha"), None, None]));
+        }
+        // Delete the highest-id composition, as the list does.
+        let mut list = load_compositions(&ui);
+        let gone = list.pop().unwrap();
+        assert_eq!(gone.id, 3);
+        save_compositions(&mut ui, &list);
+        // A new one is not 3: it would inherit C's saved stretch and view.
+        let fresh = create_composition(&mut ui, "D", channels_of([None, None, None]));
+        assert_eq!(fresh, 4);
+        // Undo puts C back with its own id.
+        assert_eq!(restore_composition(&mut ui, 2, gone.clone()), 3);
+        let ids: Vec<u64> = load_compositions(&ui).iter().map(|c| c.id).collect();
+        assert_eq!(ids, [1, 2, 3, 4], "restored at index 2, D after");
+        // An id taken meanwhile means a fresh one (and a taken name another).
+        let mut taken = gone;
+        taken.id = 4;
+        taken.name = "D".into();
+        let id = restore_composition(&mut ui, 0, taken);
+        assert_eq!(id, 5);
+        let list = load_compositions(&ui);
+        assert_eq!(list[0].id, 5);
+        assert_eq!(list[0].name, "D 2");
+        // The counter also guards a list saved without it.
+        let mut old = serde_json::json!({ "compositions": [
+            { "id": 7, "name": "X", "channels": [null, null, null] }
+        ]});
+        assert_eq!(
+            create_composition(&mut old, "Y", channels_of([None, None, None])),
+            8
+        );
+    }
+
+    #[test]
+    fn details_name_the_groups_or_the_missing_one() {
+        let groups = vec!["Ha".to_string(), "OIII".to_string()];
+        let mut c = Composition::new("HOO");
+        c.channels = channels_of([Some("Ha"), Some("OIII"), None]);
+        assert_eq!(composition_detail(&c, &groups), "R Ha · G OIII · B None");
+        c.channels[2] = Some(("SII".into(), 1.0));
+        assert_eq!(composition_detail(&c, &groups), "missing group SII");
+    }
+
+    #[test]
+    fn channel_editor_edits_without_weights() {
         use egui_kittest::kittest::Queryable;
 
         struct State {
@@ -375,48 +441,22 @@ mod tests {
             changes: usize,
         }
         let groups = vec!["Ha".to_string(), "OIII".to_string()];
-        let others = vec!["SHO".to_string()];
+        let mut start = Composition::new("New");
+        start.channels[1] = Some(("Ha".into(), 0.5));
         let mut h = egui_kittest::Harness::builder()
             .with_size(egui::vec2(500.0, 400.0))
             .build_ui_state(
                 move |ui, s: &mut State| {
-                    if composition_editor(ui, &mut s.c, &groups, &others) {
+                    if channel_editor(ui, &mut s.c, &groups) {
                         s.changes += 1;
                     }
                 },
                 State {
-                    c: Composition::new("New"),
+                    c: start,
                     changes: 0,
                 },
             );
         h.run();
-        let name_field = |h: &mut egui_kittest::Harness<'_, State>| {
-            h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
-                .focus();
-            h.step();
-            h.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
-            h.step();
-        };
-        // A unique name is taken.
-        name_field(&mut h);
-        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
-            .type_text("HOO");
-        h.run();
-        assert_eq!(h.state().c.name, "HOO");
-        // Another composition's name is refused, with a reason.
-        name_field(&mut h);
-        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Name")
-            .type_text("SHO");
-        h.run();
-        assert_eq!(h.state().c.name, "HOO");
-        h.get_by_label("Another composite has this name.");
-        // An empty name too.
-        name_field(&mut h);
-        h.key_press(egui::Key::Backspace);
-        h.run();
-        assert_eq!(h.state().c.name, "HOO");
-        h.get_by_label("A composite needs a name.");
-
         // A group picked for R gets weight 1.
         h.get_all_by_role(egui::accesskit::Role::ComboBox)
             .next()
@@ -426,8 +466,9 @@ mod tests {
         h.get_by_label("OIII").click();
         h.run();
         assert_eq!(h.state().c.channels[0], Some(("OIII".to_string(), 1.0)));
-        assert!(h.state().c.channels[1].is_none());
-        assert!(h.query_all_by_label("Weight").next().is_some());
-        assert!(h.state().changes >= 2);
+        // G's weight is kept, not edited; and no weight control exists.
+        assert_eq!(h.state().c.channels[1], Some(("Ha".to_string(), 0.5)));
+        assert!(h.query_all_by_label("Weight").next().is_none());
+        assert_eq!(h.state().changes, 1);
     }
 }

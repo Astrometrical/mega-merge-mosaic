@@ -217,6 +217,40 @@ fn composition_view_is_found_by_id() {
 }
 
 #[test]
+fn an_id_key_beats_a_legacy_name_match() {
+    let root = temp_dir("hero-comp-legacy");
+    let dir = merged_session(&root, Some("comp:2"));
+    // A composite named "2" has id 1; the one saved view names is id 2.
+    let named_two = Composition {
+        name: "2".into(),
+        ..hoo()
+    };
+    let by_id = Composition {
+        id: 2,
+        name: "Other".into(),
+        ..hoo()
+    };
+    save_comps(&dir, &[named_two, by_id]);
+    let hero = build_hero(&facts_of(&dir));
+    assert_eq!(
+        labels(&hero),
+        ["Ha · 4 panels", "OIII · 4 panels", "2", "Other"]
+    );
+    assert_eq!(hero.start, 3, "comp:2 is the id, not the name");
+    // With no key matching, the legacy name still finds its composite.
+    let dir2 = merged_session(&temp_dir("hero-comp-legacy2"), Some("comp:2"));
+    save_comps(
+        &dir2,
+        &[Composition {
+            name: "2".into(),
+            ..hoo()
+        }],
+    );
+    assert_eq!(build_hero(&facts_of(&dir2)).start, 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn planned_session_renders_previews() {
     let root = temp_dir("hero-planned");
     let s = two_group_session(&root);
