@@ -21,10 +21,14 @@
 //!   entry whose cached key differs starts ([`Wanted::priority`]: the group
 //!   in view first, then the ROI nearest the centre of the view). At most
 //!   one preview is in flight, and nothing is queued behind it.
-//! - **Delivery** ([`Previews::poll`]): a finished patch goes into the cache
-//!   only if it was not cancelled and its key is still the one wanted; a
-//!   late result for an old key is dropped. A failed preview is logged (no
-//!   toast) and not tried again with the same key.
+//! - **Delivery** ([`Previews::poll`], with what is wanted this frame,
+//!   before scheduling): a finished patch goes into the cache only if it
+//!   was not cancelled and its key is wanted now; a late result for an old
+//!   key is dropped, even one that ended as its key went stale. A failed
+//!   preview is logged (no toast) and not tried again with the same key.
+//! - **Stopping** ([`Previews::stop`], on leaving the session): the preview
+//!   in flight is cancelled and the worker thread's handle handed over, so
+//!   the session's lock is kept until it has ended.
 //! - **ROIs moved or deleted** ([`Previews::keep_rois`],
 //!   [`Previews::forget_roi`]): their running preview is cancelled and their
 //!   patches dropped, so a stale patch never shows.
@@ -36,6 +40,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
 
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{
@@ -164,17 +169,23 @@ struct Outcome {
 struct Worker {
     tx: Sender<Request>,
     rx: Receiver<Outcome>,
+    /// The thread: it ends once `tx` is dropped and its preview has ended.
+    handle: JoinHandle<()>,
 }
 
 impl Worker {
     /// The "mmm-preview" thread: runs each request in turn and sends its
     /// outcome back, repainting the UI. It ends when the sender is dropped.
-    fn spawn() -> Option<Self> {
+    fn spawn(#[cfg(test)] probe: Arc<tests::Probe>) -> Option<Self> {
         let (tx, requests) = mpsc::channel::<Request>();
         let (done, rx) = mpsc::channel::<Outcome>();
+        #[cfg(test)]
+        probe.alive.store(true, std::sync::atomic::Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name("mmm-preview".into())
             .spawn(move || {
+                #[cfg(test)]
+                let _alive = tests::Alive(probe.clone());
                 for req in requests {
                     let run = || {
                         #[cfg(test)]
@@ -188,11 +199,13 @@ impl Worker {
                             Err(mmm_core::Error::compute("the preview failed (see the log)"))
                         });
                     let _ = done.send(Outcome { id: req.id, result });
+                    #[cfg(test)]
+                    probe.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     req.ctx.request_repaint();
                 }
             });
         match spawned {
-            Ok(_) => Some(Worker { tx, rx }),
+            Ok(handle) => Some(Worker { tx, rx, handle }),
             Err(e) => {
                 tracing::warn!("cannot start the preview thread: {e}");
                 None
@@ -225,6 +238,9 @@ pub struct Previews {
     /// What the scheduler did, in order (tests).
     #[cfg(test)]
     log: Vec<Logged>,
+    /// What the worker thread did (tests).
+    #[cfg(test)]
+    probe: Arc<tests::Probe>,
 }
 
 impl Default for Previews {
@@ -260,6 +276,8 @@ impl Previews {
             gate: None,
             #[cfg(test)]
             log: Vec::new(),
+            #[cfg(test)]
+            probe: Arc::default(),
         }
     }
 
@@ -304,10 +322,13 @@ impl Previews {
     }
 
     /// Take the outcome of the preview in flight, if it has ended: its
-    /// patch goes into the cache unless it was cancelled or its key is no
-    /// longer the one wanted (dropped). Call every frame before
-    /// [`Previews::schedule`].
-    pub fn poll(&mut self) {
+    /// patch goes into the cache unless it was cancelled or its key is not
+    /// in `wanted` (dropped). Call every frame with what the window wants
+    /// now, after [`Previews::keep_rois`] and before [`Previews::schedule`]
+    /// (given the same list): a result that ends as its key goes stale (the
+    /// settings changed, an analysis started) is never cached as current.
+    pub fn poll(&mut self, wanted: &[Wanted]) {
+        self.wanted = wanted.to_vec();
         let Some(worker) = &self.worker else { return };
         let mut outcomes = Vec::new();
         let mut lost = false;
@@ -402,6 +423,20 @@ impl Previews {
         }
     }
 
+    /// End the previews (leaving the session): the one in flight is
+    /// cancelled and the worker thread let go of; it ends once that preview
+    /// has (a decode in progress is not interrupted). Its handle, if there
+    /// is one, for the caller to wait for: nothing may read or write the
+    /// session's files once its lock is released. A later
+    /// [`Previews::schedule`] would start a new thread.
+    pub fn stop(&mut self) -> Option<JoinHandle<()>> {
+        if let Some(job) = self.running.take() {
+            job.token.cancel();
+            note!(self, Logged::Cancelled(job.roi, job.group));
+        }
+        self.worker.take().map(|w| w.handle)
+    }
+
     /// ROI `roi` was deleted: its running preview is cancelled and its
     /// patches dropped.
     pub fn forget_roi(&mut self, roi: u64) {
@@ -451,7 +486,10 @@ impl Previews {
     /// Hand `w`'s preview (planned as `plan`) to the worker.
     fn start(&mut self, ctx: &egui::Context, w: Wanted, plan: PreviewPlan) {
         if self.worker.is_none() {
-            self.worker = Worker::spawn();
+            self.worker = Worker::spawn(
+                #[cfg(test)]
+                self.probe.clone(),
+            );
         }
         let Some(worker) = &self.worker else {
             self.fail(w.roi, w.group, w.key);
@@ -558,6 +596,7 @@ pub(crate) enum Logged {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
@@ -567,6 +606,27 @@ pub(crate) mod tests {
     pub(crate) struct Gate {
         open: Mutex<bool>,
         cv: Condvar,
+        /// A cancel does not let the preview go (like a decode, which
+        /// nothing interrupts).
+        through_cancel: bool,
+    }
+
+    /// What the worker thread did.
+    #[derive(Default)]
+    pub(crate) struct Probe {
+        /// The thread is running.
+        pub(crate) alive: AtomicBool,
+        /// Outcomes it has sent.
+        pub(crate) sent: AtomicUsize,
+    }
+
+    /// Clears [`Probe::alive`] when the worker thread ends, however.
+    pub(super) struct Alive(pub(super) Arc<Probe>);
+
+    impl Drop for Alive {
+        fn drop(&mut self) {
+            self.0.alive.store(false, Ordering::SeqCst);
+        }
     }
 
     impl Gate {
@@ -581,7 +641,7 @@ pub(crate) mod tests {
         pub(super) fn wait(&self, token: &CancelToken) {
             let deadline = Instant::now() + crate::testutil::PATIENCE;
             let mut open = self.open.lock().unwrap();
-            while !*open && !token.is_cancelled() {
+            while !*open && (self.through_cancel || !token.is_cancelled()) {
                 assert!(Instant::now() < deadline, "preview gate never opened");
                 open = self
                     .cv
@@ -596,12 +656,28 @@ pub(crate) mod tests {
         /// Hold every preview started from now on until the gate returned
         /// opens (or the preview is cancelled).
         pub(crate) fn hold(&mut self) -> Arc<Gate> {
+            self.hold_with(false)
+        }
+
+        /// [`Previews::hold`], but a cancel does not let a held preview go:
+        /// only the gate opening does.
+        pub(crate) fn hold_through_cancel(&mut self) -> Arc<Gate> {
+            self.hold_with(true)
+        }
+
+        fn hold_with(&mut self, through_cancel: bool) -> Arc<Gate> {
             let gate = Arc::new(Gate {
                 open: Mutex::new(false),
                 cv: Condvar::new(),
+                through_cancel,
             });
             self.gate = Some(gate.clone());
             gate
+        }
+
+        /// What the worker thread did (shared with it).
+        pub(crate) fn probe(&self) -> Arc<Probe> {
+            self.probe.clone()
         }
 
         /// What the scheduler did, in order.

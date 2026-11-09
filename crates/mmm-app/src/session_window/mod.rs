@@ -422,6 +422,25 @@ impl SessionWindow {
         self.mosaic.track_analysis(id);
     }
 
+    /// End the ROIs' previews, leaving the session ([`Previews::stop`]):
+    /// the thread of the one cancelled, if any, for the caller to wait for
+    /// before the session's lock is released.
+    pub fn stop_previews(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.previews.stop()
+    }
+
+    /// The ROIs' previews (tests).
+    #[cfg(test)]
+    pub(crate) fn previews(&self) -> &Previews {
+        &self.previews
+    }
+
+    /// The ROIs' previews, to hold them (tests).
+    #[cfg(test)]
+    pub(crate) fn previews_mut(&mut self) -> &mut Previews {
+        &mut self.previews
+    }
+
     /// The panel list (tests).
     #[cfg(test)]
     pub(crate) fn panel_list(&self) -> &PanelList {
@@ -546,15 +565,15 @@ impl SessionWindow {
         self.save_if_due(ctx, session);
     }
 
-    /// The ROIs' transient previews, every frame: take a finished one,
-    /// follow the ROIs (one moved or deleted drops its previews), schedule
-    /// what is wanted now ([`SessionWindow::wanted_previews`]) and hand each
-    /// ROI's state, for the groups in view, to the list and the canvas
-    /// labels.
+    /// The ROIs' transient previews, every frame: follow the ROIs (one
+    /// moved or deleted drops its previews), work out what is wanted now
+    /// ([`SessionWindow::wanted_previews`]), take a finished preview only if
+    /// it is still wanted, schedule, and hand each ROI's state, for the
+    /// groups in view, to the list and the canvas labels.
     fn follow_previews(&mut self, ctx: &egui::Context, session: &OpenSession, jobs: &JobRunner) {
-        self.previews.poll();
         self.previews.keep_rois(self.mosaic.rois());
         let wanted = self.wanted_previews(session, jobs);
+        self.previews.poll(&wanted);
         self.previews.schedule(ctx, session, &wanted);
         let groups = self.mosaic.members();
         let states = self

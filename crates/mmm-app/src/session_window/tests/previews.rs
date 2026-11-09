@@ -2,6 +2,7 @@
 //! ROI's area merged by itself, in memory, with the draft, through the
 //! preview runner's deterministic gate.
 
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::SystemTime;
 
 use mmm_core::mosaic::{CONFIG_FILE, analysis_stamp, result_store_paths};
@@ -24,6 +25,16 @@ fn shown(
     rois: &[(u64, &str, [u64; 4])],
     prepare: impl FnOnce(&mut State),
 ) -> (PathBuf, Harness<'static, State>, Arc<Gate>) {
+    shown_on(tag, rois, CanvasMode::Mosaic, prepare)
+}
+
+/// [`shown`] on the canvas `mode` (drawn, with the plan's panels placed).
+fn shown_on(
+    tag: &str,
+    rois: &[(u64, &str, [u64; 4])],
+    mode: CanvasMode,
+    prepare: impl FnOnce(&mut State),
+) -> (PathBuf, Harness<'static, State>, Arc<Gate>) {
     let (root, mut s, jobs) = merged(tag);
     let rois: Vec<Roi> = rois
         .iter()
@@ -38,10 +49,14 @@ fn shown(
     save_rois(&mut s.mosaic.config.ui, &rois);
     let mut state = State::new(s, jobs);
     state.w.inspector_mut().reveal(ROIS);
+    state.w.set_mode(mode);
     let gate = state.w.previews.hold();
     prepare(&mut state);
     let mut h = harness(state);
-    step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some());
+    match mode {
+        CanvasMode::Mosaic => step_to(&mut h, |st| st.w.mosaic().viewer_frame().is_some()),
+        CanvasMode::Plan => step_to(&mut h, plan_placed),
+    }
     (root, h, gate)
 }
 
@@ -107,6 +122,25 @@ fn wanted(st: &State, group: &str, rect: [u64; 4]) -> PreviewKey {
         rect,
         settings: draft_for(cfg, group),
         analysis: analysis_stamp(cfg, group).expect("analysed"),
+    }
+}
+
+/// How many outcomes `(roi, group)`'s previews ended dropped with.
+fn dropped(st: &State, roi: u64, group: &str) -> usize {
+    log(st)
+        .iter()
+        .filter(|e| **e == Logged::Dropped(roi, group.into()))
+        .count()
+}
+
+/// Wait, with no frame (so nothing takes it), until the preview thread
+/// has sent `n` outcomes in all.
+fn until_sent(h: &Harness<'static, State>, n: usize) {
+    let probe = h.state().w.previews.probe();
+    let deadline = Instant::now() + PATIENCE;
+    while probe.sent.load(AtomicOrdering::SeqCst) < n {
+        assert!(Instant::now() < deadline, "the preview never ended");
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -488,5 +522,167 @@ fn row_states_follow_previews() {
     show_hoo(h.state_mut());
     h.run_steps(3);
     assert!(row_detail(&h, "Core").ends_with("out of date"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_result_landing_as_its_key_goes_stale_is_dropped() {
+    let (root, mut h, gate) = shown("previews-same-frame", &[CORE], |_| {});
+    step_to(&mut h, |st| started(st).len() == 1);
+    // The preview ends and its result waits in the channel; in the very
+    // frame that takes it, the settings change: it is dropped, never cached
+    // as current, and the new settings' preview starts.
+    let next = h.state_mut().w.previews.hold();
+    gate.open();
+    until_sent(&h, 1);
+    let feather = draft_feather(h.state());
+    set_draft_feather(&mut h.state_mut().session, feather + 20.0);
+    h.step();
+    assert_eq!(delivered(h.state(), 7, "Ha"), 0, "{:?}", log(h.state()));
+    assert_eq!(dropped(h.state(), 7, "Ha"), 1);
+    assert_eq!(h.state().w.previews.cached_key(7, "Ha"), None);
+    assert_eq!(started(h.state()).len(), 2);
+    assert_eq!(
+        last_started_key(h.state()).settings.feather_px,
+        feather + 20.0
+    );
+    // The same when an analysis starts in that frame: dropped, and nothing
+    // starts while it runs.
+    let last = h.state_mut().w.previews.hold();
+    next.open();
+    until_sent(&h, 2);
+    let analysis = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        let id = st.jobs.start_analyze(&mut st.session);
+        st.w.track_analysis(id);
+    }
+    h.step();
+    assert_eq!(delivered(h.state(), 7, "Ha"), 0, "{:?}", log(h.state()));
+    assert_eq!(dropped(h.state(), 7, "Ha"), 2);
+    assert_eq!(h.state().w.previews.cached_key(7, "Ha"), None);
+    assert_eq!(started(h.state()).len(), 2);
+    assert_one_at_a_time(&log(h.state()));
+    analysis.open();
+    last.open();
+    step_to(&mut h, |st| !st.jobs.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn previews_wait_for_invalid_settings_waiting_edits_and_the_roi_sync() {
+    let (root, mut h, gate) = shown("previews-blocked", &[CORE], |_| {});
+    gate.open();
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 1);
+    let feather = draft_feather(h.state());
+    // Invalid typed settings: nothing merges until they are valid again.
+    h.state_mut().w.mosaic.force_feather_error();
+    set_draft_feather(&mut h.state_mut().session, feather + 10.0);
+    h.run_steps(10);
+    assert_eq!(started(h.state()).len(), 1, "{:?}", log(h.state()));
+    h.state_mut().w.mosaic.clear_feather_error();
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 2);
+    // The ROIs not reprojected for the current frame yet: nothing wanted.
+    {
+        let st = h.state_mut();
+        st.w.mosaic.want_roi_sync();
+        assert!(!st.w.mosaic().rois_synced());
+        assert!(st.w.wanted_previews(&st.session, &st.jobs).is_empty());
+    }
+    step_to(&mut h, |st| st.w.mosaic().rois_synced());
+    let st = h.state();
+    assert_eq!(st.w.wanted_previews(&st.session, &st.jobs).len(), 1);
+    // A merge running (held) does not stop previews...
+    let merge = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.jobs.start_blend(&mut st.session, "OIII", None);
+    }
+    step_to(&mut h, |st| st.jobs.busy());
+    set_draft_feather(&mut h.state_mut().session, feather + 20.0);
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 3);
+    // ...but a panel edit waiting for it does: nothing merges meanwhile.
+    {
+        let st = h.state_mut();
+        let edit = crate::panel_edits::PanelsEdit::of(&st.session);
+        st.w.panel_list_mut()
+            .submit_edit(edit, &mut st.session, &mut st.jobs);
+    }
+    h.run_steps(2);
+    assert!(h.state().w.panels_editing());
+    set_draft_feather(&mut h.state_mut().session, feather + 30.0);
+    h.run_steps(10);
+    assert_eq!(started(h.state()).len(), 3, "{:?}", log(h.state()));
+    assert!(row_detail(&h, "Core").ends_with("out of date"));
+    merge.open();
+    step_to(&mut h, |st| !st.w.panels_editing() && !st.jobs.busy());
+    // The edit changed nothing: the preview merges once it has applied.
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 4);
+    // An analysis settings edit waiting for a merge: nothing merges
+    // meanwhile, nor after (the groups then need a new analysis).
+    let merge = h.state_mut().jobs.hold();
+    {
+        let st = h.state_mut();
+        st.jobs.start_blend(&mut st.session, "OIII", None);
+    }
+    step_to(&mut h, |st| st.jobs.busy());
+    {
+        let st = h.state_mut();
+        let mut a = st.session.mosaic.config.analyze.clone();
+        a.gain = mmm_core::photometry::GainMode::Unity;
+        assert_eq!(
+            st.w.mosaic.edit_analysis(a, &mut st.session, &mut st.jobs),
+            None
+        );
+    }
+    assert!(h.state().w.has_waiting_edits());
+    set_draft_feather(&mut h.state_mut().session, feather + 40.0);
+    h.run_steps(10);
+    assert_eq!(started(h.state()).len(), 4, "{:?}", log(h.state()));
+    merge.open();
+    step_to(&mut h, |st| !st.w.has_waiting_edits() && !st.jobs.busy());
+    h.run_steps(10);
+    assert_eq!(started(h.state()).len(), 4, "{:?}", log(h.state()));
+    assert!(row_detail(&h, "Core").ends_with("out of date"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn previews_run_on_the_plan_and_wait_while_its_frame_differs() {
+    // The plan shown, zoomed in on Halo: Core is off screen there.
+    let (root, mut h, gate) = shown_on("previews-plan", &[CORE, HALO], CanvasMode::Plan, |st| {
+        let c = Camera {
+            centre: (32.0, 32.0),
+            zoom: mega_ui::viewer::MAX_ZOOM,
+        };
+        st.w.plan.set_camera(c);
+        st.w.mosaic.set_camera(c);
+    });
+    gate.open();
+    step_to(&mut h, |st| delivered(st, 9, "Ha") == 1);
+    h.run_steps(10);
+    assert_eq!(started(h.state()), [(9, "Ha".to_string())]);
+    assert_eq!(h.state().w.mode(), CanvasMode::Plan);
+    assert!(
+        h.state().w.mosaic().viewer_frame().is_none(),
+        "the plan's view"
+    );
+    step_until_row(&mut h, "Halo", "up to date");
+    assert!(row_detail(&h, "Core").ends_with("out of date"));
+    // A canvas-changing edit: the plan draws in another frame than the
+    // analysed one until the analysis catches up, and shows no ROIs: none
+    // merges, even one brought into view.
+    let analysed = h.state().session.frame.clone();
+    h.state_mut().session.frame = Some(mmm_core::reference::ReferenceFrame::Aligned {
+        width: 7,
+        height: 9,
+        wcs: None,
+    });
+    h.state_mut().w.frame(CORE.2);
+    h.run_steps(10);
+    assert_eq!(started(h.state()).len(), 1, "{:?}", log(h.state()));
+    // The frames agree again: Core, now in view, merges.
+    h.state_mut().session.frame = analysed;
+    step_to(&mut h, |st| delivered(st, 7, "Ha") == 1);
     let _ = std::fs::remove_dir_all(&root);
 }

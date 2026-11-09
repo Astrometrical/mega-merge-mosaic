@@ -265,6 +265,12 @@ impl SettingsPanel {
         self.feather_error = Some("Feather must be a number of pixels greater than 0.".into());
     }
 
+    /// Take back [`SettingsPanel::force_feather_error`] (tests).
+    #[cfg(test)]
+    pub fn clear_feather_error(&mut self) {
+        self.feather_error = None;
+    }
+
     /// Why merging is blocked by what is typed, if it is (an invalid
     /// feather width).
     pub fn input_error(&self) -> Option<&'static str> {

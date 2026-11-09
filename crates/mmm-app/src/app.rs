@@ -228,24 +228,35 @@ impl Shell {
     /// forgotten; the start screen reads the session's facts again; the
     /// title names no session.
     ///
-    /// With every job stopped, the summary is written on this thread and
-    /// the lock released at once. A job that ignores the wait (a decode
-    /// cannot be interrupted) is let go of without hanging the window: a
-    /// reaper thread keeps the session's lock until the job's worker has
-    /// ended, then writes the summary and releases the lock (the start
-    /// screen shows the session open in another window meanwhile, and
-    /// reads it again after). An edit that was waiting for the jobs is then
-    /// dropped (logged). Either way nothing writes into the session once
-    /// its lock is released. Without a session open, nothing to do.
+    /// The ROI previews stop with the jobs: the one in flight is cancelled
+    /// and its thread ([`SessionWindow::stop_previews`]) gets the same
+    /// wait as the jobs.
+    ///
+    /// With every job and the preview thread stopped, the summary is
+    /// written on this thread and the lock released at once. A job or a
+    /// preview that ignores the wait (a decode cannot be interrupted) is let
+    /// go of without hanging the window: a reaper thread keeps the session's
+    /// lock until its thread has ended, then writes the summary and releases
+    /// the lock (the start screen shows the session open in another window
+    /// meanwhile, and reads it again after). An edit that was waiting for
+    /// the jobs is then dropped (logged) if a job did not stop. Either way
+    /// nothing writes into the session (its decoded-panel cache included)
+    /// once its lock is released. Without a session open, nothing to do.
     pub fn close_session(&mut self, ctx: &egui::Context) -> Result<(), String> {
         let Some(session) = &mut self.session else {
             return Ok(());
         };
+        if let Some(why) = self
+            .jobs
+            .as_ref()
+            .and_then(SessionWindow::back_block_reason)
+        {
+            return Err(why.to_string());
+        }
+        let deadline = Instant::now() + self.stop_wait;
+        let previews = self.window.stop_previews();
         let mut stopped = true;
         if let Some(jobs) = &mut self.jobs {
-            if let Some(why) = SessionWindow::back_block_reason(jobs) {
-                return Err(why.to_string());
-            }
             let (events, done) = jobs.stop_all(session, self.stop_wait);
             stopped = done;
             for event in &events {
@@ -256,9 +267,18 @@ impl Shell {
                 self.summary.on_job_event(event, target, unix_now());
             }
         }
+        // The preview thread gets what is left of the same wait.
+        let previews = previews.and_then(|worker| join_by(worker, deadline));
+        if previews.is_some() {
+            tracing::warn!(
+                "an ROI preview did not stop within {:?} of leaving the session; the session \
+                 stays locked until it has",
+                self.stop_wait
+            );
+        }
         // With a job still running, waiting edits stay unapplied.
         self.flush_pending_saves();
-        let leftover = match &mut self.jobs {
+        let mut leftover = match &mut self.jobs {
             Some(jobs) if !stopped => {
                 tracing::warn!(
                     "a job did not stop within {:?} of leaving the session; the session \
@@ -274,6 +294,7 @@ impl Shell {
             }
             _ => Vec::new(),
         };
+        leftover.extend(previews);
         let Some(mut session) = self.session.take() else {
             return Ok(());
         };
@@ -554,7 +575,21 @@ impl Shell {
     }
 }
 
-/// Keep a session left while its jobs' `workers` still run locked until
+/// `worker` joined once it has ended (`None`), or still running at
+/// `deadline` (`Some`: the caller waits for it elsewhere).
+fn join_by(worker: JoinHandle<()>, deadline: Instant) -> Option<JoinHandle<()>> {
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            return Some(worker);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = worker.join();
+    None
+}
+
+/// Keep a session left while `workers` (its jobs' workers, its ROI
+/// previews' thread) still run locked until
 /// they have ended: on a thread of its own, join them, run the summary's
 /// last write, release `lock`, then send `dir` to `reaped` and repaint
 /// `ctx`. Nothing of the session's is written after the lock is released.
@@ -1823,6 +1858,76 @@ mod tests {
         h.get_by_label("Resume session").click();
         step_until(&mut h, |s| s.session().is_some());
         assert_eq!(h.state().session().unwrap().mosaic.dir, dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A merged two-group session in a temporary root with ROI "Core" in
+    /// view, closed: its root and its directory.
+    fn merged_with_an_roi(tag: &str) -> (PathBuf, PathBuf) {
+        let (root, mut s, mut jobs) = crate::jobs::tests::analyzed(tag);
+        jobs.start_blend(&mut s, "Ha", None);
+        let _ = crate::jobs::tests::drain(&mut jobs, &mut s);
+        let core = crate::rois::Roi {
+            id: 7,
+            name: "Core".into(),
+            note: String::new(),
+            sky: None,
+            canvas: [100, 100, 200, 160],
+        };
+        crate::rois::save_rois(&mut s.mosaic.config.ui, &[core]);
+        s.mosaic.save().unwrap();
+        let dir = s.mosaic.dir.clone();
+        drop((s, jobs));
+        (root, dir)
+    }
+
+    /// Whether the session window has started a preview of an ROI.
+    fn previewing(s: &Shell) -> bool {
+        s.window
+            .previews()
+            .log()
+            .iter()
+            .any(|e| matches!(e, crate::previews::Logged::Started(..)))
+    }
+
+    #[test]
+    fn leaving_a_session_ends_its_preview_before_the_lock_goes() {
+        use mmm_core::mosaic::lock_session;
+        use std::sync::atomic::Ordering::SeqCst;
+        let (root, dir) = merged_with_an_roi("shell-back-preview");
+        // A preview a cancel cannot stop (like a decode, which nothing
+        // interrupts) outlives the wait: leaving does not hang, and the
+        // session stays locked until the preview's thread has ended.
+        let (mut h, jobs) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        jobs.open();
+        h.state_mut().stop_wait = Duration::from_millis(50);
+        let gate = h.state_mut().window.previews_mut().hold_through_cancel();
+        let probe = h.state().window.previews().probe();
+        step_until(&mut h, previewing);
+        let ctx = h.ctx.clone();
+        assert_eq!(h.state_mut().close_session(&ctx), Ok(()));
+        assert!(h.state().session().is_none(), "left without waiting");
+        assert!(probe.alive.load(SeqCst), "the preview still runs");
+        assert!(lock_session(&dir).is_err(), "locked while the preview runs");
+        gate.open();
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        while lock_session(&dir).is_err() {
+            assert!(Instant::now() < deadline, "the lock is never released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!probe.alive.load(SeqCst), "released once the preview ended");
+        // A preview that stops when cancelled has ended by the time leaving
+        // returns, and the lock goes at once.
+        let (mut h, jobs) = harness_open(&dir, Arc::new(RecordingLauncher::default()));
+        jobs.open();
+        let gate = h.state_mut().window.previews_mut().hold();
+        let probe = h.state().window.previews().probe();
+        step_until(&mut h, previewing);
+        let ctx = h.ctx.clone();
+        assert_eq!(h.state_mut().close_session(&ctx), Ok(()));
+        assert!(!probe.alive.load(SeqCst), "the preview ended first");
+        drop(lock_session(&dir).expect("the session's lock is released"));
+        gate.open();
         let _ = std::fs::remove_dir_all(&root);
     }
 

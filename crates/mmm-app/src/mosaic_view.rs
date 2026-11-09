@@ -932,6 +932,19 @@ impl MosaicView {
         self.settings.force_feather_error();
     }
 
+    /// Take back [`MosaicView::force_feather_error`] (tests).
+    #[cfg(test)]
+    pub fn clear_feather_error(&mut self) {
+        self.settings.clear_feather_error();
+    }
+
+    /// Ask for the ROIs to be reprojected, as an analysis ending does
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn want_roi_sync(&mut self) {
+        self.rois.want_sync = true;
+    }
+
     /// Whether the merge settings draft changed since the last call
     /// ([`SettingsPanel::take_draft_changed`]).
     pub fn take_draft_changed(&mut self) -> bool {
