@@ -3,6 +3,7 @@
 pub mod button;
 pub mod canvas_label;
 pub mod chip;
+pub mod dialog;
 pub mod menu;
 pub mod notes;
 pub mod ordered_list;
@@ -18,6 +19,7 @@ pub mod toast;
 pub use button::{ButtonKind, MegaButton, focus_ring, icon_button, icon_button_of};
 pub use canvas_label::{CanvasLabel, LabelControl, LabelResponse, canvas_label};
 pub use chip::{CHIP_MAX_WIDTH, ChipMark, ChoiceChip, chip, choice_chip};
+pub use dialog::{Dialog, DialogResponse, dialog_frame, footer};
 pub use menu::submenu;
 pub use notes::{NOTES_LINES, NotesMode, NotesResponse, notes_view};
 pub use ordered_list::{ListEvent, ListRow, ListState, ordered_list, ordered_list_with};
@@ -41,3 +43,7 @@ mod input_tests;
 #[cfg(test)]
 #[path = "ordered_list_tests.rs"]
 mod ordered_list_tests;
+
+#[cfg(test)]
+#[path = "dialog_tests.rs"]
+mod dialog_tests;
