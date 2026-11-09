@@ -900,3 +900,41 @@ fn use_a_clears_an_invalid_feather() {
     gate.open();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn an_roi_just_above_the_canvas_bottom_keeps_its_label_reachable() {
+    let (root, mut h, gate) = up_to_date("compare-near-bottom");
+    gate.open();
+    h.get_by_label("Compare Core").click();
+    h.run_steps(2);
+    assert!(compare(h.state()).is_some());
+    // Core's top edge a few points above the canvas's bottom.
+    let rect = frame(&h);
+    let cam = h.state().w.mosaic().camera().unwrap();
+    let below = f64::from(rect.bottom() - 5.0 - rect.center().y) / cam.zoom;
+    let c = Camera {
+        centre: (cam.centre.0, 100.0 - below),
+        zoom: cam.zoom,
+    };
+    h.state_mut().w.mosaic.set_camera(c);
+    h.run_steps(3);
+    let top = screen(rect, c, (150.0, 100.0)).y;
+    assert!(
+        top < rect.bottom() && top > rect.bottom() - 10.0,
+        "{top} in {rect:?}"
+    );
+    // The label is lifted inside the canvas: Done is there, and works.
+    for name in [
+        "Show A of Core",
+        "Show B of Core",
+        "Use A for Core",
+        "Done comparing Core",
+    ] {
+        let r = h.get_by_label(name).rect();
+        assert!(rect.contains_rect(r), "{name} {r:?} in {rect:?}");
+    }
+    h.get_by_label("Done comparing Core").click();
+    h.run_steps(2);
+    assert!(compare(h.state()).is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}

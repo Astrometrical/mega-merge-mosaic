@@ -393,3 +393,45 @@ fn nothing_is_held_while_the_window_has_no_focus() {
     h.step();
     release(&mut h, b);
 }
+
+#[test]
+fn a_label_near_the_clips_bottom_is_lifted_inside_it() {
+    let mut h = harness(true);
+    h.run_steps(3);
+    let controls = [
+        "Show A of Core",
+        "Show B of Core",
+        "Use A for Core",
+        "Done comparing Core",
+    ];
+    let text = "B · feather 40 px · flatten 2";
+    let inside = |h: &Harness<'_, State>| {
+        let screen = Rect::from_min_size(Pos2::ZERO, SCREEN);
+        controls.iter().all(|c| screen.contains_rect(rect_of(h, c)))
+            && painted(h, text).is_some_and(|t| screen.contains_rect(t))
+            && painted(h, "Core").is_some_and(|t| screen.contains_rect(t))
+    };
+    // Its corner a few points above the bottom: lifted, all of it inside.
+    h.state_mut().corner = Pos2::new(CORNER.x, SCREEN.y - 5.0);
+    h.run_steps(2);
+    assert!(inside(&h), "{:?}", rect_of(&h, "Done comparing Core"));
+    let done = rect_of(&h, "Done comparing Core");
+    // It still works there.
+    h.get_by_label("Done comparing Core").click();
+    h.step();
+    assert_eq!(last(&h).clicked, Some((2, 0)));
+    // Something to avoid there too: fitting inside the clip wins.
+    h.state_mut().avoid = Some(Rect::from_min_max(
+        Pos2::new(0.0, SCREEN.y - 120.0),
+        Pos2::new(SCREEN.x, SCREEN.y - 60.0),
+    ));
+    h.state_mut().corner = Pos2::new(CORNER.x, SCREEN.y - 110.0);
+    h.run_steps(2);
+    assert!(inside(&h), "{:?}", rect_of(&h, "Done comparing Core"));
+    // Well clear of the bottom: where it was put, not lifted.
+    h.state_mut().avoid = None;
+    h.state_mut().corner = CORNER;
+    h.run_steps(2);
+    assert_eq!(painted(&h, "Core").unwrap().min, CORNER + LABEL_OFFSET);
+    assert!(rect_of(&h, "Done comparing Core").top() < done.top());
+}

@@ -9,9 +9,11 @@
 //!   ([`LABEL_OFFSET`]), on a translucent panel so it reads over any image.
 //!   Draw it after the canvas, so it is on top, and pass the canvas's
 //!   viewport as its clip: nothing outside is drawn or sensed. A label that
-//!   would run past the clip's right edge slides left to fit, and one that
+//!   would run past the clip's right edge slides left to fit, one that
 //!   would cover what it must keep clear of ([`CanvasLabel::avoid`], e.g.
-//!   the canvas's own buttons) goes below it.
+//!   the canvas's own buttons) goes below it, and one that would run past
+//!   the clip's bottom is lifted inside it (that wins over avoiding; its
+//!   top never goes above the clip's).
 //! - **Presses.** The label takes the presses that land on it: the canvas
 //!   beneath neither pans nor clicks there. Each frame it reports the
 //!   control clicked and the control the primary button is held down on
@@ -204,7 +206,9 @@ pub fn canvas_label(
     if let Some((at, g)) = &text {
         bounds = bounds.union(Rect::from_min_size(*at, g.size()));
     }
-    // Into the clip sideways, then clear of what to avoid (below it).
+    // Into the clip sideways, then clear of what to avoid (below it), then
+    // lifted above the clip's bottom (which wins over avoiding), its top
+    // never above the clip's.
     let mut shift = Vec2::ZERO;
     let laid = bounds.expand2(LABEL_OFFSET);
     if laid.right() > clip.right() {
@@ -214,6 +218,10 @@ pub fn canvas_label(
         && avoid.intersects(laid.translate(shift))
     {
         shift.y = avoid.bottom() + space::XS - laid.top();
+    }
+    let lift = clip.bottom() - laid.bottom();
+    if shift.y > lift {
+        shift.y = lift.max(clip.top() - laid.top());
     }
     let name_rect = name_rect.translate(shift);
     let bounds = bounds.translate(shift);
