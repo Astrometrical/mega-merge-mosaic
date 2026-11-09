@@ -1,7 +1,7 @@
 //! What the session window shows, saved with the session so reopening it
 //! looks the same (spec §15): plan or mosaic, the group or composite, the
 //! camera, the inspector's fold and open sections, whether the panel list
-//! is open, and the Outlines and ROIs toggles. Kept in `MosaicConfig.ui`
+//! is open, and the Outlines, Seams and ROIs toggles. Kept in `MosaicConfig.ui`
 //! under [`VIEW_STATE_KEY`]; the display stretch toggles keep their own key
 //! ([`crate::display_stretch::DISPLAY_STRETCH_KEY`]).
 //!
@@ -37,12 +37,16 @@ pub struct ViewState {
     pub panel_list_open: bool,
     /// The panels' outlines (and numbers) show.
     pub outlines: bool,
+    /// The seams show (off in a view saved before the toggle existed).
+    #[serde(default)]
+    pub seams: bool,
     /// The ROIs show.
     pub rois: bool,
 }
 
 impl Default for ViewState {
-    /// A new window's view: the plan, Problems open, Outlines and ROIs on.
+    /// A new window's view: the plan, Problems open, Outlines and ROIs on,
+    /// Seams off.
     fn default() -> Self {
         ViewState {
             mode: CanvasMode::Plan,
@@ -52,6 +56,7 @@ impl Default for ViewState {
             inspector_open: vec![PROBLEMS.to_string()],
             panel_list_open: false,
             outlines: true,
+            seams: false,
             rois: true,
         }
     }
@@ -114,6 +119,7 @@ mod tests {
             inspector_open: vec!["notes".into(), "rois".into()],
             panel_list_open: true,
             outlines: false,
+            seams: true,
             rois: false,
         }
     }
@@ -149,6 +155,7 @@ mod tests {
         assert_eq!(some.inspector_open, ["problems"]);
         assert!(!some.panel_list_open);
         assert!(some.outlines && some.rois);
+        assert!(!some.seams, "a view saved before Seams: off");
         // A camera that could not be looked through is dropped.
         let mut ui = json!({});
         let mut s = state();

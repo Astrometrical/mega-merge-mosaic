@@ -56,3 +56,20 @@ pub const KEN_BURNS_ZOOM: f64 = 1.08;
 pub const DIALOG_WIDTH: f32 = 520.0;
 /// Alpha of the black backdrop behind a modal dialog.
 pub const DIALOG_BACKDROP_ALPHA: u8 = 150;
+
+/// Height of a canvas badge (icon and count), in points: constant on
+/// screen however far the canvas is zoomed.
+pub const BADGE_HEIGHT: f32 = 22.0;
+/// Horizontal padding inside a canvas badge, in points.
+pub const BADGE_PAD: f32 = 7.0;
+/// Width of a polyline drawn over a canvas (a seam, say), in points.
+pub const LINE_WIDTH: f32 = 2.0;
+/// Width of a polyline that needs attention (a seam flagged as showing),
+/// in points: thicker than [`LINE_WIDTH`], so its colour is not the only
+/// signal.
+pub const LINE_WIDTH_STRONG: f32 = 3.5;
+/// Dash and gap lengths of a dashed polyline, in points.
+pub const LINE_DASH: (f32, f32) = (8.0, 5.0);
+
+/// Width of a hairline outline (a hovered row's border), in points.
+pub const HAIRLINE_WIDTH: f32 = 1.0;

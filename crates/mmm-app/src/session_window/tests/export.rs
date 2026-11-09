@@ -710,7 +710,7 @@ fn esc_closes_only_the_dialog() {
     {
         let w = &mut h.state_mut().w;
         w.plan.select(Some(panel.clone()));
-        w.selected = Some(panel.clone());
+        w.selection = Some(Selected::Panel(panel.clone()));
     }
     h.run_steps(2);
     open_dialog(&mut h);

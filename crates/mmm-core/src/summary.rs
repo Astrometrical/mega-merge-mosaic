@@ -5,7 +5,9 @@
 //! pixels, and the per-channel detail energy — the RMS of `(pixel − cell
 //! mean)` over the covered pixels, which flags star/structure cells for the
 //! seam optimizer. This single artifact drives overlap detection, photometric
-//! fitting, distance/feather maps, seam placement, and downsampled previews.
+//! fitting, distance/feather maps, seam placement, downsampled previews, and
+//! the panel quality statistics (noise, gradient, edge raggedness:
+//! [`panel_stats`]).
 //!
 //! On-disk format v2 (`panels/<id>/summary.bin`, all little-endian):
 //! magic `MMM9`, then `w8`, `h8`, `channels` as `u32`, then the coverage plane
@@ -15,6 +17,7 @@
 
 use std::path::Path;
 
+use crate::diag::median;
 use crate::{Error, Result};
 
 /// Canvas pixels per summary cell along each axis.
@@ -162,6 +165,237 @@ impl L8Summary {
     }
 }
 
+/// Coverage at or below which a cell counts as empty for the edge measure
+/// ([`PanelStats::ragged`]): a stray pixel or two is not part of the panel.
+pub const PARTIAL_MIN: f32 = 0.05;
+
+/// Coverage below which a cell counts as only partly covered for the edge
+/// measure ([`PanelStats::ragged`]); from [`PARTIAL_MIN`] up to this.
+pub const PARTIAL_MAX: f32 = 0.95;
+
+/// One panel's quality statistics, measured on its L8 summary at analysis
+/// time by [`panel_stats`] and kept in [`crate::session::PanelMeta`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PanelStats {
+    /// Per-channel background noise: the median in-cell RMS over the
+    /// background cells. `None` when unmeasured: no fully covered cell, or
+    /// a channel with no usable (finite) cell.
+    pub noise: Option<Vec<f64>>,
+    /// Background gradient strength: the largest, over the channels, of the
+    /// fitted background plane's rise across the bbox over that channel's
+    /// noise. `None` when no channel has positive noise and a well-posed
+    /// fit.
+    pub gradient: Option<f64>,
+    /// Per-channel rise of the fitted background plane across the bbox, in
+    /// data units (0 for a channel whose plane cannot be fitted). Present
+    /// exactly when `noise` is.
+    pub gradient_rise: Option<Vec<f64>>,
+    /// Per-channel background (sky) level: the median of the background
+    /// cells' means. Present exactly when `noise` is.
+    pub background: Option<Vec<f64>>,
+    /// Edge raggedness: the share of the inner rim's cells only partly
+    /// covered, 0 to 1. `None` when the panel has no inner rim.
+    pub ragged: Option<f64>,
+}
+
+/// Least-squares plane `z ≈ α + β·x + γ·y` over `(x, y, z)` samples;
+/// `(β, γ)`, or `None` with fewer than three samples or when they lie on
+/// a line.
+fn plane_slopes(samples: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let n = samples.len() as f64;
+    let (mx, my, mz) = samples
+        .iter()
+        .fold((0.0, 0.0, 0.0), |(a, b, c), &(x, y, z)| {
+            (a + x / n, b + y / n, c + z / n)
+        });
+    let (mut sxx, mut syy, mut sxy, mut sxz, mut syz) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(x, y, z) in samples {
+        let (dx, dy, dz) = (x - mx, y - my, z - mz);
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+        sxz += dx * dz;
+        syz += dy * dz;
+    }
+    let det = sxx * syy - sxy * sxy;
+    // det ≥ 0 (Cauchy–Schwarz); it vanishes exactly when the cells are
+    // collinear, so allow for rounding relative to its scale.
+    if det.is_nan() || det <= 1e-9 * sxx * syy {
+        return None;
+    }
+    Some(((sxz * syy - syz * sxy) / det, (syz * sxx - sxz * sxy) / det))
+}
+
+/// The edge measure over the cell window `[x0, x1) × [y0, y1)` (the bbox's
+/// cells; every cell outside it is empty). See [`panel_stats`].
+fn rim_raggedness(s: &L8Summary, x0: usize, x1: usize, y0: usize, y1: usize) -> Option<f64> {
+    let (w, h) = (x1 - x0, y1 - y0);
+    let w8 = s.w8 as usize;
+    let cov = |x: usize, y: usize| s.coverage[(y0 + y) * w8 + x0 + x];
+    let touched: Vec<bool> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| cov(x, y) > PARTIAL_MIN)
+        .collect();
+    // Whether any 8-neighbour of (x, y) satisfies `f` (off the window is
+    // passed as None).
+    let any_neighbour = |x: usize, y: usize, f: &dyn Fn(Option<usize>) -> bool| {
+        (-1isize..=1).any(|dy| {
+            (-1isize..=1).any(|dx| {
+                if dx == 0 && dy == 0 {
+                    return false;
+                }
+                let (nx, ny) = (x as isize + dx, y as isize + dy);
+                let inside = nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h;
+                f(inside.then(|| ny as usize * w + nx as usize))
+            })
+        })
+    };
+    // The outermost layer: touched cells with an untouched neighbour.
+    let mut outer = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            outer[y * w + x] =
+                touched[y * w + x] && any_neighbour(x, y, &|j| !j.is_some_and(|j| touched[j]));
+        }
+    }
+    // The inner rim: touched cells next to the outermost layer.
+    let (mut rim, mut partial) = (0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if touched[i] && !outer[i] && any_neighbour(x, y, &|j| j.is_some_and(|j| outer[j])) {
+                rim += 1;
+                if cov(x, y) < PARTIAL_MAX {
+                    partial += 1;
+                }
+            }
+        }
+    }
+    (rim > 0).then(|| partial as f64 / rim as f64)
+}
+
+/// Measure a panel's quality statistics on its L8 summary, over the cells
+/// of its content `bbox` (canvas px, exclusive: [`crate::session::PanelMeta::bbox`])
+/// only — never the whole canvas. Analysis calls it on the summary it has
+/// just built, so it costs no extra read.
+///
+/// Per channel, over the bbox's fully covered cells (coverage 1):
+/// - **Background cells** are those whose mean is at or below the median
+///   of those cells' means: the darker half, which leaves out stars and
+///   bright structure.
+/// - **Noise** is the median, over the background cells, of the in-cell RMS
+///   (`detail`). In a background cell that RMS is the pixel noise measured
+///   on its 64 pixels, so the median is a robust per-pixel noise estimate
+///   that stars and structure cannot drag up.
+/// - **Gradient**: a least-squares plane `mean ≈ α + β·x + γ·y` is fitted to
+///   the background cells (cell centres in canvas px). Its rise across the
+///   bbox (its max − min over it) is `|β|·width + |γ|·height`; over the
+///   channel's noise that is the channel's gradient amplitude. The panel's
+///   gradient is the largest amplitude over the channels with positive
+///   noise and a well-posed fit.
+/// - **Background level** is the median of the background cells' means
+///   (the sky the gradient is judged against), and **gradient rise** the
+///   plane's rise in data units (0 where no plane fits).
+/// - Cells with a non-finite mean or RMS (NaN pixels) are left out. A
+///   channel left with no usable cell leaves the panel's noise, gradient,
+///   rise and level unmeasured (`None`), so it cannot drag a group median.
+///
+/// **Raggedness** looks at the cells the panel touches (coverage above
+/// [`PARTIAL_MIN`]). The outermost layer is the touched cells with an
+/// untouched 8-neighbour; the inner rim is the touched cells next to the
+/// outermost layer but not on it. Raggedness is the share of the inner rim
+/// that is only partly covered (coverage below [`PARTIAL_MAX`]). A clean
+/// edge, straight at any angle, keeps its partly covered cells in the
+/// outermost layer (the neighbour diagonally outward of each lies wholly
+/// outside), so its inner rim is fully covered and reads 0; a ragged
+/// stacking edge, whose coverage thins out over several cells, leaves
+/// partial cells further in. The limit of the measure: an edge made of
+/// long straight steps (a union of dithered frames) reads as clean, since
+/// each step's partial cells border empty ones.
+pub fn panel_stats(summary: &L8Summary, bbox: [u64; 4]) -> PanelStats {
+    let block = BLOCK as u64;
+    let (w8, h8) = (summary.w8 as usize, summary.h8 as usize);
+    let x0 = (bbox[0] / block) as usize;
+    let y0 = (bbox[1] / block) as usize;
+    let x1 = (bbox[2].div_ceil(block) as usize).min(w8);
+    let y1 = (bbox[3].div_ceil(block) as usize).min(h8);
+    if x1 <= x0 || y1 <= y0 {
+        return PanelStats::default();
+    }
+    let cells = w8 * h8;
+    let full: Vec<usize> = (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| y * w8 + x))
+        .filter(|&i| summary.coverage[i] >= 1.0)
+        .collect();
+
+    let mut stats = PanelStats {
+        ragged: rim_raggedness(summary, x0, x1, y0, y1),
+        ..PanelStats::default()
+    };
+    if full.is_empty() {
+        return stats;
+    }
+    let (bw, bh) = ((bbox[2] - bbox[0]) as f64, (bbox[3] - bbox[1]) as f64);
+    let centre = |i: usize| {
+        (
+            ((i % w8) as f64 + 0.5) * BLOCK as f64,
+            ((i / w8) as f64 + 0.5) * BLOCK as f64,
+        )
+    };
+    let channels = summary.channels as usize;
+    let (mut noise, mut rise, mut level) = (
+        Vec::with_capacity(channels),
+        Vec::with_capacity(channels),
+        Vec::with_capacity(channels),
+    );
+    let mut gradient: Option<f64> = None;
+    for c in 0..channels {
+        let mean = &summary.mean[c * cells..(c + 1) * cells];
+        let detail = &summary.detail[c * cells..(c + 1) * cells];
+        // Non-finite pixels (NaN in an input) poison a cell: skip it.
+        let usable: Vec<usize> = full
+            .iter()
+            .copied()
+            .filter(|&i| mean[i].is_finite() && detail[i].is_finite())
+            .collect();
+        if usable.is_empty() {
+            // Unmeasurable channel: the panel's pixel statistics stay None.
+            return stats;
+        }
+        let mid = median(usable.iter().map(|&i| mean[i] as f64).collect());
+        let background: Vec<usize> = usable
+            .into_iter()
+            .filter(|&i| mean[i] as f64 <= mid)
+            .collect();
+        let n = median(background.iter().map(|&i| detail[i] as f64).collect());
+        level.push(median(background.iter().map(|&i| mean[i] as f64).collect()));
+        noise.push(n);
+        let samples: Vec<(f64, f64, f64)> = background
+            .iter()
+            .map(|&i| {
+                let (x, y) = centre(i);
+                (x, y, mean[i] as f64)
+            })
+            .collect();
+        let fitted = plane_slopes(&samples)
+            .map(|(bx, by)| bx.abs() * bw + by.abs() * bh)
+            .filter(|r| r.is_finite());
+        rise.push(fitted.unwrap_or(0.0));
+        if let (Some(r), true) = (fitted, n > 0.0) {
+            let amp = r / n;
+            gradient = Some(gradient.map_or(amp, |g| g.max(amp)));
+        }
+    }
+    stats.noise = Some(noise);
+    stats.gradient = gradient;
+    stats.gradient_rise = Some(rise);
+    stats.background = Some(level);
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +444,208 @@ mod tests {
         assert!(L8Summary::read(&trunc).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A summary whose coverage is the share of each cell's 64 pixel centres
+    /// inside `inside`, on a `w8`×`h8` grid, with flat means; and the
+    /// covered pixels' bbox.
+    fn covering(w8: u32, h8: u32, inside: impl Fn(f64, f64) -> bool) -> (L8Summary, [u64; 4]) {
+        let mut s = L8Summary::zeroed(w8, h8, 1);
+        let mut bbox = [u64::MAX, u64::MAX, 0, 0];
+        for y8 in 0..h8 {
+            for x8 in 0..w8 {
+                let mut n = 0;
+                for py in 0..BLOCK {
+                    for px in 0..BLOCK {
+                        let (x, y) = (x8 * BLOCK + px, y8 * BLOCK + py);
+                        if inside(x as f64 + 0.5, y as f64 + 0.5) {
+                            n += 1;
+                            bbox = [
+                                bbox[0].min(x as u64),
+                                bbox[1].min(y as u64),
+                                bbox[2].max(x as u64 + 1),
+                                bbox[3].max(y as u64 + 1),
+                            ];
+                        }
+                    }
+                }
+                let i = (y8 * w8 + x8) as usize;
+                s.coverage[i] = n as f32 / 64.0;
+                if n > 0 {
+                    s.mean[i] = 0.1;
+                }
+            }
+        }
+        (s, bbox)
+    }
+
+    /// A clean edge, straight at any angle, keeps its partly covered cells
+    /// in the outermost layer, so a rotated rectangle never reads as ragged.
+    /// A fuzzy edge (coverage thinning out over several cells) does.
+    #[test]
+    fn clean_edges_at_any_angle_are_not_ragged() {
+        for deg in [0.0f64, 1.0, 3.0, 10.0, 22.5, 30.0, 44.0, 45.0] {
+            let (sin, cos) = deg.to_radians().sin_cos();
+            let (cx, cy) = (200.0, 200.0);
+            let (s, bbox) = covering(50, 50, |x, y| {
+                let (dx, dy) = (x - cx, y - cy);
+                let (u, v) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+                u.abs() < 131.3 && v.abs() < 97.7
+            });
+            assert_eq!(panel_stats(&s, bbox).ragged, Some(0.0), "{deg} degrees");
+        }
+        // Coverage fading over four cells all round.
+        let (mut s, bbox) = covering(40, 40, |x, y| {
+            (24.0..296.0).contains(&x) && (24.0..296.0).contains(&y)
+        });
+        for y8 in 3..37u32 {
+            for x8 in 3..37u32 {
+                let depth = x8.min(y8).min(39 - x8).min(39 - y8) - 3;
+                if depth < 4 {
+                    s.coverage[(y8 * 40 + x8) as usize] = 0.2 + 0.15 * depth as f32;
+                }
+            }
+        }
+        let r = panel_stats(&s, bbox).ragged.unwrap();
+        assert!(r > 0.9, "fuzzy edges read {r}");
+    }
+
+    /// The definitions on exact values: noise is the background cells' median
+    /// RMS (bright star cells change nothing), the gradient the background
+    /// plane's rise across the bbox over that noise, per channel, the
+    /// largest kept; a NaN cell is ignored.
+    #[test]
+    fn statistics_follow_their_definitions() {
+        let (w8, h8) = (20u32, 10u32);
+        let cells = (w8 * h8) as usize;
+        let mut s = L8Summary::zeroed(w8, h8, 2);
+        s.coverage.fill(1.0);
+        for y8 in 0..h8 {
+            for x8 in 0..w8 {
+                let i = (y8 * w8 + x8) as usize;
+                let x = (x8 as f32 + 0.5) * 8.0;
+                // Channel 0 rises 1e-4 per px in x; channel 1 is flat.
+                s.mean[i] = 0.1 + 1.0e-4 * x;
+                s.detail[i] = 0.002;
+                s.mean[cells + i] = 0.2;
+                s.detail[cells + i] = 0.004;
+            }
+        }
+        // Stars: bright, high-RMS cells (above the median, so not background).
+        for i in [25usize, 77, 140] {
+            s.mean[i] += 1.0;
+            s.detail[i] = 0.5;
+            s.mean[cells + i] += 1.0;
+            s.detail[cells + i] = 0.5;
+        }
+        s.mean[3] = f32::NAN;
+        let st = panel_stats(&s, [0, 0, 160, 80]);
+        let n = st.noise.unwrap();
+        assert!(
+            (n[0] - 0.002).abs() < 1e-9 && (n[1] - 0.004).abs() < 1e-9,
+            "{n:?}"
+        );
+        // Rise 1e-4 × 160 px over 0.002; channel 1's flat plane reads 0.
+        let g = st.gradient.unwrap();
+        assert!((g - 8.0).abs() < 1e-3, "{g}");
+        // The rise per channel, in data units.
+        let rise = st.gradient_rise.unwrap();
+        assert!(
+            (rise[0] - 0.016).abs() < 1e-6 && rise[1].abs() < 1e-9,
+            "{rise:?}"
+        );
+        // The background level: the median of the background cells' means.
+        // The background is columns 0..=10 (at or below the median, col 10),
+        // less the star and NaN cells: its median lies in column 5 (x 44).
+        let level = st.background.unwrap();
+        assert!(
+            (level[0] - 0.1044).abs() < 1e-6 && (level[1] - 0.2).abs() < 1e-6,
+            "{level:?}"
+        );
+        // Fully covered to the canvas edge: the inner rim is all covered.
+        assert_eq!(st.ragged, Some(0.0));
+    }
+
+    /// A channel with no usable cell (every fully covered cell NaN) leaves
+    /// the panel's pixel statistics unmeasured, rather than reading a noise
+    /// of 0 that would drag its group's median; the edge measure, from
+    /// coverage alone, still stands.
+    #[test]
+    fn an_unusable_channel_leaves_the_panel_unmeasured() {
+        let mut s = L8Summary::zeroed(10, 10, 2);
+        s.coverage.fill(1.0);
+        s.mean[..100].fill(0.1);
+        s.detail[..100].fill(0.002);
+        s.mean[100..].fill(f32::NAN);
+        let st = panel_stats(&s, [0, 0, 80, 80]);
+        assert_eq!(st.noise, None);
+        assert_eq!(st.gradient, None);
+        assert_eq!(st.gradient_rise, None);
+        assert_eq!(st.background, None);
+        assert_eq!(st.ragged, Some(0.0));
+    }
+
+    /// A panel too small for a plane or an inner rim: one covered cell, or
+    /// one row of cells. Its noise is still measured.
+    #[test]
+    fn thin_and_single_cell_panels() {
+        let mut one = L8Summary::zeroed(6, 6, 1);
+        one.coverage[14] = 1.0;
+        one.mean[14] = 0.1;
+        one.detail[14] = 0.002;
+        let st = panel_stats(&one, [16, 16, 24, 24]);
+        assert!((st.noise.unwrap()[0] - 0.002).abs() < 1e-9);
+        assert_eq!((st.gradient, st.ragged), (None, None));
+
+        let mut row = L8Summary::zeroed(12, 3, 1);
+        for x8 in 0..12usize {
+            let i = 12 + x8;
+            row.coverage[i] = 1.0;
+            row.mean[i] = 0.1 + 0.01 * x8 as f32;
+            row.detail[i] = 0.002;
+        }
+        let st = panel_stats(&row, [0, 8, 96, 16]);
+        assert!(st.noise.is_some());
+        assert_eq!(st.gradient, None, "collinear cells: no plane");
+        assert_eq!(st.ragged, None, "every cell is on the outermost layer");
+    }
+
+    /// The edge measure's limitation, pinned down: a union of dithered
+    /// frames is a staircase of long straight steps, whose partly covered
+    /// cells each border empty ones, so it reads as clean. Only coverage
+    /// that thins out over several cells reads as ragged.
+    #[test]
+    fn a_dithered_union_edge_reads_clean() {
+        // Twelve 200 x 150 px frames dithered up to ±20 px.
+        let offsets: [(f64, f64); 12] = [
+            (0.0, 0.0),
+            (13.0, -7.0),
+            (-19.0, 4.0),
+            (6.0, 18.0),
+            (-11.0, -16.0),
+            (17.0, 9.0),
+            (-4.0, -20.0),
+            (20.0, -2.0),
+            (-15.0, 13.0),
+            (9.0, -12.0),
+            (-7.0, 19.0),
+            (2.0, 6.0),
+        ];
+        let (s, bbox) = covering(48, 40, |x, y| {
+            offsets.iter().any(|&(dx, dy)| {
+                (80.0 + dx..280.0 + dx).contains(&x) && (80.0 + dy..230.0 + dy).contains(&y)
+            })
+        });
+        // Every partly covered cell borders an empty one: exactly 0, far
+        // below RAGGED_FRACTION.
+        assert_eq!(panel_stats(&s, bbox).ragged, Some(0.0));
+    }
+
+    /// No coverage, no statistics.
+    #[test]
+    fn an_empty_panel_has_no_statistics() {
+        let s = L8Summary::zeroed(4, 4, 3);
+        assert_eq!(panel_stats(&s, [0, 0, 0, 0]), PanelStats::default());
     }
 
     #[test]

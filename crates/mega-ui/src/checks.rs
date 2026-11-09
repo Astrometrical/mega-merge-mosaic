@@ -1,14 +1,17 @@
 //! Checks list: problems and notes as tinted rows with a severity icon
-//! and bar, passed checks collapsed into one expandable summary row.
+//! and bar, passed checks collapsed into one expandable summary row. A
+//! row can lead somewhere (it is then a button: [`CheckAction::Open`]); in
+//! [`ListMode::All`] the list is grouped into Problems, Notes and Passed
+//! and an accepted problem can be taken back ([`CheckAction::Unaccept`]).
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Sense,
-    TextStyle, Ui, Vec2, collapsing_header::CollapsingState,
+    Align2, Color32, CornerRadius, Frame, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    TextStyle, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, collapsing_header::CollapsingState,
 };
 
 use crate::icons;
 use crate::theme::palette;
-use crate::theme::tokens::{CONTROL_HEIGHT, radius, space};
+use crate::theme::tokens::{CONTROL_HEIGHT, HAIRLINE_WIDTH, radius, space};
 use crate::theme::{Severity, Tone};
 use crate::widgets::{ButtonKind, MegaButton};
 
@@ -30,6 +33,10 @@ pub struct CheckItem {
     pub accepted: bool,
     /// The user may accept this problem.
     pub acceptable: bool,
+    /// The row leads somewhere (the place the check is about): it is a
+    /// button, activated by a click or Enter, and reported as
+    /// [`CheckAction::Open`].
+    pub goes_somewhere: bool,
 }
 
 /// A user action from [`checks_list`].
@@ -37,40 +44,55 @@ pub struct CheckItem {
 pub enum CheckAction {
     /// Accept the problem at this index of the items given.
     Accept(usize),
+    /// Take back the acceptance of the problem at this index.
+    Unaccept(usize),
+    /// Go to what the item at this index is about.
+    Open(usize),
+}
+
+/// What [`checks_list`] lists and how.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListMode {
+    /// A flat list: problems, then notes, then the passed checks as one
+    /// collapsed summary row. The caller gives it the items to show.
+    #[default]
+    Problems,
+    /// Everything, in sections headed Problems, Notes and Passed (the
+    /// passed checks stay collapsed under theirs). An accepted problem
+    /// shows "Accepted" with an Un-accept button.
+    All,
 }
 
 /// Show `items` under `heading`: problems, then notes, as tinted rows with
 /// a severity icon and bar (an "Accept" button on acceptable, unaccepted
-/// problems), then the passed checks as one collapsed summary row that
-/// expands to list them. With `show_all`, a "Show all" checkbox sits beside
-/// the heading; the caller does the filtering it stands for. An empty
-/// `heading` without `show_all` draws no heading row (the list sits under a
-/// heading of the caller's). Returns the actions taken this frame.
+/// problems; rows that [go somewhere](CheckItem::goes_somewhere) are
+/// buttons), then the passed checks as one collapsed summary row that
+/// expands to list them. In [`ListMode::All`] each group has its own
+/// heading and an accepted problem can be un-accepted. An empty `heading`
+/// draws no heading row (the list sits under a heading of the caller's).
+/// Returns the actions taken this frame.
 pub fn checks_list(
     ui: &mut Ui,
     heading: &str,
     items: &[CheckItem],
-    show_all: Option<&mut bool>,
+    mode: ListMode,
 ) -> Vec<CheckAction> {
     let mut actions = Vec::new();
-    if !heading.is_empty() || show_all.is_some() {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(heading).strong().color(palette::TEXT_STRONG));
-            if let Some(all) = show_all {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.checkbox(all, "Show all");
-                });
-            }
-        });
+    if !heading.is_empty() {
+        ui.label(RichText::new(heading).strong().color(palette::TEXT_STRONG));
     }
     if items.is_empty() {
         ui.label(RichText::new("No checks yet").color(palette::TEXT_MUTED));
         return actions;
     }
-    for severity in [Severity::Problem, Severity::Note] {
+    let grouped = mode == ListMode::All;
+    for (severity, name) in [(Severity::Problem, "Problems"), (Severity::Note, "Notes")] {
+        if grouped && items.iter().any(|c| c.severity == severity) {
+            section_heading(ui, name);
+        }
         for (i, item) in items.iter().enumerate() {
             if item.severity == severity {
-                row(ui, i, item, &mut actions);
+                row(ui, i, item, mode, &mut actions);
                 ui.add_space(space::XS);
             }
         }
@@ -80,9 +102,27 @@ pub fn checks_list(
         .filter(|c| c.severity == Severity::Passed)
         .collect();
     if !passed.is_empty() {
+        if grouped {
+            section_heading(ui, "Passed");
+        }
         passed_section(ui, heading, &passed);
     }
     actions
+}
+
+/// The heading of one group of an [`ListMode::All`] list.
+fn section_heading(ui: &mut Ui, name: &str) {
+    ui.add_space(space::XS);
+    let label = ui.label(
+        RichText::new(name)
+            .text_style(TextStyle::Small)
+            .strong()
+            .color(palette::TEXT_MUTED),
+    );
+    ui.ctx().accesskit_node_builder(label.id, |node| {
+        node.set_role(egui::accesskit::Role::Heading);
+        node.set_label(name);
+    });
 }
 
 /// Paint `glyph` with its top-left at `pos`.
@@ -93,7 +133,13 @@ fn paint_icon(ui: &Ui, pos: Pos2, glyph: char, color: Color32) {
 
 /// One problem or note row; `index` is the item's index in the caller's
 /// slice.
-fn row(ui: &mut Ui, index: usize, item: &CheckItem, actions: &mut Vec<CheckAction>) {
+fn row(
+    ui: &mut Ui,
+    index: usize,
+    item: &CheckItem,
+    mode: ListMode,
+    actions: &mut Vec<CheckAction>,
+) {
     let tone = Tone::from(item.severity);
     let (bar, fill, icon_color) = if item.accepted {
         (
@@ -105,7 +151,18 @@ fn row(ui: &mut Ui, index: usize, item: &CheckItem, actions: &mut Vec<CheckActio
         (tone.accent(), tone.tint(), tone.color())
     };
     let left = BAR_WIDTH + space::S + ICON_SIZE + space::S;
-    let frame = Frame::new()
+    // The chevron's room is inside the row's own text area, so the whole
+    // area is the button.
+    let chevron = if item.goes_somewhere {
+        ICON_SIZE + space::S
+    } else {
+        0.0
+    };
+    let mut builder = UiBuilder::new().id_salt(("mega-ui-check-row", index));
+    if item.goes_somewhere {
+        builder = builder.sense(Sense::click());
+    }
+    let framed = Frame::new()
         .fill(fill)
         .corner_radius(CornerRadius {
             ne: radius::CONTROL,
@@ -120,34 +177,39 @@ fn row(ui: &mut Ui, index: usize, item: &CheckItem, actions: &mut Vec<CheckActio
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(&item.title).color(palette::TEXT_EMPHASIS));
-            if !item.detail.is_empty() {
-                ui.label(
-                    RichText::new(&item.detail)
-                        .text_style(TextStyle::Small)
-                        .color(palette::TEXT_MUTED),
-                );
-            }
-            if item.severity == Severity::Problem {
-                if item.accepted {
-                    ui.label(
-                        RichText::new("Accepted")
-                            .text_style(TextStyle::Small)
-                            .color(palette::TEXT_SUBTLE),
+            let full = ui.available_width();
+            // The title and detail are the open button (when the row goes
+            // somewhere); Accept and Un-accept sit beside it, not inside.
+            let text = ui.scope_builder(builder, |ui| {
+                ui.set_width(full);
+                ui.scope(|ui| {
+                    ui.set_max_width(full - chevron);
+                    // A row that is a button says its title and detail
+                    // itself: its text has no nodes of its own.
+                    let hide = item.goes_somewhere;
+                    text_block(
+                        ui,
+                        RichText::new(&item.title).color(palette::TEXT_EMPHASIS),
+                        hide,
                     );
-                } else if item.acceptable
-                    && ui
-                        .add(MegaButton::new(ButtonKind::Quiet, "Accept"))
-                        .on_hover_text(
-                            "Accept this problem: it stays listed but is no longer flagged",
-                        )
-                        .clicked()
-                {
-                    actions.push(CheckAction::Accept(index));
-                }
+                    if !item.detail.is_empty() {
+                        text_block(
+                            ui,
+                            RichText::new(&item.detail)
+                                .text_style(TextStyle::Small)
+                                .color(palette::TEXT_MUTED),
+                            hide,
+                        );
+                    }
+                });
+            });
+            if item.severity == Severity::Problem {
+                accept_controls(ui, index, item, mode, actions);
             }
+            text
         });
-    let r = frame.response.rect;
+    let r = framed.response.rect;
+    let scope = framed.inner;
     ui.painter().rect_filled(
         Rect::from_min_max(r.min, Pos2::new(r.min.x + BAR_WIDTH, r.max.y)),
         CornerRadius::ZERO,
@@ -160,6 +222,93 @@ fn row(ui: &mut Ui, index: usize, item: &CheckItem, actions: &mut Vec<CheckActio
             glyph,
             icon_color,
         );
+    }
+    if item.goes_somewhere {
+        let response = scope.response;
+        let text_rect = response.rect;
+        ui.painter().text(
+            Pos2::new(text_rect.max.x - space::S, text_rect.center().y),
+            Align2::RIGHT_CENTER,
+            icons::CHEVRON_RIGHT,
+            icons::font(ICON_SIZE),
+            palette::TEXT_MUTED,
+        );
+        if response.hovered() {
+            ui.painter().rect_stroke(
+                text_rect,
+                CornerRadius::same(radius::CONTROL),
+                Stroke::new(HAIRLINE_WIDTH, palette::BORDER),
+                StrokeKind::Inside,
+            );
+        }
+        crate::widgets::button::focus_ring(ui, &response, radius::CONTROL);
+        let title = item.title.clone();
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, title.clone()));
+        if !item.detail.is_empty() {
+            let detail = item.detail.clone();
+            ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_description(detail);
+            });
+        }
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            actions.push(CheckAction::Open(index));
+        }
+    }
+}
+
+/// A wrapped line of text; with `silent` it is painted without an
+/// accessibility node of its own (the row that holds it says it).
+fn text_block(ui: &mut Ui, text: RichText, silent: bool) {
+    if !silent {
+        ui.label(text);
+        return;
+    }
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        ui.available_width(),
+        TextStyle::Body,
+    );
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley, palette::TEXT_BODY);
+}
+
+/// What a problem row offers about acceptance: Accept on an acceptable
+/// one; "Accepted" on an accepted one, with Un-accept in
+/// [`ListMode::All`].
+fn accept_controls(
+    ui: &mut Ui,
+    index: usize,
+    item: &CheckItem,
+    mode: ListMode,
+    actions: &mut Vec<CheckAction>,
+) {
+    if item.accepted {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Accepted")
+                    .text_style(TextStyle::Small)
+                    .color(palette::TEXT_SUBTLE),
+            );
+            if mode == ListMode::All
+                && ui
+                    .add(MegaButton::new(ButtonKind::Quiet, "Un-accept"))
+                    .on_hover_text("Flag this problem again")
+                    .clicked()
+            {
+                actions.push(CheckAction::Unaccept(index));
+            }
+        });
+    } else if item.acceptable
+        && ui
+            .add(MegaButton::new(ButtonKind::Quiet, "Accept"))
+            .on_hover_text("Accept this problem: it stays listed but is no longer flagged")
+            .clicked()
+    {
+        actions.push(CheckAction::Accept(index));
     }
 }
 
@@ -211,7 +360,7 @@ fn passed_section(ui: &mut Ui, heading: &str, passed: &[&CheckItem]) {
 #[cfg(test)]
 mod tests {
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
 
@@ -222,12 +371,13 @@ mod tests {
             detail: format!("{title} detail"),
             accepted,
             acceptable,
+            goes_somewhere: false,
         }
     }
 
     struct State {
         items: Vec<CheckItem>,
-        show_all: bool,
+        mode: ListMode,
         actions: Vec<CheckAction>,
     }
 
@@ -237,13 +387,13 @@ mod tests {
             .build_ui_state(
                 |ui, s: &mut State| {
                     if crate::testutil::themed(ui) {
-                        let a = checks_list(ui, "Checks", &s.items, Some(&mut s.show_all));
+                        let a = checks_list(ui, "Checks", &s.items, s.mode);
                         s.actions.extend(a);
                     }
                 },
                 State {
                     items,
-                    show_all: false,
+                    mode: ListMode::Problems,
                     actions: Vec::new(),
                 },
             )
@@ -266,10 +416,6 @@ mod tests {
         h.get_by_label("Accept").click();
         h.run();
         assert_eq!(h.state().actions, vec![CheckAction::Accept(2)]);
-
-        h.get_by_label("Show all").click();
-        h.run();
-        assert!(h.state().show_all);
     }
 
     /// Every text run painted in the last frame.
@@ -364,13 +510,13 @@ mod tests {
             .build_ui_state(
                 |ui, s: &mut State| {
                     if crate::testutil::themed(ui) {
-                        let a = checks_list(ui, "", &s.items, None);
+                        let a = checks_list(ui, "", &s.items, s.mode);
                         s.actions.extend(a);
                     }
                 },
                 State {
                     items: vec![check(Severity::Problem, "Broken", true, false)],
-                    show_all: false,
+                    mode: ListMode::Problems,
                     actions: Vec::new(),
                 },
             );
@@ -399,5 +545,143 @@ mod tests {
         for t in ["Pass one", "Pass two", "Pass three"] {
             h.get_by_label(t);
         }
+    }
+
+    fn goes(mut item: CheckItem) -> CheckItem {
+        item.goes_somewhere = true;
+        item
+    }
+
+    fn row_button<'a>(h: &'a Harness<'static, State>, title: &'a str) -> egui_kittest::Node<'a> {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, title)
+    }
+
+    #[test]
+    fn rows_that_go_somewhere_open() {
+        let mut h = harness(vec![
+            goes(check(Severity::Problem, "Gap in coverage", true, false)),
+            check(Severity::Note, "Stays put", false, false),
+            goes(check(Severity::Note, "Noisy panel", false, false)),
+        ]);
+        h.run();
+        // Only the rows that lead somewhere are buttons.
+        assert!(
+            h.query_by_role_and_label(egui::accesskit::Role::Button, "Stays put")
+                .is_none()
+        );
+        row_button(&h, "Gap in coverage").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![CheckAction::Open(0)]);
+
+        // Reachable by keyboard: focus and Enter.
+        h.state_mut().actions.clear();
+        row_button(&h, "Noisy panel").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().actions, vec![CheckAction::Open(2)]);
+
+        // The row's own Accept button is not a click on the row.
+        h.state_mut().actions.clear();
+        h.get_by_label("Accept").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![CheckAction::Accept(0)]);
+    }
+
+    #[test]
+    fn all_mode_groups_by_severity_with_unaccept() {
+        let mut h = harness(vec![
+            check(Severity::Passed, "Pass one", false, false),
+            check(Severity::Problem, "Accepted gap", true, true),
+            check(Severity::Note, "Noisy", false, false),
+            check(Severity::Problem, "Open gap", true, false),
+        ]);
+        // Problems mode: no sections, nothing to un-accept.
+        h.run();
+        assert!(h.query_by_label("Notes").is_none());
+        assert!(h.query_by_label("Un-accept").is_none());
+
+        h.state_mut().mode = ListMode::All;
+        h.run();
+        let y = |h: &Harness<'static, State>, t: &str| h.get_by_label(t).rect().min.y;
+        let (problems, notes, passed) = (y(&h, "Problems"), y(&h, "Notes"), y(&h, "Passed"));
+        assert!(
+            problems < notes && notes < passed,
+            "{problems} {notes} {passed}"
+        );
+        assert!(y(&h, "Accepted gap") > problems && y(&h, "Accepted gap") < notes);
+        assert!(y(&h, "Noisy") > notes && y(&h, "Noisy") < passed);
+        h.get_by_label("Accepted");
+        h.get_by_label("Un-accept").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![CheckAction::Unaccept(1)]);
+        h.state_mut().actions.clear();
+        h.get_by_label("Accept").click();
+        h.run();
+        assert_eq!(h.state().actions, vec![CheckAction::Accept(3)]);
+        // Passed stays collapsible.
+        h.get_by_label("1 check passed").click();
+        h.run();
+        h.get_by_label("Pass one");
+    }
+
+    #[test]
+    fn a_row_that_goes_somewhere_is_one_accessible_button() {
+        let mut h = harness(vec![goes(check(
+            Severity::Note,
+            "Noisy panel",
+            false,
+            false,
+        ))]);
+        h.state_mut().mode = ListMode::All;
+        h.run();
+        // One node says the title (the button), not a button and a label.
+        assert_eq!(h.query_all_by_label("Noisy panel").count(), 1);
+        assert_eq!(h.query_all_by_label("Noisy panel detail").count(), 0);
+        let button = row_button(&h, "Noisy panel");
+        assert_eq!(
+            button.accesskit_node().description().as_deref(),
+            Some("Noisy panel detail")
+        );
+    }
+
+    #[test]
+    fn section_headings_are_headings() {
+        let mut h = harness(vec![
+            check(Severity::Problem, "Broken", true, false),
+            check(Severity::Note, "Noisy", false, false),
+            check(Severity::Passed, "Fine", false, false),
+        ]);
+        h.state_mut().mode = ListMode::All;
+        h.run();
+        for name in ["Problems", "Notes", "Passed"] {
+            h.get_by_role_and_label(egui::accesskit::Role::Heading, name);
+        }
+    }
+
+    #[test]
+    fn accept_sits_beside_the_open_button_not_inside_it() {
+        let mut h = harness(vec![goes(check(Severity::Problem, "Gap", true, false))]);
+        h.run();
+        let open = row_button(&h, "Gap");
+        let accept = h.get_by_role_and_label(egui::accesskit::Role::Button, "Accept");
+        assert_ne!(
+            accept.accesskit_node().parent_id(),
+            Some(open.accesskit_node().id()),
+            "Accept is a sibling of the row's button, not its child"
+        );
+        let mut p = accept.accesskit_node().parent();
+        while let Some(n) = p {
+            assert_ne!(n.id(), open.accesskit_node().id(), "not a descendant");
+            p = n.parent();
+        }
+        // Tab reaches both: the row's button, then Accept.
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert!(row_button(&h, "Gap").accesskit_node().is_focused());
+        h.key_press(egui::Key::Tab);
+        h.run();
+        let accept = h.get_by_role_and_label(egui::accesskit::Role::Button, "Accept");
+        assert!(accept.accesskit_node().is_focused());
     }
 }

@@ -6,7 +6,10 @@
 //! ([`PlanView::selection_ui`]), and links it to the panel list: it selects
 //! ([`PlanView::select`]) and highlights ([`PlanView::set_highlight`]) the
 //! panel of a row, and reads the panel under the pointer
-//! ([`PlanView::hovered`]).
+//! ([`PlanView::hovered`]) and a click on no panel
+//! ([`PlanView::take_clicked_empty`]: the window's overlap or seam
+//! selection goes too). The details' Overlaps rows are reported back: the
+//! window selects the neighbour and frames the overlap.
 //!
 //! - **Views.** Each group, then each composition (a colour mix of groups,
 //!   [`crate::compositions`]). With grouping off there is one view.
@@ -49,7 +52,17 @@
 //!   as overlays (outlines and names, [`PlanView::set_overlays`]) and may arm
 //!   its draw tool ([`PlanView::set_drawing`]): a rectangle drawn is taken
 //!   once with [`PlanView::take_drawn`]. Both only while the plan draws in
-//!   the analysed frame ([`PlanView::frame_matches`]).
+//!   the analysed frame ([`PlanView::frame_matches`]), as are the seam
+//!   lines it hands over ([`PlanView::set_lines`]).
+//! - **Problems** ([`crate::marks`]): the window hands the plan the view's
+//!   problems, one mark per place ([`PlanView::set_marks`]). A panel's badge
+//!   sits at the top-right corner of its outline as drawn here, and the
+//!   panel is outlined in the problem colour; an overlap's, a seam's or an
+//!   area's sits where the analysis places it, only in the analysed frame.
+//!   A badge clicked is taken with [`PlanView::take_badge_clicked`]. While
+//!   the plan is not drawn, the window keeps its layout current
+//!   ([`PlanView::follow_layout`]): the merged mosaic places its outlines
+//!   and badges with it.
 //! - **Compositions** add their channels' layers: each mapped group's
 //!   previews are drawn as additive layers tinted red, green or blue (at
 //!   full strength: weights are always 1, as the export writes them).
@@ -64,25 +77,31 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{Color32, ColorImage, RichText};
-use mega_ui::canvas_layers::{Overlay, Tool};
+use mega_ui::canvas_layers::{CanvasBadge, Overlay, Polyline, Tool};
+use mega_ui::icons;
 use mega_ui::plan::{Layer, PlacedItem, PlanCanvas};
 use mega_ui::theme::palette;
+use mega_ui::theme::text::{Type, text};
 use mega_ui::theme::tokens::space;
-use mmm_core::checks::{Severity, SolutionKind, is_accepted, panel_facts};
-use mmm_core::formats::InputPanel;
+use mega_ui::widgets::{
+    ButtonKind, MegaButton, overline, property_grid, property_row, property_row_numeric,
+};
+use mmm_core::checks::SolutionKind;
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::{FRAME_FILE, Fingerprint, fingerprint};
 use mmm_core::overlap::OverlapGraph;
+use mmm_core::panel_header::{PanelHeader, read_panel_header};
 use mmm_core::preview::{Preview, aligned_bbox, footprint, preview_frame_path};
 use mmm_core::reference::ReferenceFrame;
 use mmm_core::session::Session;
 use mmm_core::stretch::{ChannelStats, StretchParams, apply, channel_stats};
 
 use crate::camera::Camera;
-use crate::checks::ChecksReport;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
+use crate::marks::{Place, ProblemMark, badge_point, outline_color};
 use crate::panel_edits::{group_colors, load_group_colors};
+use crate::panel_list::{UNKNOWN, file_name, integration_text};
 use crate::session::OpenSession;
 use crate::status::format_canvas;
 use crate::util::{Poll, Task, group_names};
@@ -102,7 +121,7 @@ const CHANNEL_COLORS: [Color32; 3] = [
     Color32::from_rgb(0, 0, 255),
 ];
 
-/// What the plan reads from the shell's pipeline and checks each frame.
+/// What the plan reads from the shell's pipeline each frame.
 pub struct PlanFeed<'a> {
     /// The previews received for the current inputs, by panel path.
     pub previews: &'a BTreeMap<PathBuf, Arc<Preview>>,
@@ -110,17 +129,18 @@ pub struct PlanFeed<'a> {
     pub generation: u64,
     /// Every preview of the current inputs has been run.
     pub complete: bool,
-    /// The last checks report, if any.
-    pub checks: Option<&'a ChecksReport>,
 }
 
 /// How the window around a canvas wants it drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CanvasLook {
-    /// Panel outlines.
+    /// Panel outlines, on the plan and on the merged mosaic alike.
     pub outlines: bool,
     /// Panel numbers.
     pub numbers: bool,
+    /// Where the merge changes from one panel to the next (the seam
+    /// lines), on the plan and on the merged mosaic alike.
+    pub seams: bool,
     /// The regions of interest, outlined and named on the plan and on the
     /// merged mosaic alike.
     pub rois: bool,
@@ -129,10 +149,12 @@ pub struct CanvasLook {
 }
 
 impl Default for CanvasLook {
+    /// Outlines (with numbers) and ROIs on, seams off.
     fn default() -> Self {
         CanvasLook {
             outlines: true,
             numbers: true,
+            seams: false,
             rois: true,
             stretch: DisplayStretch::default(),
         }
@@ -368,20 +390,23 @@ pub struct Layout {
     pub rects: BTreeMap<PathBuf, [f64; 4]>,
     /// Each analysed panel's overlapping panels (in its group).
     pub overlaps: BTreeMap<PathBuf, Vec<PathBuf>>,
+    /// Each analysed group's panels by file, with their ids in its
+    /// analysis (the ids its seam lines name).
+    pub ids: BTreeMap<String, BTreeMap<PathBuf, usize>>,
 }
 
-/// Read the frame and the analyses of `groups` (their session
-/// directories). The frame is the previews' (`frames.0`), else, before any
-/// complete previews run, the analysed one (`frames.1`). Blocking (worker
-/// thread); what cannot be read is left out and logged.
-pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
+/// Read the frame and the analyses of `groups` (each group's name and
+/// session directory). The frame is the previews' (`frames.0`), else,
+/// before any complete previews run, the analysed one (`frames.1`).
+/// Blocking (worker thread); what cannot be read is left out and logged.
+pub fn load_layout(frames: (&Path, &Path), groups: &[(String, PathBuf)]) -> Layout {
     let mut out = Layout {
         frame: ReferenceFrame::load(frames.0)
             .or_else(|_| ReferenceFrame::load(frames.1))
             .ok(),
         ..Layout::default()
     };
-    for dir in groups {
+    for (name, dir) in groups {
         let loaded = Session::open(dir)
             .and_then(|s| OverlapGraph::load(&s.overlap_graph_path()).map(|graph| (s, graph)));
         let (session, graph) = match loaded {
@@ -398,6 +423,7 @@ pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
                 .find(|p| p.id == id)
                 .map(|p| p.source.clone().unwrap_or_else(|| p.path.clone()))
         };
+        let ids = out.ids.entry(name.clone()).or_default();
         for p in &session.panels {
             let path = p.source.clone().unwrap_or_else(|| p.path.clone());
             let b = p.bbox;
@@ -405,6 +431,7 @@ pub fn load_layout(frames: (&Path, &Path), groups: &[PathBuf]) -> Layout {
                 path.clone(),
                 [b[0] as f64, b[1] as f64, b[2] as f64, b[3] as f64],
             );
+            ids.insert(path.clone(), p.id);
             out.overlaps.entry(path).or_default();
         }
         for e in &graph.edges {
@@ -492,32 +519,10 @@ pub fn find_outlines(
     out
 }
 
-/// Header facts of a panel for its details.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PanelInfo {
-    /// Width in pixels.
-    pub width: u64,
-    /// Height in pixels.
-    pub height: u64,
-    /// Channel count.
-    pub channels: u64,
-    /// Astrometric solution kind.
-    pub solution: SolutionKind,
-    /// Pixel scale (arcsec / px), when solved.
-    pub scale_arcsec: Option<f64>,
-}
-
-/// Read `path`'s header facts (worker thread).
-pub fn read_info(path: &Path) -> Result<PanelInfo, String> {
-    let panel = InputPanel::open(path).map_err(|e| e.to_string())?;
-    let facts = panel_facts(path).map_err(|e| e.to_string())?;
-    Ok(PanelInfo {
-        width: panel.width(),
-        height: panel.height(),
-        channels: facts.channels,
-        solution: facts.solution,
-        scale_arcsec: facts.scale_arcsec,
-    })
+/// Read `path`'s header facts for its details: size, channels, filter,
+/// sub-frames and solution, with one open (worker thread).
+pub fn read_info(path: &Path) -> Result<PanelHeader, String> {
+    read_panel_header(path).map_err(|e| e.to_string())
 }
 
 /// The command that shows `path` in the platform's file manager: Windows
@@ -572,7 +577,8 @@ pub struct ItemSnapshot {
     pub rect: [f64; 4],
     /// Per layer: (tint, additive).
     pub layers: Vec<(Color32, bool)>,
-    /// Outline colour (Hα for a panel with an unaccepted problem).
+    /// Outline colour (the problem colour for a panel badged with a
+    /// problem, [`outline_color`]).
     pub outline: Color32,
     /// The panel number shown.
     pub label: String,
@@ -598,7 +604,7 @@ struct AutoKey {
 struct LayoutKey {
     generation: u64,
     complete: bool,
-    analysed: Vec<PathBuf>,
+    analysed: Vec<(String, PathBuf)>,
     provenance: usize,
 }
 
@@ -671,6 +677,19 @@ pub struct PlanView {
     overlays: Vec<Overlay>,
     /// Image patches (ROI previews) drawn over the canvas.
     patches: Vec<mega_ui::canvas_layers::Patch>,
+    /// The lines last handed to the canvas (tests; the canvas keeps them).
+    #[cfg(test)]
+    lines: Vec<Polyline>,
+    /// The view's problems, one per place, to badge ([`PlanView::set_marks`]).
+    marks: Vec<ProblemMark>,
+    /// The badges the last frame drew (tests; the canvas keeps them).
+    #[cfg(test)]
+    badges: Vec<CanvasBadge>,
+    /// A badge clicked, until taken ([`PlanView::take_badge_clicked`]).
+    badge_clicked: Option<u64>,
+    /// A click landed on no panel, until taken
+    /// ([`PlanView::take_clicked_empty`]).
+    clicked_empty: bool,
     /// A rectangle just drawn, with the canvas it is on: see
     /// [`PlanView::take_drawn`].
     drawn: Option<([f64; 4], (u64, u64))>,
@@ -717,8 +736,8 @@ pub struct PlanView {
     info_generation: u64,
     /// When the view was last drawn (textures are dropped once hidden).
     last_shown: Option<Instant>,
-    info: BTreeMap<PathBuf, Result<PanelInfo, String>>,
-    info_task: Option<Task<(PathBuf, Result<PanelInfo, String>)>>,
+    info: BTreeMap<PathBuf, Result<PanelHeader, String>>,
+    info_task: Option<Task<(PathBuf, Result<PanelHeader, String>)>>,
     last_items: Vec<ItemSnapshot>,
     view_key: Option<String>,
     unplaced: usize,
@@ -754,6 +773,13 @@ impl PlanView {
             highlight: None,
             overlays: Vec::new(),
             patches: Vec::new(),
+            #[cfg(test)]
+            lines: Vec::new(),
+            marks: Vec::new(),
+            #[cfg(test)]
+            badges: Vec::new(),
+            badge_clicked: None,
+            clicked_empty: false,
             drawn: None,
             hold: None,
             quiet: None,
@@ -807,6 +833,42 @@ impl PlanView {
     /// frame on, under the overlays.
     pub fn set_patches(&mut self, patches: Vec<mega_ui::canvas_layers::Patch>) {
         self.patches = patches;
+    }
+
+    /// Draw these polylines (the seams, canvas coordinates) over the panels
+    /// from the next frame on, with the overlays (handed straight to the
+    /// canvas).
+    pub fn set_lines(&mut self, lines: Vec<Polyline>) {
+        #[cfg(test)]
+        {
+            self.lines = lines.clone();
+        }
+        self.canvas.set_lines(lines);
+    }
+
+    /// Badge these problems (the view's, one mark per place,
+    /// [`crate::marks`]) from the next frame on: a panel's at the top-right
+    /// corner of its outline as the plan draws it, its outline in the
+    /// problem colour; any other where the analysis places it, and only
+    /// while the plan draws in the analysed frame
+    /// ([`PlanView::frame_matches`]). A click on one is taken with
+    /// [`PlanView::take_badge_clicked`].
+    pub fn set_marks(&mut self, marks: Vec<ProblemMark>) {
+        self.marks = marks;
+    }
+
+    /// The badge clicked (or activated from the keyboard) since the last
+    /// call, once: its mark's id ([`ProblemMark::id`]).
+    pub fn take_badge_clicked(&mut self) -> Option<u64> {
+        self.badge_clicked.take()
+    }
+
+    /// Whether a click landed on no panel since the last call (it cleared
+    /// the plan's selection; the window clears its own too), once. Not a
+    /// click in the quiet rect ([`PlanView::set_quiet`]), nor one with the
+    /// draw tool armed.
+    pub fn take_clicked_empty(&mut self) -> bool {
+        std::mem::take(&mut self.clicked_empty)
     }
 
     /// Arm (or disarm) the draw tool: the next drag draws a rectangle
@@ -906,6 +968,41 @@ impl PlanView {
     /// What the last frame drew, item by item.
     pub fn items(&self) -> &[ItemSnapshot] {
         &self.last_items
+    }
+
+    /// The badges the last frame drew (canvas coordinates).
+    #[cfg(test)]
+    pub fn badges(&self) -> &[CanvasBadge] {
+        &self.badges
+    }
+
+    /// The lines handed to the canvas (canvas coordinates).
+    #[cfg(test)]
+    pub fn lines(&self) -> &[Polyline] {
+        &self.lines
+    }
+
+    /// The frame and what the last analyses say about the panels, as last
+    /// read ([`load_layout`]).
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Keep the layout current whether or not the plan is drawn (the merged
+    /// mosaic places its outlines and badges with it): take a finished
+    /// read, and read again (on a worker) when the previews or analyses may
+    /// have moved the panels, as drawing does. Meant to be called every
+    /// frame, and cheap: it compares a small key (previews generation,
+    /// analysed groups, provenance length) and does no I/O unless the key
+    /// changed.
+    pub fn follow_layout(
+        &mut self,
+        ctx: &egui::Context,
+        session: &OpenSession,
+        feed: &PlanFeed<'_>,
+    ) {
+        self.poll_tasks();
+        self.start_layout(ctx, session, feed);
     }
 
     /// Panels of the view with no place to draw them yet (no preview, no
@@ -1015,6 +1112,9 @@ impl PlanView {
             Some(spec) => self.build_items(session, spec, feed),
             None => {
                 self.last_items.clear();
+                #[cfg(test)]
+                self.badges.clear();
+                self.canvas.set_badges(Vec::new());
                 self.missing_layers = 0;
                 Vec::new()
             }
@@ -1068,6 +1168,9 @@ impl PlanView {
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);
         self.hold = r.held;
+        if r.badge_clicked.is_some() {
+            self.badge_clicked = r.badge_clicked;
+        }
         if let Some(rect) = r.drawn_rect {
             let size = (
                 extent[2].ceil().max(0.0) as u64,
@@ -1104,7 +1207,10 @@ impl PlanView {
         match r.clicked {
             _ if quiet => {}
             Some(id) => self.selected = path_of(id),
-            None if r.clicked_empty => self.selected = None,
+            None if r.clicked_empty => {
+                self.selected = None;
+                self.clicked_empty = true;
+            }
             None => {}
         }
         self.hovered = r.hovered.and_then(path_of);
@@ -1257,11 +1363,11 @@ impl PlanView {
     /// may have moved them.
     fn start_layout(&mut self, ctx: &egui::Context, session: &OpenSession, feed: &PlanFeed<'_>) {
         let cfg = &session.mosaic.config;
-        let analysed: Vec<PathBuf> = cfg
+        let analysed: Vec<(String, PathBuf)> = cfg
             .group_dirs
             .keys()
             .filter(|g| !cfg.needs_analyze.contains(*g))
-            .map(|g| session.mosaic.group_session_dir(g))
+            .map(|g| (g.clone(), session.mosaic.group_session_dir(g)))
             .collect();
         let key = LayoutKey {
             generation: feed.generation,
@@ -1528,7 +1634,8 @@ impl PlanView {
         }
     }
 
-    /// The items of the view, and the snapshot of what they show.
+    /// The items of the view, the snapshot of what they show, and the
+    /// badges of the view's problems ([`PlanView::set_marks`]).
     fn build_items(
         &mut self,
         session: &OpenSession,
@@ -1536,16 +1643,14 @@ impl PlanView {
         feed: &PlanFeed<'_>,
     ) -> Vec<PlacedItem> {
         let cfg = &session.mosaic.config;
-        let flagged: BTreeSet<&PathBuf> = feed
-            .checks
-            .map(|r| {
-                r.checks
-                    .iter()
-                    .filter(|c| c.severity == Severity::Problem && !is_accepted(cfg, c))
-                    .flat_map(|c| c.panels.iter())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let badged: BTreeSet<PathBuf> = self
+            .marks
+            .iter()
+            .flat_map(ProblemMark::panels)
+            .map(Path::to_path_buf)
+            .collect();
+        // Where each panel is drawn, for its badge.
+        let mut placed: BTreeMap<PathBuf, [f64; 4]> = BTreeMap::new();
         let ids: HashMap<&PathBuf, usize> = cfg
             .panels
             .iter()
@@ -1599,12 +1704,7 @@ impl PlanView {
                 let Some(&id) = ids.get(&path) else {
                     continue;
                 };
-                let flag = flagged.contains(&path);
-                let outline = if flag {
-                    palette::HA_500
-                } else {
-                    palette::ACCENT_500
-                };
+                let outline = outline_color(badged.contains(&path));
                 let highlighted = self.highlight.as_ref() == Some(&path);
                 snaps.push(ItemSnapshot {
                     path: path.clone(),
@@ -1614,19 +1714,43 @@ impl PlanView {
                     label: number.to_string(),
                     highlighted,
                 });
+                placed.insert(path.clone(), rect);
                 items.push(PlacedItem {
                     id: id as u64,
                     rect,
                     layers: drawn,
                     outline,
                     label: number.to_string(),
-                    marker: flag.then_some(palette::HA_500),
                     selected: self.selected.as_ref() == Some(&path),
                     highlighted,
                 });
             }
         }
         self.last_items = snaps;
+        // A panel's badge at its outline as drawn here (its first panel's
+        // drawn); the others where the analysis places them, only in the
+        // analysed frame.
+        let analysed = self.frame_matches(session);
+        let badges: Vec<CanvasBadge> = self
+            .marks
+            .iter()
+            .filter_map(|m| {
+                let at = match &m.place {
+                    Place::Panel(_) => {
+                        let drawn = m.panels().find_map(|p| placed.get(p))?;
+                        badge_point(&m.place, *drawn)
+                    }
+                    _ if analysed => badge_point(&m.place, m.rect?),
+                    _ => return None,
+                };
+                Some(m.badge(at))
+            })
+            .collect();
+        #[cfg(test)]
+        {
+            self.badges = badges.clone();
+        }
+        self.canvas.set_badges(badges);
         items
     }
 
@@ -1651,14 +1775,17 @@ impl PlanView {
             .map(|e| (e, false))
     }
 
-    /// The selected panel's details: its name and path, Show in folder and
-    /// Copy path, its header facts (read on a worker) and the panels it
-    /// overlaps; a hint when none is selected.
-    pub fn selection_ui(&mut self, ui: &mut egui::Ui, session: &OpenSession) {
-        ui.label(RichText::new("Panel").color(palette::TEXT_STRONG));
+    /// The selected panel's details: its name (a heading) and path,
+    /// **Show in folder** and **Copy path**, its header facts (read on a
+    /// worker: size, channels, filter, exposure, frames, integration,
+    /// solution and scale; "—" for what the header does not say) and the
+    /// panels it overlaps in its analysis, each a row; a hint when none is
+    /// selected. Returns the panel whose Overlaps row was clicked: the
+    /// window selects it and frames the overlap.
+    pub fn selection_ui(&mut self, ui: &mut egui::Ui, session: &OpenSession) -> Option<PathBuf> {
         let Some(path) = self.selected.clone().filter(|p| is_panel(session, p)) else {
-            ui.label(RichText::new("Click a panel to select it.").color(palette::TEXT_MUTED));
-            return;
+            ui.label(text(Type::Small, "Click a panel to select it."));
+            return None;
         };
         if !self.info.contains_key(&path) && self.info_task.is_none() {
             let p = path.clone();
@@ -1667,76 +1794,103 @@ impl PlanView {
                 (p, info)
             });
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        ui.label(RichText::new(name).strong().color(palette::TEXT_STRONG));
-        ui.add(
-            egui::Label::new(
-                RichText::new(path.display().to_string())
-                    .small()
-                    .color(palette::TEXT_MUTED),
-            )
-            .wrap(),
-        );
+        overline(ui, "Panel");
+        details_heading(ui, &file_name(&path));
+        ui.add(egui::Label::new(text(Type::Small, path.display().to_string())).wrap());
+        ui.add_space(space::XS);
         ui.horizontal(|ui| {
             if ui
-                .button("Show in folder")
+                .add(MegaButton::new(ButtonKind::Secondary, "Show in folder"))
                 .on_hover_text("Open the folder holding this file")
                 .clicked()
             {
                 show_in_folder(&path);
             }
             if ui
-                .button("Copy path")
+                .add(MegaButton::new(ButtonKind::Secondary, "Copy path"))
                 .on_hover_text("Copy the full path to the clipboard")
                 .clicked()
             {
                 ui.ctx().copy_text(path.display().to_string());
             }
         });
-        egui::Grid::new("plan-panel-props")
-            .num_columns(2)
-            .spacing([space::M, space::XS])
-            .show(ui, |ui| {
-                let row = |ui: &mut egui::Ui, k: &str, v: String| {
-                    ui.label(RichText::new(k).color(palette::TEXT_BODY));
-                    ui.label(RichText::new(v).color(palette::TEXT_STRONG));
-                    ui.end_row();
-                };
-                match self.info.get(&path) {
-                    None => row(ui, "Header", "Reading…".into()),
-                    Some(Err(e)) => row(ui, "Header", format!("Unreadable: {e}")),
-                    Some(Ok(info)) => {
-                        row(ui, "Size", format_canvas(info.width, info.height));
-                        row(ui, "Channels", info.channels.to_string());
-                        row(ui, "Solution", solution_text(info.solution).into());
-                        if let Some(s) = info.scale_arcsec {
-                            row(ui, "Scale", format!("{s:.3}″/px"));
-                        }
-                    }
-                }
-            });
-        ui.label(RichText::new("Overlaps").color(palette::TEXT_BODY));
+        ui.add_space(space::S);
+        property_grid(ui, "plan-panel-props", |ui| match self.info.get(&path) {
+            None => property_row(ui, "Header", "Reading…"),
+            Some(Err(e)) => property_row(ui, "Header", &format!("Unreadable: {e}")),
+            Some(Ok(h)) => header_rows(ui, h),
+        });
+        ui.add_space(space::S);
+        overline(ui, "Overlaps");
+        let mut clicked = None;
         match self.layout.overlaps.get(&path) {
             None => {
-                ui.label(RichText::new("Shown once analysed.").color(palette::TEXT_MUTED));
+                ui.label(text(Type::Small, "Shown once analysed."));
             }
             Some(o) if o.is_empty() => {
-                ui.label(RichText::new("No other panel").color(palette::HA_400));
+                // Muted: its problem (if a check flags it) says so, with
+                // its icon, in the panel's checks.
+                ui.label(text(Type::Small, "No other panel"));
             }
             Some(o) => {
                 for p in o {
-                    let n = p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    ui.label(RichText::new(n).color(palette::TEXT_STRONG));
+                    let name = file_name(p);
+                    let does = format!("Select {name} and go to the overlap");
+                    let row = MegaButton::new(ButtonKind::Quiet, &name)
+                        .trailing_icon(icons::CHEVRON_RIGHT);
+                    let r = ui.add(row);
+                    // Said to assistive technology too, as a checks row's
+                    // detail is.
+                    let said = does.clone();
+                    ui.ctx()
+                        .accesskit_node_builder(r.id, |node| node.set_description(said));
+                    if r.on_hover_text(does).clicked() {
+                        clicked = Some(p.clone());
+                    }
                 }
             }
         }
+        clicked
     }
+}
+
+/// An exposure, rounded as the integration is: "300 s"; below a second, to
+/// a hundredth ("0.25 s").
+fn exposure_text(seconds: f64) -> String {
+    if seconds >= 1.0 {
+        format!("{} s", seconds.round() as u64)
+    } else {
+        format!("{seconds:.2} s")
+    }
+}
+
+/// The header facts of a panel's details, as property rows.
+fn header_rows(ui: &mut egui::Ui, h: &PanelHeader) {
+    let or_unknown = |v: Option<String>| v.unwrap_or_else(|| UNKNOWN.into());
+    property_row_numeric(ui, "Size", &format_canvas(h.width, h.height));
+    property_row_numeric(ui, "Channels", &h.channels.to_string());
+    property_row(ui, "Filter", &or_unknown(h.filter.clone()));
+    property_row_numeric(ui, "Exposure", &or_unknown(h.exposure_s.map(exposure_text)));
+    property_row_numeric(ui, "Frames", &or_unknown(h.frames.map(|n| n.to_string())));
+    property_row_numeric(
+        ui,
+        "Integration",
+        &or_unknown(h.integration_s().map(integration_text)),
+    );
+    property_row(ui, "Solution", solution_text(h.solution));
+    if let Some(s) = h.scale_arcsec {
+        property_row_numeric(ui, "Scale", &format!("{s:.3}″/px"));
+    }
+}
+
+/// The heading of what the inspector details (a panel, an overlap, a
+/// seam), wrapped, and a heading to assistive technology.
+pub(crate) fn details_heading(ui: &mut egui::Ui, s: &str) {
+    let r = ui.add(egui::Label::new(text(Type::Heading, s)).wrap());
+    ui.ctx().accesskit_node_builder(r.id, |node| {
+        node.set_role(egui::accesskit::Role::Heading);
+        node.set_label(s);
+    });
 }
 
 #[cfg(test)]

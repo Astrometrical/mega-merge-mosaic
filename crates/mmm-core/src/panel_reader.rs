@@ -430,6 +430,11 @@ mod tests {
             ch_max: vec![],
             ch_mean: vec![],
             storage,
+            noise: None,
+            gradient: None,
+            ragged: None,
+            gradient_rise: None,
+            background: None,
         }
     }
 

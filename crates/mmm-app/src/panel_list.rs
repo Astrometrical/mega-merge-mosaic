@@ -122,7 +122,7 @@ const DEFAULT_HEADER_KEY: &str = "FILTER";
 /// The first keyword of **Path keyword…** (`…/FILTER_Ha/…` → `Ha`).
 const DEFAULT_PATH_KEYWORD: &str = "FILTER";
 /// A cell whose fact is unknown.
-const UNKNOWN: &str = "—";
+pub(crate) const UNKNOWN: &str = "—";
 /// The FILTER cell of a panel whose header is not read yet.
 const READING: &str = "Reading…";
 /// The FILTER cell of a panel that can't be opened.
@@ -237,6 +237,9 @@ fn kept_ungrouped(config: &MosaicConfig) -> bool {
     let note = CheckKey {
         code: CheckCode::FiltersDifferUngrouped,
         panel: None,
+        other: None,
+        group: None,
+        rect: None,
     };
     config.accepted_checks.contains(&note)
         || (!config.grouping.enabled && config.grouping.rule != GroupRule::default())
@@ -514,15 +517,16 @@ fn panel_of(shown: &PanelsEdit, id: u64) -> Option<&Path> {
         .find(|p| row_id(p) == id)
 }
 
-/// The file name of `path`, for rows.
-fn file_name(path: &Path) -> String {
+/// The file name of `path` (its whole path if it has none), as panels are
+/// named: rows, details, headings.
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
 
 /// An integration time: "3h 05m", or "45s" below a minute.
-fn integration_text(seconds: f64) -> String {
+pub(crate) fn integration_text(seconds: f64) -> String {
     let whole = seconds.max(0.0).round() as u64;
     if whole < 60 {
         return format!("{whole}s");

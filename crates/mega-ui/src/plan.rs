@@ -15,8 +15,8 @@ use egui::{
 };
 
 use crate::canvas_layers::{
-    DrawStep, Hold, Overlay, Patch, Pressed, Tool, drawing_rect, follow_draw, follow_hold,
-    paint_layers, pointer_over, show_tool_cursor,
+    CanvasBadge, DrawStep, Hold, Overlay, Patch, Polyline, Pressed, Tool, drawing_rect,
+    follow_draw, follow_hold, paint_layers, pointer_over, show_badges, show_tool_cursor,
 };
 use crate::theme::palette;
 use crate::viewer::{OverlayButton, View, drag_delta, overlay_buttons};
@@ -27,10 +27,17 @@ const SCROLL_ZOOM_PER_NOTCH: f64 = 1.2;
 const SELECTED_STROKE: f32 = 2.5;
 /// Width of an ordinary outline, in points.
 const OUTLINE_STROKE: f32 = 1.0;
-/// Margin left around an item zoomed to, as a fraction of its size.
-const ZOOM_MARGIN: f64 = 0.05;
-/// Radius of an item's marker, in points.
-const MARKER_RADIUS: f32 = 9.0;
+/// Margin left around an item zoomed to ([`PlanCanvas::zoom_to`], **Zoom to
+/// selection**), as a fraction of its size on each side.
+pub const ZOOM_MARGIN: f64 = 0.05;
+
+/// `r` (`[x0, y0, x1, y1]`) grown by [`ZOOM_MARGIN`] of its size on each
+/// side: what zooming to it frames, so its edges (and what sits on them)
+/// stay in view.
+pub fn with_zoom_margin(r: [f64; 4]) -> [f64; 4] {
+    let (mx, my) = ((r[2] - r[0]) * ZOOM_MARGIN, (r[3] - r[1]) * ZOOM_MARGIN);
+    [r[0] - mx, r[1] - my, r[2] + mx, r[3] + my]
+}
 /// Dash and gap of the outline of an item with no layers yet, in points.
 const DASH: (f32, f32) = (6.0, 4.0);
 /// Strength of a highlighted item's outline: the selection outline
@@ -85,8 +92,6 @@ pub struct PlacedItem {
     pub outline: Color32,
     /// Label drawn at the item's centre (when labels are shown).
     pub label: String,
-    /// Colour of a filled "!" marker at the item's top-right, if flagged.
-    pub marker: Option<Color32>,
     /// Drawn with a 2.5 px accent outline, whether or not outlines are shown;
     /// the target of "Zoom to selection".
     pub selected: bool,
@@ -121,6 +126,9 @@ pub struct PlanResponse {
     /// The primary button held down on the canvas with [`Tool::Navigate`],
     /// in canvas coordinates.
     pub held: Option<Hold>,
+    /// A badge clicked (or activated from the keyboard) this frame: its
+    /// [`CanvasBadge::id`].
+    pub badge_clicked: Option<u64>,
 }
 
 /// Canvas command from a button or the host app, applied in `show`.
@@ -144,6 +152,8 @@ pub struct PlanCanvas {
     last_frame: Option<(Rect, f64)>,
     overlays: Vec<Overlay>,
     patches: Vec<Patch>,
+    lines: Vec<Polyline>,
+    badges: Vec<CanvasBadge>,
     tool: Tool,
     /// The rectangle being drawn: its fixed corner and the current one, in
     /// canvas coordinates.
@@ -171,6 +181,8 @@ impl PlanCanvas {
             last_frame: None,
             overlays: Vec::new(),
             patches: Vec::new(),
+            lines: Vec::new(),
+            badges: Vec::new(),
             tool: Tool::Navigate,
             drawing: None,
             held: None,
@@ -186,6 +198,19 @@ impl PlanCanvas {
     /// Replace the images drawn over the items (under the overlays).
     pub fn set_patches(&mut self, patches: Vec<Patch>) {
         self.patches = patches;
+    }
+
+    /// Replace the polylines drawn over the items, with the overlays
+    /// (canvas coordinates).
+    pub fn set_lines(&mut self, lines: Vec<Polyline>) {
+        self.lines = lines;
+    }
+
+    /// Replace the badges drawn over everything else (canvas coordinates;
+    /// constant size on screen). A click or Enter on one is reported as
+    /// `badge_clicked`.
+    pub fn set_badges(&mut self, badges: Vec<CanvasBadge>) {
+        self.badges = badges;
     }
 
     /// What a drag does from now on (a rectangle being drawn is dropped).
@@ -343,6 +368,17 @@ impl PlanCanvas {
             show_outlines,
             show_labels,
         );
+        let badge_clicked = {
+            let view = &self.view;
+            let screen = |r: [f64; 4]| {
+                Rect::from_two_pos(
+                    view.image_to_screen((r[0], r[1]), rect, now),
+                    view.image_to_screen((r[2], r[3]), rect, now),
+                )
+            };
+            show_badges(ui, rect, &screen, &self.badges)
+        };
+        out.badge_clicked = badge_clicked;
         let buttons = [
             OverlayButton::new("+", 28.0, "Zoom in"),
             OverlayButton::new("\u{2212}", 28.0, "Zoom out"),
@@ -371,12 +407,8 @@ impl PlanCanvas {
     }
 
     fn zoom_to_padded(&mut self, r: [f64; 4], screen: Rect, now: f64) {
-        let (mx, my) = ((r[2] - r[0]) * ZOOM_MARGIN, (r[3] - r[1]) * ZOOM_MARGIN);
-        self.view.zoom_to_rect(
-            [r[0] - mx, r[1] - my, r[2] + mx, r[3] + my],
-            screen.size(),
-            now,
-        );
+        self.view
+            .zoom_to_rect(with_zoom_margin(r), screen.size(), now);
     }
 
     /// Follow a [`Tool::DrawRect`] drag; returns the rect once released.
@@ -437,7 +469,7 @@ impl PlanCanvas {
     }
 
     /// Images in slice order, then patches, overlays and the rectangle being
-    /// drawn, then outlines, labels and markers over them,
+    /// drawn, then outlines and labels over them,
     /// then highlighted outlines and selected outlines last (so they are
     /// never hidden; the selection over the highlight).
     fn paint(
@@ -472,6 +504,7 @@ impl PlanCanvas {
             &screen,
             &self.patches,
             &self.overlays,
+            &self.lines,
             drawing_rect(self.drawing),
         );
         for it in items {
@@ -500,20 +533,6 @@ impl PlanCanvas {
                     Align2::CENTER_CENTER,
                     &it.label,
                     FontId::proportional(14.0),
-                    palette::TEXT_STRONG,
-                );
-            }
-            if let Some(c) = it.marker {
-                let at = Pos2::new(
-                    r.right() - MARKER_RADIUS - 4.0,
-                    r.top() + MARKER_RADIUS + 4.0,
-                );
-                painter.circle_filled(at, MARKER_RADIUS, c);
-                painter.text(
-                    at,
-                    Align2::CENTER_CENTER,
-                    "!",
-                    FontId::proportional(13.0),
                     palette::TEXT_STRONG,
                 );
             }

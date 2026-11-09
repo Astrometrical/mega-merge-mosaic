@@ -153,8 +153,14 @@ impl MegaButton {
 /// Paint the keyboard focus ring (2 pt accent, just outside `response`'s
 /// rect) when `response` has focus. Every focusable Mega widget shows it.
 pub fn focus_ring(ui: &Ui, response: &Response, corner: u8) {
+    focus_ring_with(ui.painter(), response, corner);
+}
+
+/// [`focus_ring`] through `painter` (a clipped one keeps the ring inside a
+/// canvas for a widget at its edge).
+pub fn focus_ring_with(painter: &egui::Painter, response: &Response, corner: u8) {
     if response.has_focus() {
-        ui.painter().rect_stroke(
+        painter.rect_stroke(
             response.rect.expand(2.0),
             CornerRadius::same(corner + 2),
             Stroke::new(2.0, ACCENT_400),

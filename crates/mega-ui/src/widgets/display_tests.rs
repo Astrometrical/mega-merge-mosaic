@@ -82,6 +82,7 @@ fn choice_chip_reports_selected_state() {
                     selected,
                     dashed: false,
                     mark: None,
+                    problems: None,
                 },
             )
         });
@@ -111,6 +112,7 @@ fn choice_chip_click_is_reported() {
                 selected: false,
                 dashed: true,
                 mark: None,
+                problems: None,
             },
         );
         if r.clicked() {
@@ -146,6 +148,7 @@ fn choice_chip_draws_its_mark() {
                     selected: false,
                     dashed: false,
                     mark,
+                    problems: None,
                 },
             )
             .on_hover_text("Caller's hint");
@@ -218,4 +221,87 @@ fn choice_chip_draws_its_mark() {
             );
         }
     }
+}
+
+#[test]
+fn a_chip_shows_its_problem_count() {
+    use super::chip::{ChipMark, ChoiceChip, choice_chip};
+    use std::{cell::Cell, rc::Rc};
+    let widths = Rc::new(Cell::new([0.0_f32; 4]));
+    let seen = widths.clone();
+    let mut h = harness(move |ui| {
+        let mut w = [0.0_f32; 4];
+        let mut last = None;
+        let cases = [
+            (None, None),
+            (None, Some(3)),
+            (Some(ChipMark::Attention), Some(3)),
+            (None, Some(0)),
+        ];
+        for (i, (mark, problems)) in cases.into_iter().enumerate() {
+            let r = choice_chip(
+                ui,
+                &ChoiceChip {
+                    label: if i == 1 { "Counted" } else { "Same" },
+                    color: None,
+                    selected: false,
+                    dashed: false,
+                    mark,
+                    problems,
+                },
+            );
+            w[i] = r.rect.width();
+            last = Some(r);
+        }
+        seen.set(w);
+        last.unwrap()
+    });
+    h.run();
+    let [plain, counted, _both, zero] = widths.get();
+    assert!(counted > plain, "the count takes room");
+    assert_eq!(zero, plain, "no problems draws nothing");
+    // Said in words, not just drawn.
+    let said: Vec<Option<String>> = h
+        .query_all_by_role(egui::accesskit::Role::Button)
+        .map(|n| n.accesskit_node().description())
+        .collect();
+    assert_eq!(
+        said,
+        [
+            None,
+            Some("3 problems".to_string()),
+            Some("out of date, 3 problems".to_string()),
+            None
+        ]
+    );
+    // Not colour alone: the problem icon in the problem colour, once on
+    // each counted chip, and the number beside it; the warning triangle
+    // only as the Out of date mark (a problem is not out of date).
+    let drawn = |tone: Tone| {
+        let icon = tone.icon().unwrap();
+        h.output()
+            .shapes
+            .iter()
+            .filter(|c| match &c.shape {
+                egui::Shape::Text(t) => {
+                    let format = &t.galley.job.sections[0].format;
+                    t.galley.text().contains(icon)
+                        && format.font_id.family == crate::theme::fonts::icon_family()
+                        && format.color == tone.color()
+                }
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(
+        drawn(Tone::Problem),
+        2,
+        "the problem icon on the counted chips"
+    );
+    assert_eq!(drawn(Tone::Warning), 1, "the mark's triangle only");
+    let has_count = h.output().shapes.iter().any(|c| match &c.shape {
+        egui::Shape::Text(t) => t.galley.text() == "3",
+        _ => false,
+    });
+    assert!(has_count, "the count itself");
 }

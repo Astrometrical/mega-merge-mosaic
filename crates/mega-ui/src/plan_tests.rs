@@ -1,6 +1,6 @@
 use egui::{ColorImage, Pos2, Rect, Vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 use super::*;
 
@@ -45,7 +45,6 @@ fn item(id: u64, rect: [f64; 4]) -> PlacedItem {
         layers: Vec::new(),
         outline: palette::ACCENT_500,
         label: format!("{id}"),
-        marker: None,
         selected: false,
         highlighted: false,
     }
@@ -726,4 +725,315 @@ fn a_press_on_the_plans_buttons_is_no_hold() {
     assert!(held(&h).is_some());
     h.drop_at(at);
     h.run();
+}
+
+// ---- badges and lines ----
+
+use crate::canvas_layers::{CanvasBadge, Polyline};
+use crate::theme::Tone;
+
+/// A themed harness (badges draw icons) over a 1000 x 1000 extent.
+fn themed_harness() -> Harness<'static, State> {
+    Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if crate::testutil::themed(ui) {
+                    let r = s
+                        .canvas
+                        .show(ui, s.extent, &s.items, s.outlines, s.outlines);
+                    s.log.push(r);
+                }
+            },
+            State {
+                canvas: PlanCanvas::new(),
+                extent: [0.0, 0.0, 1000.0, 1000.0],
+                items: vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+                log: Vec::new(),
+                outlines: true,
+            },
+        )
+}
+
+fn warning_badge(id: u64, at: [f64; 2], count: u32) -> CanvasBadge {
+    CanvasBadge {
+        id,
+        at,
+        tone: Tone::Warning,
+        count,
+        description: format!("{count} problems here"),
+        hover: None,
+    }
+}
+
+#[test]
+fn a_badges_hover_can_say_more_than_its_name() {
+    let mut h = themed_harness();
+    let detailed = CanvasBadge {
+        description: "2 problems between a and b".into(),
+        hover: Some("Too thin\nA seam shows".into()),
+        ..warning_badge(7, [300.0, 300.0], 2)
+    };
+    h.state_mut()
+        .canvas
+        .set_badges(vec![detailed, warning_badge(8, [700.0, 700.0], 1)]);
+    h.run();
+    // Named by its description; the hover is its accessible description.
+    let node = badge_button(&h, "2 problems between a and b");
+    assert_eq!(
+        node.accesskit_node().description().as_deref(),
+        Some("Too thin\nA seam shows")
+    );
+    let at = node.rect().center();
+    h.hover_at(at);
+    h.run_steps(80);
+    assert!(
+        h.query_by_label("Too thin\nA seam shows").is_some(),
+        "its hover text shows"
+    );
+    assert_eq!(
+        h.query_all_by_label("2 problems between a and b").count(),
+        1,
+        "the name alone, not as hover text"
+    );
+    // Without one, the description shows on hover (and describes nothing
+    // more).
+    let plain = badge_button(&h, "1 problems here");
+    assert_eq!(plain.accesskit_node().description(), None);
+    let at = plain.rect().center();
+    h.hover_at(at);
+    h.run_steps(80);
+    assert_eq!(h.query_all_by_label("1 problems here").count(), 2);
+}
+
+fn painted_text(h: &Harness<'_, State>) -> String {
+    fn walk(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => out.push_str(t.galley.text()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    for c in &h.output().shapes {
+        walk(&c.shape, &mut out);
+    }
+    out
+}
+
+fn badge_button<'a>(h: &'a Harness<'static, State>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.get_by_role_and_label(egui::accesskit::Role::Button, label)
+}
+
+#[test]
+fn a_badge_shows_icon_and_count_and_clicks() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [500.0, 500.0], 2)]);
+    h.run();
+    let text = painted_text(&h);
+    assert!(
+        text.contains(crate::icons::TRIANGLE_ALERT),
+        "the tone's icon"
+    );
+    assert!(text.contains('2'), "the count");
+    h.state_mut().log.clear();
+    badge_button(&h, "2 problems here").click();
+    h.run();
+    let log = &h.state().log;
+    assert!(
+        log.iter().any(|r| r.badge_clicked == Some(7)),
+        "{:?}",
+        log.iter().map(|r| r.badge_clicked).collect::<Vec<_>>()
+    );
+    assert!(
+        log.iter().all(|r| r.clicked.is_none() && !r.clicked_empty),
+        "the canvas saw no click"
+    );
+}
+
+#[test]
+fn a_focused_badge_activates_with_enter() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(9, [300.0, 300.0], 1)]);
+    h.run();
+    badge_button(&h, "1 problems here").focus();
+    h.run();
+    h.state_mut().log.clear();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert!(
+        h.state().log.iter().any(|r| r.badge_clicked == Some(9)),
+        "Enter on the focused badge clicks it"
+    );
+}
+
+#[test]
+fn a_press_on_a_badge_does_not_pan() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [500.0, 500.0], 2)]);
+    h.run();
+    let centre = |h: &Harness<'_, State>| {
+        let (_, now) = h.state().canvas.last_frame().unwrap();
+        h.state().canvas.view().centre(now)
+    };
+    let before = centre(&h);
+    let p = badge_button(&h, "2 problems here").rect().center();
+    h.state_mut().log.clear();
+    h.hover_at(p);
+    h.drag_at(p);
+    h.hover_at(p + Vec2::new(80.0, 40.0));
+    h.run();
+    h.event(egui::Event::PointerButton {
+        pos: p + Vec2::new(80.0, 40.0),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run();
+    assert_eq!(centre(&h), before, "the view stayed put");
+    assert!(
+        h.state().log.iter().all(|r| r.held.is_none()),
+        "a press on a badge is no hold"
+    );
+}
+
+#[test]
+fn badges_keep_their_screen_size_when_zooming() {
+    let mut h = themed_harness();
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [500.0, 500.0], 2)]);
+    h.run();
+    let before = badge_button(&h, "2 problems here").rect();
+    h.state_mut().canvas.zoom_to([400.0, 400.0, 600.0, 600.0]);
+    h.run();
+    let after = badge_button(&h, "2 problems here").rect();
+    assert!(before.width() > 8.0 && before.height() > 8.0, "{before:?}");
+    assert!((before.width() - after.width()).abs() < 0.01);
+    assert!((before.height() - after.height()).abs() < 0.01);
+}
+
+#[test]
+fn polylines_paint_on_both_canvases() {
+    let solid = egui::Color32::from_rgb(11, 22, 33);
+    let dashed = egui::Color32::from_rgb(44, 55, 66);
+    let lines = vec![
+        Polyline {
+            points: vec![[100.0, 100.0], [500.0, 300.0], [900.0, 100.0]],
+            color: solid,
+            width: 3.0,
+            dashed: false,
+        },
+        Polyline {
+            points: vec![[100.0, 900.0], [900.0, 900.0]],
+            color: dashed,
+            width: 2.5,
+            dashed: true,
+        },
+    ];
+    let mut h = themed_harness();
+    h.state_mut().canvas.set_lines(lines.clone());
+    h.run();
+    assert!(
+        crate::testutil::has_stroke(&h.output().shapes, solid, 3.0),
+        "solid, plan"
+    );
+    assert!(
+        crate::testutil::has_stroke(&h.output().shapes, dashed, 2.5),
+        "dashed, plan"
+    );
+    h.state_mut().canvas.set_lines(Vec::new());
+    h.run();
+    assert!(
+        !crate::testutil::has_stroke(&h.output().shapes, solid, 3.0),
+        "cleared"
+    );
+}
+
+#[test]
+fn a_polyline_off_screen_draws_no_stroke() {
+    let colour = egui::Color32::from_rgb(77, 88, 99);
+    let mut h = themed_harness();
+    let line = |width, dashed| Polyline {
+        points: vec![[5000.0, 5000.0], [6000.0, 7000.0]],
+        color: colour,
+        width,
+        dashed,
+    };
+    h.state_mut()
+        .canvas
+        .set_lines(vec![line(3.0, false), line(2.0, true)]);
+    h.run();
+    assert!(!crate::testutil::has_stroke(
+        &h.output().shapes,
+        colour,
+        3.0
+    ));
+    assert!(!crate::testutil::has_stroke(
+        &h.output().shapes,
+        colour,
+        2.0
+    ));
+}
+
+#[test]
+fn a_focused_badge_at_the_edge_keeps_its_ring_inside_the_canvas() {
+    let mut h = Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if crate::testutil::themed(ui) {
+                    // A canvas smaller than the window, as beside an inspector.
+                    ui.set_max_size(Vec2::new(600.0, 500.0));
+                    let r = s
+                        .canvas
+                        .show(ui, s.extent, &s.items, s.outlines, s.outlines);
+                    s.log.push(r);
+                }
+            },
+            State {
+                canvas: PlanCanvas::new(),
+                extent: [0.0, 0.0, 1000.0, 1000.0],
+                items: vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+                log: Vec::new(),
+                outlines: true,
+            },
+        );
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [1004.0, 500.0], 2)]);
+    h.state_mut().canvas.zoom_to([700.0, 400.0, 990.0, 600.0]);
+    h.run();
+    badge_button(&h, "2 problems here").focus();
+    h.run();
+    let (viewport, _) = h.state().canvas.last_frame().unwrap();
+    let node = badge_button(&h, "2 problems here").rect();
+    assert!(
+        viewport.expand(0.01).contains_rect(node),
+        "{node:?} in {viewport:?}"
+    );
+    let ring = h
+        .output()
+        .shapes
+        .iter()
+        .find(|c| {
+            matches!(&c.shape, egui::Shape::Rect(r)
+                if r.stroke.color == crate::theme::palette::ACCENT_400 && r.stroke.width == 2.0)
+        })
+        .expect("the focus ring is painted");
+    assert!(
+        viewport.expand(0.01).contains_rect(ring.clip_rect),
+        "ring clipped to {:?}, canvas {viewport:?}",
+        ring.clip_rect
+    );
 }

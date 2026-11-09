@@ -15,6 +15,7 @@ mod compositions;
 mod display_stretch;
 mod export_dialog;
 mod jobs;
+mod marks;
 mod mosaic_view;
 mod panel_edits;
 mod panel_list;
