@@ -510,7 +510,8 @@ impl SessionWindow {
     /// canvas drops its textures. While the ROIs are not synced with the
     /// current frame (between an analysis applying and their reprojection
     /// landing) it is handed none, a patch could be drawn at an old rect;
-    /// its textures are kept meanwhile ([`PatchTextures::withhold`]).
+    /// its textures are kept meanwhile
+    /// ([`crate::preview_draw::PatchTextures::withhold`]).
     fn give_patches(&mut self, ctx: &egui::Context, session: &OpenSession) {
         let synced = self.mosaic.rois_synced();
         let wants = self.preview_wants(session);
