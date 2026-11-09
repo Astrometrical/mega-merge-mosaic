@@ -6,8 +6,8 @@
 //! |---|---|
 //! | Panels | none: "Add panels"; previews running: "Reading previews {done} / {n}" (cancellable); previews stopped short: "Read previews" (next); else "{n} panels" (done) |
 //! | Checks | no panels, no checks yet, or an analysis about to start by itself: "Checks"; analysis running or queued: "Analysing…" (cancellable); checks running: "Checking…"; an analysis the pipeline left to the user ([`Pipeline::analysis_stalled`]): "Analyse" (next); "{p} problem(s)" (warn); else "Checks passed" (done) |
-//! | Merge | a whole-canvas merge queued while an export runs: "Merge queued after export" (cancellable, no fraction); whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, it needs analysis, or a region of it was merged with other settings): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
-//! | Export | exports running or queued: "Exporting {i} of {n}" ("Exporting" for one) (cancellable); else "Export" |
+//! | Merge | no whole-canvas merge running, and one queued waiting for an export of its group ([`JobRunner::merge_waits_for_export`]): "Merge queued after export" (cancellable, no fraction); whole-canvas merges running or queued: "Merging {group} · {i} of {n} · {pct} %" (cancellable; no "{i} of {n}" for one merge, no group name in a session of one group); no groups, or analysis needed or running: "Merge"; nothing ever merged: "Merge" (next); a group out of date ([`out_of_date`]: no complete result, it needs analysis, or a region of it was merged with other settings): "Out of date" (next); a group whose last merge used other settings than the draft ([`draft_changed`]): "Settings changed" (next); else "Merged" (done) |
+//! | Export | exports running or queued: "Exporting {i} of {n}" ("Exporting" for one) (cancellable: Cancel cancels them all); some group ready to export and every such group exported since its last merge ([`exported`]): "Exported" (done); else "Export" |
 //!
 //! One step at most is next (highlighted): the first that waits for the
 //! user; a later one shows as to do. Steps working by themselves are no
@@ -49,7 +49,7 @@ pub fn steps(
         panels_step(session, pipeline),
         checks_step(session, jobs, &views, pipeline, checks),
         merge_step(session, jobs, &views),
-        export_step(jobs, &views),
+        export_step(session, jobs, &views),
     ];
     // One next step: the first.
     let mut next = false;
@@ -99,6 +99,24 @@ pub fn out_of_date(session: &OpenSession, group: &str) -> bool {
 pub fn draft_changed(session: &OpenSession, group: &str) -> bool {
     let cfg = &session.mosaic.config;
     !out_of_date(session, group) && settings_changed(cfg, group, &load_draft(cfg))
+}
+
+/// Whether the session's mosaics are exported: some group is ready to
+/// export (its result is complete and not [`out_of_date`]; "Settings
+/// changed" does not matter), and every such group was exported (alone or
+/// in a composite) since its last merge ([`Stamps::exported`], the summary's
+/// stamps, as the start screen reads them).
+///
+/// [`Stamps::exported`]: crate::session::Stamps::exported
+pub fn exported(session: &OpenSession) -> bool {
+    let ready: Vec<String> = group_names(session)
+        .into_iter()
+        .filter(|g| !out_of_date(session, g))
+        .collect();
+    !ready.is_empty()
+        && ready
+            .iter()
+            .all(|g| session.stamps.get(g).is_some_and(|s| s.exported()))
 }
 
 /// Whether a merge is needed: some group is [`out_of_date`] or its
@@ -226,7 +244,7 @@ fn merge_step(session: &OpenSession, jobs: &JobRunner, views: &[JobView]) -> Str
     }
 }
 
-fn export_step(jobs: &JobRunner, views: &[JobView]) -> StripStep {
+fn export_step(session: &OpenSession, jobs: &JobRunner, views: &[JobView]) -> StripStep {
     match jobs.run_of(JobTarget::Export) {
         Some(run) => working(
             if run.count > 1 {
@@ -236,6 +254,7 @@ fn export_step(jobs: &JobRunner, views: &[JobView]) -> StripStep {
             },
             Some(fraction(views, run.id).unwrap_or(0.0)),
         ),
+        None if exported(session) => step("Exported", StepState::Done),
         None => step("Export", StepState::Todo),
     }
 }

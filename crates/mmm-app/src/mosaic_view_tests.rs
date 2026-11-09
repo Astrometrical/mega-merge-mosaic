@@ -1223,6 +1223,7 @@ fn previews_do_not_move_persisted_rois() {
         summary: None,
         merged: false,
         results: Default::default(),
+        stamps: Default::default(),
     };
     // The previews run in the panels' frame...
     let mut jobs = JobRunner::new(egui::Context::default());

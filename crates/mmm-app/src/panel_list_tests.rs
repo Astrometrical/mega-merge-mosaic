@@ -903,11 +903,13 @@ fn panels_edit_spares_exports() {
     let (root, mut s, mut jobs) = analyzed("list-edit-export");
     jobs.start_blend(&mut s, "Ha", None);
     drain(&mut jobs, &mut s);
-    // A merge runs (held) with an export queued behind it.
-    let first = jobs.hold();
+    // A merge runs with an export beside it, each held at its own gate.
+    let merge_gate = jobs.hold();
     let blend = jobs.start_blend(&mut s, "OIII", None);
+    let export_gate = jobs.hold_exports();
     let out = root.join("ha.fits");
-    let export = jobs.start_export(&s, "Ha", out.clone(), ExportFormat::Fits);
+    let ha = crate::jobs::ExportTarget::Group("Ha".into());
+    let export = jobs.start_export(&s, ha, out.clone(), ExportFormat::Fits);
     let mut edit = PanelsEdit::of(&s);
     edit.panels.pop();
     // The edit cancels the merge but not the export, and waits for the
@@ -917,19 +919,18 @@ fn panels_edit_spares_exports() {
     };
     let labels: Vec<String> = jobs.views().into_iter().map(|v| v.label).collect();
     assert_eq!(labels, ["Merge OIII", "Export Ha"], "export kept");
-    let second = jobs.hold();
-    first.open();
+    merge_gate.open();
     let mut events = Vec::new();
     let deadline = Instant::now() + PATIENCE;
     while jobs.views().first().map(|v| v.label.as_str()) != Some("Export Ha") {
-        assert!(Instant::now() < deadline, "the export never ran");
+        assert!(Instant::now() < deadline, "the merge never ended");
         std::thread::sleep(Duration::from_millis(5));
         events.extend(jobs.poll(&mut s));
     }
     // A running export does not hold the edit back.
     assert!(matches!(edit.apply(&mut s, &mut jobs), Applied::Done));
     assert_eq!(s.mosaic.config.panels.len(), 7);
-    second.open();
+    export_gate.open();
     events.extend(drain(&mut jobs, &mut s));
     assert!(events.contains(&JobEvent::Cancelled { id: blend }));
     assert!(

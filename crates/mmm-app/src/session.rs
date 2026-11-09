@@ -12,7 +12,9 @@ use mmm_core::mosaic::{
     lock_session,
 };
 use mmm_core::reference::ReferenceFrame;
-use mmm_core::session_summary::{ResultState, SessionSummary, read_summary, result_state};
+use mmm_core::session_summary::{
+    GroupSummary, ResultState, SessionSummary, read_summary, result_state,
+};
 use serde_json::Value;
 
 use crate::util::group_names;
@@ -37,7 +39,8 @@ pub struct OpenSession {
     /// made to hand the session to a new process.
     pub lock: Option<SessionLock>,
     /// The session's `summary.json` as found when opening (`None` if absent
-    /// or unreadable); seeds the summary writer's blend and export stamps.
+    /// or unreadable); [`OpenSession::stamps`] start from its blend and
+    /// export stamps.
     pub summary: Option<SessionSummary>,
     /// Something has been merged: a processing group's result store exists
     /// ([`any_merged`], when opening), or a merge finished since (set by the
@@ -50,6 +53,49 @@ pub struct OpenSession {
     /// complete at once (the session window). A group missing here has no
     /// result. Says which groups need merging.
     pub results: BTreeMap<String, ResultState>,
+    /// When each group was last merged and exported: from the summary found
+    /// when opening ([`stamps_of`]), then stamped as merges and exports
+    /// finish (the shell, through
+    /// [`SummaryWriter::on_job_event`](crate::summary_writer::SummaryWriter::on_job_event)),
+    /// and written into the summary. A group missing here has neither.
+    pub stamps: BTreeMap<String, Stamps>,
+}
+
+/// When a group was last merged and last exported, in unix seconds: what
+/// `summary.json` records of it ([`GroupSummary`]'s `blended_at` and
+/// `exported_at`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stamps {
+    /// When a merge of the group last finished.
+    pub blended_at: Option<u64>,
+    /// When an export of the group (or of a composite of it) last finished.
+    pub exported_at: Option<u64>,
+}
+
+impl Stamps {
+    /// The stamps summary group `g` records.
+    pub fn of(g: &GroupSummary) -> Self {
+        Stamps {
+            blended_at: g.blended_at,
+            exported_at: g.exported_at,
+        }
+    }
+
+    /// Whether the group was exported since its last merge: both are
+    /// stamped and the export is no earlier. The start screen's "exported"
+    /// and the Export step's **Exported** both read this.
+    pub fn exported(&self) -> bool {
+        matches!((self.blended_at, self.exported_at), (Some(b), Some(e)) if e >= b)
+    }
+}
+
+/// Each group's stamps as `summary` records them (none without one).
+pub fn stamps_of(summary: Option<&SessionSummary>) -> BTreeMap<String, Stamps> {
+    summary
+        .iter()
+        .flat_map(|s| &s.groups)
+        .map(|g| (g.name.clone(), Stamps::of(g)))
+        .collect()
 }
 
 impl OpenSession {
@@ -158,6 +204,7 @@ fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
     // Reads panel headers (Header rule): fine here, off the UI thread.
     let groups = mosaic.groups().ok();
     let summary = read_summary(dir);
+    let stamps = stamps_of(summary.as_ref());
     let mut session = OpenSession {
         mosaic,
         frame,
@@ -166,6 +213,7 @@ fn open_with(dir: &Path, lock: bool) -> Result<OpenSession, String> {
         summary,
         merged: false,
         results: BTreeMap::new(),
+        stamps,
     };
     session.merged = any_merged(&session);
     session.results = classify_results(&session);
@@ -225,6 +273,7 @@ pub fn create_blocking(dir: &Path) -> Result<OpenSession, String> {
         summary: None,
         merged: false,
         results: BTreeMap::new(),
+        stamps: BTreeMap::new(),
     })
 }
 

@@ -115,7 +115,7 @@ use crate::compositions::{
     Composition, ViewKind, composition_stretch_key, load_compositions, migrate_composition_ids,
     restore_composition,
 };
-use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, JobTarget};
+use crate::jobs::{ANALYZE_LABEL, ExportTarget, JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
 use crate::panel_edits::FilesPicker;
 use crate::panel_list::{PanelList, PanelListOutput};
@@ -491,7 +491,7 @@ impl SessionWindow {
             self.inspector.reveal(MERGE_SETTINGS);
         }
         if let JobEvent::Finished { id, .. } = event
-            && let Some((JobTarget::Blend, group)) = jobs.target(*id)
+            && let Some((JobTarget::Blend, ExportTarget::Group(group))) = jobs.target(*id)
         {
             session.merged = true;
             if jobs.whole_canvas(*id) {

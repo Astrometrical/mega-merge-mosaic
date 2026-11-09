@@ -966,7 +966,9 @@ algorithm changed. Spec: `docs/superpowers/specs/2026-11-02-standalone-app-desig
   win: a settings edit cancels and joins a running job before applying; an
   analysis cancels everything; a blend cancels (or replaces) only a running
   or queued blend of the same group, and blends of other groups queue and
-  run in order.
+  run in order. It has two lanes, one job running in each: analyses,
+  previews and merges share the main lane, and exports run on their own
+  (see "Exports have their own lane" below).
   Group resolution (reads panel headers) runs on a worker via
   `plan_analyze_with`. The `apply_*` saves of `mosaic.json` stay on the UI
   thread (small atomic write; the core requires apply on the owner thread).
@@ -1278,7 +1280,13 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   never restarts it); otherwise analysis starts by itself. Merging reads "Merging
   {group} · {i} of {n} · {pct} %", without "{i} of {n}" for a single merge and
   without the group in a session of one group (an OSC mosaic: "Merging · 43
-  %"; its jobs and toasts are "Merge" and "Merge finished"). A step that
+  %"; its jobs and toasts are "Merge" and "Merge finished"). Export reads
+  "Exporting {i} of {n}" while exports run or wait (cancellable: Cancel
+  cancels them all), **Exported** (done) when some group is ready to export
+  (complete and not `out_of_date`) and every ready group was exported, alone
+  or in a composite, since its last merge (`steps::exported`: the summary's
+  `exported_at >= blended_at`, the start screen's rule, `Stamps::exported`),
+  else "Export". A step that
   cannot act now says why in its tooltip (Merge: the merge guard's reason;
   Export: `MosaicView::export_block_reason`). ROI previews are not jobs and
   not shown in the strip.
@@ -1291,8 +1299,9 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   not out of date, but its last whole-canvas merge used different effective
   merge settings from the draft (`mmm_core::mosaic::settings_changed`, the
   draft with the group's override applied). The Merge step reads, in order:
-  "Merge queued after export" (a whole-canvas merge waiting behind a running
-  export; cancellable, no fraction), "Merging …" (above), "Merge" (no
+  "Merge queued after export" (a whole-canvas merge waiting for an export of
+  its group while no whole-canvas merge runs; cancellable, no fraction),
+  "Merging …" (above), "Merge" (no
   groups, analysis needed or running; or nothing ever merged, as the next
   step), "Out of date" (some group `out_of_date`; next), "Settings changed"
   (some group `draft_changed`; next) or "Merged" (done). The step strip, the
@@ -1423,10 +1432,23 @@ algorithm changed. The UI copy is British English ("Analyse", "colour").
   cancels every non-export job (`JobRunner::cancel_for_panel_edit`,
   unaffected groups' merges included); a whole merge it stopped raises
   "Merge stopped: panels changed" once per edit.
-- **Merges behind exports.** The runner has a single slot, so every merge
-  waits behind a running export (not only a merge of the group being
-  exported); the strip says "Merge queued after export"
-  (`JobRunner::merge_waits_for_export`).
+- **Exports have their own lane** (`jobs.rs`). Exports run one at a time,
+  in order, on a lane of their own, beside the main lane's work. Only a
+  merge (whole canvas or a region) of a group being exported waits
+  (`JobRunner::exporting_groups`: the groups of the exports running or
+  queued, a composite's export counting each of its groups): it stays
+  queued while the jobs after it start, and the strip says "Merge queued
+  after export" (`JobRunner::merge_waits_for_export`). Merges of other
+  groups run during the export. The rule is a hard one: a merge rewrites
+  the store an export reads (torn tiles would be exported as zeros) and may
+  recreate it, which faults a live reader. For the same reason an export
+  waits for a running merge of a group it reads (a queued one never holds
+  it back) and for an analysis; an analysis cancels the running export,
+  drops queued ones and starts once the cancelled export has ended. A
+  panel edit spares exports. Leaving the session stops both lanes (or hands
+  both lanes' workers to the reaper, which keeps the lock until they end).
+  A composite's export is one job ("Export {composite name}"); when it
+  finishes it stamps `exported_at` for each of its groups.
 - **Display stretch** (`display_stretch.rs`). Always automatic, never set by
   hand, one rule for the plan and the mosaic: an automatic stretch per
   channel, with **Linked** (one stretch for all channels) and **Strong** (a

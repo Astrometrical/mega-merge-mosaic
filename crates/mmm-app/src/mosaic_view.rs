@@ -122,7 +122,7 @@ use crate::camera::Camera;
 use crate::compositions::{Composition, ViewKind, composition_stretch_key, load_compositions};
 use crate::display_stretch::DisplayStretch;
 use crate::export::{ExportAction, ExportDialog, RfdSavePicker};
-use crate::jobs::{JobEvent, JobRunner};
+use crate::jobs::{ExportTarget, JobEvent, JobRunner};
 use crate::plan_view::CanvasLook;
 use crate::rois::{Roi, RoiPanel};
 use crate::session::OpenSession;
@@ -870,7 +870,7 @@ impl MosaicView {
             }
             Some(ExportAction::Export(dests, format)) => {
                 for (group, out) in dests {
-                    jobs.start_export(session, &group, out, format);
+                    jobs.start_export(session, ExportTarget::Group(group), out, format);
                 }
             }
             None => {}

@@ -16,7 +16,10 @@
 //! saves the configuration, and these writes are bookkeeping, not
 //! processing — no pixel data is read or written.
 //!
-//! At most one job runs at a time; newer requests queue behind it:
+//! Jobs run in two lanes, one job at a time in each; newer requests queue
+//! behind the running one.
+//!
+//! **The main lane** runs analyses, previews and merges:
 //!
 //! - A new analysis cancels the running job and replaces everything
 //!   queued: it re-stales every group anyway. Panel previews are the
@@ -29,15 +32,28 @@
 //!   that group's queued blends; blends of other groups are kept and run
 //!   in order. Behind a running analysis it waits (its group cannot be
 //!   blended until the analysis is applied).
-//! - An export queues behind everything and cancels nothing; an analysis
-//!   cancels a running export and drops queued ones like any other job.
-//!   It reads its group's result through a [`mmm_core::tiles::TileReader`]
-//!   (never the store's writer lock); since one job runs at a time, no
-//!   blend can recreate the store under it.
+//! - A blend (of the whole canvas or of a region) of a group being
+//!   exported ([`JobRunner::exporting_groups`]: by an export running or
+//!   queued, a composite's export counting each of its groups) waits in
+//!   the queue until no export reads that group, and the jobs queued
+//!   after it start meanwhile. Blends of other groups run beside the
+//!   export. A blend rewrites the store an export reads, and may recreate
+//!   it, which faults a reader still mapping it.
 //!
-//! A queued job starts once `poll` has applied (or discarded) its
-//! predecessor's outcome; its worker joins the predecessor's thread before
-//! running, so that wait never happens on the UI thread.
+//! **The export lane** runs exports one at a time, in order. An export
+//! reads its groups' results through [`mmm_core::tiles::TileReader`]s
+//! (never a store's writer lock) and writes a file of its own. It waits
+//! for an analysis (running or queued) and for a running blend of a group
+//! it reads; a queued blend never holds it back (that blend waits for the
+//! export instead). A new analysis cancels the running export and drops
+//! queued ones, since it may recreate the stores they read, and starts
+//! once the cancelled export has ended. Input edits spare exports
+//! ([`JobRunner::cancel_all_but_exports`]).
+//!
+//! A queued job starts once `poll` has applied (or discarded) its lane's
+//! predecessor's outcome; its worker joins that predecessor's thread
+//! before running, so that wait never happens on the UI thread. The two
+//! lanes' workers never wait for each other.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -46,7 +62,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mega_ui::jobs::JobView;
-use mmm_core::export::{ExportFormat, ExportReport, export_group};
+use mmm_core::export::{
+    CompositeChannels, ExportFormat, ExportReport, export_composite, export_group,
+};
 use mmm_core::job::{CancelToken, JobCtl};
 use mmm_core::mosaic::grouping::Groups;
 use mmm_core::mosaic::{
@@ -102,12 +120,63 @@ pub enum JobEvent {
     },
 }
 
-/// The kind of job that works on one group's result.
+/// What an export writes, and so what a blend or export job works on
+/// ([`JobRunner::target`]): one group's mosaic (every blend is of one
+/// group), or a composite of groups (exports only) as one three-channel
+/// file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportTarget {
+    /// A group's merged mosaic, by group name.
+    Group(String),
+    /// A composite: its groups' mosaics as the red, green and blue planes.
+    // Nothing in the UI starts one yet: the view's Export dialog exports a
+    // composite view's groups one by one.
+    #[allow(dead_code)]
+    Composite {
+        /// The composite's id (it stays when the composite is renamed).
+        id: u64,
+        /// The composite's name (the job's label, the file's provenance).
+        name: String,
+        /// The group in each of the red, green and blue planes; `None`
+        /// leaves a plane empty (zeros).
+        channels: [Option<String>; 3],
+    },
+}
+
+impl ExportTarget {
+    /// The groups it reads, each once, in channel order: a group's export
+    /// reads its group.
+    pub fn groups(&self) -> Vec<&str> {
+        match self {
+            ExportTarget::Group(g) => vec![g.as_str()],
+            ExportTarget::Composite { channels, .. } => {
+                let mut groups: Vec<&str> = Vec::new();
+                for g in channels.iter().flatten() {
+                    if !groups.contains(&g.as_str()) {
+                        groups.push(g);
+                    }
+                }
+                groups
+            }
+        }
+    }
+
+    /// Its name: the group's, or the composite's.
+    pub fn name(&self) -> &str {
+        match self {
+            ExportTarget::Group(g) => g,
+            ExportTarget::Composite { name, .. } => name,
+        }
+    }
+}
+
+/// The kind of job that works on group results (what on:
+/// [`JobRunner::target`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobTarget {
-    /// A blend of the group.
+    /// A blend of a group.
     Blend,
-    /// An export of the group's result.
+    /// An export of a group's result, or of a composite's.
     Export,
 }
 
@@ -118,7 +187,7 @@ pub enum JobTarget {
 pub struct Run {
     /// The job at the head of the run: running, else the first queued.
     pub id: u64,
-    /// The head job's group.
+    /// The head job's group (a composite's export: the composite's name).
     pub group: String,
     /// The head job's place in the run, from 1.
     pub position: usize,
@@ -143,15 +212,15 @@ enum Kind {
     Export(ExportJob),
 }
 
-/// An export of one group's blended result to a file.
+/// An export of a group's blended result, or of a composite's, to a file.
 #[derive(Clone, Debug)]
 struct ExportJob {
-    group: String,
+    target: ExportTarget,
     out: std::path::PathBuf,
     format: ExportFormat,
 }
 
-/// A job waiting for the running one to end.
+/// A job waiting for its lane's running one to end.
 struct Queued {
     id: u64,
     kind: Kind,
@@ -211,9 +280,11 @@ enum Msg {
     Done(Box<Done>),
 }
 
-/// The running job.
+/// A lane's running job.
 struct Running {
     id: u64,
+    /// The lane it runs on.
+    lane: LaneId,
     token: CancelToken,
     rx: Receiver<Msg>,
     handle: JoinHandle<()>,
@@ -224,13 +295,61 @@ struct Running {
     resolving: Option<(GroupInputs, AnalyzeScope)>,
     /// A previews job (analysis queues behind it rather than cancel it).
     previews: bool,
-    /// An export job (input edits spare it).
-    export: bool,
     stage: String,
     done: u64,
     total: u64,
     /// Progress updates received so far.
     updates: u64,
+}
+
+/// Which lane a job runs on (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaneId {
+    /// Analyses, previews and merges.
+    Main,
+    /// Exports.
+    Exports,
+}
+
+/// One lane of jobs: one runs at a time, the rest wait their turn.
+#[derive(Default)]
+struct Lane {
+    running: Option<Running>,
+    queue: VecDeque<Queued>,
+    /// The lane's last finished worker's thread, joined by its next worker.
+    previous: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    gate: Option<Arc<tests::Gate>>,
+    #[cfg(test)]
+    stepper: Option<Arc<tests::Stepper>>,
+}
+
+impl Lane {
+    /// Whether a job runs or waits on it.
+    fn busy(&self) -> bool {
+        self.running.is_some() || !self.queue.is_empty()
+    }
+
+    /// The running job's id, then the queued ones'.
+    fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.running
+            .iter()
+            .map(|r| r.id)
+            .chain(self.queue.iter().map(|q| q.id))
+    }
+
+    /// Drop the queued jobs `keep` does not pick; their ids, in order.
+    fn drop_queued(&mut self, keep: impl Fn(&Kind) -> bool) -> Vec<u64> {
+        let mut dropped = Vec::new();
+        self.queue.retain(|q| {
+            let kept = keep(&q.kind);
+            if !kept {
+                dropped.push(q.id);
+            }
+            kept
+        });
+        dropped
+    }
 }
 
 /// Limits progress updates to one per `min` interval; a final update
@@ -258,18 +377,20 @@ impl Throttle {
     }
 }
 
-/// Runs analysis and blend jobs off the UI thread for one session.
+/// Runs analysis, previews, blend and export jobs off the UI thread for one
+/// session, in two lanes (see the module docs).
 pub struct JobRunner {
     ctx: egui::Context,
     next_id: u64,
-    running: Option<Running>,
-    queue: VecDeque<Queued>,
-    /// The last finished worker's thread, joined by the next worker.
-    previous: Option<JoinHandle<()>>,
+    /// Analyses, previews and merges.
+    main: Lane,
+    /// Exports.
+    exports: Lane,
     /// Every job's label, by id (for notices about ended jobs).
     labels: BTreeMap<u64, String>,
-    /// Blend and export jobs' group, by id (see [`JobRunner::target`]).
-    targets: BTreeMap<u64, (JobTarget, String)>,
+    /// Blend and export jobs' kind and what they work on, by id (see
+    /// [`JobRunner::target`]).
+    targets: BTreeMap<u64, (JobTarget, ExportTarget)>,
     /// The blends of the whole canvas (not of an ROI), by id.
     whole: BTreeSet<u64>,
     /// Whole-canvas blends and exports that ended (ran to an end, whatever
@@ -287,10 +408,6 @@ pub struct JobRunner {
     /// The frame of the last previews run that finished with every panel,
     /// until taken ([`JobRunner::take_previews_frame`]).
     previews_frame: Option<ReferenceFrame>,
-    #[cfg(test)]
-    gate: Option<std::sync::Arc<tests::Gate>>,
-    #[cfg(test)]
-    stepper: Option<std::sync::Arc<tests::Stepper>>,
     /// Called once [`JobRunner::stop_all`] has cancelled the jobs.
     #[cfg(test)]
     on_stop: Option<Box<dyn FnOnce() + Send>>,
@@ -302,9 +419,8 @@ impl JobRunner {
         JobRunner {
             ctx,
             next_id: 1,
-            running: None,
-            queue: VecDeque::new(),
-            previous: None,
+            main: Lane::default(),
+            exports: Lane::default(),
             labels: BTreeMap::new(),
             targets: BTreeMap::new(),
             whole: BTreeSet::new(),
@@ -315,17 +431,15 @@ impl JobRunner {
             merge_stopped: false,
             previews_frame: None,
             #[cfg(test)]
-            gate: None,
-            #[cfg(test)]
-            stepper: None,
-            #[cfg(test)]
             on_stop: None,
         }
     }
 
     /// Analyze every group; returns the job id. Cancels the running job and
     /// replaces anything queued (newer work wins), except previews: the
-    /// analysis waits for them.
+    /// analysis waits for them. Exports too are cancelled (a running one;
+    /// queued ones are dropped), and the analysis starts once the running
+    /// export has ended: it may recreate the stores exports read.
     ///
     /// The groups are resolved on a worker first ("Resolving groups…").
     /// Planning then happens on the UI thread: it marks and saves
@@ -343,20 +457,17 @@ impl JobRunner {
     /// (see [`JobRunner::poll`]), reporting no failure.
     pub fn start_analyze_scoped(&mut self, session: &mut OpenSession, scope: AnalyzeScope) -> u64 {
         let id = self.new_id(ANALYZE_LABEL.into());
-        if let Some(r) = self.running.as_ref().filter(|r| !r.previews) {
+        if let Some(r) = self.main.running.as_ref().filter(|r| !r.previews) {
             r.token.cancel();
         }
-        let mut dropped = Vec::new();
-        self.queue.retain(|q| {
-            let keep = matches!(q.kind, Kind::Previews);
-            if !keep {
-                dropped.push(q.id);
-            }
-            keep
-        });
+        if let Some(r) = &self.exports.running {
+            r.token.cancel();
+        }
+        let mut dropped = self.main.drop_queued(|k| matches!(k, Kind::Previews));
+        dropped.extend(self.exports.drop_queued(|_| false));
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
-        self.queue.push_back(Queued {
+        self.main.queue.push_back(Queued {
             id,
             kind: Kind::Analyze { scope },
         });
@@ -372,20 +483,13 @@ impl JobRunner {
     /// Planning reads nothing (the worker reads the panels).
     pub fn start_previews(&mut self, session: &OpenSession) -> u64 {
         let id = self.new_id(PREVIEWS_LABEL.into());
-        if let Some(r) = self.running.as_ref().filter(|r| r.previews) {
+        if let Some(r) = self.main.running.as_ref().filter(|r| r.previews) {
             r.token.cancel();
         }
-        let mut dropped = Vec::new();
-        self.queue.retain(|q| {
-            let keep = !matches!(q.kind, Kind::Previews);
-            if !keep {
-                dropped.push(q.id);
-            }
-            keep
-        });
+        let dropped = self.main.drop_queued(|k| !matches!(k, Kind::Previews));
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
-        self.queue.push_back(Queued {
+        self.main.queue.push_back(Queued {
             id,
             kind: Kind::Previews,
         });
@@ -397,16 +501,17 @@ impl JobRunner {
     /// of `group`; returns the job id. Cancels a running blend of the same
     /// group and replaces its queued ones (newer work wins); blends of
     /// other groups are left to run, this one queueing behind them, and it
-    /// waits behind a running or queued analysis. Planned (on the UI
+    /// waits behind a running or queued analysis, and while `group` is
+    /// being exported ([`JobRunner::exporting_groups`]). Planned (on the UI
     /// thread, no I/O) when it starts.
     ///
     /// A blend may recreate (truncate) its group's store, which would fault
     /// (SIGBUS) any [`mmm_core::tiles::TileReader`] still mapping it. The
-    /// runner does not check that: callers must not start a blend while a
-    /// reader outside the job runner maps the store — the mosaic view gates
-    /// it on its tracked sources, the export check and the merge settings
-    /// tile count (see [`crate::mosaic_view`] and
-    /// [`crate::blend_settings`]).
+    /// runner keeps its own exports clear of it, but not other readers:
+    /// callers must not start a blend while a reader outside the job runner
+    /// maps the store — the mosaic view gates it on its tracked sources,
+    /// the export check and the merge settings tile count (see
+    /// [`crate::mosaic_view`] and [`crate::blend_settings`]).
     pub fn start_blend(
         &mut self,
         session: &mut OpenSession,
@@ -415,26 +520,21 @@ impl JobRunner {
     ) -> u64 {
         let settings = session.mosaic.config.settings_for(group).1;
         let id = self.new_id(job_label("Merge", group, session));
-        self.begin(JobTarget::Blend, id, group);
+        self.begin(JobTarget::Blend, id, ExportTarget::Group(group.to_string()));
         if rect.is_none() {
             self.whole.insert(id);
         }
-        if let Some(r) = &self.running
-            && r.blend.as_ref().is_some_and(|p| p.group == group)
+        if self.merging(group)
+            && let Some(r) = &self.main.running
         {
             r.token.cancel();
         }
-        let mut dropped = Vec::new();
-        self.queue.retain(|q| match &q.kind {
-            Kind::Blend { group: g, .. } if g == group => {
-                dropped.push(q.id);
-                false
-            }
-            Kind::Blend { .. } | Kind::Analyze { .. } | Kind::Previews | Kind::Export(_) => true,
-        });
+        let dropped = self
+            .main
+            .drop_queued(|k| !matches!(k, Kind::Blend { group: g, .. } if g == group));
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
-        self.queue.push_back(Queued {
+        self.main.queue.push_back(Queued {
             id,
             kind: Kind::Blend {
                 group: group.to_string(),
@@ -446,24 +546,31 @@ impl JobRunner {
         id
     }
 
-    /// Export `group`'s blended result to `out` as `format`; returns the
-    /// job id. Queues behind every other job and cancels nothing. Stale
+    /// Export `target` (a group's blended result, or a composite's) to `out`
+    /// as `format`; returns the job id. Runs on the export lane, after the
+    /// exports before it, and cancels nothing; it waits for an analysis and
+    /// for a running blend of a group it reads (see the module docs). Stale
     /// tiles are exported as they are and missing ones as zeros (warn the
     /// user first: [`mmm_core::export::export_check`]). Planning does no
-    /// I/O.
+    /// I/O. Labelled "Export {group}" ("Export" alone in a session of one
+    /// group), or "Export {composite name}".
     pub fn start_export(
         &mut self,
         session: &OpenSession,
-        group: &str,
+        target: ExportTarget,
         out: std::path::PathBuf,
         format: ExportFormat,
     ) -> u64 {
-        let id = self.new_id(job_label("Export", group, session));
-        self.begin(JobTarget::Export, id, group);
-        self.queue.push_back(Queued {
+        let label = match &target {
+            ExportTarget::Group(group) => job_label("Export", group, session),
+            ExportTarget::Composite { name, .. } => format!("Export {name}"),
+        };
+        let id = self.new_id(label);
+        self.begin(JobTarget::Export, id, target.clone());
+        self.exports.queue.push_back(Queued {
             id,
             kind: Kind::Export(ExportJob {
-                group: group.to_string(),
+                target,
                 out,
                 format,
             }),
@@ -472,34 +579,47 @@ impl JobRunner {
         id
     }
 
+    /// The groups the exports running or queued read: each group exported,
+    /// and each group of a composite exported. A blend of one of them
+    /// waits (see the module docs).
+    pub fn exporting_groups(&self) -> BTreeSet<String> {
+        self.exports
+            .ids()
+            .filter_map(|id| match self.targets.get(&id) {
+                Some((JobTarget::Export, target)) => Some(target.groups()),
+                _ => None,
+            })
+            .flatten()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Cancel job `id`: a running job winds down (reported by
     /// [`JobRunner::poll`] when it has); a queued one is dropped at once.
     /// Unknown ids are ignored.
     pub fn cancel(&mut self, id: u64) {
-        if let Some(r) = self.running.as_ref().filter(|r| r.id == id) {
-            r.token.cancel();
-        } else if let Some(i) = self.queue.iter().position(|q| q.id == id) {
-            self.queue.remove(i);
-            self.pending.push(JobEvent::Cancelled { id });
+        for lane in [&mut self.main, &mut self.exports] {
+            if let Some(r) = lane.running.as_ref().filter(|r| r.id == id) {
+                r.token.cancel();
+                return;
+            }
+            if let Some(i) = lane.queue.iter().position(|q| q.id == id) {
+                lane.queue.remove(i);
+                self.pending.push(JobEvent::Cancelled { id });
+                return;
+            }
         }
     }
 
-    /// Cancel every job but exports: the running one winds down (reported
-    /// by [`JobRunner::poll`] when it has), queued ones are dropped at once.
-    /// For input edits, which exports tolerate (they write stale tiles as
-    /// they are).
+    /// Cancel every job but exports (the main lane's): the running one
+    /// winds down (reported by [`JobRunner::poll`] when it has), queued ones
+    /// are dropped at once. For input edits, which exports tolerate (they
+    /// write stale tiles as they are).
     pub fn cancel_all_but_exports(&mut self) {
-        if let Some(r) = self.running.as_ref().filter(|r| !r.export) {
+        if let Some(r) = &self.main.running {
             r.token.cancel();
         }
-        let mut dropped = Vec::new();
-        self.queue.retain(|q| {
-            let keep = matches!(q.kind, Kind::Export(_));
-            if !keep {
-                dropped.push(q.id);
-            }
-            keep
-        });
+        let dropped = self.main.drop_queued(|_| false);
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
     }
@@ -511,11 +631,13 @@ impl JobRunner {
     /// some. Cancelling again later stops nothing new.
     pub fn cancel_for_panel_edit(&mut self) {
         let running = self
+            .main
             .running
             .iter()
-            .filter(|r| !r.export && !r.token.is_cancelled())
+            .filter(|r| !r.token.is_cancelled())
             .map(|r| r.id);
         let queued = self
+            .main
             .queue
             .iter()
             .filter(|q| matches!(q.kind, Kind::Blend { .. }))
@@ -541,28 +663,41 @@ impl JobRunner {
         std::mem::take(&mut self.merge_stopped)
     }
 
-    /// Whether a whole-canvas merge is queued while an export runs.
+    /// Whether a queued whole-canvas merge waits for an export (its group is
+    /// being exported, [`JobRunner::exporting_groups`]) while no
+    /// whole-canvas merge runs: the Merge step then says "Merge queued after
+    /// export" (while one runs, it shows that one).
     pub fn merge_waits_for_export(&self) -> bool {
-        self.running.as_ref().is_some_and(|r| r.export)
-            && self
-                .queue
-                .iter()
-                .any(|q| matches!(q.kind, Kind::Blend { .. }) && self.whole_canvas(q.id))
+        let merging = self
+            .main
+            .running
+            .as_ref()
+            .is_some_and(|r| r.blend.is_some() && self.whole_canvas(r.id));
+        let exporting = self.exporting_groups();
+        !merging
+            && self.main.queue.iter().any(|q| {
+                matches!(&q.kind, Kind::Blend { group, .. } if exporting.contains(group))
+                    && self.whole_canvas(q.id)
+            })
     }
 
     /// Cancel every job, exports included, and wait up to `wait` for the
-    /// running one to stop, applying (or discarding) its outcome as
-    /// [`JobRunner::poll`] does (a cancelled analysis keeps the groups it
-    /// finished). The events of the jobs that ended, and whether every job
-    /// stopped in time (one that did not winds down on its own, and nothing
-    /// applies its outcome). Blocks the calling (UI) thread: for leaving the
-    /// session only.
+    /// running ones (one per lane) to stop, applying (or discarding) their
+    /// outcomes as [`JobRunner::poll`] does (a cancelled analysis keeps the
+    /// groups it finished). The events of the jobs that ended, and whether
+    /// every job stopped in time (one that did not winds down on its own,
+    /// and nothing applies its outcome). Blocks the calling (UI) thread: for
+    /// leaving the session only.
     pub fn stop_all(&mut self, session: &mut OpenSession, wait: Duration) -> (Vec<JobEvent>, bool) {
         let deadline = Instant::now() + wait;
-        if let Some(r) = &self.running {
+        for r in [&self.main, &self.exports]
+            .into_iter()
+            .flat_map(|l| &l.running)
+        {
             r.token.cancel();
         }
-        let dropped: Vec<u64> = self.queue.drain(..).map(|q| q.id).collect();
+        let mut dropped = self.main.drop_queued(|_| false);
+        dropped.extend(self.exports.drop_queued(|_| false));
         self.pending
             .extend(dropped.into_iter().map(|id| JobEvent::Cancelled { id }));
         #[cfg(test)]
@@ -581,24 +716,33 @@ impl JobRunner {
     }
 
     /// Let go of the workers, e.g. of a job that did not stop in
-    /// [`JobRunner::stop_all`]'s wait: the running job (cancelled) and every
-    /// queued one are forgotten, and nothing applies their outcomes. Their
-    /// worker threads, and the last one that ended, are returned: once all
-    /// have been joined, nothing this runner started runs any more (each
-    /// worker joins its predecessor first).
+    /// [`JobRunner::stop_all`]'s wait: the running jobs (cancelled) and every
+    /// queued one are forgotten, on both lanes, and nothing applies their
+    /// outcomes. Their worker threads, and the last one that ended on each
+    /// lane, are returned: once all have been joined, nothing this runner
+    /// started runs any more (each worker joins its lane's predecessor
+    /// first).
     pub fn detach_workers(&mut self) -> Vec<JoinHandle<()>> {
-        self.queue.clear();
-        let running = self.running.take().map(|r| {
-            r.token.cancel();
-            r.handle
-        });
-        running.into_iter().chain(self.previous.take()).collect()
+        let mut workers = Vec::new();
+        for lane in [&mut self.main, &mut self.exports] {
+            lane.queue.clear();
+            if let Some(r) = lane.running.take() {
+                r.token.cancel();
+                workers.push(r.handle);
+            }
+            workers.extend(lane.previous.take());
+        }
+        workers
     }
 
     /// Whether a blend is running or queued.
     pub fn blending(&self) -> bool {
-        self.running.as_ref().is_some_and(|r| r.blend.is_some())
+        self.main
+            .running
+            .as_ref()
+            .is_some_and(|r| r.blend.is_some())
             || self
+                .main
                 .queue
                 .iter()
                 .any(|q| matches!(q.kind, Kind::Blend { .. }))
@@ -607,10 +751,12 @@ impl JobRunner {
     /// Whether an analysis is running (resolving the groups or analysing
     /// them) or queued.
     pub fn analyzing(&self) -> bool {
-        self.running
+        self.main
+            .running
             .as_ref()
-            .is_some_and(|r| r.blend.is_none() && !r.previews && !r.export)
+            .is_some_and(|r| r.blend.is_none() && !r.previews)
             || self
+                .main
                 .queue
                 .iter()
                 .any(|q| matches!(q.kind, Kind::Analyze { .. }))
@@ -624,48 +770,16 @@ impl JobRunner {
 
     /// Whether a job other than an export is running or queued.
     pub fn busy_except_exports(&self) -> bool {
-        self.running.as_ref().is_some_and(|r| !r.export)
-            || self
-                .queue
-                .iter()
-                .any(|q| !matches!(q.kind, Kind::Export(_)))
+        self.main.busy()
     }
 
-    /// Take progress and outcomes from the workers, apply outcomes to
-    /// `session` (UI thread), start the next queued job, and return what
-    /// ended since the last call.
+    /// Take progress and outcomes from the workers (both lanes'), apply
+    /// outcomes to `session` (UI thread), start the next queued jobs, and
+    /// return what ended since the last call.
     pub fn poll(&mut self, session: &mut OpenSession) -> Vec<JobEvent> {
         let mut events = std::mem::take(&mut self.pending);
-        while let Some(r) = &mut self.running {
-            match r.rx.try_recv() {
-                Ok(Msg::Progress(stage, done, total)) => {
-                    r.stage = stage;
-                    r.done = done;
-                    r.total = total;
-                    r.updates += 1;
-                }
-                Ok(Msg::Preview(p)) => events.push(JobEvent::Preview(p)),
-                Ok(Msg::Done(done)) => {
-                    let r = self.running.take().expect("running job");
-                    self.ended(r.id);
-                    events.extend(self.finish(r, *done, session));
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    // The worker died without an outcome (a panic).
-                    let r = self.running.take().expect("running job");
-                    self.ended(r.id);
-                    let mut message =
-                        format!("{} stopped unexpectedly (see the log)", self.name(r.id));
-                    if let Some(plan) = &r.blend
-                        && let Err(e) = discard_blend(session, plan)
-                    {
-                        message = format!("{message}; {e}");
-                    }
-                    events.push(JobEvent::Failed { id: r.id, message });
-                    self.previous = Some(r.handle);
-                }
-            }
+        for lane in [LaneId::Main, LaneId::Exports] {
+            self.take_from(lane, session, &mut events);
         }
         self.start_next(session);
         events.append(&mut self.pending);
@@ -680,9 +794,11 @@ impl JobRunner {
         events
     }
 
-    /// The running job, then the queued ones, for the job panel.
+    /// The running jobs (the main lane's, then the export lane's), then the
+    /// queued ones (likewise), for the job panel and the step strip.
     pub fn views(&self) -> Vec<JobView> {
-        let running = self.running.iter().map(|r| {
+        let lanes = [&self.main, &self.exports];
+        let running = lanes.into_iter().flat_map(|l| &l.running).map(|r| {
             let cancelling = r.token.is_cancelled();
             JobView {
                 id: r.id,
@@ -697,7 +813,7 @@ impl JobRunner {
                 cancellable: !cancelling,
             }
         });
-        let queued = self.queue.iter().map(|q| JobView {
+        let queued = lanes.into_iter().flat_map(|l| &l.queue).map(|q| JobView {
             id: q.id,
             label: self.name(q.id).to_string(),
             stage: WAITING.into(),
@@ -713,7 +829,7 @@ impl JobRunner {
     /// (each update follows newly written tiles); once it is non-zero the
     /// blend has created or reopened its result store.
     pub fn blend_progress(&self) -> Option<(u64, &str, u64)> {
-        let r = self.running.as_ref()?;
+        let r = self.main.running.as_ref()?;
         let plan = r.blend.as_ref()?;
         Some((r.id, plan.group.as_str(), r.updates))
     }
@@ -722,35 +838,41 @@ impl JobRunner {
     /// reported progress yet: it may still create or recreate the group's
     /// result store, so the result must not be opened until it reports.
     pub fn blend_unstarted(&self, group: &str) -> bool {
-        let running = self
-            .running
-            .as_ref()
-            .is_some_and(|r| r.updates == 0 && r.blend.as_ref().is_some_and(|p| p.group == group));
-        running
-            || self
-                .queue
-                .iter()
-                .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
+        let running =
+            self.main.running.as_ref().is_some_and(|r| {
+                r.updates == 0 && r.blend.as_ref().is_some_and(|p| p.group == group)
+            });
+        running || self.blend_queued(group)
     }
 
     /// Whether a blend of `group` is queued or running (whatever its
     /// progress): it may (re)create or write the group's result store.
     pub fn blend_pending(&self, group: &str) -> bool {
-        self.running
+        self.merging(group) || self.blend_queued(group)
+    }
+
+    /// Whether a blend of `group` runs.
+    fn merging(&self, group: &str) -> bool {
+        self.main
+            .running
             .as_ref()
             .is_some_and(|r| r.blend.as_ref().is_some_and(|p| p.group == group))
-            || self
-                .queue
-                .iter()
-                .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
+    }
+
+    /// Whether a blend of `group` is queued.
+    fn blend_queued(&self, group: &str) -> bool {
+        self.main
+            .queue
+            .iter()
+            .any(|q| matches!(&q.kind, Kind::Blend { group: g, .. } if g == group))
     }
 
     /// Whether a whole-canvas blend of `group` is queued or running (an
     /// ROI's blend does not count).
     pub fn whole_blend_pending(&self, group: &str) -> bool {
-        self.running.as_ref().is_some_and(|r| {
+        self.main.running.as_ref().is_some_and(|r| {
             r.blend.as_ref().is_some_and(|p| p.group == group) && self.whole.contains(&r.id)
-        }) || self.queue.iter().any(|q| {
+        }) || self.main.queue.iter().any(|q| {
             matches!(&q.kind, Kind::Blend { group: g, .. } if g == group)
                 && self.whole.contains(&q.id)
         })
@@ -762,15 +884,15 @@ impl JobRunner {
         self.previews_frame.take()
     }
 
-    /// Whether a job is running or queued.
+    /// Whether a job is running or queued, on either lane.
     pub fn busy(&self) -> bool {
-        self.running.is_some() || !self.queue.is_empty()
+        self.main.busy() || self.exports.busy()
     }
 
-    /// What blend or export job `id` was for: its kind and group (also after
-    /// it ended); `None` for any other job.
-    pub fn target(&self, id: u64) -> Option<(JobTarget, &str)> {
-        self.targets.get(&id).map(|(t, g)| (*t, g.as_str()))
+    /// What blend or export job `id` was for: its kind and what it works on
+    /// (also after it ended); `None` for any other job.
+    pub fn target(&self, id: u64) -> Option<(JobTarget, &ExportTarget)> {
+        self.targets.get(&id).map(|(kind, target)| (*kind, target))
     }
 
     /// Whether job `id` blends the whole canvas (not an ROI); also after it
@@ -783,13 +905,15 @@ impl JobRunner {
     /// queued: its head job, and that job's place among the jobs started
     /// since none of them was left (a queued job dropped, e.g. replaced by
     /// newer work, does not count). The blends of a run are those of the
-    /// whole canvas: an ROI's blend is in none.
+    /// whole canvas: an ROI's blend is in none. The exports of a run are
+    /// the export lane's, in its order.
     pub fn run_of(&self, target: JobTarget) -> Option<Run> {
-        let live: Vec<u64> = self
-            .running
-            .iter()
-            .map(|r| r.id)
-            .chain(self.queue.iter().map(|q| q.id))
+        let lane = match target {
+            JobTarget::Blend => &self.main,
+            JobTarget::Export => &self.exports,
+        };
+        let live: Vec<u64> = lane
+            .ids()
             .filter(|id| self.in_run(*id) == Some(target))
             .collect();
         let id = *live.first()?;
@@ -799,7 +923,7 @@ impl JobRunner {
         };
         Some(Run {
             id,
-            group: self.target(id)?.1.to_string(),
+            group: self.target(id)?.1.name().to_string(),
             position: ended + 1,
             count: ended + live.len(),
         })
@@ -810,16 +934,16 @@ impl JobRunner {
         self.labels.get(&id).map(String::as_str)
     }
 
-    /// Record a new `target` job `id` of `group`: a run of them starts
-    /// afresh when none is left.
-    fn begin(&mut self, target: JobTarget, id: u64, group: &str) {
-        if self.run_of(target).is_none() {
-            match target {
+    /// Record a new `kind` job `id` working on `target`: a run of them
+    /// starts afresh when none is left.
+    fn begin(&mut self, kind: JobTarget, id: u64, target: ExportTarget) {
+        if self.run_of(kind).is_none() {
+            match kind {
                 JobTarget::Blend => self.blends_ended = 0,
                 JobTarget::Export => self.exports_ended = 0,
             }
         }
-        self.targets.insert(id, (target, group.to_string()));
+        self.targets.insert(id, (kind, target));
     }
 
     /// The running job `id` has ended: count it in its run.
@@ -850,40 +974,136 @@ impl JobRunner {
         id
     }
 
-    /// Start queued jobs until one runs (or the queue is empty); a job that
-    /// cannot be planned fails at once.
-    fn start_next(&mut self, session: &OpenSession) {
-        while self.running.is_none() {
-            let Some(q) = self.queue.pop_front() else {
-                return;
-            };
-            let planned = match &q.kind {
-                Kind::Analyze { scope } => {
-                    Ok(Planned::Resolve(Box::new(session.mosaic.clone()), *scope))
+    /// The lane `lane`.
+    fn lane_mut(&mut self, lane: LaneId) -> &mut Lane {
+        match lane {
+            LaneId::Main => &mut self.main,
+            LaneId::Exports => &mut self.exports,
+        }
+    }
+
+    /// Take progress and outcomes from `lane`'s running worker, applying
+    /// outcomes to `session` (an analysis that goes on to its next phase
+    /// runs again at once); the ended jobs' events go to `events`.
+    fn take_from(&mut self, lane: LaneId, session: &mut OpenSession, events: &mut Vec<JobEvent>) {
+        while let Some(r) = &mut self.lane_mut(lane).running {
+            match r.rx.try_recv() {
+                Ok(Msg::Progress(stage, done, total)) => {
+                    r.stage = stage;
+                    r.done = done;
+                    r.total = total;
+                    r.updates += 1;
                 }
-                Kind::Blend {
-                    group,
-                    rect,
-                    settings,
-                } => plan_blend_with(&session.mosaic, group, *rect, settings.clone())
-                    .map(Planned::Blend),
-                Kind::Previews => Ok(Planned::Previews(plan_previews(&session.mosaic))),
-                Kind::Export(job) => Ok(Planned::Export {
-                    dir: session.mosaic.dir.clone(),
-                    job: job.clone(),
-                }),
-            };
-            match planned {
-                Ok(planned) => self.spawn(q.id, planned),
-                Err(e) => {
-                    let message = format!("{}: {}", self.name(q.id), describe(&e));
-                    self.pending.push(JobEvent::Failed { id: q.id, message });
+                Ok(Msg::Preview(p)) => events.push(JobEvent::Preview(p)),
+                Ok(Msg::Done(done)) => {
+                    let r = self.lane_mut(lane).running.take().expect("running job");
+                    self.ended(r.id);
+                    events.extend(self.finish(r, *done, session));
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The worker died without an outcome (a panic).
+                    let r = self.lane_mut(lane).running.take().expect("running job");
+                    self.ended(r.id);
+                    let mut message =
+                        format!("{} stopped unexpectedly (see the log)", self.name(r.id));
+                    if let Some(plan) = &r.blend
+                        && let Err(e) = discard_blend(session, plan)
+                    {
+                        message = format!("{message}; {e}");
+                    }
+                    events.push(JobEvent::Failed { id: r.id, message });
+                    self.lane_mut(lane).previous = Some(r.handle);
                 }
             }
         }
     }
 
-    /// Run `planned` on its own thread as job `id`.
+    /// Start what can start on each lane (see the module docs).
+    fn start_next(&mut self, session: &OpenSession) {
+        self.start_main(session);
+        self.start_exports(session);
+    }
+
+    /// Start the main lane's queued jobs until one runs (or none can start
+    /// yet); a job that cannot be planned fails at once. A blend of a group
+    /// being exported is passed over: it stays queued while the jobs after
+    /// it start. An analysis waits for a running export (cancelled when the
+    /// analysis was asked for) to end, and holds back what is queued after
+    /// it.
+    fn start_main(&mut self, session: &OpenSession) {
+        while self.main.running.is_none() {
+            let exporting = self.exporting_groups();
+            let mut next = None;
+            for (i, q) in self.main.queue.iter().enumerate() {
+                match &q.kind {
+                    Kind::Blend { group, .. } if exporting.contains(group) => {}
+                    Kind::Analyze { .. } if self.exports.running.is_some() => break,
+                    _ => {
+                        next = Some(i);
+                        break;
+                    }
+                }
+            }
+            let Some(q) = next.and_then(|i| self.main.queue.remove(i)) else {
+                return;
+            };
+            self.plan_and_spawn(q, session);
+        }
+    }
+
+    /// Start the export lane's next export, in order, unless it must wait:
+    /// for an analysis, running or queued (it may recreate the stores), or
+    /// for a running blend of a group it reads (it rewrites that store, and
+    /// may recreate it).
+    fn start_exports(&mut self, session: &OpenSession) {
+        while self.exports.running.is_none() {
+            let Some(q) = self.exports.queue.front() else {
+                return;
+            };
+            let reads = self
+                .target(q.id)
+                .map(|(_, t)| t.groups())
+                .unwrap_or_default();
+            if self.analyzing() || reads.iter().any(|g| self.merging(g)) {
+                return;
+            }
+            let q = self.exports.queue.pop_front().expect("a queued export");
+            self.plan_and_spawn(q, session);
+        }
+    }
+
+    /// Plan queued job `q` and run it on its lane, or fail it at once if it
+    /// cannot be planned.
+    fn plan_and_spawn(&mut self, q: Queued, session: &OpenSession) {
+        let planned = match &q.kind {
+            Kind::Analyze { scope } => {
+                Ok(Planned::Resolve(Box::new(session.mosaic.clone()), *scope))
+            }
+            Kind::Blend {
+                group,
+                rect,
+                settings,
+            } => {
+                plan_blend_with(&session.mosaic, group, *rect, settings.clone()).map(Planned::Blend)
+            }
+            Kind::Previews => Ok(Planned::Previews(plan_previews(&session.mosaic))),
+            Kind::Export(job) => Ok(Planned::Export {
+                dir: session.mosaic.dir.clone(),
+                job: job.clone(),
+            }),
+        };
+        match planned {
+            Ok(planned) => self.spawn(q.id, planned),
+            Err(e) => {
+                let message = format!("{}: {}", self.name(q.id), describe(&e));
+                self.pending.push(JobEvent::Failed { id: q.id, message });
+            }
+        }
+    }
+
+    /// Run `planned` on its own thread as job `id`, on its lane (exports on
+    /// the export lane, the rest on the main one).
     fn spawn(&mut self, id: u64, planned: Planned) {
         let (tx, rx) = mpsc::channel();
         let token = CancelToken::new();
@@ -902,7 +1122,11 @@ impl JobRunner {
             | Planned::Export { .. } => None,
         };
         let previews = matches!(planned, Planned::Previews(_));
-        let export = matches!(planned, Planned::Export { .. });
+        let lane = if matches!(planned, Planned::Export { .. }) {
+            LaneId::Exports
+        } else {
+            LaneId::Main
+        };
         let stage = if resolving.is_some() {
             RESOLVING
         } else {
@@ -910,11 +1134,11 @@ impl JobRunner {
         };
         let worker_token = token.clone();
         let ctx = self.ctx.clone();
-        let previous = self.previous.take();
+        let previous = self.lane_mut(lane).previous.take();
         #[cfg(test)]
-        let gate = self.gate.clone();
+        let gate = self.lane_mut(lane).gate.clone();
         #[cfg(test)]
-        let stepper = self.stepper.clone();
+        let stepper = self.lane_mut(lane).stepper.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("mmm-job-{id}"))
             .spawn(move || {
@@ -965,9 +1189,16 @@ impl JobRunner {
                             };
                             Done::Previews(run_previews(plan, &ctl, &on_ready))
                         }
-                        Planned::Export { dir, job } => {
-                            Done::Export(export_group(dir, &job.group, &job.out, job.format, &ctl))
-                        }
+                        Planned::Export { dir, job } => Done::Export(match &job.target {
+                            ExportTarget::Group(group) => {
+                                export_group(dir, group, &job.out, job.format, &ctl)
+                            }
+                            ExportTarget::Composite { name, channels, .. } => {
+                                let [r, g, b] = channels.each_ref().map(Option::as_deref);
+                                let channels = CompositeChannels { name, r, g, b };
+                                export_composite(dir, &channels, &job.out, job.format, &ctl)
+                            }
+                        }),
                     }
                 };
                 // Everything the job held (store locks included) is
@@ -977,15 +1208,15 @@ impl JobRunner {
             });
         match spawned {
             Ok(handle) => {
-                self.running = Some(Running {
+                self.lane_mut(lane).running = Some(Running {
                     id,
+                    lane,
                     token,
                     rx,
                     handle,
                     blend,
                     resolving,
                     previews,
-                    export,
                     stage: stage.into(),
                     done: 0,
                     total: 0,
@@ -1002,7 +1233,7 @@ impl JobRunner {
     /// Apply (or discard) a finished worker's outcome on the UI thread; an
     /// analysis's resolved groups start its next phase (no event yet).
     fn finish(&mut self, r: Running, done: Done, session: &mut OpenSession) -> Option<JobEvent> {
-        self.previous = Some(r.handle);
+        self.lane_mut(r.lane).previous = Some(r.handle);
         let id = r.id;
         let name = self.name(id).to_string();
         let failed = |message: String| JobEvent::Failed { id, message };
@@ -1106,10 +1337,14 @@ impl JobRunner {
 }
 
 impl Drop for JobRunner {
-    /// Cancel the running job: nothing would apply its outcome. The worker
-    /// winds down on its own (never joined here, so dropping never waits).
+    /// Cancel the running jobs: nothing would apply their outcomes. The
+    /// workers wind down on their own (never joined here, so dropping never
+    /// waits).
     fn drop(&mut self) {
-        if let Some(r) = &self.running {
+        for r in [&self.main, &self.exports]
+            .into_iter()
+            .flat_map(|l| &l.running)
+        {
             r.token.cancel();
         }
     }
@@ -1267,25 +1502,41 @@ pub(crate) mod tests {
         }
     }
 
+    /// A closed gate.
+    fn new_gate() -> std::sync::Arc<Gate> {
+        std::sync::Arc::new(Gate {
+            open: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+
     impl JobRunner {
-        /// Hold every worker started from now on until the gate opens.
+        /// Hold every worker started from now on, on either lane, until
+        /// the gate opens.
         pub(crate) fn hold(&mut self) -> std::sync::Arc<Gate> {
-            let gate = std::sync::Arc::new(Gate {
-                open: std::sync::Mutex::new(false),
-                cv: std::sync::Condvar::new(),
-            });
-            self.gate = Some(gate.clone());
+            let gate = new_gate();
+            self.main.gate = Some(gate.clone());
+            self.exports.gate = Some(gate.clone());
             gate
         }
 
-        /// Hold every worker started from now on after each progress
-        /// update it sends (see [`Stepper`]).
+        /// Hold every export started from now on until the gate opens (the
+        /// main lane's workers are left as they were).
+        pub(crate) fn hold_exports(&mut self) -> std::sync::Arc<Gate> {
+            let gate = new_gate();
+            self.exports.gate = Some(gate.clone());
+            gate
+        }
+
+        /// Hold every worker started from now on, on either lane, after
+        /// each progress update it sends (see [`Stepper`]).
         pub(crate) fn hold_progress(&mut self) -> std::sync::Arc<Stepper> {
             let stepper = std::sync::Arc::new(Stepper {
                 state: std::sync::Mutex::new((0, false, 0)),
                 cv: std::sync::Condvar::new(),
             });
-            self.stepper = Some(stepper.clone());
+            self.main.stepper = Some(stepper.clone());
+            self.exports.stepper = Some(stepper.clone());
             stepper
         }
 
@@ -1369,13 +1620,67 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The export of group `g`.
+    fn group(g: &str) -> ExportTarget {
+        ExportTarget::Group(g.into())
+    }
+
+    /// An HOO composite of `Ha` and `OIII` (OIII in green and blue).
+    fn hoo() -> ExportTarget {
+        ExportTarget::Composite {
+            id: 7,
+            name: "HOO".into(),
+            channels: [Some("Ha".into()), Some("OIII".into()), Some("OIII".into())],
+        }
+    }
+
+    /// Whether job `id` finished among `events`.
+    fn finished(events: &[JobEvent], id: u64) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id))
+    }
+
+    /// Whether job `id` is queued (waiting its turn).
+    fn waiting(r: &JobRunner, id: u64) -> bool {
+        r.views().iter().any(|v| v.id == id && v.stage == WAITING)
+    }
+
+    /// Poll until `done` holds of the runner and the events so far
+    /// (bounded); those events.
+    fn poll_until(
+        r: &mut JobRunner,
+        s: &mut OpenSession,
+        done: impl Fn(&JobRunner, &[JobEvent]) -> bool,
+    ) -> Vec<JobEvent> {
+        let deadline = Instant::now() + crate::testutil::PATIENCE;
+        let mut events = r.poll(s);
+        while !done(r, &events) {
+            assert!(Instant::now() < deadline, "timed out waiting for the jobs");
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(r.poll(s));
+        }
+        events
+    }
+
+    /// Poll for a while (the jobs being held), expecting nothing to end.
+    fn poll_idle(r: &mut JobRunner, s: &mut OpenSession) {
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(5));
+            let events = r.poll(s);
+            assert!(events.is_empty(), "{events:?}");
+        }
+    }
+
     #[test]
     fn stop_all_cancels_every_job_and_waits_for_it() {
         let (root, mut s, mut r) = analyzed("job-stop-all");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
         let gate = r.hold();
-        let ha = r.start_blend(&mut s, "Ha", None);
-        let export = r.start_export(&s, "OIII", root.join("o.fits"), ExportFormat::Fits);
-        // The running merge gets going while `stop_all` waits for it.
+        let oiii = r.start_blend(&mut s, "OIII", None);
+        let export = r.start_export(&s, group("Ha"), root.join("h.fits"), ExportFormat::Fits);
+        // The running jobs get going while `stop_all` waits for them.
         let opener = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             gate.open();
@@ -1384,7 +1689,7 @@ pub(crate) mod tests {
         opener.join().unwrap();
         assert!(stopped);
         assert!(!r.busy());
-        for id in [ha, export] {
+        for id in [oiii, export] {
             assert!(events.contains(&JobEvent::Cancelled { id }), "{events:?}");
         }
         // A job that ignores the wait is let go of; its worker is handed
@@ -1408,11 +1713,212 @@ pub(crate) mod tests {
         let (root, mut s, mut r) = analyzed("job-target");
         let blend = r.start_blend(&mut s, "Ha", None);
         let out = root.join("o.fits");
-        let export = r.start_export(&s, "OIII", out, ExportFormat::Fits);
-        assert_eq!(r.target(blend), Some((JobTarget::Blend, "Ha")));
-        assert_eq!(r.target(export), Some((JobTarget::Export, "OIII")));
+        let export = r.start_export(&s, group("OIII"), out, ExportFormat::Fits);
+        let composite = r.start_export(&s, hoo(), root.join("c.fits"), ExportFormat::Fits);
+        // A composite named like a group is told apart from it.
+        let named_oiii = ExportTarget::Composite {
+            id: 8,
+            name: "OIII".into(),
+            channels: [None, Some("OIII".into()), None],
+        };
+        let lookalike = r.start_export(
+            &s,
+            named_oiii.clone(),
+            root.join("l.fits"),
+            ExportFormat::Fits,
+        );
+        assert_eq!(r.target(blend), Some((JobTarget::Blend, &group("Ha"))));
+        assert_eq!(r.target(export), Some((JobTarget::Export, &group("OIII"))));
+        assert_eq!(r.target(composite), Some((JobTarget::Export, &hoo())));
+        assert_eq!(r.target(lookalike), Some((JobTarget::Export, &named_oiii)));
+        assert_ne!(named_oiii, group("OIII"));
+        assert_eq!(r.label(composite), Some("Export HOO"));
+        assert_eq!(hoo().groups(), ["Ha", "OIII"], "each member once");
+        assert_eq!(hoo().name(), "HOO");
         assert_eq!(r.target(9999), None);
         let _ = drain(&mut r, &mut s);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_merges_of_exported_groups_wait() {
+        use mmm_core::formats::InputPanel;
+        let (root, mut s, mut r) = analyzed("job-export-lane");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        let groups =
+            |names: &[&str]| -> BTreeSet<String> { names.iter().map(|g| g.to_string()).collect() };
+        // An export of Ha runs, held on its lane.
+        let gate = r.hold_exports();
+        let ha_out = root.join("ha.fits");
+        let export = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits);
+        assert!(!waiting(&r, export), "running");
+        assert_eq!(r.exporting_groups(), groups(&["Ha"]));
+        // A merge of OIII runs beside it, to its end.
+        let oiii = r.start_blend(&mut s, "OIII", None);
+        assert!(!waiting(&r, oiii), "runs at once");
+        assert!(!r.merge_waits_for_export());
+        let events = poll_until(&mut r, &mut s, |_, e| finished(e, oiii));
+        assert_eq!(
+            events,
+            vec![JobEvent::Finished {
+                id: oiii,
+                label: "Merge OIII".into()
+            }]
+        );
+        assert_eq!(r.run_of(JobTarget::Export).map(|run| run.id), Some(export));
+        // A merge of Ha waits until the export has ended.
+        let ha = r.start_blend(&mut s, "Ha", None);
+        poll_idle(&mut r, &mut s);
+        assert!(waiting(&r, ha));
+        assert!(r.merge_waits_for_export());
+        gate.open();
+        assert_eq!(
+            drain(&mut r, &mut s),
+            vec![
+                JobEvent::Finished {
+                    id: export,
+                    label: "Export Ha".into()
+                },
+                JobEvent::Finished {
+                    id: ha,
+                    label: "Merge Ha".into()
+                },
+            ]
+        );
+        assert!(ha_out.is_file());
+        assert!(!r.merge_waits_for_export());
+
+        // A composite's export holds back a merge of any of its members.
+        let gate = r.hold_exports();
+        let hoo_out = root.join("hoo.fits");
+        let export = r.start_export(&s, hoo(), hoo_out.clone(), ExportFormat::Fits);
+        assert_eq!(r.exporting_groups(), groups(&["Ha", "OIII"]));
+        let ha = r.start_blend(&mut s, "Ha", None);
+        let oiii = r.start_blend(&mut s, "OIII", None);
+        poll_idle(&mut r, &mut s);
+        assert!(waiting(&r, ha) && waiting(&r, oiii));
+        assert!(r.merge_waits_for_export());
+        gate.open();
+        assert_eq!(
+            drain(&mut r, &mut s),
+            vec![
+                JobEvent::Finished {
+                    id: export,
+                    label: "Export HOO".into()
+                },
+                JobEvent::Finished {
+                    id: ha,
+                    label: "Merge Ha".into()
+                },
+                JobEvent::Finished {
+                    id: oiii,
+                    label: "Merge OIII".into()
+                },
+            ]
+        );
+        assert_eq!(InputPanel::open(&hoo_out).unwrap().channels(), 3);
+        assert!(r.exporting_groups().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn analysis_cancels_exports_on_their_lane() {
+        let (root, mut s, mut r) = analyzed("job-analysis-exports");
+        r.start_blend(&mut s, "Ha", None);
+        r.start_blend(&mut s, "OIII", None);
+        drain(&mut r, &mut s);
+        // One export runs (held on its lane), another waits behind it.
+        let gate = r.hold_exports();
+        let ha_out = root.join("ha.fits");
+        let running = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits);
+        let queued = r.start_export(&s, group("OIII"), root.join("o.fits"), ExportFormat::Fits);
+        assert!(waiting(&r, queued), "one export at a time");
+        // An analysis drops the queued export at once and cancels the
+        // running one, then waits for it to end: it may recreate the store
+        // the export reads.
+        let analyze = r.start_analyze(&mut s);
+        let stages: Vec<(u64, String)> = r.views().into_iter().map(|v| (v.id, v.stage)).collect();
+        assert_eq!(
+            stages,
+            [(running, CANCELLING.into()), (analyze, WAITING.into())]
+        );
+        let mut events = r.poll(&mut s);
+        assert_eq!(events, vec![JobEvent::Cancelled { id: queued }]);
+        poll_idle(&mut r, &mut s);
+        assert!(waiting(&r, analyze), "not before the export has ended");
+        gate.open();
+        events.extend(drain(&mut r, &mut s));
+        assert_eq!(
+            events,
+            vec![
+                JobEvent::Cancelled { id: queued },
+                JobEvent::Cancelled { id: running },
+                JobEvent::Finished {
+                    id: analyze,
+                    label: ANALYZE_LABEL.into()
+                },
+            ]
+        );
+        assert!(!ha_out.exists());
+        // An export started while an analysis runs waits for it.
+        let gate = r.hold();
+        let analyze = r.start_analyze(&mut s);
+        let export = r.start_export(&s, group("Ha"), ha_out.clone(), ExportFormat::Fits);
+        assert!(!waiting(&r, analyze) && waiting(&r, export));
+        gate.open();
+        let events = drain(&mut r, &mut s);
+        assert_eq!(
+            events,
+            vec![
+                JobEvent::Finished {
+                    id: analyze,
+                    label: ANALYZE_LABEL.into()
+                },
+                JobEvent::Finished {
+                    id: export,
+                    label: "Export Ha".into()
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn leaving_waits_for_both_lanes() {
+        let (root, mut s, mut r) = analyzed("job-leaving-lanes");
+        r.start_blend(&mut s, "Ha", None);
+        drain(&mut r, &mut s);
+        let out = root.join("ha.fits");
+        // A merge and an export run side by side, both held.
+        let gate = r.hold();
+        let merge = r.start_blend(&mut s, "OIII", None);
+        let export = r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits);
+        assert!(!waiting(&r, merge) && !waiting(&r, export), "both run");
+        // Leaving cancels both and waits for both.
+        let opener = gate.clone();
+        r.on_stop(move || opener.open());
+        let (events, stopped) = r.stop_all(&mut s, crate::testutil::PATIENCE);
+        assert!(stopped && !r.busy());
+        for id in [merge, export] {
+            assert!(events.contains(&JobEvent::Cancelled { id }), "{events:?}");
+        }
+        assert!(!out.exists());
+        // Workers that outlive the wait are let go of: both lanes' are
+        // handed over, to be joined before the session's lock goes.
+        let gate = r.hold();
+        r.start_blend(&mut s, "OIII", None);
+        r.start_export(&s, group("Ha"), out.clone(), ExportFormat::Fits);
+        let (_, stopped) = r.stop_all(&mut s, Duration::from_millis(20));
+        assert!(!stopped);
+        let workers = r.detach_workers();
+        assert_eq!(workers.len(), 2, "the merge's and the export's");
+        assert!(!r.busy());
+        gate.open();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(!out.exists(), "the export was cancelled");
         let _ = std::fs::remove_dir_all(&root);
     }
 

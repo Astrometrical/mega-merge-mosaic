@@ -14,14 +14,14 @@ use mega_ui::widgets::{StepState, StripStep};
 use mmm_core::checks::{Check, CheckCode, Severity};
 use mmm_core::mosaic::{MosaicConfig, SINGLE_GROUP};
 
-use super::steps::{MERGE_STEP, draft_changed, out_of_date, steps};
+use super::steps::{EXPORT_STEP, MERGE_STEP, draft_changed, out_of_date, steps};
 use super::*;
 use crate::camera::Camera;
 use crate::checks::{ChecksEngine, ChecksReport};
 use crate::compositions::{Composition, ViewKind, load_compositions, save_compositions};
 use crate::display_stretch::DisplayStretch;
 use crate::jobs::tests::{analyzed, drain};
-use crate::jobs::{JobRunner, JobTarget};
+use crate::jobs::{ExportTarget, JobRunner, JobTarget};
 use crate::panel_edits::FilesPicker;
 use crate::pipeline::{Pipeline, Step};
 use crate::rois::{Roi, save_rois};
@@ -3293,7 +3293,8 @@ fn a_one_group_merge_names_no_group() {
     // One export: "Exporting", no "1 of 1"; the job is "Export".
     let gate = jobs.hold();
     let out = root.join("one.fits");
-    let id = jobs.start_export(&s, SINGLE_GROUP, out, crate::export::ExportFormat::Fits);
+    let target = ExportTarget::Group(SINGLE_GROUP.into());
+    let id = jobs.start_export(&s, target, out, crate::export::ExportFormat::Fits);
     assert_eq!(jobs.label(id), Some("Export"));
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     assert_eq!(got[3].label, "Exporting");
@@ -3315,11 +3316,12 @@ fn a_merge_waits_behind_an_export() {
     let (root, mut s, mut jobs) = analyzed("steps-merge-after-export");
     jobs.start_blend(&mut s, "Ha", None);
     let _ = drain(&mut jobs, &mut s);
-    // An export runs (held); a merge is pressed meanwhile.
-    let gate = jobs.hold();
+    // An export of Ha runs (held); a merge of Ha is pressed meanwhile.
+    let gate = jobs.hold_exports();
     let out = root.join("ha.fits");
-    let export = jobs.start_export(&s, "Ha", out, crate::export::ExportFormat::Fits);
-    let merge = jobs.start_blend(&mut s, "OIII", None);
+    let ha = ExportTarget::Group("Ha".into());
+    let export = jobs.start_export(&s, ha, out, crate::export::ExportFormat::Fits);
+    let merge = jobs.start_blend(&mut s, "Ha", None);
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     let want = StripStep {
         label: "Merge queued after export".into(),
@@ -3334,16 +3336,93 @@ fn a_merge_waits_behind_an_export() {
     assert!(events.contains(&JobEvent::Cancelled { id: merge }));
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     assert_ne!(got[MERGE_STEP].label, "Merge queued after export");
-    // Queued again, it runs once the export has ended.
-    let merge = jobs.start_blend(&mut s, "OIII", None);
+    // A merge of another group runs beside the export, and the step shows
+    // it (with Ha's merge queued again behind the export).
+    let held = jobs.hold();
+    let oiii = jobs.start_blend(&mut s, "OIII", None);
+    let merge = jobs.start_blend(&mut s, "Ha", None);
+    let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
+    assert_eq!(got[MERGE_STEP].label, "Merging OIII · 1 of 2 · 0 %");
+    // Ha's merge runs once the export has ended.
+    held.open();
     gate.open();
     let events = drain(&mut jobs, &mut s);
     let finished = |id: u64| {
         events
             .iter()
-            .any(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id))
+            .position(|e| matches!(e, JobEvent::Finished { id: i, .. } if *i == id))
     };
-    assert!(finished(export) && finished(merge), "{events:?}");
+    let (export, merge) = (finished(export), finished(merge));
+    assert!(finished(oiii).is_some(), "{events:?}");
+    assert!(export.is_some() && merge > export, "{events:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_export_step_says_exported() {
+    use crate::session::Stamps;
+    let (root, mut s, mut jobs) = analyzed("steps-exported");
+    jobs.start_blend(&mut s, "Ha", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.results = classify_results(&s);
+    let export = |s: &OpenSession, jobs: &JobRunner| {
+        steps(s, jobs, &Pipeline::new(), &ChecksEngine::new())[EXPORT_STEP].clone()
+    };
+    let stamp = |blended_at, exported_at| Stamps {
+        blended_at,
+        exported_at,
+    };
+    let todo = strip("Export", StepState::Todo);
+    let exported = strip("Exported", StepState::Done);
+    // Ha is merged and never exported (OIII, not merged, is not ready).
+    s.stamps.insert("Ha".into(), stamp(Some(100), None));
+    assert_eq!(export(&s, &jobs), todo);
+    // Exported since its merge.
+    s.stamps.insert("Ha".into(), stamp(Some(100), Some(100)));
+    assert_eq!(export(&s, &jobs), exported);
+    // Merged again since.
+    s.stamps.insert("Ha".into(), stamp(Some(200), Some(100)));
+    assert_eq!(export(&s, &jobs), todo);
+    s.stamps.insert("Ha".into(), stamp(Some(200), Some(300)));
+    assert_eq!(export(&s, &jobs), exported);
+    // Every group ready must have been exported: OIII merged, not yet.
+    jobs.start_blend(&mut s, "OIII", None);
+    let _ = drain(&mut jobs, &mut s);
+    s.results = classify_results(&s);
+    s.stamps.insert("OIII".into(), stamp(Some(400), None));
+    assert_eq!(export(&s, &jobs), todo);
+    s.stamps.insert("OIII".into(), stamp(Some(400), Some(500)));
+    assert_eq!(export(&s, &jobs), exported);
+    // While exports run, the step says so, and its Cancel cancels them all
+    // (a composite's too).
+    let gate = jobs.hold();
+    let fits = crate::export::ExportFormat::Fits;
+    let ha = ExportTarget::Group("Ha".into());
+    let first = jobs.start_export(&s, ha, root.join("ha.fits"), fits);
+    let hoo = ExportTarget::Composite {
+        id: 1,
+        name: "HOO".into(),
+        channels: [Some("Ha".into()), Some("OIII".into()), Some("OIII".into())],
+    };
+    let second = jobs.start_export(&s, hoo, root.join("hoo.fits"), fits);
+    let got = export(&s, &jobs);
+    assert_eq!(
+        (got.label.as_str(), got.cancellable),
+        ("Exporting 1 of 2", true)
+    );
+    super::top_bar::cancel_step(EXPORT_STEP, &mut jobs);
+    gate.open();
+    let events = drain(&mut jobs, &mut s);
+    for id in [first, second] {
+        assert!(events.contains(&JobEvent::Cancelled { id }), "{events:?}");
+    }
+    assert_eq!(export(&s, &jobs), exported);
+    // An out-of-date group is not ready, so it does not count; with none
+    // ready, nothing reads as exported.
+    mmm_core::mosaic::mark_needs_analyze(&mut s.mosaic, &["OIII".to_string()]).unwrap();
+    assert_eq!(export(&s, &jobs), exported, "Ha still is");
+    mmm_core::mosaic::mark_needs_analyze(&mut s.mosaic, &["Ha".to_string()]).unwrap();
+    assert_eq!(export(&s, &jobs), todo);
     let _ = std::fs::remove_dir_all(&root);
 }
 

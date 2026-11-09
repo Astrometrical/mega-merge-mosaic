@@ -221,7 +221,8 @@ impl Shell {
     /// Leave the open session for the start screen, in this window (‹,
     /// spec §15). Refused while an export runs or waits (`Err` says why).
     /// Otherwise every other job is cancelled (all can be run again) and
-    /// waited for, at most [`STOP_WAIT`]; pending saves are flushed
+    /// waited for, on both of the runner's lanes ([`JobRunner::stop_all`]),
+    /// at most [`STOP_WAIT`]; pending saves are flushed
     /// ([`Shell::flush_pending_saves`]); the session is dropped with its
     /// window, pipeline, checks and summary writer, and its Undo toasts
     /// are taken down; the decode cache is
@@ -236,7 +237,9 @@ impl Shell {
     /// written on this thread and the lock released at once. A job or a
     /// preview that ignores the wait (a decode cannot be interrupted) is let
     /// go of without hanging the window: a reaper thread keeps the session's
-    /// lock until its thread has ended, then writes the summary and releases
+    /// lock until its thread, and every job worker of either lane
+    /// ([`JobRunner::detach_workers`]), has ended, then writes the summary
+    /// and releases
     /// the lock (the start screen shows the session open in another window
     /// meanwhile, and reads it again after). An edit that was waiting for
     /// the jobs is then dropped (logged) if a job did not stop. Either way
@@ -264,7 +267,8 @@ impl Shell {
                     JobEvent::Finished { id, .. } => jobs.target(*id),
                     _ => None,
                 };
-                self.summary.on_job_event(event, target, unix_now());
+                self.summary
+                    .on_job_event(session, event, target, unix_now());
             }
         }
         // The preview thread gets what is left of the same wait.
@@ -483,7 +487,8 @@ impl Shell {
                 JobEvent::Finished { id, .. } => jobs.target(*id),
                 _ => None,
             };
-            self.summary.on_job_event(event, target, unix_now());
+            self.summary
+                .on_job_event(session, event, target, unix_now());
             let name = |id: &u64| jobs.label(*id).unwrap_or("Job").to_string();
             let (tone, text) = match event {
                 // Previews run by themselves and often: no toasts but
@@ -1944,7 +1949,8 @@ mod tests {
         {
             let shell = h.state_mut();
             let (session, jobs) = shell.session.as_mut().zip(shell.jobs.as_mut()).unwrap();
-            jobs.start_export(session, "Ha", root.join("Ha.fits"), ExportFormat::Fits);
+            let ha = crate::jobs::ExportTarget::Group("Ha".into());
+            jobs.start_export(session, ha, root.join("Ha.fits"), ExportFormat::Fits);
         }
         h.run_steps(3);
         let back = |h: &Harness<'static, Shell>| {

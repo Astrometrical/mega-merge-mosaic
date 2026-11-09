@@ -3,12 +3,14 @@
 //! session's facts without opening it.
 //!
 //! [`SummaryWriter::poll`] runs each frame. It notices changes to what the
-//! summary shows (panels, groups, checks, canvas, last view) and to the
-//! settings the results depend on (a settings edit marks them stale) by
-//! itself, and the Shell marks it dirty when a job ends, cancelled ones
-//! included ([`SummaryWriter::on_job_event`]: a result changed). The work
-//! (classifying each group's result store, writing the file) runs on a
-//! background thread; the UI thread does no file I/O. The classified
+//! summary shows (panels, groups, checks, canvas, last view, the session's
+//! merge and export [`Stamps`]) and to the settings the results depend on
+//! (a settings edit marks them stale) by itself, and the Shell marks it
+//! dirty when a job ends, cancelled ones included
+//! ([`SummaryWriter::on_job_event`]: a result changed; a finished merge or
+//! export stamps its groups, a composite's export each of its groups). The
+//! work (classifying each group's result store, writing the file) runs on
+//! a background thread; the UI thread does no file I/O. The classified
 //! result states are handed back ([`SummaryWriter::take_results`]) unless
 //! something changed while they were read. Leaving the session closes the
 //! writer ([`SummaryWriter::close`]: no background write lands after it)
@@ -30,12 +32,9 @@ use mmm_core::settings::{AnalyzeSettings, BlendSettings, GroupOverride};
 
 use crate::blend_settings::load_draft;
 use crate::checks::CheckCounts;
-use crate::jobs::{JobEvent, JobTarget};
-use crate::session::OpenSession;
+use crate::jobs::{ExportTarget, JobEvent, JobTarget};
+use crate::session::{OpenSession, Stamps};
 use crate::start::unix_now;
-
-/// Per-group `(blended_at, exported_at)` stamps, in unix seconds.
-type Stamps = BTreeMap<String, (Option<u64>, Option<u64>)>;
 
 /// The facts of a session as a [`SessionSummary`] (with `written_at` 0: the
 /// writer stamps it). Groups follow processing order; a group missing from
@@ -50,7 +49,7 @@ pub fn summarize(
     canvas: Option<(u64, u64)>,
     last_view: Option<String>,
     results: &BTreeMap<String, ResultState>,
-    stamps: &Stamps,
+    stamps: &BTreeMap<String, Stamps>,
 ) -> SessionSummary {
     let draft = load_draft(cfg);
     let groups = groups
@@ -58,7 +57,10 @@ pub fn summarize(
             g.processing_groups()
                 .into_iter()
                 .map(|(name, panels)| {
-                    let (blended_at, exported_at) = stamps.get(&name).copied().unwrap_or_default();
+                    let Stamps {
+                        blended_at,
+                        exported_at,
+                    } = stamps.get(&name).copied().unwrap_or_default();
                     let result = results.get(&name).copied().unwrap_or_default();
                     // Out of date though complete: never settings changed.
                     let region_differs = region_differs(cfg, &name);
@@ -100,6 +102,7 @@ struct Inputs {
     checks: Option<CheckCounts>,
     canvas: Option<(u64, u64)>,
     last_view: Option<String>,
+    stamps: BTreeMap<String, Stamps>,
     settings: Settings,
 }
 
@@ -147,6 +150,7 @@ impl Inputs {
             checks,
             canvas: session.canvas(),
             last_view,
+            stamps: session.stamps.clone(),
             settings: Settings::of(&session.mosaic.config),
         }
     }
@@ -167,7 +171,6 @@ fn classify_and_write(
     mosaic: &Mosaic,
     groups: Option<&Groups>,
     inputs: &Inputs,
-    stamps: &Stamps,
     last: Option<&SessionSummary>,
     closed: Option<&Mutex<bool>>,
 ) -> Written {
@@ -186,7 +189,7 @@ fn classify_and_write(
         inputs.canvas,
         inputs.last_view.clone(),
         &results,
-        stamps,
+        &inputs.stamps,
     );
     if last.is_some_and(|l| same_facts(l, &summary)) {
         return Written {
@@ -217,7 +220,6 @@ pub struct FinalWrite {
     mosaic: Mosaic,
     groups: Option<Groups>,
     inputs: Inputs,
-    stamps: Stamps,
     last: Option<SessionSummary>,
 }
 
@@ -231,7 +233,6 @@ impl FinalWrite {
             &self.mosaic,
             self.groups.as_ref(),
             &self.inputs,
-            &self.stamps,
             self.last.as_ref(),
             None,
         );
@@ -240,7 +241,6 @@ impl FinalWrite {
 
 /// Writes the session's summary in the background when it has changed.
 pub struct SummaryWriter {
-    stamps: Stamps,
     dirty: bool,
     /// The last summary written (or found on opening).
     last: Option<SessionSummary>,
@@ -269,16 +269,11 @@ fn same_facts(a: &SessionSummary, b: &SessionSummary) -> bool {
 }
 
 impl SummaryWriter {
-    /// A writer for a session whose existing summary is `previous`: its
-    /// blend and export stamps carry over. Starts dirty.
+    /// A writer for a session whose existing summary is `previous` (not
+    /// written again while its facts stay the same; the session carries its
+    /// stamps, [`OpenSession::stamps`]). Starts dirty.
     pub fn new(previous: Option<SessionSummary>) -> Self {
-        let stamps = previous
-            .iter()
-            .flat_map(|s| &s.groups)
-            .map(|g| (g.name.clone(), (g.blended_at, g.exported_at)))
-            .collect();
         SummaryWriter {
-            stamps,
             dirty: true,
             last: previous,
             inputs: None,
@@ -314,7 +309,6 @@ impl SummaryWriter {
             mosaic: session.mosaic.clone(),
             groups: session.groups.clone(),
             inputs: Inputs::of(session, checks, last_view),
-            stamps: self.stamps.clone(),
             last: self.last.clone(),
         }
     }
@@ -343,32 +337,33 @@ impl SummaryWriter {
         self.running.is_some()
     }
 
-    /// Group `group` was blended at `at` (unix seconds).
-    pub fn record_blend(&mut self, group: &str, at: u64) {
-        self.stamps.entry(group.to_string()).or_default().0 = Some(at);
-        self.dirty = true;
-    }
-
-    /// Group `group` was exported at `at` (unix seconds).
-    pub fn record_export(&mut self, group: &str, at: u64) {
-        self.stamps.entry(group.to_string()).or_default().1 = Some(at);
-        self.dirty = true;
-    }
-
-    /// Note a job event: a finished blend or export (`target`) stamps its
-    /// group at `at` (unix seconds); a job that ended marks the writer
-    /// dirty (its result may have changed). A cancelled one too: discarding
-    /// a cancelled blend may invalidate its store (`jobs::discard_blend`),
-    /// and on Windows a store a blend holds reads as no result until the
-    /// blend lets go of it (see [`mmm_core::tiles::FileTileReader`]).
-    pub fn on_job_event(&mut self, event: &JobEvent, target: Option<(JobTarget, &str)>, at: u64) {
+    /// Note a job event: a finished blend or export (`target`, what
+    /// [`JobRunner::target`](crate::jobs::JobRunner::target) says of it)
+    /// stamps its group in `session` at `at` (unix seconds), a composite's
+    /// export each of the composite's groups; a job that ended marks the
+    /// writer dirty (its result may have changed). A cancelled one too:
+    /// discarding a cancelled blend may invalidate its store
+    /// (`jobs::discard_blend`), and on Windows a store a blend holds reads
+    /// as no result until the blend lets go of it (see
+    /// [`mmm_core::tiles::FileTileReader`]).
+    pub fn on_job_event(
+        &mut self,
+        session: &mut OpenSession,
+        event: &JobEvent,
+        target: Option<(JobTarget, &ExportTarget)>,
+        at: u64,
+    ) {
         match event {
             JobEvent::Finished { .. } => {
                 self.mark_dirty();
-                match target {
-                    Some((JobTarget::Blend, group)) => self.record_blend(group, at),
-                    Some((JobTarget::Export, group)) => self.record_export(group, at),
-                    None => {}
+                if let Some((kind, target)) = target {
+                    for group in target.groups() {
+                        let stamps = session.stamps.entry(group.to_string()).or_default();
+                        match kind {
+                            JobTarget::Blend => stamps.blended_at = Some(at),
+                            JobTarget::Export => stamps.exported_at = Some(at),
+                        }
+                    }
                 }
             }
             JobEvent::Failed { .. } | JobEvent::Cancelled { .. } => self.mark_dirty(),
@@ -431,7 +426,6 @@ impl SummaryWriter {
         self.dirty = false;
         let mosaic = session.mosaic.clone();
         let groups = session.groups.clone();
-        let stamps = self.stamps.clone();
         let last = self.last.clone();
         let closed = Arc::clone(&self.closed);
         let ctx = ctx.clone();
@@ -443,7 +437,6 @@ impl SummaryWriter {
                     &mosaic,
                     groups.as_ref(),
                     &inputs,
-                    &stamps,
                     last.as_ref(),
                     Some(&closed),
                 );
@@ -500,7 +493,7 @@ mod tests {
             Some((600, 420)),
             Some("Ha".into()),
             &results,
-            &Stamps::new(),
+            &BTreeMap::new(),
         );
         assert_eq!(s.panels, 5);
         assert_eq!(s.problems, Some(1));
@@ -521,7 +514,7 @@ mod tests {
             None,
             None,
             &BTreeMap::new(),
-            &Stamps::new(),
+            &BTreeMap::new(),
         );
         assert_eq!((unchecked.problems, unchecked.notes), (None, None));
         assert!(unchecked.groups.is_empty());
@@ -529,7 +522,8 @@ mod tests {
 
     #[test]
     fn exports_survive_reopening() {
-        let (cfg, groups) = two_groups();
+        let root = temp_dir("summary-reopen");
+        let dir = crate::testutil::two_group_session(&root).mosaic.dir;
         let previous = SessionSummary {
             format: SUMMARY_FORMAT,
             groups: vec![GroupSummary {
@@ -540,33 +534,39 @@ mod tests {
             }],
             ..SessionSummary::default()
         };
-        let mut w = SummaryWriter::new(Some(previous));
-        let s = summarize(
-            &cfg,
-            Some(&groups),
-            None,
-            None,
-            None,
-            &BTreeMap::new(),
-            &w.stamps,
-        );
-        assert_eq!(s.groups[0].exported_at, Some(100));
-        assert_eq!(s.groups[0].blended_at, Some(50));
-        assert_eq!(s.groups[1].exported_at, None);
-        w.record_export("OIII", 200);
-        w.record_blend("Ha", 300);
-        let s = summarize(
-            &cfg,
-            Some(&groups),
-            None,
-            None,
-            None,
-            &BTreeMap::new(),
-            &w.stamps,
-        );
-        assert_eq!(s.groups[1].exported_at, Some(200));
-        assert_eq!(s.groups[0].blended_at, Some(300));
-        assert_eq!(s.groups[0].exported_at, Some(100));
+        write_summary(&dir, &previous).unwrap();
+        // The stamps the summary records come back with the session.
+        let mut s = crate::session::open_blocking(&dir).unwrap();
+        let stamp = |blended_at, exported_at| Stamps {
+            blended_at,
+            exported_at,
+        };
+        assert_eq!(s.stamps.get("Ha"), Some(&stamp(Some(50), Some(100))));
+        assert_eq!(s.stamps.get("OIII"), None);
+        let groups = s.groups.clone().unwrap();
+        let summary = |s: &OpenSession| {
+            summarize(
+                &s.mosaic.config,
+                Some(&groups),
+                None,
+                None,
+                None,
+                &BTreeMap::new(),
+                &s.stamps,
+            )
+        };
+        let sum = summary(&s);
+        assert_eq!(sum.groups[0].exported_at, Some(100));
+        assert_eq!(sum.groups[0].blended_at, Some(50));
+        assert_eq!(sum.groups[1].exported_at, None);
+        s.stamps.entry("OIII".into()).or_default().exported_at = Some(200);
+        s.stamps.entry("Ha".into()).or_default().blended_at = Some(300);
+        let sum = summary(&s);
+        assert_eq!(sum.groups[1].exported_at, Some(200));
+        assert_eq!(sum.groups[0].blended_at, Some(300));
+        assert_eq!(sum.groups[0].exported_at, Some(100));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Poll `w` until no write runs and nothing is dirty (bounded by
@@ -588,12 +588,15 @@ mod tests {
     #[test]
     fn poll_writes_stamps_and_skips_unchanged() {
         let root = temp_dir("summary-poll");
-        let s = crate::testutil::two_group_session(&root);
+        let mut s = crate::testutil::two_group_session(&root);
         let dir = s.mosaic.dir.clone();
         let ctx = egui::Context::default();
         let mut w = SummaryWriter::new(None);
-        w.record_blend("Ha", 111);
-        w.record_export("Ha", 222);
+        let ha = Stamps {
+            blended_at: Some(111),
+            exported_at: Some(222),
+        };
+        s.stamps.insert("Ha".into(), ha);
         settle(&mut w, &ctx, &s);
         let written = read_summary(&dir).unwrap();
         assert_eq!(written.groups[0].name, "Ha");
@@ -606,7 +609,7 @@ mod tests {
         settle(&mut w, &ctx, &s);
         assert_eq!(w.writes, 1, "unchanged facts are not rewritten");
         // A real change is written.
-        w.record_blend("OIII", 333);
+        s.stamps.entry("OIII".into()).or_default().blended_at = Some(333);
         settle(&mut w, &ctx, &s);
         assert_eq!(w.writes, 2);
         assert_eq!(read_summary(&dir).unwrap().groups[1].blended_at, Some(333));
@@ -616,20 +619,20 @@ mod tests {
     #[test]
     fn finish_writes_at_once_and_nothing_lands_after() {
         let root = temp_dir("summary-finish");
-        let s = crate::testutil::two_group_session(&root);
+        let mut s = crate::testutil::two_group_session(&root);
         let dir = s.mosaic.dir.clone();
         let ctx = egui::Context::default();
         let mut w = SummaryWriter::new(None);
         // A background write starts, then the session is left at once.
         w.poll(&ctx, &s, None, Some("Ha".into()));
-        w.record_blend("Ha", 111);
+        s.stamps.entry("Ha".into()).or_default().blended_at = Some(111);
         w.finish(&s, None, Some("OIII".into()));
         let written = read_summary(&dir).unwrap();
         assert_eq!(written.last_view.as_deref(), Some("OIII"));
         assert_eq!(written.groups[0].blended_at, Some(111));
         let bytes = std::fs::read(dir.join(SUMMARY_FILE)).unwrap();
         // Nothing is written after it, by the write under way or a later one.
-        w.record_blend("OIII", 222);
+        s.stamps.entry("OIII".into()).or_default().blended_at = Some(222);
         settle(&mut w, &ctx, &s);
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(std::fs::read(dir.join(SUMMARY_FILE)).unwrap(), bytes);
@@ -755,7 +758,7 @@ mod tests {
     #[test]
     fn cancelled_job_rewrites_the_summary() {
         let root = temp_dir("summary-cancelled");
-        let s = ha_merged(&root);
+        let mut s = ha_merged(&root);
         let ctx = egui::Context::default();
         let mut w = SummaryWriter::new(None);
         settle(&mut w, &ctx, &s);
@@ -763,9 +766,75 @@ mod tests {
         // A cancelled blend whose settings were superseded invalidates its
         // store (`jobs::discard_blend`), then reports Cancelled.
         invalidate_group(&s.mosaic, "Ha").unwrap();
-        w.on_job_event(&JobEvent::Cancelled { id: 1 }, None, 0);
+        w.on_job_event(&mut s, &JobEvent::Cancelled { id: 1 }, None, 0);
         settle(&mut w, &ctx, &s);
         assert_eq!(written_result(&s, 0), ResultState::Stale);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Note `events` from `jobs` as the shell does, at `at`.
+    fn note(
+        w: &mut SummaryWriter,
+        s: &mut OpenSession,
+        jobs: &crate::jobs::JobRunner,
+        events: &[JobEvent],
+        at: u64,
+    ) {
+        for e in events {
+            let target = match e {
+                JobEvent::Finished { id, .. } => jobs.target(*id),
+                _ => None,
+            };
+            w.on_job_event(s, e, target, at);
+        }
+    }
+
+    #[test]
+    fn a_composite_export_stamps_its_members() {
+        use crate::jobs::ExportTarget;
+        use crate::jobs::tests::{analyzed, drain};
+        use mmm_core::export::ExportFormat;
+        let (root, mut s, mut jobs) = analyzed("summary-composite-export");
+        let mut w = SummaryWriter::new(None);
+        jobs.start_blend(&mut s, "Ha", None);
+        jobs.start_blend(&mut s, "OIII", None);
+        let events = drain(&mut jobs, &mut s);
+        note(&mut w, &mut s, &jobs, &events, 100);
+        let stamp = |blended_at, exported_at| Stamps {
+            blended_at,
+            exported_at,
+        };
+        assert_eq!(s.stamps.get("Ha"), Some(&stamp(Some(100), None)));
+        // A group's export stamps its group.
+        let ha = ExportTarget::Group("Ha".into());
+        jobs.start_export(&s, ha, root.join("ha.fits"), ExportFormat::Fits);
+        let events = drain(&mut jobs, &mut s);
+        note(&mut w, &mut s, &jobs, &events, 150);
+        assert_eq!(s.stamps.get("Ha"), Some(&stamp(Some(100), Some(150))));
+        assert_eq!(s.stamps.get("OIII"), Some(&stamp(Some(100), None)));
+        // A composite's export stamps each of its groups.
+        let hoo = ExportTarget::Composite {
+            id: 1,
+            name: "HOO".into(),
+            channels: [Some("Ha".into()), Some("OIII".into()), Some("OIII".into())],
+        };
+        jobs.start_export(&s, hoo, root.join("hoo.fits"), ExportFormat::Fits);
+        let events = drain(&mut jobs, &mut s);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, JobEvent::Finished { .. })),
+            "{events:?}"
+        );
+        note(&mut w, &mut s, &jobs, &events, 200);
+        assert_eq!(s.stamps.get("Ha"), Some(&stamp(Some(100), Some(200))));
+        assert_eq!(s.stamps.get("OIII"), Some(&stamp(Some(100), Some(200))));
+        // ...which the summary records.
+        let ctx = egui::Context::default();
+        settle(&mut w, &ctx, &s);
+        let written = read_summary(&s.mosaic.dir).unwrap();
+        let exported: Vec<_> = written.groups.iter().map(|g| g.exported_at).collect();
+        assert_eq!(exported, [Some(200), Some(200)]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
