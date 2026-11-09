@@ -78,7 +78,11 @@ pub fn lock_session(dir: &Path) -> Result<SessionLock> {
 ///
 /// Opens [`LOCK_FILE`] without creating it (absent: `false`) and tries a
 /// shared lock, released at once. This microseconds-long probe is the only
-/// time a start screen touches the lock; it never holds it.
+/// time a start screen touches the lock; it never holds it. Contention is
+/// retried for up to [`LOCK_CONTENTION_WAIT`] (as [`lock_session`] does), so a
+/// holder that lets go at once (a notes save, another window's own probe or
+/// open that is about to fail) doesn't read as busy; a real holder still
+/// does, at most that long after the call.
 ///
 /// A probe error other than contention (permissions, I/O) returns `false`: it
 /// is not evidence of another holder. Live reads go through
@@ -89,13 +93,21 @@ pub fn session_busy(dir: &Path) -> bool {
     let Ok(file) = File::open(dir.join(LOCK_FILE)) else {
         return false;
     };
-    match file.try_lock_shared() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
+    let start = Instant::now();
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let _ = file.unlock();
+                return false;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if start.elapsed() >= LOCK_CONTENTION_WAIT {
+                    return true;
+                }
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            Err(std::fs::TryLockError::Error(_)) => return false,
         }
-        Err(std::fs::TryLockError::WouldBlock) => true,
-        Err(std::fs::TryLockError::Error(_)) => false,
     }
 }
 
@@ -164,6 +176,24 @@ mod tests {
         assert!(err.is_busy(), "{err}");
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_brief_holder_does_not_make_the_session_busy() {
+        let dir = fresh_dir("brief");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.clone();
+        let holder = std::thread::spawn(move || {
+            let held = lock_session(&path).unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+        rx.recv().unwrap();
+        let busy = session_busy(&dir);
+        holder.join().unwrap();
+        assert!(!busy, "a lock held for 50 ms reads as busy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
