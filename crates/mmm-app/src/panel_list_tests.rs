@@ -1264,6 +1264,7 @@ fn rows_show_their_problems() {
     h.state_mut().checks.set_report(ChecksReport {
         checks: vec![check],
         errors: Vec::new(),
+        seams: Default::default(),
     });
     steps(&mut h);
     // The rolled-up section shows the row with the problem, its ⚠ telling

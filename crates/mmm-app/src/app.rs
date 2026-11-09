@@ -589,6 +589,15 @@ impl Shell {
                     .push(toast(Tone::Problem, message), ctx.input(|i| i.time));
             }
         }
+        for check in &out.unaccept {
+            if let Err(message) = self.checks.unaccept(session, check) {
+                tracing::warn!("{message}");
+                #[cfg(test)]
+                self.toasted.push(message.clone());
+                self.toasts
+                    .push(toast(Tone::Problem, message), ctx.input(|i| i.time));
+            }
+        }
         let now = ctx.input(|i| i.time);
         for WindowToast { toast, undo } in out.toasts {
             let has_action = toast.action.is_some();

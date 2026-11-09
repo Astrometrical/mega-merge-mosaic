@@ -1832,6 +1832,7 @@ fn problems_accept_a_check() {
             ),
         ],
         errors: Vec::new(),
+        seams: Default::default(),
     });
     let mut h = harness(state);
     h.run_steps(3);
@@ -1901,6 +1902,7 @@ fn a_selected_panel_shows_its_details_and_checks() {
             ),
         ],
         errors: Vec::new(),
+        seams: Default::default(),
     });
     let mut h = harness(state);
     step_until(&mut h, |st| {
@@ -2114,6 +2116,7 @@ fn problems(s: &OpenSession, n: usize) -> ChecksReport {
             })
             .collect(),
         errors: Vec::new(),
+        seams: Default::default(),
     }
 }
 

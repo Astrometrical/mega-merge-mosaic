@@ -153,6 +153,8 @@ pub enum CanvasMode {
 pub struct SessionOutput {
     /// Accept these checks ([`ChecksEngine::accept`]).
     pub accept: Vec<Check>,
+    /// Take back accepting these checks ([`ChecksEngine::unaccept`]).
+    pub unaccept: Vec<Check>,
     /// ‹ was clicked: back to the start screen
     /// ([`crate::app::Shell::close_session`]).
     pub back: bool,
