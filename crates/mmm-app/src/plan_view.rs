@@ -690,11 +690,13 @@ pub struct PlanView {
     overlays: Vec<Overlay>,
     /// Image patches (ROI previews) drawn over the canvas.
     patches: Vec<mega_ui::canvas_layers::Patch>,
-    /// The lines the window has drawn over the plan (the seams).
+    /// The lines last handed to the canvas (tests; the canvas keeps them).
+    #[cfg(test)]
     lines: Vec<Polyline>,
     /// The view's problems, one per place, to badge ([`PlanView::set_marks`]).
     marks: Vec<ProblemMark>,
-    /// The badges the last frame drew.
+    /// The badges the last frame drew (tests; the canvas keeps them).
+    #[cfg(test)]
     badges: Vec<CanvasBadge>,
     /// A badge clicked, until taken ([`PlanView::take_badge_clicked`]).
     badge_clicked: Option<u64>,
@@ -781,8 +783,10 @@ impl PlanView {
             highlight: None,
             overlays: Vec::new(),
             patches: Vec::new(),
+            #[cfg(test)]
             lines: Vec::new(),
             marks: Vec::new(),
+            #[cfg(test)]
             badges: Vec::new(),
             badge_clicked: None,
             drawn: None,
@@ -841,9 +845,14 @@ impl PlanView {
     }
 
     /// Draw these polylines (the seams, canvas coordinates) over the panels
-    /// from the next frame on, with the overlays.
+    /// from the next frame on, with the overlays (handed straight to the
+    /// canvas).
     pub fn set_lines(&mut self, lines: Vec<Polyline>) {
-        self.lines = lines;
+        #[cfg(test)]
+        {
+            self.lines = lines.clone();
+        }
+        self.canvas.set_lines(lines);
     }
 
     /// Badge these problems (the view's, one mark per place,
@@ -980,11 +989,13 @@ impl PlanView {
         &self.layout
     }
 
-    /// Keep the layout current while the plan is not drawn (the merged
+    /// Keep the layout current whether or not the plan is drawn (the merged
     /// mosaic places its outlines and badges with it): take a finished
-    /// read, and read again when the previews or analyses may have moved
-    /// the panels, as drawing does. Call each frame the plan is not drawn
-    /// (drawing it does this too).
+    /// read, and read again (on a worker) when the previews or analyses may
+    /// have moved the panels, as drawing does. Meant to be called every
+    /// frame, and cheap: it compares a small key (previews generation,
+    /// analysed groups, provenance length) and does no I/O unless the key
+    /// changed.
     pub fn follow_layout(
         &mut self,
         ctx: &egui::Context,
@@ -1102,6 +1113,7 @@ impl PlanView {
             Some(spec) => self.build_items(session, spec, feed),
             None => {
                 self.last_items.clear();
+                #[cfg(test)]
                 self.badges.clear();
                 self.canvas.set_badges(Vec::new());
                 self.missing_layers = 0;
@@ -1153,7 +1165,6 @@ impl PlanView {
         }
         self.canvas.set_overlays(self.overlays.clone());
         self.canvas.set_patches(self.patches.clone());
-        self.canvas.set_lines(self.lines.clone());
         let r = self
             .canvas
             .show(ui, extent, items, look.outlines, look.numbers);
@@ -1731,8 +1742,11 @@ impl PlanView {
                 Some(m.badge(at))
             })
             .collect();
-        self.canvas.set_badges(badges.clone());
-        self.badges = badges;
+        #[cfg(test)]
+        {
+            self.badges = badges.clone();
+        }
+        self.canvas.set_badges(badges);
         items
     }
 

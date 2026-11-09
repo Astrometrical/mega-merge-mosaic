@@ -312,13 +312,13 @@ pub struct MosaicView {
     settings: SettingsPanel,
     /// The ROIs' preview patches the viewer draws ([`MosaicView::set_patches`]).
     patches: Vec<mega_ui::canvas_layers::Patch>,
-    /// The panels' outlines the viewer draws, under the ROIs
-    /// ([`MosaicView::set_outlines`]).
+    /// The panels' outlines for the next frame drawn, under the ROIs
+    /// ([`MosaicView::set_outlines`]); taken by the frame.
     outlines: Vec<Overlay>,
-    /// The lines the viewer draws (the seams, [`MosaicView::set_lines`]).
-    lines: Vec<Polyline>,
-    /// The badges the viewer draws (the problems, [`MosaicView::set_badges`]).
-    badges: Vec<CanvasBadge>,
+    /// What was last handed over, as handed (tests: the viewer keeps the
+    /// lines and badges, and the frame takes the outlines).
+    #[cfg(test)]
+    handed: (Vec<Overlay>, Vec<Polyline>, Vec<CanvasBadge>),
     /// A badge clicked, until taken ([`MosaicView::take_badge_clicked`]).
     badge_clicked: Option<u64>,
     /// The tag over the image (why the shown groups are out of date, or
@@ -368,8 +368,8 @@ impl MosaicView {
             rois: RoiPanel::default(),
             patches: Vec::new(),
             outlines: Vec::new(),
-            lines: Vec::new(),
-            badges: Vec::new(),
+            #[cfg(test)]
+            handed: Default::default(),
             badge_clicked: None,
             tag: None,
             reveal_settings: false,
@@ -497,24 +497,42 @@ impl MosaicView {
         self.hold
     }
 
-    /// Draw these panel outlines (canvas coordinates) over the mosaic from
-    /// the next frame on, under the ROIs: the window hands them while the
-    /// look has them ([`crate::marks::panel_outlines`]).
+    /// Draw these panel outlines (canvas coordinates) over the mosaic in
+    /// the next frame drawn, under the ROIs: the window hands them each
+    /// frame while the look has them ([`crate::marks::panel_outlines`]).
     pub fn set_outlines(&mut self, outlines: Vec<Overlay>) {
+        #[cfg(test)]
+        {
+            self.handed.0 = outlines.clone();
+        }
         self.outlines = outlines;
     }
 
     /// Draw these polylines (the seams, canvas coordinates) over the mosaic
-    /// from the next frame on.
+    /// from the next frame on (handed straight to the viewer, if there is
+    /// one: the window hands them each frame).
     pub fn set_lines(&mut self, lines: Vec<Polyline>) {
-        self.lines = lines;
+        #[cfg(test)]
+        {
+            self.handed.1 = lines.clone();
+        }
+        if let Some(viewer) = &mut self.viewer {
+            viewer.set_lines(lines);
+        }
     }
 
     /// Draw these badges (the view's problems, canvas coordinates) over the
-    /// mosaic from the next frame on. A click on one is taken with
-    /// [`MosaicView::take_badge_clicked`].
+    /// mosaic from the next frame on (handed straight to the viewer, if
+    /// there is one: the window hands them each frame). A click on one is
+    /// taken with [`MosaicView::take_badge_clicked`].
     pub fn set_badges(&mut self, badges: Vec<CanvasBadge>) {
-        self.badges = badges;
+        #[cfg(test)]
+        {
+            self.handed.2 = badges.clone();
+        }
+        if let Some(viewer) = &mut self.viewer {
+            viewer.set_badges(badges);
+        }
     }
 
     /// The badge clicked (or activated from the keyboard) since the last
@@ -523,22 +541,22 @@ impl MosaicView {
         self.badge_clicked.take()
     }
 
-    /// The badges handed to the viewer (canvas coordinates).
+    /// The badges last handed over (canvas coordinates).
     #[cfg(test)]
     pub fn badges(&self) -> &[CanvasBadge] {
-        &self.badges
+        &self.handed.2
     }
 
-    /// The lines handed to the viewer (canvas coordinates).
+    /// The lines last handed over (canvas coordinates).
     #[cfg(test)]
     pub fn lines(&self) -> &[Polyline] {
-        &self.lines
+        &self.handed.1
     }
 
-    /// The panel outlines handed to the viewer (canvas coordinates).
+    /// The panel outlines last handed over (canvas coordinates).
     #[cfg(test)]
     pub fn outlines(&self) -> &[Overlay] {
-        &self.outlines
+        &self.handed.0
     }
 
     /// Why the typed merge settings are refused, if they are
@@ -1073,7 +1091,7 @@ impl MosaicView {
         }
         let canvas = self.view_canvas();
         // The ROIs over the panels' outlines.
-        let mut overlays = self.outlines.clone();
+        let mut overlays = std::mem::take(&mut self.outlines);
         if look.rois {
             overlays.extend(self.rois.overlays());
         }
@@ -1092,8 +1110,6 @@ impl MosaicView {
                 }
                 viewer.set_overlays(overlays);
                 viewer.set_patches(self.patches.clone());
-                viewer.set_lines(self.lines.clone());
-                viewer.set_badges(self.badges.clone());
                 let shown = viewer.show(ui);
                 drawn = shown.drawn_rect;
                 self.hold = shown.held;

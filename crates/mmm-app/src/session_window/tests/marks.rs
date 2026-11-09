@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use egui::Color32;
 use egui::epaint::ColorMode;
-use mega_ui::canvas_layers::CanvasBadge;
+use mega_ui::canvas_layers::{CanvasBadge, LABEL_OFFSET};
 use mega_ui::theme::tokens::{LINE_WIDTH, LINE_WIDTH_STRONG};
 use mega_ui::theme::{Tone, palette};
 use mmm_core::checks::CheckTarget;
@@ -106,6 +106,33 @@ fn badge_at(badges: &[CanvasBadge], p: [f64; 2]) -> Option<&CanvasBadge> {
         .find(|b| (b.at[0] - p[0]).abs() < 0.01 && (b.at[1] - p[1]).abs() < 0.01)
 }
 
+/// Canvas points rounded to a hundredth of a pixel, sorted: a set of badge
+/// places to compare.
+fn spots(points: impl IntoIterator<Item = [f64; 2]>) -> Vec<[i64; 2]> {
+    let mut v: Vec<[i64; 2]> = points
+        .into_iter()
+        .map(|p| p.map(|c| (c * 100.0).round() as i64))
+        .collect();
+    v.sort();
+    v
+}
+
+/// The badge button drawn at screen point `at` (its pill's centre).
+fn badge_button<'h>(h: &'h Harness<'static, State>, at: egui::Pos2) -> egui_kittest::Node<'h> {
+    h.query_all(By::new().role(Role::Button))
+        .find(|n| {
+            let said = n.accesskit_node().label().unwrap_or_default();
+            said.ends_with(" here") && n.rect().expand(1.0).contains(at)
+        })
+        .unwrap_or_else(|| panic!("a badge at {at:?}"))
+}
+
+/// A canvas rect framed as [`target_rect`](crate::marks::target_rect)
+/// rounds it: whole pixels, covering it.
+fn covering(r: [f64; 4]) -> [f64; 4] {
+    [r[0].floor(), r[1].floor(), r[2].ceil(), r[3].ceil()]
+}
+
 /// Whether the last frame stroked a line in `color` at `width` inside
 /// `canvas` (a polyline, or one of its dashes).
 fn stroked(h: &Harness<'_, State>, canvas: egui::Rect, color: Color32, width: f32) -> bool {
@@ -188,12 +215,20 @@ fn badges_match_on_plan_and_mosaic() {
             &["Ha"],
             "Panel 0 alone",
         ),
+        // A thin overlap and a seam of the same pair: one badge, "2".
         problem_at(
             CheckCode::ThinOverlap,
             CheckTarget::Overlap(ha[1].clone(), ha[0].clone()),
             &["Ha"],
             "Thin",
         ),
+        problem_at(
+            CheckCode::ResidualSeam,
+            seam("Ha", &ha[0], &ha[1]),
+            &["Ha"],
+            "A seam shows between 0 and 1",
+        ),
+        // A seam alone: badged at its overlap, framed at its lines.
         problem_at(
             CheckCode::ResidualSeam,
             seam("Ha", &ha[3], &ha[1]),
@@ -238,13 +273,14 @@ fn badges_match_on_plan_and_mosaic() {
     h.run_steps(2);
     let plan = by_id(h.state().w.plan().badges());
     assert_eq!(plan.len(), 4, "one badge per place: {plan:?}");
-    // Each at its place: a panel's at its outline's top-right, the others
-    // at their rect's centre (a seam's: its lines' bbox).
+    // Each at its place: a panel's at its outline's top-right, a pair's
+    // (its overlap's and its seam's problems) at the overlap's centre, an
+    // area's at its centre.
     let r0 = rect(&ha[0]);
     let want = [
         ([r0[2], r0[1]], 2),
-        (centre(meet(r0, rect(&ha[1]))), 1),
-        ([o13[0] + 10.0, o13[1] + 15.0], 1),
+        (centre(meet(r0, rect(&ha[1]))), 2),
+        (centre(o13), 1),
         ([40.0, 40.0], 1),
     ];
     for (p, n) in want {
@@ -263,33 +299,51 @@ fn badges_match_on_plan_and_mosaic() {
         h.query_all(By::new().role(Role::Button).label(label))
             .count()
     };
-    assert_eq!(buttons(&h, "2 problems here"), 1);
-    assert_eq!(buttons(&h, "1 problem here"), 3);
-    // The mosaic badges the same places, the same way.
+    assert_eq!(buttons(&h, "2 problems here"), 2);
+    assert_eq!(buttons(&h, "1 problem here"), 2);
+    // A badge clicked on the plan goes to its place: the lone seam's
+    // badge frames its lines.
+    let at = h
+        .state()
+        .w
+        .plan()
+        .to_screen((centre(o13)[0], centre(o13)[1]));
+    badge_button(&h, at.expect("the plan drawn")).click();
+    h.run_steps(3);
+    let (plan_frame, _) = h.state().w.plan().canvas_frame().unwrap();
+    let lines_bbox = [line[0][0], line[0][1], line[1][0], line[1][1]];
+    assert_camera(
+        h.state().w.plan().camera(),
+        Camera::framing(covering(lines_bbox), plan_frame.size()),
+    );
+    // The mosaic badges the same places, the same way (the whole canvas
+    // in view again).
     h.get_by_label("Mosaic").click();
     step_to(&mut h, |st| {
         mosaic_ready(st) && !st.w.mosaic().badges().is_empty()
     });
-    h.run_steps(2);
-    assert_eq!(by_id(h.state().w.mosaic().badges()), plan);
-    assert_eq!(buttons(&h, "2 problems here"), 1);
-    assert_eq!(buttons(&h, "1 problem here"), 3);
-    // A badge clicked goes to its place: the panel's bbox is framed.
-    h.get(By::new().role(Role::Button).label("2 problems here"))
-        .click();
+    h.state_mut().w.frame([0, 0, 600, 420]);
     h.run_steps(3);
+    assert_eq!(by_id(h.state().w.mosaic().badges()), plan);
+    assert_eq!(buttons(&h, "2 problems here"), 2);
+    assert_eq!(buttons(&h, "1 problem here"), 2);
+    // A badge clicked on the mosaic goes to its place too: the panel's
+    // bbox is framed.
     let (frame, _) = h.state().w.mosaic().viewer_frame().unwrap();
-    let rect0 = [r0[0].floor(), r0[1].floor(), r0[2].ceil(), r0[3].ceil()];
+    let cam = h.state().w.mosaic().camera().unwrap();
+    badge_button(&h, screen(frame, cam, (r0[2], r0[1]))).click();
+    h.run_steps(3);
     assert_camera(
         h.state().w.mosaic().camera(),
-        Camera::framing(rect0, frame.size()),
+        Camera::framing(covering(r0), frame.size()),
     );
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn outlines_show_over_the_mosaic() {
-    let (root, s, jobs) = merged("window-mosaic-outlines");
+    let (root, mut s, jobs) = merged("window-mosaic-outlines");
+    add_roi(&mut s);
     let ha = members(&s, "Ha");
     let geo = analysed(&s, "Ha");
     let mut state = State::new(s, jobs);
@@ -331,7 +385,7 @@ fn outlines_show_over_the_mosaic() {
         .enumerate()
         .map(|(i, p)| {
             let r = geo[p].1;
-            let at = screen(frame, cam, (r[0], r[1])) + egui::vec2(4.0, 2.0);
+            let at = screen(frame, cam, (r[0], r[1])) + LABEL_OFFSET;
             ((i + 1).to_string(), at)
         })
         .collect();
@@ -344,6 +398,33 @@ fn outlines_show_over_the_mosaic() {
     for (label, at) in &numbers {
         assert!(numbered(&h, label, *at), "panel {label} numbered at {at:?}");
     }
+    // Under the ROIs: the panel's outline (a stroked rect) is painted
+    // before the ROI's (dashed: not selected).
+    let on_screen = |r: [f64; 4]| {
+        egui::Rect::from_two_pos(
+            screen(frame, cam, (r[0], r[1])),
+            screen(frame, cam, (r[2], r[3])),
+        )
+    };
+    let panel0 = on_screen(geo[&ha[0]].1);
+    let outline = h.output().shapes.iter().position(|cs| match &cs.shape {
+        egui::Shape::Rect(s) => {
+            s.stroke.color == palette::ACCENT_500
+                && (s.rect.min - panel0.min).length() < 0.5
+                && (s.rect.max - panel0.max).length() < 0.5
+        }
+        _ => false,
+    });
+    let roi = on_screen(h.state().w.mosaic().rois()[0].canvas.map(|v| v as f64)).expand(1.0);
+    let roi_color = h.state().w.mosaic().roi_color(1);
+    let region = h.output().shapes.iter().position(|cs| match &cs.shape {
+        egui::Shape::LineSegment { points, stroke } => {
+            stroke.color == roi_color && points.iter().all(|p| roi.contains(*p))
+        }
+        _ => false,
+    });
+    let (outline, region) = (outline.expect("outline"), region.expect("ROI dashes"));
+    assert!(outline < region, "outline {outline}, ROI {region}");
     // Outlines off: none over the mosaic (the badge stays).
     h.get(toggle("Outlines")).click();
     h.run_steps(2);
@@ -371,13 +452,22 @@ fn the_seams_toggle_draws_flagged_seams_in_warning() {
         }
     };
     // The seam of panels 0 and 1 shows after the merge (a problem); that of
-    // 2 and 3 only disagrees (a note: no warning); OIII's are not shown.
+    // 2 and 3 only disagrees (a note), and the pair's overlap is thin (a
+    // problem badged with the pair, not the seam's own: no warning); OIII's
+    // are not shown. A panel and an area have problems too.
     let shows = problem_at(
         CheckCode::ResidualSeam,
         seam("Ha", &ha[0], &ha[1]),
         &["Ha"],
         "A seam shows",
     );
+    let mut hole = problem_at(
+        CheckCode::CoverageHole,
+        CheckTarget::Group("Ha".into()),
+        &["Ha"],
+        "A hole",
+    );
+    hole.rect = Some([20, 30, 60, 50]);
     let oiii = members(&s, "OIII");
     let report = ChecksReport {
         checks: vec![
@@ -389,6 +479,19 @@ fn the_seams_toggle_draws_flagged_seams_in_warning() {
                 &["Ha"],
                 "A seam is likely",
             ),
+            problem_at(
+                CheckCode::ThinOverlap,
+                CheckTarget::Overlap(ha[3].clone(), ha[2].clone()),
+                &["Ha"],
+                "Thin",
+            ),
+            problem_at(
+                CheckCode::NoOverlap,
+                CheckTarget::Panel(ha[2].clone()),
+                &["Ha"],
+                "Panel 2 alone",
+            ),
+            hole,
         ],
         errors: Vec::new(),
         seams: BTreeMap::from([
@@ -438,10 +541,18 @@ fn the_seams_toggle_draws_flagged_seams_in_warning() {
     }
     assert!(stroked(&h, frame, warning, LINE_WIDTH_STRONG));
     assert!(stroked(&h, frame, neutral, LINE_WIDTH));
-    // The seam showing has its badge.
-    let o = meet(geo[&ha[0]].1, geo[&ha[1]].1);
-    let mid = [(o[0] + 4.0 + o[2] - 4.0) / 2.0, o[1] + 4.0];
-    assert!(badge_at(h.state().w.mosaic().badges(), mid).is_some());
+    // The seam showing has its badge, its pair's, at the overlap.
+    let r = |i: usize| geo[&ha[i]].1;
+    let pair01 = centre(meet(r(0), r(1)));
+    let pair23 = centre(meet(r(2), r(3)));
+    let panel2 = [r(2)[2], r(2)[1]];
+    let area = [40.0, 40.0];
+    let places = |badges: &[CanvasBadge]| spots(badges.iter().map(|b| b.at));
+    let sorted = |ps: &[[f64; 2]]| spots(ps.iter().copied());
+    assert_eq!(
+        places(h.state().w.mosaic().badges()),
+        sorted(&[pair01, pair23, panel2, area])
+    );
     // The plan draws them the same.
     h.get_by_label("Plan").click();
     step_to(&mut h, plan_ready);
@@ -449,8 +560,12 @@ fn the_seams_toggle_draws_flagged_seams_in_warning() {
     assert_eq!(h.state().w.plan().lines(), lines.as_slice());
     let (plan_frame, _) = h.state().w.plan().canvas_frame().unwrap();
     assert!(stroked(&h, plan_frame, warning, LINE_WIDTH_STRONG));
-    // Accepted, the seam goes neutral like any accepted problem (and loses
-    // its badge).
+    assert_eq!(
+        places(h.state().w.plan().badges()),
+        sorted(&[pair01, pair23, panel2, area])
+    );
+    // Accepted, the seam goes neutral like any accepted problem (and its
+    // pair loses its badge).
     h.state_mut()
         .session
         .mosaic
@@ -466,10 +581,14 @@ fn the_seams_toggle_draws_flagged_seams_in_warning() {
             .iter()
             .all(|l| l.color == neutral && l.width == LINE_WIDTH)
     );
-    assert!(h.state().w.plan().badges().is_empty());
+    assert_eq!(
+        places(h.state().w.plan().badges()),
+        sorted(&[pair23, panel2, area])
+    );
     assert!(!stroked(&h, plan_frame, warning, LINE_WIDTH_STRONG));
     // While the plan draws in another frame than the analysed one the
-    // seams are in, it draws none.
+    // seams are in, it draws none, and badges only its panels (placed by
+    // its own outlines), not the pair or the area.
     h.state_mut().session.frame = Some(mmm_core::reference::ReferenceFrame::Aligned {
         width: 7,
         height: 9,
@@ -478,6 +597,90 @@ fn the_seams_toggle_draws_flagged_seams_in_warning() {
     h.run_steps(3);
     assert!(h.state().w.plan().lines().is_empty());
     assert!(!stroked(&h, plan_frame, neutral, LINE_WIDTH));
+    assert_eq!(places(h.state().w.plan().badges()), sorted(&[panel2]));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_composite_gathers_its_members_badges_and_seams() {
+    let (root, mut s, jobs) = merged("window-composite-marks");
+    save_compositions(
+        &mut s.mosaic.config.ui,
+        &[Composition {
+            id: 1,
+            name: "Both".into(),
+            channels: [Some(("Ha".into(), 1.0)), Some(("OIII".into(), 1.0)), None],
+        }],
+    );
+    let (ha, oiii) = (members(&s, "Ha"), members(&s, "OIII"));
+    let (gh, go) = (analysed(&s, "Ha"), analysed(&s, "OIII"));
+    let line = |geo: &BTreeMap<PathBuf, (usize, [f64; 4])>, a: &PathBuf, b: &PathBuf| {
+        let o = meet(geo[a].1, geo[b].1);
+        let (x, y) = (geo[a].0 as u16, geo[b].0 as u16);
+        SeamLine {
+            a: x.min(y),
+            b: x.max(y),
+            points: vec![[o[0] + 2.0, o[1] + 2.0], [o[0] + 2.0, o[3] - 2.0]],
+            flagged: false,
+        }
+    };
+    let mut state = State::new(s, jobs);
+    state.checks.set_report(ChecksReport {
+        checks: vec![
+            problem_at(
+                CheckCode::NoOverlap,
+                CheckTarget::Panel(ha[0].clone()),
+                &["Ha"],
+                "Ha alone",
+            ),
+            problem_at(
+                CheckCode::NoOverlap,
+                CheckTarget::Panel(oiii[1].clone()),
+                &["OIII"],
+                "OIII alone",
+            ),
+        ],
+        errors: Vec::new(),
+        seams: BTreeMap::from([
+            ("Ha".to_string(), vec![line(&gh, &ha[0], &ha[1])]),
+            ("OIII".to_string(), vec![line(&go, &oiii[2], &oiii[3])]),
+        ]),
+    });
+    state.w.select_view(ViewKind::Composition(1));
+    let mut h = harness(state);
+    step_to(&mut h, |st| {
+        mosaic_ready(st) && !st.w.mosaic().badges().is_empty()
+    });
+    h.get(toggle("Seams")).click();
+    h.run_steps(2);
+    assert_eq!(h.state().w.view(), Some(&ViewKind::Composition(1)));
+    // Both members' problems and seams, and all their panels' outlines.
+    let want = spots([
+        [gh[&ha[0]].1[2], gh[&ha[0]].1[1]],
+        [go[&oiii[1]].1[2], go[&oiii[1]].1[1]],
+    ]);
+    let points = |lines: &[mega_ui::canvas_layers::Polyline]| {
+        let mut v: Vec<Vec<[f64; 2]>> = lines.iter().map(|l| l.points.clone()).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let mut seams = vec![
+        line(&gh, &ha[0], &ha[1]).points,
+        line(&go, &oiii[2], &oiii[3]).points,
+    ];
+    seams.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mosaic = h.state().w.mosaic();
+    assert_eq!(spots(mosaic.badges().iter().map(|b| b.at)), want);
+    assert_eq!(points(mosaic.lines()), seams);
+    let labels: Vec<String> = mosaic.outlines().iter().map(|o| o.label.clone()).collect();
+    assert_eq!(labels, (1..=8).map(|i| i.to_string()).collect::<Vec<_>>());
+    // The plan shows the composite the same way.
+    h.get_by_label("Plan").click();
+    step_to(&mut h, plan_ready);
+    h.run_steps(2);
+    let plan = h.state().w.plan();
+    assert_eq!(spots(plan.badges().iter().map(|b| b.at)), want);
+    assert_eq!(points(plan.lines()), seams);
     let _ = std::fs::remove_dir_all(&root);
 }
 

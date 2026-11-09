@@ -6,19 +6,23 @@
 //!   the canvas (a coverage hole) has a [`Place`] ([`Place::of`]); a
 //!   session- or group-wide one has none: it counts on the group chips and
 //!   in the Problems list only. The unaccepted problems of the groups shown
-//!   are gathered one [`ProblemMark`] per place ([`problem_marks`]): one
-//!   badge, counting them ("{n} problem(s) here"), with the problem icon.
+//!   are gathered one [`ProblemMark`] per badge place ([`problem_marks`],
+//!   [`Place::badged`]): a panel, a pair of panels (its overlap's problems
+//!   and its seam's share one badge, spec §7.4), an area. One badge,
+//!   counting them ("{n} problem(s) here"), with the problem icon.
 //! - **Where.** A place's rect comes from the analysis (the plan's
 //!   [`Layout`], in the analysed frame) and the checks' seam lines
 //!   ([`place_rect`], [`target_rect`]): a panel's analysed bbox, the
 //!   intersection of two panels' bboxes, the bbox of a seam's lines (else
-//!   its overlap's), an area's rect. A panel's badge sits at its outline's
+//!   its overlap's), an area's rect. Going to a seam frames its lines; its
+//!   badge is its pair's, at the overlap (at its lines only where the
+//!   overlap does not resolve). A panel's badge sits at its outline's
 //!   top-right corner, any other at its rect's centre ([`badge_point`]). A
 //!   panel or group no longer in the session places nothing.
 //! - **Seams** ([`seam_lines`]): the shown groups' seam lines in a neutral
-//!   colour; one with an unaccepted problem (the seam shows after a merge)
-//!   in the warning colour and thicker, so colour is not the only signal,
-//!   and badged like any place. An accepted one goes neutral.
+//!   colour; one with an unaccepted problem of its own (the seam shows after
+//!   a merge) in the warning colour and thicker, so colour is not the only
+//!   signal, and badged with its pair. An accepted one goes neutral.
 //! - **Outlines over the mosaic** ([`panel_outlines`]): each shown panel's
 //!   analysed bbox, numbered as on the plan, in the problem colour when it
 //!   is badged ([`outline_color`], as the plan's).
@@ -96,6 +100,15 @@ impl Place {
         }
     }
 
+    /// Where a problem at this place is badged: a seam with its pair's
+    /// overlap (one badge per pair of panels), any other place at itself.
+    pub fn badged(self) -> Place {
+        match self {
+            Place::Seam { a, b, .. } => Place::Overlap(a, b),
+            other => other,
+        }
+    }
+
     /// An id for the place's badge: the same for the same place, so the
     /// badge keeps its widget (and keyboard focus) while problems come and
     /// go elsewhere.
@@ -106,17 +119,21 @@ impl Place {
     }
 }
 
-/// The unaccepted problems at one place: one badge.
+/// The unaccepted problems at one badge place: one badge.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProblemMark {
-    /// The badge's id ([`CanvasBadge::id`]), the same while the place is.
+    /// The badge's id ([`CanvasBadge::id`]), the same while the place is
+    /// (for a pair, whichever of its overlap's and seam's problems it has).
     pub id: u64,
-    /// Where the problems are.
+    /// Where the badge sits ([`Place::badged`]): a panel, a pair of panels
+    /// ([`Place::Overlap`], for its overlap's and its seam's problems), or
+    /// an area.
     pub place: Place,
-    /// The place's rect in the analysed frame ([`place_rect`]), if it
+    /// The place's rect in the analysed frame ([`place_rect`]; for a pair
+    /// whose overlap does not resolve, its seam's lines' bbox), if it
     /// resolves.
     pub rect: Option<[f64; 4]>,
-    /// The problems there, in the report's order.
+    /// The problems there, in the report's order (the Problems list's).
     pub problems: Vec<Check>,
 }
 
@@ -164,8 +181,10 @@ fn concerns(check: &Check, group: &str, panels: &[PathBuf]) -> bool {
 }
 
 /// The unaccepted problems in `report` that concern any of `groups` (the
-/// groups shown), one mark per place, in place order, each with its rect
-/// from `layout` and the report's seam lines. None without a report.
+/// groups shown), one mark per badge place ([`Place::badged`]: a pair's
+/// overlap and seam problems together), in place order, each with its rect
+/// from `layout` and the report's seam lines: a pair's overlap, else its
+/// seam's lines. None without a report.
 pub fn problem_marks(
     session: &OpenSession,
     layout: &Layout,
@@ -187,15 +206,25 @@ pub fn problem_marks(
             continue;
         }
         if let Some(place) = Place::of(c) {
-            at.entry(place).or_default().push(c.clone());
+            at.entry(place.badged()).or_default().push(c.clone());
         }
     }
+    let seams = &report.seams;
     at.into_iter()
-        .map(|(place, problems)| ProblemMark {
-            id: place.id(),
-            rect: place_rect(session, layout, &report.seams, &place),
-            place,
-            problems,
+        .map(|(place, problems)| {
+            // A pair whose overlap does not resolve: at its seam's lines.
+            let rect = place_rect(session, layout, seams, &place).or_else(|| {
+                problems.iter().find_map(|c| match Place::of(c)? {
+                    seam @ Place::Seam { .. } => place_rect(session, layout, seams, &seam),
+                    _ => None,
+                })
+            });
+            ProblemMark {
+                id: place.id(),
+                place,
+                rect,
+                problems,
+            }
         })
         .collect()
 }
@@ -324,8 +353,9 @@ pub fn target_rect(
 }
 
 /// The seam lines of `groups` in `report` (canvas coordinates): neutral,
-/// and those of a seam badged in `marks` (an unaccepted problem) in the
-/// warning colour and thicker, drawn last (on top). None without a report.
+/// and those of a seam with an unaccepted problem of its own in `marks` (an
+/// overlap problem of the same pair does not count) in the warning colour
+/// and thicker, drawn last (on top). None without a report.
 pub fn seam_lines(
     layout: &Layout,
     report: Option<&ChecksReport>,
@@ -337,8 +367,11 @@ pub fn seam_lines(
     };
     let badged: BTreeSet<(&str, (usize, usize))> = marks
         .iter()
-        .filter_map(|m| match &m.place {
-            Place::Seam { group, a, b } => Some((group.as_str(), pair_ids(layout, group, a, b)?)),
+        .flat_map(|m| &m.problems)
+        .filter_map(|c| match &c.target {
+            CheckTarget::Seam { group, a, b } => {
+                Some((group.as_str(), pair_ids(layout, group, a, b)?))
+            }
             _ => None,
         })
         .collect();
@@ -596,6 +629,88 @@ mod tests {
         assert_eq!(problem_count(&s, &report, "Ha"), 5);
         assert_eq!(problem_count(&s, &report, "OIII"), 1);
         assert!(problem_marks(&s, &layout, None, &groups).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pair_has_one_badge_for_its_overlap_and_its_seam() {
+        let (root, s, p, layout) = fixture("marks-pair");
+        let seam_of = |a: &PathBuf, b: &PathBuf| {
+            let mut c = problem(
+                CheckTarget::Seam {
+                    group: "Ha".into(),
+                    a: a.clone(),
+                    b: b.clone(),
+                },
+                &["Ha"],
+            );
+            c.code = CheckCode::ResidualSeam;
+            c
+        };
+        let thin = problem(CheckTarget::Overlap(p[1].clone(), p[0].clone()), &["Ha"]);
+        let shows = seam_of(&p[0], &p[1]);
+        // Lines off the overlap's centre, and a seam of two panels that do
+        // not overlap (its badge falls back to its lines).
+        let lines = |a: u16, b: u16, points: Vec<[f64; 2]>| SeamLine {
+            a,
+            b,
+            points,
+            flagged: true,
+        };
+        let seams = Seams::from([(
+            "Ha".to_string(),
+            vec![
+                lines(0, 1, vec![[70.5, 10.0], [70.5, 30.0]]),
+                lines(1, 2, vec![[170.0, 10.0], [170.0, 50.0]]),
+            ],
+        )]);
+        let report = |checks: Vec<Check>| ChecksReport {
+            checks,
+            errors: Vec::new(),
+            seams: seams.clone(),
+        };
+        let groups = ["Ha".to_string()];
+        let both = report(vec![thin.clone(), shows.clone()]);
+        let marks = problem_marks(&s, &layout, Some(&both), &groups);
+        assert_eq!(marks.len(), 1, "one badge for the pair: {marks:?}");
+        let b = marks[0].placed_badge().unwrap();
+        assert_eq!(
+            (b.at, b.count),
+            ([80.0, 40.0], 2),
+            "at the overlap's centre"
+        );
+        assert_eq!(
+            marks[0].problems,
+            [thin.clone(), shows.clone()],
+            "in report order"
+        );
+        // The same id whichever of the pair's problems it has.
+        for alone in [thin.clone(), shows.clone()] {
+            let one = problem_marks(&s, &layout, Some(&report(vec![alone])), &groups);
+            assert_eq!(one[0].id, marks[0].id);
+            assert_eq!(one[0].placed_badge().unwrap().at, [80.0, 40.0]);
+        }
+        // Going to the seam still frames its lines.
+        assert_eq!(
+            target_rect(&s, &layout, &seams, &shows),
+            Some([70, 10, 71, 30])
+        );
+        // The seam's line warns for its own problem only.
+        let looks = |r: &ChecksReport| {
+            let marks = problem_marks(&s, &layout, Some(r), &groups);
+            seam_lines(&layout, Some(r), &groups, &marks)
+                .iter()
+                .map(|l| (l.points[0], l.color))
+                .collect::<Vec<_>>()
+        };
+        let (warning, neutral) = (Tone::Warning.color(), Tone::Neutral.color());
+        assert!(looks(&both).contains(&([70.5, 10.0], warning)));
+        let thin_only = report(vec![thin]);
+        assert!(looks(&thin_only).contains(&([70.5, 10.0], neutral)));
+        // No overlap to place it at: the seam's lines' centre.
+        let apart = report(vec![seam_of(&p[2], &p[1])]);
+        let marks = problem_marks(&s, &layout, Some(&apart), &groups);
+        assert_eq!(marks[0].placed_badge().unwrap().at, [170.0, 30.0]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
