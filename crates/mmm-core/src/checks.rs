@@ -171,6 +171,24 @@ pub struct CheckKey {
     /// from every older key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// For an area result that names no panel (a coverage hole), its rect
+    /// `[x0, y0, x1, y1]` rounded outward to whole L8 cells
+    /// ([`crate::summary::BLOCK`] px), so accepting one hole accepts no
+    /// other, and a hole that moves by more than a cell is a new problem.
+    /// Absent from every older key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rect: Option<[u64; 4]>,
+}
+
+/// `r` rounded outward to whole L8 cells.
+fn covering_cells(r: [u64; 4]) -> [u64; 4] {
+    let cell = u64::from(crate::summary::BLOCK);
+    [
+        r[0] / cell * cell,
+        r[1] / cell * cell,
+        r[2].div_ceil(cell) * cell,
+        r[3].div_ceil(cell) * cell,
+    ]
 }
 
 /// One check result.
@@ -201,8 +219,9 @@ impl Check {
     /// The identities of this result: one key for a pair target (an overlap
     /// or a seam; the pair in path order, so the order the panels were
     /// found in does not matter), one group key for a group-scoped result
-    /// that names no panels (a coverage hole), else one key per panel, or
-    /// one panel-less key when it names no panels.
+    /// that names no panels (a coverage hole, with its rect in L8 cells:
+    /// [`CheckKey::rect`]), else one key per panel, or one panel-less key
+    /// when it names no panels.
     pub fn keys(&self) -> Vec<CheckKey> {
         if let CheckTarget::Overlap(a, b) | CheckTarget::Seam { a, b, .. } = &self.target {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -211,6 +230,7 @@ impl Check {
                 panel: Some(lo.clone()),
                 other: Some(hi.clone()),
                 group: None,
+                rect: None,
             }];
         }
         if self.panels.is_empty() {
@@ -223,6 +243,7 @@ impl Check {
                 panel: None,
                 other: None,
                 group,
+                rect: self.rect.map(covering_cells),
             }];
         }
         self.panels
@@ -232,6 +253,7 @@ impl Check {
                 panel: Some(p.clone()),
                 other: None,
                 group: None,
+                rect: None,
             })
             .collect()
     }
@@ -397,19 +419,27 @@ pub fn input_checks(
                 let off = (s - med).abs() / med > 0.01;
                 out.push(Check {
                     code: CheckCode::ScaleMismatch,
-target: CheckTarget::Panel(f.path.clone()),                    rect: None,
-                    severity: if off { Severity::Problem } else { Severity::Passed },
+                    target: CheckTarget::Panel(f.path.clone()),
+                    rect: None,
+                    severity: if off {
+                        Severity::Problem
+                    } else {
+                        Severity::Passed
+                    },
                     panels: vec![f.path.clone()],
                     groups: vec![gname.clone()],
                     message: if off {
                         format!(
-                            "{name} has a pixel scale of {s:.3} arcsec/px, which differs by more than 1% from the group median of {med:.3}."
+                            "{name} has a pixel scale of {s:.3} arcsec/px, which differs \
+                             by more than 1% from the group median of {med:.3}."
                         )
                     } else {
                         format!("{name} matches the group's pixel scale ({s:.3} arcsec/px).")
                     },
                     remedy: off.then(|| {
-                        "Check that every panel in the group came from the same optical setup, or resample it first.".into()
+                        "Check that every panel in the group came from the same optical \
+                         setup, or resample it first."
+                            .into()
                     }),
                 });
             }
@@ -588,15 +618,19 @@ pub fn analysis_checks(group: &str, session: &Session, graph: &OverlapGraph) -> 
             if med > 0.0 && (mine > 2.0 * med || mine < 0.5 * med) {
                 out.push(Check {
                     code: CheckCode::SkyLevelMismatch,
-target: CheckTarget::Panel(user_file(m)),                    rect: None,
+                    target: CheckTarget::Panel(user_file(m)),
+                    rect: None,
                     severity: Severity::Note,
                     panels: vec![user_file(m)],
                     groups: vec![group.to_string()],
                     message: format!(
-                        "{name} has a mean level of {mine:.4}, against {med:.4} for its overlapping neighbours."
+                        "{name} has a mean level of {mine:.4}, against {med:.4} for its \
+                         overlapping neighbours."
                     ),
                     remedy: Some(
-                        "Check for a gradient or a different exposure; the merge will match levels, but large differences can leave residuals.".into(),
+                        "Check for a gradient or a different exposure; the merge will \
+                         match levels, but large differences can leave residuals."
+                            .into(),
                     ),
                 });
             }
@@ -1260,6 +1294,7 @@ mod tests {
             panel: Some(a),
             other: None,
             group: None,
+            rect: None,
         });
         assert!(!is_accepted(&cfg, &check));
         cfg.accepted_checks.push(CheckKey {
@@ -1267,6 +1302,7 @@ mod tests {
             panel: Some(b),
             other: None,
             group: None,
+            rect: None,
         });
         assert!(is_accepted(&cfg, &check));
         // Panel-less checks use a single panel-less key.
@@ -1533,6 +1569,7 @@ mod tests {
             panel: Some(PathBuf::from("a.xisf")),
             other: None,
             group: None,
+            rect: None,
         };
         let json = serde_json::to_string(&old).unwrap();
         assert_eq!(json, r#"{"code":"no_overlap","panel":"a.xisf"}"#);
@@ -1544,6 +1581,20 @@ mod tests {
         let json = serde_json::to_string(&pair).unwrap();
         assert!(json.contains(r#""other":"b.xisf""#));
         assert_eq!(serde_json::from_str::<CheckKey>(&json).unwrap(), pair);
+        // A hole's key adds its group and its rect (in L8 cells).
+        let hole = CheckKey {
+            code: CheckCode::CoverageHole,
+            panel: None,
+            other: None,
+            group: Some("Ha".into()),
+            rect: Some([96, 144, 200, 256]),
+        };
+        let json = serde_json::to_string(&hole).unwrap();
+        assert_eq!(
+            json,
+            r#"{"code":"coverage_hole","panel":null,"group":"Ha","rect":[96,144,200,256]}"#
+        );
+        assert_eq!(serde_json::from_str::<CheckKey>(&json).unwrap(), hole);
     }
 
     // ---- targets, aligned mode, layout checks ----
@@ -1922,6 +1973,46 @@ mod tests {
         };
         let n = analysis_checks("Ha", &s, &g);
         assert_eq!(of(&n, CheckCode::NoOverlap)[0].keys()[0].group, None);
+    }
+
+    #[test]
+    fn accepting_one_hole_accepts_only_that_hole() {
+        // Two rings of four panels, each round a gap of its own.
+        let ring = |first: usize, dx: u64| {
+            [
+                [0, 0, 200, 150],
+                [200, 0, 400, 250],
+                [100, 250, 400, 400],
+                [0, 150, 100, 400],
+            ]
+            .into_iter()
+            .enumerate()
+            .map(move |(i, r)| boxed(first + i, [r[0] + dx, r[1], r[2] + dx, r[3]]))
+        };
+        let s = canvas_session(ring(0, 0).chain(ring(4, 500)).collect());
+        let checks = layout_checks("Ha", &s, &no_edges());
+        let holes: Vec<Check> = of(&checks, CheckCode::CoverageHole)
+            .into_iter()
+            .cloned()
+            .collect();
+        let rects: Vec<Option<[u64; 4]>> = holes.iter().map(|h| h.rect).collect();
+        assert_eq!(
+            rects,
+            [Some([100, 150, 200, 250]), Some([600, 150, 700, 250])]
+        );
+        // The key holds the hole's rect, rounded outward to L8 cells.
+        assert_eq!(holes[0].keys()[0].rect, Some([96, 144, 200, 256]));
+        // Accepting one hole leaves the other a problem.
+        let mut cfg = MosaicConfig::new(vec![]);
+        cfg.accepted_checks.extend(holes[0].keys());
+        assert!(is_accepted(&cfg, &holes[0]));
+        assert!(!is_accepted(&cfg, &holes[1]), "the other hole");
+        // A hole that moved by more than a cell is a new problem.
+        let moved = Check {
+            rect: Some([110, 150, 210, 250]),
+            ..holes[0].clone()
+        };
+        assert!(!is_accepted(&cfg, &moved), "moved by more than a cell");
     }
 
     #[test]

@@ -239,6 +239,7 @@ fn kept_ungrouped(config: &MosaicConfig) -> bool {
         panel: None,
         other: None,
         group: None,
+        rect: None,
     };
     config.accepted_checks.contains(&note)
         || (!config.grouping.enabled && config.grouping.rule != GroupRule::default())

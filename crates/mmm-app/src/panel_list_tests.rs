@@ -2377,6 +2377,7 @@ fn a_prior_choice_keeps_grouping_off() {
             panel: None,
             other: None,
             group: None,
+            rect: None,
         });
     });
     // A rule other than FILTER header chosen before grouping was turned off.
