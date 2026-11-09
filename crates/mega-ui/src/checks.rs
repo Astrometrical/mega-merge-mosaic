@@ -11,7 +11,7 @@ use egui::{
 
 use crate::icons;
 use crate::theme::palette;
-use crate::theme::tokens::{CONTROL_HEIGHT, radius, space};
+use crate::theme::tokens::{CONTROL_HEIGHT, HAIRLINE_WIDTH, radius, space};
 use crate::theme::{Severity, Tone};
 use crate::widgets::{ButtonKind, MegaButton};
 
@@ -113,12 +113,16 @@ pub fn checks_list(
 /// The heading of one group of an [`ListMode::All`] list.
 fn section_heading(ui: &mut Ui, name: &str) {
     ui.add_space(space::XS);
-    ui.label(
+    let label = ui.label(
         RichText::new(name)
             .text_style(TextStyle::Small)
             .strong()
             .color(palette::TEXT_MUTED),
     );
+    ui.ctx().accesskit_node_builder(label.id, |node| {
+        node.set_role(egui::accesskit::Role::Heading);
+        node.set_label(name);
+    });
 }
 
 /// Paint `glyph` with its top-left at `pos`.
@@ -175,12 +179,21 @@ fn row(
             })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(&item.title).color(palette::TEXT_EMPHASIS));
+                // A row that is a button says its title and detail itself: its
+                // text is hidden from the accessibility tree, not said twice.
+                let hide = item.goes_somewhere;
+                text_block(
+                    ui,
+                    RichText::new(&item.title).color(palette::TEXT_EMPHASIS),
+                    hide,
+                );
                 if !item.detail.is_empty() {
-                    ui.label(
+                    text_block(
+                        ui,
                         RichText::new(&item.detail)
                             .text_style(TextStyle::Small)
                             .color(palette::TEXT_MUTED),
+                        hide,
                     );
                 }
                 if item.severity == Severity::Problem {
@@ -217,13 +230,19 @@ fn row(
             ui.painter().rect_stroke(
                 r,
                 CornerRadius::same(radius::CONTROL),
-                Stroke::new(1.0, palette::BORDER),
+                Stroke::new(HAIRLINE_WIDTH, palette::BORDER),
                 StrokeKind::Inside,
             );
         }
         crate::widgets::button::focus_ring(ui, &response, radius::CONTROL);
         let title = item.title.clone();
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, title.clone()));
+        if !item.detail.is_empty() {
+            let detail = item.detail.clone();
+            ui.ctx().accesskit_node_builder(response.id, |node| {
+                node.set_description(detail);
+            });
+        }
         if response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
@@ -231,6 +250,23 @@ fn row(
             actions.push(CheckAction::Open(index));
         }
     }
+}
+
+/// A wrapped line of text; with `silent` it is painted without an
+/// accessibility node of its own (the row that holds it says it).
+fn text_block(ui: &mut Ui, text: RichText, silent: bool) {
+    if !silent {
+        ui.label(text);
+        return;
+    }
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        ui.available_width(),
+        TextStyle::Body,
+    );
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley, palette::TEXT_BODY);
 }
 
 /// What a problem row offers about acceptance: Accept on an acceptable
@@ -317,7 +353,7 @@ fn passed_section(ui: &mut Ui, heading: &str, passed: &[&CheckItem]) {
 #[cfg(test)]
 mod tests {
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
 
@@ -580,5 +616,39 @@ mod tests {
         h.get_by_label("1 check passed").click();
         h.run();
         h.get_by_label("Pass one");
+    }
+
+    #[test]
+    fn a_row_that_goes_somewhere_is_one_accessible_button() {
+        let mut h = harness(vec![goes(check(
+            Severity::Note,
+            "Noisy panel",
+            false,
+            false,
+        ))]);
+        h.state_mut().mode = ListMode::All;
+        h.run();
+        // One node says the title (the button), not a button and a label.
+        assert_eq!(h.query_all_by_label("Noisy panel").count(), 1);
+        assert_eq!(h.query_all_by_label("Noisy panel detail").count(), 0);
+        let button = row_button(&h, "Noisy panel");
+        assert_eq!(
+            button.accesskit_node().description().as_deref(),
+            Some("Noisy panel detail")
+        );
+    }
+
+    #[test]
+    fn section_headings_are_headings() {
+        let mut h = harness(vec![
+            check(Severity::Problem, "Broken", true, false),
+            check(Severity::Note, "Noisy", false, false),
+            check(Severity::Passed, "Fine", false, false),
+        ]);
+        h.state_mut().mode = ListMode::All;
+        h.run();
+        for name in ["Problems", "Notes", "Passed"] {
+            h.get_by_role_and_label(egui::accesskit::Role::Heading, name);
+        }
     }
 }

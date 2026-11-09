@@ -263,24 +263,22 @@ pub fn choice_chip(ui: &mut Ui, chip: &ChoiceChip<'_>) -> Response {
     let (selected, label) = (chip.selected, chip.label);
     response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, label));
     let problems_said = problems.map(|n| format!("{n} problem{}", if n == 1 { "" } else { "s" }));
-    let description = match (chip.mark, &problems_said) {
-        (Some(m), Some(p)) => Some(format!("{}, {p}", m.description())),
-        (Some(m), None) => Some(m.description().to_owned()),
-        (None, Some(p)) => Some(p.clone()),
+    // The state in words, once: (accessible description, hover text).
+    let said = match (chip.mark, problems_said) {
+        (Some(m), Some(p)) => Some((
+            format!("{}, {p}", m.description()),
+            format!("{}, {p}", m.label()),
+        )),
+        (Some(m), None) => Some((m.description().to_owned(), m.label().to_owned())),
+        (None, Some(p)) => Some((p.clone(), p)),
         (None, None) => None,
     };
-    let Some(description) = description else {
+    let Some((description, hover)) = said else {
         return response;
     };
     ui.ctx().accesskit_node_builder(response.id, |node| {
         node.set_description(description);
     });
-    // The state in words; hover text the caller adds stacks below.
-    let hover = match (chip.mark, problems_said) {
-        (Some(m), Some(p)) => format!("{}, {p}", m.label()),
-        (Some(m), None) => m.label().to_owned(),
-        (None, Some(p)) => p,
-        (None, None) => unreachable!("a description implies a state"),
-    };
+    // Hover text the caller adds stacks below.
     response.on_hover_text(hover)
 }

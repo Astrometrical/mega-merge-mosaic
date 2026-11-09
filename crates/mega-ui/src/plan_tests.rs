@@ -845,6 +845,7 @@ fn a_press_on_a_badge_does_not_pan() {
     };
     let before = centre(&h);
     let p = badge_button(&h, "2 problems here").rect().center();
+    h.state_mut().log.clear();
     h.hover_at(p);
     h.drag_at(p);
     h.hover_at(p + Vec2::new(80.0, 40.0));
@@ -857,6 +858,10 @@ fn a_press_on_a_badge_does_not_pan() {
     });
     h.run();
     assert_eq!(centre(&h), before, "the view stayed put");
+    assert!(
+        h.state().log.iter().all(|r| r.held.is_none()),
+        "a press on a badge is no hold"
+    );
 }
 
 #[test]
@@ -909,5 +914,85 @@ fn polylines_paint_on_both_canvases() {
     assert!(
         !crate::testutil::has_stroke(&h.output().shapes, solid, 3.0),
         "cleared"
+    );
+}
+
+#[test]
+fn a_polyline_off_screen_draws_no_stroke() {
+    let colour = egui::Color32::from_rgb(77, 88, 99);
+    let mut h = themed_harness();
+    let line = |width, dashed| Polyline {
+        points: vec![[5000.0, 5000.0], [6000.0, 7000.0]],
+        color: colour,
+        width,
+        dashed,
+    };
+    h.state_mut()
+        .canvas
+        .set_lines(vec![line(3.0, false), line(2.0, true)]);
+    h.run();
+    assert!(!crate::testutil::has_stroke(
+        &h.output().shapes,
+        colour,
+        3.0
+    ));
+    assert!(!crate::testutil::has_stroke(
+        &h.output().shapes,
+        colour,
+        2.0
+    ));
+}
+
+#[test]
+fn a_focused_badge_at_the_edge_keeps_its_ring_inside_the_canvas() {
+    let mut h = Harness::builder()
+        .with_size(SCREEN)
+        .with_step_dt(0.01)
+        .with_max_steps(400)
+        .build_ui_state(
+            |ui, s: &mut State| {
+                if crate::testutil::themed(ui) {
+                    // A canvas smaller than the window, as beside an inspector.
+                    ui.set_max_size(Vec2::new(600.0, 500.0));
+                    let r = s
+                        .canvas
+                        .show(ui, s.extent, &s.items, s.outlines, s.outlines);
+                    s.log.push(r);
+                }
+            },
+            State {
+                canvas: PlanCanvas::new(),
+                extent: [0.0, 0.0, 1000.0, 1000.0],
+                items: vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+                log: Vec::new(),
+                outlines: true,
+            },
+        );
+    h.state_mut()
+        .canvas
+        .set_badges(vec![warning_badge(7, [1004.0, 500.0], 2)]);
+    h.state_mut().canvas.zoom_to([700.0, 400.0, 990.0, 600.0]);
+    h.run();
+    badge_button(&h, "2 problems here").focus();
+    h.run();
+    let (viewport, _) = h.state().canvas.last_frame().unwrap();
+    let node = badge_button(&h, "2 problems here").rect();
+    assert!(
+        viewport.expand(0.01).contains_rect(node),
+        "{node:?} in {viewport:?}"
+    );
+    let ring = h
+        .output()
+        .shapes
+        .iter()
+        .find(|c| {
+            matches!(&c.shape, egui::Shape::Rect(r)
+                if r.stroke.color == crate::theme::palette::ACCENT_400 && r.stroke.width == 2.0)
+        })
+        .expect("the focus ring is painted");
+    assert!(
+        viewport.expand(0.01).contains_rect(ring.clip_rect),
+        "ring clipped to {:?}, canvas {viewport:?}",
+        ring.clip_rect
     );
 }

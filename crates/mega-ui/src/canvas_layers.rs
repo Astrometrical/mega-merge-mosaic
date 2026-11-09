@@ -464,7 +464,7 @@ pub(crate) fn show_badges(
             pill,
             egui::CornerRadius::same(corner),
             palette::SURFACE_900,
-            Stroke::new(1.5, outline),
+            Stroke::new(OVERLAY_STROKE, outline),
             StrokeKind::Inside,
         );
         let left = pill.left() + BADGE_PAD;
@@ -481,7 +481,7 @@ pub(crate) fn show_badges(
             count,
             palette::TEXT_STRONG,
         );
-        crate::widgets::button::focus_ring(ui, &response, corner);
+        crate::widgets::button::focus_ring_with(&painter, &response, corner);
         let label = badge.description.clone();
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone())

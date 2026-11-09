@@ -66,3 +66,6 @@ pub const BADGE_PAD: f32 = 7.0;
 pub const LINE_WIDTH: f32 = 2.0;
 /// Dash and gap lengths of a dashed polyline, in points.
 pub const LINE_DASH: (f32, f32) = (8.0, 5.0);
+
+/// Width of a hairline outline (a hovered row's border), in points.
+pub const HAIRLINE_WIDTH: f32 = 1.0;
