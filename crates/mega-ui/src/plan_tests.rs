@@ -390,3 +390,189 @@ fn a_highlighted_item_is_outlined_under_the_selection() {
     let plain = Stroke::new(OUTLINE_STROKE, palette::ACCENT_500);
     assert_eq!(strokes_on(&h, screen(&h, a)), [plain]);
 }
+
+/// Bounding box of a mesh's vertex positions, and of its uvs.
+fn mesh_bounds(m: &egui::Mesh) -> (Rect, Rect) {
+    let pos = Rect::from_points(&m.vertices.iter().map(|v| v.pos).collect::<Vec<_>>());
+    let uv = Rect::from_points(&m.vertices.iter().map(|v| v.uv).collect::<Vec<_>>());
+    (pos, uv)
+}
+
+fn texture(h: &Harness<'_, State>, name: &str) -> egui::TextureHandle {
+    h.ctx.load_texture(
+        name,
+        ColorImage::new([4, 4], vec![Color32::WHITE; 16]),
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+fn screen_rect(h: &Harness<'_, State>, r: [f64; 4]) -> Rect {
+    Rect::from_min_max(to_screen(h, (r[0], r[1])), to_screen(h, (r[2], r[3])))
+}
+
+fn near(a: Rect, b: Rect) -> bool {
+    (a.min - b.min).length() < 0.5 && (a.max - b.max).length() < 0.5
+}
+
+#[test]
+fn the_plan_draws_overlays_and_patches() {
+    let mut h = harness([0.0, 0.0, 1000.0, 1000.0], Vec::new());
+    let tex = texture(&h, "patch");
+    let id = tex.id();
+    let patch_rect = [100.0, 100.0, 500.0, 500.0];
+    let clip = [300.0, 100.0, 800.0, 400.0];
+    h.state_mut().canvas.set_patches(vec![Patch {
+        rect: patch_rect,
+        clip,
+        texture: tex,
+    }]);
+    let roi = [200.0, 600.0, 700.0, 900.0];
+    h.state_mut().canvas.set_overlays(vec![Overlay {
+        rect: roi,
+        color: Color32::RED,
+        label: "Region 1".into(),
+        dashed: false,
+    }]);
+    h.run();
+
+    // The patch is clipped: only x 300..500, y 100..400 of it is drawn,
+    // with the matching part of the texture.
+    let meshes: Vec<_> = h
+        .output()
+        .shapes
+        .iter()
+        .filter_map(|cs| match &cs.shape {
+            Shape::Mesh(m) if m.texture_id == id => Some(mesh_bounds(m)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(meshes.len(), 1, "one patch mesh");
+    let (pos, uv) = meshes[0];
+    let want = screen_rect(&h, [300.0, 100.0, 500.0, 400.0]);
+    assert!(near(pos, want), "{pos:?} vs {want:?}");
+    let want_uv = Rect::from_min_max(Pos2::new(0.5, 0.0), Pos2::new(1.0, 0.75));
+    assert!(
+        (uv.min - want_uv.min).length() < 1e-4 && (uv.max - want_uv.max).length() < 1e-4,
+        "{uv:?}"
+    );
+
+    // The overlay is stroked at its mapped rect and labelled.
+    let strokes = strokes_on(&h, screen_rect(&h, roi));
+    assert_eq!(strokes.len(), 1);
+    assert_eq!(strokes[0].color, Color32::RED);
+    assert!(drawn_label_exists(&h, "Region 1"));
+
+    // A patch wholly outside its clip draws nothing.
+    let tex2 = texture(&h, "patch2");
+    let id2 = tex2.id();
+    h.state_mut().canvas.set_patches(vec![Patch {
+        rect: patch_rect,
+        clip: [600.0, 600.0, 700.0, 700.0],
+        texture: tex2,
+    }]);
+    h.run();
+    let drawn = h
+        .output()
+        .shapes
+        .iter()
+        .any(|cs| matches!(&cs.shape, Shape::Mesh(m) if m.texture_id == id2));
+    assert!(!drawn, "a patch outside its clip drew");
+}
+
+fn drawn_label_exists(h: &Harness<'_, State>, label: &str) -> bool {
+    h.output()
+        .shapes
+        .iter()
+        .any(|cs| matches!(&cs.shape, Shape::Text(t) if t.galley.text() == label))
+}
+
+fn drag_between(h: &mut Harness<'_, State>, from: (f64, f64), to: (f64, f64)) {
+    let (from, to) = (to_screen(h, from), to_screen(h, to));
+    h.drag_at(from);
+    h.step();
+    h.hover_at(Pos2::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0));
+    h.step();
+    h.hover_at(to);
+    h.step();
+    h.drop_at(to);
+    h.run();
+}
+
+fn drawn_rects(h: &Harness<'_, State>) -> Vec<[f64; 4]> {
+    h.state().log.iter().filter_map(|r| r.drawn_rect).collect()
+}
+
+#[test]
+fn the_plan_draw_tool_returns_a_rect() {
+    let mut h = harness(
+        [0.0, 0.0, 1000.0, 1000.0],
+        vec![item(1, [0.0, 0.0, 1000.0, 1000.0])],
+    );
+    h.run();
+    assert_eq!(h.state().canvas.tool(), Tool::Navigate);
+    h.state_mut().canvas.set_tool(Tool::DrawRect);
+    h.run();
+    let view0 = {
+        let (_, now) = h.state().canvas.last_frame().unwrap();
+        (
+            h.state().canvas.view().centre(now),
+            h.state().canvas.view().zoom(now),
+        )
+    };
+    // Dragged up-left: normalised, in canvas coordinates; neither panned
+    // nor clicked.
+    let (a, b) = ((600.0, 500.0), (200.0, 300.0));
+    drag_between(&mut h, a, b);
+    let rects = drawn_rects(&h);
+    assert_eq!(rects.len(), 1, "one rect per drag");
+    let want = [200.0, 300.0, 600.0, 500.0];
+    for i in 0..4 {
+        assert!((rects[0][i] - want[i]).abs() < 1.0, "{:?}", rects[0]);
+    }
+    assert!(
+        h.state()
+            .log
+            .iter()
+            .all(|r| r.clicked.is_none() && !r.clicked_empty)
+    );
+    let (_, now) = h.state().canvas.last_frame().unwrap();
+    assert_eq!(
+        (
+            h.state().canvas.view().centre(now),
+            h.state().canvas.view().zoom(now)
+        ),
+        view0,
+        "drawing panned"
+    );
+    // Back to Navigate: the next drag pans.
+    assert_eq!(h.state().canvas.tool(), Tool::Navigate);
+    drag_between(&mut h, a, b);
+    assert_eq!(drawn_rects(&h).len(), 1);
+    let (_, now) = h.state().canvas.last_frame().unwrap();
+    assert_ne!(h.state().canvas.view().centre(now), view0.0);
+
+    // Clamped to the extent.
+    h.state_mut().canvas.home();
+    h.run();
+    h.state_mut().canvas.set_tool(Tool::DrawRect);
+    h.run();
+    drag_between(&mut h, (-100.0, 500.0), (400.0, 700.0));
+    let r = drawn_rects(&h)[1];
+    assert!(r[0] == 0.0 && (r[2] - 400.0).abs() < 1.0, "{r:?}");
+
+    // Esc cancels the tool and the rest of the drag.
+    h.state_mut().canvas.set_tool(Tool::DrawRect);
+    h.run();
+    h.drag_at(to_screen(&h, a));
+    h.step();
+    h.hover_at(to_screen(&h, (400.0, 400.0)));
+    h.step();
+    h.key_press(egui::Key::Escape);
+    h.step();
+    h.hover_at(to_screen(&h, b));
+    h.step();
+    h.drop_at(to_screen(&h, b));
+    h.run();
+    assert_eq!(drawn_rects(&h).len(), 2, "cancelled drag reported");
+    assert_eq!(h.state().canvas.tool(), Tool::Navigate);
+}

@@ -37,6 +37,7 @@ fn gallery_renders_every_section() {
         "BRAND LOCKUP",
         "STARFIELD",
         "HERO STAGE",
+        "PLAN CANVAS",
         "SESSION CARDS",
         "41 checks passed",
         "62% · 0:41 left",

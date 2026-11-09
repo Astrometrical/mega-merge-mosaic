@@ -12,11 +12,13 @@ use egui::{
 };
 
 use crate::brand::{self, BrandImages, LockupSize};
+use crate::canvas_layers::{Overlay, Patch};
 use crate::checks::{CheckItem, checks_list};
 use crate::groups::GROUP_PALETTE;
 use crate::hero::{HeroStage, HeroView};
 use crate::icons;
 use crate::inspector::{Badge, InspectorState, Section, inspector, inspector_width};
+use crate::plan::{Layer, PlacedItem, PlanCanvas};
 use crate::starfield::Starfield;
 use crate::table::{self, TableEvent, TableState, sectioned_table};
 use crate::theme::palette::*;
@@ -47,6 +49,13 @@ pub struct GalleryState {
     hero: Option<HeroStage>,
     portrait_hero: Option<HeroStage>,
     card_thumbs: Option<[TextureHandle; 2]>,
+    plan: Option<PlanGallery>,
+}
+
+/// The plan canvas section: two panels, a region overlay and a patch.
+struct PlanGallery {
+    canvas: PlanCanvas,
+    items: Vec<PlacedItem>,
 }
 
 impl Default for GalleryState {
@@ -101,6 +110,7 @@ Panel 7: gradient in the lower left, redo DBE."
             hero: None,
             portrait_hero: None,
             card_thumbs: None,
+            plan: None,
         }
     }
 }
@@ -197,6 +207,62 @@ fn gallery_hero(size: [usize; 2], grid: [usize; 2]) -> HeroStage {
         0.0,
     );
     stage
+}
+
+/// Canvas extent of the gallery's plan.
+const PLAN_EXTENT: [f64; 4] = [0.0, 0.0, 1000.0, 440.0];
+
+/// Two panels, a region drawn over both as a dashed overlay (as "Region 1"
+/// is on the plan), and a preview patch inside it, clipped to the region.
+fn gallery_plan(ctx: &egui::Context) -> PlanGallery {
+    let tex = |name: &str, a, b| {
+        ctx.load_texture(
+            name,
+            gradient_image([200, 160], a, b),
+            TextureOptions::LINEAR,
+        )
+    };
+    let item = |id: u64, rect: [f64; 4], texture: TextureHandle| PlacedItem {
+        id,
+        rect,
+        layers: vec![Layer {
+            texture,
+            tint: Color32::WHITE,
+            additive: false,
+        }],
+        outline: ACCENT_500,
+        label: format!("Panel {id}"),
+        marker: None,
+        selected: false,
+        highlighted: false,
+    };
+    let mut canvas = PlanCanvas::new();
+    canvas.set_overlays(vec![Overlay {
+        rect: [380.0, 120.0, 700.0, 340.0],
+        color: ACCENT_400,
+        label: "Region 1".into(),
+        dashed: true,
+    }]);
+    canvas.set_patches(vec![Patch {
+        rect: [380.0, 120.0, 700.0, 340.0],
+        clip: [380.0, 120.0, 620.0, 340.0],
+        texture: tex("gallery-plan-patch", HA_500, SURFACE_700),
+    }]);
+    PlanGallery {
+        canvas,
+        items: vec![
+            item(
+                1,
+                [20.0, 20.0, 520.0, 420.0],
+                tex("gallery-plan-a", ACCENT_600, HA_500),
+            ),
+            item(
+                2,
+                [480.0, 20.0, 980.0, 420.0],
+                tex("gallery-plan-b", SURFACE_700, ACCENT_500),
+            ),
+        ],
+    }
 }
 
 /// Draw `hero` as the start screen does, full bleed in a 1000 × 320 strip
@@ -519,6 +585,14 @@ pub fn show(ui: &mut Ui, state: &mut GalleryState) {
             ui.scope(|ui| {
                 ui.set_max_width(640.0);
                 table_section(ui, &mut state.table, &mut state.table_selection);
+            });
+        });
+
+        section(ui, "Plan canvas", |ui| {
+            let ctx = ui.ctx().clone();
+            let plan = state.plan.get_or_insert_with(|| gallery_plan(&ctx));
+            ui.allocate_ui(Vec2::new(640.0, 280.0), |ui| {
+                let _ = plan.canvas.show(ui, PLAN_EXTENT, &plan.items, true, true);
             });
         });
 

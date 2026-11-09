@@ -1127,3 +1127,39 @@ fn opacity_scales_tile_tint() {
     }
     assert!(meshes > 0);
 }
+
+#[test]
+fn viewer_patches_are_clipped() {
+    let src = TestSource::new(20_000, 10_000);
+    let mut h = drawing_harness(TiledViewer::new_synchronous(src));
+    let tex = h.ctx.load_texture(
+        "patch",
+        ColorImage::new([4, 4], vec![Color32::WHITE; 16]),
+        egui::TextureOptions::LINEAR,
+    );
+    let id = tex.id();
+    h.state_mut().viewer.set_patches(vec![Patch {
+        rect: [2000.0, 2000.0, 6000.0, 6000.0],
+        clip: [4000.0, 1000.0, 9000.0, 4000.0],
+        texture: tex,
+    }]);
+    h.run();
+    let (rect, now) = h.state().viewer.last_frame().unwrap();
+    let to_screen = |p: (f64, f64)| h.state().viewer.view().image_to_screen(p, rect, now);
+    let mut bounds = Vec::new();
+    for cs in &h.output().shapes {
+        if let egui::Shape::Mesh(m) = &cs.shape
+            && m.texture_id == id
+        {
+            let pts: Vec<Pos2> = m.vertices.iter().map(|v| v.pos).collect();
+            let uvs: Vec<Pos2> = m.vertices.iter().map(|v| v.uv).collect();
+            bounds.push((egui::Rect::from_points(&pts), egui::Rect::from_points(&uvs)));
+        }
+    }
+    assert_eq!(bounds.len(), 1);
+    let want = egui::Rect::from_min_max(to_screen((4000.0, 2000.0)), to_screen((6000.0, 4000.0)));
+    let (pos, uv) = bounds[0];
+    assert!((pos.min - want.min).length() < 0.5 && (pos.max - want.max).length() < 0.5);
+    assert!((uv.min - Pos2::new(0.5, 0.0)).length() < 1e-4);
+    assert!((uv.max - Pos2::new(1.0, 0.5)).length() < 1e-4);
+}

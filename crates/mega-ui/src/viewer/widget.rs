@@ -21,12 +21,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use egui::{
-    Align2, Color32, Event, FontId, MouseWheelUnit, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
-    TextureHandle, TextureId, TextureOptions, Ui, Vec2,
+    Color32, Event, MouseWheelUnit, Pos2, Rect, Sense, Stroke, TextureHandle, TextureId,
+    TextureOptions, Ui, Vec2,
 };
 
 use super::cache::{DEFAULT_CAPACITY, TileCache};
 use super::{Fetched, PyramidGeometry, TileKey, TileSource, View, pick_level, visible_tiles};
+use crate::canvas_layers::{
+    DrawStep, Overlay, Patch, Tool, drawing_rect, follow_draw, paint_layers,
+};
 use crate::theme::palette;
 
 /// Most tile textures uploaded per frame.
@@ -37,37 +40,6 @@ const SCROLL_ZOOM_PER_NOTCH: f64 = 1.2;
 const STALE_BRIGHTNESS: f32 = 0.55;
 /// Screen spacing of the stale hatch lines, in points.
 const HATCH_SPACING: f32 = 10.0;
-/// Stroke width of an overlay rectangle, in points.
-const OVERLAY_STROKE: f32 = 1.5;
-/// Dash and gap lengths of a dashed overlay, in points.
-const OVERLAY_DASH: (f32, f32) = (6.0, 4.0);
-
-/// What a primary-button drag does in the viewer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Tool {
-    /// Drag pans (the default).
-    #[default]
-    Navigate,
-    /// Drag draws a rectangle, reported on release as
-    /// [`ViewerResponse::drawn_rect`]; Esc cancels. The tool returns to
-    /// [`Tool::Navigate`] after a rect is drawn or cancelled.
-    DrawRect,
-}
-
-/// A rectangle drawn over the image, in image coordinates (level-0
-/// pixels).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Overlay {
-    /// `[x0, y0, x1, y1]` in image coordinates.
-    pub rect: [f64; 4],
-    /// Stroke and label colour.
-    pub color: Color32,
-    /// Text drawn at the top-left corner (none if empty).
-    pub label: String,
-    /// Dashed rather than solid outline.
-    pub dashed: bool,
-}
-
 /// What the viewer reports back each frame.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewerResponse {
@@ -242,7 +214,7 @@ enum Command {
 /// Deep-zoom viewer over a [`TileSource`]: drag pans (or draws a rectangle
 /// with [`Tool::DrawRect`]), the scroll wheel zooms about the cursor,
 /// double-click zooms in 2x, and `+` / `−` / `Home` buttons sit top-left.
-/// [`Overlay`] rectangles are drawn over the image.
+/// [`Patch`] images and [`Overlay`] rectangles are drawn over the image.
 pub struct TiledViewer {
     source: Arc<dyn TileSource>,
     geom: PyramidGeometry,
@@ -263,6 +235,7 @@ pub struct TiledViewer {
     /// image coordinates.
     drawing: Option<((f64, f64), (f64, f64))>,
     overlays: Vec<Overlay>,
+    patches: Vec<Patch>,
     /// See [`TiledViewer::set_presentation`].
     presentation: bool,
     /// See [`TiledViewer::set_opacity`].
@@ -301,6 +274,7 @@ impl TiledViewer {
             tool: Tool::Navigate,
             drawing: None,
             overlays: Vec::new(),
+            patches: Vec::new(),
             presentation: false,
             opacity: 1.0,
             drawn_any: false,
@@ -412,6 +386,11 @@ impl TiledViewer {
         self.overlays = overlays;
     }
 
+    /// Replace the images drawn over the tiles (under the overlays).
+    pub fn set_patches(&mut self, patches: Vec<Patch>) {
+        self.patches = patches;
+    }
+
     /// Viewport rect and `ui.input().time` of the last frame shown, for
     /// mapping between screen and image with [`TiledViewer::view`].
     pub fn last_frame(&self) -> Option<(Rect, f64)> {
@@ -501,15 +480,6 @@ impl TiledViewer {
         }
     }
 
-    /// Image point under screen point `p`, clamped to the image.
-    fn clamped_image_pos(&self, p: Pos2, rect: Rect, now: f64) -> (f64, f64) {
-        let (x, y) = self.view.screen_to_image(p, rect, now);
-        (
-            x.clamp(0.0, self.geom.width as f64),
-            y.clamp(0.0, self.geom.height as f64),
-        )
-    }
-
     /// Follow a [`Tool::DrawRect`] drag; returns the rect once released.
     fn handle_draw(
         &mut self,
@@ -518,32 +488,26 @@ impl TiledViewer {
         rect: Rect,
         now: f64,
     ) -> Option<[f64; 4]> {
-        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if esc && !ui.ctx().egui_wants_keyboard_input() {
-            // egui aborts the drag in progress on Escape too, so the rest
-            // of it is not a pan.
-            self.set_tool(Tool::Navigate);
-            return None;
-        }
-        if response.drag_started()
-            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
-        {
-            let a = self.clamped_image_pos(origin, rect, now);
-            self.drawing = Some((a, a));
-        }
-        if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
-            let at = self.clamped_image_pos(p, rect, now);
-            if let Some((_, end)) = &mut self.drawing {
-                *end = at;
+        let geom = self.geom;
+        let view = &self.view;
+        let clamp = |p: Pos2| {
+            let (x, y) = view.screen_to_image(p, rect, now);
+            (
+                x.clamp(0.0, geom.width as f64),
+                y.clamp(0.0, geom.height as f64),
+            )
+        };
+        match follow_draw(ui, response, &mut self.drawing, &clamp) {
+            DrawStep::Idle => None,
+            DrawStep::Cancelled => {
+                self.set_tool(Tool::Navigate);
+                None
+            }
+            DrawStep::Done(r) => {
+                self.tool = Tool::Navigate;
+                Some(r)
             }
         }
-        if response.drag_stopped()
-            && let Some((a, b)) = self.drawing.take()
-        {
-            self.tool = Tool::Navigate;
-            return Some([a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)]);
-        }
-        None
     }
 
     fn handle_input(
@@ -591,7 +555,7 @@ impl TiledViewer {
         drawn
     }
 
-    /// The overlays, and the rectangle being drawn.
+    /// The patches, the overlays, and the rectangle being drawn.
     fn paint_overlays(&self, painter: &egui::Painter, rect: Rect, now: f64) {
         let screen = |r: [f64; 4]| {
             Rect::from_two_pos(
@@ -599,48 +563,14 @@ impl TiledViewer {
                 self.view.image_to_screen((r[2], r[3]), rect, now),
             )
         };
-        for o in &self.overlays {
-            let r = screen(o.rect);
-            if !r.intersects(rect) {
-                continue;
-            }
-            let stroke = Stroke::new(OVERLAY_STROKE, o.color);
-            if o.dashed {
-                let ring = [
-                    r.left_top(),
-                    r.right_top(),
-                    r.right_bottom(),
-                    r.left_bottom(),
-                    r.left_top(),
-                ];
-                painter.extend(Shape::dashed_line(
-                    &ring,
-                    stroke,
-                    OVERLAY_DASH.0,
-                    OVERLAY_DASH.1,
-                ));
-            } else {
-                painter.rect_stroke(r, 0.0, stroke, StrokeKind::Inside);
-            }
-            if !o.label.is_empty() {
-                painter.text(
-                    r.left_top() + Vec2::new(4.0, 2.0),
-                    Align2::LEFT_TOP,
-                    &o.label,
-                    FontId::proportional(13.0),
-                    o.color,
-                );
-            }
-        }
-        if let Some((a, b)) = self.drawing {
-            let r = screen([a.0, a.1, b.0, b.1]);
-            painter.rect_stroke(
-                r,
-                0.0,
-                Stroke::new(OVERLAY_STROKE, palette::ACCENT_400),
-                StrokeKind::Inside,
-            );
-        }
+        paint_layers(
+            painter,
+            rect,
+            &screen,
+            &self.patches,
+            &self.overlays,
+            drawing_rect(self.drawing),
+        );
     }
 
     /// Fetch and upload order of `key`: tiles with nothing cached first,

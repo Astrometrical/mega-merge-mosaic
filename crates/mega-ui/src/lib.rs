@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod brand;
+pub mod canvas_layers;
 pub mod checks;
 pub mod gallery;
 pub mod groups;
