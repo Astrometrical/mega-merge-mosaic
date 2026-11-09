@@ -67,13 +67,19 @@
 //!   through it (no fit is painted first). With nothing saved: the mosaic
 //!   once something is merged, the first group, Problems open, Outlines and
 //!   ROIs on.
+//! - **Export dialog** ([`crate::export_dialog`]): the session's groups and
+//!   composites, exported into a folder; it opens from **Export…**, the
+//!   Export step and `Ctrl+E` once something is merged and while no
+//!   analysis runs ([`SessionWindow::export_block_reason`]).
 //! - **Shortcuts** ([`shortcuts`]): `I`, `M`, `[` / `]`, `O`, `R`, `D`, `L`,
-//!   `S` and `Ctrl+Enter`, each named in its control's tooltip, `Delete`
-//!   (removes the panels selected in the open list), `Esc` (clears the
-//!   selection) and `Space` held (comparing, shows the other side); none
-//!   while a text field has the keyboard or the Export dialog is open.
+//!   `S`, `Ctrl+Enter` and `Ctrl+E`, each named in its control's tooltip,
+//!   `Delete` (removes the panels selected in the open list), `Esc` (clears
+//!   the selection) and `Space` held (comparing, shows the other side);
+//!   none while a text field has the keyboard or the Export dialog is open
+//!   (Esc then closes the dialog only).
 //! - **Saves.** The view state, the display stretch toggles, the composites,
-//!   the notes and the user's grouping choice (noted by the panel list,
+//!   the remembered export choices, the notes and the user's grouping
+//!   choice (noted by the panel list,
 //!   [`PanelList::take_ui_changed`]) live in the session's
 //!   `MosaicConfig.ui`, changed at once
 //!   in memory and written to `mosaic.json` on the UI thread at most once
@@ -92,6 +98,9 @@ mod shortcuts;
 mod steps;
 mod top_bar;
 pub mod view_state;
+
+pub(crate) use sections::counted;
+pub(crate) use steps::out_of_date;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -115,6 +124,7 @@ use crate::compositions::{
     Composition, ViewKind, composition_stretch_key, load_compositions, migrate_composition_ids,
     restore_composition,
 };
+use crate::export_dialog::{ExportDialog, RfdFolderPicker};
 use crate::jobs::{ANALYZE_LABEL, ExportTarget, JobEvent, JobRunner, JobTarget};
 use crate::mosaic_view::MosaicView;
 use crate::panel_edits::FilesPicker;
@@ -240,6 +250,8 @@ pub struct SessionWindow {
     labelled: BTreeSet<u64>,
     /// Space has been held since a press while comparing ([`compare`]).
     peek_key: bool,
+    /// The Export dialog.
+    export: ExportDialog,
     /// The top bar's rect, as last drawn (tests).
     #[cfg(test)]
     pub(crate) top_bar_rect: Option<egui::Rect>,
@@ -292,6 +304,7 @@ impl SessionWindow {
             plan_patches: PatchTextures::default(),
             labelled: BTreeSet::new(),
             peek_key: false,
+            export: ExportDialog::new(Arc::new(RfdFolderPicker)),
             #[cfg(test)]
             top_bar_rect: None,
             #[cfg(test)]
@@ -833,9 +846,64 @@ impl SessionWindow {
         self.save.touch();
     }
 
+    /// Why the Export dialog cannot open now, if it cannot: an analysis
+    /// runs or is queued, or nothing is merged yet. Otherwise it opens,
+    /// whatever is ready: its rows say what is not.
+    pub fn export_block_reason(
+        &self,
+        session: &OpenSession,
+        jobs: &JobRunner,
+    ) -> Option<&'static str> {
+        if jobs.analyzing() {
+            Some(crate::export_dialog::ANALYSING)
+        } else if !session.merged {
+            Some(crate::export_dialog::NOTHING_MERGED)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the Export dialog is open.
+    pub fn export_open(&self) -> bool {
+        self.export.is_open()
+    }
+
+    /// Open the Export dialog (**Export…**, the Export step, `Ctrl+E`);
+    /// nothing while [`SessionWindow::export_block_reason`] gives a reason.
+    /// It shows from the next frame drawn.
+    pub fn open_export(&mut self, session: &OpenSession, jobs: &JobRunner) {
+        if self.export_block_reason(session, jobs).is_none() {
+            self.export.open(session, jobs);
+        }
+    }
+
+    /// The Export dialog (tests).
+    #[cfg(test)]
+    pub(crate) fn export_dialog(&self) -> &ExportDialog {
+        &self.export
+    }
+
+    /// Browse… in the Export dialog asks `picker` (tests).
+    #[cfg(test)]
+    pub(crate) fn set_folder_picker(
+        &mut self,
+        picker: Arc<dyn crate::export_dialog::FolderPicker>,
+    ) {
+        self.export.set_picker(picker);
+    }
+
+    /// Hold the Export dialog's folder checks until the sender is dropped
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn hold_export_checks(&mut self) -> std::sync::mpsc::Sender<()> {
+        self.export.hold_checks()
+    }
+
     /// Draw the window filling `ui`: the top bar across it, the inspector
     /// at the right, the panel list (when open) at the left, the view bar
-    /// and the canvas in the rest, and the export dialog when open.
+    /// and the canvas in the rest, and the Export dialog over it all when
+    /// open ([`crate::export_dialog`]; its choices remembered in the
+    /// session's `ui` are saved like the rest).
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -847,6 +915,12 @@ impl SessionWindow {
         let ctx = ui.ctx().clone();
         self.follow_session(session, jobs);
         self.shortcuts(&ctx, session, jobs, pipeline);
+        // The Export dialog first: it takes Esc before anything behind it
+        // sees the key (a modal's layer is in front however late it is
+        // drawn).
+        if self.export.ui(&ctx, session, jobs) {
+            self.save.touch();
+        }
         let mut out = SessionOutput::default();
         let margin = egui::Margin::symmetric(space::M as i8, space::S as i8);
         let _top = egui::Panel::top("session-top-bar")
@@ -895,7 +969,6 @@ impl SessionWindow {
                 self.view_bar(ui, session, jobs, pipeline);
                 self.canvas_ui(ui, session, jobs, pipeline, checks);
             });
-        self.mosaic.export_ui(&ctx, session, jobs);
         self.follow_settings();
         out.toasts.append(&mut self.toasts);
         self.save_panel_choices();
@@ -1136,7 +1209,7 @@ impl SessionWindow {
 }
 
 /// The session's composites (none with grouping off: one group to show).
-fn compositions_of(session: &OpenSession) -> Vec<Composition> {
+pub(crate) fn compositions_of(session: &OpenSession) -> Vec<Composition> {
     if session.mosaic.config.grouping.enabled {
         load_compositions(&session.mosaic.config.ui)
     } else {

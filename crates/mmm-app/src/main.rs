@@ -13,7 +13,7 @@ mod camera;
 mod checks;
 mod compositions;
 mod display_stretch;
-mod export;
+mod export_dialog;
 mod jobs;
 mod mosaic_view;
 mod panel_edits;

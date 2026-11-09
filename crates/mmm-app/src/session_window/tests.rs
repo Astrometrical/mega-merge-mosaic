@@ -2530,18 +2530,21 @@ fn analyse_step_restarts_a_stalled_analysis() {
     step_until(&mut h, |st| !st.jobs.busy());
     h.run_steps(2);
     assert_eq!(shown_steps(h.state())[1], strip("Analyse", StepState::Next));
-    assert!(
-        h.state().w.mosaic().can_open_export(),
-        "no analysis tracked"
+    let export_block = |st: &State| st.w.export_block_reason(&st.session, &st.jobs);
+    assert_eq!(
+        export_block(h.state()),
+        Some("Nothing is merged yet."),
+        "no analysis running"
     );
     // Pressed: it starts, and the mosaic tracks it.
     let again = h.state_mut().jobs.hold();
     h.get_by_label("Analyse").click();
     h.run_steps(2);
     assert!(h.state().jobs.analyzing());
-    assert!(
-        !h.state().w.mosaic().can_open_export(),
-        "the analysis is tracked"
+    assert_eq!(
+        export_block(h.state()),
+        Some("Waiting for the analysis to finish."),
+        "the analysis runs"
     );
     again.open();
     step_until(&mut h, |st| {
@@ -2642,13 +2645,12 @@ fn no_user_visible_blend_wording() {
     );
 
     // The export dialog.
-    let State { w, session, .. } = h.state_mut();
-    w.mosaic.open_export(session);
+    let State {
+        w, session, jobs, ..
+    } = h.state_mut();
+    w.open_export(session, jobs);
     h.run_steps(4);
-    assert!(
-        !h.state().w.mosaic().can_open_export(),
-        "the dialog is open"
-    );
+    assert!(h.state().w.export_open(), "the dialog is open");
     assert_no_blend(&h, "export dialog");
 
     // The plan.
@@ -2922,10 +2924,13 @@ fn shortcuts_ignored_in_the_export_dialog() {
     use egui::Key;
     let (root, s, jobs) = merged("window-export-keys");
     let mut h = harness(State::new(s, jobs));
-    step_until(&mut h, |st| st.w.mosaic().can_open_export());
-    let State { w, session, .. } = h.state_mut();
-    w.mosaic.open_export(session);
+    step_until(&mut h, |st| st.w.view().is_some());
+    let State {
+        w, session, jobs, ..
+    } = h.state_mut();
+    w.open_export(session, jobs);
     h.run_steps(2);
+    assert!(h.state().w.export_open());
     h.key_press(Key::O);
     h.key_press(Key::M);
     h.run_steps(2);
@@ -3183,7 +3188,8 @@ fn steps_that_cannot_act_say_why() {
     let (root, s, jobs) = merged("window-why-not");
     let mut h = harness(State::new(s, jobs));
     step_until(&mut h, |st| {
-        st.w.mosaic().can_open_export() && st.w.mosaic().viewer_frame().is_some()
+        st.w.export_block_reason(&st.session, &st.jobs).is_none()
+            && st.w.mosaic().viewer_frame().is_some()
     });
     // An analysis running (held): nothing merges or exports until it ends.
     let gate = h.state_mut().jobs.hold();
@@ -3207,7 +3213,7 @@ fn steps_that_cannot_act_say_why() {
     h.get_by_label("Export").click();
     h.run_steps(2);
     assert_eq!(labels(&h.state().jobs).len(), 1, "the analysis only");
-    assert!(!h.state().w.mosaic().export_open());
+    assert!(!h.state().w.export_open());
     gate.open();
     step_until(&mut h, |st| !st.jobs.busy());
     drop(h);
@@ -3294,7 +3300,7 @@ fn a_one_group_merge_names_no_group() {
     let gate = jobs.hold();
     let out = root.join("one.fits");
     let target = ExportTarget::Group(SINGLE_GROUP.into());
-    let id = jobs.start_export(&s, target, out, crate::export::ExportFormat::Fits);
+    let id = jobs.start_export(&s, target, out, mmm_core::export::ExportFormat::Fits);
     assert_eq!(jobs.label(id), Some("Export"));
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     assert_eq!(got[3].label, "Exporting");
@@ -3320,7 +3326,7 @@ fn a_merge_waits_behind_an_export() {
     let gate = jobs.hold_exports();
     let out = root.join("ha.fits");
     let ha = ExportTarget::Group("Ha".into());
-    let export = jobs.start_export(&s, ha, out, crate::export::ExportFormat::Fits);
+    let export = jobs.start_export(&s, ha, out, mmm_core::export::ExportFormat::Fits);
     let merge = jobs.start_blend(&mut s, "Ha", None);
     let got = steps(&s, &jobs, &Pipeline::new(), &ChecksEngine::new());
     let want = StripStep {
@@ -3396,7 +3402,7 @@ fn the_export_step_says_exported() {
     // While exports run, the step says so, and its Cancel cancels them all
     // (a composite's too).
     let gate = jobs.hold();
-    let fits = crate::export::ExportFormat::Fits;
+    let fits = mmm_core::export::ExportFormat::Fits;
     let ha = ExportTarget::Group("Ha".into());
     let first = jobs.start_export(&s, ha, root.join("ha.fits"), fits);
     let hoo = ExportTarget::Composite {
@@ -3752,7 +3758,7 @@ fn settings_changed_is_not_out_of_date() {
     assert!(draft_changed(&st.session, "Ha") && !out_of_date(&st.session, "Ha"));
     // The main button merges; export stays allowed.
     assert!(!rightmost_disabled(&h, "Merge"));
-    assert!(st.w.mosaic().export_block_reason().is_none());
+    assert!(st.w.export_block_reason(&st.session, &st.jobs).is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -4394,4 +4400,5 @@ fn a_region_entry_with_other_settings_still_makes_the_group_out_of_date() {
 }
 
 mod compare;
+mod export;
 mod previews;

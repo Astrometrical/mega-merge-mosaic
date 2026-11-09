@@ -94,6 +94,20 @@ impl<T: Send + 'static> Task<T> {
     }
 }
 
+/// `path` as the user writes it: without Windows' `\\?\` verbatim prefix
+/// (`\\?\UNC\server\share` as `\\server\share`), which canonical paths
+/// carry there and Windows accepts either way.
+pub fn plain_path(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(local) = s.strip_prefix(r"\\?\") {
+        local.to_string()
+    } else {
+        s
+    }
+}
+
 /// The processing groups of `session`: resolved ones if known, else those
 /// known from analysis.
 pub fn group_names(session: &OpenSession) -> Vec<String> {
@@ -120,5 +134,16 @@ mod tests {
         assert!(d.due(t0 + SAVE_INTERVAL));
         d.saved(t0 + SAVE_INTERVAL);
         assert!(!d.due(t0 + 3 * SAVE_INTERVAL), "nothing new to save");
+    }
+
+    #[test]
+    fn plain_paths_have_no_verbatim_prefix() {
+        use std::path::Path;
+        assert_eq!(plain_path(Path::new(r"\\?\C:\Astro\m")), r"C:\Astro\m");
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\nas\astro\m")),
+            r"\\nas\astro\m"
+        );
+        assert_eq!(plain_path(Path::new("/home/ann/m")), "/home/ann/m");
     }
 }

@@ -216,7 +216,7 @@ fn muted(ui: &mut egui::Ui, s: impl Into<String>) {
 }
 
 /// `n` and `noun`, plural unless one.
-pub(super) fn counted(n: usize, noun: &str) -> String {
+pub(crate) fn counted(n: usize, noun: &str) -> String {
     if n == 1 {
         format!("1 {noun}")
     } else {

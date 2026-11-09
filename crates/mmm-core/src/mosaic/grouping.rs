@@ -174,8 +174,11 @@ pub fn resolve_groups(cfg: &MosaicConfig, header: &dyn Fn(&Path) -> Option<Strin
     out
 }
 
-/// Windows reserved device names (with or without an extension).
-fn is_reserved_device_name(s: &str) -> bool {
+/// Whether file name `s` is a Windows reserved device name (`CON`, `PRN`,
+/// `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`), whatever its case and with
+/// or without an extension: its stem, before the first `.`, is one. Windows
+/// refuses to create such a file anywhere.
+pub fn is_reserved_device_name(s: &str) -> bool {
     let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
     matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ((stem.starts_with("COM") || stem.starts_with("LPT"))

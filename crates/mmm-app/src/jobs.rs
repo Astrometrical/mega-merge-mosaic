@@ -131,9 +131,6 @@ pub enum ExportTarget {
     /// A group's merged mosaic, by group name.
     Group(String),
     /// A composite: its groups' mosaics as the red, green and blue planes.
-    // Nothing in the UI starts one yet: the view's Export dialog exports a
-    // composite view's groups one by one.
-    #[allow(dead_code)]
     Composite {
         /// The composite's id (it stays when the composite is renamed).
         id: u64,
@@ -515,9 +512,9 @@ impl JobRunner {
     /// (SIGBUS) any [`mmm_core::tiles::TileReader`] still mapping it. The
     /// runner keeps its own exports clear of it, but not other readers:
     /// callers must not start a blend while a reader outside the job runner
-    /// maps the store — the mosaic view gates it on its tracked sources,
-    /// the export check and the merge settings tile count (see
-    /// [`crate::mosaic_view`] and [`crate::blend_settings`]).
+    /// maps the store — the mosaic view gates it on its tracked sources
+    /// and the merge settings tile count (see [`crate::mosaic_view`] and
+    /// [`crate::blend_settings`]).
     pub fn start_blend(
         &mut self,
         session: &mut OpenSession,
@@ -556,9 +553,10 @@ impl JobRunner {
     /// as `format`; returns the job id. Runs on the export lane, after the
     /// exports before it, and cancels nothing; it waits for an analysis and
     /// for a running blend of a group it reads (see the module docs). Stale
-    /// tiles are exported as they are and missing ones as zeros (warn the
-    /// user first: [`mmm_core::export::export_check`]). Planning does no
-    /// I/O. Labelled "Export {group}" ("Export" alone in a session of one
+    /// tiles are exported as they are and missing ones as zeros: the Export
+    /// dialog offers only targets ready to export
+    /// ([`crate::export_dialog::readiness_of`]). Planning does no I/O.
+    /// Labelled "Export {group}" ("Export" alone in a session of one
     /// group), or "Export {composite name}".
     pub fn start_export(
         &mut self,
