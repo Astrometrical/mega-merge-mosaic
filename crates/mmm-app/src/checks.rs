@@ -37,7 +37,7 @@ use mmm_core::photometry::Photometry;
 use mmm_core::session::Session;
 use mmm_core::surfaces::Surfaces;
 
-use crate::blend_settings::{MERGE_DRAFT_KEY, draft_for};
+use crate::blend_settings::draft_for;
 use crate::jobs::{ANALYZE_LABEL, JobEvent, JobRunner, JobTarget, PREVIEWS_LABEL};
 use crate::session::OpenSession;
 use crate::util::{Poll, Task};
@@ -220,7 +220,7 @@ pub struct ChecksEngine {
     groups_seen: Option<Groups>,
     panels_seen: Vec<PanelEntry>,
     /// The draft's feathers (unmerged groups) when last looked at.
-    drafts_seen: Option<(Option<serde_json::Value>, BTreeMap<String, f32>)>,
+    drafts_seen: Option<BTreeMap<String, f32>>,
     /// When the draft feather last changed, while a run waits for typing
     /// to pause.
     pending: Option<Instant>,
@@ -271,6 +271,18 @@ impl ChecksEngine {
         jobs: &JobRunner,
         events: &[JobEvent],
     ) {
+        self.poll_at(ctx, session, jobs, events, Instant::now());
+    }
+
+    /// [`ChecksEngine::poll`] at time `now` (the debounce's clock).
+    fn poll_at(
+        &mut self,
+        ctx: &egui::Context,
+        session: &OpenSession,
+        jobs: &JobRunner,
+        events: &[JobEvent],
+        now: Instant,
+    ) {
         if let Some(task) = &self.task {
             match task.poll() {
                 Poll::Pending => {}
@@ -307,7 +319,7 @@ impl ChecksEngine {
                 JobEvent::Preview(_) => false,
             };
         }
-        self.watch_draft(ctx, &session.mosaic.config);
+        self.watch_draft(ctx, &session.mosaic.config, now);
         if self.dirty && self.task.is_none() {
             self.dirty = false;
             #[cfg(test)]
@@ -327,26 +339,22 @@ impl ChecksEngine {
 
     /// Notice a changed draft feather and run again once it has stayed
     /// the same for the debounce.
-    fn watch_draft(&mut self, ctx: &egui::Context, cfg: &MosaicConfig) {
-        let draft = cfg.ui.get(MERGE_DRAFT_KEY);
-        let unchanged = self
-            .drafts_seen
-            .as_ref()
-            .is_some_and(|(seen, _)| seen.as_ref() == draft);
-        if !unchanged {
-            let feathers = draft_feathers(cfg);
-            // The first look is the session's own state, not a change.
-            let moved = self
-                .drafts_seen
-                .as_ref()
-                .is_some_and(|(_, seen)| *seen != feathers);
-            self.drafts_seen = Some((draft.cloned(), feathers));
-            if moved {
-                self.pending = Some(Instant::now());
-            }
+    fn watch_draft(&mut self, ctx: &egui::Context, cfg: &MosaicConfig, now: Instant) {
+        let feathers = draft_feathers(cfg);
+        // A group that is new or has been merged since is not a change (its
+        // run was asked for by the analysis or the merge); the first look is
+        // the session's own state.
+        let moved = self.drafts_seen.as_ref().is_some_and(|seen| {
+            feathers
+                .iter()
+                .any(|(g, f)| seen.get(g).is_some_and(|old| old != f))
+        });
+        self.drafts_seen = Some(feathers);
+        if moved {
+            self.pending = Some(now);
         }
         if let Some(since) = self.pending {
-            let waited = since.elapsed();
+            let waited = now.saturating_duration_since(since);
             if waited >= self.debounce {
                 self.pending = None;
                 self.dirty = true;
@@ -596,25 +604,60 @@ mod tests {
         use mmm_core::settings::BlendSettings;
         let (root, mut s, r) = analyzed("checks-feather");
         let mut e = ChecksEngine::new();
-        e.debounce = Duration::from_millis(300);
         settle(&mut e, &s, &r);
         let before = e.runs;
         let ctx = egui::Context::default();
-        // Typing: several values in a row, each within the debounce.
-        for feather in [31.0, 32.0, 33.0, 34.0] {
+        // A clock the test drives: typing, each value within the debounce.
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        e.poll_at(&ctx, &s, &r, &[], t0);
+        for (i, feather) in [31.0, 32.0, 33.0, 34.0].into_iter().enumerate() {
             let draft = BlendSettings {
                 feather_px: feather,
                 ..crate::blend_settings::load_draft(&s.mosaic.config)
             };
             crate::blend_settings::save_draft(&mut s.mosaic.config.ui, &draft);
-            e.poll(&ctx, &s, &r, &[]);
+            e.poll_at(&ctx, &s, &r, &[], at(100 * (i as u64 + 1)));
         }
+        // 600 ms after the last change: still waiting.
+        e.poll_at(&ctx, &s, &r, &[], at(400 + 600));
         assert_eq!(e.runs, before, "nothing runs while typing");
+        assert!(e.pending.is_some());
+        // 750 ms after the last change: one run.
+        e.poll_at(&ctx, &s, &r, &[], at(400 + 750));
         settle(&mut e, &s, &r);
         assert_eq!(e.runs, before + 1, "one run after typing stops");
-        e.poll(&ctx, &s, &r, &[]);
+        e.poll_at(&ctx, &s, &r, &[], at(5000));
         settle(&mut e, &s, &r);
         assert_eq!(e.runs, before + 1, "an unchanged feather asks for nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_feather_edit_after_a_merge_runs_nothing() {
+        use mmm_core::settings::BlendSettings;
+        let (root, mut s, mut r) = analyzed("checks-nonfeather");
+        let mut e = ChecksEngine::new();
+        settle(&mut e, &s, &r);
+        let ctx = egui::Context::default();
+        // Merge Ha: it leaves the draft feathers' map.
+        r.start_blend(&mut s, "Ha", None);
+        let events = crate::jobs::tests::drain(&mut r, &mut s);
+        e.poll(&ctx, &s, &r, &events);
+        settle(&mut e, &s, &r);
+        let before = e.runs;
+        let t0 = Instant::now();
+        let draft = crate::blend_settings::load_draft(&s.mosaic.config);
+        let edited = BlendSettings {
+            defect_veto: !draft.defect_veto,
+            ..draft
+        };
+        crate::blend_settings::save_draft(&mut s.mosaic.config.ui, &edited);
+        e.poll_at(&ctx, &s, &r, &[], t0);
+        e.poll_at(&ctx, &s, &r, &[], t0 + Duration::from_secs(10));
+        assert!(e.pending.is_none() && !e.dirty);
+        settle(&mut e, &s, &r);
+        assert_eq!(e.runs, before);
         let _ = std::fs::remove_dir_all(&root);
     }
 
