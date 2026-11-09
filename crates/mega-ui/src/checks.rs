@@ -151,59 +151,65 @@ fn row(
         (tone.accent(), tone.tint(), tone.color())
     };
     let left = BAR_WIDTH + space::S + ICON_SIZE + space::S;
-    // A chevron at the right says the row leads somewhere.
-    let right = if item.goes_somewhere {
-        space::S + ICON_SIZE + space::S
+    // The chevron's room is inside the row's own text area, so the whole
+    // area is the button.
+    let chevron = if item.goes_somewhere {
+        ICON_SIZE + space::S
     } else {
-        space::S
+        0.0
     };
     let mut builder = UiBuilder::new().id_salt(("mega-ui-check-row", index));
     if item.goes_somewhere {
-        // Registered before the row's content, so a button inside it
-        // (Accept) is on top of the row and takes its own clicks.
         builder = builder.sense(Sense::click());
     }
-    let scope = ui.scope_builder(builder, |ui| {
-        Frame::new()
-            .fill(fill)
-            .corner_radius(CornerRadius {
-                ne: radius::CONTROL,
-                se: radius::CONTROL,
-                ..CornerRadius::ZERO
-            })
-            .inner_margin(Margin {
-                left: left as i8,
-                right: right as i8,
-                top: 6,
-                bottom: 6,
-            })
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                // A row that is a button says its title and detail itself: its
-                // text is hidden from the accessibility tree, not said twice.
-                let hide = item.goes_somewhere;
-                text_block(
-                    ui,
-                    RichText::new(&item.title).color(palette::TEXT_EMPHASIS),
-                    hide,
-                );
-                if !item.detail.is_empty() {
+    let framed = Frame::new()
+        .fill(fill)
+        .corner_radius(CornerRadius {
+            ne: radius::CONTROL,
+            se: radius::CONTROL,
+            ..CornerRadius::ZERO
+        })
+        .inner_margin(Margin {
+            left: left as i8,
+            right: space::S as i8,
+            top: 6,
+            bottom: 6,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let full = ui.available_width();
+            // The title and detail are the open button (when the row goes
+            // somewhere); Accept and Un-accept sit beside it, not inside.
+            let text = ui.scope_builder(builder, |ui| {
+                ui.set_width(full);
+                ui.scope(|ui| {
+                    ui.set_max_width(full - chevron);
+                    // A row that is a button says its title and detail
+                    // itself: its text has no nodes of its own.
+                    let hide = item.goes_somewhere;
                     text_block(
                         ui,
-                        RichText::new(&item.detail)
-                            .text_style(TextStyle::Small)
-                            .color(palette::TEXT_MUTED),
+                        RichText::new(&item.title).color(palette::TEXT_EMPHASIS),
                         hide,
                     );
-                }
-                if item.severity == Severity::Problem {
-                    accept_controls(ui, index, item, mode, actions);
-                }
-            })
-            .response
-            .rect
-    });
-    let r = scope.inner;
+                    if !item.detail.is_empty() {
+                        text_block(
+                            ui,
+                            RichText::new(&item.detail)
+                                .text_style(TextStyle::Small)
+                                .color(palette::TEXT_MUTED),
+                            hide,
+                        );
+                    }
+                });
+            });
+            if item.severity == Severity::Problem {
+                accept_controls(ui, index, item, mode, actions);
+            }
+            text
+        });
+    let r = framed.response.rect;
+    let scope = framed.inner;
     ui.painter().rect_filled(
         Rect::from_min_max(r.min, Pos2::new(r.min.x + BAR_WIDTH, r.max.y)),
         CornerRadius::ZERO,
@@ -219,8 +225,9 @@ fn row(
     }
     if item.goes_somewhere {
         let response = scope.response;
+        let text_rect = response.rect;
         ui.painter().text(
-            Pos2::new(r.max.x - space::S, r.center().y),
+            Pos2::new(text_rect.max.x - space::S, text_rect.center().y),
             Align2::RIGHT_CENTER,
             icons::CHEVRON_RIGHT,
             icons::font(ICON_SIZE),
@@ -228,7 +235,7 @@ fn row(
         );
         if response.hovered() {
             ui.painter().rect_stroke(
-                r,
+                text_rect,
                 CornerRadius::same(radius::CONTROL),
                 Stroke::new(HAIRLINE_WIDTH, palette::BORDER),
                 StrokeKind::Inside,
@@ -650,5 +657,31 @@ mod tests {
         for name in ["Problems", "Notes", "Passed"] {
             h.get_by_role_and_label(egui::accesskit::Role::Heading, name);
         }
+    }
+
+    #[test]
+    fn accept_sits_beside_the_open_button_not_inside_it() {
+        let mut h = harness(vec![goes(check(Severity::Problem, "Gap", true, false))]);
+        h.run();
+        let open = row_button(&h, "Gap");
+        let accept = h.get_by_role_and_label(egui::accesskit::Role::Button, "Accept");
+        assert_ne!(
+            accept.accesskit_node().parent_id(),
+            Some(open.accesskit_node().id()),
+            "Accept is a sibling of the row's button, not its child"
+        );
+        let mut p = accept.accesskit_node().parent();
+        while let Some(n) = p {
+            assert_ne!(n.id(), open.accesskit_node().id(), "not a descendant");
+            p = n.parent();
+        }
+        // Tab reaches both: the row's button, then Accept.
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert!(row_button(&h, "Gap").accesskit_node().is_focused());
+        h.key_press(egui::Key::Tab);
+        h.run();
+        let accept = h.get_by_role_and_label(egui::accesskit::Role::Button, "Accept");
+        assert!(accept.accesskit_node().is_focused());
     }
 }
