@@ -223,6 +223,12 @@ impl Shell {
         &self.checks
     }
 
+    /// The open session's job runner (for the tours' idle test).
+    #[cfg(test)]
+    pub fn jobs(&self) -> Option<&JobRunner> {
+        self.jobs.as_ref()
+    }
+
     /// Every toast's title pushed so far, in order, whether or not it is
     /// still on screen.
     #[cfg(test)]

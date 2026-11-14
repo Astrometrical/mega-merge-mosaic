@@ -32,3 +32,5 @@
 
 # Narration tool output (clips are the voice owner's recordings)
 /crates/mmm-app/tours/out/
+# any tour output folder, wherever a run lands it (videos and clips are never committed)
+**/tours/out/

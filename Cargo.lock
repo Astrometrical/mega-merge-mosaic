@@ -1534,6 +1534,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mega-tour"
+version = "1.7.0"
+dependencies = [
+ "egui",
+ "egui_kittest",
+ "image",
+ "mega-ui",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "mega-ui"
 version = "1.7.0"
 dependencies = [
@@ -1589,6 +1602,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "mega-tour",
  "mega-ui",
  "mmm-core",
  "rfd",

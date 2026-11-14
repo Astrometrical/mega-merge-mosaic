@@ -2004,7 +2004,8 @@ stays free of `mmm-core`.
 - **Tokens** (`mega_ui::theme`): `palette` (the web's colours and AA text
   roles, plus `HA_400` for Hα text and SII gold `SII_300/400/600` for
   warnings), `tokens` (spacing 4·8·12·16·24·32, radii 4/6/8, 30 px controls,
-  100 ms hover fades), `text::Type` (the type scale), `Tone` (success, info,
+  100 ms hover fades, and the caption card and click ripple of recorded
+  tours), `text::Type` (the type scale), `Tone` (success, info,
   warning, problem, neutral: colour, accent, tint and icon), and
   `contrast_ratio`/`legible_text` for checking new colours, plus `scrim`
   (a surface colour at the lowest opacity that keeps given text AA over
@@ -2283,3 +2284,53 @@ pruned). Usage and workflow are in `tools/narrate/README.md`. As built:
   start. It gives ffmpeg absolute paths, so the argv does not depend on the
   working directory. Audio is mixed at 48 kHz, `loudnorm` I=-16 TP=-1.5
   LRA=11, AAC 192k; the video stream is copied.
+
+### Plan 3: the `mega-tour` recorder and the NGC 7000 tour
+
+Plan 3 built `crates/mega-tour` (README there) and the app tour in
+`crates/mmm-app/src/tours/ngc7000.rs`, run by `tools/tour.sh SESSION [OUT]
+[--draft] [--allow-unapproved]`. The script builds (or drafts) the narration,
+runs the tour as an ignored `mmm-app` test (headless egui_kittest on wgpu, no
+window; `WGPU_BACKEND=vulkan` on Windows), then muxes. With no voice set up it
+falls back to a draft: a silent video and captions, no mux. As built:
+
+- **Generic crate.** `mega-tour` depends on `mega-ui` only, never on `mmm-*`.
+  It renders a caption card and a cursor over the app at 1280 x 720, 1.5 ppp
+  (1920 x 1080 output), 30 fps, piped to ffmpeg. Any egui app can be
+  recorded: mega-ui's theme is optional (it gives the Astrometrical look),
+  and without its named text styles the caption and badge fall back to
+  egui's `Heading` and `Body`.
+- **Overlay tokens.** The overlay's colours, spacing and radii come from
+  mega-ui, as do its caption card (`CAPTION_FADE_S`, `CAPTION_WRAP_FRACTION`,
+  `CAPTION_CARD_ALPHA` at 0.94 rather than a `scrim`, so the look is
+  unchanged, and a `HAIRLINE_WIDTH` border) and the ripple's lifetime
+  (`RIPPLE_S`). The written exception to the tokens rule is pointer-feedback
+  geometry: the cursor arrow's shape and its black, white and shadow
+  colours, the ripple's radius (6 + 22k pt) and stroke (0.5 to 3.0 pt), and
+  the 0.88 pressed-cursor scale stay literal.
+- **Narration-paced.** `say(id)` checks the id, keeps recording until the
+  previous clip and its breath are over (rounded up to whole frames, so cues
+  never overlap clips), shows the caption and starts the clip `lead` seconds
+  later; passage captions switch per sentence at frames derived from the
+  clip start. `finish` lets the last clip play out. During a `hold` (and
+  while `say` waits) the app keeps stepping: no frame is frozen.
+- **Real-time waits.** Each `wait` step is paced to a real frame time, since
+  the app's jobs run on wall-clock threads, so a wait lasts as long in the
+  video as it took the app, divided by its lapse. Slow work is time-lapsed
+  (`Wait::lapse`, with a "sped up" badge) to keep that short; the video's
+  length depends on the narration and on how long the app takes in each
+  wait. A wait that can fail gets a short `Wait::timeout` and an `on_step`
+  that reports the app's error: the tour's session open panics with the
+  start screen's error, or after 120 s.
+- **Finding widgets.** `find` and `click_on` match buttons (AccessKit
+  `Role::Button`) by label; `dump_labels` lists what there is.
+- **Outputs.** `silent.mp4`, `timeline.json`, `captions.vtt` and stills;
+  `narrate mux --timeline` consumes the timeline.
+- **Acceptance (2026-11-14).** The real two-panel, six-filter NGC 7000 session:
+  the draft run recorded 51.0 s of video in about 2.7 min with 8 cues and 8
+  captions; the narrated preview (cached takes, `--allow-unapproved`) muxed a
+  47.6 s `tour.mp4` with an AAC audio stream and no overrun. Most wall time is
+  the real analysis and merge, which the recorder time-lapses.
+- **The spike is superseded.** The uncommitted spike on `spike/tour-video` in
+  the main checkout (`tour_spike.rs`) is replaced by this crate and can be
+  discarded.
