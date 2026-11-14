@@ -231,6 +231,14 @@ def test_clip_paths_cannot_escape(make_app):
         assert call(server.url + p)[0] == 404
 
 
+def test_clips_answer_byte_ranges(make_app):
+    _, _, server = make_app(("a", LINE))
+    req = urllib.request.Request(server.url + "/clips/a.wav", headers={"Range": "bytes=0-3"})
+    with urllib.request.urlopen(req) as r:
+        assert (r.status, r.read(), r.headers["Accept-Ranges"]) == (206, b"RIFF", "bytes")
+        assert r.headers["Content-Range"].startswith("bytes 0-3/")
+
+
 def test_oversized_body_413(make_app):
     _, _, server = make_app(("a", LINE))
     assert call(server.url + "/api/note", raw=b" " * (64 * 1024 + 1))[0] == 413

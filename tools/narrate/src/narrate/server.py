@@ -15,9 +15,12 @@ from pathlib import Path
 from narrate import NarrateError
 
 MAX_BODY = 64 * 1024
-Response = tuple[int, str, bytes]
+#: (status, content type, body), optionally with extra headers.
+Response = tuple[int, str, bytes] | tuple[int, str, bytes, dict[str, str]]
 Handler = Callable[[object], Response]
 _CLIP_RE = re.compile(r"/clips/([a-z0-9-]+)\.wav")
+# One range only; positions longer than 15 digits (a petabyte) are treated as malformed.
+_RANGE_RE = re.compile(r"bytes=(\d{0,15})-(\d{0,15})", re.IGNORECASE)
 
 
 def _finite(value):
@@ -37,15 +40,49 @@ def json_response(obj, status: int = 200) -> Response:
 
 
 def serve_clip(out_dir: Path, ids: Collection[str], request_path: str) -> Response:
-    """The WAV for exactly `/clips/<id>.wav` with a known id; anything else is a 404."""
+    """The WAV for exactly `/clips/<id>.wav` with a known id; anything else is a 404.
+
+    The reply offers byte ranges (`Accept-Ranges: bytes`), so the server answers a `Range`
+    request with the slice (see `ranged`) and browsers can seek in the clip.
+    """
     m = _CLIP_RE.fullmatch(request_path)
     if m is None or m.group(1) not in ids:
         return json_response({"error": "not found"}, 404)
     path = Path(out_dir) / "clips" / f"{m.group(1)}.wav"
     try:
-        return 200, "audio/wav", path.read_bytes()
+        return 200, "audio/wav", path.read_bytes(), {"Accept-Ranges": "bytes"}
     except OSError:
         return json_response({"error": "not found"}, 404)
+
+
+def ranged(response: Response, range_header: str | None) -> Response:
+    """Answer a GET's `Range` header from a whole-body 200 that offers `Accept-Ranges: bytes`.
+
+    A single `bytes=a-b`, `bytes=a-` or `bytes=-n` gives 206 with `Content-Range` and the
+    slice (an end past the body is clamped), or 416 with `Content-Range: bytes */size` when
+    nothing of the body is in range. Anything else (several ranges, another unit, a malformed
+    or reversed span) gets the whole 200, as RFC 9110 allows. Other responses pass through.
+    """
+    status, ctype, body, *rest = response
+    headers = dict(rest[0]) if rest else {}
+    if status != 200 or headers.get("Accept-Ranges") != "bytes" or range_header is None:
+        return response
+    m = _RANGE_RE.fullmatch(range_header.strip())
+    if m is None or m.group(1) == m.group(2) == "":
+        return response
+    size = len(body)
+    if m.group(1):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else size - 1
+        if m.group(2) and end < start:
+            return response
+    else:
+        start, end = max(0, size - int(m.group(2))), size - 1
+    if start >= size:
+        status, ctype, body = json_response({"error": "range not satisfiable"}, 416)
+        return status, ctype, body, {**headers, "Content-Range": f"bytes */{size}"}
+    end = min(end, size - 1)
+    return 206, ctype, body[start : end + 1], {**headers, "Content-Range": f"bytes {start}-{end}/{size}"}
 
 
 class Routes:
@@ -81,11 +118,13 @@ class _RequestHandler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, response: Response) -> None:
-        status, ctype, body = response
+        status, ctype, body, *rest = response
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (rest[0] if rest else {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -139,6 +178,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
         except Exception:
             traceback.print_exc(file=sys.stderr)
             response = json_response({"error": "internal error"}, 500)
+        if method == "GET":
+            response = ranged(response, self.headers.get("Range"))
         self._send(response)
 
     def do_GET(self) -> None:  # noqa: N802

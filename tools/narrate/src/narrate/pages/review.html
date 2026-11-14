@@ -80,6 +80,12 @@ let state = null;
 let pollTimer = null;
 let message = "";
 let isError = false;
+// While a rebuild runs the cards are frozen: left in place (audio keeps playing, notes keep
+// focus) with their buttons off; only the header and status update. It ends with one full render.
+let frozen = false;
+// Note text typed but not saved yet (line id -> text), so no render or 409 ever loses it.
+const drafts = {};
+const POLL_MS = 1000;
 
 const $ = (id) => document.getElementById(id);
 
@@ -118,18 +124,55 @@ async function request(url, body) {
   return data;
 }
 
+// Apply a state from the server: mid-build only the header changes; otherwise render it all.
+function show(next) {
+  const wasFrozen = frozen;
+  state = next;
+  frozen = !!state.building;
+  if (frozen && wasFrozen) renderHeader();
+  else render();
+  if (frozen) poll();
+  else if (wasFrozen) saveDrafts();
+}
+
 async function act(url, body, focusKey) {
+  let next;
   try {
-    state = await request(url, body);
-    setStatus("", false);
+    next = await request(url, body);
   } catch (e) {
     setStatus(e.message, true);
     return;
   }
-  render();
+  setStatus("", false);
+  show(next);
   if (focusKey) {
     const b = document.querySelector('[data-focus="' + CSS.escape(focusKey) + '"]');
     if (b) b.focus();
+  }
+}
+
+async function saveNote(id) {
+  if (!(id in drafts) || !state || frozen) return;  // mid-build: saved when the build finishes
+  const text = drafts[id];
+  if (text === (state.lock.notes[id] || "")) {
+    delete drafts[id];
+    return;
+  }
+  try {
+    const fresh = await request(API.note, { id: id, note: text });
+    state.lock.notes = fresh.lock.notes;
+    if (drafts[id] === text) delete drafts[id];
+    setStatus("", false);
+  } catch (e) {
+    setStatus(e.message, true);  // the draft stays; it is saved on the next blur or after a build
+  }
+}
+
+async function saveDrafts() {
+  const focused = document.activeElement;
+  for (const id of Object.keys(drafts)) {
+    if (focused && focused.dataset && focused.dataset.line === id) continue;  // saved on blur
+    await saveNote(id);
   }
 }
 
@@ -150,7 +193,7 @@ function fmtTime(t) { return t.toFixed(2) + "s"; }
 function renderCard(line) {
   const c = line.check;
   const rejected = isRejected(line);
-  const canAct = !!c && !!c.sha256 && !state.manifest.draft && !state.building;
+  const canAct = !!c && !!c.sha256 && !state.manifest.draft && !frozen;
   const badges = [el("span", { class: "badge " + line.status, text: line.status })];
   if (rejected) badges.push(el("span", { class: "badge rejected", text: "rejected" }));
   const head = el("div", { class: "head" }, [el("span", { class: "id", text: line.id }), ...badges]);
@@ -160,7 +203,7 @@ function renderCard(line) {
   if (line.clip && c) {
     const audio = el("audio", {
       controls: "", preload: "none", "aria-label": "Play line " + line.id,
-      src: "/clips/" + encodeURIComponent(line.id) + ".wav?take=" + encodeURIComponent(c.take),
+      src: "/clips/" + encodeURIComponent(line.id) + ".wav?v=" + encodeURIComponent(c.sha256 || c.take),
     });
     card.appendChild(audio);
     if (line.kind === "passage" && line.captions && line.captions.length) {
@@ -203,22 +246,33 @@ function renderCard(line) {
   card.appendChild(el("div", { class: "actions" }, [approve, reject]));
 
   const noteId = "note-" + line.id.replace(/[^A-Za-z0-9_-]/g, "_");
-  const area = el("textarea", { id: noteId, rows: "2" });
-  area.value = state.lock.notes[line.id] || "";
-  area.addEventListener("blur", async () => {
-    if (area.value === (state.lock.notes[line.id] || "")) return;
-    try {
-      state = await request(API.note, { id: line.id, note: area.value });
-      setStatus("", false);
-    } catch (e) {
-      setStatus(e.message, true);
-    }
-  });
+  const area = el("textarea", { id: noteId, rows: "2", "data-line": line.id });
+  area.value = line.id in drafts ? drafts[line.id] : (state.lock.notes[line.id] || "");
+  area.addEventListener("input", () => { drafts[line.id] = area.value; });
+  area.addEventListener("blur", () => saveNote(line.id));
   card.appendChild(el("div", { class: "note" }, [el("label", { for: noteId, text: "Note for " + line.id }), area]));
   return card;
 }
 
-function render() {
+function renderCards() {
+  // A note being typed keeps its text, focus and selection across the re-render.
+  const f = document.activeElement;
+  const keep = f && f.tagName === "TEXTAREA" && f.closest("#lines")
+    ? { id: f.id, value: f.value, start: f.selectionStart, end: f.selectionEnd } : null;
+  const lines = state.manifest.lines;
+  const sorted = lines.map((l, i) => [l, i]).sort((a, b) => (ORDER[a[0].status] ?? 9) - (ORDER[b[0].status] ?? 9) || a[1] - b[1]).map((p) => p[0]);
+  const host = $("lines");
+  if (!sorted.length) host.replaceChildren(el("p", { class: "empty", text: "No lines in this script." }));
+  else host.replaceChildren(...sorted.map(renderCard));
+  const area = keep && document.getElementById(keep.id);
+  if (area) {
+    area.value = keep.value;
+    area.focus();
+    area.setSelectionRange(keep.start, keep.end);
+  }
+}
+
+function renderHeader() {
   const lines = state.manifest.lines;
   const n = (s) => lines.filter((l) => l.status === s).length;
   $("counts").replaceChildren(
@@ -226,62 +280,68 @@ function render() {
     el("span", { text: n("new") + " new" }),
     el("span", { text: n("flagged") + " flagged" }),
   );
-  const sorted = lines.map((l, i) => [l, i]).sort((a, b) => (ORDER[a[0].status] ?? 9) - (ORDER[b[0].status] ?? 9) || a[1] - b[1]).map((p) => p[0]);
-  const host = $("lines");
-  if (!sorted.length) host.replaceChildren(el("p", { class: "empty", text: "No lines in this script." }));
-  else host.replaceChildren(...sorted.map(renderCard));
-
-  const building = !!state.building;
   const rb = $("rebuild");
-  rb.textContent = building ? "building…" : "Rebuild";
-  rb.disabled = building || !lines.some(isRejected);
+  rb.textContent = frozen ? "building…" : "Rebuild";
+  rb.disabled = frozen || !lines.some(isRejected);
   const bulk = state.manifest.draft ? 0 : lines.filter(bulkApprovable).length;
   $("approve-all").textContent = "Approve all unflagged (" + bulk + ")";
-  $("approve-all").disabled = building || bulk === 0;
-  if (building) setStatus("Building…", false);
-  else if (message === "Building…") setStatus("", false);
+  $("approve-all").disabled = frozen || bulk === 0;
+  if (frozen) {
+    for (const b of $("lines").querySelectorAll(".actions button")) b.disabled = true;
+    setStatus(Object.keys(drafts).length ? "Building… notes are saved when it finishes." : "Building…", false);
+  } else if (message.startsWith("Building…")) {
+    setStatus("", false);
+  }
+}
+
+function render() {
+  renderCards();
+  renderHeader();
+}
+
+function stopPolling() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 }
 
 function poll() {
   if (pollTimer) return;
-  const tick = async () => {
+  pollTimer = setTimeout(async () => {
     pollTimer = null;
+    let next;
     try {
-      state = await request(API.state);
+      next = await request(API.state);
     } catch (e) {
       setStatus(e.message, true);
       return;
     }
-    render();
-    if (state.building) pollTimer = setTimeout(tick, 1000);
-  };
-  pollTimer = setTimeout(tick, 1000);
+    if (frozen) show(next);  // the rebuild's own reply may have ended the build already
+  }, POLL_MS);
 }
 
 $("approve-all").addEventListener("click", () => act(API.approveUnflagged, {}, "approve-all"));
 $("approve-all").setAttribute("data-focus", "approve-all");
 $("rebuild").addEventListener("click", async () => {
-  $("rebuild").disabled = true;
-  $("rebuild").textContent = "building…";
-  setStatus("Building…", false);
+  frozen = true;
+  state.building = true;  // until the server says otherwise
+  renderHeader();
   poll();
+  let next;
+  let error = null;
   try {
-    state = await request(API.rebuild, {});
-    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-    setStatus("Rebuilt.", false);
+    next = await request(API.rebuild, {});
   } catch (e) {
-    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-    setStatus(e.message, true);
-    try { state = await request(API.state); } catch (e2) { return; }
+    error = e.message;
+    try { next = await request(API.state); } catch (e2) { setStatus(e2.message, true); return; }
   }
-  render();
+  stopPolling();
+  if (frozen) show(next);  // else a poll already saw the build end and rendered
+  if (error) setStatus(error, true);
+  else setStatus("Rebuilt.", false);
 });
 
 (async () => {
   try {
-    state = await request(API.state);
-    render();
-    if (state.building) poll();
+    show(await request(API.state));
   } catch (e) {
     setStatus(e.message, true);
   }

@@ -130,8 +130,11 @@ def test_try_end_to_end_with_fakes(lab):
     raw = json.dumps(state)
     assert "neb-yoo-la" not in raw and "nebb-you-la" not in raw
     assert all("spelling" not in c for c in state["candidates"])
-    status, wav = http(server.url + "/clips/" + state["candidates"][0]["clips"][0]["id"] + ".wav")
+    clip_url = server.url + "/clips/" + state["candidates"][0]["clips"][0]["id"] + ".wav"
+    status, wav = http(clip_url)
     assert status == 200 and wav[:4] == b"RIFF"
+    with urllib.request.urlopen(urllib.request.Request(clip_url, headers={"Range": "bytes=-4"})) as r:
+        assert (r.status, r.read()) == (206, wav[-4:])
     status, page = http(server.url + "/")
     assert status == 200 and b"None of these" in page
 
