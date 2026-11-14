@@ -150,7 +150,9 @@ A Python 3.11 package at `tools/narrate/` (src layout, `pyproject.toml`, uv), wi
 4. **Takes:** make up to `takes.count` (default 3). Batch by reference, sorted by length, within a padded-size budget scaled to the reference length (§3: ~900 characters at 49 s, ~2400 at 10 s). Gaps across a whole build are filled in as few model loads as possible.
 5. **Check each take:**
    - **Transcribe:** Whisper, cached per take.
-   - **Word error:** compare the transcript with `text` (not the spoken form) after normalising both (§3). A take fails at or above `checks.max_cer` (default 0.04).
+   - **Word error:** normalise both sides (§3), then compare the transcript with both `text` and the spoken form, keeping the lower error.
+     - **Why both:** Whisper writes a respelling either way. It hears "Dahta" as "Data", which matches `text`, but writes "Zabara" for the respelled "Sbarra", which matches the spoken form.
+     - A take fails at or above `checks.max_cer` (default 0.04).
    - **Pace,** measured as in §5.4:
      - **Passages:** a take fails above `pace.max` (default 5.3).
      - **Lines:** never fail on pace. A take over `pace.max` is chosen only when no take at or under it passes the word check. Short lines measure noisily, and the user passed all 30 round-4 phrases, some of which run over 5.3.
@@ -189,7 +191,7 @@ Then write `narration.json` (§8.4). `build` exits non-zero when a line is flagg
 `pace.max` encodes the user's "not faster than it is". Defaults are 5.3 max and 4.8 target, from round 4: the takes the user rated 5 ran at 4.6–4.9.
 
 **Measure,** fixed so the numbers stay on the scale of the rounds:
-- **Syllables:** count matches of `[aeiouy]+` in each word of `[a-z]+` in the lowercased `text`, at least 1 per word, and sum.
+- **Syllables:** count matches of `[aeiouy]+` in each word of `[a-z]+` in the lowercased spoken form, at least 1 per word, and sum. Use the spoken form because it's what is said: "X I S F" counts 4, where "XISF" would count 1. Passages in the rounds had no respellings, so their figures carry over.
 - **Speech span:** from the start of the first non-silent interval to the end of the last, with non-silent meaning within 35 dB of the clip's peak (as `librosa.effects.split(top_db=35)` defines it; reimplement with numpy, since librosa is not a core dependency).
 - **Pace:** syllables divided by the speech span.
 
@@ -417,7 +419,7 @@ The format of `voice/pronunciations.json`: `{"about", "entries": [{"match", "say
 - **Licences:** Qwen3-TTS weights and code are Apache 2.0, and Whisper is MIT. No CC-BY-NC weights (F5-TTS is out).
 - **Hardware:** one 11 GB Turing GPU on Windows is the reference machine.
   - **Batching:** the batch budget must keep generation from oversubscribing VRAM (§3).
-  - **Model loads:** one per build.
+  - **Model loads:** one per generation round, so at most two per build. The backend is closed before takes are checked, so Qwen and Whisper are never in VRAM together.
   - **Pinning:** the CUDA build (cu126) is pinned through uv.
 - **Tests and CI:**
   - **Python job:** a new CI job runs `narrate`'s unit tests on ubuntu: uv, Python 3.11, core dependencies only, with the fake backend and checker. Clean is `ruff` plus `pytest`.
@@ -435,7 +437,8 @@ The format of `voice/pronunciations.json`: `{"about", "entries": [{"match", "say
    - batching, takes, checks, pace gate and pick; clips; cache and manifest;
    - `build` and `draft`; the CI job;
    - Dan's profile, assembled from `voice/`;
-   - the `/voice/` gitignore.
+   - the `/voice/` gitignore;
+   - the tour's narration script and terms list (§7). They are text only, and the smoke needs them.
    - **Manual smoke:** build the eight tour lines in Dan's voice.
 2. **Human loop and video:**
    - the lock file;
@@ -459,7 +462,9 @@ The format of `voice/pronunciations.json`: `{"about", "entries": [{"match", "say
 | Voice library outside the repo (`NARRATE_VOICES`); scripts name a voice, not a path | Privacy, and sharing across projects |
 | Two pronunciation layers (project and profile) | Brand words belong to a project; "Dahta" and "Paul" belong to the speaker and model |
 | Short or long reference chosen per line, inferred from length | The rounds showed opposite winners for lines and passages |
-| Take checks compare against `text`, not the spoken form | Whisper hears "Dahta" as "Data"; checking intent is what matters |
+| Take checks compare against both `text` and the spoken form, keeping the lower error | Whisper writes some respellings as the intended word ("Dahta" as "Data") and others as spoken ("Zabara" for "Sbarra") |
+| Pace counts syllables in the spoken form | It's what is actually said ("X I S F" is 4 syllables) |
+| The backend closes before checking (at most two model loads per build) | Keeps Qwen and Whisper out of VRAM together on an 11 GB card |
 | Review through a local stdlib HTTP server writing the lock directly | Faster than the export and import round-trip of the listening pages, with no new dependencies |
 | Lock pins by cache key; approved takes copied to a durable private store | Keeps approvals stable without committing audio. Takes can't be regenerated exactly, because qwen-tts samples once per batch with no per-take seed, so the store holds them instead of slowing generation to batches of one |
 | Pace is a hard gate for passages only; for lines it only decides the pick | The user's pace remark was about passages, and they passed all 30 phrases, some over the cap |
