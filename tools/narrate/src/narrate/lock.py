@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from narrate import NarrateError
+from narrate._fs import read_text_retry, replace_with_retry
 
 VERSION = 1
 _ID_RE = re.compile(r"[a-z0-9-]+")
@@ -58,7 +58,7 @@ class Lock:
         if not path.is_file():
             return lock
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(read_text_retry(path))
         except (OSError, ValueError) as e:
             raise NarrateError(f"{path}: cannot read lock file: {e}") from e
         if not isinstance(data, dict):
@@ -94,7 +94,7 @@ class Lock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, self.path)
+        replace_with_retry(tmp, self.path)
 
     def pin(
         self,

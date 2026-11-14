@@ -64,7 +64,10 @@ class ReviewApp:
         return r
 
     def _state(self) -> Response:
-        lock = Lock.load(self.lock_file)
+        with self._mutate:
+            return self._state_locked(Lock.load(self.lock_file))
+
+    def _state_locked(self, lock: Lock) -> Response:
         return json_response(
             {
                 "manifest": self.manifest.to_json(),
@@ -92,7 +95,7 @@ class ReviewApp:
             lock = Lock.load(self.lock_file)
             action(lock)
             lock.save()
-        return self._state()
+            return self._state_locked(lock)
 
     def _checked(self, line: ManifestLine) -> dict:
         if self.manifest.draft:
@@ -129,8 +132,10 @@ class ReviewApp:
 
     def _approve_unflagged(self, lock: Lock) -> None:
         for line in self.manifest.lines:
-            if line.status == "new" and line.check is not None:
-                self._approve(lock, line)
+            c = line.check
+            if line.status != "new" or c is None or c["take"] in lock.rejected.get(c["key"], set()):
+                continue
+            self._approve(lock, line)
 
     def _rebuild(self) -> Response:
         if not self._build.acquire(blocking=False):

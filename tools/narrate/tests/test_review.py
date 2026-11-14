@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import threading
@@ -28,7 +29,8 @@ def world(monkeypatch):
 
 def call(url, body=None, raw=None):
     data = raw if raw is not None else (None if body is None else json.dumps(body).encode())
-    req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET", headers=headers)
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, r.read()
@@ -196,7 +198,14 @@ def test_rebuild_conflict_409(make_app, world):
 def test_clip_paths_cannot_escape(make_app):
     _, _, server = make_app(("open", LINE))
     assert call(server.url + "/clips/open.wav")[0] == 200
-    for p in ["/clips/..%2Fnarration.json", "/clips/nope.wav", "/clips/open.wav/../x"]:
+    assert call(server.url + "/clips/open.wav?take=2")[0] == 200
+    for p in [
+        "/clips/..%2Fnarration.json",
+        "/clips/nope.wav",
+        "/clips/open.wav/../x",
+        "/clips/..%5Cnarration.json",
+        "/clips/%6Fpen.wav",
+    ]:
         assert call(server.url + p)[0] == 404
 
 
@@ -208,3 +217,69 @@ def test_oversized_body_413(make_app):
 def test_bad_json_400(make_app):
     _, _, server = make_app(("a", LINE))
     assert call(server.url + "/api/approve", raw=b"{nope")[0] == 400
+
+
+def test_approve_unflagged_keeps_rejections(make_app):
+    path, _, server = make_app(("a", LINE), ("b", OTHER))
+    jcall(server.url + "/api/reject", {"id": "b"})
+    _, state = jcall(server.url + "/api/approve-unflagged", {})
+    assert list(state["lock"]["pins"]) == ["a"]
+    assert len(state["lock"]["rejected"]) == 1
+    assert "b" not in Lock.load(lock_path(path)).pins
+
+
+def test_approve_hash_matches_store_and_rebuild_is_approved(make_app):
+    path, _, server = make_app(("a", LINE))
+    _, state = jcall(server.url + "/api/state")
+    check = state["manifest"]["lines"][0]["check"]
+    jcall(server.url + "/api/approve", {"id": "a"})
+    stored = ApprovedStore(approved_root(None)).path(check["key"], check["take"])
+    assert Lock.load(lock_path(path)).pins["a"].sha256 == hashlib.sha256(stored.read_bytes()).hexdigest()
+    status, state = jcall(server.url + "/api/rebuild", {})
+    line = state["manifest"]["lines"][0]
+    assert status == 200 and line["status"] == "approved" and "pinned-audio-missing" not in line["flags"]
+
+
+def test_approve_falls_back_to_the_approved_store(make_app):
+    path, _, server = make_app(("a", LINE))
+    jcall(server.url + "/api/approve", {"id": "a"})
+    shutil.rmtree(cache_root(None))
+    status, state = jcall(server.url + "/api/approve", {"id": "a"})
+    assert status == 200 and "a" in state["lock"]["pins"]
+    stored = ApprovedStore(approved_root(None)).path(*(lambda p: (p.key, p.take))(Lock.load(lock_path(path)).pins["a"]))
+    assert Lock.load(lock_path(path)).pins["a"].sha256 == hashlib.sha256(stored.read_bytes()).hexdigest()
+
+
+def test_draft_manifest_and_missing_check_are_400(make_app):
+    path, app, server = make_app(("a", LINE))
+    app.manifest.lines[0].check = None
+    status, body = jcall(server.url + "/api/approve", {"id": "a"})
+    assert status == 400 and "no checked take" in body["error"]
+    status, _ = jcall(server.url + "/api/reject", {"id": "a"})
+    assert status == 400
+    app.manifest.draft = True
+    status, body = jcall(server.url + "/api/approve", {"id": "a"})
+    assert status == 400 and "draft" in body["error"]
+
+
+def test_state_reads_do_not_break_concurrent_saves(make_app):
+    path, _, server = make_app(("a", LINE), ("b", OTHER))
+    stop = threading.Event()
+
+    def hammer():
+        while not stop.is_set():
+            call(server.url + "/api/state")
+
+    readers = [threading.Thread(target=hammer) for _ in range(4)]
+    for t in readers:
+        t.start()
+    try:
+        for i in range(10):
+            assert jcall(server.url + "/api/approve", {"id": "a" if i % 2 else "b"})[0] == 200
+            assert jcall(server.url + "/api/note", {"id": "a", "note": f"n{i}"})[0] == 200
+    finally:
+        stop.set()
+        for t in readers:
+            t.join(10)
+    lock = Lock.load(lock_path(path))
+    assert set(lock.pins) == {"a", "b"} and lock.notes == {"a": "n9"}

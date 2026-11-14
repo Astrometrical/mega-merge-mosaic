@@ -103,10 +103,19 @@ class _RequestHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode("utf-8")) if raw else {}
-        except ValueError:
+        except (ValueError, RecursionError):
             return json_response({"error": "invalid JSON"}, 400)
 
+    def _host_ok(self) -> bool:
+        """Only our own origin may talk to us (a DNS-rebinding guard)."""
+        port = self.server.server_address[1]
+        return self.headers.get("Host") in (f"127.0.0.1:{port}", f"localhost:{port}")
+
     def _dispatch(self, method: str) -> None:
+        if not self._host_ok():
+            self.close_connection = True
+            self._send(json_response({"error": "misdirected request"}, 421))
+            return
         path = self.path.split("?", 1)[0]
         handler = self.server.routes.find(method, path)
         if handler is None:
@@ -114,6 +123,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
             return
         body = None
         if method == "POST":
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                self.close_connection = True
+                self._send(json_response({"error": "Content-Type must be application/json"}, 415))
+                return
             body = self._read_body()
             if isinstance(body, tuple):
                 self._send(body)

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from narrate import NarrateError
+from narrate._fs import read_text_retry, replace_with_retry
 from narrate.captions import Caption
 
 VERSION = 1
@@ -85,7 +85,7 @@ class Manifest:
         text = json.dumps(self.to_json(), indent=1, ensure_ascii=False, allow_nan=False)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(text + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
 
     def flagged(self) -> list[str]:
         """Ids of the flagged lines."""
@@ -111,7 +111,7 @@ def read_manifest(path: Path) -> Manifest:
     """Read a manifest; every defect raises a `NarrateError` naming the file."""
     path = Path(path)
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_text_retry(path)
     except (OSError, UnicodeDecodeError) as e:
         raise NarrateError(f"{path}: cannot read ({e})") from e
     try:

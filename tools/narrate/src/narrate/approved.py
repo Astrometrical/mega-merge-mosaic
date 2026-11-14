@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from narrate._fs import replace_with_retry
 from narrate.audio import read_wav
 
 
@@ -41,7 +42,7 @@ class ApprovedStore:
         tmp = final.with_name(final.name + ".tmp")
         final.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, tmp)
-        os.replace(tmp, final)
+        replace_with_retry(tmp, final)
         return final
 
     def load(self, key: str, take: int) -> tuple[np.ndarray, int]:

@@ -1,3 +1,4 @@
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -10,7 +11,8 @@ from narrate.server import LocalServer, Routes, json_response, serve_clip, start
 
 def call(url, body=None, raw=None):
     data = raw if raw is not None else (None if body is None else json.dumps(body).encode())
-    req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET", headers=headers)
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, r.read()
@@ -71,5 +73,46 @@ def test_serve_clip_only_known_ids(root):
     (root / "clips" / "open.wav").write_bytes(b"RIFF")
     (root / "narration.json").write_text("{}")
     assert serve_clip(root, ["open"], "/clips/open.wav") == (200, "audio/wav", b"RIFF")
-    for p in ["/clips/..%2Fnarration.json", "/clips/nope.wav", "/clips/open.wav/../x", "/clips/open.wav.bak"]:
+    for p in [
+        "/clips/..%2Fnarration.json",
+        "/clips/nope.wav",
+        "/clips/open.wav/../x",
+        "/clips/open.wav.bak",
+        "/clips/..\narration.json",
+        "/clips/%6Fpen.wav",
+    ]:
         assert serve_clip(root, ["open"], p)[0] == 404
+
+
+def raw_request(server, method, path, headers, body=None):
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+    conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+    for k, v in headers.items():
+        conn.putheader(k, v)
+    if body is not None:
+        conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders(body)
+    r = conn.getresponse()
+    status = r.status
+    conn.close()
+    return status
+
+
+def test_foreign_host_is_421(server):
+    port = server.server_address[1]
+    assert raw_request(server, "GET", "/ok", {"Host": f"evil.example:{port}"}) == 421
+    assert raw_request(server, "GET", "/ok", {"Host": "127.0.0.1"}) == 421
+    assert raw_request(server, "GET", "/ok", {"Host": f"localhost:{port}"}) == 200
+    assert raw_request(server, "GET", "/ok", {"Host": f"127.0.0.1:{port}"}) == 200
+
+
+def test_post_needs_json_content_type_415(server):
+    host = {"Host": f"127.0.0.1:{server.server_address[1]}"}
+    assert raw_request(server, "POST", "/echo", host | {"Content-Type": "text/plain"}, b"{}") == 415
+    assert raw_request(server, "POST", "/echo", host, b"{}") == 415
+    ok = host | {"Content-Type": "application/json; charset=utf-8"}
+    assert raw_request(server, "POST", "/echo", ok, b"{}") == 200
+
+
+def test_deeply_nested_json_is_400(server):
+    assert call(server.url + "/echo", raw=b"[" * 30000 + b"]" * 30000)[0] == 400

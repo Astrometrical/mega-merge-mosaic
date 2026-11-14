@@ -73,6 +73,15 @@ def test_registry(monkeypatch, voice_library):
 
 
 def test_core_import_does_not_import_torch():
-    mods = ["narrate.backends", "narrate.checkers", "narrate.cli", "narrate.draft", "narrate.fakes", "narrate.build"]
+    mods = [
+        "narrate.backends",
+        "narrate.checkers",
+        "narrate.cli",
+        "narrate.draft",
+        "narrate.fakes",
+        "narrate.build",
+        "narrate.review",
+        "narrate.server",
+    ]
     code = f"import {', '.join(mods)}, sys; assert 'torch' not in sys.modules"
     subprocess.run([sys.executable, "-c", code], check=True)
