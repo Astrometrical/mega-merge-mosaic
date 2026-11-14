@@ -73,3 +73,14 @@ pub const LINE_DASH: (f32, f32) = (8.0, 5.0);
 
 /// Width of a hairline outline (a hovered row's border), in points.
 pub const HAIRLINE_WIDTH: f32 = 1.0;
+
+/// Narration caption card (recorded tours): seconds it takes to fade and
+/// rise in.
+pub const CAPTION_FADE_S: f32 = 0.3;
+/// Narration caption card: the widest it wraps to, as a fraction of the
+/// screen width.
+pub const CAPTION_WRAP_FRACTION: f32 = 0.7;
+/// Narration caption card: opacity of its surface fill once faded in.
+pub const CAPTION_CARD_ALPHA: f32 = 0.94;
+/// Click ripple (recorded tours): seconds it takes to spread and fade out.
+pub const RIPPLE_S: f64 = 0.45;
