@@ -281,7 +281,10 @@ def test_syllables():
   - `Entry(match: re.Pattern[str], say: str, why: str)`, frozen.
   - `Lexicon(entries: tuple[Entry, ...])`, with:
     - `Lexicon.load(paths: Sequence[Path]) -> Lexicon`, which concatenates the lists in the given order;
-    - `apply(text: str) -> str`, which applies `re.sub` once per entry, in order.
+    - `apply(text: str) -> str`, which applies `re.sub` once per entry, in order;
+    - `variants(text: str, limit: int = 64) -> list[str]`, the answer key for the word check. Take the entries that change `text`, apply every subset of them in list order, and return the distinct results. `text` comes first and `apply(text)` is included.
+      - **Why:** Whisper writes some respellings as the intended word and others as spoken, so one line can mix both ("Data … Zabara").
+      - **Over `limit`:** when 2^k exceeds it, return just `[text, apply(text)]`.
   - `LexiconError(NarrateError)`.
 - File format (spec §8.3): `{"about": str, "entries": [{"match", "say", "why"}], "fine_as_written": [str]}`. `about` and `fine_as_written` are optional.
 
@@ -306,6 +309,17 @@ def test_lists_chain_in_given_order(root):
     b = write_list(root / "b.json", [{"match": "Bar", "say": "Baz", "why": ""}])
     assert Lexicon.load([a, b]).apply("Foo") == "Baz"
     assert Lexicon.load([b, a]).apply("Foo") == "Bar"
+
+def test_variants_mix_written_and_respelled(root):
+    lx = Lexicon.load([write_list(root / "a.json", [
+        {"match": r"\bData\b", "say": "Dahta", "why": ""},
+        {"match": r"\bSbarra\b", "say": "Zabara", "why": ""},
+        {"match": r"\bXISF\b", "say": "X I S F", "why": ""}])])
+    v = lx.variants("Data courtesy of Adam Sbarra.")
+    assert v[0] == "Data courtesy of Adam Sbarra."
+    assert sorted(v) == sorted(["Data courtesy of Adam Sbarra.", "Dahta courtesy of Adam Sbarra.",
+                                "Data courtesy of Adam Zabara.", "Dahta courtesy of Adam Zabara."])
+    assert lx.variants("Nothing to change.") == ["Nothing to change."]
 ```
 
 Also these error cases, each raising `LexiconError` whose message names the file:
@@ -421,7 +435,7 @@ Also these error cases, each raising `LexiconError` whose message names the file
   - **Fallback:** with fewer than `n−1` pauses, return `share_captions(text, duration)`.
 
 - [ ] **Step 1: Write the failing tests**
-  - **`test_share_captions`:** `"One two three. Four five six seven eight nine."` over 9.0 s puts the boundary at 9 × 3/9 = 3.0. The captions are contiguous and cover `[0, 9]`.
+  - **`test_share_captions`:** `"One two three. Four five six seven eight nine."` over 9.0 s puts the boundary at `9.0 * syllables("One two three.") / syllables(text)`, which is 9 × 4/13 ≈ 2.769 (`one` counts 2 vowel groups). The captions are contiguous and cover `[0, 9]`.
   - **`test_pause_matching`:** three sentences of 8 syllables each. The audio is tone 0.3–3.0, silence 3.0–3.6, tone 3.6–6.0, silence 6.0–6.5, tone 6.5–9.0, with a decoy 0.3 s silence at 1.5–1.8. The boundaries come out at 3.3 and 6.25 (± 0.08), and the decoy isn't chosen.
   - **`test_too_few_pauses_falls_back`:** the same text over a continuous tone equals `share_captions(text, duration)`.
   - **`test_single_sentence`:** one caption, covering `[0, duration]`.
@@ -538,9 +552,9 @@ Also these error cases, each raising `LexiconError` whose message names the file
 - Produces:
   - `MAX_CER = 0.04`.
   - `TakeResult(n: int, heard: str, cer: float, punct: int, pace: float, duration: float)`, frozen.
-  - `evaluate(n: int, text: str, spoken: str, heard: str, audio: np.ndarray, sr: int) -> TakeResult`:
-    - `cer = min(cer(text, heard), cer(spoken, heard))`;
-    - `punct = min(punct_distance(text, heard), punct_distance(spoken, heard))`;
+  - `evaluate(n: int, keys: Sequence[str], spoken: str, heard: str, audio: np.ndarray, sr: int) -> TakeResult`. `keys` is the answer key: `Lexicon.variants(text)`, plus the line's `say` when it has one.
+    - `cer = min(cer(k, heard) for k in keys)`;
+    - `punct = min(punct_distance(k, heard) for k in keys)`;
     - `pace = measure.pace(audio, sr, spoken)`;
     - `duration = len(audio) / sr`.
   - `Choice(take: TakeResult, status: str, flags: tuple[str, ...])`, frozen, with `status` either `"new"` or `"flagged"`.
@@ -578,7 +592,7 @@ def test_garbled_everywhere_flags_words():
     assert (c.status, c.flags, c.take.n) == ("flagged", ("words",), 1)
 ```
 
-Also: `test_evaluate_uses_spoken_or_text`. With text `"Data courtesy of Adam Sbarra."`, spoken `"Dahta courtesy of Adam Zabara."` and heard `"Data courtesy of Adam Zabara."`, `cer < 0.04` (so `cer(text)` alone would fail). The audio is a synthetic tone.
+Also: `test_evaluate_uses_the_best_key`. The keys are the four variants of `"Data courtesy of Adam Sbarra."` (see Task 4's test), the spoken form is `"Dahta courtesy of Adam Zabara."` and heard is `"Data courtesy of Adam Zabara."`. Then `cer == 0.0`. With only `[text, spoken]` as keys it would come out at exactly 0.04 and fail. The audio is a synthetic tone.
 
 - [ ] **Step 2: Run them to make sure they fail.**
 - [ ] **Step 3: Implement `select.py`.**
@@ -609,7 +623,7 @@ Also: `test_evaluate_uses_spoken_or_text`. With text `"Data courtesy of Adam Sba
   1. Load the script; a missing `voice` is a `ScriptError`. Load the profile, and `Lexicon.load(script.pronunciations + profile.pronunciations)`, in that order.
   2. Resolve every line's spoken form, kind, reference and key **before any generation**, so a missing style or length fails first.
   3. **Round 1:** jobs for takes `1..takes.count` that the cache lacks go through `plan_batches`. Run `backend.synthesize(texts, ref, batch_seed(batch[0]))` per batch and `store.save` each take. Then `backend.close()`.
-  4. **Check** every take: cached `heard` for `checker.name`, else `checker.transcribe` and `set_heard`. Then `evaluate` and `choose`.
+  4. **Check** every take: cached `heard` for `checker.name`, else `checker.transcribe` and `set_heard`. Then `evaluate` with keys `lexicon.variants(line.text)` (plus `line.say` when set), and `choose`.
   5. **Round 2,** only if some line is flagged: jobs for takes `count+1..takes.max` of the flagged lines. Generate, close the backend, check, then choose again over all of that line's takes.
   6. Then `checker.close()`.
   7. **Write each clip:** `normalise_loudness(trim(audio))`, as `PCM_16`. Captions are one caption over `[0, duration]` for a `line`, or `sentence_captions(text, clip, sr)` for a `passage`.

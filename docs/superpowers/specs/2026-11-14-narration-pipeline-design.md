@@ -150,8 +150,8 @@ A Python 3.11 package at `tools/narrate/` (src layout, `pyproject.toml`, uv), wi
 4. **Takes:** make up to `takes.count` (default 3). Batch by reference, sorted by length, within a padded-size budget scaled to the reference length (§3: ~900 characters at 49 s, ~2400 at 10 s). Gaps across a whole build are filled in as few model loads as possible.
 5. **Check each take:**
    - **Transcribe:** Whisper, cached per take.
-   - **Word error:** normalise both sides (§3), then compare the transcript with both `text` and the spoken form, keeping the lower error.
-     - **Why both:** Whisper writes a respelling either way. It hears "Dahta" as "Data", which matches `text`, but writes "Zabara" for the respelled "Sbarra", which matches the spoken form.
+   - **Word error:** normalise both sides (§3), then compare the transcript with every mix of as-written and respelled terms, keeping the lowest error. The mixes run from `text` itself to the full spoken form.
+     - **Why mixes:** Whisper writes a respelling either way. It hears "Dahta" as "Data", as written, but writes "Zabara" for the respelled "Sbarra", as spoken. One line can hold both: "Data courtesy of Adam Zabara."
      - A take fails at or above `checks.max_cer` (default 0.04).
    - **Pace,** measured as in §5.4:
      - **Passages:** a take fails above `pace.max` (default 5.3).
