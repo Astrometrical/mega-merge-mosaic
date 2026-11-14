@@ -27,7 +27,7 @@ class ManifestLine:
     clip: str | None
     duration: float
     at: float | None
-    status: str
+    status: str  # approved, new, flagged or draft
     flags: list[str] = field(default_factory=list)
     captions: list[Caption] = field(default_factory=list)
     check: dict | None = None

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from narrate.approved import ApprovedStore, approved_root
 from narrate.audio import normalise_loudness, trim, write_wav
 from narrate.backends import Backend, get_backend
 from narrate.batching import Job, batch_seed, plan_batches
@@ -14,6 +15,7 @@ from narrate.cache import TakeStore, cache_root, take_key
 from narrate.captions import Caption, sentence_captions
 from narrate.checkers import Checker, get_checker
 from narrate.lexicon import Lexicon
+from narrate.lock import Lock, Pin, lock_path
 from narrate.manifest import Manifest, ManifestLine
 from narrate.profile import ProfileError, Reference, VoiceProfile, load_profile
 from narrate.script import Line, Script, ScriptError, load_script
@@ -28,6 +30,7 @@ class BuildOptions:
     out: Path | None = None
     voices: Path | None = None
     cache: Path | None = None
+    approved: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -85,17 +88,25 @@ def _generate(backend: Backend, store: TakeStore, jobs: list[Job]) -> None:
         backend.close()
 
 
-def _missing_jobs(plans: list[_Plan], store: TakeStore, takes: range) -> list[Job]:
+def _wanted(have: list[int], rejected: set[int], target: int) -> list[int]:
+    """Take numbers to consider: live existing takes first, then fresh numbers above every used one."""
+    live = [n for n in have if n not in rejected]
+    base = max([*have, *rejected], default=0)
+    fresh = range(base + 1, base + 1 + max(0, target - len(live)))
+    return [*live, *fresh][:target]
+
+
+def _missing_jobs(plans: list[_Plan], store: TakeStore, wanted: dict[str, list[int]]) -> list[Job]:
     jobs: dict[tuple[str, int], Job] = {}
     for p in plans:
         have = set(store.takes(p.key))
-        for n in takes:
+        for n in wanted[p.line.id]:
             if n not in have and (p.key, n) not in jobs:
                 jobs[(p.key, n)] = Job(p.key, n, p.spoken, p.reference)
     return list(jobs.values())
 
 
-def _check(plan: _Plan, store: TakeStore, checker: Checker, takes: range, results: dict[int, TakeResult]) -> None:
+def _check(plan: _Plan, store: TakeStore, checker: Checker, takes: list[int], results: dict[int, TakeResult]) -> None:
     """Score takes not yet in `results`, transcribing only those never heard."""
     for n in takes:
         if n in results:
@@ -114,27 +125,48 @@ def _captions(plan: _Plan, clip: np.ndarray, sr: int, duration: float) -> list[C
     return sentence_captions(plan.line.text, clip, sr)
 
 
-def _select(plans: list[_Plan], profile: VoiceProfile, store, backend: Backend, checker: Checker) -> dict[str, Choice]:
-    """Rounds 1 and 2: generate, check and choose a take per line key."""
+def _select(
+    plans: list[_Plan], profile: VoiceProfile, store, backend: Backend, checker: Checker, rejected: dict[str, set[int]]
+) -> dict[str, Choice]:
+    """Rounds 1 and 2: generate, check and choose a take per line id."""
+
+    def wanted(ps: list[_Plan], target: int) -> dict[str, list[int]]:
+        return {p.line.id: _wanted(store.takes(p.key), rejected.get(p.key, set()), target) for p in ps}
+
     results: dict[str, dict[int, TakeResult]] = {p.line.id: {} for p in plans}
-    choices: dict[str, Choice] = {}  # by line id
-    first = range(1, profile.takes.count + 1)
+    choices: dict[str, Choice] = {}
+    first = wanted(plans, profile.takes.count)
     _generate(backend, store, _missing_jobs(plans, store, first))
     for p in plans:
-        _check(p, store, checker, first, results[p.line.id])
+        _check(p, store, checker, first[p.line.id], results[p.line.id])
         choices[p.line.id] = choose(p.kind, list(results[p.line.id].values()), profile.pace)
     flagged = [p for p in plans if choices[p.line.id].status == "flagged"]
     if flagged and profile.takes.max > profile.takes.count:
-        more = range(profile.takes.count + 1, profile.takes.max + 1)
+        more = wanted(flagged, profile.takes.max)
         jobs = _missing_jobs(flagged, store, more)
         if jobs:
             checker.close()  # Whisper and Qwen are never in VRAM together; Whisper reloads lazily
         _generate(backend, store, jobs)
-        everything = range(1, profile.takes.max + 1)
+        everything = wanted(flagged, profile.takes.max)
         for p in flagged:
-            _check(p, store, checker, everything, results[p.line.id])
+            _check(p, store, checker, everything[p.line.id], results[p.line.id])
             choices[p.line.id] = choose(p.kind, list(results[p.line.id].values()), profile.pace)
     return choices
+
+
+def _usable_pins(plans: list[_Plan], lock: Lock, store: TakeStore, approved: ApprovedStore) -> dict[str, Pin]:
+    """Pins whose key still matches and whose audio is in the approved store (repaired from the cache)."""
+    usable: dict[str, Pin] = {}
+    for p in plans:
+        pin = lock.pins.get(p.line.id)
+        if pin is None or pin.key != p.key:
+            continue
+        if not approved.has(pin.key, pin.take):
+            if pin.take not in store.takes(pin.key):
+                continue
+            approved.put(pin.key, pin.take, store.path(pin.key, pin.take))
+        usable[p.line.id] = pin
+    return usable
 
 
 def build(
@@ -152,12 +184,20 @@ def build(
     lexicon = Lexicon.load([*script.pronunciations, *profile.pronunciations])
     plans = _plan_lines(script, profile, lexicon)
     store = TakeStore(cache_root(options.cache))
+    approved = ApprovedStore(approved_root(options.approved))
+    lock = Lock.load(lock_path(script.path))
+    pins = _usable_pins(plans, lock, store, approved)
+    pinned_missing = {
+        p.line.id
+        for p in plans
+        if p.line.id in lock.pins and lock.pins[p.line.id].key == p.key and p.line.id not in pins
+    }
     out = options.out if options.out is not None else default_out(script)
     backend = backend if backend is not None else get_backend(profile.backend, profile)
     checker = checker if checker is not None else get_checker(profile.checker)
 
     try:
-        choices = _select(plans, profile, store, backend, checker)
+        choices = _select([p for p in plans if p.line.id not in pins], profile, store, backend, checker, lock.rejected)
     finally:
         checker.close()
 
@@ -165,8 +205,23 @@ def build(
     lines: list[ManifestLine] = []
     sample_rate: int | None = None
     for p in plans:
-        choice = choices[p.line.id]
-        audio, sr = store.load(p.key, choice.take.n)
+        pin = pins.get(p.line.id)
+        if pin is not None:
+            audio, sr = approved.load(p.key, pin.take)
+            status, flags = "approved", []
+            check = {"heard": pin.heard, "cer": pin.cer, "pace": pin.pace, "take": pin.take, "key": p.key}
+        else:
+            choice = choices[p.line.id]
+            audio, sr = store.load(p.key, choice.take.n)
+            status = choice.status
+            flags = [*choice.flags, *(["pinned-audio-missing"] if p.line.id in pinned_missing else [])]
+            check = {
+                "heard": choice.take.heard,
+                "cer": choice.take.cer,
+                "pace": choice.take.pace,
+                "take": choice.take.n,
+                "key": p.key,
+            }
         clip = normalise_loudness(trim(audio, sr), sr)
         rel = f"clips/{p.line.id}.wav"
         write_wav(out / rel, clip, sr)
@@ -181,16 +236,10 @@ def build(
                 clip=rel,
                 duration=duration,
                 at=p.line.at,
-                status=choice.status,
-                flags=list(choice.flags),
+                status=status,
+                flags=flags,
                 captions=_captions(p, clip, sr, duration),
-                check={
-                    "heard": choice.take.heard,
-                    "cer": choice.take.cer,
-                    "pace": choice.take.pace,
-                    "take": choice.take.n,
-                    "key": p.key,
-                },
+                check=check,
             )
         )
     manifest = Manifest(script.path.name, script.voice, False, sample_rate, lines=lines)
