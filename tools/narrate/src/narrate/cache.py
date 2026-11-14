@@ -31,6 +31,7 @@ def take_key(profile: VoiceProfile, reference: Reference, spoken: str) -> str:
     payload = json.dumps(
         {
             "backend": profile.backend,
+            "language": profile.language,
             "model": profile.model,
             "precision": profile.precision,
             "ref_sha256": reference.sha256,

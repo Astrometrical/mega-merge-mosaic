@@ -26,8 +26,9 @@ def test_key_is_stable_and_sensitive(voice_library):
         take_key(profile, dataclasses.replace(ref, sha256="f" * 64), "hello"),
         take_key(dataclasses.replace(profile, precision="fp32"), ref, "hello"),
         take_key(dataclasses.replace(profile, model="other/model"), ref, "hello"),
+        take_key(dataclasses.replace(profile, language="French"), ref, "hello"),
     ]
-    assert len({key, *others}) == 6
+    assert len({key, *others}) == 7
 
 
 def test_store_round_trip(root):
