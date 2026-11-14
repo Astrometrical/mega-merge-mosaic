@@ -13,6 +13,7 @@ from narrate.build import BuildOptions, build, default_out, ensure_ignored
 from narrate.cache import cache_root
 from narrate.draft import PACE_TARGET, draft
 from narrate.manifest import Manifest
+from narrate.mux import load_timeline, mux, script_cues
 from narrate.profile import load_profile
 from narrate.review import ReviewApp, serve
 from narrate.script import load_script
@@ -65,7 +66,38 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--to", type=Path, help="pronunciation list to write (default: the voice's first list)")
     t.add_argument("--port", type=int, default=0, help="port to listen on (default: any free port)")
     t.add_argument("--no-browser", action="store_true", help="do not open the page in a browser")
+    m = sub.add_parser("mux", help="mix approved narration clips onto a silent video")
+    m.add_argument("--timeline", type=Path, help="timeline file (video, manifest and cues)")
+    m.add_argument("--video", type=Path, help="silent video (with --script)")
+    m.add_argument("--script", type=Path, help="script whose lines carry `at` times (with --video)")
+    m.add_argument("--manifest", type=Path, help="manifest (default: the script's out directory)")
+    m.add_argument("-o", "--output", type=Path, required=True, help="output video")
+    m.add_argument("--allow-overlap", action="store_true", help="mux even if clips overlap the next cue")
+    m.add_argument("--allow-unapproved", action="store_true", help="mux lines that are not approved")
     return parser
+
+
+def _run_mux(args: argparse.Namespace) -> int:
+    if args.timeline is not None:
+        if args.video or args.script or args.manifest:
+            raise NarrateError("mux: --timeline cannot be combined with --video/--script/--manifest")
+        video, manifest, cues = load_timeline(args.timeline)
+    else:
+        if args.video is None or args.script is None:
+            raise NarrateError("mux: give --timeline, or both --video and --script")
+        script = load_script(args.script)
+        video, cues = args.video, script_cues(script)
+        manifest = args.manifest or default_out(script) / "narration.json"
+    mux(
+        video,
+        manifest,
+        cues,
+        args.output,
+        allow_overlap=args.allow_overlap,
+        allow_unapproved=args.allow_unapproved,
+    )
+    print(args.output)
+    return 0
 
 
 def _num(value, fmt: str) -> str:
@@ -111,6 +143,8 @@ def _run_try(args: argparse.Namespace) -> int:
 def _run(args: argparse.Namespace) -> int:
     if args.command == "try":
         return _run_try(args)
+    if args.command == "mux":
+        return _run_mux(args)
     script = load_script(args.script)
     out = args.out if args.out is not None else default_out(script)
     if args.command == "review":
