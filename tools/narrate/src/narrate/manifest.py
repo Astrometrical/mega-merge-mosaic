@@ -103,58 +103,122 @@ def _finite(value):
     return value
 
 
+def _refuse_constant(name: str):
+    raise ValueError(f"non-finite constant {name}")
+
+
 def read_manifest(path: Path) -> Manifest:
     """Read a manifest; every defect raises a `NarrateError` naming the file."""
     path = Path(path)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError) as e:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise NarrateError(f"{path}: cannot read ({e})") from e
+    try:
+        data = json.loads(text, parse_constant=_refuse_constant)
+    except ValueError as e:
         raise NarrateError(f"{path}: invalid JSON ({e})") from e
     if not isinstance(data, dict):
         raise NarrateError(f"{path}: invalid JSON (top level must be an object)")
     version = data.get("version")
-    if not isinstance(version, int) or isinstance(version, bool):
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
         raise NarrateError(f"{path}: unsupported manifest version {version!r}")
     if version > VERSION:
         raise NarrateError(f"{path}: manifest version {version!r} is newer than supported ({VERSION})")
     raw_lines = data.get("lines", [])
     if not isinstance(raw_lines, list):
         raise NarrateError(f"{path}: 'lines' must be a list")
-    lines = [_read_line(path, d) for d in raw_lines]
     if "script" not in data:
         raise NarrateError(f"{path}: missing required field 'script'")
     return Manifest(
-        script=data["script"],
-        voice=data.get("voice"),
+        script=_str(path, "", data, "script"),
+        voice=_opt(_str, path, "", data, "voice"),
         draft=bool(data.get("draft", False)),
-        sample_rate=data.get("sample_rate"),
-        lead=data.get("lead", LEAD),
-        breath=data.get("breath", BREATH),
-        lines=lines,
+        sample_rate=_opt(_int, path, "", data, "sample_rate"),
+        lead=_num(path, "", data, "lead", LEAD),
+        breath=_num(path, "", data, "breath", BREATH),
+        lines=[_read_line(path, d) for d in raw_lines],
     )
+
+
+def _bad(path: Path, where: str, key: str, what: str, value) -> NarrateError:
+    return NarrateError(f"{path}: {where}field {key!r} must be {what}, got {value!r}")
+
+
+def _str(path, where, d, key):
+    if key not in d:
+        raise NarrateError(f"{path}: {where}missing required field {key!r}")
+    if not isinstance(d[key], str):
+        raise _bad(path, where, key, "a string", d[key])
+    return d[key]
+
+
+def _int(path, where, d, key):
+    v = d[key]
+    if not isinstance(v, int) or isinstance(v, bool):
+        raise _bad(path, where, key, "an integer", v)
+    return v
+
+
+def _opt(fn, path, where, d, key):
+    return None if d.get(key) is None else fn(path, where, d, key)
+
+
+def _num(path, where, d, key, default=None):
+    if key not in d:
+        if default is None:
+            raise NarrateError(f"{path}: {where}missing required field {key!r}")
+        return default
+    v = d[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+        raise _bad(path, where, key, "a finite number >= 0", v)
+    return v
+
+
+def _finite_num(path, where, d, key):
+    v = d.get(key)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise _bad(path, where, key, "a finite number", v)
+    return v
 
 
 def _read_line(path: Path, d) -> ManifestLine:
     if not isinstance(d, dict):
         raise NarrateError(f"{path}: each line must be an object")
-    where = f"line {d['id']!r}" if isinstance(d.get("id"), str) else "a line"
-    for key in ("id", "text", "spoken", "kind", "duration", "status"):
-        if key not in d:
-            raise NarrateError(f"{path}: {where} is missing required field {key!r}")
-    try:
-        captions = [Caption(c["text"], c["start"], c["end"]) for c in d.get("captions", [])]
-    except (KeyError, TypeError) as e:
-        raise NarrateError(f"{path}: {where} has a malformed caption ({e!r})") from e
+    ident = _str(path, "a line: ", d, "id")
+    where = f"line {ident!r}: "
+    for key in ("text", "spoken", "kind", "status"):
+        _str(path, where, d, key)
+    flags = d.get("flags", [])
+    if not isinstance(flags, list) or not all(isinstance(f, str) for f in flags):
+        raise _bad(path, where, "flags", "a list of strings", flags)
+    raw_caps = d.get("captions", [])
+    if not isinstance(raw_caps, list) or not all(isinstance(c, dict) for c in raw_caps):
+        raise _bad(path, where, "captions", "a list of objects", raw_caps)
+    captions = [
+        Caption(
+            _str(path, where + "caption ", c, "text"),
+            _finite_num(path, where + "caption ", c, "start"),
+            _finite_num(path, where + "caption ", c, "end"),
+        )
+        for c in raw_caps
+    ]
+    check = d.get("check")
+    if check is not None and not isinstance(check, dict):
+        raise _bad(path, where, "check", "an object or null", check)
+    at = d.get("at")
+    if at is not None:
+        at = _finite_num(path, where, d, "at")
     return ManifestLine(
-        id=d["id"],
+        id=ident,
         text=d["text"],
         spoken=d["spoken"],
         kind=d["kind"],
-        clip=d.get("clip"),
-        duration=d["duration"],
-        at=d.get("at"),
+        clip=_opt(_str, path, where, d, "clip"),
+        duration=_num(path, where, d, "duration"),
+        at=at,
         status=d["status"],
-        flags=list(d.get("flags", [])),
+        flags=list(flags),
         captions=captions,
-        check=d.get("check"),
+        check=check,
     )
