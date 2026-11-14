@@ -9,11 +9,15 @@ import webbrowser
 from pathlib import Path
 
 from narrate import NarrateError, __version__
-from narrate.build import BuildOptions, build, default_out
+from narrate.build import BuildOptions, build, default_out, ensure_ignored
+from narrate.cache import cache_root
 from narrate.draft import PACE_TARGET, draft
 from narrate.manifest import Manifest
+from narrate.profile import load_profile
 from narrate.review import ReviewApp, serve
 from narrate.script import load_script
+from narrate.trylab import TryApp, candidates_for, check_carriers, prepare, workdir_for
+from narrate.trylab import serve as try_serve
 
 
 def _positive_float(text: str) -> float:
@@ -52,6 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--port", type=int, default=0, help="port to listen on (default: any free port)")
     r.add_argument("--no-browser", action="store_true", help="do not open the page in a browser")
     r.add_argument("--no-build", action="store_true", help="review the existing build without building first")
+    t = sub.add_parser("try", help="hear a word in several spellings and write the closest to a pronunciation list")
+    t.add_argument("word")
+    t.add_argument("--voice", required=True, help="voice profile name")
+    t.add_argument("--spell", action="append", default=[], help="a respelling to try (repeatable)")
+    t.add_argument("--in", dest="carriers", action="append", default=[], help="carrier sentence with {} (repeatable)")
+    t.add_argument("--style", help="reference style (default: the voice's default)")
+    t.add_argument("--to", type=Path, help="pronunciation list to write (default: the voice's first list)")
+    t.add_argument("--port", type=int, default=0, help="port to listen on (default: any free port)")
+    t.add_argument("--no-browser", action="store_true", help="do not open the page in a browser")
     return parser
 
 
@@ -77,7 +90,27 @@ def _print_summary(manifest: Manifest, path: Path) -> None:
     print(path)
 
 
+def _run_try(args: argparse.Namespace) -> int:
+    candidates = candidates_for(args.word, args.spell)
+    carriers = check_carriers(args.carriers)
+    profile = load_profile(args.voice)
+    to = args.to
+    if to is None:
+        if not profile.pronunciations:
+            raise NarrateError(f"voice {args.voice!r} has no pronunciation list; pass --to LIST")
+        to = profile.pronunciations[0]
+    workdir = workdir_for(cache_root(None), args.word, candidates, carriers, args.voice, args.style)
+    script = prepare(args.word, candidates, carriers, args.voice, args.style, workdir)
+    out = workdir / "out"
+    ensure_ignored(out)
+    build(script, options=BuildOptions(out))
+    try_serve(TryApp(script, args.word, candidates, to, out), args.port, None if args.no_browser else webbrowser.open)
+    return 0
+
+
 def _run(args: argparse.Namespace) -> int:
+    if args.command == "try":
+        return _run_try(args)
     script = load_script(args.script)
     out = args.out if args.out is not None else default_out(script)
     if args.command == "review":
