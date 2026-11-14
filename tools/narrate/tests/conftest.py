@@ -8,6 +8,7 @@ def _isolate(monkeypatch, tmp_path):
     """No test may touch the real ~/.narrate."""
     monkeypatch.setenv("NARRATE_CACHE", str(tmp_path / "cache dir"))
     monkeypatch.setenv("NARRATE_VOICES", str(tmp_path / "voices dir"))
+    monkeypatch.setenv("NARRATE_APPROVED", str(tmp_path / "approved dir"))
 
 
 @pytest.fixture

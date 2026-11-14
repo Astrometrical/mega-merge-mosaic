@@ -118,3 +118,9 @@ def test_default_style_must_exist(voice_library):
     _edit(voice_library, 'default_style = "explainer"', 'default_style = "story"')
     with pytest.raises(ProfileError, match="story"):
         load_profile("test")
+
+
+@pytest.mark.parametrize("name", ["../x", "a/b", "", "a\\b", "..", "x\n"])
+def test_profile_name_must_be_simple(voice_library, name):
+    with pytest.raises(ProfileError, match="profile name"):
+        load_profile(name)

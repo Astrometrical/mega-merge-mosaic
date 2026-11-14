@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from narrate._fs import read_text_retry, replace_with_retry
 from narrate.audio import read_wav
 from narrate.profile import Reference, VoiceProfile
 
@@ -72,7 +73,7 @@ class TakeStore:
         tmp.parent.mkdir(parents=True, exist_ok=True)
         self._sidecar(key, n).unlink(missing_ok=True)  # a transcript belongs to its audio
         sf.write(tmp, audio, sr, subtype="FLOAT", format="WAV")
-        os.replace(tmp, final)
+        replace_with_retry(tmp, final)
         return final
 
     def load(self, key: str, n: int) -> tuple[np.ndarray, int]:
@@ -90,7 +91,7 @@ class TakeStore:
         p = self._sidecar(key, n)
         if not p.is_file() or not self.path(key, n).is_file():
             return {}
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(read_text_retry(p))
         if data.get("sha256") != self._fingerprint(key, n):
             return {}
         return data.get("heard", {})
@@ -107,4 +108,4 @@ class TakeStore:
         final.parent.mkdir(parents=True, exist_ok=True)
         tmp = final.with_name(final.name + ".tmp")
         tmp.write_text(json.dumps({"sha256": self._fingerprint(key, n), "heard": heard}), encoding="utf-8")
-        os.replace(tmp, final)
+        replace_with_retry(tmp, final)

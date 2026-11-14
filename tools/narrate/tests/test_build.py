@@ -9,7 +9,7 @@ from narrate import fakes
 from narrate.build import BuildOptions, build, default_out
 from narrate.fakes import FakeWorld
 from narrate.manifest import read_manifest
-from narrate.profile import ProfileError
+from narrate.profile import ProfileError, Takes
 from narrate.script import ScriptError, load_script
 
 LINE = "Each filter is a group of its own."
@@ -234,3 +234,50 @@ def test_options_redirect_out(root, make, world):
     out = root / "elsewhere"
     build(make(("one", LINE)), options=BuildOptions(out=out))
     assert (out / "narration.json").is_file()
+
+
+def test_takes_option_overrides_the_profile(make, world):
+    world.script(LINE, heard=["garbled"])
+    m = build(make(("one", LINE)), options=BuildOptions(takes=Takes(count=2, max=2)))
+    assert m.lines[0].status == "flagged"
+    assert spoken_texts(world) == [LINE] * 2
+
+
+def refuse_models(monkeypatch):
+    import narrate.build as build_module
+
+    def no(*_a, **_kw):
+        raise AssertionError("a model was constructed for a build with nothing to generate or hear")
+
+    monkeypatch.setattr(build_module, "get_backend", no)
+    monkeypatch.setattr(build_module, "get_checker", no)
+
+
+def test_cached_build_constructs_no_models(make, world, monkeypatch):
+    path = make(("one", LINE), ("two", PASSAGE))
+    first = build(path)
+    refuse_models(monkeypatch)
+    again = build(path)
+    assert [ln.to_json() for ln in again.lines] == [ln.to_json() for ln in first.lines]
+
+
+def test_approved_build_constructs_no_models(make, world, monkeypatch):
+    import hashlib
+    import shutil
+
+    from narrate.approved import ApprovedStore, approved_root
+    from narrate.cache import TakeStore, cache_root
+    from narrate.lock import Lock, lock_path
+
+    path = make(("one", LINE))
+    ln = build(path).lines[0]
+    c = ln.check
+    cached = TakeStore(cache_root(None)).path(c["key"], c["take"])
+    sha = hashlib.sha256(cached.read_bytes()).hexdigest()
+    ApprovedStore(approved_root(None)).put(sha, cached)
+    lock = Lock.load(lock_path(path))
+    lock.pin("one", c["key"], c["take"], ln.duration, c["heard"], c["cer"], c["pace"], sha)
+    lock.save()
+    shutil.rmtree(cache_root(None))
+    refuse_models(monkeypatch)
+    assert build(path).lines[0].status == "approved"

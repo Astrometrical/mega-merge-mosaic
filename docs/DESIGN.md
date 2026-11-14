@@ -2202,7 +2202,7 @@ extra). It turns a `.narration.toml` script into per-line WAV clips and a
 audio (`narrate draft`). Dan's voice profile lives in `~/.narrate/voices/dan/`
 outside git; the NGC 7000 tour script and the project's pronunciation list are
 in `crates/mmm-app/tours/` (`ngc7000.narration.toml`, `terms.json`; `out/` is
-gitignored). Plan 2 adds the lock, the approved store, review, try and mux;
+gitignored). Plan 2 (below) added the lock, the approved store, review, try and mux;
 plan 3 the `mega-tour` recorder and the app tour; both consume the manifest.
 Usage is in `tools/narrate/README.md`.
 
@@ -2230,3 +2230,56 @@ As built, differing from the first spec draft:
   voice audio is never committed by accident.
 - **Take sidecars** record the sha256 of their WAV; a transcript is ignored if
   the audio changed, and saving a take drops its old sidecar.
+
+### Plan 2: the human loop and video
+
+Plan 2 added `narrate review` (a local page to listen, approve, reject, note
+and rebuild), `narrate try` (the pronunciation lab), `narrate mux` (approved
+clips onto a silent video) and the two stores behind them: the lock file
+(`<script>.lock.json`, text only, committed) and the approved store
+(`NARRATE_APPROVED`, default `~/.narrate/approved/`, WAVs, private, never
+pruned). Usage and workflow are in `tools/narrate/README.md`. As built:
+
+- **Pins bound to audio.** An approval pins the take's sha256; a line counts as
+  approved only while its audio matches the pin.
+- **Content-addressed approved store.** Approved WAVs live at
+  `<sha[:2]>/<sha>.wav`, named by the sha256 of their bytes. Take numbers
+  restart after a cache clear and lines with the same text share a key, so a
+  `(key, take)` layout let one approval overwrite another line's audio; an
+  address now names exactly one audio. `put` checks the bytes against the
+  hash, never rewrites a good file, and writes the store's `.gitignore`.
+- **Approvals bound to the heard take.** `build` records the chosen take's
+  sha256 in the manifest (`check.sha256`; the pin's hash for an approved
+  line). The page sends it back with approve and reject; the server re-reads
+  the manifest from disk and answers 409 when the line's take, or the cached
+  take's bytes, no longer match. While a rebuild runs, every mutation is a
+  409, and a rebuild only starts between mutations.
+- **Review page during a rebuild.** Polls update only the header and status;
+  the cards stay (audio keeps playing, a focused note keeps its text) with
+  their buttons off, and the page renders fully once when the build ends. A
+  note typed meanwhile is saved then.
+- **Windows-safe writes.** The lock, manifest and lists are written atomically
+  (temp file, then a replace retried on `PermissionError`, since Windows
+  refuses while another handle is open); reads retry the same way.
+- **Review server.** It binds 127.0.0.1 and refuses a request whose `Host` is
+  not the local address and port (421, against DNS rebinding) and a POST whose
+  content type is not JSON (415, so a cross-site form cannot post). Clips
+  answer a single `Range` (206 with `Content-Range`, 416 when unsatisfiable,
+  `Accept-Ranges: bytes` always), without which Chromium cannot seek them.
+  A port in use or out of range is a user error (exit 2).
+- **Approve unflagged** approves `new` lines with no flags, skipping takes the
+  lock has rejected and `pinned-audio-missing` lines (their take is unheard).
+- **Lazy models.** `build` makes the backend only when a round has jobs and
+  the checker only when a take has no cached transcript, so a fully cached or
+  approved build runs on a core-only install.
+- **`try`** builds two takes per carrier sentence (`BuildOptions.takes`
+  overrides the profile), in three default carriers whose words before the
+  term differ.
+- **Mux gating.** `mux` refuses lines that are not approved
+  (`--allow-unapproved`), clips running past the next cue (`--allow-overlap`,
+  tolerance 1 ms, checked per cue in start order; a line may be cued more
+  than once), draft manifests, no cues, unknown cues and missing clips, all
+  as exit 2, as are an `FFMPEG` naming no program and an ffmpeg that cannot
+  start. It gives ffmpeg absolute paths, so the argv does not depend on the
+  working directory. Audio is mixed at 48 kHz, `loudnorm` I=-16 TP=-1.5
+  LRA=11, AAC 192k; the video stream is copied.

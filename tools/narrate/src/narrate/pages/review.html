@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>narrate review</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --surface: #ffffff; --text: #1d1d1b; --muted: #6b6a66; --border: #dddbd5;
+    --accent: #2f6f8f; --accent-soft: #e3eef3; --on-accent: #ffffff; --ok: #2e7d4f; --bad: #b3402e; --warn: #8a6d1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121417; --surface: #1b1e22; --text: #e8e6e1; --muted: #9a9892; --border: #2c3036;
+      --accent: #7fb6d2; --accent-soft: #1f2d35; --on-accent: #10161a; --ok: #6cc08f; --bad: #e08070; --warn: #d8b65a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 12px; }
+  button, input, textarea { font: inherit; color: var(--text); }
+  button { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  button.ok { border-color: var(--ok); color: var(--ok); }
+  button.bad { border-color: var(--bad); color: var(--bad); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  header.bar { position: sticky; top: 0; z-index: 2; background: var(--bg); padding: 10px 0 12px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 10px 16px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  .counts { display: flex; gap: 14px; font-variant-numeric: tabular-nums; }
+  .spacer { flex: 1; }
+  #status { min-height: 1.5em; margin: 0 0 12px; color: var(--muted); }
+  #status.error { color: var(--bad); font-weight: 600; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .id { font-weight: 600; font-family: ui-monospace, Consolas, monospace; }
+  .badge { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 8px; border-radius: 999px;
+    border: 1.5px solid currentColor; }
+  .badge.approved { color: var(--ok); }
+  .badge.flagged { color: var(--bad); }
+  .badge.new { color: var(--accent); }
+  .badge.draft { color: var(--muted); }
+  .badge.rejected { color: var(--warn); }
+  .dur { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+  audio { width: 100%; height: 36px; margin: 4px 0 8px; }
+  .text { margin: 4px 0; }
+  .spoken, .meta { color: var(--muted); font-size: 13px; margin: 2px 0; }
+  .flags { color: var(--bad); font-weight: 600; font-size: 13px; margin: 2px 0; }
+  .caps { list-style: none; margin: 8px 0; padding: 0; }
+  .caps li { padding: 3px 8px; border-left: 3px solid transparent; border-radius: 4px; }
+  .caps li.now { background: var(--accent-soft); border-left-color: var(--accent); font-weight: 600; }
+  .caps .t { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin-right: 8px; }
+  .actions { display: flex; gap: 8px; margin: 10px 0 8px; flex-wrap: wrap; }
+  .note label { display: block; font-size: 13px; color: var(--muted); }
+  .note textarea { width: 100%; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); resize: vertical; }
+  .empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>narrate review</h1>
+  <header class="bar">
+    <div class="counts" id="counts" aria-label="Line counts"></div>
+    <span class="spacer"></span>
+    <button type="button" id="approve-all">Approve all unflagged</button>
+    <button type="button" id="rebuild" class="primary">Rebuild</button>
+  </header>
+  <p id="status" role="status" aria-live="polite"></p>
+  <div id="lines"></div>
+</main>
+<script>
+"use strict";
+const API = {
+  state: "/api/state", approve: "/api/approve", reject: "/api/reject", note: "/api/note",
+  approveUnflagged: "/api/approve-unflagged", rebuild: "/api/rebuild",
+};
+const ORDER = { flagged: 0, new: 1, approved: 2, draft: 3 };
+let state = null;
+let pollTimer = null;
+let message = "";
+let isError = false;
+// While a rebuild runs the cards are frozen: left in place (audio keeps playing, notes keep
+// focus) with their buttons off; only the header and status update. It ends with one full render.
+let frozen = false;
+// Note text typed but not saved yet (line id -> text), so no render or 409 ever loses it.
+const drafts = {};
+const POLL_MS = 1000;
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, props, children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "text") node.textContent = v;
+    else if (k === "class") node.className = v;
+    else node.setAttribute(k, v);
+  }
+  for (const c of children || []) node.appendChild(c);
+  return node;
+}
+
+function setStatus(text, error) {
+  message = text;
+  isError = !!error;
+  const s = $("status");
+  s.textContent = text;
+  s.className = error ? "error" : "";
+}
+
+async function request(url, body) {
+  const init = body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  };
+  let res;
+  try {
+    res = await fetch(url, init);
+  } catch (e) {
+    throw new Error("could not reach the review server");
+  }
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* non-JSON error body */ }
+  if (!res.ok) throw new Error((data && data.error) || "request failed (" + res.status + ")");
+  return data;
+}
+
+// Apply a state from the server: mid-build only the header changes; otherwise render it all.
+function show(next) {
+  const wasFrozen = frozen;
+  state = next;
+  frozen = !!state.building;
+  if (frozen && wasFrozen) renderHeader();
+  else render();
+  if (frozen) poll();
+  else if (wasFrozen) saveDrafts();
+}
+
+async function act(url, body, focusKey) {
+  let next;
+  try {
+    next = await request(url, body);
+  } catch (e) {
+    setStatus(e.message, true);
+    return;
+  }
+  setStatus("", false);
+  show(next);
+  if (focusKey) {
+    const b = document.querySelector('[data-focus="' + CSS.escape(focusKey) + '"]');
+    if (b) b.focus();
+  }
+}
+
+async function saveNote(id) {
+  if (!(id in drafts) || !state || frozen) return;  // mid-build: saved when the build finishes
+  const text = drafts[id];
+  if (text === (state.lock.notes[id] || "")) {
+    delete drafts[id];
+    return;
+  }
+  try {
+    const fresh = await request(API.note, { id: id, note: text });
+    state.lock.notes = fresh.lock.notes;
+    if (drafts[id] === text) delete drafts[id];
+    setStatus("", false);
+  } catch (e) {
+    setStatus(e.message, true);  // the draft stays; it is saved on the next blur or after a build
+  }
+}
+
+async function saveDrafts() {
+  const focused = document.activeElement;
+  for (const id of Object.keys(drafts)) {
+    if (focused && focused.dataset && focused.dataset.line === id) continue;  // saved on blur
+    await saveNote(id);
+  }
+}
+
+function isRejected(line) {
+  const c = line.check;
+  if (!c || !state) return false;
+  const r = state.lock.rejected[c.key];
+  return !!r && r.includes(c.take);
+}
+
+// The server's rule for "Approve all unflagged": new, no flags at all, a hashed take, not rejected.
+function bulkApprovable(line) {
+  return line.status === "new" && !(line.flags && line.flags.length) && !!line.check && !!line.check.sha256 && !isRejected(line);
+}
+
+function fmtTime(t) { return t.toFixed(2) + "s"; }
+
+function renderCard(line) {
+  const c = line.check;
+  const rejected = isRejected(line);
+  const canAct = !!c && !!c.sha256 && !state.manifest.draft && !frozen;
+  const badges = [el("span", { class: "badge " + line.status, text: line.status })];
+  if (rejected) badges.push(el("span", { class: "badge rejected", text: "rejected" }));
+  const head = el("div", { class: "head" }, [el("span", { class: "id", text: line.id }), ...badges]);
+  if (typeof line.duration === "number") head.appendChild(el("span", { class: "dur", text: fmtTime(line.duration) }));
+  const card = el("section", { class: "card", "aria-label": "Line " + line.id }, [head]);
+
+  if (line.clip && c) {
+    const audio = el("audio", {
+      controls: "", preload: "none", "aria-label": "Play line " + line.id,
+      src: "/clips/" + encodeURIComponent(line.id) + ".wav?v=" + encodeURIComponent(c.sha256 || c.take),
+    });
+    card.appendChild(audio);
+    if (line.kind === "passage" && line.captions && line.captions.length) {
+      const items = line.captions.map((cap) => {
+        const li = el("li", null, [el("span", { class: "t", text: fmtTime(cap.start) }), document.createTextNode(cap.text)]);
+        return li;
+      });
+      card.appendChild(el("ol", { class: "caps", "aria-label": "Captions" }, items));
+      const lis = card.querySelectorAll(".caps li");
+      audio.addEventListener("timeupdate", () => {
+        const t = audio.currentTime;
+        line.captions.forEach((cap, i) => lis[i].classList.toggle("now", t >= cap.start && t < cap.end));
+      });
+    }
+  }
+
+  card.appendChild(el("p", { class: "text", text: line.text }));
+  if (line.spoken && line.spoken !== line.text) {
+    card.appendChild(el("p", { class: "spoken", text: "Spoken as: " + line.spoken }));
+  }
+  if (c) {
+    const bits = [];
+    if (c.heard !== undefined && c.heard !== null) bits.push("Heard: " + c.heard);
+    if (typeof c.pace === "number") bits.push("pace " + c.pace.toFixed(2) + " syl/s");
+    if (typeof c.cer === "number") bits.push("CER " + c.cer.toFixed(3));
+    bits.push("take " + c.take);
+    card.appendChild(el("p", { class: "meta", text: bits.join(" · ") }));
+  }
+  if (line.flags && line.flags.length) {
+    card.appendChild(el("p", { class: "flags", text: "Flags: " + line.flags.join(", ") }));
+  }
+
+  const approve = el("button", { type: "button", class: "ok", "data-focus": "a:" + line.id, text: line.status === "approved" ? "Approved" : "Approve" });
+  const reject = el("button", { type: "button", class: "bad", "data-focus": "r:" + line.id, text: rejected ? "Rejected" : "Reject" });
+  approve.disabled = !canAct || line.status === "approved";
+  reject.disabled = !canAct || rejected;
+  // The take is named by the hash of the take this card shows, so a changed take is a 409, never a wrong pin.
+  approve.addEventListener("click", () => act(API.approve, { id: line.id, sha256: c.sha256 }, "a:" + line.id));
+  reject.addEventListener("click", () => act(API.reject, { id: line.id, sha256: c.sha256 }, "r:" + line.id));
+  card.appendChild(el("div", { class: "actions" }, [approve, reject]));
+
+  const noteId = "note-" + line.id.replace(/[^A-Za-z0-9_-]/g, "_");
+  const area = el("textarea", { id: noteId, rows: "2", "data-line": line.id });
+  area.value = line.id in drafts ? drafts[line.id] : (state.lock.notes[line.id] || "");
+  area.addEventListener("input", () => { drafts[line.id] = area.value; });
+  area.addEventListener("blur", () => saveNote(line.id));
+  card.appendChild(el("div", { class: "note" }, [el("label", { for: noteId, text: "Note for " + line.id }), area]));
+  return card;
+}
+
+function renderCards() {
+  // A note being typed keeps its text, focus and selection across the re-render.
+  const f = document.activeElement;
+  const keep = f && f.tagName === "TEXTAREA" && f.closest("#lines")
+    ? { id: f.id, value: f.value, start: f.selectionStart, end: f.selectionEnd } : null;
+  const lines = state.manifest.lines;
+  const sorted = lines.map((l, i) => [l, i]).sort((a, b) => (ORDER[a[0].status] ?? 9) - (ORDER[b[0].status] ?? 9) || a[1] - b[1]).map((p) => p[0]);
+  const host = $("lines");
+  if (!sorted.length) host.replaceChildren(el("p", { class: "empty", text: "No lines in this script." }));
+  else host.replaceChildren(...sorted.map(renderCard));
+  const area = keep && document.getElementById(keep.id);
+  if (area) {
+    area.value = keep.value;
+    area.focus();
+    area.setSelectionRange(keep.start, keep.end);
+  }
+}
+
+function renderHeader() {
+  const lines = state.manifest.lines;
+  const n = (s) => lines.filter((l) => l.status === s).length;
+  $("counts").replaceChildren(
+    el("span", { text: n("approved") + " approved" }),
+    el("span", { text: n("new") + " new" }),
+    el("span", { text: n("flagged") + " flagged" }),
+  );
+  const rb = $("rebuild");
+  rb.textContent = frozen ? "building…" : "Rebuild";
+  rb.disabled = frozen || !lines.some(isRejected);
+  const bulk = state.manifest.draft ? 0 : lines.filter(bulkApprovable).length;
+  $("approve-all").textContent = "Approve all unflagged (" + bulk + ")";
+  $("approve-all").disabled = frozen || bulk === 0;
+  if (frozen) {
+    for (const b of $("lines").querySelectorAll(".actions button")) b.disabled = true;
+    setStatus(Object.keys(drafts).length ? "Building… notes are saved when it finishes." : "Building…", false);
+  } else if (message.startsWith("Building…")) {
+    setStatus("", false);
+  }
+}
+
+function render() {
+  renderCards();
+  renderHeader();
+}
+
+function stopPolling() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+}
+
+function poll() {
+  if (pollTimer) return;
+  pollTimer = setTimeout(async () => {
+    pollTimer = null;
+    let next;
+    try {
+      next = await request(API.state);
+    } catch (e) {
+      setStatus(e.message, true);
+      return;
+    }
+    if (frozen) show(next);  // the rebuild's own reply may have ended the build already
+  }, POLL_MS);
+}
+
+$("approve-all").addEventListener("click", () => act(API.approveUnflagged, {}, "approve-all"));
+$("approve-all").setAttribute("data-focus", "approve-all");
+$("rebuild").addEventListener("click", async () => {
+  frozen = true;
+  state.building = true;  // until the server says otherwise
+  renderHeader();
+  poll();
+  let next;
+  let error = null;
+  try {
+    next = await request(API.rebuild, {});
+  } catch (e) {
+    error = e.message;
+    try { next = await request(API.state); } catch (e2) { setStatus(e2.message, true); return; }
+  }
+  stopPolling();
+  if (frozen) show(next);  // else a poll already saw the build end and rendered
+  if (error) setStatus(error, true);
+  else setStatus("Rebuilt.", false);
+});
+
+(async () => {
+  try {
+    show(await request(API.state));
+  } catch (e) {
+    setStatus(e.message, true);
+  }
+})();
+</script>
+</body>
+</html>

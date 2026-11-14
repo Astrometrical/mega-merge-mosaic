@@ -32,15 +32,77 @@ uv run narrate draft path/to/x.narration.toml [--pace 4.8] [--out DIR]
 
 # Generate takes, check each with Whisper, pick, write clips and manifest.
 uv run narrate build path/to/x.narration.toml [--out DIR] [--voices DIR]
-                                              [--cache DIR] [--allow-flagged]
+                                              [--cache DIR] [--approved DIR] [--allow-flagged]
 ```
 
 `build` prints one row per line: id, status, take, CER, pace (syllables per
-second), duration. A second `build` reuses cached takes and takes seconds.
+second), duration, then what was heard and the flags for any line that has
+flags. A second `build` reuses cached takes and takes seconds; a build with
+nothing to generate or transcribe never loads a model, so a fully cached or
+approved script builds on a core-only install. `--approved` names the
+approved store (default `NARRATE_APPROVED`, as for `review`).
 
-Exit codes: 0 ok; 1 a line is flagged (unless `--allow-flagged`); 2 a user
-error (bad script, profile or option, or the `qwen` extra missing); 3 an
-internal error (traceback on stderr). 1 only ever means flagged.
+```sh
+# Listen, approve, reject, annotate and rebuild in a local web page.
+uv run narrate review path/to/x.narration.toml [--no-browser] [--no-build] [--port N]
+                                               [--out DIR] [--voices DIR] [--cache DIR] [--approved DIR]
+# The pronunciation lab: hear a word in carrier sentences under candidate respellings.
+uv run narrate try Kappa --voice dan --spell "KAP-uh" --in "Say {} again." [--to terms.json]
+# Mix the approved clips onto a silent video at cue times.
+uv run narrate mux --timeline tour/timeline.json -o tour-narrated.mp4 [--allow-overlap] [--allow-unapproved]
+uv run narrate mux --video silent.mp4 --script x.narration.toml [--manifest narration.json]
+                   -o tour-narrated.mp4 [--allow-overlap] [--allow-unapproved]   # `at` times from the script
+```
+
+`review` serves on 127.0.0.1 only (any free port unless `--port`; a port in
+use or outside 0-65535 is exit 2), builds first unless `--no-build`, and opens
+the page unless `--no-browser`. Clips are served with byte ranges, so the
+players can seek. `try` builds each respelling in each carrier sentence with
+two takes, then serves a small page that auditions them blind and writes the
+chosen one into a pronunciation list. `mux` needs ffmpeg (`FFMPEG` names it,
+else it is looked up on PATH); `--manifest` overrides the script's default
+`out/<stem>/narration.json`. A timeline may cue a line more than once; lines
+with no cue are left out.
+
+## Approval workflow: build, review, then mux
+
+1. `narrate build` generates and checks takes; each line comes out `new`
+   (nothing approved yet), `flagged` (failed a check) or `approved`.
+2. `narrate review` plays each take beside its text and checks. Approve a
+   take to pin it, reject one to bar it from being picked again, add a note, or
+   rebuild from the page. "Approve all unflagged" approves every `new` line
+   with no flags whose take is not rejected (a line flagged
+   `pinned-audio-missing` carries a take nobody has heard, so it is skipped).
+3. `narrate mux` puts only approved lines on the video.
+
+A pin is bound to the sha256 of the approved audio, so a changed or replaced
+take is no longer approved until it is approved again. Approve and reject are
+bound to the take you heard: the page sends the sha256 of the take it shows,
+and the server answers 409 ("the take changed — reload") if the manifest or
+the cached take has moved on since. While a rebuild runs, the page keeps
+playing and keeps what you type: approve, reject and "Approve all unflagged"
+are off (the server answers 409 to any change), and notes are saved when the
+build finishes. Two stores keep the text and the voice apart:
+
+- The **lock file**, `<script>.lock.json` next to the script, holds pins,
+  rejections and notes. It has no audio: commit it.
+- The **approved store**, `NARRATE_APPROVED` (default `~/.narrate/approved/`),
+  holds the approved WAVs, each named by the sha256 of its bytes
+  (`<sha[:2]>/<sha>.wav`), so approving one line can never replace another
+  line's audio. It is a real person's voice: private, never pruned, never
+  committed; it writes its own `.gitignore` (`*`) on first use.
+
+`mux` refuses, with exit 2 and a message naming the lines: a draft manifest
+(no audio); no cues; cues for unknown lines; lines with no clip; lines that
+are not approved (`--allow-unapproved` overrides); and clips that run past the
+next cue's start (`--allow-overlap` overrides; the message gives each overrun
+in seconds). Missing clip files, an `FFMPEG` that names no program, and an
+ffmpeg that cannot start or fails are also exit 2.
+
+Exit codes: 0 ok; 1 a line is flagged (`build` only, unless
+`--allow-flagged`); 2 a user error (bad script, profile, timeline or option, a
+port in use, a mux refusal, ffmpeg missing or failing, or the `qwen` extra
+missing); 3 an internal error (traceback on stderr). 1 only ever means flagged.
 
 Checks are English-only: Whisper runs in English and text normalisation assumes
 English.
@@ -76,13 +138,10 @@ the project's names. Spec sections 8.2 and 8.3.
 
 ## Where files go
 
-The approval rows describe the design (spec section 5.8); the approvals
-commands are not built yet, so `build` does not write them.
-
 | What | Where |
 |---|---|
 | Takes, transcripts | `NARRATE_CACHE`, default `~/.narrate/cache` (safe to delete) |
-| Approved takes (plan 2, not built yet) | `NARRATE_APPROVED`, default `~/.narrate/approved/` (never pruned) |
+| Approved takes | `NARRATE_APPROVED`, default `~/.narrate/approved/`, as `<sha[:2]>/<sha>.wav` (never pruned; carries its own `.gitignore`) |
 | Clips and `narration.json` | `--out`, default `<script dir>/out/<script stem>/`; the folder carries its own `.gitignore` (`*`) |
 | Approvals | `<script>.lock.json` next to the script (no audio; commit it) |
 

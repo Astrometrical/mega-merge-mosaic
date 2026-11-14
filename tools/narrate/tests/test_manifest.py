@@ -80,3 +80,68 @@ def test_manifest_version_guard(root):
     path.write_text(json.dumps({"version": 2, "script": "x", "lines": []}), encoding="utf-8")
     with pytest.raises(NarrateError):
         read_manifest(path)
+
+
+def _line():
+    return {"id": "open", "text": "Hi.", "spoken": "Hi.", "kind": "line", "status": "ok"}
+
+
+def _doc(**over):
+    line = {"id": "open", "text": "Hi.", "spoken": "Hi.", "kind": "line", "status": "ok", "duration": 1.0}
+    line.update(over)
+    return json.dumps({"version": 1, "script": "s", "lines": [line]})
+
+
+@pytest.mark.parametrize(
+    ("content", "needle"),
+    [
+        ("{not json", "invalid JSON"),
+        ('{"version": true}', "unsupported manifest version"),
+        ('{"version": "1"}', "unsupported manifest version"),
+        ('{"lines": []}', "unsupported manifest version"),
+        ('{"version": 2}', "newer"),
+        (json.dumps({"version": 1, "script": "s", "lines": [_line()]}), "duration"),
+        (json.dumps({"version": 1, "lines": []}), "script"),
+        (_doc(flags=5), "flags"),
+        (_doc(duration="x"), "duration"),
+        (_doc(duration=None), "duration"),
+        (_doc(duration=-1), "duration"),
+        (_doc(id=3), "'id'"),
+        (_doc(captions=[{"text": "a", "start": "0", "end": 1}]), "start"),
+        ('{"version": 1, "script": "s", "lead": "x", "lines": []}', "lead"),
+        ('{"version": 0, "script": "s", "lines": []}', "unsupported manifest version"),
+        ('{"version": 1, "script": "s", "lead": NaN, "lines": []}', "NaN"),
+        ('{"version": 1, "script": "s", "lines": 5}', "lines"),
+        (None, "cannot read"),
+    ],
+)
+def test_read_manifest_errors(root, content, needle):
+    path = root / "m.json"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    with pytest.raises(NarrateError, match="m.json") as info:
+        read_manifest(path)
+    assert needle in str(info.value)
+
+
+def test_read_manifest_missing_field_names_line(root):
+    path = root / "m.json"
+    path.write_text(json.dumps({"version": 1, "script": "s", "lines": [_line()]}), encoding="utf-8")
+    with pytest.raises(NarrateError, match="'open'"):
+        read_manifest(path)
+
+
+@pytest.mark.parametrize("bad", [3, None, "abc", "A" * 64, "0" * 63, "g" * 64])
+def test_check_sha256_is_type_checked(root, bad):
+    path = root / "m.json"
+    path.write_text(_doc(check={"take": 1, "sha256": bad}), encoding="utf-8")
+    with pytest.raises(NarrateError, match=r"m\.json.*'open'.*sha256"):
+        read_manifest(path)
+
+
+def test_check_sha256_round_trips(root):
+    path = root / "m.json"
+    path.write_text(_doc(check={"take": 1, "sha256": "0123456789abcdef" * 4}), encoding="utf-8")
+    assert read_manifest(path).lines[0].check["sha256"] == "0123456789abcdef" * 4
+    path.write_text(_doc(check={"take": 1}), encoding="utf-8")
+    assert "sha256" not in read_manifest(path).lines[0].check

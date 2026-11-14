@@ -255,9 +255,9 @@ This is the round-3 workflow made into a command:
 | What | Where | In git? |
 |---|---|---|
 | Takes, transcripts, prompt cache | `NARRATE_CACHE`, default `~/.narrate/cache`; content-addressed and shared across projects. Safe to delete | no |
-| Approved takes | `NARRATE_APPROVED`, default `~/.narrate/approved/<key>/`. A copy of each pinned take and its check results; durable, and never pruned by `narrate` | no (private audio) |
+| Approved takes | `NARRATE_APPROVED`, default `~/.narrate/approved/`. A copy of each pinned take's WAV at `<sha[:2]>/<sha>.wav`, addressed by the sha256 of its bytes, so storing one take never replaces another; durable, never pruned by `narrate`, and carrying its own `.gitignore` | no (private audio) |
 | Clips and `narration.json` | `--out`, default `<script dir>/out/<script stem>/` | no (gitignore it) |
-| Approvals | `<script>.lock.json` next to the script | yes: it holds keys, take numbers, durations, transcripts and notes, no audio |
+| Approvals | `<script>.lock.json` next to the script | yes: it holds keys, take numbers, each pin's sha256, durations, transcripts and notes, no audio |
 
 **Pinned takes come from the approved store,** so clearing the cache never changes approved narration.
 - **Approved store also missing,** on a new machine for example: the line returns to `new`, with a "pinned audio missing" flag. A take can't be regenerated exactly (§3).
@@ -395,9 +395,22 @@ The format of `voice/pronunciations.json`: `{"about", "entries": [{"match", "say
  "lines": [{"id": "open", "text": "…", "spoken": "…", "kind": "line", "clip": "clips/open.wav",
             "duration": 5.42, "at": null, "status": "approved", "flags": [],
             "captions": [{"text": "…", "start": 0.0, "end": 5.42}],
-            "check": {"heard": "…", "cer": 0.0, "pace": 4.7, "take": 2, "key": "…"}}]}
+            "check": {"heard": "…", "cer": 0.0, "pace": 4.7, "take": 2, "key": "…", "sha256": "…"}}]}
 ```
 
+- **`status`** is one of:
+  - `approved`: a pin applies and its audio was found with the pinned hash;
+  - `new`: a checked take nobody has approved yet;
+  - `flagged`: the chosen take failed a check;
+  - `draft`: a timing-only manifest, with no audio.
+- **`flags`** lists, in any order:
+  - `words`: no take was heard as the text (the character error rate is at or above the word check's limit);
+  - `pace`: every take of a passage that passes the word check is faster than `pace.max`;
+  - `pinned-audio-missing`: the line was approved, but that audio is in neither the approved store nor the cache. The line comes back `new`, or `flagged` when the replacement take also fails its checks; either way its take is fresh and unheard.
+- **`check`** describes the chosen take:
+  - `heard`, `cer` and `pace` are the checker's measurements (`null` when not finite);
+  - `take` and `key` name it in the take cache;
+  - `sha256` is the sha256 of the take's WAV bytes, 64 lowercase hex characters. For an approved line it is the pin's hash. `review` sends it back with an approve or reject, so a take that changed since the page loaded is refused, never pinned.
 - **Paths** are relative to the manifest.
 - **Caption times** are seconds from the clip's start; together the entries cover the clip.
 - **Draft manifests** have `"draft": true`, `clip: null` and no `check`. Their captions are split by syllable share over the estimated duration.
@@ -409,6 +422,8 @@ The format of `voice/pronunciations.json`: `{"about", "entries": [{"match", "say
 {"version": 1, "video": "silent.mp4", "narration": "narration.json", "fps": 30,
  "cues": [{"id": "open", "start": 0.15}, {"id": "groups", "start": 9.4}]}
 ```
+
+- **Cues:** a line may be cued more than once; lines with no cue are not muxed.
 
 ## 9. Constraints
 
