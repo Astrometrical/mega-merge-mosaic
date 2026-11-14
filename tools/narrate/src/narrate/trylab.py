@@ -17,15 +17,19 @@ from narrate import NarrateError
 from narrate._fs import read_text_retry, replace_with_retry
 from narrate.build import default_out
 from narrate.manifest import Manifest, read_manifest
+from narrate.profile import Takes
 from narrate.script import load_script
 from narrate.server import LocalServer, Response, Routes, json_response, serve_clip, start
 
 PLACEHOLDER = "{}"
+# The words before the term differ ("is", "of", "to"): spec 5.6 wants carriers that do not repeat them.
 DEFAULT_CARRIERS = (
     "Next up is {}.",
     "Everyone here has heard of {}.",
     "That brings us back to {}, again.",
 )
+#: Spec 5.6: each spelling in each carrier, with two takes each.
+TRY_TAKES = Takes(count=2, max=2)
 LIST_ABOUT = "Pronunciation respellings written by narrate try."
 _LINE_ID = re.compile(r"c(\d+)-s(\d+)")
 _DEL = re.compile(r"\x7f")

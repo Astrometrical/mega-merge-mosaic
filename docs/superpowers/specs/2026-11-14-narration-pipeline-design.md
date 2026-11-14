@@ -410,6 +410,8 @@ The format of `voice/pronunciations.json`: `{"about", "entries": [{"match", "say
  "cues": [{"id": "open", "start": 0.15}, {"id": "groups", "start": 9.4}]}
 ```
 
+- **Cues:** a line may be cued more than once; lines with no cue are not muxed.
+
 ## 9. Constraints
 
 - **Privacy:** the user's recordings, reference clips, voice profile and every generated clip stay off git and off any external service.

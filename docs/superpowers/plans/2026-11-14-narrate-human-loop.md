@@ -43,7 +43,7 @@ Plan 1's code is on main: `tools/narrate/`. Its DESIGN.md section is "Narration 
   - **Lock and timeline JSON** carry `"version": 1`; readers refuse a newer version with a `NarrateError` naming the file.
   - **Mux filter graph** (spike values): `aresample=48000,adelay={ms}:all=1` per clip, then `amix=inputs=N:normalize=0:dropout_transition=0,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000`. Output: `-c:v copy -c:a aac -b:a 192k -movflags +faststart`.
   - **Overrun tolerance:** `OVERRUN_TOLERANCE = 0.001` s.
-  - **`try`:** 2 takes per carrier sentence. The default carriers are `"We start with {}."`, `"Here is {} again, in the middle."` and `"And this one ends with {}."`.
+  - **`try`:** 2 takes per carrier sentence (`TRY_TAKES = Takes(count=2, max=2)`, passed as `BuildOptions.takes`). The default carriers are `"Next up is {}."`, `"Everyone here has heard of {}."` and `"That brings us back to {}, again."`. Ruled at the final review: the words before the term differ ("is", "of", "to"), which meets spec §5.6 better than the first pinned set, where "with" repeated.
 - **Anti-goal (spec §2):** no unheard line reaches a video. `mux` refuses unapproved lines unless `--allow-unapproved` is passed.
 
 ## Review Focus

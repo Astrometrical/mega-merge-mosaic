@@ -64,8 +64,7 @@ def load_timeline(path: Path) -> tuple[Path, Path, list[Cue]]:
     raw = data.get("cues")
     if not isinstance(raw, list):
         raise NarrateError(f"{path}: field 'cues' must be a list, got {raw!r}")
-    cues: list[Cue] = []
-    seen: set[str] = set()
+    cues: list[Cue] = []  # a line may be cued more than once
     for i, c in enumerate(raw):
         if not isinstance(c, dict):
             raise NarrateError(f"{path}: cue #{i + 1} must be an object")
@@ -74,9 +73,6 @@ def load_timeline(path: Path) -> tuple[Path, Path, list[Cue]]:
             raise NarrateError(f"{path}: cue #{i + 1} field 'id' must be a non-empty string, got {id_!r}")
         if not _is_num(start) or not math.isfinite(start) or start < 0:
             raise NarrateError(f"{path}: cue {id_!r} field 'start' must be a finite number >= 0, got {start!r}")
-        if id_ in seen:
-            raise NarrateError(f"{path}: duplicate cue id {id_!r}")
-        seen.add(id_)
         cues.append(Cue(id_, float(start)))
     base = path.parent
     return base / data["video"], base / data["narration"], cues
@@ -111,10 +107,13 @@ def overruns(cues: list[Cue], manifest: Manifest) -> list[str]:
 
 
 def find_ffmpeg() -> str:
-    """`$FFMPEG` if set, else `ffmpeg` on PATH."""
+    """`$FFMPEG` if set (it must name an existing program), else `ffmpeg` on PATH."""
     env = os.environ.get("FFMPEG")
     if env:
-        return env
+        found = shutil.which(env)
+        if found is None:
+            raise NarrateError(f"FFMPEG={env!r}: no such program; fix FFMPEG or unset it to use PATH")
+        return found
     found = shutil.which("ffmpeg")
     if found is None:
         raise NarrateError("ffmpeg not found; install it or set FFMPEG to its path")
@@ -181,7 +180,10 @@ def mux(
     tmp = out.with_name(out.name + ".tmp.mp4")
     cmd = mux_command(find_ffmpeg(), video, clips, tmp)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise NarrateError(f"cannot run ffmpeg {cmd[0]!r}: {e}") from e
         if result.returncode != 0:
             tail = "\n".join((result.stderr or "").splitlines()[-STDERR_TAIL:])
             raise NarrateError(f"ffmpeg failed (exit {result.returncode}):\n{tail}")

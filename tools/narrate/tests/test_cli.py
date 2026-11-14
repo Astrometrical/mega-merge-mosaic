@@ -132,6 +132,79 @@ def test_cli_review_no_browser(root, write_script, voice_library, world, capsys,
     assert "Reviewing" in capsys.readouterr().out
 
 
+def pin_take_then_lose_it(path, line):
+    """Pin a line's take, then empty the cache, so its audio is nowhere (the approved store is empty)."""
+    import shutil
+
+    from narrate.cache import cache_root
+    from narrate.lock import Lock, lock_path
+
+    c = line.check
+    lock = Lock.load(lock_path(path))
+    lock.pin(line.id, c["key"], c["take"], line.duration, c["heard"], c["cer"], c["pace"], c["sha256"])
+    lock.save()
+    shutil.rmtree(cache_root(None) / "takes")
+
+
+def test_cli_build_approved_dir(root, write_script, voice_library, world):
+    from narrate.approved import ApprovedStore, approved_root
+    from narrate.build import build
+    from narrate.lock import Lock, lock_path
+
+    path = make(root, write_script)
+    line = build(path).lines[0]
+    c = line.check
+    lock = Lock.load(lock_path(path))
+    lock.pin("one", c["key"], c["take"], line.duration, c["heard"], c["cer"], c["pace"], c["sha256"])
+    lock.save()
+    mine = root / "my approved"
+    assert main(["build", str(path), "--approved", str(mine)]) == 0
+    assert ApprovedStore(mine).has(c["sha256"])  # the pin's audio was copied into DIR
+    assert not approved_root(None).exists()
+
+
+def test_cli_summary_prints_flags_of_new_lines(root, write_script, voice_library, world, capsys):
+    from narrate.build import build
+
+    path = make(root, write_script)
+    pin_take_then_lose_it(path, build(path).lines[0])
+    capsys.readouterr()
+    assert main(["build", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "one  new" in out and "flags: pinned-audio-missing" in out
+
+
+@pytest.fixture
+def busy_port():
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    yield s.getsockname()[1]
+    s.close()
+
+
+@pytest.mark.parametrize("port", ["busy", "70000", "-1"])
+def test_cli_review_bad_port_exit_2(root, write_script, voice_library, world, capsys, busy_port, port):
+    path = make(root, write_script)
+    assert main(["build", str(path)]) == 0
+    capsys.readouterr()
+    port = str(busy_port) if port == "busy" else port
+    assert main(["review", str(path), "--no-browser", "--no-build", "--port", port]) == 2
+    assert f"port {port}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("port", ["busy", "65536"])
+def test_cli_try_bad_port_exit_2(root, voice_library, world, capsys, busy_port, port):
+    port = str(busy_port) if port == "busy" else port
+    args = ["try", "Nebula", "--voice", "test", "--to", str(root / "p.json"), "--no-browser", "--port", port]
+    assert main(args) == 2
+    assert f"port {port}" in capsys.readouterr().err
+    if port == "65536":
+        assert world.calls == []  # refused before building
+
+
 def test_cli_review_opens_browser_and_build_errors_skip_server(root, write_script, voice_library, world, monkeypatch):
     opened = []
     monkeypatch.setattr("narrate.cli.serve", lambda app, port, opener: opener("http://x/"))

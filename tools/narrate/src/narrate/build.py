@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Generic, Protocol, TypeVar
 
 import numpy as np
 
@@ -18,7 +20,7 @@ from narrate.checkers import Checker, get_checker
 from narrate.lexicon import Lexicon
 from narrate.lock import Lock, Pin, lock_path
 from narrate.manifest import Manifest, ManifestLine
-from narrate.profile import ProfileError, Reference, VoiceProfile, load_profile
+from narrate.profile import ProfileError, Reference, Takes, VoiceProfile, load_profile
 from narrate.script import Line, Script, ScriptError, load_script
 from narrate.select import Choice, TakeResult, choose, evaluate
 from narrate.text import infer_kind
@@ -26,12 +28,45 @@ from narrate.text import infer_kind
 
 @dataclass(frozen=True)
 class BuildOptions:
-    """Where a build reads and writes; `None` means the default."""
+    """Where a build reads and writes, and how many takes it tries; `None` means the default.
+
+    `takes` overrides the profile's `[takes]` policy (`narrate try` uses two takes per line).
+    """
 
     out: Path | None = None
     voices: Path | None = None
     cache: Path | None = None
     approved: Path | None = None
+    takes: Takes | None = None
+
+
+class _Closable(Protocol):
+    def close(self) -> None: ...
+
+
+_M = TypeVar("_M", bound=_Closable)
+
+
+class _Lazy(Generic[_M]):
+    """A model made on first `get()`, so a build with nothing to generate or hear loads none.
+
+    `close()` releases only a model that was made, and keeps it: the models reload lazily.
+    """
+
+    def __init__(self, make: Callable[[], _M]) -> None:
+        self._make = make
+        self._made: _M | None = None
+
+    def get(self) -> _M:
+        """The model, made now if it was not yet."""
+        if self._made is None:
+            self._made = self._make()
+        return self._made
+
+    def close(self) -> None:
+        """Release the model if it was made."""
+        if self._made is not None:
+            self._made.close()
 
 
 @dataclass(frozen=True)
@@ -68,15 +103,16 @@ def _plan_lines(script: Script, profile: VoiceProfile, lexicon: Lexicon) -> list
     return plans
 
 
-def _generate(backend: Backend, store: TakeStore, jobs: list[Job]) -> None:
-    """Synthesise and store the jobs, then release the backend."""
+def _generate(backend: _Lazy[Backend], store: TakeStore, jobs: list[Job]) -> None:
+    """Synthesise and store the jobs, then release the backend (made only if there are jobs)."""
     if not jobs:
         return
     try:
+        model = backend.get()
         for batch in plan_batches(jobs):
-            audios = backend.synthesize([j.spoken for j in batch], batch[0].reference, batch_seed(batch[0]))
+            audios = model.synthesize([j.spoken for j in batch], batch[0].reference, batch_seed(batch[0]))
             for job, audio in zip(batch, audios, strict=True):
-                store.save(job.key, job.take, audio, backend.sample_rate)
+                store.save(job.key, job.take, audio, model.sample_rate)
     finally:
         backend.close()
 
@@ -99,15 +135,15 @@ def _missing_jobs(plans: list[_Plan], store: TakeStore, wanted: dict[str, list[i
     return list(jobs.values())
 
 
-def _check(plan: _Plan, store: TakeStore, checker: Checker, takes: list[int], results: dict[int, TakeResult]) -> None:
-    """Score takes not yet in `results`, transcribing only those never heard."""
+def _check(plan: _Plan, store: TakeStore, checker: _Checking, takes: list[int], results: dict[int, TakeResult]) -> None:
+    """Score takes not yet in `results`, transcribing (and so making the checker) only those never heard."""
     for n in takes:
         if n in results:
             continue
         audio, sr = store.load(plan.key, n)
         heard = store.heard(plan.key, n, checker.name)
         if heard is None:
-            heard = checker.transcribe(audio, sr)
+            heard = checker.model.get().transcribe(audio, sr)
             store.set_heard(plan.key, n, checker.name, heard)
         results[n] = evaluate(n, plan.answers, plan.spoken, heard, audio, sr)
 
@@ -118,8 +154,22 @@ def _captions(plan: _Plan, clip: np.ndarray, sr: int, duration: float) -> list[C
     return sentence_captions(plan.line.text, clip, sr)
 
 
+@dataclass(frozen=True)
+class _Checking:
+    """The checker (made on first transcription) and the name its transcripts are cached under."""
+
+    model: _Lazy[Checker]
+    name: str
+
+
 def _select(
-    plans: list[_Plan], profile: VoiceProfile, store, backend: Backend, checker: Checker, rejected: dict[str, set[int]]
+    plans: list[_Plan],
+    profile: VoiceProfile,
+    takes: Takes,
+    store: TakeStore,
+    backend: _Lazy[Backend],
+    checker: _Checking,
+    rejected: dict[str, set[int]],
 ) -> dict[str, Choice]:
     """Rounds 1 and 2: generate, check and choose a take per line id."""
 
@@ -128,19 +178,19 @@ def _select(
 
     results: dict[str, dict[int, TakeResult]] = {p.line.id: {} for p in plans}
     choices: dict[str, Choice] = {}
-    first = wanted(plans, profile.takes.count)
+    first = wanted(plans, takes.count)
     _generate(backend, store, _missing_jobs(plans, store, first))
     for p in plans:
         _check(p, store, checker, first[p.line.id], results[p.line.id])
         choices[p.line.id] = choose(p.kind, list(results[p.line.id].values()), profile.pace)
     flagged = [p for p in plans if choices[p.line.id].status == "flagged"]
-    if flagged and profile.takes.max > profile.takes.count:
-        more = wanted(flagged, profile.takes.max)
+    if flagged and takes.max > takes.count:
+        more = wanted(flagged, takes.max)
         jobs = _missing_jobs(flagged, store, more)
         if jobs:
-            checker.close()  # Whisper and Qwen are never in VRAM together; Whisper reloads lazily
+            checker.model.close()  # Whisper and Qwen are never in VRAM together; Whisper reloads lazily
         _generate(backend, store, jobs)
-        everything = wanted(flagged, profile.takes.max)
+        everything = wanted(flagged, takes.max)
         for p in flagged:
             _check(p, store, checker, everything[p.line.id], results[p.line.id])
             choices[p.line.id] = choose(p.kind, list(results[p.line.id].values()), profile.pace)
@@ -192,13 +242,19 @@ def build(
     lock = Lock.load(lock_path(script.path))
     pins, pinned_missing = _usable_pins(plans, lock, store, approved)
     out = options.out if options.out is not None else default_out(script)
-    backend = backend if backend is not None else get_backend(profile.backend, profile)
-    checker = checker if checker is not None else get_checker(profile.checker)
+    takes = options.takes if options.takes is not None else profile.takes
+    # A registry checker's `name` is its registry name, so cached transcripts are found without making it.
+    checking = _Checking(
+        _Lazy(lambda: checker if checker is not None else get_checker(profile.checker)),
+        checker.name if checker is not None else profile.checker,
+    )
+    synth = _Lazy(lambda: backend if backend is not None else get_backend(profile.backend, profile))
 
+    todo = [p for p in plans if p.line.id not in pins]
     try:
-        choices = _select([p for p in plans if p.line.id not in pins], profile, store, backend, checker, lock.rejected)
+        choices = _select(todo, profile, takes, store, synth, checking, lock.rejected)
     finally:
-        checker.close()
+        checking.model.close()
 
     ensure_ignored(out)
     lines: list[ManifestLine] = []

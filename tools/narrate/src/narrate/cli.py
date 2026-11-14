@@ -17,7 +17,8 @@ from narrate.mux import load_timeline, mux, script_cues
 from narrate.profile import load_profile
 from narrate.review import ReviewApp, serve
 from narrate.script import load_script
-from narrate.trylab import TryApp, candidates_for, check_carriers, prepare, workdir_for
+from narrate.server import check_port
+from narrate.trylab import TRY_TAKES, TryApp, candidates_for, check_carriers, prepare, workdir_for
 from narrate.trylab import serve as try_serve
 
 
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--out", type=Path, help="output directory (default: <script dir>/out/<stem>)")
     b.add_argument("--voices", type=Path, help="voice library directory")
     b.add_argument("--cache", type=Path, help="take cache directory")
+    b.add_argument("--approved", type=Path, help="approved-take store directory")
     b.add_argument("--allow-flagged", action="store_true", help="exit 0 even if lines are flagged")
     d = sub.add_parser("draft", help="write a timing-only manifest without audio")
     d.add_argument("script", type=Path)
@@ -117,12 +119,13 @@ def _print_summary(manifest: Manifest, path: Path) -> None:
             _num(ln.duration, ".2f"),
         )
         print("  ".join(row))
-        if ln.status == "flagged":
+        if ln.flags:
             print(f"  heard: {check.get('heard')!r}  flags: {', '.join(ln.flags)}")
     print(path)
 
 
 def _run_try(args: argparse.Namespace) -> int:
+    check_port(args.port)
     candidates = candidates_for(args.word, args.spell)
     carriers = check_carriers(args.carriers)
     profile = load_profile(args.voice)
@@ -135,7 +138,7 @@ def _run_try(args: argparse.Namespace) -> int:
     script = prepare(args.word, candidates, carriers, args.voice, args.style, workdir)
     out = workdir / "out"
     ensure_ignored(out)
-    build(script, options=BuildOptions(out))
+    build(script, options=BuildOptions(out, takes=TRY_TAKES))
     try_serve(TryApp(script, args.word, candidates, to, out), args.port, None if args.no_browser else webbrowser.open)
     return 0
 
@@ -148,6 +151,7 @@ def _run(args: argparse.Namespace) -> int:
     script = load_script(args.script)
     out = args.out if args.out is not None else default_out(script)
     if args.command == "review":
+        check_port(args.port)
         options = BuildOptions(out, args.voices, args.cache, args.approved)
         if not args.no_build:
             build(args.script, options=options)
@@ -156,7 +160,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.command == "draft":
         manifest = draft(args.script, out=out, pace_target=args.pace)
     else:
-        manifest = build(args.script, options=BuildOptions(out, args.voices, args.cache))
+        manifest = build(args.script, options=BuildOptions(out, args.voices, args.cache, args.approved))
     _print_summary(manifest, out / "narration.json")
     return 1 if manifest.flagged() and not getattr(args, "allow_flagged", False) else 0
 

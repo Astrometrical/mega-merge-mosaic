@@ -117,7 +117,6 @@ def test_load_timeline_and_script_cues(root, write_script):
         {"cues": [{"id": "a", "start": -1}]},
         {"cues": [{"id": "a", "start": float("inf")}]},
         {"cues": [{"id": "a", "start": "1"}]},
-        {"cues": [{"id": "a", "start": 1}, {"id": "a", "start": 2}]},
         {"cues": [{"start": 1}]},
         {"video": 3},
     ],
@@ -250,6 +249,58 @@ def test_script_cues_rejects_bad_at(root, write_script, at):
     s = write_script(root, f'[[line]]\nid = "a"\ntext = "One."\nat = {at}\n')
     with pytest.raises(NarrateError, match=r"demo\.narration\.toml.*'a'"):
         script_cues(load_script(s))
+
+
+def test_a_line_may_be_cued_twice(root, fake_ffmpeg):
+    tl = root / "timeline.json"
+    cues = [{"id": "a", "start": 0}, {"id": "b", "start": 2}, {"id": "a", "start": 4.5}]
+    tl.write_text(json.dumps({"version": 1, "video": "v.mp4", "narration": "narration.json", "cues": cues}))
+    video, manifest_path, loaded = load_timeline(tl)
+    assert loaded == [Cue("a", 0.0), Cue("b", 2.0), Cue("a", 4.5)]
+    write_manifest(root, [line("a"), line("b")])
+    video.write_bytes(b"v")
+    mux(video, manifest_path, loaded, root / "o.mp4")
+    cmd = fake_ffmpeg[0]
+    ins = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-i"][1:]
+    a, b = str((root / "clips" / "a.wav").resolve()), str((root / "clips" / "b.wav").resolve())
+    assert ins == [a, b, a]
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "[1:a]aresample=48000,adelay=0:all=1[a1]" in graph and "[3:a]aresample=48000,adelay=4500:all=1[a3]" in graph
+
+
+def test_overruns_are_per_cue_in_start_order():
+    m = Manifest("s", "v", False, 24000, lines=[line("a", 1.0), line("b", 1.0)])
+    assert overruns([Cue("a", 3.0), Cue("b", 2.0), Cue("a", 0.0)], m) == []
+    msgs = overruns([Cue("a", 0.0), Cue("a", 0.5), Cue("b", 3.0)], m)
+    assert len(msgs) == 1 and "'a' (starts 0.00 s" in msgs[0] and "overlaps 'a' (starts 0.50 s)" in msgs[0]
+
+
+def test_ffmpeg_env_naming_a_missing_file_is_a_user_error(root, monkeypatch, capsys):
+    monkeypatch.setenv("FFMPEG", str(root / "no-such-ffmpeg.exe"))
+    with pytest.raises(NarrateError, match="no-such-ffmpeg"):
+        find_ffmpeg()
+    write_manifest(root, [line("a")])
+    (root / "v.mp4").write_bytes(b"v")
+    tl = root / "timeline.json"
+    cues = [{"id": "a", "start": 0}]
+    tl.write_text(json.dumps({"version": 1, "video": "v.mp4", "narration": "narration.json", "cues": cues}))
+    assert main(["mux", "--timeline", str(tl), "-o", str(root / "o.mp4")]) == 2
+    assert "FFMPEG" in capsys.readouterr().err
+    assert not (root / "o.mp4").exists()
+
+
+def test_ffmpeg_that_cannot_start_is_a_user_error(root, monkeypatch):
+    write_manifest(root, [line("a")])
+    (root / "v.mp4").write_bytes(b"v")
+    monkeypatch.setattr("narrate.mux.find_ffmpeg", lambda: "ff")
+
+    def cannot_start(cmd, **kw):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr("narrate.mux.subprocess.run", cannot_start)
+    with pytest.raises(NarrateError, match="cannot run ffmpeg.*denied"):
+        mux(root / "v.mp4", root / "narration.json", [Cue("a", 0)], root / "o.mp4")
+    assert not (root / "o.mp4").exists() and not (root / "o.mp4.tmp.mp4").exists()
 
 
 def test_mux_paths_absolute_with_relative_inputs(root, fake_ffmpeg, monkeypatch):

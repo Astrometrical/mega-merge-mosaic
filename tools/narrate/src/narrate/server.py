@@ -15,6 +15,7 @@ from pathlib import Path
 from narrate import NarrateError
 
 MAX_BODY = 64 * 1024
+MAX_PORT = 65535
 #: (status, content type, body), optionally with extra headers.
 Response = tuple[int, str, bytes] | tuple[int, str, bytes, dict[str, str]]
 Handler = Callable[[object], Response]
@@ -191,13 +192,24 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
+def check_port(port: int) -> int:
+    """`port` if it is 0 (any free port) to 65535, else a `NarrateError`."""
+    if not 0 <= port <= MAX_PORT:
+        raise NarrateError(f"port {port} is outside 0-{MAX_PORT}")
+    return port
+
+
 class LocalServer(ThreadingHTTPServer):
-    """Binds 127.0.0.1 only; port 0 picks a free port."""
+    """Binds 127.0.0.1 only; port 0 picks a free port. A port that cannot be bound is a `NarrateError`."""
 
     daemon_threads = True
 
     def __init__(self, routes: Routes, port: int = 0) -> None:
-        super().__init__(("127.0.0.1", port), _RequestHandler)
+        check_port(port)
+        try:
+            super().__init__(("127.0.0.1", port), _RequestHandler)
+        except OSError as e:
+            raise NarrateError(f"port {port}: cannot listen on 127.0.0.1 ({e.strerror or e})") from e
         self.routes = routes
 
     @property

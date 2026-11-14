@@ -213,6 +213,27 @@ def test_cli_requires_to_without_a_pronunciation_list(voice_library, world):
     assert main(["try", WORD, "--voice", "test"]) == 2
 
 
+@pytest.mark.parametrize("garbled", [False, True])
+def test_try_build_makes_two_takes_per_line(voice_library, world, monkeypatch, root, garbled):
+    """Spec 5.6: each spelling in each carrier, with two takes each (a flagged line gets no round 2)."""
+    from collections import Counter
+
+    import narrate.cli as cli
+    from narrate.profile import Takes
+    from narrate.trylab import DEFAULT_CARRIERS, TRY_TAKES
+
+    assert TRY_TAKES == Takes(count=2, max=2)
+    monkeypatch.setattr(cli, "try_serve", lambda app, port, opener: None)
+    if garbled:
+        for carrier in DEFAULT_CARRIERS:
+            for spelling in (WORD, "neb-yoo-la"):
+                world.script(carrier.replace("{}", spelling), heard=["garbled"])
+    args = ["try", WORD, "--voice", "test", "--spell", "neb-yoo-la", "--to", str(root / "p.json"), "--no-browser"]
+    assert main(args) == 0
+    takes = Counter(text for call in world.calls for text in call)
+    assert len(takes) == 6 and set(takes.values()) == {2}
+
+
 def test_cli_try_serves_and_stops(voice_library, world, monkeypatch, root, capsys):
     import narrate.cli as cli
 
