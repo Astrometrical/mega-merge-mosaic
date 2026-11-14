@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from collections.abc import Callable
+from importlib import resources
 from pathlib import Path
 
 from narrate import NarrateError
@@ -15,9 +17,11 @@ from narrate.checkers import Checker
 from narrate.lock import Lock, lock_path
 from narrate.manifest import Manifest, ManifestLine, read_manifest
 from narrate.script import load_script
-from narrate.server import Response, Routes, json_response, serve_clip
+from narrate.server import LocalServer, Response, Routes, json_response, serve_clip, start
 
-PLACEHOLDER_PAGE = "<!doctype html><title>narrate review</title><p>review page not built yet</p>"
+
+def _page() -> bytes:
+    return (resources.files("narrate") / "pages" / "review.html").read_bytes()
 
 
 def _sha256(path: Path) -> str:
@@ -53,7 +57,7 @@ class ReviewApp:
     def routes(self) -> Routes:
         """The review routes."""
         r = Routes()
-        r.add("GET", "/", lambda _b: (200, "text/html; charset=utf-8", PLACEHOLDER_PAGE.encode("utf-8")))
+        r.add("GET", "/", lambda _b: (200, "text/html; charset=utf-8", _page()))
         r.add("GET", "/api/state", lambda _b: self._state())
         r.add_prefix("GET", "/clips/", lambda p: serve_clip(self.out, [ln.id for ln in self.manifest.lines], p))
         r.add("POST", "/api/approve", lambda b: self._edit(lambda lock: self._approve(lock, self._line(b))))
@@ -146,3 +150,27 @@ class ReviewApp:
         finally:
             self._build.release()
         return self._state()
+
+
+def serve(
+    app: ReviewApp,
+    port: int,
+    opener: Callable[[str], object] | None,
+    ready: Callable[[LocalServer], None] | None = None,
+) -> None:
+    """Serve the review page until interrupted (or until the server is shut down from elsewhere)."""
+    server = LocalServer(app.routes(), port)
+    thread = start(server)
+    try:
+        print(f"Reviewing {app.script_path} at {server.url} (Ctrl+C to stop)", flush=True)
+        if ready is not None:
+            ready(server)
+        if opener is not None:
+            opener(server.url)
+        while thread.is_alive():
+            thread.join(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()

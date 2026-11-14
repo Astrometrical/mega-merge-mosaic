@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import sys
 import traceback
+import webbrowser
 from pathlib import Path
 
 from narrate import NarrateError, __version__
 from narrate.build import BuildOptions, build, default_out
 from narrate.draft import PACE_TARGET, draft
 from narrate.manifest import Manifest
+from narrate.review import ReviewApp, serve
 from narrate.script import load_script
 
 
@@ -25,7 +27,7 @@ def _positive_float(text: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the top-level parser with the `build` and `draft` subcommands."""
+    """Build the top-level parser with the `build`, `draft` and `review` subcommands."""
     parser = argparse.ArgumentParser(prog="narrate", description="Script to voice-over audio.")
     parser.add_argument("--version", action="version", version=f"narrate {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -41,6 +43,15 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument(
         "--pace", type=_positive_float, default=PACE_TARGET, help="syllables per second (default %(default)s)"
     )
+    r = sub.add_parser("review", help="listen to new lines in the browser and approve or reject them")
+    r.add_argument("script", type=Path)
+    r.add_argument("--out", type=Path, help="output directory (default: <script dir>/out/<stem>)")
+    r.add_argument("--voices", type=Path, help="voice library directory")
+    r.add_argument("--cache", type=Path, help="take cache directory")
+    r.add_argument("--approved", type=Path, help="approved-take store directory")
+    r.add_argument("--port", type=int, default=0, help="port to listen on (default: any free port)")
+    r.add_argument("--no-browser", action="store_true", help="do not open the page in a browser")
+    r.add_argument("--no-build", action="store_true", help="review the existing build without building first")
     return parser
 
 
@@ -69,6 +80,12 @@ def _print_summary(manifest: Manifest, path: Path) -> None:
 def _run(args: argparse.Namespace) -> int:
     script = load_script(args.script)
     out = args.out if args.out is not None else default_out(script)
+    if args.command == "review":
+        options = BuildOptions(out, args.voices, args.cache, args.approved)
+        if not args.no_build:
+            build(args.script, options=options)
+        serve(ReviewApp(args.script, options), args.port, None if args.no_browser else webbrowser.open)
+        return 0
     if args.command == "draft":
         manifest = draft(args.script, out=out, pace_target=args.pace)
     else:

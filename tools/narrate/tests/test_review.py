@@ -283,3 +283,14 @@ def test_state_reads_do_not_break_concurrent_saves(make_app):
             t.join(10)
     lock = Lock.load(lock_path(path))
     assert set(lock.pins) == {"a", "b"} and lock.notes == {"a": "n9"}
+
+
+def test_page_is_served(make_app):
+    _, _, server = make_app(("a", LINE))
+    status, data = call(server.url + "/")
+    assert status == 200
+    page = data.decode("utf-8")
+    assert page.lstrip().lower().startswith("<!doctype html>")
+    for api in ("/api/state", "/api/approve", "/api/reject", "/api/note", "/api/approve-unflagged", "/api/rebuild"):
+        assert api in page
+    assert "http://" not in page and "https://" not in page

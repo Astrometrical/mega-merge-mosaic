@@ -94,3 +94,53 @@ def test_cli_unexpected_exception_exit_3(root, write_script, voice_library, worl
     assert main(["build", str(make(root, write_script))]) == 3
     err = capsys.readouterr().err
     assert "kaboom" in err and "internal error" in err
+
+
+def test_cli_review_no_browser(root, write_script, voice_library, world, capsys, monkeypatch):
+    import json
+    import threading
+    import urllib.request
+
+    from narrate import review
+
+    script = make(root, write_script)
+    got = {}
+    ready = threading.Event()
+    opened = []
+    real_serve = review.serve
+
+    def on_ready(server):
+        got["server"] = server
+        ready.set()
+
+    monkeypatch.setattr("narrate.cli.serve", lambda app, port, opener: real_serve(app, port, opener, on_ready))
+    monkeypatch.setattr("narrate.cli.webbrowser.open", opened.append)
+    result = {}
+    t = threading.Thread(
+        target=lambda: result.update(code=main(["review", str(script), "--no-browser", "--port", "0"]))
+    )
+    t.start()
+    assert ready.wait(30)
+    server = got["server"]
+    with urllib.request.urlopen(server.url + "/api/state") as r:
+        state = json.loads(r.read())
+    assert state["manifest"]["lines"][0]["id"] == "one"
+    server.shutdown()
+    t.join(10)
+    assert result["code"] == 0
+    assert opened == []
+    assert "Reviewing" in capsys.readouterr().out
+
+
+def test_cli_review_opens_browser_and_build_errors_skip_server(root, write_script, voice_library, world, monkeypatch):
+    opened = []
+    monkeypatch.setattr("narrate.cli.serve", lambda app, port, opener: opener("http://x/"))
+    monkeypatch.setattr("narrate.cli.webbrowser.open", opened.append)
+    script = make(root, write_script)
+    assert main(["review", str(script), "--port", "0"]) == 0
+    assert opened == ["http://x/"]
+    bad = make(root, write_script, voice="nobody")
+    called = []
+    monkeypatch.setattr("narrate.cli.serve", lambda *a: called.append(1))
+    assert main(["review", str(bad)]) == 2
+    assert called == []
