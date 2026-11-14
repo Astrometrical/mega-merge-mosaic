@@ -406,7 +406,7 @@ The format of `voice/pronunciations.json`: `{"about", "entries": [{"match", "say
 - **`flags`** lists, in any order:
   - `words`: no take was heard as the text (the character error rate is at or above the word check's limit);
   - `pace`: every take of a passage that passes the word check is faster than `pace.max`;
-  - `pinned-audio-missing`: the line was approved, but that audio is in neither the approved store nor the cache. It comes with `new`, and its take is fresh and unheard.
+  - `pinned-audio-missing`: the line was approved, but that audio is in neither the approved store nor the cache. The line comes back `new`, or `flagged` when the replacement take also fails its checks; either way its take is fresh and unheard.
 - **`check`** describes the chosen take:
   - `heard`, `cer` and `pace` are the checker's measurements (`null` when not finite);
   - `take` and `key` name it in the take cache;
