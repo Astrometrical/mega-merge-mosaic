@@ -1,6 +1,5 @@
 """Sentence captions: one caption per sentence, timed against the pauses."""
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,6 +10,7 @@ from narrate.text import sentences, syllables
 CAPTION_TOP_DB = 30.0
 CAPTION_PAUSE_MIN = 0.15
 SNAP_WINDOW = 1.5  # seconds a boundary may move to reach a pause
+PAUSE_WEIGHT = 1.0  # cost reduction per second of pause length when snapping
 
 
 @dataclass(frozen=True)
@@ -48,27 +48,33 @@ def share_captions(text: str, duration: float) -> list[Caption]:
     return _build(sents, [duration * f for f in _cumulative_fractions(sents)], duration)
 
 
-def _match(targets: list[float], mids: list[float]) -> list[float]:
+def _match(targets: list[float], found: list[tuple[float, float]]) -> list[float]:
     """Place each boundary on a nearby pause midpoint, or leave it at its target.
 
-    Monotonic DP: a snap (|m - target| <= SNAP_WINDOW) costs the distance, no
-    pause costs SNAP_WINDOW, and snapped pauses strictly increase across boundaries.
+    `found` holds (start, end) pauses. Monotonic DP: a snap (|m - target| <= SNAP_WINDOW)
+    costs the distance minus PAUSE_WEIGHT times the pause length (so longer pauses win),
+    no pause costs SNAP_WINDOW, and snapped pauses strictly increase across boundaries.
     """
+    mids = [(a + b) / 2 for a, b in found]
+    lengths = [b - a for a, b in found]
+
+    def snap(k: int, j: int) -> float:
+        return abs(mids[j - 1] - targets[k - 1]) - PAUSE_WEIGHT * lengths[j - 1]
+
     n, m = len(targets), len(mids)
     # f[k][j]: best cost placing the first k boundaries using only the first j pauses
     f = [[0.0] * (m + 1)] + [[SNAP_WINDOW * k] + [0.0] * m for k in range(1, n + 1)]
     for k in range(1, n + 1):
         for j in range(1, m + 1):
             best = min(f[k][j - 1], f[k - 1][j] + SNAP_WINDOW)
-            d = abs(mids[j - 1] - targets[k - 1])
-            if d <= SNAP_WINDOW:
-                best = min(best, f[k - 1][j - 1] + d)
+            if abs(mids[j - 1] - targets[k - 1]) <= SNAP_WINDOW:
+                best = min(best, f[k - 1][j - 1] + snap(k, j))
             f[k][j] = best
     out = list(targets)
     k, j = n, m
     while k > 0:
-        d = abs(mids[j - 1] - targets[k - 1]) if j > 0 else math.inf
-        if j > 0 and d <= SNAP_WINDOW and f[k][j] == f[k - 1][j - 1] + d:
+        near = j > 0 and abs(mids[j - 1] - targets[k - 1]) <= SNAP_WINDOW
+        if near and f[k][j] == f[k - 1][j - 1] + snap(k, j):
             out[k - 1] = mids[j - 1]
             k, j = k - 1, j - 1
         elif j > 0 and f[k][j] == f[k][j - 1]:
@@ -84,16 +90,16 @@ def sentence_captions(text: str, audio: np.ndarray, sr: int) -> list[Caption]:
     """Captions whose boundaries snap to nearby pauses, else sit at syllable shares.
 
     Each boundary's target is its cumulative syllable share of the speech span;
-    it snaps to a pause midpoint within `SNAP_WINDOW` seconds when one fits the
-    monotonic best assignment. With no pauses (or no speech) this is `share_captions`.
+    it snaps to a pause midpoint within `SNAP_WINDOW` seconds (preferring longer
+    pauses) per the monotonic best assignment. With no pauses (or no speech) this is `share_captions`.
     """
     duration = len(audio) / sr
     sents = sentences(text)
     if len(sents) < 2:
         return _build(sents, [], duration)
     s0, s1 = speech_span(audio, sr)
-    mids = [(a + b) / 2 for a, b in pauses(audio, sr, min_secs=CAPTION_PAUSE_MIN, top_db=CAPTION_TOP_DB)]
-    if s1 <= s0 or not mids:
+    found = pauses(audio, sr, min_secs=CAPTION_PAUSE_MIN, top_db=CAPTION_TOP_DB)
+    if s1 <= s0 or not found:
         return share_captions(text, duration)
     targets = [s0 + (s1 - s0) * f for f in _cumulative_fractions(sents)]
-    return _build(sents, _match(targets, mids), duration)
+    return _build(sents, _match(targets, found), duration)

@@ -79,3 +79,9 @@ def test_far_pause_is_ignored():
     y = np.concatenate([tone(2.3), silence(0.4), tone(6.3)])
     caps = sentence_captions("Ba ba ba ba. Da da da da.", y, SR)
     assert caps[0].end == pytest.approx(4.5, abs=0.05)
+
+
+def test_longer_pause_wins_near_a_paragraph_break():
+    y = np.concatenate([tone(2.05), silence(0.6), tone(0.765), silence(0.17), tone(5.415)])
+    caps = sentence_captions(THREE, y, SR)
+    assert caps[0].end == pytest.approx(2.35, abs=0.08)
