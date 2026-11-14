@@ -1602,6 +1602,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "mega-tour",
  "mega-ui",
  "mmm-core",
  "rfd",

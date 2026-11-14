@@ -35,6 +35,8 @@ mod synth_mosaic;
 #[cfg(test)]
 mod testutil;
 mod tile_source;
+#[cfg(test)]
+mod tours;
 mod util;
 
 use std::path::PathBuf;
