@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,9 @@ class ManifestLine:
 
     def to_json(self) -> dict:
         """JSON form with the section 8.4 field names."""
+        return _finite(self._raw_json())
+
+    def _raw_json(self) -> dict:
         return {
             "id": self.id,
             "text": self.text,
@@ -61,23 +65,27 @@ class Manifest:
     lines: list[ManifestLine] = field(default_factory=list)
 
     def to_json(self) -> dict:
-        """JSON form, `version` first."""
-        return {
-            "version": VERSION,
-            "script": self.script,
-            "voice": self.voice,
-            "draft": self.draft,
-            "sample_rate": self.sample_rate,
-            "lead": self.lead,
-            "breath": self.breath,
-            "lines": [ln.to_json() for ln in self.lines],
-        }
+        """JSON form, `version` first; non-finite numbers become null."""
+        return _finite(
+            {
+                "version": VERSION,
+                "script": self.script,
+                "voice": self.voice,
+                "draft": self.draft,
+                "sample_rate": self.sample_rate,
+                "lead": self.lead,
+                "breath": self.breath,
+                "lines": [ln.to_json() for ln in self.lines],
+            }
+        )
 
     def write(self, path: Path) -> None:
-        """Write strict JSON (non-finite numbers become null), UTF-8."""
+        """Write strict JSON (non-finite numbers become null), UTF-8, atomically."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        text = json.dumps(_finite(self.to_json()), indent=1, ensure_ascii=False, allow_nan=False)
-        path.write_text(text + "\n", encoding="utf-8")
+        text = json.dumps(self.to_json(), indent=1, ensure_ascii=False, allow_nan=False)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text + "\n", encoding="utf-8")
+        os.replace(tmp, path)
 
     def flagged(self) -> list[str]:
         """Ids of the flagged lines."""

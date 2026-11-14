@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from narrate.build import default_out
+from narrate import NarrateError
+from narrate.build import default_out, ensure_ignored
 from narrate.captions import Caption, share_captions
 from narrate.lexicon import Lexicon
 from narrate.manifest import Manifest, ManifestLine
@@ -16,6 +17,8 @@ PACE_TARGET = 4.8  # syllables per second
 
 def draft(script_path: Path, *, out: Path | None = None, pace_target: float = PACE_TARGET) -> Manifest:
     """Write `<out>/narration.json` with estimated durations; only the script's own lists apply."""
+    if pace_target <= 0:
+        raise NarrateError(f"pace must be positive, got {pace_target}")
     script = load_script(script_path)
     lexicon = Lexicon.load(list(script.pronunciations))
     lines = []
@@ -38,5 +41,7 @@ def draft(script_path: Path, *, out: Path | None = None, pace_target: float = PA
             )
         )
     manifest = Manifest(script.path.name, script.voice, True, None, lines=lines)
-    manifest.write((out if out is not None else default_out(script)) / "narration.json")
+    out = out if out is not None else default_out(script)
+    ensure_ignored(out)
+    manifest.write(out / "narration.json")
     return manifest

@@ -43,6 +43,20 @@ def test_write_is_strict_json_with_null_for_non_finite(root):
     assert data["lines"][0]["check"]["pace"] is None
 
 
+def test_to_json_is_strict_json():
+    m = sample()
+    json.dumps(m.to_json(), allow_nan=False)
+    json.dumps(m.lines[0].to_json(), allow_nan=False)
+    m.lines[0].duration = float("inf")
+    assert m.to_json()["lines"][0]["duration"] is None
+
+
+def test_write_is_atomic(root):
+    path = root / "m" / "narration.json"
+    sample().write(path)
+    assert sorted(p.name for p in path.parent.iterdir()) == ["narration.json"]
+
+
 def test_round_trip_and_flagged(root):
     path = root / "m" / "narration.json"
     m = sample()

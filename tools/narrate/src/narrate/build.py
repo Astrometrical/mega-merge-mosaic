@@ -15,7 +15,7 @@ from narrate.captions import Caption, sentence_captions
 from narrate.checkers import Checker, get_checker
 from narrate.lexicon import Lexicon
 from narrate.manifest import Manifest, ManifestLine
-from narrate.profile import Reference, VoiceProfile, load_profile
+from narrate.profile import ProfileError, Reference, VoiceProfile, load_profile
 from narrate.script import Line, Script, ScriptError, load_script
 from narrate.select import Choice, TakeResult, choose, evaluate
 from narrate.text import infer_kind
@@ -47,13 +47,24 @@ def default_out(script: Script) -> Path:
     return script.path.parent / "out" / script.stem
 
 
+def ensure_ignored(out: Path) -> None:
+    """Create `out` with a `.gitignore` of `*` (kept if present) so voice audio is never committed."""
+    out.mkdir(parents=True, exist_ok=True)
+    ignore = out / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
+
+
 def _plan_lines(script: Script, profile: VoiceProfile, lexicon: Lexicon) -> list[_Plan]:
     plans = []
     for line in script.lines:
         spoken = line.say or lexicon.apply(line.text)
         kind = line.kind or infer_kind(line.text)
         style = line.style or script.style or profile.default_style
-        reference = profile.reference(style, kind)
+        try:
+            reference = profile.reference(style, kind)
+        except ProfileError as e:
+            raise ProfileError(f"line {line.id!r}: {e}") from e
         answers = lexicon.variants(line.text)
         if line.say:
             answers = [*answers, line.say]
@@ -150,6 +161,7 @@ def build(
     finally:
         checker.close()
 
+    ensure_ignored(out)
     lines: list[ManifestLine] = []
     sample_rate: int | None = None
     for p in plans:

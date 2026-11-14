@@ -161,9 +161,16 @@ def test_backend_closed_before_checking(make, world):
 
 def test_missing_style_fails_before_generation(root, write_script, voice_library, world):
     body = script_text(("one", LINE)) + '\n[[line]]\nid = "two"\ntext = "Story time."\nstyle = "story"\n'
-    with pytest.raises(ProfileError):
+    with pytest.raises(ProfileError, match=r"line 'two': .*story"):
         build(write_script(root, body))
     assert world.events == []
+
+
+def test_build_ignores_its_output_folder(make, world):
+    path = make(("one", LINE))
+    out = default_out(load_script(path))
+    build(path)
+    assert (out / ".gitignore").read_text(encoding="utf-8").strip() == "*"
 
 
 def test_missing_voice_is_a_script_error(root, write_script, voice_library, world):
