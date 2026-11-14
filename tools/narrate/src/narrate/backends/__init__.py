@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
+from narrate import NarrateError
+
 if TYPE_CHECKING:
     from narrate.profile import Reference, VoiceProfile
 
@@ -29,11 +31,13 @@ class Backend(Protocol):
 def get_backend(name: str, profile: VoiceProfile) -> Backend:
     """The backend called `name`, imported lazily so core never loads torch."""
     if name == "qwen3-tts":
-        from narrate.backends.qwen import QwenBackend
-
+        try:
+            from narrate.backends.qwen import QwenBackend
+        except ImportError as e:
+            raise NarrateError("backend 'qwen3-tts' needs the qwen extra: uv sync --extra qwen") from e
         return QwenBackend(profile)
     if name == "fake":
         from narrate import fakes
 
         return fakes.FakeBackend(fakes.default_world())
-    raise ValueError(f"unknown backend {name!r}; known backends: {', '.join(BACKEND_NAMES)}")
+    raise NarrateError(f"unknown backend {name!r}; known backends: {', '.join(BACKEND_NAMES)}")

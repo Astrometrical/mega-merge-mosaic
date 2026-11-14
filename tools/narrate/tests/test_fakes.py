@@ -1,6 +1,5 @@
 import subprocess
 import sys
-from importlib.util import find_spec
 
 import pytest
 
@@ -74,8 +73,6 @@ def test_registry(monkeypatch, voice_library):
 
 
 def test_core_import_does_not_import_torch():
-    mods = ["narrate.backends", "narrate.checkers"]
-    if find_spec("narrate.build") is not None:
-        mods.insert(0, "narrate.build")
+    mods = ["narrate.backends", "narrate.checkers", "narrate.cli", "narrate.draft", "narrate.fakes", "narrate.build"]
     code = f"import {', '.join(mods)}, sys; assert 'torch' not in sys.modules"
     subprocess.run([sys.executable, "-c", code], check=True)

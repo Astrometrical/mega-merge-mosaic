@@ -24,6 +24,20 @@ def test_loads_profile(voice_library):
     assert p.styles["explainer"]["long"].seconds == pytest.approx(49.0)
 
 
+@pytest.mark.parametrize("key", ["backend", "checker"])
+def test_unknown_backend_or_checker(voice_library, key):
+    p = voice_library / "test" / "voice.toml"
+    p.write_text(p.read_text(encoding="utf-8").replace(f'{key} = "fake"', f'{key} = "nope"'), encoding="utf-8")
+    with pytest.raises(ProfileError, match=rf"voice\.toml.*unknown {key} 'nope'"):
+        load_profile("test")
+
+
+def test_non_utf8_profile(voice_library):
+    (voice_library / "test" / "voice.toml").write_bytes(b'backend = "fake" # \xff\xfe\n')
+    with pytest.raises(ProfileError, match=r"voice\.toml"):
+        load_profile("test")
+
+
 def test_reference_choice(voice_library):
     p = load_profile("test")
     assert p.reference("explainer", "line") is p.styles["explainer"]["short"]

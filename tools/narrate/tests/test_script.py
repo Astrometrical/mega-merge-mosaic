@@ -6,6 +6,13 @@ from narrate import NarrateError
 from narrate.script import Line, ScriptError, load_script
 
 
+def test_non_utf8_script(root):
+    p = root / "bad.narration.toml"
+    p.write_bytes(b'voice = "test" # \xff\xfe\n')
+    with pytest.raises(ScriptError, match=r"bad\.narration\.toml"):
+        load_script(p)
+
+
 def test_loads_lines_and_resolves_lists(root, write_script):
     p = write_script(
         root,

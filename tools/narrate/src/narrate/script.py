@@ -87,7 +87,7 @@ def load_script(path: Path) -> Script:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
         raise ScriptError(f"{path}: invalid TOML: {e}") from e
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         raise ScriptError(f"{path}: cannot read: {e}") from e
     where = f"{path}: "
     unknown = sorted(set(data) - _SCRIPT_KEYS)

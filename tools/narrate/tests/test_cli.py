@@ -58,3 +58,39 @@ def test_cli_draft(root, write_script, capsys):
     out = default_out(load_script(path))
     assert (out / "narration.json").is_file()
     assert "draft" in capsys.readouterr().out
+
+
+def test_cli_missing_extra_exit_2(root, write_script, voice_library, monkeypatch, capsys):
+    import builtins
+
+    real = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "narrate.backends.qwen":
+            raise ImportError("no torch")
+        return real(name, *a, **kw)
+
+    path = make(root, write_script)
+    prof = voice_library / "test" / "voice.toml"
+    prof.write_text(prof.read_text(encoding="utf-8").replace('backend = "fake"', 'backend = "qwen3-tts"'))
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert main(["build", str(path)]) == 2
+    assert "uv sync --extra qwen" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("pace", ["0", "-2", "nan", "abc"])
+def test_cli_bad_pace_exit_2(root, write_script, pace):
+    path = make(root, write_script)
+    assert main(["draft", str(path), "--pace", pace]) == 2
+
+
+def test_cli_unexpected_exception_exit_3(root, write_script, voice_library, world, monkeypatch, capsys):
+    import narrate.cli
+
+    def boom(*a, **kw):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(narrate.cli, "build", boom)
+    assert main(["build", str(make(root, write_script))]) == 3
+    err = capsys.readouterr().err
+    assert "kaboom" in err and "internal error" in err

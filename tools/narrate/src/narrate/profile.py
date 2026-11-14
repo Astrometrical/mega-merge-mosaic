@@ -11,6 +11,8 @@ from pathlib import Path
 import soundfile
 
 from narrate import NarrateError
+from narrate.backends import BACKEND_NAMES
+from narrate.checkers import CHECKER_NAMES
 
 DEFAULT_PACE_MAX = 5.3
 DEFAULT_PACE_TARGET = 4.8
@@ -151,7 +153,7 @@ def load_profile(name: str, library: Path | None = None) -> VoiceProfile:
         raise ProfileError(f"{path}: voice profile {name!r} not found")
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as e:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise ProfileError(f"{path}: cannot parse ({e})") from e
     where = str(path)
     _check_keys(where, data, _TOP_KEYS)
@@ -195,17 +197,24 @@ def load_profile(name: str, library: Path | None = None) -> VoiceProfile:
         _number(f"{where}: [takes]", takes_raw, "max", DEFAULT_TAKES_MAX, int),
     )
 
+    backend = _string(where, data, "backend")
+    if backend not in BACKEND_NAMES:
+        raise ProfileError(f"{where}: unknown backend {backend!r}; known backends: {', '.join(BACKEND_NAMES)}")
+    checker = _string(where, data, "checker", "whisper")
+    if checker not in CHECKER_NAMES:
+        raise ProfileError(f"{where}: unknown checker {checker!r}; known checkers: {', '.join(CHECKER_NAMES)}")
+
     return VoiceProfile(
         name=name,
         root=root,
-        backend=_string(where, data, "backend"),
+        backend=backend,
         model=_string(where, data, "model"),
         default_style=default_style,
         pronunciations=tuple(root / p for p in pron),
         styles=styles,
         language=_string(where, data, "language", "English"),
         precision=_string(where, data, "precision", "fp16"),
-        checker=_string(where, data, "checker", "whisper"),
+        checker=checker,
         pace=pace,
         takes=takes,
     )

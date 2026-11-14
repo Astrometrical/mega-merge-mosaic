@@ -6,6 +6,8 @@ from typing import Protocol
 
 import numpy as np
 
+from narrate import NarrateError
+
 CHECKER_NAMES = ("whisper", "fake")
 
 
@@ -26,11 +28,13 @@ class Checker(Protocol):
 def get_checker(name: str) -> Checker:
     """The checker called `name`, imported lazily so core never loads torch."""
     if name == "whisper":
-        from narrate.checkers.whisper import WhisperChecker
-
+        try:
+            from narrate.checkers.whisper import WhisperChecker
+        except ImportError as e:
+            raise NarrateError("checker 'whisper' needs the qwen extra: uv sync --extra qwen") from e
         return WhisperChecker()
     if name == "fake":
         from narrate import fakes
 
         return fakes.FakeChecker(fakes.default_world())
-    raise ValueError(f"unknown checker {name!r}; known checkers: {', '.join(CHECKER_NAMES)}")
+    raise NarrateError(f"unknown checker {name!r}; known checkers: {', '.join(CHECKER_NAMES)}")
