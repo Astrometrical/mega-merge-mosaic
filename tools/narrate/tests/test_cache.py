@@ -1,4 +1,5 @@
 import dataclasses
+import json
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,40 @@ def test_store_round_trip(root):
     assert store.heard(key, 1, "other") == "hi"
     assert store.heard(key, 2, "whisper") is None
     assert store.takes(key) == [1, 2]
+
+
+def test_regenerated_take_does_not_reuse_old_transcript(root):
+    store = TakeStore(root)
+    key = "ab" + "c" * 22
+    store.save(key, 1, np.zeros(100, dtype=np.float32), 8000)
+    store.set_heard(key, 1, "whisper", "old words")
+    store.path(key, 1).unlink()
+    store.save(key, 1, np.ones(100, dtype=np.float32) * 0.1, 8000)
+    assert store.heard(key, 1, "whisper") is None
+    assert not store.path(key, 1).with_suffix(".json").exists()
+
+
+def test_sidecar_with_wrong_fingerprint_is_ignored(root):
+    store = TakeStore(root)
+    key = "ab" + "c" * 22
+    store.save(key, 1, np.zeros(100, dtype=np.float32), 8000)
+    store.set_heard(key, 1, "whisper", "words")
+    assert store.heard(key, 1, "whisper") == "words"
+    sidecar = store.path(key, 1).with_suffix(".json")
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    data["sha256"] = "0" * 64
+    sidecar.write_text(json.dumps(data), encoding="utf-8")
+    assert store.heard(key, 1, "whisper") is None
+    store.set_heard(key, 1, "other", "fresh")
+    assert store.heard(key, 1, "whisper") is None and store.heard(key, 1, "other") == "fresh"
+
+
+def test_legacy_sidecar_without_fingerprint_is_ignored(root):
+    store = TakeStore(root)
+    key = "ab" + "c" * 22
+    store.save(key, 1, np.zeros(100, dtype=np.float32), 8000)
+    store.path(key, 1).with_suffix(".json").write_text('{"heard": {"whisper": "x"}}', encoding="utf-8")
+    assert store.heard(key, 1, "whisper") is None
 
 
 def test_tmp_files_are_ignored(root):

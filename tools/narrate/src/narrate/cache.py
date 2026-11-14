@@ -70,6 +70,7 @@ class TakeStore:
         final = self.path(key, n)
         tmp = final.with_name(final.name + ".tmp")
         tmp.parent.mkdir(parents=True, exist_ok=True)
+        self._sidecar(key, n).unlink(missing_ok=True)  # a transcript belongs to its audio
         sf.write(tmp, audio, sr, subtype="FLOAT", format="WAV")
         os.replace(tmp, final)
         return final
@@ -81,11 +82,18 @@ class TakeStore:
     def _sidecar(self, key: str, n: int) -> Path:
         return self.path(key, n).with_suffix(".json")
 
+    def _fingerprint(self, key: str, n: int) -> str:
+        return hashlib.sha256(self.path(key, n).read_bytes()).hexdigest()
+
     def _read_heard(self, key: str, n: int) -> dict[str, str]:
+        """Transcripts recorded for the take's current audio; none if it changed."""
         p = self._sidecar(key, n)
-        if not p.is_file():
+        if not p.is_file() or not self.path(key, n).is_file():
             return {}
-        return json.loads(p.read_text(encoding="utf-8")).get("heard", {})
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if data.get("sha256") != self._fingerprint(key, n):
+            return {}
+        return data.get("heard", {})
 
     def heard(self, key: str, n: int, checker: str) -> str | None:
         """What `checker` heard in take `n`, if it has listened."""
@@ -98,5 +106,5 @@ class TakeStore:
         final = self._sidecar(key, n)
         final.parent.mkdir(parents=True, exist_ok=True)
         tmp = final.with_name(final.name + ".tmp")
-        tmp.write_text(json.dumps({"heard": heard}), encoding="utf-8")
+        tmp.write_text(json.dumps({"sha256": self._fingerprint(key, n), "heard": heard}), encoding="utf-8")
         os.replace(tmp, final)
