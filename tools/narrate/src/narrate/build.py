@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from narrate._fs import ensure_ignored, sha256_file
 from narrate.approved import ApprovedStore, approved_root
 from narrate.audio import normalise_loudness, trim, write_wav
 from narrate.backends import Backend, get_backend
@@ -49,14 +49,6 @@ class _Plan:
 def default_out(script: Script) -> Path:
     """`<script dir>/out/<stem>`."""
     return script.path.parent / "out" / script.stem
-
-
-def ensure_ignored(out: Path) -> None:
-    """Create `out` with a `.gitignore` of `*` (kept if present) so voice audio is never committed."""
-    out.mkdir(parents=True, exist_ok=True)
-    ignore = out / ".gitignore"
-    if not ignore.exists():
-        ignore.write_text("*\n", encoding="utf-8")
 
 
 def _plan_lines(script: Script, profile: VoiceProfile, lexicon: Lexicon) -> list[_Plan]:
@@ -155,10 +147,6 @@ def _select(
     return choices
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _usable_pins(
     plans: list[_Plan], lock: Lock, store: TakeStore, approved: ApprovedStore
 ) -> tuple[dict[str, Pin], set[str]]:
@@ -173,13 +161,12 @@ def _usable_pins(
         pin = lock.pins.get(p.line.id)
         if pin is None or pin.key != p.key or pin.take in lock.rejected.get(pin.key, set()):
             continue
-        stored = approved.path(pin.key, pin.take)
-        if approved.has(pin.key, pin.take) and _sha256(stored) == pin.sha256:
+        if approved.has(pin.sha256) and sha256_file(approved.path(pin.sha256)) == pin.sha256:
             usable[p.line.id] = pin
             continue
         cached = store.path(pin.key, pin.take)
-        if cached.is_file() and _sha256(cached) == pin.sha256:
-            approved.put(pin.key, pin.take, cached)
+        if cached.is_file() and sha256_file(cached) == pin.sha256:
+            approved.put(pin.sha256, cached)
             usable[p.line.id] = pin
         else:
             missing.add(p.line.id)
@@ -219,9 +206,16 @@ def build(
     for p in plans:
         pin = pins.get(p.line.id)
         if pin is not None:
-            audio, sr = approved.load(p.key, pin.take)
+            audio, sr = approved.load(pin.sha256)
             status, flags = "approved", []
-            check = {"heard": pin.heard, "cer": pin.cer, "pace": pin.pace, "take": pin.take, "key": p.key}
+            check = {
+                "heard": pin.heard,
+                "cer": pin.cer,
+                "pace": pin.pace,
+                "take": pin.take,
+                "key": p.key,
+                "sha256": pin.sha256,
+            }
         else:
             choice = choices[p.line.id]
             audio, sr = store.load(p.key, choice.take.n)
@@ -233,6 +227,7 @@ def build(
                 "pace": choice.take.pace,
                 "take": choice.take.n,
                 "key": p.key,
+                "sha256": sha256_file(store.path(p.key, choice.take.n)),
             }
         clip = normalise_loudness(trim(audio, sr), sr)
         rel = f"clips/{p.line.id}.wav"

@@ -129,3 +129,19 @@ def test_read_manifest_missing_field_names_line(root):
     path.write_text(json.dumps({"version": 1, "script": "s", "lines": [_line()]}), encoding="utf-8")
     with pytest.raises(NarrateError, match="'open'"):
         read_manifest(path)
+
+
+@pytest.mark.parametrize("bad", [3, None, "abc", "A" * 64, "0" * 63, "g" * 64])
+def test_check_sha256_is_type_checked(root, bad):
+    path = root / "m.json"
+    path.write_text(_doc(check={"take": 1, "sha256": bad}), encoding="utf-8")
+    with pytest.raises(NarrateError, match=r"m\.json.*'open'.*sha256"):
+        read_manifest(path)
+
+
+def test_check_sha256_round_trips(root):
+    path = root / "m.json"
+    path.write_text(_doc(check={"take": 1, "sha256": "0123456789abcdef" * 4}), encoding="utf-8")
+    assert read_manifest(path).lines[0].check["sha256"] == "0123456789abcdef" * 4
+    path.write_text(_doc(check={"take": 1}), encoding="utf-8")
+    assert "sha256" not in read_manifest(path).lines[0].check

@@ -36,18 +36,24 @@ def make(root, write_script, voice_library):
     return lambda *lines: write_script(root, script_text(*lines))
 
 
+def cached_take(line):
+    return TakeStore(cache_root(None)).path(line.check["key"], line.check["take"])
+
+
+def take_sha(line):
+    return hashlib.sha256(cached_take(line).read_bytes()).hexdigest()
+
+
 def pin_line(path, line):
     lock = Lock.load(lock_path(path))
     c = line.check
-    sha = hashlib.sha256(TakeStore(cache_root(None)).path(c["key"], c["take"]).read_bytes()).hexdigest()
-    lock.pin(line.id, c["key"], c["take"], line.duration, c["heard"], c["cer"], c["pace"], sha)
+    lock.pin(line.id, c["key"], c["take"], line.duration, c["heard"], c["cer"], c["pace"], take_sha(line))
     lock.save()
     return lock
 
 
 def store_approved(line):
-    key, take = line.check["key"], line.check["take"]
-    ApprovedStore(approved_root(None)).put(key, take, TakeStore(cache_root(None)).path(key, take))
+    ApprovedStore(approved_root(None)).put(take_sha(line), cached_take(line))
 
 
 def test_pinned_line_is_approved_without_work(make, world):
@@ -68,6 +74,7 @@ def test_pinned_line_is_approved_without_work(make, world):
 def test_approved_line_survives_cache_loss(make, world):
     path = make(("a", LINE))
     a = build(path).lines[0]
+    sha = take_sha(a)
     store_approved(a)
     pin_line(path, a)
     shutil.rmtree(cache_root(None) / "takes")
@@ -77,7 +84,7 @@ def test_approved_line_survives_cache_loss(make, world):
     assert world.calls == []
     assert "transcribe" not in world.events
     assert m.lines[0].status == "approved"
-    audio, sr = ApprovedStore(approved_root(None)).load(a.check["key"], a.check["take"])
+    audio, sr = ApprovedStore(approved_root(None)).load(sha)
     expected = normalise_loudness(trim(audio, sr), sr)
     got, _ = read_wav(default_out(load_script(path)) / m.lines[0].clip)
     assert np.allclose(got, expected, atol=1e-3)
@@ -88,9 +95,9 @@ def test_pin_repairs_the_store_from_cache(make, world):
     a = build(path).lines[0]
     pin_line(path, a)
     store = ApprovedStore(approved_root(None))
-    assert not store.has(a.check["key"], a.check["take"])
+    assert not store.has(take_sha(a))
     assert build(path).lines[0].status == "approved"
-    assert store.has(a.check["key"], a.check["take"])
+    assert store.has(take_sha(a))
 
 
 def test_pinned_audio_missing_is_flagged(make, world):
@@ -147,14 +154,15 @@ def test_rejections_in_round_2(make, world):
 def test_regenerated_take_is_not_reapproved(make, world):
     path = make(("a", LINE))
     a = build(path).lines[0]
+    sha = take_sha(a)
     pin_line(path, a)
     shutil.rmtree(cache_root(None) / "takes")
     store = ApprovedStore(approved_root(None))
-    assert not store.has(a.check["key"], a.check["take"])
+    assert not store.has(sha)
     assert build(path).lines[0].flags == ["pinned-audio-missing"]
     m = build(path).lines[0]
     assert (m.status, m.flags) == ("new", ["pinned-audio-missing"])
-    assert not store.has(a.check["key"], a.check["take"])
+    assert not store.has(sha)
 
 
 def test_pinned_line_with_round_2_neighbour(make, world):
@@ -203,7 +211,7 @@ def test_pin_with_mismatched_cache_audio_is_not_copied(make, world):
     cached.write_bytes(bytes(data))
     m = build(path).lines[0]
     assert m.flags == ["pinned-audio-missing"]
-    assert not ApprovedStore(approved_root(None)).has(a.check["key"], a.check["take"])
+    assert not list(approved_root(None).rglob("*.wav"))
 
 
 def test_build_options_approved_override(root, make, world):
@@ -211,4 +219,17 @@ def test_build_options_approved_override(root, make, world):
     a = build(path, options=BuildOptions(approved=root / "mine")).lines[0]
     pin_line(path, a)
     build(path, options=BuildOptions(approved=root / "mine"))
-    assert ApprovedStore(root / "mine").has(a.check["key"], a.check["take"])
+    assert ApprovedStore(root / "mine").has(take_sha(a))
+    assert not approved_root(None).exists()
+
+
+def test_check_records_the_chosen_takes_hash(make, world):
+    path = make(("a", LINE), ("b", OTHER))
+    a, b = build(path).lines
+    assert a.check["sha256"] == take_sha(a) and b.check["sha256"] == take_sha(b)
+    store_approved(a)
+    pin = pin_line(path, a).pins["a"]
+    shutil.rmtree(cache_root(None) / "takes")
+    m = build(path)
+    assert m.lines[0].status == "approved" and m.lines[0].check["sha256"] == pin.sha256
+    assert m.lines[1].check["sha256"] == take_sha(m.lines[1])

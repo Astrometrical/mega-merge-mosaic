@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 
 from narrate import NarrateError
+from narrate._fs import sha256_file
 from narrate.approved import ApprovedStore, approved_root
 from narrate.backends import Backend
 from narrate.build import BuildOptions, build, default_out
@@ -22,10 +22,6 @@ from narrate.server import LocalServer, Response, Routes, json_response, serve_c
 
 def _page() -> bytes:
     return (resources.files("narrate") / "pages" / "review.html").read_bytes()
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class ReviewApp:
@@ -113,13 +109,11 @@ class ReviewApp:
         key, take = c["key"], c["take"]
         store = ApprovedStore(approved_root(self.options.approved))
         cached = TakeStore(cache_root(self.options.cache)).path(key, take)
+        sha = c.get("sha256")
         if cached.is_file():
-            sha = _sha256(cached)
-            if not (store.has(key, take) and _sha256(store.path(key, take)) == sha):
-                store.put(key, take, cached)
-        elif store.has(key, take):
-            sha = _sha256(store.path(key, take))
-        else:
+            sha = sha256_file(cached)
+            store.put(sha, cached)
+        elif not (isinstance(sha, str) and store.has(sha)):
             raise NarrateError(f"line {line.id!r}: take {take} is in neither the take cache nor the approved store")
         lock.pin(line.id, key, take, line.duration, c["heard"], c["cer"], c["pace"], sha)
 

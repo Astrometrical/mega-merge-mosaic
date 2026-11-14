@@ -5,15 +5,18 @@ import threading
 import urllib.error
 import urllib.request
 
+import numpy as np
 import pytest
 
 from narrate import NarrateError, fakes
 from narrate.approved import ApprovedStore, approved_root
-from narrate.build import BuildOptions, build
-from narrate.cache import cache_root
+from narrate.audio import normalise_loudness, read_wav, trim
+from narrate.build import BuildOptions, build, default_out
+from narrate.cache import TakeStore, cache_root
 from narrate.fakes import FakeBackend, FakeWorld
 from narrate.lock import Lock, lock_path
 from narrate.review import ReviewApp
+from narrate.script import load_script
 from narrate.server import LocalServer, start
 
 LINE = "Each filter is a group of its own."
@@ -99,7 +102,9 @@ def test_approve_pins_and_copies(make_app):
     lock = Lock.load(lock_path(path))
     assert (lock.pins["a"].key, lock.pins["a"].take) == (check["key"], check["take"])
     assert "b" not in lock.pins
-    assert ApprovedStore(approved_root(None)).has(check["key"], check["take"])
+    cached = TakeStore(cache_root(None)).path(check["key"], check["take"])
+    assert lock.pins["a"].sha256 == hashlib.sha256(cached.read_bytes()).hexdigest()
+    assert ApprovedStore(approved_root(None)).has(lock.pins["a"].sha256)
     _, again = jcall(server.url + "/api/state")
     assert "a" in again["lock"]["pins"]
 
@@ -230,11 +235,9 @@ def test_approve_unflagged_keeps_rejections(make_app):
 
 def test_approve_hash_matches_store_and_rebuild_is_approved(make_app):
     path, _, server = make_app(("a", LINE))
-    _, state = jcall(server.url + "/api/state")
-    check = state["manifest"]["lines"][0]["check"]
     jcall(server.url + "/api/approve", {"id": "a"})
-    stored = ApprovedStore(approved_root(None)).path(check["key"], check["take"])
-    assert Lock.load(lock_path(path)).pins["a"].sha256 == hashlib.sha256(stored.read_bytes()).hexdigest()
+    sha = Lock.load(lock_path(path)).pins["a"].sha256
+    assert hashlib.sha256(ApprovedStore(approved_root(None)).path(sha).read_bytes()).hexdigest() == sha
     status, state = jcall(server.url + "/api/rebuild", {})
     line = state["manifest"]["lines"][0]
     assert status == 200 and line["status"] == "approved" and "pinned-audio-missing" not in line["flags"]
@@ -246,8 +249,32 @@ def test_approve_falls_back_to_the_approved_store(make_app):
     shutil.rmtree(cache_root(None))
     status, state = jcall(server.url + "/api/approve", {"id": "a"})
     assert status == 200 and "a" in state["lock"]["pins"]
-    stored = ApprovedStore(approved_root(None)).path(*(lambda p: (p.key, p.take))(Lock.load(lock_path(path)).pins["a"]))
-    assert Lock.load(lock_path(path)).pins["a"].sha256 == hashlib.sha256(stored.read_bytes()).hexdigest()
+    sha = Lock.load(lock_path(path)).pins["a"].sha256
+    assert hashlib.sha256(ApprovedStore(approved_root(None)).path(sha).read_bytes()).hexdigest() == sha
+
+
+def test_identical_lines_keep_their_own_approved_audio(make_app):
+    """Lines with the same text share a key; after a cache clear take numbers restart (probe P9)."""
+    path, _, server = make_app(("x", LINE), ("y", LINE))
+    assert jcall(server.url + "/api/approve", {"id": "x"})[0] == 200
+    x_pin = Lock.load(lock_path(path)).pins["x"]
+    shutil.rmtree(cache_root(None) / "takes")
+    _, state = jcall(server.url + "/api/rebuild", {})
+    by = {ln["id"]: ln for ln in state["manifest"]["lines"]}
+    assert by["x"]["status"] == "approved"
+    assert (by["y"]["check"]["key"], by["y"]["check"]["take"]) == (x_pin.key, x_pin.take)  # same take, new audio
+    assert jcall(server.url + "/api/approve", {"id": "y"})[0] == 200
+    y_pin = Lock.load(lock_path(path)).pins["y"]
+    assert y_pin.sha256 != x_pin.sha256
+    _, state = jcall(server.url + "/api/rebuild", {})
+    by = {ln["id"]: ln for ln in state["manifest"]["lines"]}
+    assert (by["x"]["status"], by["x"]["flags"]) == ("approved", [])
+    assert (by["y"]["status"], by["y"]["flags"]) == ("approved", [])
+    store = ApprovedStore(approved_root(None))
+    assert hashlib.sha256(store.path(x_pin.sha256).read_bytes()).hexdigest() == x_pin.sha256
+    audio, sr = store.load(x_pin.sha256)
+    got, _ = read_wav(default_out(load_script(path)) / by["x"]["clip"])
+    assert np.allclose(got, normalise_loudness(trim(audio, sr), sr), atol=1e-3)
 
 
 def test_draft_manifest_and_missing_check_are_400(make_app):

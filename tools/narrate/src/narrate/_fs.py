@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -29,3 +30,16 @@ def read_text_retry(path: Path, attempts: int = 20, delay: float = 0.025) -> str
                 raise
             time.sleep(delay)
     raise AssertionError("unreachable")
+
+
+def sha256_file(path: Path) -> str:
+    """The sha256 of a file's bytes, as lowercase hex."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def ensure_ignored(folder: Path) -> None:
+    """Create `folder` with a `.gitignore` of `*` (kept if present) so voice audio is never committed."""
+    folder.mkdir(parents=True, exist_ok=True)
+    ignore = folder / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
