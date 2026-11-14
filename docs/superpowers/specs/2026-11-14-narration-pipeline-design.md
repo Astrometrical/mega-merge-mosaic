@@ -163,9 +163,11 @@ A Python 3.11 package at `tools/narrate/` (src layout, `pyproject.toml`, uv), wi
 7. **Clip:** trim silence, leaving ~50 ms of padding. Normalise loudness to a common integrated level (default −20 LUFS) and write `<out>/clips/<id>.wav`.
    - **Sentence captions:** a passage also gets one caption per sentence, timed against its clip.
      - Split `text` into sentences.
-     - Find the clip's pauses (silences of about 0.25 s or more).
-     - Choose the n−1 pauses whose positions best match where each sentence boundary should fall by syllable share (a small dynamic programme).
-     - Too few pauses: fall back to placing the boundaries by syllable share.
+     - Place each sentence boundary by syllable share.
+     - Find the clip's pauses: silences of 0.15 s or more, 30 dB below the peak. Clone audio has short gaps, and real recordings have room noise.
+     - Snap each boundary to a pause within 1.5 s of its share position. A small monotonic dynamic programme makes the choice; a boundary with no pause in reach keeps its share position.
+     - **Longer pauses are preferred:** a pause's cost is its distance minus its length. A paragraph break's 0.6 s pause beats a comma's 0.2 s one nearby.
+     - On round-4 clips the share positions sat within about 0.4 s of real pauses, so most boundaries snap.
      - A line gets a single caption covering the whole clip.
 8. **Approval:**
    - **Status:**
