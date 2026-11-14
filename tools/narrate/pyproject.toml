@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "narrate"
+version = "0.1.0"
+description = "Standalone narration tool: script to loudness-normalised voice-over audio."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2",
+    "soundfile>=0.13",
+    "pyloudnorm>=0.1.1",
+]
+
+[project.optional-dependencies]
+qwen = [
+    "qwen-tts==0.1.1",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "transformers==4.57.3",
+    "accelerate>=1.12",
+]
+
+[project.scripts]
+narrate = "narrate.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/narrate"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }
+torchaudio = { index = "pytorch-cu126", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a CUDA GPU, model weights and a voice profile (NARRATE_GPU_TESTS=1)",
+]

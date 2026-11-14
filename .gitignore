@@ -23,3 +23,12 @@
 # Local cargo overrides (e.g. mpp-core [patch] to the sibling checkout)
 /.cargo/config.toml
 .superpowers/
+
+# Git worktrees made by Claude Code sessions
+/.claude/worktrees/
+
+# The user's voice recordings and voice-clone material: private, never committed
+/voice/
+
+# Narration tool output (clips are the voice owner's recordings)
+/crates/mmm-app/tours/out/
