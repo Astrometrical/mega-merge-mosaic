@@ -104,27 +104,25 @@ def _finite(value):
 
 
 def read_manifest(path: Path) -> Manifest:
-    """Read a manifest; a newer major version is refused."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    """Read a manifest; every defect raises a `NarrateError` naming the file."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        raise NarrateError(f"{path}: invalid JSON ({e})") from e
+    if not isinstance(data, dict):
+        raise NarrateError(f"{path}: invalid JSON (top level must be an object)")
     version = data.get("version")
-    if not isinstance(version, int) or version > VERSION:
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise NarrateError(f"{path}: unsupported manifest version {version!r}")
+    if version > VERSION:
         raise NarrateError(f"{path}: manifest version {version!r} is newer than supported ({VERSION})")
-    lines = [
-        ManifestLine(
-            id=d["id"],
-            text=d["text"],
-            spoken=d["spoken"],
-            kind=d["kind"],
-            clip=d.get("clip"),
-            duration=d["duration"],
-            at=d.get("at"),
-            status=d["status"],
-            flags=list(d.get("flags", [])),
-            captions=[Caption(c["text"], c["start"], c["end"]) for c in d.get("captions", [])],
-            check=d.get("check"),
-        )
-        for d in data.get("lines", [])
-    ]
+    raw_lines = data.get("lines", [])
+    if not isinstance(raw_lines, list):
+        raise NarrateError(f"{path}: 'lines' must be a list")
+    lines = [_read_line(path, d) for d in raw_lines]
+    if "script" not in data:
+        raise NarrateError(f"{path}: missing required field 'script'")
     return Manifest(
         script=data["script"],
         voice=data.get("voice"),
@@ -133,4 +131,30 @@ def read_manifest(path: Path) -> Manifest:
         lead=data.get("lead", LEAD),
         breath=data.get("breath", BREATH),
         lines=lines,
+    )
+
+
+def _read_line(path: Path, d) -> ManifestLine:
+    if not isinstance(d, dict):
+        raise NarrateError(f"{path}: each line must be an object")
+    where = f"line {d['id']!r}" if isinstance(d.get("id"), str) else "a line"
+    for key in ("id", "text", "spoken", "kind", "duration", "status"):
+        if key not in d:
+            raise NarrateError(f"{path}: {where} is missing required field {key!r}")
+    try:
+        captions = [Caption(c["text"], c["start"], c["end"]) for c in d.get("captions", [])]
+    except (KeyError, TypeError) as e:
+        raise NarrateError(f"{path}: {where} has a malformed caption ({e!r})") from e
+    return ManifestLine(
+        id=d["id"],
+        text=d["text"],
+        spoken=d["spoken"],
+        kind=d["kind"],
+        clip=d.get("clip"),
+        duration=d["duration"],
+        at=d.get("at"),
+        status=d["status"],
+        flags=list(d.get("flags", [])),
+        captions=captions,
+        check=d.get("check"),
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -145,8 +146,13 @@ def _reference(where: str, root: Path, raw: object) -> Reference:
     return Reference(audio, text, seconds, digest)
 
 
+_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def load_profile(name: str, library: Path | None = None) -> VoiceProfile:
     """Load `<library>/<name>/voice.toml`, resolving paths against the profile folder."""
+    if not _NAME.fullmatch(name):
+        raise ProfileError(f"invalid voice profile name {name!r}: use letters, digits, '_' and '-' only")
     root = voice_library(library) / name
     path = root / "voice.toml"
     if not path.is_file():

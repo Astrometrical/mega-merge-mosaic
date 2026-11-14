@@ -80,3 +80,34 @@ def test_manifest_version_guard(root):
     path.write_text(json.dumps({"version": 2, "script": "x", "lines": []}), encoding="utf-8")
     with pytest.raises(NarrateError):
         read_manifest(path)
+
+
+def _line():
+    return {"id": "open", "text": "Hi.", "spoken": "Hi.", "kind": "line", "status": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("content", "needle"),
+    [
+        ("{not json", "invalid JSON"),
+        ('{"version": true}', "unsupported manifest version"),
+        ('{"version": "1"}', "unsupported manifest version"),
+        ('{"lines": []}', "unsupported manifest version"),
+        ('{"version": 2}', "newer"),
+        (json.dumps({"version": 1, "script": "s", "lines": [_line()]}), "duration"),
+        (json.dumps({"version": 1, "lines": []}), "script"),
+    ],
+)
+def test_read_manifest_errors(root, content, needle):
+    path = root / "m.json"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(NarrateError, match="m.json") as info:
+        read_manifest(path)
+    assert needle in str(info.value)
+
+
+def test_read_manifest_missing_field_names_line(root):
+    path = root / "m.json"
+    path.write_text(json.dumps({"version": 1, "script": "s", "lines": [_line()]}), encoding="utf-8")
+    with pytest.raises(NarrateError, match="'open'"):
+        read_manifest(path)
