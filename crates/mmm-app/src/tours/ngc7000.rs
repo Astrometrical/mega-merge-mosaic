@@ -7,11 +7,13 @@
 //! `TOUR_OUT`. `TOUR_PROBE=1` records nothing: it waits for idle, dumps the
 //! AccessKit labels and saves stills.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use egui::pos2;
 use mega_tour::narration::Narration;
+use mega_tour::schedule::frames;
 use mega_tour::{Config, Pick, Recorder, Wait};
 
 use crate::app::Shell;
@@ -65,6 +67,11 @@ fn recorder(out: PathBuf, narration: Narration, video: bool) -> Rec {
 #[ignore = "tour: needs a GPU, ffmpeg, TOUR_SESSION, TOUR_NARRATION and TOUR_OUT"]
 fn ngc7000() {
     let session = PathBuf::from(env("TOUR_SESSION"));
+    assert!(
+        session.is_dir(),
+        "TOUR_SESSION {} is not an existing directory",
+        session.display()
+    );
     let narration_path = PathBuf::from(env("TOUR_NARRATION"));
     let out = PathBuf::from(env("TOUR_OUT"));
     let probe = std::env::var_os("TOUR_PROBE").is_some_and(|v| v == "1");
@@ -72,25 +79,40 @@ fn ngc7000() {
         .unwrap_or_else(|e| panic!("load {}: {e}", narration_path.display()));
     let mut rec = recorder(out, narration, !probe);
     let ctx = rec.ctx().clone();
-    rec.state_mut().request(Request::Open(session), &ctx);
+    rec.state_mut()
+        .request(Request::Open(session.clone()), &ctx);
     if probe {
+        // A still every 5 s of steps (one step is one frame).
+        let every = frames(5.0, rec.config().fps) as u32;
         let mut next = 0u32;
         rec.wait("idle", Wait::new().stable(30), idle, |rec, i| {
+            fail_if_not_opened(rec, &session);
             if i >= next {
                 rec.still(&format!("probe_{i:05}.png"));
-                next = i + 150;
+                next = i + every;
             }
         });
         rec.still("probe_idle.png");
         rec.dump_labels();
         return;
     }
-    tour(&mut rec);
+    tour(&mut rec, &session);
     rec.finish().expect("finish the recording");
 }
 
-/// The walkthrough. The session was asked to open just before.
-fn tour(rec: &mut Rec) {
+/// Panic with the start screen's error when opening `session` has failed,
+/// rather than wait for it.
+fn fail_if_not_opened(rec: &Rec, session: &Path) {
+    let shell = rec.state();
+    if shell.session().is_none()
+        && let Some(why) = shell.start.error()
+    {
+        panic!("session {} did not open: {why}", session.display());
+    }
+}
+
+/// The walkthrough. `session` was asked to open just before.
+fn tour(rec: &mut Rec, session: &Path) {
     let none = |_: &mut Rec, _: u32| {};
     let once = Wait::new().stable(5);
 
@@ -98,9 +120,9 @@ fn tour(rec: &mut Rec) {
     rec.say("open");
     rec.wait(
         "session open",
-        Wait::new().stable(1),
+        Wait::new().stable(1).timeout(Duration::from_secs(120)),
         |s| s.session().is_some(),
-        none,
+        |rec, _| fail_if_not_opened(rec, session),
     );
     rec.hold(2.5);
     rec.say("analyse");
@@ -152,7 +174,8 @@ fn tour(rec: &mut Rec) {
     rec.hold(3.5);
     rec.still("t6_rgb.png");
     rec.say("rendered");
-    rec.move_to(pos2(1280.0 * 0.62, 720.0 * 0.62));
+    let size = rec.config().size;
+    rec.move_to(pos2(size.x * 0.62, size.y * 0.62));
     rec.hold(3.0);
     rec.clear_caption();
     rec.hold(0.5);
