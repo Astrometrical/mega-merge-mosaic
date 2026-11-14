@@ -49,6 +49,11 @@ def _load_one(path: Path) -> list[Entry]:
             pattern = re.compile(raw["match"])
         except re.error as e:
             raise LexiconError(f"{where}: bad regex {raw['match']!r} ({e})") from e
+        try:
+            # CPython parses the template eagerly, even on empty input.
+            pattern.sub(raw["say"], "")
+        except (re.error, IndexError) as e:
+            raise LexiconError(f"{where}: bad 'say' template {raw['say']!r} ({e})") from e
         out.append(Entry(pattern, raw["say"], why))
     return out
 

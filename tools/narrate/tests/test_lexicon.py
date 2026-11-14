@@ -84,6 +84,16 @@ def test_bad_regex_names_entry(root):
         Lexicon.load([p])
 
 
+@pytest.mark.parametrize("say", [r"\2", r"\q"])
+def test_bad_say_template_names_entry(root, say):
+    p = write_list(
+        root / "t.json",
+        [{"match": "ok", "say": "a", "why": ""}, {"match": r"\bFoo\b", "say": say, "why": ""}],
+    )
+    with pytest.raises(LexiconError, match=r"t\.json.*entry 2.*say"):
+        Lexicon.load([p])
+
+
 def test_missing_file(root):
     with pytest.raises(LexiconError, match=r"nope\.json"):
         Lexicon.load([root / "nope.json"])
