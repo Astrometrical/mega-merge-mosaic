@@ -11,4 +11,8 @@
 
 pub mod narration;
 pub mod outputs;
+mod overlay;
+pub mod recorder;
 pub mod schedule;
+
+pub use recorder::{Config, Pick, Recorder, Wait};
