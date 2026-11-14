@@ -147,6 +147,14 @@ def test_backend_closed_before_checking(make, world):
             backend_busy = False
         elif e == "transcribe":
             assert not backend_busy
+    checker_loaded = False
+    for e in world.events:
+        if e == "transcribe":
+            checker_loaded = True
+        elif e == "close-checker":
+            checker_loaded = False
+        elif e == "synthesize":
+            assert not checker_loaded
     assert world.events.count("close-backend") == 2
     assert world.events[-1] == "close-checker"
 
@@ -201,6 +209,18 @@ def test_respelled_line_passes(root, write_script, voice_library, world):
     ln = build(path).lines[0]
     assert ln.status == "new"
     assert "Zabara" in ln.spoken
+
+
+@pytest.mark.parametrize("order", [["a", "b"], ["b", "a"]])
+def test_shared_key_lines_get_their_own_verdicts(root, write_script, voice_library, world, order):
+    write_terms(root)
+    world.script(SBARRA_SPOKEN, heard=[SBARRA])
+    texts = {"a": SBARRA, "b": SBARRA_SPOKEN}
+    body = script_text(*[(i, texts[i]) for i in order], extra='pronunciations = ["terms.json"]\n')
+    by = {ln.id: ln for ln in build(write_script(root, body)).lines}
+    assert by["a"].check["key"] == by["b"].check["key"]
+    assert (by["a"].status, by["a"].flags) == ("new", [])
+    assert (by["b"].status, by["b"].flags) == ("flagged", ["words"])
 
 
 def test_options_redirect_out(root, make, world):

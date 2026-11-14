@@ -105,21 +105,24 @@ def _captions(plan: _Plan, clip: np.ndarray, sr: int, duration: float) -> list[C
 
 def _select(plans: list[_Plan], profile: VoiceProfile, store, backend: Backend, checker: Checker) -> dict[str, Choice]:
     """Rounds 1 and 2: generate, check and choose a take per line key."""
-    results: dict[str, dict[int, TakeResult]] = {p.key: {} for p in plans}
-    choices: dict[str, Choice] = {}
+    results: dict[str, dict[int, TakeResult]] = {p.line.id: {} for p in plans}
+    choices: dict[str, Choice] = {}  # by line id
     first = range(1, profile.takes.count + 1)
     _generate(backend, store, _missing_jobs(plans, store, first))
     for p in plans:
-        _check(p, store, checker, first, results[p.key])
-        choices[p.key] = choose(p.kind, list(results[p.key].values()), profile.pace)
-    flagged = [p for p in plans if choices[p.key].status == "flagged"]
+        _check(p, store, checker, first, results[p.line.id])
+        choices[p.line.id] = choose(p.kind, list(results[p.line.id].values()), profile.pace)
+    flagged = [p for p in plans if choices[p.line.id].status == "flagged"]
     if flagged and profile.takes.max > profile.takes.count:
         more = range(profile.takes.count + 1, profile.takes.max + 1)
-        _generate(backend, store, _missing_jobs(flagged, store, more))
+        jobs = _missing_jobs(flagged, store, more)
+        if jobs:
+            checker.close()  # Whisper and Qwen are never in VRAM together; Whisper reloads lazily
+        _generate(backend, store, jobs)
         everything = range(1, profile.takes.max + 1)
         for p in flagged:
-            _check(p, store, checker, everything, results[p.key])
-            choices[p.key] = choose(p.kind, list(results[p.key].values()), profile.pace)
+            _check(p, store, checker, everything, results[p.line.id])
+            choices[p.line.id] = choose(p.kind, list(results[p.line.id].values()), profile.pace)
     return choices
 
 
@@ -150,7 +153,7 @@ def build(
     lines: list[ManifestLine] = []
     sample_rate: int | None = None
     for p in plans:
-        choice = choices[p.key]
+        choice = choices[p.line.id]
         audio, sr = store.load(p.key, choice.take.n)
         clip = normalise_loudness(trim(audio, sr), sr)
         rel = f"clips/{p.line.id}.wav"
