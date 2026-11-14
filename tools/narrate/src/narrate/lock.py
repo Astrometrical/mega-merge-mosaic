@@ -14,6 +14,7 @@ from narrate import NarrateError
 
 VERSION = 1
 _ID_RE = re.compile(r"[a-z0-9-]+")
+_SHA_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def lock_path(script_path: Path) -> Path:
@@ -34,6 +35,7 @@ class Pin:
     cer: float | None
     pace: float | None
     approved_at: str
+    sha256: str  # of the approved take's WAV file bytes
 
 
 def _finite(x: float | None) -> float | None:
@@ -95,11 +97,19 @@ class Lock:
         os.replace(tmp, self.path)
 
     def pin(
-        self, line_id: str, key: str, take: int, duration: float, heard: str, cer: float | None, pace: float | None
+        self,
+        line_id: str,
+        key: str,
+        take: int,
+        duration: float,
+        heard: str,
+        cer: float | None,
+        pace: float | None,
+        sha256: str,
     ) -> None:
         """Approve `take` for a line; this also un-rejects it."""
         stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.pins[line_id] = Pin(key, take, duration, heard, cer, pace, stamp)
+        self.pins[line_id] = Pin(key, take, duration, heard, cer, pace, stamp, sha256)
         self.rejected.get(key, set()).discard(take)
 
     def unpin(self, line_id: str) -> None:
@@ -159,6 +169,7 @@ def _read_pin(id_: str, raw: object, path: Path) -> Pin:
         "cer": lambda v: v is None or _is_num(v),
         "pace": lambda v: v is None or _is_num(v),
         "approved_at": lambda v: isinstance(v, str),
+        "sha256": lambda v: isinstance(v, str) and _SHA_RE.fullmatch(v) is not None,
     }
     for name, ok in checks.items():
         if name not in raw or not ok(raw[name]):
@@ -171,4 +182,5 @@ def _read_pin(id_: str, raw: object, path: Path) -> Pin:
         cer=None if raw["cer"] is None else float(raw["cer"]),
         pace=None if raw["pace"] is None else float(raw["pace"]),
         approved_at=raw["approved_at"],
+        sha256=raw["sha256"],
     )

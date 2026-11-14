@@ -6,9 +6,11 @@ import pytest
 from narrate import NarrateError
 from narrate.lock import Lock, lock_path
 
+SHA = "ab" * 32
+
 
 def _pin(lock: Lock, line="intro", key="k1", take=1, cer=0.0, pace=1.0):
-    lock.pin(line, key, take, 2.5, "heard text", cer, pace)
+    lock.pin(line, key, take, 2.5, "heard text", cer, pace, SHA)
 
 
 def test_lock_path():
@@ -99,4 +101,17 @@ def test_malformed_lock_raises(root, doc):
     p = root / "l.json"
     p.write_text(doc, encoding="utf-8")
     with pytest.raises(NarrateError, match="l.json"):
+        Lock.load(p)
+
+
+def test_pin_sha256_is_validated(root):
+    p = root / "l.json"
+    lock = Lock.load(p)
+    _pin(lock)
+    lock.save()
+    assert Lock.load(p).pins["intro"].sha256 == SHA
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    raw["lines"]["intro"]["sha256"] = "XYZ"
+    p.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(NarrateError, match="sha256"):
         Lock.load(p)

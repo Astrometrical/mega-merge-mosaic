@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,19 +155,35 @@ def _select(
     return choices
 
 
-def _usable_pins(plans: list[_Plan], lock: Lock, store: TakeStore, approved: ApprovedStore) -> dict[str, Pin]:
-    """Pins whose key still matches and whose audio is in the approved store (repaired from the cache)."""
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _usable_pins(
+    plans: list[_Plan], lock: Lock, store: TakeStore, approved: ApprovedStore
+) -> tuple[dict[str, Pin], set[str]]:
+    """Pins that apply and whose audio matches their hash, plus the ids of pins whose audio is missing.
+
+    The audio comes from the approved store, else (repairing the store) from the take cache;
+    audio that does not hash to the pin's `sha256` counts as missing and is never copied.
+    """
     usable: dict[str, Pin] = {}
+    missing: set[str] = set()
     for p in plans:
         pin = lock.pins.get(p.line.id)
-        if pin is None or pin.key != p.key:
+        if pin is None or pin.key != p.key or pin.take in lock.rejected.get(pin.key, set()):
             continue
-        if not approved.has(pin.key, pin.take):
-            if pin.take not in store.takes(pin.key):
-                continue
-            approved.put(pin.key, pin.take, store.path(pin.key, pin.take))
-        usable[p.line.id] = pin
-    return usable
+        stored = approved.path(pin.key, pin.take)
+        if approved.has(pin.key, pin.take) and _sha256(stored) == pin.sha256:
+            usable[p.line.id] = pin
+            continue
+        cached = store.path(pin.key, pin.take)
+        if cached.is_file() and _sha256(cached) == pin.sha256:
+            approved.put(pin.key, pin.take, cached)
+            usable[p.line.id] = pin
+        else:
+            missing.add(p.line.id)
+    return usable, missing
 
 
 def build(
@@ -186,12 +203,7 @@ def build(
     store = TakeStore(cache_root(options.cache))
     approved = ApprovedStore(approved_root(options.approved))
     lock = Lock.load(lock_path(script.path))
-    pins = _usable_pins(plans, lock, store, approved)
-    pinned_missing = {
-        p.line.id
-        for p in plans
-        if p.line.id in lock.pins and lock.pins[p.line.id].key == p.key and p.line.id not in pins
-    }
+    pins, pinned_missing = _usable_pins(plans, lock, store, approved)
     out = options.out if options.out is not None else default_out(script)
     backend = backend if backend is not None else get_backend(profile.backend, profile)
     checker = checker if checker is not None else get_checker(profile.checker)
