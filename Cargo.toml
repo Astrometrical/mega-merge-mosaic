@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mmm-core", "crates/mmm", "crates/mmm-ipc-worker", "crates/mega-ui", "crates/mmm-app"]
+members = ["crates/mmm-core", "crates/mmm", "crates/mmm-ipc-worker", "crates/mega-ui", "crates/mmm-app", "crates/mega-tour"]
 
 [workspace.package]
 # Kept in exact sync with the PixInsight module's MMM_VERSION_STRING
@@ -17,6 +17,8 @@ repository = "https://github.com/Astrometrical/mega-merge-mosaic"
 
 [workspace.dependencies]
 mmm-core = { path = "crates/mmm-core" }
+mega-tour = { path = "crates/mega-tour" }
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Image formats (XISF/FITS) live in the sibling Mega Pixel Processor repo.
 # Pinned by rev; bump it deliberately. For co-development against a local
 # ../mega-pixel-processor checkout, override it in a (gitignored)
