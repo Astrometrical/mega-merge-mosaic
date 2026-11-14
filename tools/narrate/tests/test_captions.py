@@ -50,7 +50,7 @@ def test_pause_matching():
     assert_contiguous(caps, len(y) / SR)
 
 
-def test_too_few_pauses_falls_back():
+def test_no_pauses_falls_back():
     y = tone(9.0)
     assert sentence_captions(THREE, y, SR) == share_captions(THREE, 9.0)
 
@@ -65,3 +65,17 @@ def test_single_sentence():
     caps = sentence_captions("Just one sentence here.", y, SR)
     assert len(caps) == 1
     assert (caps[0].start, caps[0].end) == (0.0, pytest.approx(2.5))
+
+
+def test_boundaries_snap_individually():
+    y = np.concatenate([tone(3.2), silence(0.4), tone(5.4)])
+    caps = sentence_captions(THREE, y, SR)
+    assert caps[0].end == pytest.approx(3.4, abs=0.08)
+    assert caps[1].end == pytest.approx(6.0, abs=0.05)
+    assert_contiguous(caps, len(y) / SR)
+
+
+def test_far_pause_is_ignored():
+    y = np.concatenate([tone(2.3), silence(0.4), tone(6.3)])
+    caps = sentence_captions("Ba ba ba ba. Da da da da.", y, SR)
+    assert caps[0].end == pytest.approx(4.5, abs=0.05)
