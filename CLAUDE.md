@@ -15,6 +15,9 @@ architecture, verified facts about the input data, and the algorithm choices.
 - `crates/mega-ui` — generic egui components/theme/tile viewer; must not
   depend on `mmm-core` (liftable to other apps); egui/eframe pinned at 0.36
 - `crates/mmm-app` — eframe desktop app (`mega-merge-mosaic`), glow renderer
+- `tools/narrate` — standalone Python narration tool (script to voice-over
+  clips); `uv`-managed, no mmm dependency; design in
+  `docs/superpowers/specs/2026-11-14-narration-pipeline-design.md`
 - `integration/pixinsight/` — PCL module + `mmm-ipc-worker` host. **Development
   eased off (2026-11-02), shelving expected** under PixInsight CPD rules 1.0.1;
   no new feature work here (DESIGN.md "PixInsight module status")
@@ -35,6 +38,7 @@ architecture, verified facts about the input data, and the algorithm choices.
 cargo test                 # unit + integration tests (no big files needed)
 cargo build --release      # required for real-data runs (2 GB frames)
 target/release/mmm info test_data/orion_mosaic/*PANEL-4_*.xisf --stats
+cd tools/narrate && uv run pytest -q   # narrate tests (no GPU); see its README
 ```
 
 UI standard: `cargo run -p mega-ui --example gallery` shows every token and

@@ -1,0 +1,45 @@
+{
+ "about": "The project's terms: how tricky names in the tour scripts are typed for the Qwen3-TTS voice clone. Regexes apply in order, case-sensitive, word-bounded.",
+ "entries": [
+  {
+   "match": "\\bSbarra\\b",
+   "say": "Zabara",
+   "why": "as written it said 'Sparrow'; 'Zbarra' and 'Zuh-bar-ra' were worse"
+  },
+  {
+   "match": "\\bSHO\\b",
+   "say": "S H O",
+   "why": "as written it said 'Show'; hyphens (S-H-O) ran the letters into 'SHOO'"
+  },
+  {
+   "match": "\\bHOO\\b",
+   "say": "H O O",
+   "why": "as written it said 'Who'"
+  },
+  {
+   "match": "\\bMosaicByCoordinates\\b",
+   "say": "Mosaic By Coordinates",
+   "why": "product name read as one run-together word"
+  },
+  {
+   "match": "\\bAstrometrical\\b",
+   "say": "Astro-metrical",
+   "why": "wrong stress as written; 'Astrohmetrical' (round 3 pick) became 'Astro-heterical' after 'From' and 'on'"
+  },
+  {
+   "match": "\\bXISF\\b",
+   "say": "X I S F",
+   "why": "as written it said 'X I sef' or 'exis'"
+  },
+  {
+   "match": "\\bComposites\\b",
+   "say": "Compozits",
+   "why": "as written it said 'com-POSE-ites' from the long reference; from the 10 s one both sound the same"
+  },
+  {
+   "match": "\\bcomposites\\b",
+   "say": "compozits",
+   "why": "as above"
+  }
+ ]
+}

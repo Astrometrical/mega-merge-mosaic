@@ -2191,3 +2191,29 @@ parts (`starfield`, `hero::HeroStage`, `widgets::session_card`,
   path in the hero's details line (the home directory is shown as `~`, so
   no user name, but the temp location and separators are the OS's), so it
   differs on another OS; refresh it there with `UPDATE_SNAPSHOTS=1`.
+
+## Narration and tours (2026-11)
+
+Spec: [`docs/superpowers/specs/2026-11-14-narration-pipeline-design.md`](superpowers/specs/2026-11-14-narration-pipeline-design.md).
+Plan 1 (this section) built `tools/narrate`, a standalone Python tool
+(core deps numpy, soundfile, pyloudnorm; torch and Qwen3-TTS under the `qwen`
+extra). It turns a `.narration.toml` script into per-line WAV clips and a
+`narration.json` manifest (`narrate build`), or a timing-only manifest with no
+audio (`narrate draft`). Dan's voice profile lives in `~/.narrate/voices/dan/`
+outside git; the NGC 7000 tour script and the project's pronunciation list are
+in `crates/mmm-app/tours/` (`ngc7000.narration.toml`, `terms.json`; `out/` is
+gitignored). Plans 2 and 3 (the `mega-tour` recorder, the app tour) consume the
+manifest. Usage is in `tools/narrate/README.md`.
+
+As built, differing from the first spec draft:
+
+- **Answer key.** The checker compares Whisper's transcript with every mix of
+  as-written and respelled terms, and takes the best score.
+- **Captions.** Sentence captions snap to nearby pauses in the audio,
+  preferring longer ones.
+- **GPU order.** The backend closes before checking, and the checker closes
+  before round-2 generation, so only one model is on the 11 GB card at a time.
+- **Manifest numbers.** Non-finite numbers (an infinite pace, say) are written
+  as `null`.
+- **Take keys.** A take is keyed on backend, model, precision, language, the
+  reference and the spoken text.

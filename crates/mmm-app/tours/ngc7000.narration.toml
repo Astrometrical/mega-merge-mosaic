@@ -1,0 +1,35 @@
+voice = "dan"
+style = "explainer"
+pronunciations = ["terms.json"]
+
+[[line]]
+id = "open"
+text = "A real mosaic of NGC 7000: two panels, shot through six filters: S, H, O, R, G and B."
+
+[[line]]
+id = "analyse"
+text = "Mega Merge Mosaic reads every panel, places it on the sky and checks the overlaps."
+
+[[line]]
+id = "groups"
+text = "Each filter is a group of its own. Pick one to see its panels."
+
+[[line]]
+id = "merge"
+text = "One click merges all six filters."
+
+[[line]]
+id = "h-mosaic"
+text = "The merged H-alpha mosaic: gains matched, seams blended away."
+
+[[line]]
+id = "sho"
+text = "Composites combine filters. Here is SHO, the Hubble palette..."
+
+[[line]]
+id = "rgb"
+text = "...and natural colour from R, G and B."
+
+[[line]]
+id = "rendered"
+text = "Rendered frame by frame from the running app: no screen recording."
