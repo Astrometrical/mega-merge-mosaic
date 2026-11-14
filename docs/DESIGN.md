@@ -2202,7 +2202,7 @@ extra). It turns a `.narration.toml` script into per-line WAV clips and a
 audio (`narrate draft`). Dan's voice profile lives in `~/.narrate/voices/dan/`
 outside git; the NGC 7000 tour script and the project's pronunciation list are
 in `crates/mmm-app/tours/` (`ngc7000.narration.toml`, `terms.json`; `out/` is
-gitignored). Plan 2 adds the lock, the approved store, review, try and mux;
+gitignored). Plan 2 (below) added the lock, the approved store, review, try and mux;
 plan 3 the `mega-tour` recorder and the app tour; both consume the manifest.
 Usage is in `tools/narrate/README.md`.
 
@@ -2230,3 +2230,29 @@ As built, differing from the first spec draft:
   voice audio is never committed by accident.
 - **Take sidecars** record the sha256 of their WAV; a transcript is ignored if
   the audio changed, and saving a take drops its old sidecar.
+
+### Plan 2: the human loop and video
+
+Plan 2 added `narrate review` (a local page to listen, approve, reject, note
+and rebuild), `narrate try` (the pronunciation lab), `narrate mux` (approved
+clips onto a silent video) and the two stores behind them: the lock file
+(`<script>.lock.json`, text only, committed) and the approved store
+(`NARRATE_APPROVED`, default `~/.narrate/approved/`, WAVs, private, never
+pruned). Usage and workflow are in `tools/narrate/README.md`. As built:
+
+- **Pins bound to audio.** An approval pins the take's sha256; a line counts as
+  approved only while its audio matches the pin.
+- **Windows-safe writes.** The lock, manifest and lists are written atomically
+  (temp file, then a replace retried on `PermissionError`, since Windows
+  refuses while another handle is open); reads retry the same way.
+- **Review server.** It binds 127.0.0.1 and refuses a request whose `Host` is
+  not the local address and port (421, against DNS rebinding) and a POST whose
+  content type is not JSON (415, so a cross-site form cannot post).
+- **Approve unflagged** approves `new` lines and skips takes the lock has
+  rejected.
+- **Mux gating.** `mux` refuses lines that are not approved
+  (`--allow-unapproved`), clips running past the next cue (`--allow-overlap`,
+  tolerance 1 ms), draft manifests, unknown cues and missing clips, all as
+  exit 2. It gives ffmpeg absolute paths, so the argv does not depend on the
+  working directory. Audio is mixed at 48 kHz, `loudnorm` I=-16 TP=-1.5
+  LRA=11, AAC 192k; the video stream is copied.
