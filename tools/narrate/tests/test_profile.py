@@ -90,6 +90,16 @@ def test_unknown_key_in_style(voice_library):
         load_profile("test")
 
 
+@pytest.mark.parametrize(
+    "extra,section",
+    [("pace = 5\n", "pace"), ('pace = "x"\n', "pace"), ("takes = [1]\n", "takes")],
+)
+def test_non_table_sections_are_profile_errors(voice_library, extra, section):
+    _edit(voice_library, 'backend = "fake"', 'backend = "fake"\n' + extra)
+    with pytest.raises(ProfileError, match=rf"voice\.toml.*{section}"):
+        load_profile("test")
+
+
 def test_default_style_must_exist(voice_library):
     _edit(voice_library, 'default_style = "explainer"', 'default_style = "story"')
     with pytest.raises(ProfileError, match="story"):

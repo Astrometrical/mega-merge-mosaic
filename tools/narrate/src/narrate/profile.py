@@ -107,6 +107,11 @@ def _check_keys(where: str, table: dict, allowed: set[str]) -> None:
         raise ProfileError(f"{where}: unknown key {unknown[0]!r}")
 
 
+def _require_table(where: str, value: object) -> None:
+    if not isinstance(value, dict):
+        raise ProfileError(f"{where} must be a table")
+
+
 def _string(where: str, table: dict, key: str, default: str | None = None) -> str:
     value = table.get(key, default)
     if not isinstance(value, str) or not value:
@@ -176,12 +181,14 @@ def load_profile(name: str, library: Path | None = None) -> VoiceProfile:
         raise ProfileError(f"{where}: default_style {default_style!r} is not a defined style")
 
     pace_raw = data.get("pace", {})
+    _require_table(f"{where}: [pace]", pace_raw)
     _check_keys(f"{where}: [pace]", pace_raw, {"max", "target"})
     pace = Pace(
         _number(f"{where}: [pace]", pace_raw, "max", DEFAULT_PACE_MAX, float),
         _number(f"{where}: [pace]", pace_raw, "target", DEFAULT_PACE_TARGET, float),
     )
     takes_raw = data.get("takes", {})
+    _require_table(f"{where}: [takes]", takes_raw)
     _check_keys(f"{where}: [takes]", takes_raw, {"count", "max"})
     takes = Takes(
         _number(f"{where}: [takes]", takes_raw, "count", DEFAULT_TAKES_COUNT, int),
