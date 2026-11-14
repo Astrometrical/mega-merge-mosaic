@@ -237,3 +237,27 @@ def test_mux_end_to_end(root):
     info = subprocess.run([ff, "-i", str(out)], capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert "Audio:" in info.stderr and "Video:" in info.stderr
     assert not (root / "out.mp4.tmp.mp4").exists()
+
+
+def test_overrun_tolerance_boundary():
+    m = Manifest("s", "v", False, 24000, lines=[line("a", 1.0), line("b", 1.0)])
+    assert overruns([Cue("a", 0.0), Cue("b", 0.9995)], m) == []
+    assert len(overruns([Cue("a", 0.0), Cue("b", 0.998)], m)) == 1
+
+
+@pytest.mark.parametrize("at", ["nan", "inf", "-1"])
+def test_script_cues_rejects_bad_at(root, write_script, at):
+    s = write_script(root, f'[[line]]\nid = "a"\ntext = "One."\nat = {at}\n')
+    with pytest.raises(NarrateError, match=r"demo\.narration\.toml.*'a'"):
+        script_cues(load_script(s))
+
+
+def test_mux_paths_absolute_with_relative_inputs(root, fake_ffmpeg, monkeypatch):
+    write_manifest(root, [line("a")])
+    (root / "v.mp4").write_bytes(b"v")
+    monkeypatch.chdir(root)
+    mux(Path("v.mp4"), Path("narration.json"), [Cue("a", 0)], Path("-o.mp4"))
+    cmd = fake_ffmpeg[0]
+    ins = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert all(Path(p).is_absolute() for p in ins) and Path(cmd[-1]).is_absolute()
+    assert (root / "-o.mp4").exists()

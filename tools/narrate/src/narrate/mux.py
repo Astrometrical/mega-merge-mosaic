@@ -17,7 +17,7 @@ from narrate.script import Script
 
 TIMELINE_VERSION = 1
 #: Seconds a clip may run past the next cue's start before it counts as an overrun.
-OVERRUN_TOLERANCE = 0.05
+OVERRUN_TOLERANCE = 0.001
 SAMPLE_RATE = 48000
 LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
 AUDIO_BITRATE = "192k"
@@ -87,6 +87,9 @@ def script_cues(script: Script) -> list[Cue]:
     missing = [ln.id for ln in script.lines if ln.at is None]
     if missing:
         raise NarrateError(f"{script.path}: lines without 'at': {', '.join(repr(i) for i in missing)}")
+    for ln in script.lines:
+        if not math.isfinite(ln.at) or ln.at < 0:
+            raise NarrateError(f"{script.path}: line {ln.id!r}: 'at' must be a finite number >= 0, got {ln.at!r}")
     return [Cue(ln.id, float(ln.at)) for ln in script.lines]
 
 
@@ -169,11 +172,12 @@ def mux(
     over = overruns(cues, manifest)
     if over and not allow_overlap:
         raise NarrateError("clips overlap:\n  " + "\n  ".join(over) + "\n(--allow-overlap to mux anyway)")
-    clips = [(manifest_path.parent / lines[c.id].clip, c.start) for c in cues]
+    clips = [((manifest_path.parent / lines[c.id].clip).resolve(), c.start) for c in cues]
     missing = [str(p) for p, _ in clips if not p.is_file()]
     if missing:
         raise NarrateError(f"clip files missing: {', '.join(missing)}")
-    out = Path(out)
+    out = Path(out).resolve()
+    video = Path(video).resolve()
     tmp = out.with_name(out.name + ".tmp.mp4")
     cmd = mux_command(find_ffmpeg(), video, clips, tmp)
     try:
