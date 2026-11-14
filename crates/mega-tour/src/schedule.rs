@@ -5,12 +5,19 @@
 //! Passages show one caption per sentence, switching at frames derived from
 //! the clip start, never from wall-clock time.
 
-use crate::narration::Narration;
+use crate::narration::{Line, Narration};
 
 /// Convert seconds to output frames, rounding half away from zero and
 /// saturating at 0.
 pub fn frames(secs: f64, fps: u32) -> u64 {
     (secs * f64::from(fps)).round().max(0.0) as u64
+}
+
+/// Convert seconds to output frames, rounding up so the frames cover all of
+/// `secs`, and saturating at 0. Floating-point noise under a millionth of
+/// a frame is ignored, so 4.4 s at 30 fps is 132 frames, not 133.
+pub fn frames_ceil(secs: f64, fps: u32) -> u64 {
+    (secs * f64::from(fps) - 1e-6).ceil().max(0.0) as u64
 }
 
 /// One scheduled caption; `end` is `None` while it is still open.
@@ -54,10 +61,7 @@ impl Schedule {
     /// Panics, naming `id` and the known ids, when `id` is not in the
     /// narration.
     pub fn say(&mut self, id: &str, now: u64) -> u64 {
-        let Some(line) = self.narration.line(id) else {
-            let known: Vec<&str> = self.narration.lines.iter().map(|l| l.id.as_str()).collect();
-            panic!("say: unknown narration line {id:?}; known ids: {known:?}");
-        };
+        let line = self.known_line(id);
         let clip_start = now + frames(self.lead, self.fps);
         let starts: Vec<(u64, String)> = if line.captions.is_empty() {
             vec![(now, line.text.clone())]
@@ -75,7 +79,7 @@ impl Schedule {
                 })
                 .collect()
         };
-        let until = clip_start + frames(line.duration + self.breath, self.fps);
+        let until = clip_start + frames_ceil(line.duration + self.breath, self.fps);
 
         self.end_open(now);
         let ends: Vec<Option<u64>> = (0..starts.len())
@@ -89,7 +93,25 @@ impl Schedule {
         clip_start
     }
 
-    /// The frame the current clip and its breath finish on.
+    /// Check that line `id` is in the narration, so a caller can fail
+    /// before doing anything else.
+    ///
+    /// # Panics
+    /// Panics, naming `id` and the known ids, when it is not.
+    pub fn check_id(&self, id: &str) {
+        self.known_line(id);
+    }
+
+    /// Line `id`, or a panic naming it and the known ids.
+    fn known_line(&self, id: &str) -> &Line {
+        self.narration.line(id).unwrap_or_else(|| {
+            let known: Vec<&str> = self.narration.lines.iter().map(|l| l.id.as_str()).collect();
+            panic!("say: unknown narration line {id:?}; known ids: {known:?}");
+        })
+    }
+
+    /// The frame the current clip and its breath finish on (rounded up, so
+    /// the next cue never starts before the clip ends).
     pub fn speech_until(&self) -> u64 {
         self.speech_until
     }
@@ -222,14 +244,56 @@ mod tests {
         let mut s = sched();
         let start = s.say("d", 0);
         assert_eq!(start, 5);
-        assert_eq!(s.speech_until(), 5 + frames(3.3 + 0.4, 30));
+        assert_eq!(s.speech_until(), 5 + frames_ceil(3.3 + 0.4, 30));
+        assert_eq!(s.speech_until(), 5 + 111);
         assert_eq!(s.cues(), &[("d".to_string(), 5)]);
     }
 
     #[test]
-    #[should_panic(expected = "nope")]
+    fn frames_ceil_rounds_up_but_ignores_float_noise() {
+        assert_eq!(frames_ceil(2.4, 30), 72);
+        assert_eq!(frames_ceil(1.41, 30), 43);
+        assert_eq!(frames_ceil(1.0 / 60.0, 30), 1);
+        // 4.0 + 0.4 is 4.4000000000000004, whose 132.00000000000003 frames
+        // must not become 133.
+        assert_eq!(frames_ceil(4.0 + 0.4, 30), 132);
+        assert_eq!(frames_ceil(0.0, 30), 0);
+        assert_eq!(frames_ceil(-1.0, 30), 0);
+    }
+
+    #[test]
+    fn speech_until_covers_the_whole_clip() {
+        let n = Narration::from_json(
+            PathBuf::from("n.json"),
+            r#"{"version":1,"lines":[
+            {"id":"a","text":"A.","kind":"line","clip":"a.wav","duration":1.01,"status":"approved"}]}"#,
+        )
+        .unwrap();
+        let mut s = Schedule::new(n, 30, 0.15, 0.4);
+        let start = s.say("a", 0);
+        // 1.41 s is 42.3 frames: rounding to 42 would start the next cue
+        // before this clip and its breath end.
+        assert_eq!(s.speech_until(), start + 43);
+        assert!((s.speech_until() - start) as f64 / 30.0 >= 1.01 + 0.4);
+    }
+
+    #[test]
+    #[should_panic(expected = r#"unknown narration line "nope"; known ids: ["a", "b", "p", "d"]"#)]
     fn unknown_line_id_is_named() {
         sched().say("nope", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = r#"unknown narration line "nope"; known ids: ["a", "b", "p", "d"]"#)]
+    fn check_id_names_an_unknown_id() {
+        sched().check_id("nope");
+    }
+
+    #[test]
+    fn check_id_accepts_a_known_id() {
+        let s = sched();
+        s.check_id("p");
+        assert!(s.cues().is_empty());
     }
 
     #[test]

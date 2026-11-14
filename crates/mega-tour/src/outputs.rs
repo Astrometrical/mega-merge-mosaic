@@ -15,14 +15,37 @@ fn timestamp(frame: u64, fps: u32) -> String {
     )
 }
 
-/// Write `spans` (`(start, end, text)` in frames) as a WebVTT file.
+/// `text` as a WebVTT cue payload: a blank line would end the cue, so each
+/// run of blank (or whitespace-only) lines becomes a single space, and
+/// leading and trailing ones go. Single line breaks stay.
+fn cue_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            gap = true;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(if gap { ' ' } else { '\n' });
+        }
+        out.push_str(line);
+        gap = false;
+    }
+    out
+}
+
+/// Write `spans` (`(start, end, text)` in frames) as a WebVTT file, one cue
+/// per span. Blank lines inside a span's text collapse into single spaces,
+/// so no cue is split.
 pub fn write_vtt(path: &Path, spans: &[(u64, u64, String)], fps: u32) -> io::Result<()> {
     let mut vtt = String::from("WEBVTT\n\n");
     for (a, b, text) in spans {
         vtt.push_str(&format!(
-            "{} --> {}\n{text}\n\n",
+            "{} --> {}\n{}\n\n",
             timestamp(*a, fps),
-            timestamp(*b, fps)
+            timestamp(*b, fps),
+            cue_text(text)
         ));
     }
     std::fs::write(path, vtt)
@@ -95,6 +118,22 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "WEBVTT\n\n00:00:00.000 --> 00:00:02.567\nAlpha.\n\n\
              00:00:02.567 --> 00:00:04.067\nBeta.\n\n"
+        );
+    }
+
+    #[test]
+    fn vtt_cue_text_has_no_blank_lines() {
+        let dir = scratch("vtt-blank");
+        let p = dir.join("captions.vtt");
+        let spans = vec![
+            (0, 30, "One.\n\nTwo.\n \t\nThree.\nFour.".to_string()),
+            (30, 60, "\n\nLead.\r\n\r\nTrail.\n\n".to_string()),
+        ];
+        write_vtt(&p, &spans, 30).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nOne. Two. Three.\nFour.\n\n\
+             00:00:01.000 --> 00:00:02.000\nLead. Trail.\n\n"
         );
     }
 

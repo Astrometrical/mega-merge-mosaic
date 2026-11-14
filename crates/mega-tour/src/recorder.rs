@@ -42,7 +42,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Default settings writing to `out_dir`.
+    /// Default settings writing to `out_dir`. There is no `Default`: the
+    /// output directory is always the caller's choice.
     pub fn new(out_dir: impl Into<PathBuf>) -> Config {
         Config {
             size: vec2(1280.0, 720.0),
@@ -55,12 +56,6 @@ impl Config {
             breath: None,
             video: true,
         }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Config {
-        Config::new("tour-out")
     }
 }
 
@@ -78,7 +73,7 @@ pub enum Pick {
 pub struct Wait {
     /// One frame is captured per `speed` steps (a time-lapse when > 1).
     pub speed: u32,
-    /// Steps in a row the condition must hold.
+    /// Steps in a row the condition must hold (at least 1).
     pub stable: u32,
     /// Real-time limit before the wait panics.
     pub timeout: Duration,
@@ -94,17 +89,32 @@ impl Wait {
         }
     }
 
-    /// Time-lapse: capture one frame per `speed` steps.
+    /// Time-lapse: capture one frame per `speed` steps (0 counts as 1).
     pub fn lapse(mut self, speed: u32) -> Wait {
         self.speed = speed.max(1);
         self
     }
 
-    /// Require the condition to hold for `steps` steps in a row.
+    /// Require the condition to hold for `steps` steps in a row (0 counts
+    /// as 1).
     pub fn stable(mut self, steps: u32) -> Wait {
-        self.stable = steps;
+        self.stable = steps.max(1);
         self
     }
+
+    /// Panic if the condition hasn't held after `limit` of real time (the
+    /// default is 30 minutes), so a step that can't finish fails fast.
+    pub fn timeout(mut self, limit: Duration) -> Wait {
+        self.timeout = limit;
+        self
+    }
+}
+
+/// Whether step `step` (from 0) of a wait at time-lapse `speed` is
+/// captured: the first of every `speed` steps, so a wait of `n` steps
+/// captures `n.div_ceil(speed)` frames. A `speed` of 0 counts as 1.
+fn captures(step: u32, speed: u32) -> bool {
+    step.is_multiple_of(speed.max(1))
 }
 
 impl Default for Wait {
@@ -130,12 +140,18 @@ fn ease(t: f32) -> f32 {
 
 /// Canonicalise `p` and strip the Windows verbatim prefix, if any.
 fn plain(p: &Path) -> io::Result<PathBuf> {
-    let c = std::fs::canonicalize(p)?;
-    let s = c.to_string_lossy();
-    Ok(match s.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
-        _ => c,
-    })
+    Ok(strip_verbatim(std::fs::canonicalize(p)?))
+}
+
+/// `p` without a drive path's Windows verbatim prefix (`\\?\C:\x` is
+/// `C:\x`). Verbatim UNC paths (`\\?\UNC\server\share`) and every other
+/// path come back unchanged.
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with(r"UNC\") => PathBuf::from(rest),
+        _ => p,
+    }
 }
 
 /// A scripted headless recording of an egui app of state `S`.
@@ -154,7 +170,16 @@ pub struct Recorder<S: 'static> {
 impl<S: 'static> Recorder<S> {
     /// Build the harness around `ui` and `state`, and start ffmpeg when
     /// `config.video` is set. `ui` draws into a root ui covering the whole
-    /// viewport; it should apply the app's theme itself.
+    /// viewport, and applies the app's own theme, if it has one.
+    ///
+    /// Any egui app works: the theme is optional. mega-ui's theme
+    /// (`mega_ui::theme::ensure_applied`) gives the Astrometrical look, and
+    /// the overlay then uses its type scale; without it the caption and
+    /// badge use egui's `Heading` and `Body` text styles.
+    ///
+    /// # Errors
+    /// Fails when the output directory can't be created, or when ffmpeg
+    /// can't be started (the error names the ffmpeg path).
     pub fn new(
         config: Config,
         narration: Narration,
@@ -222,6 +247,11 @@ impl<S: 'static> Recorder<S> {
         &self.h.ctx
     }
 
+    /// The settings the recorder was built with (stage size, fps, ...).
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
     /// The app state.
     pub fn state(&self) -> &S {
         &self.h.state().app
@@ -285,14 +315,16 @@ impl<S: 'static> Recorder<S> {
         img.save(self.cfg.out_dir.join(name)).expect("save still");
     }
 
-    /// Hold the current view for `secs` seconds of video.
+    /// Record `secs` seconds of video with no input: the app keeps
+    /// stepping (animations, background work), so this is not a frozen
+    /// frame.
     pub fn hold(&mut self, secs: f32) {
         for _ in 0..frames(f64::from(secs), self.cfg.fps) {
             self.frame();
         }
     }
 
-    /// Hold until the current clip (and its breath) has played.
+    /// Keep recording until the current clip (and its breath) has played.
     fn finish_speech(&mut self) {
         while self.frames < self.schedule.speech_until() {
             self.frame();
@@ -300,11 +332,14 @@ impl<S: 'static> Recorder<S> {
     }
 
     /// Show narration line `id`'s caption and start its clip; the voice sets
-    /// the pace, so this first waits for the previous clip to finish.
+    /// the pace, so this first keeps recording until the previous clip has
+    /// finished.
     ///
     /// # Panics
-    /// Panics when `id` is not in the narration.
+    /// Panics, naming `id` and the known ids, when `id` is not in the
+    /// narration; it does so before recording anything.
     pub fn say(&mut self, id: &str) {
+        self.schedule.check_id(id);
         self.finish_speech();
         self.schedule.say(id, self.frames);
     }
@@ -363,8 +398,8 @@ impl<S: 'static> Recorder<S> {
         self.frame();
     }
 
-    /// The rect of the button labelled `label`: the rightmost one when `pick`
-    /// is [`Pick::Right`], else the leftmost.
+    /// The rect of the button (AccessKit `Role::Button`) labelled `label`:
+    /// the rightmost one when `pick` is [`Pick::Right`], else the leftmost.
     pub fn find(&self, label: &str, pick: Pick) -> Option<Rect> {
         let rects = self
             .h
@@ -393,7 +428,9 @@ impl<S: 'static> Recorder<S> {
     /// Run until `done` has held for `how.stable` steps in a row. One frame
     /// is captured per `how.speed` steps (a time-lapse when > 1); each step
     /// is paced to a real frame time, so the app's wall clock and egui's
-    /// agree.
+    /// agree. The wait's share of the video is therefore the real time it
+    /// took, divided by `how.speed`. `on_step(rec, i)` runs after step `i`
+    /// (from 0).
     ///
     /// # Panics
     /// Panics when `how.timeout` passes first.
@@ -406,16 +443,18 @@ impl<S: 'static> Recorder<S> {
     ) {
         let started = Instant::now();
         let speed = how.speed.max(1);
+        let stable = how.stable.max(1);
         self.overlay().fast = (speed > 1).then_some(speed);
         let (mut i, mut held) = (0u32, 0u32);
-        while held < how.stable {
+        while held < stable {
             assert!(
                 started.elapsed() < how.timeout,
-                "timed out waiting for {what}"
+                "timed out after {:?} waiting for {what}",
+                how.timeout
             );
             let t0 = Instant::now();
             self.step();
-            if i.is_multiple_of(speed) {
+            if captures(i, speed) {
                 self.capture();
             }
             on_step(self, i);
@@ -450,14 +489,20 @@ impl<S: 'static> Recorder<S> {
         }
     }
 
-    /// Close the video, then write `captions.vtt` and (for a video) the
-    /// `timeline.json` that `narrate mux` reads.
+    /// Let the last clip (and its breath) play out, close the video, then
+    /// write `captions.vtt` and (for a video) the `timeline.json` that
+    /// `narrate mux` reads. A tour may end on a `say`: the video still
+    /// covers the whole clip.
     pub fn finish(mut self) -> io::Result<()> {
+        self.finish_speech();
         if let Some(mut ff) = self.ff.take() {
             drop(ff.stdin.take());
             let status = ff.wait()?;
             if !status.success() {
-                return Err(io::Error::other(format!("ffmpeg failed: {status}")));
+                return Err(io::Error::other(format!(
+                    "{} failed: {status}",
+                    self.cfg.ffmpeg.display()
+                )));
             }
         }
         self.schedule.finish(self.frames);
@@ -509,4 +554,84 @@ fn spawn_ffmpeg(cfg: &Config) -> io::Result<Child> {
         .arg(cfg.out_dir.join("silent.mp4"))
         .stdin(Stdio::piped())
         .spawn()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot start ffmpeg {}: {e} (set FFMPEG to the ffmpeg executable)",
+                    cfg.ffmpeg.display()
+                ),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_zero_means_one() {
+        assert_eq!(Wait::new().stable(0).stable, 1);
+        assert_eq!(Wait::new().stable(7).stable, 7);
+    }
+
+    #[test]
+    fn timeout_is_a_builder() {
+        let w = Wait::new()
+            .lapse(4)
+            .timeout(Duration::from_secs(120))
+            .stable(3);
+        assert_eq!(w.timeout, Duration::from_secs(120));
+        assert_eq!((w.speed, w.stable), (4, 3));
+        assert_eq!(Wait::new().timeout, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn a_lapse_captures_the_first_of_every_speed_steps() {
+        for k in [1u32, 2, 3, 8] {
+            for n in [0u32, 1, 2, 7, 8, 9, 16, 30, 101] {
+                let captured = (0..n).filter(|&i| captures(i, k)).count() as u32;
+                assert_eq!(captured, n.div_ceil(k), "{n} steps at lapse {k}");
+            }
+        }
+        assert!(captures(0, 8) && !captures(1, 8) && captures(8, 8));
+        // A speed of 0 is real time, as `Wait::lapse` clamps it.
+        assert_eq!((0..5).filter(|&i| captures(i, 0)).count(), 5);
+    }
+
+    #[test]
+    fn plain_strips_only_the_drive_verbatim_prefix() {
+        let s = |p: &str| strip_verbatim(PathBuf::from(p));
+        assert_eq!(s(r"\\?\C:\x"), PathBuf::from(r"C:\x"));
+        assert_eq!(s(r"\\?\C:\x\y.json"), PathBuf::from(r"C:\x\y.json"));
+        // Stripping a UNC path's prefix would leave `UNC\server\share`.
+        assert_eq!(
+            s(r"\\?\UNC\server\share"),
+            PathBuf::from(r"\\?\UNC\server\share")
+        );
+        assert_eq!(s(r"C:\x"), PathBuf::from(r"C:\x"));
+        assert_eq!(s(r"\\server\share\x"), PathBuf::from(r"\\server\share\x"));
+        assert_eq!(s("/home/x/n.json"), PathBuf::from("/home/x/n.json"));
+        assert_eq!(s("rel/n.json"), PathBuf::from("rel/n.json"));
+    }
+
+    #[test]
+    fn plain_canonicalises_an_existing_path() {
+        let dir = std::env::temp_dir();
+        let p = plain(&dir).unwrap();
+        assert!(p.is_absolute(), "{}", p.display());
+        assert!(!p.to_string_lossy().starts_with(r"\\?\"), "{}", p.display());
+        assert!(plain(&dir.join("mega-tour-no-such-file")).is_err());
+    }
+
+    #[test]
+    fn a_missing_ffmpeg_is_named() {
+        let mut cfg = Config::new(std::env::temp_dir().join("mega-tour-no-ffmpeg"));
+        cfg.ffmpeg = PathBuf::from("mega-tour-no-such-ffmpeg-binary");
+        let err = spawn_ffmpeg(&cfg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(msg.contains("mega-tour-no-such-ffmpeg-binary"), "{msg}");
+        assert!(msg.contains("FFMPEG"), "{msg}");
+    }
 }
