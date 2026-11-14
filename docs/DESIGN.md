@@ -2283,3 +2283,31 @@ pruned). Usage and workflow are in `tools/narrate/README.md`. As built:
   start. It gives ffmpeg absolute paths, so the argv does not depend on the
   working directory. Audio is mixed at 48 kHz, `loudnorm` I=-16 TP=-1.5
   LRA=11, AAC 192k; the video stream is copied.
+
+### Plan 3: the `mega-tour` recorder and the NGC 7000 tour
+
+Plan 3 built `crates/mega-tour` (README there) and the app tour in
+`crates/mmm-app/src/tours/ngc7000.rs`, run by `tools/tour.sh SESSION [OUT]
+[--draft] [--allow-unapproved]`. The script builds (or drafts) the narration,
+runs the tour as an ignored `mmm-app` test (headless egui_kittest on wgpu, no
+window; `WGPU_BACKEND=vulkan` on Windows), then muxes. With no voice set up it
+falls back to a draft: a silent video and captions, no mux. As built:
+
+- **Generic crate.** `mega-tour` depends on `mega-ui` only, never on `mmm-*`.
+  It renders a caption card and a cursor over the app at 1280 x 720, 1.5 ppp
+  (1920 x 1080 output), 30 fps, piped to ffmpeg.
+- **Narration-paced.** `say(id)` waits for the previous clip, shows the caption
+  and starts the clip `lead` seconds later; passage captions switch per
+  sentence at frames derived from the clip start. Slow work is time-lapsed
+  (`Wait::lapse`, with a "sped up" badge), so the video length depends on the
+  narration, not on how long the app takes.
+- **Outputs.** `silent.mp4`, `timeline.json`, `captions.vtt` and stills;
+  `narrate mux --timeline` consumes the timeline.
+- **Acceptance (2026-11-14).** The real two-panel, six-filter NGC 7000 session:
+  the draft run recorded 51.0 s of video in about 2.7 min with 8 cues and 8
+  captions; the narrated preview (cached takes, `--allow-unapproved`) muxed a
+  47.6 s `tour.mp4` with an AAC audio stream and no overrun. Most wall time is
+  the real analysis and merge, which the recorder time-lapses.
+- **The spike is superseded.** The uncommitted spike on `spike/tour-video` in
+  the main checkout (`tour_spike.rs`) is replaced by this crate and can be
+  discarded.

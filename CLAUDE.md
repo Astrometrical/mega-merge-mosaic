@@ -14,6 +14,8 @@ architecture, verified facts about the input data, and the algorithm choices.
 - `crates/mmm` — CLI frontend (thin)
 - `crates/mega-ui` — generic egui components/theme/tile viewer; must not
   depend on `mmm-core` (liftable to other apps); egui/eframe pinned at 0.36
+- `crates/mega-tour` — generic headless egui recorder for narration-paced
+  tour videos; no `mmm-*` deps; pairs with `tools/narrate` (its README)
 - `crates/mmm-app` — eframe desktop app (`mega-merge-mosaic`), glow renderer
 - `tools/narrate` — standalone Python narration tool (script to voice-over
   clips); `uv`-managed, no mmm dependency; design in
@@ -39,6 +41,7 @@ cargo test                 # unit + integration tests (no big files needed)
 cargo build --release      # required for real-data runs (2 GB frames)
 target/release/mmm info test_data/orion_mosaic/*PANEL-4_*.xisf --stats
 cd tools/narrate && uv run pytest -q   # narrate tests (no GPU); see its README
+tools/tour.sh SESSION [OUT] [--draft] [--allow-unapproved]   # record the NGC 7000 tour
 ```
 
 UI standard: `cargo run -p mega-ui --example gallery` shows every token and
