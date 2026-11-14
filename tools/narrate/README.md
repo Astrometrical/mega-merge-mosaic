@@ -11,6 +11,12 @@ the design is in
 cd tools/narrate
 uv sync                 # core: script, text, audio, manifest, draft (no GPU)
 uv sync --extra qwen    # adds torch, Qwen3-TTS and Whisper for real generation
+```
+
+A plain `uv sync` after `uv sync --extra qwen` removes torch again, so on the
+GPU machine use `uv sync --extra qwen` every time (and `uv run --extra qwen`).
+
+```sh
 uv run pytest -q        # tests need no GPU, weights or voice recordings
 ```
 
@@ -30,8 +36,14 @@ uv run narrate build path/to/x.narration.toml [--out DIR] [--voices DIR]
 ```
 
 `build` prints one row per line: id, status, take, CER, pace (syllables per
-second), duration. It exits non-zero if any line is flagged, unless
-`--allow-flagged`. A second `build` reuses cached takes and takes seconds.
+second), duration. A second `build` reuses cached takes and takes seconds.
+
+Exit codes: 0 ok; 1 a line is flagged (unless `--allow-flagged`); 2 a user
+error (bad script, profile or option, or the `qwen` extra missing); 3 an
+internal error (traceback on stderr). 1 only ever means flagged.
+
+Checks are English-only: Whisper runs in English and text normalisation assumes
+English.
 
 Try it on the tour script:
 `uv run narrate build ../../crates/mmm-app/tours/ngc7000.narration.toml`.
@@ -48,7 +60,8 @@ Profiles live in `~/.narrate/voices/<name>/` (override with `NARRATE_VOICES`
 or `--voices`):
 
 ```
-voice.toml              backend, model, language, precision, default_style,
+voice.toml              backend, model, language, precision, checker
+                        (default `whisper`), default_style,
                         [style.<name>] short/long reference (audio + exact
                         transcript), [pace], [takes]
 refs/*.wav              the reference clips
@@ -69,8 +82,8 @@ commands are not built yet, so `build` does not write them.
 | What | Where |
 |---|---|
 | Takes, transcripts | `NARRATE_CACHE`, default `~/.narrate/cache` (safe to delete) |
-| Approved takes | `NARRATE_APPROVED`, default `~/.narrate/approved/` (never pruned) |
-| Clips and `narration.json` | `--out`, default `<script dir>/out/<script stem>/` |
+| Approved takes (plan 2, not built yet) | `NARRATE_APPROVED`, default `~/.narrate/approved/` (never pruned) |
+| Clips and `narration.json` | `--out`, default `<script dir>/out/<script stem>/`; the folder carries its own `.gitignore` (`*`) |
 | Approvals | `<script>.lock.json` next to the script (no audio; commit it) |
 
 ## Privacy

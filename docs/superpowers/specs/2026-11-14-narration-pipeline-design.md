@@ -145,7 +145,7 @@ A Python 3.11 package at `tools/narrate/` (src layout, `pyproject.toml`, uv), wi
    - **Style:** the line's style, else the script's, else the profile's default.
    - **Kind:** the line's `kind`, else inferred. Three or more sentences, or about 250+ characters, means `passage`; anything shorter is a `line`.
    - **Clip:** a line uses the style's short reference, a passage the long one.
-3. **Cache key:** a hash of the backend, model, precision, reference audio bytes, reference transcript and spoken text. The key names a cache entry holding numbered takes.
+3. **Cache key:** a hash of the backend, model, precision, language, reference audio bytes, reference transcript and spoken text. The key names a cache entry holding numbered takes.
    - **Seeds:** each batch is seeded from its first take's key and take number, so batches differ. A take is not reproducible on its own (§3), which is why approved audio is stored durably (§5.8).
 4. **Takes:** make up to `takes.count` (default 3). Batch by reference, sorted by length, within a padded-size budget scaled to the reference length (§3: ~900 characters at 49 s, ~2400 at 10 s). Gaps across a whole build are filled in as few model loads as possible.
 5. **Check each take:**
@@ -174,9 +174,9 @@ A Python 3.11 package at `tools/narrate/` (src layout, `pyproject.toml`, uv), wi
      - **`approved`:** the lock pins this key, so use the pinned take.
      - **`flagged`:** no take passed.
      - **`new`:** otherwise.
-   - **A pin is tied to its key:** editing a line's text, its pronunciations, the profile's reference or the model changes the key, so the line comes back as `new`.
+   - **A pin is tied to its key:** editing a line's text, its pronunciations, the profile's reference, language or the model changes the key, so the line comes back as `new`.
 
-Then write `narration.json` (§8.4). `build` exits non-zero when a line is flagged, unless `--allow-flagged` is passed.
+Then write `narration.json` (§8.4). `build` exits 0 when it is ok, 1 when a line is flagged (unless `--allow-flagged` is passed), 2 on a user error (bad script, profile or option, or a missing extra) and 3 on an internal error. Exit 1 only ever means flagged.
 
 ### 5.3 Backend and checker boundaries
 
@@ -245,7 +245,7 @@ This is the round-3 workflow made into a command:
 
 ### 5.7 `draft` and `mux`
 
-- **`narrate draft SCRIPT`:** writes `narration.json` with `clip: null` and estimated durations, using `text` at `pace.target`. It needs no GPU and no voice profile.
+- **`narrate draft SCRIPT`:** writes `narration.json` with `clip: null` and estimated durations: the spoken form's syllables at `pace.target`. It needs no GPU and no voice profile.
 - **`narrate mux --timeline T -o OUT`:** reads the timeline (§8.5) and the manifest, then mixes each clip at its start onto the silent video, using the spike's filter graph (§3).
 - **`narrate mux --video V --script S -o OUT`:** video-first. It places each line at its `at` time.
 - **Overruns:** both forms report any clip that runs past the next cue's start, and fail unless `--allow-overlap`.
