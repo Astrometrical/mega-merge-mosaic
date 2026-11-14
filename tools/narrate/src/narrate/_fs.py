@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def replace_with_retry(src: Path, dst: Path, attempts: int = 20, delay: float = 0.025) -> None:
@@ -35,6 +38,11 @@ def read_text_retry(path: Path, attempts: int = 20, delay: float = 0.025) -> str
 def sha256_file(path: Path) -> str:
     """The sha256 of a file's bytes, as lowercase hex."""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def is_sha256(value: object) -> bool:
+    """Whether `value` is a sha256 as `sha256_file` writes it: 64 lowercase hex characters."""
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
 
 
 def ensure_ignored(folder: Path) -> None:

@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from narrate import NarrateError
-from narrate._fs import read_text_retry, replace_with_retry
+from narrate._fs import is_sha256, read_text_retry, replace_with_retry
 from narrate.captions import Caption
 
 VERSION = 1
 LEAD = 0.15
 BREATH = 0.4
-_SHA_RE = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass
@@ -208,10 +206,8 @@ def _read_line(path: Path, d) -> ManifestLine:
     check = d.get("check")
     if check is not None and not isinstance(check, dict):
         raise _bad(path, where, "check", "an object or null", check)
-    if check is not None and "sha256" in check:
-        sha = check["sha256"]
-        if not isinstance(sha, str) or _SHA_RE.fullmatch(sha) is None:
-            raise _bad(path, where + "check ", "sha256", "64 lowercase hex characters", sha)
+    if check is not None and "sha256" in check and not is_sha256(check["sha256"]):
+        raise _bad(path, where + "check ", "sha256", "64 lowercase hex characters", check["sha256"])
     at = d.get("at")
     if at is not None:
         at = _finite_num(path, where, d, "at")

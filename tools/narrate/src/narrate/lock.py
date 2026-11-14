@@ -10,11 +10,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from narrate import NarrateError
-from narrate._fs import read_text_retry, replace_with_retry
+from narrate._fs import is_sha256, read_text_retry, replace_with_retry
 
 VERSION = 1
 _ID_RE = re.compile(r"[a-z0-9-]+")
-_SHA_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def lock_path(script_path: Path) -> Path:
@@ -169,7 +168,7 @@ def _read_pin(id_: str, raw: object, path: Path) -> Pin:
         "cer": lambda v: v is None or _is_num(v),
         "pace": lambda v: v is None or _is_num(v),
         "approved_at": lambda v: isinstance(v, str),
-        "sha256": lambda v: isinstance(v, str) and _SHA_RE.fullmatch(v) is not None,
+        "sha256": is_sha256,
     }
     for name, ok in checks.items():
         if name not in raw or not ok(raw[name]):

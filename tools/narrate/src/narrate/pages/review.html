@@ -140,12 +140,17 @@ function isRejected(line) {
   return !!r && r.includes(c.take);
 }
 
+// The server's rule for "Approve all unflagged": new, no flags at all, a hashed take, not rejected.
+function bulkApprovable(line) {
+  return line.status === "new" && !(line.flags && line.flags.length) && !!line.check && !!line.check.sha256 && !isRejected(line);
+}
+
 function fmtTime(t) { return t.toFixed(2) + "s"; }
 
 function renderCard(line) {
   const c = line.check;
   const rejected = isRejected(line);
-  const canAct = !!c && !state.manifest.draft;
+  const canAct = !!c && !!c.sha256 && !state.manifest.draft && !state.building;
   const badges = [el("span", { class: "badge " + line.status, text: line.status })];
   if (rejected) badges.push(el("span", { class: "badge rejected", text: "rejected" }));
   const head = el("div", { class: "head" }, [el("span", { class: "id", text: line.id }), ...badges]);
@@ -192,8 +197,9 @@ function renderCard(line) {
   const reject = el("button", { type: "button", class: "bad", "data-focus": "r:" + line.id, text: rejected ? "Rejected" : "Reject" });
   approve.disabled = !canAct || line.status === "approved";
   reject.disabled = !canAct || rejected;
-  approve.addEventListener("click", () => act(API.approve, { id: line.id }, "a:" + line.id));
-  reject.addEventListener("click", () => act(API.reject, { id: line.id }, "r:" + line.id));
+  // The take is named by the hash of the take this card shows, so a changed take is a 409, never a wrong pin.
+  approve.addEventListener("click", () => act(API.approve, { id: line.id, sha256: c.sha256 }, "a:" + line.id));
+  reject.addEventListener("click", () => act(API.reject, { id: line.id, sha256: c.sha256 }, "r:" + line.id));
   card.appendChild(el("div", { class: "actions" }, [approve, reject]));
 
   const noteId = "note-" + line.id.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -229,7 +235,9 @@ function render() {
   const rb = $("rebuild");
   rb.textContent = building ? "building…" : "Rebuild";
   rb.disabled = building || !lines.some(isRejected);
-  $("approve-all").disabled = building || state.manifest.draft || !lines.some((l) => l.status === "new" && l.check && !isRejected(l));
+  const bulk = state.manifest.draft ? 0 : lines.filter(bulkApprovable).length;
+  $("approve-all").textContent = "Approve all unflagged (" + bulk + ")";
+  $("approve-all").disabled = building || bulk === 0;
   if (building) setStatus("Building…", false);
   else if (message === "Building…") setStatus("", false);
 }

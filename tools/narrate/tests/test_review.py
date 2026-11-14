@@ -15,6 +15,7 @@ from narrate.build import BuildOptions, build, default_out
 from narrate.cache import TakeStore, cache_root
 from narrate.fakes import FakeBackend, FakeWorld
 from narrate.lock import Lock, lock_path
+from narrate.manifest import read_manifest
 from narrate.review import ReviewApp
 from narrate.script import load_script
 from narrate.server import LocalServer, start
@@ -44,6 +45,17 @@ def call(url, body=None, raw=None):
 def jcall(url, body=None):
     status, data = call(url, body)
     return status, json.loads(data)
+
+
+def shown(server, id_):
+    """The sha256 of the take the page shows for a line (`check.sha256` in the state)."""
+    _, state = jcall(server.url + "/api/state")
+    return next(ln for ln in state["manifest"]["lines"] if ln["id"] == id_)["check"]["sha256"]
+
+
+def heard(server, action, id_):
+    """Approve or reject the take the page shows."""
+    return jcall(server.url + f"/api/{action}", {"id": id_, "sha256": shown(server, id_)})
 
 
 def script_text(*lines):
@@ -95,7 +107,7 @@ def test_approve_pins_and_copies(make_app):
     path, _, server = make_app(("a", LINE), ("b", OTHER))
     _, state = jcall(server.url + "/api/state")
     check = state["manifest"]["lines"][0]["check"]
-    status, state = jcall(server.url + "/api/approve", {"id": "a"})
+    status, state = heard(server, "approve", "a")
     assert status == 200
     assert state["lock"]["pins"]["a"]["take"] == check["take"]
     assert state["lock"]["pins"]["a"]["key"] == check["key"]
@@ -111,15 +123,20 @@ def test_approve_pins_and_copies(make_app):
 
 def test_approve_errors(make_app):
     _, _, server = make_app(("a", LINE))
-    assert jcall(server.url + "/api/approve", {"id": "zzz"})[0] == 400
+    sha = shown(server, "a")
+    assert jcall(server.url + "/api/approve", {"id": "zzz", "sha256": sha})[0] == 400
     assert jcall(server.url + "/api/approve", {})[0] == 400
+    for action in ("approve", "reject"):
+        for bad in (None, 3, "abc", sha.upper()):
+            status, body = jcall(server.url + f"/api/{action}", {"id": "a", "sha256": bad})
+            assert status == 400 and "sha256" in body["error"]
     assert jcall(server.url + "/api/note", {"id": "a", "note": 3})[0] == 400
 
 
 def test_approve_missing_take_is_400(make_app):
     _, _, server = make_app(("a", LINE))
     shutil.rmtree(cache_root(None))
-    status, body = jcall(server.url + "/api/approve", {"id": "a"})
+    status, body = heard(server, "approve", "a")
     assert status == 400 and "neither" in body["error"]
 
 
@@ -127,7 +144,7 @@ def test_reject_then_rebuild_picks_another_take(make_app):
     _, _, server = make_app(("a", LINE))
     _, state = jcall(server.url + "/api/state")
     first = state["manifest"]["lines"][0]["check"]
-    status, state = jcall(server.url + "/api/reject", {"id": "a"})
+    status, state = heard(server, "reject", "a")
     assert status == 200
     assert state["lock"]["rejected"] == {first["key"]: [first["take"]]}
     status, state = jcall(server.url + "/api/rebuild", {})
@@ -163,7 +180,7 @@ def test_approve_unflagged_skips_flagged(root, write_script, voice_library, worl
 
 def test_lock_edited_on_disk_between_requests_is_kept(make_app):
     path, _, server = make_app(("a", LINE), ("b", OTHER))
-    jcall(server.url + "/api/approve", {"id": "a"})
+    heard(server, "approve", "a")
     lock = Lock.load(lock_path(path))
     lock.note("b", "from disk")
     lock.save()
@@ -187,7 +204,7 @@ class GatedBackend(FakeBackend):
 def test_rebuild_conflict_409(make_app, world):
     backend = GatedBackend(world)
     _, _, server = make_app(("a", LINE), backend=backend)
-    jcall(server.url + "/api/reject", {"id": "a"})  # forces a fresh take, so the rebuild synthesises
+    heard(server, "reject", "a")  # forces a fresh take, so the rebuild synthesises
     first = {}
     t = threading.Thread(target=lambda: first.update(r=jcall(server.url + "/api/rebuild", {})))
     t.start()
@@ -226,7 +243,7 @@ def test_bad_json_400(make_app):
 
 def test_approve_unflagged_keeps_rejections(make_app):
     path, _, server = make_app(("a", LINE), ("b", OTHER))
-    jcall(server.url + "/api/reject", {"id": "b"})
+    heard(server, "reject", "b")
     _, state = jcall(server.url + "/api/approve-unflagged", {})
     assert list(state["lock"]["pins"]) == ["a"]
     assert len(state["lock"]["rejected"]) == 1
@@ -235,7 +252,7 @@ def test_approve_unflagged_keeps_rejections(make_app):
 
 def test_approve_hash_matches_store_and_rebuild_is_approved(make_app):
     path, _, server = make_app(("a", LINE))
-    jcall(server.url + "/api/approve", {"id": "a"})
+    heard(server, "approve", "a")
     sha = Lock.load(lock_path(path)).pins["a"].sha256
     assert hashlib.sha256(ApprovedStore(approved_root(None)).path(sha).read_bytes()).hexdigest() == sha
     status, state = jcall(server.url + "/api/rebuild", {})
@@ -245,9 +262,9 @@ def test_approve_hash_matches_store_and_rebuild_is_approved(make_app):
 
 def test_approve_falls_back_to_the_approved_store(make_app):
     path, _, server = make_app(("a", LINE))
-    jcall(server.url + "/api/approve", {"id": "a"})
+    heard(server, "approve", "a")
     shutil.rmtree(cache_root(None))
-    status, state = jcall(server.url + "/api/approve", {"id": "a"})
+    status, state = heard(server, "approve", "a")
     assert status == 200 and "a" in state["lock"]["pins"]
     sha = Lock.load(lock_path(path)).pins["a"].sha256
     assert hashlib.sha256(ApprovedStore(approved_root(None)).path(sha).read_bytes()).hexdigest() == sha
@@ -256,14 +273,14 @@ def test_approve_falls_back_to_the_approved_store(make_app):
 def test_identical_lines_keep_their_own_approved_audio(make_app):
     """Lines with the same text share a key; after a cache clear take numbers restart (probe P9)."""
     path, _, server = make_app(("x", LINE), ("y", LINE))
-    assert jcall(server.url + "/api/approve", {"id": "x"})[0] == 200
+    assert heard(server, "approve", "x")[0] == 200
     x_pin = Lock.load(lock_path(path)).pins["x"]
     shutil.rmtree(cache_root(None) / "takes")
     _, state = jcall(server.url + "/api/rebuild", {})
     by = {ln["id"]: ln for ln in state["manifest"]["lines"]}
     assert by["x"]["status"] == "approved"
     assert (by["y"]["check"]["key"], by["y"]["check"]["take"]) == (x_pin.key, x_pin.take)  # same take, new audio
-    assert jcall(server.url + "/api/approve", {"id": "y"})[0] == 200
+    assert heard(server, "approve", "y")[0] == 200
     y_pin = Lock.load(lock_path(path)).pins["y"]
     assert y_pin.sha256 != x_pin.sha256
     _, state = jcall(server.url + "/api/rebuild", {})
@@ -278,19 +295,25 @@ def test_identical_lines_keep_their_own_approved_audio(make_app):
 
 
 def test_draft_manifest_and_missing_check_are_400(make_app):
-    path, app, server = make_app(("a", LINE))
-    app.manifest.lines[0].check = None
-    status, body = jcall(server.url + "/api/approve", {"id": "a"})
+    path, _, server = make_app(("a", LINE))
+    sha = shown(server, "a")
+    manifest_path = default_out(load_script(path)) / "narration.json"
+    m = read_manifest(manifest_path)
+    m.lines[0].check = None
+    m.write(manifest_path)
+    status, body = jcall(server.url + "/api/approve", {"id": "a", "sha256": sha})
     assert status == 400 and "no checked take" in body["error"]
-    status, _ = jcall(server.url + "/api/reject", {"id": "a"})
+    status, _ = jcall(server.url + "/api/reject", {"id": "a", "sha256": sha})
     assert status == 400
-    app.manifest.draft = True
-    status, body = jcall(server.url + "/api/approve", {"id": "a"})
+    m.draft = True
+    m.write(manifest_path)
+    status, body = jcall(server.url + "/api/approve", {"id": "a", "sha256": sha})
     assert status == 400 and "draft" in body["error"]
 
 
 def test_state_reads_do_not_break_concurrent_saves(make_app):
     path, _, server = make_app(("a", LINE), ("b", OTHER))
+    shas = [shown(server, "b"), shown(server, "a")]
     stop = threading.Event()
 
     def hammer():
@@ -302,7 +325,7 @@ def test_state_reads_do_not_break_concurrent_saves(make_app):
         t.start()
     try:
         for i in range(10):
-            assert jcall(server.url + "/api/approve", {"id": "a" if i % 2 else "b"})[0] == 200
+            assert jcall(server.url + "/api/approve", {"id": "a" if i % 2 else "b", "sha256": shas[i % 2]})[0] == 200
             assert jcall(server.url + "/api/note", {"id": "a", "note": f"n{i}"})[0] == 200
     finally:
         stop.set()
@@ -321,3 +344,106 @@ def test_page_is_served(make_app):
     for api in ("/api/state", "/api/approve", "/api/reject", "/api/note", "/api/approve-unflagged", "/api/rebuild"):
         assert api in page
     assert "http://" not in page and "https://" not in page
+    assert "sha256: c.sha256" in page  # approve and reject name the take the page shows
+
+
+def test_approve_unflagged_skips_pinned_audio_missing(root, write_script, voice_library, world):
+    """A `new` line flagged pinned-audio-missing carries a fresh, unheard take (probe P1)."""
+    path = write_script(root, script_text(("a", LINE), ("b", OTHER)))
+    first = build(path).lines[0]
+    lock = Lock.load(lock_path(path))
+    c = first.check
+    lock.pin("a", c["key"], c["take"], first.duration, c["heard"], c["cer"], c["pace"], c["sha256"])
+    lock.save()
+    shutil.rmtree(cache_root(None) / "takes")  # a new machine: neither the cache nor the store has the audio
+    m = build(path)
+    assert (m.lines[0].status, m.lines[0].flags) == ("new", ["pinned-audio-missing"])
+    server = LocalServer(ReviewApp(path, BuildOptions()).routes())
+    start(server)
+    try:
+        status, state = jcall(server.url + "/api/approve-unflagged", {})
+        assert status == 200
+        assert state["lock"]["pins"]["a"]["approved_at"] == lock.pins["a"].approved_at
+        assert Lock.load(lock_path(path)).pins["a"] == lock.pins["a"]
+        assert "b" in state["lock"]["pins"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+BUILDING = "building — try again when the build finishes"
+TAKE_CHANGED = "the take changed — reload"
+
+
+def test_mutations_during_a_rebuild_are_409(make_app, world):
+    backend = GatedBackend(world)
+    path, _, server = make_app(("a", LINE), ("b", OTHER), backend=backend)
+    heard(server, "reject", "a")  # forces a fresh take, so the rebuild synthesises
+    shas = {i: shown(server, i) for i in ("a", "b")}
+    before = lock_path(path).read_bytes()
+    t = threading.Thread(target=lambda: jcall(server.url + "/api/rebuild", {}))
+    t.start()
+    try:
+        assert backend.entered.wait(10)
+        for url, body in [
+            ("/api/approve", {"id": "b", "sha256": shas["b"]}),
+            ("/api/reject", {"id": "b", "sha256": shas["b"]}),
+            ("/api/note", {"id": "b", "note": "typed during the build"}),
+            ("/api/approve-unflagged", {}),
+        ]:
+            assert jcall(server.url + url, body) == (409, {"error": BUILDING})
+        assert lock_path(path).read_bytes() == before
+    finally:
+        backend.release.set()
+        t.join(10)
+    assert heard(server, "approve", "b")[0] == 200
+
+
+def test_stale_take_is_409(make_app):
+    path, _, server = make_app(("a", LINE))
+    for action in ("approve", "reject"):
+        assert jcall(server.url + f"/api/{action}", {"id": "a", "sha256": "0" * 64}) == (409, {"error": TAKE_CHANGED})
+    assert Lock.load(lock_path(path)).pins == {} and Lock.load(lock_path(path)).rejected == {}
+
+
+def test_take_rewritten_in_the_cache_is_409(make_app):
+    path, _, server = make_app(("a", LINE))
+    sha = shown(server, "a")
+    _, state = jcall(server.url + "/api/state")
+    c = state["manifest"]["lines"][0]["check"]
+    cached = TakeStore(cache_root(None)).path(c["key"], c["take"])
+    data = bytearray(cached.read_bytes())
+    data[-1] ^= 0xFF
+    cached.write_bytes(bytes(data))  # the take was regenerated after a cache clear, say
+    for action in ("approve", "reject"):
+        assert jcall(server.url + f"/api/{action}", {"id": "a", "sha256": sha}) == (409, {"error": TAKE_CHANGED})
+    assert jcall(server.url + "/api/approve-unflagged", {}) == (409, {"error": TAKE_CHANGED})
+    assert Lock.load(lock_path(path)).pins == {}
+
+
+def test_manifest_rebuilt_elsewhere_makes_a_stale_approve_409(make_app):
+    path, _, server = make_app(("a", LINE), ("b", OTHER))
+    stale = shown(server, "a")
+    lock = Lock.load(lock_path(path))
+    c = read_manifest(default_out(load_script(path)) / "narration.json").lines[0].check
+    lock.reject(c["key"], c["take"])
+    lock.save()
+    fresh = build(path).lines[0].check["sha256"]  # another `narrate build`, outside the review server
+    assert fresh != stale
+    assert jcall(server.url + "/api/approve", {"id": "a", "sha256": stale}) == (409, {"error": TAKE_CHANGED})
+    assert shown(server, "a") == fresh  # the page reloads the take now on disk
+    status, state = jcall(server.url + "/api/approve", {"id": "a", "sha256": fresh})
+    assert status == 200 and Lock.load(lock_path(path)).pins["a"].sha256 == fresh
+
+
+def test_approve_unflagged_pins_the_take_on_disk(make_app):
+    path, _, server = make_app(("a", LINE))
+    lock = Lock.load(lock_path(path))
+    c = read_manifest(default_out(load_script(path)) / "narration.json").lines[0].check
+    lock.reject(c["key"], c["take"])
+    lock.save()
+    fresh = build(path).lines[0].check
+    status, state = jcall(server.url + "/api/approve-unflagged", {})
+    assert status == 200
+    pin = Lock.load(lock_path(path)).pins["a"]
+    assert (pin.take, pin.sha256) == (fresh["take"], fresh["sha256"])

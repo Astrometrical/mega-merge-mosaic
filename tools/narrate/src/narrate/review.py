@@ -1,4 +1,4 @@
-"""The review API: state, approvals, rejections, notes and rebuilds (spec 5.4)."""
+"""The review API: state, approvals, rejections, notes and rebuilds (spec §5.5)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from importlib import resources
 from pathlib import Path
 
 from narrate import NarrateError
-from narrate._fs import sha256_file
+from narrate._fs import is_sha256, sha256_file
 from narrate.approved import ApprovedStore, approved_root
 from narrate.backends import Backend
 from narrate.build import BuildOptions, build, default_out
@@ -19,13 +19,20 @@ from narrate.manifest import Manifest, ManifestLine, read_manifest
 from narrate.script import load_script
 from narrate.server import LocalServer, Response, Routes, json_response, serve_clip, start
 
+BUILDING = "building — try again when the build finishes"
+TAKE_CHANGED = "the take changed — reload"
+
 
 def _page() -> bytes:
     return (resources.files("narrate") / "pages" / "review.html").read_bytes()
 
 
+class _Conflict(Exception):
+    """A mutation the state on disk no longer allows (HTTP 409)."""
+
+
 class ReviewApp:
-    """State on disk: the manifest is re-read after each build, the lock before each mutation."""
+    """State on disk: the manifest is re-read after each build and, with the lock, before each mutation."""
 
     def __init__(
         self,
@@ -56,8 +63,8 @@ class ReviewApp:
         r.add("GET", "/", lambda _b: (200, "text/html; charset=utf-8", _page()))
         r.add("GET", "/api/state", lambda _b: self._state())
         r.add_prefix("GET", "/clips/", lambda p: serve_clip(self.out, [ln.id for ln in self.manifest.lines], p))
-        r.add("POST", "/api/approve", lambda b: self._edit(lambda lock: self._approve(lock, self._line(b))))
-        r.add("POST", "/api/reject", lambda b: self._edit(lambda lock: self._reject(lock, self._line(b))))
+        r.add("POST", "/api/approve", lambda b: self._edit(lambda lock: self._approve(lock, b)))
+        r.add("POST", "/api/reject", lambda b: self._edit(lambda lock: self._reject(lock, b)))
         r.add("POST", "/api/note", lambda b: self._edit(lambda lock: self._note(lock, b)))
         r.add("POST", "/api/approve-unflagged", lambda _b: self._edit(self._approve_unflagged))
         r.add("POST", "/api/rebuild", lambda _b: self._rebuild())
@@ -90,10 +97,21 @@ class ReviewApp:
                 return ln
         raise NarrateError(f"unknown line id {id_!r}")
 
-    def _edit(self, action) -> Response:
+    def _edit(self, action: Callable[[Lock], None]) -> Response:
+        """Run a mutation against the manifest and lock as they are on disk now.
+
+        Refused (409) while a rebuild runs: the clips and takes are changing under the page.
+        A rebuild only starts while holding `_mutate`, so none starts mid-mutation either.
+        """
         with self._mutate:
+            if self._build.locked():
+                return json_response({"error": BUILDING}, 409)
+            self.manifest = self._read_manifest()
             lock = Lock.load(self.lock_file)
-            action(lock)
+            try:
+                action(lock)
+            except _Conflict as e:
+                return json_response({"error": str(e)}, 409)
             lock.save()
             return self._state_locked(lock)
 
@@ -102,23 +120,48 @@ class ReviewApp:
             raise NarrateError("the manifest is a draft; build the script first")
         if line.check is None:
             raise NarrateError(f"line {line.id!r} has no checked take")
+        if not is_sha256(line.check.get("sha256")):
+            raise NarrateError(f"line {line.id!r}: the manifest has no take hash; rebuild the script")
         return line.check
 
-    def _approve(self, lock: Lock, line: ManifestLine) -> None:
-        c = self._checked(line)
-        key, take = c["key"], c["take"]
-        store = ApprovedStore(approved_root(self.options.approved))
-        cached = TakeStore(cache_root(self.options.cache)).path(key, take)
-        sha = c.get("sha256")
-        if cached.is_file():
-            sha = sha256_file(cached)
-            store.put(sha, cached)
-        elif not (isinstance(sha, str) and store.has(sha)):
-            raise NarrateError(f"line {line.id!r}: take {take} is in neither the take cache nor the approved store")
-        lock.pin(line.id, key, take, line.duration, c["heard"], c["cer"], c["pace"], sha)
+    def _heard(self, body) -> tuple[ManifestLine, dict]:
+        """The line a request names and its check, if its take is still the one the page showed.
 
-    def _reject(self, lock: Lock, line: ManifestLine) -> None:
+        The body's `sha256` is the page's `check.sha256`; the take now in the manifest and
+        in the take cache must still hash to it, else the request is a 409.
+        """
+        line = self._line(body)
         c = self._checked(line)
+        sha = body.get("sha256")
+        if not is_sha256(sha):
+            raise NarrateError("'sha256' must be the sha256 of the take shown (64 lowercase hex characters)")
+        return line, self._current(line, c, sha)
+
+    def _current(self, line: ManifestLine, c: dict, sha: str) -> dict:
+        cached = TakeStore(cache_root(self.options.cache)).path(c["key"], c["take"])
+        if c["sha256"] != sha or (cached.is_file() and sha256_file(cached) != sha):
+            raise _Conflict(TAKE_CHANGED)
+        return c
+
+    def _pin(self, lock: Lock, line: ManifestLine, c: dict) -> None:
+        """Pin the line's take, copying its audio into the approved store if it is not there yet."""
+        sha = c["sha256"]
+        cached = TakeStore(cache_root(self.options.cache)).path(c["key"], c["take"])
+        store = ApprovedStore(approved_root(self.options.approved))
+        if cached.is_file():
+            store.put(sha, cached)
+        elif not store.has(sha):
+            raise NarrateError(
+                f"line {line.id!r}: take {c['take']} is in neither the take cache nor the approved store"
+            )
+        lock.pin(line.id, c["key"], c["take"], line.duration, c["heard"], c["cer"], c["pace"], sha)
+
+    def _approve(self, lock: Lock, body) -> None:
+        line, c = self._heard(body)
+        self._pin(lock, line, c)
+
+    def _reject(self, lock: Lock, body) -> None:
+        _, c = self._heard(body)
         lock.reject(c["key"], c["take"])
 
     def _note(self, lock: Lock, body) -> None:
@@ -129,15 +172,19 @@ class ReviewApp:
         lock.note(line.id, text)
 
     def _approve_unflagged(self, lock: Lock) -> None:
+        """Pin every `new` line with no flags whose take is not rejected: the take now on disk."""
         for line in self.manifest.lines:
             c = line.check
-            if line.status != "new" or c is None or c["take"] in lock.rejected.get(c["key"], set()):
+            if line.status != "new" or line.flags or c is None or not is_sha256(c.get("sha256")):
                 continue
-            self._approve(lock, line)
+            if c["take"] in lock.rejected.get(c["key"], set()):
+                continue
+            self._pin(lock, line, self._current(line, c, c["sha256"]))
 
     def _rebuild(self) -> Response:
-        if not self._build.acquire(blocking=False):
-            return json_response({"error": "a rebuild is already running"}, 409)
+        with self._mutate:
+            if not self._build.acquire(blocking=False):
+                return json_response({"error": "a rebuild is already running"}, 409)
         try:
             build(self.script_path, backend=self.backend, checker=self.checker, options=self.options)
             self.manifest = self._read_manifest()
