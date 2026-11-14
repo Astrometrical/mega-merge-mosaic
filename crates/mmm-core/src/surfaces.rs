@@ -588,8 +588,7 @@ mod tests {
         // Compare the fitted fields over each panel's window on a grid.
         let (w, h) = (canvas.0 as f64, canvas.1 as f64);
         let mut max_field = 0.0f64;
-        for p in 0..4 {
-            let [x0, y0, x1, y1] = res_a.windows[p];
+        for (p, &[x0, y0, x1, y1]) in res_a.windows.iter().enumerate().take(4) {
             for y in (y0..y1).step_by(8) {
                 for x in (x0..x1).step_by(8) {
                     let v = surf_a.eval(0, p, x as f64 / w, y as f64 / h);
@@ -603,8 +602,7 @@ mod tests {
         );
 
         let mut max_diff = 0.0f64;
-        for p in 0..4 {
-            let [x0, y0, x1, y1] = res_a.windows[p];
+        for (p, &[x0, y0, x1, y1]) in res_a.windows.iter().enumerate().take(4) {
             for y in (y0..y1).step_by(8) {
                 for x in (x0..x1).step_by(8) {
                     let (xn, yn) = (x as f64 / w, y as f64 / h);

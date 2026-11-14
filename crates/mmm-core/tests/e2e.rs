@@ -444,8 +444,8 @@ fn full_pipeline_with_gradients_recovers_ground_truth() {
     // and the RMSE assertion below is the real quality gate. Offsets are not
     // comparable at all: the injected gradients *are* spatially varying
     // offsets, absorbed by the surfaces rather than by o.
-    for c in 0..nch {
-        let compose_gain = |p: usize| phot.gains[c][p] * res.applied[p].0 as f64;
+    for (c, channel_gains) in phot.gains.iter().enumerate().take(nch) {
+        let compose_gain = |p: usize| channel_gains[p] * res.applied[p].0 as f64;
         let ref_gain = compose_gain(reference);
         for p in 0..n_panels {
             let gain_err = (compose_gain(p) / ref_gain - 1.0).abs();
@@ -1943,8 +1943,8 @@ fn run_solved_pipeline(tag: &str, gain_tol: f64, format: &dyn Fn(usize) -> Solve
     let reference = (0..n_panels)
         .find(|&p| phot.gains[0][p] == 1.0 && phot.offsets[0][p] == 0.0)
         .expect("one panel must carry the gauge (g=1, o=0)");
-    for c in 0..nch {
-        let compose_gain = |p: usize| phot.gains[c][p] * gains[p] as f64;
+    for (c, channel_gains) in phot.gains.iter().enumerate().take(nch) {
+        let compose_gain = |p: usize| channel_gains[p] * gains[p] as f64;
         let ref_gain = compose_gain(reference);
         for p in 0..n_panels {
             let gain_err = (compose_gain(p) / ref_gain - 1.0).abs();
